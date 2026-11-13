@@ -5,7 +5,7 @@ use crate::model::FindingsDocument;
 
 /// Columns after `evidence_dir` were added later; they stay at the end so a
 /// reader that addresses columns by position keeps working.
-pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status";
+pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status,verdict_reason";
 
 /// Longest `arguments` cell, in characters.
 pub const ARGUMENTS_CELL_MAX: usize = 200;
@@ -75,6 +75,7 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
                 .as_ref()
                 .and_then(|fuzz| fuzz.input_to_state_status.clone())
                 .unwrap_or_default(),
+            f.verdict_reason.clone().unwrap_or_default(),
         ];
         out.push_str(&row.iter().map(|v| cell(v)).collect::<Vec<_>>().join(","));
         out.push('\n');
@@ -189,18 +190,18 @@ mod tests {
         assert!(
             fuzz.ends_with(
                 ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin,\
-                 data=len 12 hex 48445231;flags=7,data,,recorded"
+                 data=len 12 hex 48445231;flags=7,data,,recorded,"
             ),
             "{fuzz}"
         );
-        assert!(CSV_HEADER.ends_with(",build_fidelity,input_to_state_status"));
+        assert!(CSV_HEADER.ends_with(",build_fidelity,input_to_state_status,verdict_reason"));
         let sca = lines.next().unwrap();
         assert!(
             sca.contains(",CVE-2026-0001,pkg:npm/example@2.4.2,"),
             "{sca}"
         );
         assert!(
-            sca.ends_with(",,,,,,,,,,"),
+            sca.ends_with(",,,,,,,,,,,"),
             "no fuzz columns for SCA: {sca}"
         );
         assert_eq!(lines.next(), None);
@@ -270,7 +271,7 @@ mod tests {
         let out = render_csv(&doc);
         let fuzz = out.lines().nth(1).unwrap();
         assert!(
-            fuzz.ends_with(",\"reduced: macro WIDGET_SLOTS=0, header tables.h\",recorded"),
+            fuzz.ends_with(",\"reduced: macro WIDGET_SLOTS=0, header tables.h\",recorded,"),
             "{fuzz}"
         );
         assert_eq!(
@@ -278,6 +279,21 @@ mod tests {
             fuzz.matches(',').count(),
             "one column per header field (the cell's own comma is quoted): {fuzz}"
         );
+    }
+
+    /// A `lab_only` or `blocked` verdict's reason fills the `verdict_reason`
+    /// column.
+    #[test]
+    fn a_verdict_reason_fills_its_column() {
+        let mut doc = example();
+        doc.findings[0].verdict = Some("lab_only".to_owned());
+        doc.findings[0].verdict_reason = Some("harness_sized_buffer".to_owned());
+        let out = render_csv(&doc);
+        let header: Vec<&str> = CSV_HEADER.split(',').collect();
+        let row: Vec<&str> = out.lines().nth(1).unwrap().split(',').collect();
+        let column = |name: &str| header.iter().position(|h| *h == name).unwrap();
+        assert_eq!(row[column("verdict")], "lab_only");
+        assert_eq!(row[column("verdict_reason")], "harness_sized_buffer");
     }
 
     #[test]

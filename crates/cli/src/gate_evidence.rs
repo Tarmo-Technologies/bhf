@@ -563,6 +563,29 @@ fn capture_with(
     capture
 }
 
+/// Why a run that entered the target has no comparison of the target, from
+/// what the driver recorded: the comparisons it left out, by why, without
+/// claiming what was or was not instrumented. `excluded` holds the sites in
+/// bhf's harness code.
+fn no_target_comparison_reason(baseline: &EvidenceLog, excluded: &BTreeSet<u32>) -> String {
+    let total = baseline.records.len();
+    let detail = if total == 0 {
+        "the run recorded no comparison at all".to_owned()
+    } else {
+        let before = baseline.records.iter().filter(|r| !r.in_target).count();
+        let in_target = || baseline.records.iter().filter(|r| r.in_target);
+        let pointer = in_target().filter(|r| r.is_pointer_like()).count();
+        let harness = in_target()
+            .filter(|r| !r.is_pointer_like() && excluded.contains(&r.site))
+            .count();
+        format!(
+            "the run recorded {total} in all: {before} before the target was entered, {harness} \
+             in bhf's harness code, {pointer} on pointer values"
+        )
+    };
+    format!("the target made no comparison the driver recorded on this input ({detail})")
+}
+
 fn capture_in(
     replay: &Replay<'_>,
     input: &[u8],
@@ -631,10 +654,7 @@ fn capture_in(
     } else if records.is_empty() {
         summary.status = "no_comparisons".to_owned();
         summary.reason = Some(if baseline.target_entered {
-            "no instrumented comparison was recorded in the target on this input (code built \
-             without bhf's comparison instrumentation, such as a prebuilt library, is not \
-             observed)"
-                .to_owned()
+            no_target_comparison_reason(&baseline, &runner.excluded)
         } else {
             "no instrumented comparison was recorded on this input".to_owned()
         });
@@ -1523,9 +1543,9 @@ impl<'a> Runner<'a> {
             }
         }
         let _ = std::fs::remove_file(&input_path);
-        // The shim creates its log when it loads: no log, no shim, whatever
-        // LD_PRELOAD said.
-        if armed_log.is_some_and(|log| log.is_file()) {
+        // The shim writes a marker when it first opens its log: no marker, no
+        // shim, whatever LD_PRELOAD said.
+        if armed_log.is_some_and(|log| crate::auto::runtrace::log_shows_shim_loaded(&log)) {
             self.shim_armed = true;
         }
         let bytes = std::fs::read(&evidence).map_err(|_| {
@@ -2962,10 +2982,34 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             assert_eq!(capture.summary.comparisons, 0, "{capture:?}");
             let reason = capture.summary.reason.as_deref().unwrap_or_default();
             assert!(
-                reason.contains("no instrumented comparison was recorded in the target"),
+                reason.contains("the target made no comparison the driver recorded"),
                 "{reason}"
             );
+            // The reason counts what the run recorded and why each was left
+            // out: with no comparison of the target, every record was made
+            // before the target was entered (the driver discards those at
+            // entry), in bhf's harness code, or on a pointer value.
+            let count = |what: &str| {
+                counted(reason, what).unwrap_or_else(|| panic!("no {what:?} count: {reason}"))
+            };
+            let total = count("in all");
+            assert!(total > 0, "the harness compared input bytes: {reason}");
+            assert_eq!(
+                count("before the target was entered")
+                    + count("in bhf's harness code")
+                    + count("on pointer values"),
+                total,
+                "{reason}"
+            );
+            assert!(!reason.contains("built without"), "{reason}");
         }
+    }
+
+    /// The number written just before `what` in a capture reason
+    /// (`... 3 before the target was entered ...`, `recorded 5 in all`).
+    fn counted(reason: &str, what: &str) -> Option<usize> {
+        let head = &reason[..reason.find(what)?];
+        head.trim_end().rsplit([' ', '(']).next()?.parse().ok()
     }
 
     /// A comparison the harness makes after entering the target (checking
@@ -2984,6 +3028,11 @@ int bhf_run_one(const uint8_t *data, size_t size) {
         assert!(capture.gates.is_empty(), "{:?}", capture.gates);
         assert_eq!(capture.summary.status, "no_comparisons", "{capture:?}");
         assert_eq!(capture.summary.comparisons, 0, "{capture:?}");
+        let reason = capture.summary.reason.as_deref().unwrap_or_default();
+        assert!(
+            counted(reason, "in bhf's harness code").is_some_and(|n| n >= 1),
+            "{reason}"
+        );
     }
 
     /// A `memcmp` the harness makes after entering the target is placed at

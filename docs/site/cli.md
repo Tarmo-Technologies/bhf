@@ -747,9 +747,10 @@ and explain it — all offline and deterministic (no LLM):
 - `bhf explain` — explain WHY a crash fired, each claim with its evidence or
   a line saying there is none:
   - the input: `min_testcase.bin` when the finding was minimized, else
-    `testcase.bin`, named with its size, and whether it is one of bhf's
-    built-in starting inputs (empty, `A`, `AAAAAAAA`) or a byte-identical
-    copy of a seed listed in `auto/seeds.json`;
+    `testcase.bin`, named with its size, and whether it, or its
+    `testcase.bin` (the crashing input as found, before minimizing), is one
+    of bhf's built-in starting inputs (empty, `A`, `AAAAAAAA`) or a
+    byte-identical copy of a seed listed in `auto/seeds.json`;
   - comparison evidence for that input: each input span that reached a
     comparison of the target, with its offset, the operand, what it was
     compared with, whether they were equal, the comparison (`cmp`, `switch`,
@@ -778,8 +779,10 @@ and explain it — all offline and deterministic (no LLM):
     without it, explain replays the input once (nothing is written).
     Otherwise it prints `No comparison evidence recorded:` and the reason,
     which says what was not searched (computed operands beyond the replay
-    budget, comparisons past the driver's 8192-record limit) and that only
-    instrumented code is observed. Dictionary tokens found in the input are listed only as labelled
+    budget, comparisons past the driver's 8192-record limit), or, when the
+    target made no comparison the driver recorded, how many comparisons the
+    run recorded and why each was left out (before the target was entered, in
+    bhf's harness code, on pointer values). Dictionary tokens found in the input are listed only as labelled
     substring matches (at least 3 bytes, at most 3 occurrences);
   - the harness arguments: the value each parameter was decoded to, from the
     argument trace recorded with the finding. An argument whose input bytes a
@@ -798,8 +801,10 @@ and explain it — all offline and deterministic (no LLM):
     runtrace shim was loaded for it, else the harness's last fuzz pass (all of
     its inputs, labelled so), and `environment not observed (runtrace shim not
     loaded)` when the shim was not loaded (`finding.json`
-    `runtime_mode.shim_armed`, true only when the fuzz pass produced the
-    runtrace log, which the shim creates as it loads). An installed bhf
+    `runtime_mode.shim_armed`, true only when the fuzz pass's runtrace log
+    holds the `shim_loaded` line the shim writes when it first opens the log,
+    before any event, even one a library's constructor causes). An
+    installed bhf
     without the shim beside it
     can be pointed at one with `BHF_RUNTRACE_SHIM=/path/libbhf_runtrace_shim.so`;
   - reachability: the verdict and what it rests on. A verdict inferred from the
@@ -809,7 +814,13 @@ and explain it — all offline and deterministic (no LLM):
     resolves to `const uint8_t *`) is a read-only byte buffer``); an unproven
     one says when the classifier read the types with their typedefs resolved,
     and a `static` entry says it has internal linkage; an entry with no recorded
-    reachability reads "not assessed". A `Caveat:` line follows when the input
+    reachability reads "not assessed". A registered entry point says which call
+    in its source file registers it ("is passed to `intConnect` in its source
+    file, which registers it as a task, interrupt or callback"), and a channel
+    consumer says what its body reads ("reads a message with `mq_receive`", or
+    "reads memory through a volatile pointer (the memory-mapped register
+    idiom)"); both say "not proven", and a finding recorded before bhf kept
+    that call says the call it matched was not recorded. A `Caveat:` line follows when the input
     is empty or all zero bytes (a real caller may never pass all-zero
     arguments) or the method ran on an object bhf's harness constructed (a
     default constructor, a factory, or decoded constructor arguments, which a

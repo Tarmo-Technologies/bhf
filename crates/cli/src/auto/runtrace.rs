@@ -160,11 +160,56 @@ pub fn parse_log(path: &Path) -> Result<Vec<RuntraceEvent>> {
     Ok(parse_str(&text))
 }
 
+/// The event of the line the runtrace shim writes when it first opens a log
+/// that holds none yet (`{"e":"shim_loaded"}`), ahead of its first event.
+pub const SHIM_LOADED_EVENT: &str = "shim_loaded";
+
+/// How far into a runtrace log [`log_shows_shim_loaded`] looks for the marker.
+const SHIM_MARKER_SCAN_BYTES: u64 = 64 * 1024;
+
+/// Whether `line` is the shim's load marker.
+fn is_shim_loaded_line(line: &str) -> bool {
+    line.contains(SHIM_LOADED_EVENT)
+        && serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value.get("e").and_then(Value::as_str) == Some(SHIM_LOADED_EVENT))
+}
+
+/// Whether the runtrace log at `path` shows that the runtrace shim was loaded
+/// into the run that wrote it: a line among its first 64 KiB is the shim's
+/// load marker. The log's existence proves nothing, because the fuzz driver
+/// opens the same path for its comparison records with or without the shim;
+/// a shim the dynamic loader did not preload, or one from a release that
+/// wrote no marker, counts as not loaded.
+pub fn log_shows_shim_loaded(path: &Path) -> bool {
+    use std::io::{BufRead, Read};
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file.take(SHIM_MARKER_SCAN_BYTES));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        // A line cut off by the scan limit has no newline and is not a marker.
+        if line.last() != Some(&b'\n') {
+            return false;
+        }
+        if is_shim_loaded_line(String::from_utf8_lossy(&line).trim()) {
+            return true;
+        }
+    }
+}
+
 pub fn parse_str(text: &str) -> Vec<RuntraceEvent> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || is_shim_loaded_line(line) {
             continue;
         }
         match parse_line(line) {
@@ -1484,6 +1529,48 @@ pub fn collector_jsonl_from_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shim_load_marker_is_not_an_event() {
+        let events = parse_str(
+            "{\"e\":\"shim_loaded\"}\n{\"e\":\"getenv\",\"n\":\"WIDGET_HOME\",\"r\":null}\n",
+        );
+        assert_eq!(
+            events,
+            vec![RuntraceEvent::EnvVarMissing {
+                api: "getenv".to_owned(),
+                name: "WIDGET_HOME".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn only_the_shim_load_marker_shows_the_shim_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("runtrace.jsonl");
+        assert!(!log_shows_shim_loaded(&log), "a missing log");
+        std::fs::write(&log, b"").unwrap();
+        assert!(!log_shows_shim_loaded(&log), "an empty log");
+        std::fs::write(&log, b"{\"e\":\"cmplog\",\"a\":\"00\",\"b\":\"01\"}\n").unwrap();
+        assert!(!log_shows_shim_loaded(&log), "a log of driver records");
+        std::fs::write(
+            &log,
+            b"{\"e\":\"getenv\",\"n\":\"shim_loaded\",\"r\":null}\n",
+        )
+        .unwrap();
+        assert!(!log_shows_shim_loaded(&log), "the word in another field");
+        std::fs::write(
+            &log,
+            b"{\"e\":\"shim_loaded\"}\n{\"e\":\"cmplog\",\"a\":\"00\",\"b\":\"01\"}\n",
+        )
+        .unwrap();
+        assert!(log_shows_shim_loaded(&log));
+        // A marker beyond the first 64 KiB is not looked for.
+        let mut late = b"{\"e\":\"cmplog\",\"a\":\"00\",\"b\":\"01\"}\n".repeat(4096);
+        late.extend_from_slice(b"{\"e\":\"shim_loaded\"}\n");
+        std::fs::write(&log, &late).unwrap();
+        assert!(!log_shows_shim_loaded(&log));
+    }
 
     #[test]
     fn sink_tracker_bounds_distinct_subjects_and_representative_inputs() {

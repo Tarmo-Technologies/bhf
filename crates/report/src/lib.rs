@@ -3154,6 +3154,8 @@ fn sarif_result(
         "reproAdaOmittedReason": finding.repro_ada_omitted_reason,
         "generatedReproPy": finding.generated_repro_py,
         "actionabilityVerdict": finding.actionability.verdict.as_str(),
+        // Why the verdict is `lab_only` or `blocked`; null for the others.
+        "actionabilityVerdictReason": &finding.actionability.verdict_reason,
         "actionabilityImpact": finding.actionability.impact.as_str(),
         "actionabilityConfidence": finding.actionability.confidence.as_str(),
         "actionabilityEntryPath": &finding.actionability.entry_path,
@@ -6101,6 +6103,55 @@ mod tests {
     /// out-of-bounds READ is not the rule's write CWE); the rule entry keeps
     /// the catalog CWE.
     #[test]
+    fn sarif_result_names_a_lab_only_verdicts_reason() {
+        let root = temp_dir("sarif-verdict-reason");
+        let findings = root.join("findings");
+        let out = root.join("reports");
+        write_finding(
+            &findings.join("F-0001-0a0b0c0d"),
+            json!({
+                "id": "F-0001-0a0b0c0d",
+                "rule_id": "BHF-201",
+                "classification": "unhandled",
+                "harness_id": "H-C0001",
+                "input_reachability": "attacker_reachable",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (READ of size 4)",
+                    "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 9 }],
+                    "access": {
+                        "direction": "read", "size": 4,
+                        "region": { "kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0 },
+                        "alloc_stack": [
+                            { "function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68 },
+                            { "function": "bhf_c_string", "file": "/w/harnesses/H-C0001/bhf_decode.h", "line": 195 },
+                            { "function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 106 }
+                        ]
+                    }
+                }
+            }),
+        );
+        let summary = write_reports(
+            ReportOptions::new(&findings, &out)
+                .with_run_id("verdict-reason")
+                .with_sarif(true),
+        )
+        .unwrap();
+        let sarif: serde_json::Value = serde_json::from_slice(
+            &fs::read(summary.sarif_path.expect("SARIF path is recorded")).unwrap(),
+        )
+        .unwrap();
+        validate_sarif_report(&sarif).unwrap();
+        let properties = &sarif["runs"][0]["results"][0]["properties"];
+        assert_eq!(properties["actionabilityVerdict"], "lab_only");
+        assert_eq!(
+            properties["actionabilityVerdictReason"],
+            "harness_sized_buffer"
+        );
+    }
+
+    #[test]
     fn sarif_result_cwe_is_the_findings_cwe_not_the_rules() {
         let root = temp_dir("sarif-finding-cwe");
         let findings = root.join("findings");
@@ -7497,6 +7548,7 @@ mod tests {
                 prosthetics: actionability::Prosthetics::default(),
                 patch_hints: Vec::new(),
                 next_steps: Vec::new(),
+                verdict_reason: None,
             },
             raw: json!({}),
         }

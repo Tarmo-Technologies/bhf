@@ -223,8 +223,12 @@ the current harness execution ends. Successful `unlink`, `unlinkat`, or
 `remove` events whose path contains a parent-directory segment become
 `file-deletion-runtime` BHF-414 oracle hits. Printf-style format strings observed
 through `printf`, `fprintf`, `dprintf`, `sprintf`, or `snprintf` become
-format-string oracle hits when the format bytes match the current fuzz input
-and contain a conversion marker such as `%x`, `%p`, `%s`, or `%n`. `dlopen`
+format-string oracle hits when the format is fuzz-controlled and contains a
+conversion marker such as `%x`, `%p`, `%s`, or `%n`. A format counts as
+fuzz-controlled when it is not in the program's read-only data (a string
+literal never is, even when the fuzzer put its bytes into the input) and the
+whole format, at least 4 bytes long, occurs verbatim in the current fuzz
+input. `dlopen`
 events for bare names, relative paths, parent-directory paths, temporary
 writable directories, or otherwise non-system absolute library paths become
 `dynamic-library-load-runtime` BHF-413 oracle hits. Native C/C++ assertion

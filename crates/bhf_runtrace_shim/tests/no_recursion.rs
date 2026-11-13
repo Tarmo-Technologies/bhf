@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -48,6 +49,7 @@ fn fresh_shim(profile: &str) -> Option<PathBuf> {
                 "src/dlsym.rs",
                 "src/jsonl.rs",
                 "src/policy.rs",
+                "src/fakes/fuzz_input.rs",
                 "src/fakes/mode.rs",
                 "src/fakes/reporting.rs",
                 "src/symbolizer.rs",
@@ -351,9 +353,11 @@ fn fs_hooks_log_open_close_lifecycle_under_ld_preload() {
     let _ = std::fs::remove_file(&target);
 }
 
-/// The runtrace log is created when the shim loads, so its existence after a
-/// run proves the shim was preloaded, even for a target that touched nothing
-/// the shim records (bhf reports such a run as observed, not as unobserved).
+/// The shim starts the runtrace log with a `shim_loaded` line when it loads, so
+/// that line proves the shim was preloaded, even for a target that touched
+/// nothing the shim records (bhf reports such a run as observed, not as
+/// unobserved). The log's existence proves nothing: the fuzz driver opens the
+/// same path for its comparison records whether or not the shim is loaded.
 #[test]
 fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
     let Some(shim) = shim_so() else {
@@ -385,10 +389,28 @@ fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
         .status()
         .expect("spawn probe");
     assert!(status.success(), "probe exited abnormally: {status:?}");
-    assert!(
-        log.is_file(),
-        "the preloaded shim did not create {}",
-        log.display()
+    let marker = "{\"e\":\"shim_loaded\"}";
+    let text = std::fs::read_to_string(&log)
+        .unwrap_or_else(|e| panic!("the preloaded shim did not create {}: {e}", log.display()));
+    assert_eq!(
+        text.lines().next(),
+        Some(marker),
+        "the shim's log does not start with its load marker:\n{text}"
+    );
+    // A second process appending to the same log does not mark it again.
+    let status = Command::new(&bin)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe");
+    assert!(status.success());
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.lines().filter(|line| *line == marker).count(),
+        1,
+        "a second run marked the log again:\n{text}"
     );
     // Without the shim nothing creates it.
     let unshimmed = dir.join("rt-plain.jsonl");
@@ -398,6 +420,603 @@ fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
         .expect("spawn probe");
     assert!(status.success());
     assert!(!unshimmed.exists());
+    // A log someone else created (the fuzz driver opens it for its comparison
+    // records) gets no marker from a run without the shim.
+    let driver_made = dir.join("rt-driver.jsonl");
+    std::fs::write(&driver_made, b"").unwrap();
+    let status = Command::new(&bin)
+        .env("BHF_CMPLOG", "1")
+        .env("BHF_RUNTRACE_LOG", &driver_made)
+        .status()
+        .expect("spawn probe");
+    assert!(status.success());
+    let text = std::fs::read_to_string(&driver_made).unwrap();
+    assert!(
+        !text.contains("shim_loaded"),
+        "a run without the shim marked the log:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const SHIM_LOADED_LINE: &str = "{\"e\":\"shim_loaded\"}";
+
+/// Build `lib<name>.so` from `src` in `dir`, so a probe can link against it or
+/// preload it.
+fn build_shared_library(cc: &str, dir: &std::path::Path, name: &str, src: &str) -> PathBuf {
+    let c = dir.join(format!("{name}.c"));
+    std::fs::write(&c, src).unwrap();
+    let so = dir.join(format!("lib{name}.so"));
+    let built = Command::new(cc)
+        .args(["-shared", "-fPIC"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&so)
+        .status()
+        .unwrap();
+    assert!(built.success(), "lib{name}.so failed to compile");
+    so
+}
+
+/// A library whose constructor reads an environment variable. glibc runs the
+/// constructors of a program's other libraries, and of every library preloaded
+/// after the shim, before the shim's own, with the shim's hooks already bound.
+const GETENV_IN_CONSTRUCTOR_LIBRARY: &str = r#"
+    #include <stdlib.h>
+    static const char *probe_home;
+    __attribute__((constructor)) static void read_home(void) {
+        probe_home = getenv("PROBE_DEP_HOME");
+    }
+    int probe_dep_ready(void) { return probe_home == 0; }
+"#;
+
+/// Run `bin` with `preload` as `LD_PRELOAD` and `log` as the runtrace log, and
+/// return the log's text.
+fn run_logged(bin: &std::path::Path, preload: &std::ffi::OsStr, log: &std::path::Path) -> String {
+    let status = Command::new(bin)
+        .env("LD_PRELOAD", preload)
+        .env("BHF_RUNTRACE_LOG", log)
+        .env_remove("PROBE_DEP_HOME")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe");
+    assert!(status.success(), "probe exited abnormally: {status:?}");
+    std::fs::read_to_string(log)
+        .unwrap_or_else(|e| panic!("the preloaded shim did not create {}: {e}", log.display()))
+}
+
+/// The log of a run with the shim loaded starts with the load marker even when
+/// a hook fires before the shim's own constructor runs: the shim writes the
+/// marker when it first opens the log, ahead of the event that opened it.
+fn assert_marker_leads(text: &str, early_event: &str) {
+    assert_eq!(
+        text.lines().next(),
+        Some(SHIM_LOADED_LINE),
+        "the shim's log does not start with its load marker:\n{text}"
+    );
+    assert!(
+        text.lines().any(|line| line.contains(early_event)),
+        "the hooked call made before the shim's constructor was not logged:\n{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == SHIM_LOADED_LINE)
+            .count(),
+        1,
+        "the shim marked its log more than once:\n{text}"
+    );
+}
+
+/// A probe linked against a library whose constructor calls `getenv`: that
+/// constructor runs before the shim's, through the shim's `getenv` hook.
+#[test]
+fn the_load_marker_leads_the_log_when_a_linked_library_reads_the_environment_first() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-early-dep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    build_shared_library(cc, &dir, "probedep", GETENV_IN_CONSTRUCTOR_LIBRARY);
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        "int probe_dep_ready(void);\nint main(void) { return probe_dep_ready() ? 0 : 1; }\n",
+    )
+    .unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .arg(format!("-L{}", dir.display()))
+        .arg("-lprobedep")
+        .arg(format!("-Wl,-rpath,{}", dir.display()))
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let log = dir.join("rt.jsonl");
+    let text = run_logged(&bin, shim.as_os_str(), &log);
+    assert_marker_leads(&text, "PROBE_DEP_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// bhf puts its shim first in `LD_PRELOAD`, ahead of any library the run
+/// already preloads; glibc runs that later library's constructor first.
+#[test]
+fn the_load_marker_leads_the_log_when_a_later_preload_reads_the_environment_first() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-early-preload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dep = build_shared_library(cc, &dir, "probedep", GETENV_IN_CONSTRUCTOR_LIBRARY);
+    let src = dir.join("probe.c");
+    std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let mut preload = shim.into_os_string();
+    preload.push(":");
+    preload.push(&dep);
+    let log = dir.join("rt.jsonl");
+    let text = run_logged(&bin, &preload, &log);
+    assert_marker_leads(&text, "PROBE_DEP_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An OpenMP program: libgomp's constructor reads its `OMP_*` settings
+/// through the shim's hooks before the shim's constructor runs.
+#[test]
+fn the_load_marker_leads_the_log_of_an_openmp_program() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-early-omp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        "#include <omp.h>\nint main(void) { return omp_get_max_threads() > 0 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg("-fopenmp")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    if !built.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("skipping: {cc} cannot build an OpenMP program (no libgomp)");
+        return;
+    }
+    let log = dir.join("rt.jsonl");
+    let status = Command::new(&bin)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe");
+    assert!(status.success(), "probe exited abnormally: {status:?}");
+    let text = std::fs::read_to_string(&log)
+        .unwrap_or_else(|e| panic!("the preloaded shim did not create {}: {e}", log.display()));
+    if !text.lines().any(|line| line.contains("\"n\":\"OMP_")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("skipping: this libgomp read no OMP_ variable through the shim:\n{text}");
+        return;
+    }
+    assert_marker_leads(&text, "\"n\":\"OMP_");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A log another writer started (the fuzz driver's comparison records, a
+/// process without the shim) still gets the marker from the first process
+/// that runs with the shim, and only once: a later process finds it.
+#[test]
+fn the_shim_marks_a_log_another_writer_started_once() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-late-mark-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let log = dir.join("rt.jsonl");
+    // More than one read's worth of earlier records, so a marker after them
+    // is not found by a look at the first block alone.
+    let earlier = "{\"e\":\"cmplog\",\"a\":\"00\",\"b\":\"01\"}\n".repeat(200);
+    std::fs::write(&log, &earlier).unwrap();
+    run_logged(&bin, shim.as_os_str(), &log);
+    let text = run_logged(&bin, shim.as_os_str(), &log);
+    assert!(
+        text.starts_with(&earlier),
+        "the earlier records were not kept"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == SHIM_LOADED_LINE)
+            .count(),
+        1,
+        "two runs with the shim left other than one marker:\n{}",
+        &text[earlier.len()..]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Threads of a library constructor, spinning until all are started and then
+/// released at once, whose `getenv` calls are the process's first hooked
+/// calls: each may find the log not yet open.
+const RACING_THREADS_LIBRARY: &str = r#"
+    #include <pthread.h>
+    #include <stdlib.h>
+    #define RACERS 16
+    static int ready, go;
+    static void *race(void *arg) {
+        /* No printf-family call: the shim logs those too. */
+        char name[] = "PROBE_RACE_00";
+        name[11] = (char)('0' + (int)(long)arg / 10);
+        name[12] = (char)('0' + (int)(long)arg % 10);
+        __atomic_add_fetch(&ready, 1, __ATOMIC_ACQ_REL);
+        while (!__atomic_load_n(&go, __ATOMIC_ACQUIRE)) {}
+        (void)getenv(name);
+        return 0;
+    }
+    __attribute__((constructor)) static void start_racers(void) {
+        pthread_t threads[RACERS];
+        long i;
+        /* The shim resolves the real getenv on its first call and logs no
+           BHF_ variable: the racers then go straight to the log. */
+        (void)getenv("BHF_PROBE_WARMUP");
+        for (i = 0; i < RACERS; i++) pthread_create(&threads[i], 0, race, (void *)i);
+        while (__atomic_load_n(&ready, __ATOMIC_ACQUIRE) < RACERS) {}
+        __atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+        for (i = 0; i < RACERS; i++) pthread_join(threads[i], 0);
+    }
+    int probe_race_ready(void) { return 0; }
+"#;
+
+/// The program linked against [`RACING_THREADS_LIBRARY`]: it prints how many
+/// of its descriptors are open on the runtrace log.
+const RACING_THREADS_PROBE: &str = r#"
+    #include <dirent.h>
+    #include <limits.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+    int probe_race_ready(void);
+    int main(void) {
+        char log[PATH_MAX], link[PATH_MAX + 32], target[PATH_MAX];
+        struct dirent *entry;
+        int count = 0;
+        DIR *fds;
+        if (!realpath(getenv("BHF_RUNTRACE_LOG"), log)) return 2;
+        fds = opendir("/proc/self/fd");
+        if (!fds) return 2;
+        while ((entry = readdir(fds)) != 0) {
+            ssize_t n;
+            snprintf(link, sizeof link, "/proc/self/fd/%s", entry->d_name);
+            n = readlink(link, target, sizeof target - 1);
+            if (n < 0) continue;
+            target[n] = 0;
+            if (strcmp(target, log) == 0) count++;
+        }
+        closedir(fds);
+        printf("%d\n", count);
+        return probe_race_ready();
+    }
+"#;
+
+/// How many closes of the watched file the events waiting on the inotify
+/// descriptor `inotify` report. inotify merges an event into an identical one
+/// at the end of its queue, so the watch takes writes too: a write between
+/// two closes keeps them apart.
+fn closes_seen(inotify: i32) -> usize {
+    let mut closes = 0;
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: `buf` is writable for its length.
+        let n = unsafe { libc::read(inotify, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return closes;
+        }
+        let mut at = 0usize;
+        while at + 16 <= n as usize {
+            let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
+            let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
+            if mask & libc::IN_CLOSE != 0 {
+                closes += 1;
+            }
+            at += 16 + len;
+        }
+    }
+}
+
+/// Threads that all make their first hooked call at once may each open the
+/// log; one keeps its descriptor and marks the log, the others close theirs
+/// and write through it. Every thread's event is logged, the log is marked
+/// once, and one descriptor stays open on it. The runs repeat until some are
+/// seen (by their closes of the log) to have raced.
+#[test]
+fn threads_racing_the_first_open_of_the_log_share_one_descriptor() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("racedep.c");
+    std::fs::write(&c, RACING_THREADS_LIBRARY).unwrap();
+    let built = Command::new(cc)
+        .args(["-shared", "-fPIC", "-pthread"])
+        .arg(&c)
+        .arg("-o")
+        .arg(dir.join("libracedep.so"))
+        .status()
+        .unwrap();
+    assert!(built.success(), "libracedep.so failed to compile");
+    let src = dir.join("probe.c");
+    std::fs::write(&src, RACING_THREADS_PROBE).unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .arg(format!("-L{}", dir.display()))
+        .arg("-lracedep")
+        .arg(format!("-Wl,-rpath,{}", dir.display()))
+        .arg("-pthread")
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    // SAFETY: plain syscalls on descriptors this test owns.
+    let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(inotify >= 0, "inotify_init1 failed");
+    let log = dir.join("rt.jsonl");
+    let log_c = std::ffi::CString::new(log.as_os_str().as_encoded_bytes()).unwrap();
+    let mut raced = 0;
+    for _ in 0..50 {
+        std::fs::write(&log, b"").unwrap();
+        // SAFETY: a NUL-terminated path and the descriptor made above.
+        let watch = unsafe {
+            libc::inotify_add_watch(inotify, log_c.as_ptr(), libc::IN_CLOSE | libc::IN_MODIFY)
+        };
+        assert!(watch >= 0, "inotify_add_watch failed");
+        let out = Command::new(&bin)
+            .env("LD_PRELOAD", &shim)
+            .env("BHF_RUNTRACE_LOG", &log)
+            .output()
+            .expect("spawn probe");
+        // The descriptor the process exits with closes once; a thread that
+        // lost the race closed its own before writing through the kept one.
+        let closes = closes_seen(inotify);
+        // SAFETY: as above.
+        unsafe { libc::inotify_rm_watch(inotify, watch) };
+        let _ = closes_seen(inotify);
+        assert!(out.status.success(), "probe exited abnormally: {out:?}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "1",
+            "descriptors open on the log at main ({closes} closes):\n{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| *line == SHIM_LOADED_LINE)
+                .count(),
+            1,
+            "the log is not marked once ({closes} closes):\n{text}"
+        );
+        for racer in 0..16 {
+            let name = format!("\"PROBE_RACE_{racer:02}\"");
+            assert!(
+                text.lines().any(|line| line.contains(&name)),
+                "{name} was not logged ({closes} closes):\n{text}"
+            );
+        }
+        if closes > 1 {
+            raced += 1;
+            if raced == 3 {
+                break;
+            }
+        }
+    }
+    // SAFETY: the descriptor made above.
+    unsafe { libc::close(inotify) };
+    let _ = std::fs::remove_dir_all(&dir);
+    if raced == 0 {
+        eprintln!("skipping the race: no run had a thread lose the first open of the log");
+    }
+}
+
+/// A library whose constructor makes the process's first hooked call, ahead of
+/// the shim's own constructor, through a hook that leaves `errno` to the shim's
+/// log handling: with identity faking on, `getuid` answers without calling
+/// libc, so a changed `errno` is the shim's doing.
+const ERRNO_IN_CONSTRUCTOR_LIBRARY: &str = r#"
+    #include <errno.h>
+    #include <unistd.h>
+    int probe_ctor_errno = -1;
+    __attribute__((constructor)) static void read_uid(void) {
+        errno = 0;
+        (void)getuid();
+        probe_ctor_errno = errno;
+    }
+"#;
+
+/// Run `bin` under the shim with `log` as the runtrace log, bounded so a
+/// shim that blocks on the log fails the test instead of hanging it, and
+/// return its stdout.
+fn run_bounded(bin: &std::path::Path, shim: &std::path::Path, log: &std::path::Path) -> String {
+    let mut child = Command::new(bin)
+        .env("LD_PRELOAD", shim)
+        .env("BHF_RUNTRACE_LOG", log)
+        .env("BHF_FAKE_IDENTITY", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn probe");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "{} hung under the shim with log {}",
+                bin.display(),
+                log.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "probe exited abnormally: {status:?}");
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+    out
+}
+
+/// The shim's handling of its log leaves `errno` as the program had it, as C
+/// requires it to be zero at `main`, even when the log cannot be read back
+/// (a file only writable, a FIFO): looking for an earlier marker in such a
+/// log fails, and that failure must not reach the program, neither at `main`
+/// nor in a library constructor whose hooked call first opened the log.
+#[test]
+fn the_shim_leaves_errno_alone_when_its_log_cannot_be_read_back() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-errno-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain = dir.join("plain");
+    let plain_src = dir.join("plain.c");
+    std::fs::write(
+        &plain_src,
+        "#include <errno.h>\n#include <stdio.h>\n\
+         int main(void) { int at_main = errno; printf(\"%d\\n\", at_main); return 0; }\n",
+    )
+    .unwrap();
+    let built = Command::new(cc)
+        .arg(&plain_src)
+        .arg("-o")
+        .arg(&plain)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    build_shared_library(cc, &dir, "errnodep", ERRNO_IN_CONSTRUCTOR_LIBRARY);
+    let linked = dir.join("linked");
+    let linked_src = dir.join("linked.c");
+    std::fs::write(
+        &linked_src,
+        "#include <errno.h>\n#include <stdio.h>\nextern int probe_ctor_errno;\n\
+         int main(void) { int at_main = errno; printf(\"%d %d\\n\", probe_ctor_errno, at_main); return 0; }\n",
+    )
+    .unwrap();
+    let built = Command::new(cc)
+        .arg(&linked_src)
+        .arg("-o")
+        .arg(&linked)
+        .arg(format!("-L{}", dir.display()))
+        .arg("-lerrnodep")
+        .arg(format!("-Wl,-rpath,{}", dir.display()))
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+
+    // A log only its writer may write: the shim falls back to opening it
+    // write-only, and its look for a marker cannot read it.
+    let write_only = dir.join("write-only.jsonl");
+    std::fs::write(&write_only, b"").unwrap();
+    std::fs::set_permissions(
+        &write_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o200),
+    )
+    .unwrap();
+    if std::fs::File::open(&write_only).is_ok() {
+        eprintln!("skipping the write-only log: this user reads any file");
+    } else {
+        assert_eq!(run_bounded(&plain, &shim, &write_only).trim(), "0");
+        assert_eq!(run_bounded(&linked, &shim, &write_only).trim(), "0 0");
+    }
+
+    // A FIFO, read by another process: it cannot be read at an offset.
+    for bin in [&plain, &linked] {
+        let fifo = dir.join("fifo.jsonl");
+        let _ = std::fs::remove_file(&fifo);
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let reader_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let mut file = std::fs::File::open(&reader_path).unwrap();
+            std::io::Read::read_to_end(&mut file, &mut text).unwrap();
+            text
+        });
+        let out = run_bounded(bin, &shim, &fifo);
+        // Release a reader still waiting for a writer, should the shim not
+        // have opened the FIFO at all.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo);
+        let read = reader.join().unwrap();
+        assert!(
+            String::from_utf8_lossy(&read).contains(SHIM_LOADED_LINE),
+            "the shim wrote no marker into the FIFO"
+        );
+        let expected = if bin == &plain { "0" } else { "0 0" };
+        assert_eq!(out.trim(), expected, "errno changed under a FIFO log");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -763,6 +1382,119 @@ fn fs_hooks_record_path_taint_under_ld_preload() {
         !untainted_line.contains("\"u\":1"),
         "untainted open event must not carry taint: {untainted_line}"
     );
+}
+
+/// A printf format counts as fuzz-controlled only when it is not a literal in
+/// the program's read-only data: a constant format whose bytes the fuzzer put
+/// into the input (a mined dictionary token) is not the input's format, while
+/// a format copied out of the input into the heap is.
+#[test]
+fn format_taint_ignores_literal_formats_found_in_the_input() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-fmt-taint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <stddef.h>
+        extern void bhf_shim_set_fuzz_input(const unsigned char *data, size_t size)
+            __attribute__((weak));
+        int main(void) {
+            const char *input = "A%s%x%x%x\n";
+            if (bhf_shim_set_fuzz_input)
+                bhf_shim_set_fuzz_input((const unsigned char *)input, strlen(input));
+            printf("%s", "x");
+            printf("%x%x%x\n", 1, 2, 3);
+            char *heap = malloc(8);
+            if (!heap) return 1;
+            memcpy(heap, input + 3, 7);
+            heap[7] = '\0';
+            printf(heap, 1, 2, 3);
+            free(heap);
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, vec!["-fno-builtin"])];
+    let asan = dir.join("probe-asan-check");
+    if Command::new("clang")
+        .args(["-fsanitize=address", "-fno-builtin"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&asan)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        builds.push((
+            "clang-asan",
+            "clang",
+            vec!["-fsanitize=address", "-fno-builtin"],
+        ));
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        let log = dir.join(format!("rt-{label}.jsonl"));
+        let output = Command::new(&bin)
+            .env("LD_PRELOAD", &shim)
+            .env("BHF_RUNTRACE_LOG", &log)
+            .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+            .output()
+            .expect("spawn probe");
+        assert!(
+            output.status.success(),
+            "{label} probe exited abnormally: {:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let formats: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("\"e\":\"format\"") && line.contains("\"a\":\"printf\""))
+            .collect();
+        let constant = formats
+            .iter()
+            .find(|line| line.contains("\"f\":\"%s\""))
+            .unwrap_or_else(|| panic!("{label}: no printf event for \"%s\":\n{text}"));
+        assert!(constant.contains("\"u\":0"), "{label}: {constant}");
+        let copies: Vec<&&str> = formats
+            .iter()
+            .filter(|line| line.contains("\"f\":\"%x%x%x\\n\""))
+            .collect();
+        assert_eq!(copies.len(), 2, "{label}: {text}");
+        assert!(
+            copies[0].contains("\"u\":0"),
+            "{label}: the literal format counted as input-controlled: {}",
+            copies[0]
+        );
+        assert!(
+            copies[1].contains("\"u\":1"),
+            "{label}: the heap copy of the input's format was not counted: {}",
+            copies[1]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `fopen`/`fopen64` open the file through a glibc-internal call the `open`

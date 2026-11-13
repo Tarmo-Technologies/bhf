@@ -311,7 +311,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         for line in hexdump(bytes, 6) {
             let _ = writeln!(s, "  {line}");
         }
-        for note in input_origin(work_dir, bytes) {
+        for note in input_origin(work_dir, &f.dir, name, bytes) {
             for (index, line) in wrap(&note, 74).into_iter().enumerate() {
                 let indent = if index == 0 { "  " } else { "    " };
                 let _ = writeln!(s, "{indent}{line}");
@@ -1252,14 +1252,49 @@ fn input_label(finding_dir: &Path, name: &str, len: usize) -> String {
 /// What is known about where the input came from: one of bhf's built-in
 /// starting inputs, or a byte-identical copy of a seed the run listed in
 /// `auto/seeds.json`.
-fn input_origin(work_dir: &Path, bytes: &[u8]) -> Vec<String> {
+/// Notes on where the shown input came from: one of bhf's built-in starting
+/// inputs or a listed seed, byte for byte, which means the crash needed no
+/// mutation. When the shown input is not `testcase.bin` (its minimized form),
+/// `testcase.bin` is checked too and named. The empty and all-zero notes are
+/// about the shown bytes.
+fn input_origin(
+    work_dir: &Path,
+    finding_dir: &Path,
+    shown_name: &str,
+    bytes: &[u8],
+) -> Vec<String> {
     let mut notes = Vec::new();
-    if matches!(bytes, b"" | b"A" | b"AAAAAAAA") {
-        notes.push(
-            "This is one of bhf's built-in starting inputs (empty, \"A\" or \"AAAAAAAA\"): \
-             the crash needed no mutation."
-                .to_owned(),
-        );
+    let seeds = read_json(&crate::auto::seed_manifest::manifest_path(work_dir))
+        .and_then(|manifest| manifest.get("seeds").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    match StartingInput::of(bytes, &seeds) {
+        Some(StartingInput::BuiltIn(_)) => notes.push(format!(
+            "This input ({shown_name}) is one of bhf's built-in starting inputs (empty, \"A\" \
+             or \"AAAAAAAA\"): the crash needed no mutation."
+        )),
+        Some(StartingInput::Seed { source, path }) => notes.push(format!(
+            "This input ({shown_name}) is byte-identical to {source} {path}: the crash needed no \
+             mutation of it."
+        )),
+        None if shown_name != "testcase.bin" => {
+            let found = std::fs::read(finding_dir.join("testcase.bin")).unwrap_or_default();
+            let as_found = "The crashing input as found (testcase.bin)";
+            let shown = "the input shown is its minimized form";
+            match StartingInput::of(&found, &seeds)
+                .filter(|_| finding_dir.join("testcase.bin").is_file())
+            {
+                Some(StartingInput::BuiltIn(which)) => notes.push(format!(
+                    "{as_found} is one of bhf's built-in starting inputs ({which}): the crash \
+                     needed no mutation; {shown}."
+                )),
+                Some(StartingInput::Seed { source, path }) => notes.push(format!(
+                    "{as_found} is byte-identical to {source} {path}: the crash needed no \
+                     mutation of it; {shown}."
+                )),
+                None => {}
+            }
+        }
+        None => {}
     }
     if bytes.is_empty() {
         notes.push(
@@ -1273,38 +1308,51 @@ fn input_origin(work_dir: &Path, bytes: &[u8]) -> Vec<String> {
             "The input is all zero bytes: every argument decoded from it is zero.".to_owned(),
         );
     }
-    let digest = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(bytes);
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
-    let manifest = crate::auto::seed_manifest::manifest_path(work_dir);
-    if let Some(seed) = read_json(&manifest)
-        .as_ref()
-        .and_then(|m| m.get("seeds"))
-        .and_then(Value::as_array)
-        .and_then(|seeds| {
-            seeds
-                .iter()
-                .find(|seed| seed.get("sha256").and_then(Value::as_str) == Some(digest.as_str()))
-                .cloned()
-        })
-    {
-        let source = match seed.get("source").and_then(Value::as_str) {
-            Some("user") => "your seed",
-            _ => "the seed mined from",
-        };
-        let path = seed.get("path").and_then(Value::as_str).unwrap_or("?");
-        notes.push(format!(
-            "This input is byte-identical to {source} {path}: the crash needed no mutation of it."
-        ));
-    }
     notes
+}
+
+/// A starting input of the fuzz pass that an input is byte-identical to.
+enum StartingInput {
+    /// One of [`crate::auto::attempt::BOOTSTRAP_SEEDS`], shown as `empty` or
+    /// quoted.
+    BuiltIn(String),
+    /// A seed of the seed manifest: who supplied it and its path.
+    Seed { source: &'static str, path: String },
+}
+
+impl StartingInput {
+    /// The starting input `bytes` is, if any, checking the built-in inputs
+    /// and then the manifest's `seeds` by sha256.
+    fn of(bytes: &[u8], seeds: &[Value]) -> Option<Self> {
+        if crate::auto::attempt::BOOTSTRAP_SEEDS.contains(&bytes) {
+            return Some(Self::BuiltIn(if bytes.is_empty() {
+                "empty".to_owned()
+            } else {
+                format!("\"{}\"", String::from_utf8_lossy(bytes))
+            }));
+        }
+        let digest = {
+            use sha2::Digest;
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.get("sha256").and_then(Value::as_str) == Some(digest.as_str()))?;
+        Some(Self::Seed {
+            source: match seed.get("source").and_then(Value::as_str) {
+                Some("user") => "your seed",
+                _ => "the seed mined from",
+            },
+            path: seed
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_owned(),
+        })
+    }
 }
 
 /// Comparison evidence for a finding's input, and the environment the
@@ -3007,6 +3055,53 @@ mod tests {
             "{out}"
         );
         assert!(!words.contains("built-in starting inputs"), "{out}");
+
+        // The crash as found was a starting input, and only its minimized
+        // form is shown.
+        std::fs::write(finding.dir.join("testcase.bin"), b"AAAAAAAA").unwrap();
+        std::fs::write(finding.dir.join("min_testcase.bin"), b"AAAAA").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "The crashing input as found (testcase.bin) is one of bhf's built-in starting \
+                 inputs (\"AAAAAAAA\"): the crash needed no mutation; the input shown is its \
+                 minimized form."
+            ),
+            "{out}"
+        );
+        // The same for a crash found as a seed.
+        std::fs::write(finding.dir.join("testcase.bin"), seed).unwrap();
+        std::fs::write(finding.dir.join("min_testcase.bin"), b"<Project/>").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "The crashing input as found (testcase.bin) is byte-identical to the seed mined \
+                 from tests/widget.vcxproj"
+            ),
+            "{out}"
+        );
+        assert!(words.contains("minimized form"), "{out}");
+        assert!(!words.contains("built-in starting inputs"), "{out}");
+        // A shown input that matches names itself, and only once.
+        std::fs::write(finding.dir.join("testcase.bin"), b"AAAAAAAA").unwrap();
+        std::fs::write(finding.dir.join("min_testcase.bin"), b"A").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words
+                .contains("This input (min_testcase.bin) is one of bhf's built-in starting inputs"),
+            "{out}"
+        );
+        assert!(!words.contains("as found (testcase.bin)"), "{out}");
+        // Neither matching: no note.
+        std::fs::write(finding.dir.join("testcase.bin"), b"WIDGET-7").unwrap();
+        std::fs::write(finding.dir.join("min_testcase.bin"), b"WIDG").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!words.contains("built-in starting inputs"), "{out}");
+        assert!(!words.contains("byte-identical"), "{out}");
     }
 
     /// The environment section names where its events come from, and says

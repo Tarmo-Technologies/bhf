@@ -61,6 +61,13 @@ pub struct ReachabilityBasis {
     /// least one parameter's type changed).
     #[serde(default)]
     pub typedefs_resolved: bool,
+    /// For `call_graph_provenance`, what the call-graph scan matched: the
+    /// registrar the entry is passed to (`intConnect`), the receive call or
+    /// method its body makes (`mq_receive`, `take`), or `volatile_pointer`
+    /// for a read through a volatile pointer (the memory-mapped register
+    /// idiom).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 impl ReachabilityBasis {
@@ -88,6 +95,7 @@ impl ReachabilityBasis {
                 .iter()
                 .zip(resolved)
                 .any(|((_, spelled), (_, resolved))| spelled.trim() != resolved.trim()),
+            via: None,
         }
     }
 }
@@ -306,6 +314,19 @@ const CONSUME_METHODS: &[&str] = &[
 pub fn detect_entry_point_provenance(
     source: &str,
 ) -> std::collections::BTreeMap<String, EntryPointProvenance> {
+    detect_entry_point_provenance_with_via(source)
+        .into_iter()
+        .map(|(name, (provenance, _))| (name, provenance))
+        .collect()
+}
+
+/// [`detect_entry_point_provenance`], with what decided each entry: the
+/// registrar callee it is passed to (`intConnect`), the receive call or
+/// method its body makes (`mq_receive`, `take`), or `volatile_pointer` for a
+/// read through a volatile pointer (the memory-mapped register idiom).
+pub fn detect_entry_point_provenance_with_via(
+    source: &str,
+) -> std::collections::BTreeMap<String, (EntryPointProvenance, String)> {
     let mut provenance = std::collections::BTreeMap::new();
     let Ok(graph) = c_parser::analyze_call_graph(source) else {
         return provenance;
@@ -320,30 +341,37 @@ pub fn detect_entry_point_provenance(
         }
         for arg in &site.argument_idents {
             if defined.contains(arg.as_str()) {
-                provenance
-                    .entry(arg.clone())
-                    .or_insert(EntryPointProvenance::RegisteredEntryPoint);
+                provenance.entry(arg.clone()).or_insert((
+                    EntryPointProvenance::RegisteredEntryPoint,
+                    site.registrar.clone(),
+                ));
             }
         }
     }
 
     // A function whose body drains a channel is a consumer. Registration wins on
     // a tie (it is the stronger, event-driven provenance), so only insert where
-    // no registration provenance was recorded.
+    // no registration provenance was recorded. A named receive call is the more
+    // specific evidence, so it is named before a volatile-pointer read.
     for func in &graph.functions {
-        let consumes = func.reads_mmio_register
-            || func
-                .callees
-                .iter()
-                .any(|c| CONSUME_IDENTS.contains(&c.as_str()))
-            || func
-                .method_calls
-                .iter()
-                .any(|m| CONSUME_METHODS.contains(&m.as_str()));
-        if consumes {
+        let via = func
+            .callees
+            .iter()
+            .find(|c| CONSUME_IDENTS.contains(&c.as_str()))
+            .or_else(|| {
+                func.method_calls
+                    .iter()
+                    .find(|m| CONSUME_METHODS.contains(&m.as_str()))
+            })
+            .cloned()
+            .or_else(|| {
+                func.reads_mmio_register
+                    .then(|| "volatile_pointer".to_owned())
+            });
+        if let Some(via) = via {
             provenance
                 .entry(func.name.clone())
-                .or_insert(EntryPointProvenance::ChannelConsumer);
+                .or_insert((EntryPointProvenance::ChannelConsumer, via));
         }
     }
     provenance
@@ -1831,6 +1859,57 @@ mod tests {
         assert!(poll.score > 0, "{poll:?}");
     }
 
+    /// The provenance map names the call or read that decided each entry: the
+    /// registrar a handler is passed to, the receive call a consumer makes,
+    /// or the volatile-pointer read of the memory-mapped register idiom.
+    #[test]
+    fn entry_point_provenance_names_the_call_that_decided_it() {
+        let src = "\
+            #include <stdint.h>\n\
+            void sensor_isr(int vector) { (void)vector; }\n\
+            void install(void) { intConnect((void *)0x40, (VOIDFUNCPTR)sensor_isr, 0); }\n\
+            int drain_queue(int q) {\n\
+            \x20   char frame[64];\n\
+            \x20   return (int)mq_receive(q, frame, sizeof frame, 0);\n\
+            }\n\
+            unsigned poll_status(void) {\n\
+            \x20   volatile uint32_t *reg = (uint32_t *)0x40001000u;\n\
+            \x20   unsigned x = *reg;\n\
+            \x20   return x;\n\
+            }\n";
+        let with_via = detect_entry_point_provenance_with_via(src);
+        assert_eq!(
+            with_via.get("sensor_isr"),
+            Some(&(
+                EntryPointProvenance::RegisteredEntryPoint,
+                "intConnect".to_owned()
+            ))
+        );
+        assert_eq!(
+            with_via.get("drain_queue"),
+            Some(&(
+                EntryPointProvenance::ChannelConsumer,
+                "mq_receive".to_owned()
+            ))
+        );
+        assert_eq!(
+            with_via.get("poll_status"),
+            Some(&(
+                EntryPointProvenance::ChannelConsumer,
+                "volatile_pointer".to_owned()
+            ))
+        );
+        // The plain map is the same verdicts without the call.
+        let plain = detect_entry_point_provenance(src);
+        assert_eq!(
+            plain,
+            with_via
+                .iter()
+                .map(|(name, (provenance, _))| (name.clone(), *provenance))
+                .collect()
+        );
+    }
+
     /// A registered entry point with an opaque `void *arg` (the classic VxWorks
     /// ISR shape) must NOT be buried by the opaque-`void *` demotion — the
     /// registration proves it is a real entry point supplied by the RTOS.
@@ -2473,6 +2552,7 @@ mod tests {
                 spelled_type: Some("const u8_t *".to_owned()),
                 resolved_type: Some("const uint8_t *".to_owned()),
                 typedefs_resolved: true,
+                via: None,
             }
         );
         let (reach, basis) = classify_input_reachability_with_basis(

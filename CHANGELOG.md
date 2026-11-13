@@ -54,6 +54,46 @@
   entry of kind `include_dir`, low confidence, a caveat in every report),
   and a copy of the header in the scanned tree wins over it. A dir named
   with `--extra-include` is not counted.
+- The `no_comparisons` reason of a comparison-evidence capture no longer
+  says the target was built without comparison instrumentation, which bhf
+  does not check. It says the target made no comparison the driver recorded
+  on that input, and counts what the run did record: before the target was
+  entered, in bhf's harness code, and on pointer values.
+- `bhf explain` also says when the crashing input as found (`testcase.bin`)
+  was one of bhf's built-in starting inputs or a listed seed, not only when
+  the input it shows (`min_testcase.bin`) is, and names the file that
+  matched.
+- A `lab_only` or `blocked` verdict now says why: `finding.json`
+  `actionability.verdict_reason`, `findings.json` `verdict_reason` (a key
+  added to v1, optional in the schema), a `verdict_reason` column at the end
+  of `findings.csv`, `verdict lab_only (<reason>)` in `INDEX.md`, and
+  `actionabilityVerdictReason` in SARIF. `reachability.attacker_reachable`
+  stays the entry's signature verdict, so a finding can read `true` there
+  while its verdict is `lab_only` for `harness_sized_buffer`.
+- The reachability statement no longer calls a channel consumer (a function
+  that reads a message queue or a volatile pointer) a registered handler. The
+  C reachability basis records what the call-graph scan matched
+  (`input_reachability_basis.via`: the registrar, the receive call, or
+  `volatile_pointer`), and `bhf explain` names it.
+- `learned_dictionary.txt` no longer keeps a mined dictionary token that the
+  comparison records only ever show as the input side of a comparison (the
+  fuzzer spliced it in). A mined token is kept only where it was a
+  comparison's constant at some site, or where the records cannot tell the
+  input from the constant.
+- A constant printf format such as `"%s"` is no longer reported as a
+  fuzz-controlled format string (BHF-408) because the mined dictionary put
+  its bytes into the input. A format now counts as fuzz-controlled only when
+  it is not in the program's read-only data and the whole format, at least 4
+  bytes long, occurs verbatim in the current input.
+- A native C/C++ fuzz pass no longer counts as run with the runtrace shim
+  just because its runtrace log exists: the fuzz driver creates that log for
+  its comparison records with or without the shim. The shim now writes a
+  `{"e":"shim_loaded"}` line when it first opens the log, before any event,
+  even one a library's constructor causes before the shim's own constructor
+  runs, and only that line sets `runtime_mode.shim_armed` (and the capture
+  replay's `shim_armed`), so a bhf installed without its shim, or a shim the
+  dynamic loader refuses, records the environment as not observed and
+  `bhf explain` says so.
 - Windows: cartography, provenance, the capability profiler and coverage
   replay no longer run a harness through `timeout`, which on Windows is the
   console pause command and ran nothing: cartography mapped no finding and no

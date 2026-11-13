@@ -238,6 +238,7 @@ pub fn from_finding_report(
             detail: str_at(raw, &["confirmation"]),
         },
         verdict: Some(a.verdict.as_str().to_owned()),
+        verdict_reason: a.verdict_reason.clone(),
         location,
         fix_location,
         stack: project_frames(&f.exception, ctx.source_root),
@@ -1318,6 +1319,7 @@ pub fn from_static_value(
             detail: None,
         },
         verdict: None,
+        verdict_reason: None,
         location: Some(location),
         fix_location: None,
         stack: Vec::new(),
@@ -1415,6 +1417,7 @@ pub fn from_sca_value(m: &Value) -> Option<Finding> {
             detail: None,
         },
         verdict: None,
+        verdict_reason: None,
         location: None,
         fix_location: None,
         stack: Vec::new(),
@@ -1913,6 +1916,55 @@ mod tests {
             reachability["reachability_basis"]["resolved_type"],
             "const uint8_t *"
         );
+    }
+
+    /// An overflow of a buffer bhf's harness sized is `lab_only` for a reason
+    /// the results finding names, while the entry's own reachability (from
+    /// its signature) still says it takes input.
+    #[test]
+    fn a_lab_only_finding_names_its_verdict_reason() {
+        let mut raw = asan_record();
+        raw["input_reachability"] = json!("attacker_reachable");
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 4,
+            "region": {"kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0},
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "bhf_c_string", "file": "/w/harnesses/H-C-parse/bhf_decode.h", "line": 195},
+                {"function": "bhf_run_one", "file": "/w/harnesses/H-C-parse/main.c", "line": 106}
+            ]
+        });
+        let finding = normalize(raw, None);
+        assert_eq!(finding.verdict.as_deref(), Some("lab_only"));
+        assert_eq!(
+            finding.verdict_reason.as_deref(),
+            Some("harness_sized_buffer")
+        );
+        let reachability = finding.reachability.expect("an entry path");
+        assert_eq!(reachability["attacker_reachable"], true);
+        // A verdict with no demoting reason has none.
+        let finding = normalize(asan_record(), None);
+        assert_ne!(finding.verdict.as_deref(), Some("lab_only"));
+        assert_eq!(finding.verdict_reason, None);
+    }
+
+    /// The schema lists exactly the reason codes the verdict classifier gives.
+    #[test]
+    fn the_schema_lists_every_verdict_reason() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/bhf.findings.v1.schema.json"))
+                .unwrap();
+        let listed: Vec<&str> = schema["$defs"]["finding"]["properties"]["verdict_reason"]["enum"]
+            .as_array()
+            .expect("an enum of codes")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        let codes: Vec<&str> = actionability::VERDICT_REASONS
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        assert_eq!(listed, codes);
     }
 
     /// A finding whose input is all zero bytes, or whose method ran on an

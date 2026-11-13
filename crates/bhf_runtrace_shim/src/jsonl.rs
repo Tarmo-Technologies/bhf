@@ -53,11 +53,24 @@ pub fn emit_raw(line: &[u8]) {
     }
 }
 
-/// Open (and so create) the runtrace log as soon as the shim is loaded. bhf
-/// removes the log before a run and reads its existence afterwards as proof
-/// that the shim was preloaded: a run whose target touched nothing the shim
-/// records still leaves an empty log, while a harness the dynamic loader could
-/// not preload the shim into (a path `LD_PRELOAD` splits) leaves none.
+/// The event of the line the shim starts its writes to a runtrace log with.
+pub const SHIM_LOADED_EVENT: &str = "shim_loaded";
+
+/// The whole marker line, `SHIM_LOADED_EVENT` as a runtrace event.
+const SHIM_LOADED_LINE: &[u8] = b"{\"e\":\"shim_loaded\"}\n";
+
+/// How far into the log the shim looks for a marker an earlier process wrote.
+/// bhf looks for it as far, so a marker the shim finds there is one bhf finds.
+const MARKER_SCAN_BYTES: usize = 64 * 1024;
+
+/// Open the runtrace log as soon as the shim is loaded, so a run whose target
+/// touches nothing the shim records still gets the load marker that
+/// [`ensure_fd`] writes. bhf removes the log before a run and reads that line
+/// afterwards as proof that the shim was preloaded; a harness the dynamic
+/// loader did not preload the shim into (a path `LD_PRELOAD` splits, a library
+/// it refuses to load) leaves none. The log's existence proves nothing: the
+/// fuzz driver opens the same path for its comparison records whether or not
+/// the shim is loaded.
 #[used]
 #[link_section = ".init_array"]
 static OPEN_LOG_AT_LOAD: extern "C" fn() = open_log_at_load;
@@ -66,15 +79,104 @@ extern "C" fn open_log_at_load() {
     // A hook guard, so the `open` of the log (which may bind to the shim's own
     // `open` hook) is not itself recorded.
     if let Some(_guard) = crate::reentrancy::HookGuard::acquire() {
-        let _ = ensure_fd();
+        ensure_fd();
     }
 }
 
+/// Whether the log behind `fd` already holds the load marker as a line within
+/// its first `MARKER_SCAN_BYTES`, written by another process with the shim (an
+/// exec'd child of the target, an earlier run appending to the same log).
+/// False when the log cannot be read. One stack buffer and `pread`, no heap.
+fn log_holds_marker(fd: i32) -> bool {
+    let mut buf = [0u8; EVENT_BUFFER_SIZE];
+    // Bytes carried into the next read, so a marker split across two reads is
+    // still seen whole, together with the byte before it.
+    let carry = SHIM_LOADED_LINE.len();
+    let mut held = 0usize;
+    let mut buf_starts_file = true;
+    let mut offset = 0usize;
+    while offset < MARKER_SCAN_BYTES {
+        let want = (buf.len() - held).min(MARKER_SCAN_BYTES - offset);
+        // SAFETY: the destination is the unused tail of `buf`, at least
+        // `want` bytes long.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[held..].as_mut_ptr().cast(),
+                want,
+                offset as libc::off_t,
+            )
+        };
+        if n <= 0 {
+            return false;
+        }
+        offset += n as usize;
+        let filled = held + n as usize;
+        if holds_marker_line(&buf[..filled], buf_starts_file) {
+            return true;
+        }
+        if filled > carry {
+            buf.copy_within(filled - carry..filled, 0);
+            held = carry;
+            buf_starts_file = false;
+        } else {
+            held = filled;
+        }
+    }
+    false
+}
+
+/// Whether `bytes` holds the marker line at the start of a line: right after a
+/// newline, or at index 0 when `bytes` starts the file. A marker at index 0 of
+/// a later window lies wholly in the previous one, where it was checked
+/// together with the byte before it.
+fn holds_marker_line(bytes: &[u8], starts_file: bool) -> bool {
+    bytes
+        .windows(SHIM_LOADED_LINE.len())
+        .enumerate()
+        .any(|(at, window)| {
+            window == SHIM_LOADED_LINE
+                && if at == 0 {
+                    starts_file
+                } else {
+                    bytes[at - 1] == b'\n'
+                }
+        })
+}
+
+/// Open the log with read access too, so [`log_holds_marker`] can look into
+/// it; a log that is only writable is opened write-only.
+fn open_log(path: &CString) -> i32 {
+    let flags = libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC;
+    // SAFETY: `path` is a NUL-terminated C string.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | flags, 0o644) };
+    if fd >= 0 {
+        return fd;
+    }
+    // SAFETY: as above.
+    unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | flags, 0o644) }
+}
+
+/// The log fd, opened on the first call in this process. That first open
+/// writes the load marker, unless the log already holds one, before the event
+/// that caused the open: glibc runs the constructors of a program's other
+/// libraries, and of any library preloaded after the shim, before the shim's
+/// own, with the shim's hooks already bound, so a hooked call there (libgomp
+/// and GLib read their settings with `getenv`) can open the log before the
+/// shim's constructor runs. A forked child inherits the open fd and writes no
+/// second marker; an exec'd one finds the marker already in the log. Two
+/// processes starting at the same moment may both write it, which consumers
+/// tolerate.
 fn ensure_fd() -> i32 {
     let cached = LOG_FD.load(Ordering::Relaxed);
     if cached != FD_UNINITIALIZED {
         return cached;
     }
+    // Opening the log and looking into it may fail on the way (a log only
+    // writable fails the read-write open and then `pread`, a FIFO fails
+    // `pread`), and the caller may be the shim's constructor or a hook that
+    // leaves `errno` alone: the program must see the `errno` it had.
+    let _errno = ErrnoKept::now();
     // Open the log file. Use libc directly so we don't accidentally
     // wind up inside our own hooked open() (which would recurse).
     let path = match std::env::var_os("BHF_RUNTRACE_LOG") {
@@ -104,20 +206,43 @@ fn ensure_fd() -> i32 {
             return FD_DISABLED;
         }
     };
-    // O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC; mode 0644
-    let fd = unsafe {
-        libc::open(
-            path_cstr.as_ptr(),
-            libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC,
-            0o644,
-        )
-    };
+    let fd = open_log(&path_cstr);
     if fd < 0 {
         LOG_FD.store(FD_DISABLED, Ordering::Relaxed);
         return FD_DISABLED;
     }
-    LOG_FD.store(fd, Ordering::Relaxed);
+    // Two threads may both get here first; the one that stores its fd marks
+    // the log, the other closes its own and uses the stored one.
+    if let Err(stored) =
+        LOG_FD.compare_exchange(FD_UNINITIALIZED, fd, Ordering::AcqRel, Ordering::Acquire)
+    {
+        // SAFETY: `fd` is this call's own, unshared descriptor.
+        unsafe {
+            libc::close(fd);
+        }
+        return stored;
+    }
+    if !log_holds_marker(fd) {
+        emit_raw(SHIM_LOADED_LINE);
+    }
     fd
+}
+
+/// The calling thread's `errno`, put back when this is dropped.
+struct ErrnoKept(libc::c_int);
+
+impl ErrnoKept {
+    fn now() -> Self {
+        // SAFETY: `__errno_location` returns the calling thread's errno slot.
+        Self(unsafe { *libc::__errno_location() })
+    }
+}
+
+impl Drop for ErrnoKept {
+    fn drop(&mut self) {
+        // SAFETY: as in `now`.
+        unsafe { *libc::__errno_location() = self.0 };
+    }
 }
 
 /// True when THIS process is a crash-symbolizer helper the sanitizer spawned
@@ -340,6 +465,65 @@ mod tests {
         assert!(!basename_is_symbolizer(b"my_target_fuzzer"));
         assert!(!basename_is_symbolizer(b"parse"));
         assert!(!basename_is_symbolizer(b""));
+    }
+
+    /// Whether the shim would find a marker in a log holding `bytes`.
+    fn log_with(bytes: &[u8]) -> bool {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!(
+            "bhf-shim-marker-scan-{}-{}",
+            std::process::id(),
+            bytes.len()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let found = log_holds_marker(file.as_raw_fd());
+        let _ = std::fs::remove_file(&path);
+        found
+    }
+
+    #[test]
+    fn a_marker_is_found_as_a_whole_line_within_the_scanned_window() {
+        let mut marker = Builder::new(SHIM_LOADED_EVENT.as_bytes());
+        marker.write_byte(b'}');
+        marker.write_byte(b'\n');
+        assert_eq!(&marker.buf[..marker.len], SHIM_LOADED_LINE);
+
+        let record = b"{\"e\":\"cmplog\",\"a\":\"00\",\"b\":\"01\"}\n";
+        assert!(!log_with(b""), "an empty log");
+        assert!(!log_with(record), "a log of other records");
+        assert!(log_with(SHIM_LOADED_LINE), "a log the marker starts");
+        assert!(
+            log_with(&[&record[..], SHIM_LOADED_LINE].concat()),
+            "a marker after another record"
+        );
+        assert!(
+            !log_with(&[b"{\"x\":1}".as_slice(), SHIM_LOADED_LINE].concat()),
+            "the marker's bytes in the middle of a line"
+        );
+        assert!(
+            !log_with(&SHIM_LOADED_LINE[..SHIM_LOADED_LINE.len() - 1]),
+            "a marker without its newline"
+        );
+        // A marker split across two reads, at every offset around the edge.
+        for split in 0..=SHIM_LOADED_LINE.len() + 1 {
+            let mut log = vec![b' '; EVENT_BUFFER_SIZE - split - 1];
+            log.push(b'\n');
+            log.extend_from_slice(SHIM_LOADED_LINE);
+            assert!(
+                log_with(&log),
+                "a marker split {split} bytes before a read's end"
+            );
+        }
+        // The scan covers the window bhf reads, and no further.
+        let mut last = vec![b' '; MARKER_SCAN_BYTES - SHIM_LOADED_LINE.len() - 1];
+        last.push(b'\n');
+        last.extend_from_slice(SHIM_LOADED_LINE);
+        assert!(log_with(&last), "a marker that ends the window");
+        let mut beyond = vec![b' '; MARKER_SCAN_BYTES - SHIM_LOADED_LINE.len()];
+        beyond.push(b'\n');
+        beyond.extend_from_slice(SHIM_LOADED_LINE);
+        assert!(!log_with(&beyond), "a marker past the window");
     }
 
     #[test]

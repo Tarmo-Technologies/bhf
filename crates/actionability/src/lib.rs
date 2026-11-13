@@ -249,6 +249,10 @@ pub struct ActionabilityRecord {
     pub patch_hints: Vec<PatchHint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next_steps: Vec<String>,
+    /// Why the verdict is `lab_only` or `blocked`: one of the codes in
+    /// [`VERDICT_REASONS`]. `None` for the other verdicts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -277,7 +281,7 @@ pub fn backfill_actionability(
         fix_location.as_ref(),
         entry_path.as_ref(),
     );
-    let verdict = classify_verdict(
+    let (verdict, verdict_reason) = classify_verdict_with_reason(
         raw,
         entry_path.as_ref(),
         fix_location.as_ref(),
@@ -306,6 +310,7 @@ pub fn backfill_actionability(
         prosthetics,
         patch_hints,
         next_steps,
+        verdict_reason: verdict_reason.map(str::to_owned),
     }
 }
 
@@ -316,11 +321,73 @@ pub fn classify_verdict(
     replay: Option<&ReplayEvidence>,
     prosthetics: &Prosthetics,
 ) -> Verdict {
+    classify_verdict_with_reason(raw, entry_path, fix_location, replay, prosthetics).0
+}
+
+/// The reason codes [`classify_verdict_with_reason`] gives a `lab_only` or
+/// `blocked` verdict, each with what it means.
+pub const VERDICT_REASONS: &[(&str, &str)] = &[
+    (
+        "stubbed_value",
+        "the crash needed a value a build-recovery stub, mock or fake supplied",
+    ),
+    (
+        "missing_resource",
+        "the run was blocked by a resource it could not find",
+    ),
+    (
+        "allocator_only_leak",
+        "a leak report with no frame of the target, only allocator frames",
+    ),
+    (
+        "contract_assertion",
+        "a contract assertion the generated harness cannot satisfy",
+    ),
+    (
+        "short_slice_precondition",
+        "a fixed-width read of a slice shorter than the entry documents",
+    ),
+    (
+        "harness_cleanup",
+        "a fault in the generated harness's own cleanup",
+    ),
+    (
+        "must_panic",
+        "a `Must`-style function that panics by design",
+    ),
+    (
+        "enum_domain_precondition",
+        "an assertion on an enum value outside its declared domain",
+    ),
+    (
+        "harness_sized_buffer",
+        "an overflow of a buffer the generated harness sized for a pointer parameter it \
+         passes without a length",
+    ),
+    (
+        "entry_not_input",
+        "the fuzzed entry's signature does not take input (an internal helper or output \
+         serializer the harness drove directly)",
+    ),
+];
+
+/// A rule that demotes a finding to `lab_only`, with its reason code.
+type DemotingRule = (fn(&Value) -> bool, &'static str);
+
+/// [`classify_verdict`], with the reason code of a `lab_only` or `blocked`
+/// verdict (one of [`VERDICT_REASONS`]); `None` for the other verdicts.
+pub fn classify_verdict_with_reason(
+    raw: &Value,
+    entry_path: Option<&EntryPath>,
+    fix_location: Option<&FixLocation>,
+    replay: Option<&ReplayEvidence>,
+    prosthetics: &Prosthetics,
+) -> (Verdict, Option<&'static str>) {
     if prosthetics.used {
-        return Verdict::LabOnly;
+        return (Verdict::LabOnly, Some("stubbed_value"));
     }
     if has_blocking_resource_evidence(raw) {
-        return Verdict::Blocked;
+        return (Verdict::Blocked, Some("missing_resource"));
     }
     // Harness-quality false-positive classes: a LeakSanitizer report with no
     // target frame (G5), a relational `assert!` contract panic the auto-harness
@@ -328,15 +395,20 @@ pub fn classify_verdict(
     // (byteorder-style documented length precondition, #467). Reproducible in the
     // lab but not an attacker-reachable bug — demote so they don't read as real
     // findings (still surfaced, not dropped).
-    if is_rust_alloc_only_leak(raw)
-        || is_relational_contract_panic(raw)
-        || is_fixed_width_slice_read_panic(raw)
-        || is_harness_cleanup_artifact(raw)
-        || is_go_must_panic(raw)
-        || is_native_assertion_enum_domain_precondition(raw)
-        || is_harness_sized_buffer_overflow(raw)
-    {
-        return Verdict::LabOnly;
+    let demoting: [DemotingRule; 7] = [
+        (is_rust_alloc_only_leak, "allocator_only_leak"),
+        (is_relational_contract_panic, "contract_assertion"),
+        (is_fixed_width_slice_read_panic, "short_slice_precondition"),
+        (is_harness_cleanup_artifact, "harness_cleanup"),
+        (is_go_must_panic, "must_panic"),
+        (
+            is_native_assertion_enum_domain_precondition,
+            "enum_domain_precondition",
+        ),
+        (is_harness_sized_buffer_overflow, "harness_sized_buffer"),
+    ];
+    if let Some((_, reason)) = demoting.iter().find(|(applies, _)| applies(raw)) {
+        return (Verdict::LabOnly, Some(reason));
     }
     let has_failure = string_at(raw, &["rule_id"]).is_some()
         || string_at(raw, &["signature"]).is_some()
@@ -352,14 +424,14 @@ pub fn classify_verdict(
         // Unknown reachability (`None`, e.g. Ada / legacy findings) keeps the
         // prior behavior — we only downgrade on a definite unproven signal.
         if entry_path.is_some_and(|entry| entry.attacker_reachable == Some(false)) {
-            return Verdict::LabOnly;
+            return (Verdict::LabOnly, Some("entry_not_input"));
         }
         if reproduced && has_source_fix {
-            return Verdict::RealReachable;
+            return (Verdict::RealReachable, None);
         }
-        return Verdict::LikelyReachable;
+        return (Verdict::LikelyReachable, None);
     }
-    Verdict::Unknown
+    (Verdict::Unknown, None)
 }
 
 pub fn select_fix_location(raw: &Value, finding_json_path: Option<&str>) -> Option<FixLocation> {
@@ -733,11 +805,26 @@ pub fn existing_actionability_or_backfill(
                     record.prosthetics = raw_prosthetics;
                 }
                 record.verdict = Verdict::LabOnly;
+                record.verdict_reason = Some("stubbed_value".to_owned());
                 record.next_steps = next_steps_for(
                     record.verdict,
                     record.fix_location.as_ref(),
                     &record.prosthetics,
                 );
+            }
+            // A record stored before the reason was kept: the reason of the
+            // recomputed verdict, when that is the stored verdict.
+            if record.verdict_reason.is_none() {
+                let (verdict, reason) = classify_verdict_with_reason(
+                    raw,
+                    record.entry_path.as_ref(),
+                    record.fix_location.as_ref(),
+                    record.replay.as_ref(),
+                    &record.prosthetics,
+                );
+                if verdict == record.verdict {
+                    record.verdict_reason = reason.map(str::to_owned);
+                }
             }
             return record;
         }
@@ -2171,10 +2258,44 @@ pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
                 "input reached {entry} through a virtualized IPC channel, so likely reachable \
                  from input; not proven (attacker control depends on who can write to that channel)"
             ),
-            Some("registered_entry_point" | "channel_consumer") => format!(
-                "{entry} is registered as a task, interrupt or message handler, so likely \
-                 reachable from input; not proven (attacker control depends on that channel)"
-            ),
+            Some("registered_entry_point") => {
+                match basis.as_ref().and_then(|basis| basis.via.as_deref()) {
+                    Some(via) => format!(
+                        "{entry} is passed to `{via}` in its source file, which registers it as a \
+                         task, interrupt or callback, so it likely runs on event-supplied data; \
+                         not proven (attacker control depends on the event that triggers it)"
+                    ),
+                    None => format!(
+                        "{entry} is registered as a task, interrupt or callback (bhf's call-graph \
+                         scan of its source; the call it matched was not recorded), so it likely \
+                         runs on event-supplied data; not proven (attacker control depends on the \
+                         event that triggers it)"
+                    ),
+                }
+            }
+            Some("channel_consumer") => {
+                match basis.as_ref().and_then(|basis| basis.via.as_deref()) {
+                    Some(via) => {
+                        let what = if via == "volatile_pointer" {
+                            "memory through a volatile pointer (the memory-mapped register idiom)"
+                                .to_owned()
+                        } else {
+                            format!("a message with `{via}`")
+                        };
+                        format!(
+                            "{entry} reads {what} in its body, so it likely consumes that \
+                             channel's data; not proven (attacker control depends on who writes \
+                             to it)"
+                        )
+                    }
+                    None => format!(
+                        "{entry} reads a message queue, bus or device register (bhf's call-graph \
+                         scan of its source; the call it matched was not recorded), so it likely \
+                         consumes that channel's data; not proven (attacker control depends on \
+                         who writes to it)"
+                    ),
+                }
+            }
             _ => format!(
                 "reachability not assessed: nothing records how input reaches {entry}; the \
                  crash reproduces through bhf's harness, which calls it directly"
@@ -2294,6 +2415,9 @@ struct ReachabilityBasisText {
     spelled_type: Option<String>,
     resolved_type: Option<String>,
     typedefs_resolved: bool,
+    /// What a `call_graph_provenance` scan matched (a registrar, a receive
+    /// call, or `volatile_pointer`).
+    via: Option<String>,
 }
 
 impl ReachabilityBasisText {
@@ -2311,6 +2435,7 @@ impl ReachabilityBasisText {
                 .get("typedefs_resolved")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            via: string_at(basis, &["via"]).filter(|via| !via.is_empty()),
         })
     }
 

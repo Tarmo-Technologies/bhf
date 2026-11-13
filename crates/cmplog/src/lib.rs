@@ -75,10 +75,15 @@ impl CmpLog {
     /// those values met there: a constant is compared with input after input,
     /// while each input meets only the few constants it is checked against
     /// (one at a plain check, every entry of a keyword table at a lookup).
-    /// When neither side has met more, neither counts. Entries with an
-    /// [`UNKNOWN_SITE`] (the runtrace shim's, an older driver's) cannot tell
-    /// one site from another, so they only confirm tokens of `known` (the
-    /// harness's mined dictionary); any operand `known` lists is kept.
+    /// When neither side has met more, neither counts. A token of `known`
+    /// (the harness's mined dictionary) is kept with less evidence, but only
+    /// where the records cannot show it to be the input: it is an operand of
+    /// an entry with an [`UNKNOWN_SITE`] (the runtrace shim's, an older
+    /// driver's, which cannot tell one site from another) or of an entry
+    /// comparing a value with itself, or at some site it met at least as many
+    /// distinct values as any value it met there. A known token that was only
+    /// ever the side with fewer partners (the fuzzer spliced it into the
+    /// input) is dropped.
     /// Strongest evidence first (most distinct values compared against);
     /// a token that is a one-byte edit of a token kept with more evidence is
     /// dropped. A fuzz run compares a constant with many mutated inputs, so
@@ -95,6 +100,8 @@ impl CmpLog {
         type Partners<'a> = BTreeMap<&'a [u8], BTreeSet<&'a [u8]>>;
         let mut sites: BTreeMap<(u64, u8), Partners<'_>> = BTreeMap::new();
         let mut first_seen: BTreeMap<&[u8], usize> = BTreeMap::new();
+        // Operands of entries that cannot tell the input from the constant.
+        let mut ambiguous: BTreeSet<&[u8]> = BTreeSet::new();
         for (index, entry) in self.entries.iter().enumerate() {
             let (a, b) = (entry.operand_a.as_slice(), entry.operand_b.as_slice());
             for operand in [a, b] {
@@ -102,6 +109,8 @@ impl CmpLog {
             }
             // An input equal to the constant says nothing about which is which.
             if entry.site_id & UNKNOWN_SITE != 0 || a == b {
+                ambiguous.insert(a);
+                ambiguous.insert(b);
                 continue;
             }
             let partners = sites
@@ -110,8 +119,10 @@ impl CmpLog {
             partners.entry(a).or_default().insert(b);
             partners.entry(b).or_default().insert(a);
         }
-        // Each constant with the number of distinct operands it met.
+        // Each constant with the number of distinct operands it met, and the
+        // operands that, at some site, no partner out-met.
         let mut evidence: BTreeMap<&[u8], usize> = BTreeMap::new();
+        let mut undominated: BTreeSet<&[u8]> = BTreeSet::new();
         for partners in sites.values() {
             for (value, met) in partners {
                 let most_met_by_a_partner = met
@@ -119,6 +130,9 @@ impl CmpLog {
                     .map(|other| partners.get(other).map_or(0, BTreeSet::len))
                     .max()
                     .unwrap_or(0);
+                if met.len() >= most_met_by_a_partner {
+                    undominated.insert(*value);
+                }
                 if met.len() >= 2 && met.len() > most_met_by_a_partner {
                     let count = evidence.entry(*value).or_default();
                     *count = (*count).max(met.len());
@@ -127,7 +141,7 @@ impl CmpLog {
         }
         let known: BTreeSet<&[u8]> = known.iter().map(Vec::as_slice).collect();
         for value in first_seen.keys() {
-            if known.contains(value) {
+            if known.contains(value) && (ambiguous.contains(value) || undominated.contains(value)) {
                 evidence.entry(*value).or_insert(1);
             }
         }
@@ -480,6 +494,43 @@ not-json-just-noise\n\
     /// Records without a site (the runtrace shim's, an older driver's) cannot
     /// tell one comparison from another: whatever the operands met, they only
     /// confirm tokens the mined dictionary lists.
+    #[test]
+    fn a_known_token_compared_only_as_the_input_is_not_kept() {
+        let mut log = CmpLog::new();
+        for input in [&b"MAGC"[..], b"4096", b"zz", b"\x02"] {
+            log.record(entry(0x10, input, b"encoding=utf8"));
+        }
+        let known = [
+            b"MAGC".to_vec(),
+            b"4096".to_vec(),
+            b"\x02".to_vec(),
+            b"encoding=utf8".to_vec(),
+        ];
+        assert_eq!(
+            log.constant_operands(&known),
+            vec![b"encoding=utf8".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_known_token_that_is_a_constant_somewhere_is_kept_once() {
+        let mut log = CmpLog::new();
+        // The constant of the check at 0x10 ...
+        log.record(entry(0x10, b"aaaa", b"KEY1"));
+        log.record(entry(0x10, b"bbbb", b"KEY1"));
+        // ... is the input of the lookup at 0x20.
+        for input in [&b"KEY1"[..], b"cccc", b"dddd"] {
+            log.record(entry(0x20, input, b"LIST"));
+        }
+        // An input equal to the constant cannot tell which side is which.
+        log.record(entry(0x30, b"SAME", b"SAME"));
+        let known = [b"KEY1".to_vec(), b"SAME".to_vec(), b"cccc".to_vec()];
+        assert_eq!(
+            log.constant_operands(&known),
+            vec![b"LIST".to_vec(), b"KEY1".to_vec(), b"SAME".to_vec()]
+        );
+    }
+
     #[test]
     fn records_without_a_site_only_confirm_known_tokens() {
         let mut log = CmpLog::new();

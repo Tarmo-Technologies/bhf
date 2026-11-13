@@ -211,6 +211,12 @@ pub struct Finding {
     pub cwe: Vec<u32>,
     pub confirmation: Confirmation,
     pub verdict: Option<String>,
+    /// Why `verdict` is `lab_only` or `blocked` (`harness_sized_buffer`,
+    /// `stubbed_value`, ...), `None` for the other verdicts. Added after the
+    /// first v1 release: `#[serde(default)]` keeps documents written before
+    /// it readable.
+    #[serde(default)]
+    pub verdict_reason: Option<String>,
     pub location: Option<Location>,
     pub fix_location: Option<Location>,
     pub stack: Vec<Frame>,

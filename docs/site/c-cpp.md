@@ -840,7 +840,9 @@ observed through `system` or `popen` are promoted when they contain
 command-injection
 metacharacters. Printf-style format strings observed through `printf`,
 `fprintf`, `dprintf`, `sprintf`, or `snprintf` are promoted when the format
-bytes match the current fuzz input and contain a conversion marker. The same
+is not a literal in the program's read-only data, the whole format, at least
+4 bytes long, occurs verbatim in the current fuzz input, and it contains a
+conversion marker. The same
 per-input runtrace stream now reports audited file descriptors that are opened
 and not closed before the harness execution exits. Successful `unlink`,
 `unlinkat`, or `remove` calls with parent-directory paths promote to

@@ -253,7 +253,10 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             md_text(&rep.confidence.level),
             rep.verdict
                 .as_deref()
-                .map(|v| format!(" · verdict {}", md_text(v)))
+                .map(|v| match rep.verdict_reason.as_deref() {
+                    Some(reason) => format!(" · verdict {} ({})", md_text(v), md_text(reason)),
+                    None => format!(" · verdict {}", md_text(v)),
+                })
                 .unwrap_or_default()
         );
         let _ = writeln!(
@@ -707,5 +710,21 @@ mod tests {
         let md = render_index(&doc, &IndexContext::default());
         assert!(md.contains(r"high\`\<b\>"), "{md}");
         assert!(md.contains(r"verdict real\`\<i\>"), "{md}");
+    }
+
+    #[test]
+    fn a_verdict_shows_its_reason() {
+        let mut doc = example();
+        doc.findings[0].verdict = Some("lab_only".to_owned());
+        doc.findings[0].verdict_reason = Some("harness_sized_buffer".to_owned());
+        let md = render_index(&doc, &IndexContext::default());
+        // Markdown-escaped, it renders as `verdict lab_only (harness_sized_buffer)`.
+        assert!(
+            md.contains(r"verdict lab\_only (harness\_sized\_buffer)"),
+            "{md}"
+        );
+        doc.findings[0].verdict_reason = None;
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(md.contains("verdict lab\\_only\n"), "{md}");
     }
 }

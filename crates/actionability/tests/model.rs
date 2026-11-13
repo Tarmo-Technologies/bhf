@@ -142,6 +142,7 @@ fn serializes_actionability_record_in_spec_shape() {
         prosthetics: Prosthetics::default(),
         patch_hints: Vec::new(),
         next_steps: Vec::new(),
+        verdict_reason: None,
     };
 
     let value = serde_json::to_value(record).unwrap();
@@ -637,4 +638,279 @@ fn wild_address_segv_is_not_a_null_dereference() {
         backfill_actionability(RunMode::Reporting, &null, None).cwe,
         ["CWE-476"]
     );
+}
+
+/// The reachability of an event-driven entry says what the call-graph scan
+/// matched: the registrar a handler is passed to, or the channel a consumer
+/// reads, and that the match was not recorded for an older finding.
+#[test]
+fn channel_consumer_reachability_names_its_basis() {
+    let statement = |label: &str, basis: serde_json::Value| {
+        let raw = json!({
+            "harness_id": "H-C0001",
+            "actionability": { "verdict": "likely_reachable" },
+            "input_reachability": label,
+            "input_reachability_basis": basis,
+        });
+        actionability::reachability_statement(&raw, Some("poll_status"))
+    };
+    let mmio = statement(
+        "channel_consumer",
+        json!({"rule": "call_graph_provenance", "via": "volatile_pointer"}),
+    );
+    assert!(mmio.contains("volatile pointer"), "{mmio}");
+    assert!(!mmio.contains("registered"), "{mmio}");
+    assert!(mmio.contains("not proven"), "{mmio}");
+    let queue = statement(
+        "channel_consumer",
+        json!({"rule": "call_graph_provenance", "via": "mq_receive"}),
+    );
+    assert!(queue.contains("a message with `mq_receive`"), "{queue}");
+    assert!(!queue.contains("registered"), "{queue}");
+    let handler = statement(
+        "registered_entry_point",
+        json!({"rule": "call_graph_provenance", "via": "intConnect"}),
+    );
+    assert!(handler.contains("passed to `intConnect`"), "{handler}");
+    assert!(handler.contains("not proven"), "{handler}");
+    let older = statement("channel_consumer", json!({"rule": "call_graph_provenance"}));
+    assert!(
+        older.contains("the call it matched was not recorded"),
+        "{older}"
+    );
+    assert!(!older.contains("registered as a task"), "{older}");
+}
+
+/// A heap overflow of a decoded C string the generated harness allocated, on
+/// an entry whose signature takes a byte buffer.
+fn overflow_of_a_decoded_string() -> serde_json::Value {
+    json!({
+        "id": "F-0001-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0001",
+        "input_reachability": "attacker_reachable",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+            "message": "heap-buffer-overflow READ of size 4",
+            "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }],
+            "access": {
+                "direction": "read", "size": 4,
+                "region": { "kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0 },
+                "alloc_stack": [
+                    { "function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68 },
+                    { "function": "bhf_c_string", "file": "/w/harnesses/H-C0001/bhf_decode.h", "line": 195 },
+                    { "function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 106 }
+                ]
+            }
+        }
+    })
+}
+
+/// A `lab_only` verdict records why, beside the entry's own signature-based
+/// reachability, which can still say the entry takes input.
+#[test]
+fn lab_only_verdicts_name_their_reason() {
+    let raw = overflow_of_a_decoded_string();
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(
+        record.verdict_reason.as_deref(),
+        Some("harness_sized_buffer")
+    );
+    assert_eq!(
+        record
+            .entry_path
+            .as_ref()
+            .and_then(|entry| entry.attacker_reachable),
+        Some(true)
+    );
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["verdict_reason"],
+        "harness_sized_buffer"
+    );
+
+    let mut stubbed = raw.clone();
+    stubbed["build"] = json!({"deps": {"stubbed": ["read_sensor"]}});
+    let record = backfill_actionability(RunMode::Reporting, &stubbed, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(record.verdict_reason.as_deref(), Some("stubbed_value"));
+
+    let reachable = json!({
+        "id": "F-0002-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0002",
+        "input_reachability": "attacker_reachable",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+            "message": "heap-buffer-overflow READ of size 4",
+            "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }]
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &reachable, None);
+    assert_eq!(record.verdict, Verdict::LikelyReachable);
+    assert_eq!(record.verdict_reason, None);
+    assert!(serde_json::to_value(&record)
+        .unwrap()
+        .get("verdict_reason")
+        .is_none());
+
+    // A record stored before the reason was kept gets it filled in when the
+    // recomputed verdict is the stored one.
+    let mut stored = raw.clone();
+    let mut older =
+        serde_json::to_value(backfill_actionability(RunMode::Reporting, &raw, None)).unwrap();
+    older.as_object_mut().unwrap().remove("verdict_reason");
+    stored["actionability"] = older;
+    let record =
+        actionability::existing_actionability_or_backfill(RunMode::Reporting, &stored, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(
+        record.verdict_reason.as_deref(),
+        Some("harness_sized_buffer")
+    );
+    // A stored verdict the record no longer supports gets no reason.
+    stored["actionability"]["verdict"] = json!("likely_reachable");
+    let record =
+        actionability::existing_actionability_or_backfill(RunMode::Reporting, &stored, None);
+    assert_eq!(record.verdict, Verdict::LikelyReachable);
+    assert_eq!(record.verdict_reason, None);
+    // The stub override of a stored record says why.
+    let mut stored_stubbed = stubbed.clone();
+    stored_stubbed["actionability"] = stored["actionability"].clone();
+    let record = actionability::existing_actionability_or_backfill(
+        RunMode::Reporting,
+        &stored_stubbed,
+        None,
+    );
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(record.verdict_reason.as_deref(), Some("stubbed_value"));
+}
+
+/// Every lab-only and blocked verdict has a reason code of its own: each code
+/// in `VERDICT_REASONS` is what a finding that only its rule demotes records.
+#[test]
+fn each_demoting_rule_has_its_own_reason_code() {
+    let mut stubbed = overflow_of_a_decoded_string();
+    stubbed["build"] = json!({"deps": {"stubbed": ["read_sensor"]}});
+    let cases: Vec<(&str, Verdict, serde_json::Value)> = vec![
+        ("stubbed_value", Verdict::LabOnly, stubbed),
+        (
+            "missing_resource",
+            Verdict::Blocked,
+            json!({
+                "id": "F-0010-0a0b0c0d", "rule_id": "BHF-304", "harness_id": "H-C0010",
+                "blocked_resources": [{ "kind": "file_missing", "path": "/etc/widget/widget.conf" }]
+            }),
+        ),
+        (
+            "allocator_only_leak",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0011-0a0b0c0d", "rule_id": "BHF-208", "harness_id": "H-R0011",
+                "exception": {
+                    "sanitizer": "lsan", "name": "memory-leak",
+                    "stack": [
+                        { "function": "malloc" },
+                        { "function": "<alloc::raw_vec::RawVecInner>::with_capacity_in" },
+                        { "function": "<alloc::vec::Vec<u8>>::with_capacity_in" }
+                    ]
+                }
+            }),
+        ),
+        (
+            "contract_assertion",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0012-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-R0012",
+                "exception": {
+                    "name": "panic",
+                    "message": "subset is out of bounds: self = (0x1, 10), subset = (0x2, 3)",
+                    "stack": [{ "function": "slice_ref", "file": "src/widget.rs", "line": 43 }]
+                }
+            }),
+        ),
+        (
+            "short_slice_precondition",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0013-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-R0013",
+                "exception": {
+                    "sanitizer": "asan", "name": "ASAN_RUST_PANIC_INDEX_OUT_OF_BOUNDS",
+                    "message": "Rust panic: range end index 8 out of range for slice of length 3",
+                    "stack": [{ "function": "<rust panic>", "file": "src/lib.rs", "line": 90 }]
+                }
+            }),
+        ),
+        (
+            "harness_cleanup",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0014-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0014",
+                "input_reachability": "attacker_reachable",
+                "exception": {
+                    "name": "ASAN_ATTEMPTING",
+                    "message": "ERROR: AddressSanitizer: attempting double-free on 0x502000000070 in thread T0:",
+                    "stack": [
+                        { "function": "free", "file": null, "line": null },
+                        { "function": "bhf_run_one", "file": "/w/auto/H-C0014/main.c", "line": 64 },
+                        { "function": "main", "file": "/w/auto/H-C0014/main.c", "line": 545 }
+                    ]
+                }
+            }),
+        ),
+        (
+            "must_panic",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0015-0a0b0c0d", "rule_id": "BHF-210", "harness_id": "H-G0015",
+                "input_reachability": "attacker_reachable",
+                "exception": {
+                    "name": "ASAN_GO_PANIC",
+                    "message": "Go panic: cannot decode widget: empty input",
+                    "stack": [{ "function": "example.com/widget.MustDecode", "file": "decode.go", "line": 60 }]
+                }
+            }),
+        ),
+        (
+            "enum_domain_precondition",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0016-0a0b0c0d", "rule_id": "BHF-415", "harness_id": "H-C0016",
+                "classification": "oracle_hit",
+                "oracle": {
+                    "name": "native-assertion-contract", "api": "__assert_fail",
+                    "evidence": [{ "key": "expression", "value": "kind == WidgetSmall || kind == WidgetLarge" }]
+                },
+                "exception": { "name": "oracle", "message": "native assertion contract failed" }
+            }),
+        ),
+        (
+            "harness_sized_buffer",
+            Verdict::LabOnly,
+            overflow_of_a_decoded_string(),
+        ),
+        (
+            "entry_not_input",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0003-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0003",
+                "input_reachability": "reachability_unproven",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+                    "message": "heap-buffer-overflow READ of size 4",
+                    "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }]
+                }
+            }),
+        ),
+    ];
+    for (code, verdict, raw) in &cases {
+        let record = backfill_actionability(RunMode::Reporting, raw, None);
+        assert_eq!(
+            (record.verdict, record.verdict_reason.as_deref()),
+            (*verdict, Some(*code)),
+            "{raw:#}"
+        );
+    }
+    let covered: std::collections::BTreeSet<&str> = cases.iter().map(|(code, ..)| *code).collect();
+    let listed: std::collections::BTreeSet<&str> = actionability::VERDICT_REASONS
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    assert_eq!(covered, listed, "a listed reason code no case demotes to");
 }

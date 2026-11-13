@@ -260,12 +260,81 @@ pub unsafe extern "C" fn bhf_shim_fuzz_stub_value(symbol: *const libc::c_char) -
     u64::from_le_bytes(buf)
 }
 
-pub fn contains_bytes(needle: &[u8]) -> bool {
-    taint_span(needle, needle.len()).is_some()
+/// The shortest format string that can count as fuzz-controlled.
+pub const FORMAT_TAINT_MIN_LEN: usize = 4;
+
+/// Whether a printf-family `format` came from the fuzz input: the whole
+/// format, at least [`FORMAT_TAINT_MIN_LEN`] bytes long, occurs verbatim in
+/// the current input ([`taint_span`]), and it does not lie in a loaded
+/// object's read-only data. A format only part of which matches the input is
+/// not controlled. `format` must be the program's own format bytes (not a
+/// copy), since its address is checked.
+///
+/// The address check removes string literals, which live in `.rodata`
+/// whatever their length, although the mined dictionary puts a constant
+/// format such as `"%s"` into the input. The floor removes short writable
+/// copies of literals (a `std::string` holding `"%s"`). The content check
+/// runs first, so the program-header walk runs only for a format that
+/// matched.
+pub fn format_is_input_controlled(format: &[u8]) -> bool {
+    taint_span(format, FORMAT_TAINT_MIN_LEN).is_some()
+        && !points_into_read_only_image(format.as_ptr())
 }
 
-/// Byte-origin taint check (#422): does `needle` occur verbatim in the
-/// current fuzz input as a run of at least `min_len` bytes? Returns the
+/// Whether `addr` lies in read-only memory of an object the process has
+/// loaded: a `PT_LOAD` segment that is not writable, or a `PT_GNU_RELRO`
+/// range. String literals live there; memory built at run time (heap, stack,
+/// writable `.data`) does not. Walks the link map in place (no allocation)
+/// and returns false when no object holds `addr`.
+pub fn points_into_read_only_image(addr: *const u8) -> bool {
+    struct Probe {
+        addr: usize,
+        found: bool,
+    }
+    unsafe extern "C" fn visit(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        let probe = &mut *(data as *mut Probe);
+        let info = &*info;
+        if info.dlpi_phdr.is_null() {
+            return 0;
+        }
+        let headers = std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum));
+        for header in headers {
+            let read_only = match header.p_type {
+                libc::PT_LOAD => header.p_flags & libc::PF_W == 0,
+                libc::PT_GNU_RELRO => true,
+                _ => false,
+            };
+            if !read_only {
+                continue;
+            }
+            let start = (info.dlpi_addr as usize).wrapping_add(header.p_vaddr as usize);
+            let end = start.wrapping_add(header.p_memsz as usize);
+            if (start..end).contains(&probe.addr) {
+                probe.found = true;
+                return 1;
+            }
+        }
+        0
+    }
+    if addr.is_null() {
+        return false;
+    }
+    let mut probe = Probe {
+        addr: addr as usize,
+        found: false,
+    };
+    unsafe {
+        libc::dl_iterate_phdr(Some(visit), (&mut probe as *mut Probe).cast());
+    }
+    probe.found
+}
+
+/// Byte-origin taint check (#422): does the whole of `needle`, at least
+/// `min_len` bytes long, occur verbatim in the current fuzz input? Returns the
 /// `(offset, len)` of the first such occurrence, which is the *source*
 /// end of a fuzz-input→sink taint path the oracles confirm.
 ///
@@ -280,7 +349,9 @@ pub fn contains_bytes(needle: &[u8]) -> bool {
 /// appears in almost any input by chance, so callers pass a floor (the
 /// shim uses 4) below which a match is not treated as taint. A
 /// `needle` shorter than `min_len`, an empty needle, or a needle longer
-/// than the input all return `None`.
+/// than the input all return `None`. A format string is checked through
+/// [`format_is_input_controlled`], which also excludes literals in the
+/// program's read-only data.
 pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
     if needle.is_empty() || needle.len() < min_len {
         return None;
@@ -474,16 +545,44 @@ mod tests {
     }
 
     #[test]
-    fn contains_bytes_matches_live_input_substrings() {
+    fn read_only_images_hold_literals_not_heap_or_writable_data() {
+        static mut WRITABLE: [u8; 8] = *b"%x%x%x\0\0";
+        let literal: &'static str = "a literal format %d";
+        assert!(points_into_read_only_image(literal.as_ptr()));
+        let heap = literal.as_bytes().to_vec();
+        assert!(!points_into_read_only_image(heap.as_ptr()));
+        let writable = (&raw const WRITABLE).cast::<u8>();
+        assert!(!points_into_read_only_image(writable));
+        let on_stack = [b'%'; 8];
+        assert!(!points_into_read_only_image(on_stack.as_ptr()));
+        assert!(!points_into_read_only_image(std::ptr::null()));
+    }
+
+    #[test]
+    fn only_formats_outside_read_only_data_that_match_the_input_are_controlled() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        let payload = b"AA%x%nZZ";
+        let payload = b"A%s%x%x%x";
         unsafe {
             bhf_shim_set_fuzz_input(payload.as_ptr(), payload.len());
         }
-
-        assert!(contains_bytes(b"%x%n"));
-        assert!(!contains_bytes(b"%p%n"));
+        // A format copied out of the input into memory the program owns.
+        let copied: Vec<u8> = b"%x%x%x".to_vec();
+        assert!(format_is_input_controlled(&copied));
+        let copied_tail: Vec<u8> = payload[3..].to_vec();
+        assert!(format_is_input_controlled(&copied_tail));
+        // Too short to tell a copy of the input from a copy of a literal.
+        let short: Vec<u8> = b"%s".to_vec();
+        assert!(!format_is_input_controlled(&short));
+        // Not in the input at all.
+        let absent: Vec<u8> = b"%p%n%p".to_vec();
+        assert!(!format_is_input_controlled(&absent));
+        // Only part of the format occurs in the input: the whole format must.
+        let partly: Vec<u8> = b"name=%x%x%x and more text".to_vec();
+        assert!(!format_is_input_controlled(&partly));
+        // A literal in the program's read-only data, though its bytes also
+        // occur in the input (a dictionary token put them there).
+        assert!(!format_is_input_controlled(b"%x%x"));
         reset();
     }
 

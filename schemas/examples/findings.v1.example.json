@@ -31,6 +31,7 @@
       "cwe": [122],
       "confirmation": { "level": "sanitizer_crash", "detail": null },
       "verdict": "real_reachable",
+      "verdict_reason": null,
       "location": { "file": "src/parse.c", "line": 42, "column": null, "function": "parse_header" },
       "fix_location": { "file": "src/parse.c", "line": 40, "column": null, "function": null },
       "stack": [
@@ -109,6 +110,7 @@
       "cwe": [1395],
       "confirmation": { "level": "advisory", "detail": null },
       "verdict": null,
+      "verdict_reason": null,
       "location": null,
       "fix_location": null,
       "stack": [],

@@ -3381,7 +3381,8 @@ fn run_attempt(
                 // Built-in tiny seeds, plus any user `--seed-file`/`--seed-dir`
                 // inputs so parser/decompressor targets start from valid
                 // examples rather than only empty/`A` bytes.
-                let mut seeds = vec![b"".to_vec(), b"A".to_vec(), b"AAAAAAAA".to_vec()];
+                let mut seeds: Vec<Vec<u8>> =
+                    BOOTSTRAP_SEEDS.iter().map(|seed| seed.to_vec()).collect();
                 seeds.extend(options.user_seeds.iter().cloned());
                 // A mined or user seed is a sample of the input format. Where
                 // the harness decodes fixed-width parameters before its buffer,
@@ -4827,17 +4828,24 @@ fn afl_skipped_message(harness_id: &str, builtin_fuzzed: bool, failure: &str) ->
     }
 }
 
+/// The starting inputs every builtin fuzz pass gets besides the mined and
+/// user seeds. `bhf explain` names a crash found on one of them.
+pub(crate) const BOOTSTRAP_SEEDS: [&[u8]; 3] = [b"", b"A", b"AAAAAAAA"];
+
 /// Whether the builtin fuzz pass of this harness that just ran had the
 /// runtrace shim loaded: a native (not emulated) harness without its own
-/// launcher whose pass produced the runtrace log. The log is removed before
-/// each pass and the shim creates it when it loads, so a shim the dynamic
-/// loader could not preload (a path `LD_PRELOAD` splits) counts as not armed.
+/// launcher whose runtrace log holds the line the shim writes when it first
+/// opens the log. The log is removed before each pass, and the fuzz driver
+/// creates it for its comparison records with or without the shim, so only
+/// that marker counts: a shim the dynamic loader did not preload (a path
+/// `LD_PRELOAD` splits, a file it refuses to load) or no shim at all counts as
+/// not armed.
 /// Recorded in each finding's `runtime_mode.shim_armed`, so a report can tell
 /// "no environment use observed" from "not observed".
 fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
     !cross
         && !harness_owns_runtime_instrumentation(harness_dir)
-        && harness_dir.join("runtrace.jsonl").is_file()
+        && crate::auto::runtrace::log_shows_shim_loaded(&harness_dir.join("runtrace.jsonl"))
 }
 
 /// One-shot warning latch so we don't print "shim not found" once
@@ -4881,9 +4889,10 @@ fn run_fuzz_with_runtrace(
     String,
 > {
     let runtrace_log = harness_dir.join("runtrace.jsonl");
-    // Remove any prior log so this pass's events stand alone. The shim creates
-    // the log when it loads, so its presence afterwards also shows that the
-    // pass ran with the shim preloaded ([`fuzz_pass_shim_armed`]).
+    // Remove any prior log so this pass's events stand alone. The shim writes
+    // a marker line when it first opens the log, so that line afterwards shows
+    // that the pass ran with the shim preloaded ([`fuzz_pass_shim_armed`]); the
+    // log's existence does not, since the driver opens it for comparisons.
     let _ = std::fs::remove_file(&runtrace_log);
 
     let mut child_env: Vec<(String, String)> = vec![
@@ -11497,6 +11506,7 @@ mod stamp_tests {
             spelled_type: Some("const u8_t *".to_owned()),
             resolved_type: Some("const uint8_t *".to_owned()),
             typedefs_resolved: true,
+            via: None,
         };
         stamp_runtime_mode(
             &path,
@@ -11549,12 +11559,25 @@ mod stamp_tests {
     }
 
     #[test]
-    fn a_pass_counts_as_shim_armed_only_when_it_produced_the_runtrace_log() {
+    fn a_pass_counts_as_shim_armed_only_when_the_shim_marked_its_log() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        let log = dir.path().join("runtrace.jsonl");
         // LD_PRELOAD was set but the shim never loaded (a path ld.so split): no log.
         assert!(!fuzz_pass_shim_armed(dir.path(), false));
-        fs::write(dir.path().join("runtrace.jsonl"), "").unwrap();
+        // The fuzz driver opens the log for its comparison records on its own.
+        fs::write(&log, "").unwrap();
+        assert!(!fuzz_pass_shim_armed(dir.path(), false), "an empty log");
+        fs::write(&log, "{\"e\":\"cmplog\",\"a\":\"41\",\"b\":\"42\"}\n").unwrap();
+        assert!(
+            !fuzz_pass_shim_armed(dir.path(), false),
+            "a log holding only driver records"
+        );
+        fs::write(
+            &log,
+            "{\"e\":\"shim_loaded\"}\n{\"e\":\"cmplog\",\"a\":\"41\",\"b\":\"42\"}\n",
+        )
+        .unwrap();
         assert!(fuzz_pass_shim_armed(dir.path(), false));
         // An emulated pass never runs the host shim.
         assert!(!fuzz_pass_shim_armed(dir.path(), true));

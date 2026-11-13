@@ -75,7 +75,7 @@ pub unsafe extern "C" fn bhf_runtrace_log_format(
     let Some(_guard) = HookGuard::acquire() else {
         return;
     };
-    let controlled = crate::fakes::fuzz_input::contains_bytes(format);
+    let controlled = crate::fakes::fuzz_input::format_is_input_controlled(format);
     let mut builder = Builder::new(b"format");
     builder.field_str(b"a", api);
     builder.field_str(b"f", format);

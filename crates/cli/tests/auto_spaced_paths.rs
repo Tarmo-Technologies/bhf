@@ -368,45 +368,28 @@ fn link_or_copy(from: &Path, to: &Path) {
     }
 }
 
-/// bhf installed under a directory with spaces (`Program Files (x86)`, a
-/// user profile) still preloads its runtrace shim, which `LD_PRELOAD` would
-/// split at the space, and the finding says it was armed because the run
-/// produced the runtrace log.
+/// The line the runtrace shim starts its log with when it loads.
 #[cfg(target_os = "linux")]
-#[test]
-fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
-    if !tool_available("clang") || !tool_available("make") {
-        eprintln!("skip: clang/make unavailable");
-        return;
-    }
-    let bin = bhf_bin();
-    let Some(shim) = ["libbhf_runtrace.so", "libbhf_runtrace_shim.so"]
-        .into_iter()
-        .map(|name| bin.with_file_name(name))
-        .find(|path| path.is_file())
-    else {
-        eprintln!("skip: bhf or its runtrace shim is not built");
-        return;
-    };
-    if !bin.is_file() {
-        eprintln!("skip: bhf binary not built");
-        return;
-    }
+const SHIM_LOADED_LINE: &str = "{\"e\":\"shim_loaded\"}";
 
-    let tmp = tempfile::tempdir().expect("temp dir");
-    let install = tmp
-        .path()
-        .join("Program Files (x86)")
-        .join("bhf")
-        .join("bin");
-    std::fs::create_dir_all(&install).unwrap();
-    let installed = install.join("bhf");
-    link_or_copy(&bin, &installed);
-    link_or_copy(&shim, &install.join("libbhf_runtrace.so"));
+/// What [`auto_on_a_planted_read`] leaves: the work dir, the harness of the
+/// planted read, its finding dir and the run's output.
+#[cfg(target_os = "linux")]
+struct PlantedReadRun {
+    work: PathBuf,
+    harness: String,
+    finding: PathBuf,
+    log: String,
+}
 
-    let tree = tmp.path().join("proj");
+/// Run the bhf at `installed` (`auto`, C only, one target) on a tree whose
+/// `parse_record` reads out of bounds, with `shim` as `BHF_RUNTRACE_SHIM`
+/// (unset when `None`), and return the run with the planted read's finding.
+#[cfg(target_os = "linux")]
+fn auto_on_a_planted_read(installed: &Path, shim: Option<&Path>, root: &Path) -> PlantedReadRun {
+    let tree = root.join("proj");
     let src = tree.join("src");
-    let work = tmp.path().join("work");
+    let work = root.join("work");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         src.join("record.h"),
@@ -423,7 +406,8 @@ fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
     )
     .unwrap();
 
-    let output = Command::new(&installed)
+    let mut command = Command::new(installed);
+    command
         .arg("auto")
         .arg(&tree)
         .arg("--work-dir")
@@ -439,10 +423,12 @@ fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
             "6",
             "--no-discovery-cache",
         ])
-        .env_remove("BHF_RUNTRACE_SHIM")
-        .env_remove("LD_PRELOAD")
-        .output()
-        .expect("run the installed bhf auto");
+        .env_remove("LD_PRELOAD");
+    match shim {
+        Some(shim) => command.env("BHF_RUNTRACE_SHIM", shim),
+        None => command.env_remove("BHF_RUNTRACE_SHIM"),
+    };
+    let output = command.output().expect("run the installed bhf auto");
     let log = format!(
         "stderr:\n{}\nstdout:\n{}",
         String::from_utf8_lossy(&output.stderr),
@@ -455,15 +441,6 @@ fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
         .cloned()
         .unwrap_or_else(|| panic!("parse_record was not attempted: {outcomes:?}\n{log}"));
     assert_eq!(outcome, "built_and_fuzzed", "{log}");
-    assert!(!log.contains("cannot be preloaded"), "{log}");
-    assert!(
-        work.join("harnesses")
-            .join(&harness)
-            .join("runtrace.jsonl")
-            .is_file(),
-        "the fuzz pass produced no runtrace log, so the shim was not loaded:\n{log}"
-    );
-
     let finding = finding_dirs(&work)
         .into_iter()
         .find(|dir| {
@@ -473,14 +450,150 @@ fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
                 .is_some_and(|finding| finding["harness_id"] == harness.as_str())
         })
         .unwrap_or_else(|| panic!("the planted read must be found:\n{log}"));
+    PlantedReadRun {
+        work,
+        harness,
+        finding,
+        log,
+    }
+}
+
+/// The installed bhf and its runtrace shim, when both are built.
+#[cfg(target_os = "linux")]
+fn built_bhf_and_shim() -> Option<(PathBuf, PathBuf)> {
+    if !tool_available("clang") || !tool_available("make") {
+        eprintln!("skip: clang/make unavailable");
+        return None;
+    }
+    let bin = bhf_bin();
+    if !bin.is_file() {
+        eprintln!("skip: bhf binary not built");
+        return None;
+    }
+    let Some(shim) = ["libbhf_runtrace.so", "libbhf_runtrace_shim.so"]
+        .into_iter()
+        .map(|name| bin.with_file_name(name))
+        .find(|path| path.is_file())
+    else {
+        eprintln!("skip: the runtrace shim is not built");
+        return None;
+    };
+    Some((bin, shim))
+}
+
+/// bhf installed under a directory with spaces (`Program Files (x86)`, a
+/// user profile) still preloads its runtrace shim, which `LD_PRELOAD` would
+/// split at the space, and the finding says it was armed because the run's
+/// runtrace log starts with the line the shim writes when it loads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_runtrace_shim_loads_when_bhf_is_installed_under_a_spaced_path() {
+    let Some((bin, shim)) = built_bhf_and_shim() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let install = tmp
+        .path()
+        .join("Program Files (x86)")
+        .join("bhf")
+        .join("bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let installed = install.join("bhf");
+    link_or_copy(&bin, &installed);
+    link_or_copy(&shim, &install.join("libbhf_runtrace.so"));
+
+    let run = auto_on_a_planted_read(&installed, None, tmp.path());
+    let log = &run.log;
+    assert!(!log.contains("cannot be preloaded"), "{log}");
+    let runtrace = std::fs::read_to_string(
+        run.work
+            .join("harnesses")
+            .join(&run.harness)
+            .join("runtrace.jsonl"),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        runtrace.lines().next(),
+        Some(SHIM_LOADED_LINE),
+        "the fuzz pass's runtrace log does not start with the shim's load marker, so the shim \
+         was not loaded:\n{log}"
+    );
+
     let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(run.finding.join("finding.json")).unwrap()).unwrap();
     assert_eq!(raw["runtime_mode"]["shim_armed"], true, "{raw:#}");
-    let sanitizer_log = std::fs::read_to_string(finding.join("sanitizer.log")).unwrap_or_default();
+    let sanitizer_log =
+        std::fs::read_to_string(run.finding.join("sanitizer.log")).unwrap_or_default();
     assert!(
         !sanitizer_log.contains("cannot be preloaded"),
         "{sanitizer_log}"
     );
+}
+
+/// Run bhf auto on the planted read with no usable shim and check that the
+/// finding and `bhf explain` both say the environment was not observed.
+#[cfg(target_os = "linux")]
+fn assert_environment_not_observed(installed: &Path, shim: Option<&Path>, root: &Path) {
+    let run = auto_on_a_planted_read(installed, shim, root);
+    let log = &run.log;
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.finding.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(raw["runtime_mode"]["shim_armed"], false, "{raw:#}\n{log}");
+    let id = raw["id"].as_str().expect("finding id").to_owned();
+    let explained = Command::new(installed)
+        .arg("explain")
+        .arg("--work-dir")
+        .arg(&run.work)
+        .arg("--finding-id")
+        .arg(&id)
+        .output()
+        .expect("run bhf explain");
+    let stdout = String::from_utf8_lossy(&explained.stdout);
+    assert!(
+        explained.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    assert!(
+        stdout.contains("FAKED ENVIRONMENT\n  environment not observed (runtrace shim not loaded)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("touched no external resource"), "{stdout}");
+}
+
+/// bhf installed with no runtrace shim beside it fuzzes without the shim, and
+/// the finding records that, although the fuzz driver still creates the
+/// runtrace log for its comparison records.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bhf_installed_without_its_shim_records_the_environment_as_not_observed() {
+    let Some((bin, _)) = built_bhf_and_shim() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let install = tmp.path().join("bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let installed = install.join("bhf");
+    link_or_copy(&bin, &installed);
+    assert_environment_not_observed(&installed, None, tmp.path());
+}
+
+/// A shim path the dynamic loader refuses to preload (not a shared object)
+/// leaves `LD_PRELOAD` set but the shim unloaded, and the finding says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shim_the_loader_refuses_records_the_environment_as_not_observed() {
+    let Some((bin, _)) = built_bhf_and_shim() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let install = tmp.path().join("bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let installed = install.join("bhf");
+    link_or_copy(&bin, &installed);
+    let bogus = tmp.path().join("libbogus_shim.so");
+    std::fs::write(&bogus, "not a shim\n").unwrap();
+    assert_environment_not_observed(&installed, Some(&bogus), tmp.path());
 }
 
 /// Every file under `dir`, recursively.

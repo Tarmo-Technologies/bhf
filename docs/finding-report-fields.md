@@ -52,7 +52,7 @@ omitted), and unknown keys are rejected. Keys added to v1 after its first
 release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
 `fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
 `fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
-the `runtrace` evidence role)
+`verdict_reason`, the `runtrace` evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
 older schema rejects them. `reproduce.build.fidelity` is optional the same
@@ -83,6 +83,7 @@ records that failed to load — a bad record never aborts the rebuild).
 | `cwe` | int[] | at least one |
 | `confirmation` | `{level, detail}` | see [Confirmation levels](#confirmation-levels) |
 | `verdict` | enum \| null | `real_reachable`, `likely_reachable`, `lab_only`, `blocked`, `unknown` |
+| `verdict_reason` | enum \| null | why `verdict` is `lab_only` or `blocked`, `null` for the others: `stubbed_value` (the crash needed a value a build-recovery stub, mock or fake supplied), `missing_resource` (`blocked`: the run lacked a resource), `allocator_only_leak` (a leak report with only allocator frames), `contract_assertion` (a contract assertion the harness cannot satisfy), `short_slice_precondition` (a fixed-width read of a slice shorter than documented), `harness_cleanup` (a fault in the harness's own cleanup), `must_panic` (a function that panics by design), `enum_domain_precondition` (an assertion on an enum value outside its domain), `harness_sized_buffer` (an overflow of a buffer bhf's harness sized for a pointer parameter it passes without a length), `entry_not_input` (the entry's signature does not take input) |
 | `location` | `{file, line, column, function}` \| null | repo-relative POSIX path, 1-based |
 | `fix_location` | same shape \| null | the single best place to start a fix |
 | `stack` | `[{function, file, line}]` | project frames only, at most 32; frames under the source root, and with no root known, frames outside toolchain, harness and libc component paths. A relative frame path that names no file under the source root (glibc's `assert/assert.c`, `csu/libc-start.c`) is not a project frame |
@@ -91,7 +92,7 @@ records that failed to load — a bad record never aborts the rebuild).
 | `group` | string \| null | root-cause group key |
 | `occurrences` | int | members in the group this finding represents |
 | `first_seen`, `last_seen` | RFC 3339 \| null | `last_seen` updates when a later run reproduces the same `fingerprint.primary` |
-| `reachability` | object \| null | entry path for fuzz; fuzz reachability for SCA |
+| `reachability` | object \| null | entry path for fuzz; fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
@@ -164,9 +165,9 @@ carries the envelope below, in addition to its producer-specific fields
 | `history[]` | `{at, command, fields[]}` — one entry per enrichment pass (`minimize`, `cartography`, `confirm`, fidelity) that edited this record in place |
 | `minimization_skipped` | `true` when `auto`'s minimization pass ran out of budget before reaching this finding's group |
 | `gates` | comparison evidence for the input named in `gate_capture.input`: each input span (`offset`, `len`) whose bytes reached a comparison, with `operand_hex`, `compared_with_hex`, `cmp_kind`, `site`, `location` (`{file, line, function}` or `null`), `relation` and `operands_equal`. Written by `bhf auto` after minimization and by `bhf report --backfill`. An operand counts only when its bytes occur in the input and a replay with those bytes changed shows it change with them (`derived`: flipping a byte changed it, and two replays of the unchanged input agreed on it, so a process id or clock reading does not count). Comparisons the harness makes before entering the target are left out, and so are later ones whose site symbolizes to harness code (this needs `llvm-symbolizer`) |
-| `gate_capture` | how `gates` was recorded: `{input, input_len, status, reason, comparisons, truncated, unconfirmed, runs, shim_armed, runner}`. `status` is `recorded`, `no_input_comparisons`, `no_comparisons` (no instrumented comparison was recorded in the target; uninstrumented code such as a prebuilt library is not observed) or `unavailable` (the capture could not run; with `reason`); `unconfirmed` counts operands whose bytes occur in the input but that did not follow a change of them; `shim_armed` says the replay ran with the runtrace shim, whose events for this one input are in the finding's `runtrace.jsonl`; `runner` names the emulator the capture replayed a harness built for another platform under (`qemu-aarch64`), and is absent for a native replay |
+| `gate_capture` | how `gates` was recorded: `{input, input_len, status, reason, comparisons, truncated, unconfirmed, runs, shim_armed, runner}`. `status` is `recorded`, `no_input_comparisons`, `no_comparisons` (the target made no comparison the driver recorded on this input; the reason gives the counts it left out) or `unavailable` (the capture could not run; with `reason`); `unconfirmed` counts operands whose bytes occur in the input but that did not follow a change of them; `shim_armed` says the replay ran with the runtrace shim, whose events for this one input are in the finding's `runtrace.jsonl`; `runner` names the emulator the capture replayed a harness built for another platform under (`qemu-aarch64`), and is absent for a native replay |
 | `build` | how the harness was built: `binary` is `{sha256, build_id, coverage_instrumentation}` for the harness binary that produced the finding, where `coverage_instrumentation` is the instrumentation that fed its edge map as the binary shows it (`sancov-trace-pc-guard` for clang's guards, `sancov-trace-pc` for a translation unit compiled with GCC's `-fsanitize-coverage=trace-pc`, `go-cover`), and is absent when the binary does not show one (no coverage, stripped or compressed debug information); `sandbox` is the sandbox the run used |
-| `runtime_mode` | `{pass, env_injected, shim_armed}` stamped by `auto` on each finding: the fuzz pass, the environment it injected, and whether the runtrace shim was loaded for it (the pass produced the runtrace log, which the shim creates when it loads) |
+| `runtime_mode` | `{pass, env_injected, shim_armed}` stamped by `auto` on each finding: the fuzz pass, the environment it injected, and whether the runtrace shim was loaded for it (the pass's runtrace log holds, within its first 64 KiB, the `shim_loaded` line the shim writes when it first opens the log) |
 
 ## Producer history
 
@@ -187,7 +188,7 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status,verdict_reason
 ```
 
 `cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
@@ -199,16 +200,19 @@ columns by position keep working: `access` is the access direction,
 names the file those offsets index, `arguments` summarises `fuzz.arguments`,
 `access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads
 `reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
-built with fabricated inputs (empty otherwise), and `input_to_state_status` is
+built with fabricated inputs (empty otherwise), `input_to_state_status` is
 `fuzz.input_to_state_status` (why `input_to_state` is empty is in
-`findings.json` and `INDEX.md`). `arguments` is
+`findings.json` and `INDEX.md`), and `verdict_reason` is the finding's
+`verdict_reason` (empty when there is none). `arguments` is
 `name=value` per argument, `;`-separated: a buffer or string reads
 `len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
 (`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed
 reads `<before>-><after>`, a `;` inside a name or value is written `,`, and
 the cell stops at 200 characters with `...`.
 
-SARIF results carry the comparison evidence as the `bhfInputToState` property
+SARIF results carry the actionability verdict as `actionabilityVerdict` and
+its reason as `actionabilityVerdictReason` (`null` unless the verdict is
+`lab_only` or `blocked`). They carry the comparison evidence as the `bhfInputToState` property
 (the `finding.json` `gates` entries), the file its offsets index as
 `bhfInputToStateInput`, and each comparison site with a source position as a
 related location. A capture that could not run adds neither property.
@@ -312,7 +316,9 @@ dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
   `LPCBYTE` or `typedef const octet_t *rbuf_t` read as the pointer they are);
   `finding.json` `input_reachability_basis` records the rule, the parameter and
   its type as spelled and resolved (`{rule, param, spelled_type,
-  resolved_type, typedefs_resolved}`), `findings.json` carries it as
+  resolved_type, typedefs_resolved}`, plus `via` for a
+  `call_graph_provenance` entry: the registrar it is passed to, the receive
+  call its body makes, or `volatile_pointer`), `findings.json` carries it as
   `reachability.reachability_basis`, and `bhf explain` says what each verdict
   rests on. A finding whose input is empty or all zero bytes, or whose method
   ran on an object bhf's harness constructed, carries a caveat that real

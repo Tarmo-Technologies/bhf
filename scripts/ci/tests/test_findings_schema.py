@@ -86,6 +86,20 @@ class SchemaFilesTest(unittest.TestCase):
         }
         self.assertEqual(_errors(_validator("bhf.finding.v1.schema.json"), envelope), [])
 
+    def test_verdict_reason_is_an_optional_known_code(self):
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["verdict"] = "lab_only"
+        doc["findings"][0]["verdict_reason"] = "harness_sized_buffer"
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["verdict_reason"] = "because"
+        self.assertNotEqual(_errors(findings, bad), [])
+        older = json.loads(json.dumps(doc))
+        for finding in older["findings"]:
+            finding.pop("verdict_reason", None)
+        self.assertEqual(_errors(findings, older), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

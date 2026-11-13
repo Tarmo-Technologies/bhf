@@ -279,6 +279,10 @@
           }
         },
         "verdict": { "$ref": "#/$defs/nullable_string" },
+        "verdict_reason": {
+          "description": "Why verdict is lab_only or blocked, or null for the other verdicts: stubbed_value (the crash needed a value a stub, mock or fake supplied), missing_resource (blocked by a resource the run could not find), allocator_only_leak, contract_assertion, short_slice_precondition, harness_cleanup, must_panic, enum_domain_precondition, harness_sized_buffer (an overflow of a buffer bhf's harness sized for a pointer parameter it passes without a length) or entry_not_input (the entry's signature does not take input). Added after the first v1 release, so documents written before it omit the key.",
+          "enum": [null, "stubbed_value", "missing_resource", "allocator_only_leak", "contract_assertion", "short_slice_precondition", "harness_cleanup", "must_panic", "enum_domain_precondition", "harness_sized_buffer", "entry_not_input"]
+        },
         "location": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/location" }] },
         "fix_location": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/location" }] },
         "stack": {

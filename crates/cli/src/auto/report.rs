@@ -4251,9 +4251,10 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("F-0000-fab0cafe"))
             .unwrap();
-        // The build_fidelity column, then input_to_state_status (no capture).
+        // The build_fidelity column, then input_to_state_status (no capture)
+        // and verdict_reason (none).
         assert!(
-            row.ends_with("\"reduced: macro WIDGET_SLOTS=0, header tables.h\","),
+            row.ends_with("\"reduced: macro WIDGET_SLOTS=0, header tables.h\",,"),
             "{row}"
         );
         let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();

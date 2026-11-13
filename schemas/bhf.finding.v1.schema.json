@@ -96,6 +96,10 @@
         "typedefs_resolved": {
           "description": "The classifier read the parameter types with typedefs resolved (at least one parameter's type changed).",
           "type": "boolean"
+        },
+        "via": {
+          "description": "For call_graph_provenance, what the call-graph scan matched: the registrar the entry is passed to, the receive call or method its body makes, or volatile_pointer for a read through a volatile pointer. Added after the first v1 release; absent in findings recorded before it.",
+          "type": "string"
         }
       }
     },

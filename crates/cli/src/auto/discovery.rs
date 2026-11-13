@@ -722,6 +722,18 @@ fn basis_for_linkage(
     basis
 }
 
+/// A `call_graph_provenance` basis with `via`, what the call-graph scan
+/// matched for the entry; any other basis is returned as it is.
+fn basis_with_provenance_via(
+    mut basis: target_rank::ReachabilityBasis,
+    via: Option<&str>,
+) -> target_rank::ReachabilityBasis {
+    if basis.rule == "call_graph_provenance" {
+        basis.via = via.map(str::to_owned);
+    }
+    basis
+}
+
 pub fn discover(root: &Path) -> Result<Vec<Candidate>> {
     discover_with_dir_filter(root, &DirFilter::default())
 }
@@ -2154,7 +2166,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
             // These carry attacker-influenced data but take no byte buffer, so the
             // signature ranker would sink them to `ReachabilityUnproven`; the
             // provenance map instead marks them the event-driven attack surface.
-            let entry_provenance = target_rank::detect_entry_point_provenance(&source);
+            let provenance_via = target_rank::detect_entry_point_provenance_with_via(&source);
+            let entry_provenance: std::collections::BTreeMap<_, _> = provenance_via
+                .iter()
+                .map(|(name, (provenance, _))| (name.clone(), *provenance))
+                .collect();
             // A byte buffer or length spelled through a project typedef
             // (`const u8_t *data`) is ranked as the type it aliases.
             let registry = crate::generate_harness::ranking_type_registry(
@@ -2182,6 +2198,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                             .or_else(|| path_guard.clone()),
                     )
                 };
+                let via = provenance_via.get(&tgt.name).map(|(_, via)| via.as_str());
                 out.push(Candidate {
                     harness_id: stable_harness_id("H-C", path, tgt.line, &tgt.name),
                     lang: Lang::C,
@@ -2197,7 +2214,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     )),
                     input_reachability_basis: Some(basis_for_linkage(
                         tgt.input_reachability,
-                        tgt.input_reachability_basis,
+                        basis_with_provenance_via(tgt.input_reachability_basis, via),
                         is_static,
                     )),
                     dialect: Some(target_dialect),
@@ -4944,6 +4961,20 @@ mod tests {
         assert!(
             consumer.score > 0,
             "queue consumer must score positive: {consumer:?}"
+        );
+        // The basis names what the call-graph scan matched.
+        let via = |candidate: &Candidate| {
+            candidate
+                .input_reachability_basis
+                .as_ref()
+                .filter(|basis| basis.rule == "call_graph_provenance")
+                .and_then(|basis| basis.via.clone())
+        };
+        assert_eq!(via(isr).as_deref(), Some("intConnect"), "{isr:?}");
+        assert_eq!(
+            via(consumer).as_deref(),
+            Some("msgQReceive"),
+            "{consumer:?}"
         );
 
         let helper = find("add_scalars").expect("helper discovered");
