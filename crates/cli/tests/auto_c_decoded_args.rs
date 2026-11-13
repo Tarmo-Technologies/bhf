@@ -12,13 +12,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -182,11 +178,16 @@ fn a_c_finding_records_its_decoded_arguments() {
         assert_eq!(arg("data")["len"], rest.len());
         assert_eq!(doc["not_decoded"], serde_json::json!([]), "{doc:#}");
     }
-    // Without the binary the layout still decodes it, and says so.
+    // Without the binary (`main.exe` on Windows) the layout still decodes it,
+    // and says so.
     let harness_bin = std::fs::read_dir(work.join("harnesses"))
         .unwrap()
         .flatten()
-        .map(|entry| entry.path().join("main"))
+        .map(|entry| {
+            entry
+                .path()
+                .join(format!("main{}", std::env::consts::EXE_SUFFIX))
+        })
         .find(|path| path.is_file())
         .expect("built harness");
     std::fs::remove_file(&harness_bin).unwrap();

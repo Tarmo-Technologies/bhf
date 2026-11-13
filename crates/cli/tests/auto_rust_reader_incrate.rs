@@ -19,13 +19,9 @@ fn fixture(name: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("canonicalize fixture {name}: {e}"))
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn has_cargo_nightly() -> bool {
@@ -98,6 +94,11 @@ fn attempt_findings(attempt: &serde_json::Value, name: &str) -> usize {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn reader_trait_method_builds_fuzzes_and_finds_planted_crash() {
     let bin = bhf_bin();
     if !bin.exists() {
@@ -147,6 +148,11 @@ fn reader_trait_method_builds_fuzzes_and_finds_planted_crash() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn private_module_target_builds_and_fuzzes_in_crate() {
     let bin = bhf_bin();
     if !bin.exists() {

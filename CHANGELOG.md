@@ -146,6 +146,15 @@
 - `bhf report --backfill` no longer tells you to pass `--harness`, which
   `bhf report` does not have, when a finding's harness is gone; it says to
   restore or rebuild the harness and run the backfill again.
+- Windows: the memory ceiling of target discovery and of the static scan
+  (`BHF_MAX_MEMORY_KB`, `--max-memory-mb`) is enforced on Windows, against the
+  process's working set, with a default of 80% of the available physical
+  memory. It was Linux-only, so discovery under memory pressure ran
+  unguarded on Windows and never said its target list was partial. At the
+  ceiling the scan stops admitting files and marks its results partial, and
+  the per-file size cap there follows the ceiling as on Linux (1/64 of it,
+  16 to 256 MiB). On a host where bhf does not measure resident memory the
+  cap stays 64 MiB, whatever `BHF_MAX_MEMORY_KB` says.
 - TypeScript: esbuild is found on `PATH` or in a `node_modules/.bin` of the
   scanned tree (the target's directory up to the directory `bhf auto` scans,
   never above it), never through `npx`. Since npm 7,
@@ -1444,6 +1453,15 @@
 - Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
   len)` pair as a C string now reports a heap overflow, as it does under
   libFuzzer.
+- The integration tests run the `bhf` that cargo built for them (`bhf.exe` on
+  Windows) instead of a path built by hand. 26 tests looked for `bhf` without
+  `.exe` and so skipped on Windows. 12 of them now run there:
+  `auto_c_decoded_args` (2), `auto_c_private_handle`, `auto_config_cli`,
+  `auto_cxx_std_cli` (2), `auto_grammar_cli`, `auto_max_len_cli`,
+  `discovery_memory_ceiling` (2) and two discovery tests of
+  `auto_rust_private_incrate`. The other 14 fuzz the Java, JavaScript or Rust
+  lane, which run under WSL on Windows, or build a tree with a POSIX
+  `build.sh`, and are ignored on Windows with that reason.
 - A JavaScript or TypeScript target whose lane's toolchain is not installed
   (no `node`, or no esbuild for TypeScript) has its own outcome,
   `missing_toolchain`, in `run.json` (and `summary.missing_toolchain`, the

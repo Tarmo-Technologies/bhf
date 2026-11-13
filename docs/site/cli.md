@@ -183,9 +183,19 @@ rebuilding the index; follow it with `bhf report` to fold the new static
 report back into `findings.json`/`INDEX.md`.
 
 Use `--jobs <N>` to bound parallel file workers and `--max-memory-mb <MB>` to
-set the static process RSS ceiling. At the ceiling the Linux scanner stops
-admitting new work and records an analysis gap. The default ceiling is the
-smaller of 80% of host-available memory and 70% of the cgroup memory limit.
+set the static process RSS ceiling. At the ceiling the scanner stops
+admitting new work and records an analysis gap; target discovery (`bhf auto`,
+`bhf list targets`) stops the same way and says its list is partial. On Linux
+the default ceiling is the smaller of 80% of host-available memory and 70% of
+the cgroup memory limit; on Windows it is 80% of the available physical
+memory, measured against the process's working set. Windows pages instead of
+killing a process that runs out, so there the ceiling trades the rest of the
+scan for responsiveness rather than averting a kill; raise it with
+`--max-memory-mb` on a host with little memory free. A single source file
+larger than 1/64 of the ceiling (at least 16 MiB, at most 256 MiB) is skipped
+and recorded as a gap; `BHF_MAX_FILE_BYTES` sets that cap exactly. On other
+hosts bhf does not measure resident memory, so no ceiling applies and the file
+cap is 64 MiB.
 On an 8 GiB host, start with `--jobs 2 --max-memory-mb 4096`.
 
 Use `--sloc <FILE>` to also write an accurate per-language SLOC breakdown

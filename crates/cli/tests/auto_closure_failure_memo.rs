@@ -169,14 +169,9 @@ fn a_resumed_run_reports_only_lanes_of_the_attempt_behind_each_result() {
     let work = root.join("work");
 
     // The bhf this test binary was built with.
-    let mut bhf = std::env::current_exe().unwrap();
-    bhf.pop();
-    if bhf.ends_with("deps") {
-        bhf.pop();
-    }
-    let bhf = bhf.join(format!("bhf{}", std::env::consts::EXE_SUFFIX));
+    let bhf = env!("CARGO_BIN_EXE_bhf");
     let run = |resume: bool| {
-        let mut command = std::process::Command::new(&bhf);
+        let mut command = std::process::Command::new(bhf);
         command.current_dir(&root).args([
             "auto",
             "--work-dir",
