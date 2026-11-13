@@ -5,6 +5,11 @@
 ## Unreleased
 
 ### Fixed
+- A capsule's `build.sh` prints a missing tool's message as written: the
+  message is one single-quoted word, so the Rust capsule's, which shows
+  `cargo +nightly`, no longer runs cargo (and prints its help) when
+  `$BHF_CARGO` names a program that is not installed; it says what is missing
+  and exits 127.
 - A forced include that names no file next to the build (`-include
   iostream` from a compile database, `AUTO_EXTRA_INCLUDES` or the toolchain
   flags) reaches a capsule's `build.sh` as written, instead of as a missing

@@ -391,22 +391,30 @@ impl Relocator {
 }
 
 /// The build.sh line setting `$<var>` to the program `toolchain` names on the
-/// host that runs it, or stopping with what is missing.
+/// host that runs it, or stopping with what is missing. The message is one
+/// single-quoted word, so a purpose that shows a command (`` `cargo
+/// +nightly` ``) or a `$` is printed, never run or expanded.
 pub(crate) fn resolve_tool(var: &str, toolchain: &Toolchain) -> String {
     let env = toolchain.env_var;
-    let mut lookups = vec![format!("command -v \"${{{env}:-{}}}\"", toolchain.default)];
+    let mut lookups = vec![format!(
+        "command -v \"${{{env}:-{}}}\"",
+        super::sh_double_quoted(toolchain.default)
+    )];
     lookups.extend(
         toolchain
             .fallbacks
             .iter()
-            .map(|name| format!("command -v {name}")),
+            .map(|name| format!("command -v {}", super::sh_word(name))),
+    );
+    let message = format!(
+        "build.sh: needs {} (or ${env}): it {}",
+        toolchain.default, toolchain.purpose
     );
     format!(
         "{var}=$({{ {}; }} 2>/dev/null | head -n 1)\n\
-         if [ -z \"${var}\" ]; then echo \"build.sh: needs {} (or \\${env}): it {}\" >&2; exit 127; fi\n",
+         if [ -z \"${var}\" ]; then printf '%s\\n' {} >&2; exit 127; fi\n",
         lookups.join(" || "),
-        toolchain.default,
-        toolchain.purpose,
+        super::sh_word(&message),
     )
 }
 
@@ -639,6 +647,55 @@ pub(crate) fn is_harness_state(rel: &Path, is_dir: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool's purpose and name reach build.sh's missing-tool message as
+    /// text: backticks, `$`, quotes and backslashes are never run or expanded.
+    #[test]
+    fn a_missing_tools_message_is_printed_as_written() {
+        const TOOL: Toolchain = Toolchain::new(
+            "BHF_WIDGET_TOOL",
+            "widget-tool",
+            "builds the harness (with `widget-tool +nightly`, $HOME's \"cache\" and a \\ path)",
+        );
+        let snippet = resolve_tool("TOOL_WIDGET", &TOOL);
+        assert!(
+            !snippet.contains("echo \"build.sh: needs"),
+            "the message must not sit inside double quotes: {snippet}"
+        );
+        assert!(snippet.contains("`widget-tool +nightly`"), "{snippet}");
+        #[cfg(unix)]
+        {
+            let marker = tempfile::tempdir().unwrap();
+            // A `widget-tool` on PATH that leaves a mark if the message runs it.
+            let fake = marker.path().join("widget-tool");
+            std::fs::write(&fake, "#!/bin/sh\ntouch \"$0.ran\"\necho RAN\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&snippet)
+                .env("BHF_WIDGET_TOOL", "/nonexistent/widget-tool")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        marker.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(127), "{out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.trim_end(),
+                "build.sh: needs widget-tool (or $BHF_WIDGET_TOOL): it builds the harness \
+                 (with `widget-tool +nightly`, $HOME's \"cache\" and a \\ path)"
+            );
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("RAN"));
+            assert!(!marker.path().join("widget-tool.ran").exists());
+        }
+    }
 
     #[cfg(unix)]
     fn relocator(work: &Path, tree: &Path) -> Relocator {
