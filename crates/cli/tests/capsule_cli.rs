@@ -1358,6 +1358,210 @@ fn a_gcc_compiler_is_refused_for_c_on_native_windows() {
     );
 }
 
+/// On native Windows a target whose first build fails at compile time (here
+/// a `#error` for a macro the repair loop then defines) is repaired and built
+/// with clang alone, even with MinGW's gcc first on PATH: no MinGW-built
+/// driver object reaches the MSVC-ABI link, nothing is stubbed, and the
+/// harness is the clang-built `main.exe`. Two things keep it so: the gcc
+/// retry is not tried on Windows, and a compiler switch in a harness dir
+/// rebuilds the driver object (`bhf_toolchain.stamp`); this checks the
+/// outcome either one alone guarantees.
+#[cfg(windows)]
+#[test]
+fn a_repaired_c_target_builds_with_clang_alone_on_native_windows() {
+    if which::which("gcc").is_err() || !clang_available() || which::which("make").is_err() {
+        eprintln!("skipping: gcc, clang or make not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("parse_header.c"),
+        format!("#ifndef FROM_PROPS\n#error \"FROM_PROPS is set by the project build\"\n#endif\n{OVERFLOW_C}"),
+    )
+    .unwrap();
+    // gcc first on PATH, ahead of clang.
+    let gcc_dir = which::which("gcc").unwrap().parent().unwrap().to_path_buf();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(gcc_dir).chain(std::env::split_paths(&path))).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "2", "--no-discovery-cache"])
+        .env("PATH", path)
+        .env_remove("CC")
+        .output()
+        .expect("run bhf auto");
+    let log = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json"))
+            .unwrap_or_else(|error| panic!("run.json: {error}\n{log}")),
+    )
+    .unwrap();
+    let target = &report["targets"][0];
+    assert_eq!(
+        target["outcome"]["outcome"], "built_and_fuzzed",
+        "{target}\n{log}"
+    );
+    assert_eq!(target["stub_execution"]["stub_only"], false, "{target}");
+    assert!(
+        !work.join("c_compiler.txt").exists(),
+        "the gcc retry ran: {log}"
+    );
+    let harness = work
+        .join("harnesses")
+        .join(target["harness_id"].as_str().unwrap());
+    assert!(!harness.join("repairs/auto_stubs.c").exists(), "{log}");
+    assert!(harness.join("main.exe").is_file());
+    let driver = std::fs::read(harness.join("bhf_driver.o")).unwrap();
+    let ident = |needle: &[u8]| driver.windows(needle.len()).any(|w| w == needle);
+    assert!(ident(b"clang version"), "bhf_driver.o is not clang's");
+    assert!(!ident(b"GCC: ("), "bhf_driver.o was built by gcc");
+}
+
+/// A tree whose logging writes through a newlib-style syscall hook (`_write`,
+/// declared by its board header, defined by its board support package, not
+/// here) builds with that hook stubbed and is fuzzed, as one calling any other
+/// undefined function is: `_write` is a Windows C runtime name only on a
+/// Windows link. On Windows it is the C runtime's, and links from it.
+#[test]
+fn a_board_syscall_hook_is_stubbed_like_any_undefined_function() {
+    if !clang_available() || which::which("make").is_err() {
+        eprintln!("skipping: clang or make not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("board.h"),
+        "int _write(int fd, const char *buf, int len);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join("log.c"),
+        "#include \"board.h\"\nvoid log_line(const char *s, int n) { _write(1, s, n); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join("parse_header.c"),
+        format!("void log_line(const char *s, int n);\n{OVERFLOW_C}").replace(
+            "    char buf[16];",
+            "    char buf[16];\n    log_line(data, 1);",
+        ),
+    )
+    .unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--languages",
+            "c",
+            "--target",
+            "parse_header",
+            "--max-targets",
+            "1",
+        ])
+        .args([
+            "--jobs",
+            "1",
+            "--per-target-time",
+            "15",
+            "--no-discovery-cache",
+        ])
+        .output()
+        .expect("run bhf auto");
+    let log = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json"))
+            .unwrap_or_else(|error| panic!("run.json: {error}\n{log}")),
+    )
+    .unwrap();
+    let target = &report["targets"][0];
+    assert_eq!(
+        target["outcome"]["outcome"], "built_and_fuzzed",
+        "{target}\n{log}"
+    );
+    let findings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("results/findings.json")).unwrap())
+            .unwrap();
+    assert!(
+        findings["findings"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|f| f["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("Buffer Overflow")))),
+        "the overflow was not found: {findings}\n{log}"
+    );
+}
+
+/// A target that reads a `FILE *` is fuzzed through a stream over the input,
+/// on every host: fmemopen where the C library has it, and on Windows a
+/// temporary file deleted on close (the Windows C runtime has no fmemopen).
+/// A read past a stack buffer once the stream holds more than 16 bytes is
+/// found.
+#[test]
+fn a_file_stream_parameter_is_fuzzed_through_its_stream() {
+    if !clang_available() || which::which("make").is_err() {
+        eprintln!("skipping: clang or make not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("parse_stream.c"),
+        "#include <stdio.h>\n\
+         int parse_stream(FILE *stream) {\n\
+         \x20   char record[16];\n\
+         \x20   size_t n = fread(record, 1, 64, stream);\n\
+         \x20   return n ? record[0] : -1;\n\
+         }\n",
+    )
+    .unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "15", "--no-discovery-cache"])
+        .output()
+        .expect("run bhf auto");
+    let log = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json"))
+            .unwrap_or_else(|error| panic!("run.json: {error}\n{log}")),
+    )
+    .unwrap();
+    let target = &report["targets"][0];
+    assert_eq!(
+        target["outcome"]["outcome"], "built_and_fuzzed",
+        "{target}\n{log}"
+    );
+    let findings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("results/findings.json")).unwrap())
+            .unwrap();
+    assert!(
+        findings["findings"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|f| f["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("Buffer Overflow")))),
+        "no overflow found through the stream: {findings}\n{log}"
+    );
+}
+
 /// A launcher in front of the compiler (`CXX="ccache clang++"`) works for
 /// the capsule's include scan and for its build.sh, as it does for make.
 // The launcher is a POSIX shell script, which Windows cannot run as a program.

@@ -380,7 +380,8 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         })?;
 
     let mut tried: Vec<PathBuf> = Vec::new();
-    // The harness dirs searched for one of HARNESS_LEAVES, each listed once.
+    // The harness dirs searched for a harness binary
+    // (`crate::auto::layout::harness_exe_leaves`), each listed once.
     let mut searched: Vec<PathBuf> = Vec::new();
 
     // 1) `fixture_path` records the harness binary that ran when the finding
@@ -405,7 +406,7 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
             let mut dirs = crate::auto::layout::harness_dir_candidates(&work, harness_id);
             dirs.push(work.join("build").join(harness_id));
             for harness_dir in dirs {
-                for leaf in HARNESS_LEAVES {
+                for leaf in crate::auto::layout::harness_exe_leaves() {
                     let candidate = harness_dir.join(leaf);
                     if candidate.is_file() {
                         return Ok(candidate);
@@ -457,9 +458,6 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         finding_dir.display()
     ))
 }
-
-/// The binary names a harness dir is searched for.
-const HARNESS_LEAVES: [&str; 4] = ["main", "main_afl", "main.exe", "main_afl.exe"];
 
 /// The harness a finding records ([`resolve_harness`] without an explicit
 /// path): its `fixture_path` resolved in the work dir holding the finding

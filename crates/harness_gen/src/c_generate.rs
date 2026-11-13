@@ -6565,7 +6565,7 @@ mod tests {
             let main = dry_run_link(
                 &out,
                 "main",
-                "main",
+                "main.exe",
                 &[("OS", "Windows_NT"), ("CC", cc), ("BHF_CC_FAMILY", family)],
             );
             assert!(
@@ -6580,17 +6580,84 @@ mod tests {
             ("DIFF_CC", mingw),
             ("COV_CC", msvc),
         ];
-        let diff = dry_run_link(&out, "diff", "main_diff", &windows);
+        let diff = dry_run_link(&out, "diff", "main_diff.exe", &windows);
         assert!(diff.contains(gnu) && !diff.contains(ms), "{diff}");
-        let cov = dry_run_link(&out, "cov", "main_cov", &windows);
+        let cov = dry_run_link(&out, "cov", "main_cov.exe", &windows);
         assert!(cov.contains(ms) && !cov.contains(gnu), "{cov}");
         // SECTION_LDFLAGS replaces the flag for every lane, even with nothing.
         let mut none = windows.to_vec();
         none.push(("SECTION_LDFLAGS", ""));
-        for (goal, binary) in [("main", "main"), ("cov", "main_cov")] {
+        for (goal, binary) in [("main", "main.exe"), ("cov", "main_cov.exe")] {
             let link = dry_run_link(&out, goal, binary, &none);
             assert!(!link.contains(gnu) && !link.contains(ms), "{link}");
         }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// On Windows every lane's binary is named with `.exe` (`main.exe`,
+    /// `main_cov.exe`, ...), so cmd and PowerShell can run it by its path; an
+    /// extensionless `main` starts only through CreateProcess. The goals bhf
+    /// and the docs use (`make main`, `make cov`, `make main_afl`) still build
+    /// it. Elsewhere the names stay bare.
+    #[cfg(unix)]
+    #[test]
+    fn windows_builds_name_each_binary_with_the_exe_suffix() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_exe_suffix");
+        let mut args = direct_args("parse_record", out.clone());
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let cc = machine_reporting_compiler(&out, "msvc-cc", "x86_64-pc-windows-msvc");
+        let cc = cc.to_str().unwrap();
+        let windows = [
+            ("OS", "Windows_NT"),
+            ("CC", cc),
+            ("COV_CC", cc),
+            ("DIFF_CC", cc),
+            ("LIBFUZZER_CC", cc),
+        ];
+        for (goal, binary) in [
+            ("main", "main.exe"),
+            ("all", "main.exe"),
+            ("cov", "main_cov.exe"),
+            ("main_cov", "main_cov.exe"),
+            ("diff", "main_diff.exe"),
+            ("main_diff", "main_diff.exe"),
+        ] {
+            dry_run_link(&out, goal, binary, &windows);
+        }
+        for (goal, binary) in [("afl", "main_afl.exe"), ("main_afl", "main_afl.exe")] {
+            let mut vars = windows.to_vec();
+            vars.push(("AFLPP_CC", cc));
+            dry_run_link(&out, goal, binary, &vars);
+        }
+        for (goal, binary) in [("main", "main"), ("cov", "main_cov"), ("diff", "main_diff")] {
+            dry_run_link(
+                &out,
+                goal,
+                binary,
+                &[("CC", cc), ("COV_CC", cc), ("DIFF_CC", cc)],
+            );
+        }
+        let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
+        let clean = makefile
+            .lines()
+            .find(|line| line.trim_start().starts_with("rm -f main"))
+            .expect("clean recipe");
+        assert!(
+            clean.contains("main$(EXEEXT)") && clean.contains("main_cov$(EXEEXT)"),
+            "{clean}"
+        );
         fs::remove_dir_all(&out).ok();
     }
 
@@ -6663,7 +6730,7 @@ mod tests {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        let bin = out.join("main_libfuzzer");
+        let bin = out.join(format!("main_libfuzzer{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.is_file(), "main_libfuzzer not produced");
 
         // A clean input runs the target once and exits 0.
@@ -6755,7 +6822,7 @@ mod tests {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        let bin = out.join("main_libfuzzer");
+        let bin = out.join(format!("main_libfuzzer{}", std::env::consts::EXE_SUFFIX));
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
         let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
@@ -9234,8 +9301,9 @@ mod tests {
         let main = fs::read_to_string(&result.main_c).unwrap();
         assert!(main.contains("LLVMFuzzerTestOneInput"));
         assert!(
-            main.contains("#if defined(_WIN32)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)")
-                && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
+            main.contains(
+                "#if defined(BHF_WINDOWS_CRT)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
+            ) && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
             "Windows harnesses must omit the Linux-only weak runtrace hook:\n{main}"
         );
         // (const char *, size_t) gets pair-detected as a buffer/length view over

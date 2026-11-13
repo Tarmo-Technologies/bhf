@@ -161,7 +161,8 @@ pub fn build_go_harness(
     // GOTOOLCHAIN=local: use the INSTALLED Go, never auto-download a newer toolchain
     // a target's `go 1.x` directive asks for (that needs network + is an env limit,
     // not a bhf failure). The version-compatible majority then still builds.
-    let bin = auto_dir.join("main");
+    // `main.exe` on Windows, so the harness runs from cmd and PowerShell too.
+    let bin = auto_dir.join(crate::auto::layout::harness_exe_name("main"));
     // `go mod tidy` reaches the module graph and can sit indefinitely on a wedged
     // proxy or a huge closure, so it is bounded like every other spawn.
     let mut tidy = Command::new(&go);

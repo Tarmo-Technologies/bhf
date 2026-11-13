@@ -1256,9 +1256,10 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
             Some(2)
         }
         Ok((out, false)) if out.status.success() => {
-            let built = harness_dir.join(built_name);
+            // `main.exe` on Windows: the Makefile names its binaries so.
+            let built = crate::auto::layout::harness_exe(&harness_dir, built_name);
             if built.is_file() {
-                let dest = build_dir.join(staged_name);
+                let dest = build_dir.join(crate::auto::layout::harness_exe_name(staged_name));
                 if let Err(error) = fs::copy(&built, &dest) {
                     bhfeprintln!(
                         "copy '{}' -> '{}': {error}",
@@ -1519,10 +1520,17 @@ fn recipe_words(text: &str) -> Vec<String> {
     words
 }
 
+/// Whether `line` heads a harness Makefile's `main` link rule: `main$(EXEEXT):`
+/// in a generated Makefile (the binary is `main.exe` on Windows), `main:` in
+/// an older or hand-written one.
+pub(crate) fn is_main_rule(line: &str) -> bool {
+    line.starts_with("main$(EXEEXT):") || line.starts_with("main:")
+}
+
 /// The target sources the harness Makefile compiles into `main` (the operands
 /// after `main.c`/`main.cpp` on the `main:` recipe), and the first `-iquote`
 /// include directory, which is the target's own directory.
-fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+pub(crate) fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
     let Ok(text) = fs::read_to_string(harness_dir.join("Makefile")) else {
         return (Vec::new(), None);
     };
@@ -1537,7 +1545,7 @@ fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>
                 .position(|word| word == "-iquote")
                 .and_then(|index| words.get(index + 1))
                 .map(PathBuf::from);
-        } else if line.starts_with("main:") {
+        } else if is_main_rule(line) {
             let Some(recipe) = lines.next() else {
                 break;
             };
@@ -4051,8 +4059,14 @@ mod tests {
         let work = temp.path().join("work");
         let harness = work.join("harnesses").join("H-ONE");
         write_trivial_cpp_harness(&harness);
+        let main = crate::auto::layout::harness_exe_name("main");
+        fs::write(
+            harness.join("Makefile"),
+            format!("main:\n\tprintf built > {main}\n"),
+        )
+        .unwrap();
         assert_eq!(c_make_build(&c_build_args(&harness, None)), Some(0));
-        let staged = work.join("build").join("H-ONE").join("main");
+        let staged = work.join("build").join("H-ONE").join(&main);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "built");
         fs::remove_file(&staged).unwrap();
         assert_eq!(

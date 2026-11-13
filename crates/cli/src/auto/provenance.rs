@@ -137,8 +137,8 @@ fn provenance_one(
     if !build_prov(hdir, &prov_src) {
         return stats; // couldn't reconstruct the build -> stay honest, skip.
     }
-    let prov_bin = hdir.join("main_prov");
-    let real_bin = hdir.join("main");
+    let prov_bin = crate::auto::layout::harness_exe(hdir, "main_prov");
+    let real_bin = crate::auto::layout::harness_exe(hdir, "main");
     if !prov_bin.is_file() || !real_bin.is_file() {
         return stats;
     }

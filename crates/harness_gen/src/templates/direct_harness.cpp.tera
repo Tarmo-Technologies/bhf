@@ -91,7 +91,7 @@
 #ifndef BHF_NOCOV
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
-#if defined(_WIN32)
+#if defined(BHF_WINDOWS_CRT)
 // On Windows AddressSanitizer's interceptors call the comparison hooks
 // below before the program starts, while its shadow memory is still being
 // set up, so an instrumented hook faulted there and the process died before
@@ -155,7 +155,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
 // fuzz-driven mode can route the current iteration's bytes into fake fds /
 // socket peers / dlopen stubs. Windows has no preload shim and must not emit a
 // COFF weak reference: multiple weak defaults conflict under link.exe.
-#if defined(_WIN32)
+#if defined(BHF_WINDOWS_CRT)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern "C" void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));
@@ -194,7 +194,7 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
  * The runtime is the C driver's, wrapped in extern "C" so the sanitizer resolves
  * the unmangled callback names; layout MUST stay in sync with direct_harness.c.tera
  * and CmpShmReader in crates/cli/src/fuzz.rs. */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -227,7 +227,7 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
  * MapViewOfFile, which writes through to the backing file so the engine reads the
  * same bytes (under wine the host sees the same file). */
 BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -251,7 +251,7 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 #endif
 }
 
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* Report only unhandled exceptions. First-chance exceptions can be handled by
  * the target or by ASan (including its shadow-memory allocation), so treating
  * them as crashes makes a valid sanitized harness reject every input. Chain
@@ -514,7 +514,7 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
 /* Unified trace-cmp callbacks: feed BOTH the value-profile dictionary (#398) AND
  * the per-input RedQueen ring (#400). */
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, __builtin_return_address(0)); }
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* mingw-w64 gcc has no `trace-pc-guard`; the Windows build instruments with
  * `-fsanitize-coverage=trace-pc`, which calls this guard-less hook at each edge.
  * Hash the return address into the SAME bitmap the guard path fills so the
@@ -540,7 +540,7 @@ BHF_NOCOV void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(
  * the same cmplog so a magic float/double constant stays learnable. */
 BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; __builtin_memcpy(&ua, &a, 4); __builtin_memcpy(&ub, &b, 4); bhf_cmp_int(ua, ub, 4); bhf_cmpp_int(ua, ub, 4, __builtin_return_address(0)); }
 BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; __builtin_memcpy(&ua, &a, 8); __builtin_memcpy(&ub, &b, 8); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, __builtin_return_address(0)); }
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* mingw g++ has a builtin __sanitizer_cov_trace_switch(uint64_t, void*); match
  * its pointer type so this definition does not "ambiguate the built-in
  * declaration", then recover the uint64_t* view. (clang/gcc accept uint64_t*.) */
@@ -626,7 +626,7 @@ int main(int argc, char **argv) {
     /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
      * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
      * per input. */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     /* Install the crash handler before any target code runs so a fault in either
      * the framed loop or the argv re-isolation path becomes a detectable exit. */
     bhf_win_install_crash_handler();
@@ -642,7 +642,7 @@ int main(int argc, char **argv) {
         int bhf_devnull;
         unsigned char ready = 1;
         if (bhf_ctrl_fd < 0) return 1;
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
         /* trace-pc has no guard-init to open the maps, so open them here; set
          * stdin + the control fd to binary so the framed {u32 len, bytes}
          * protocol is not CRLF/EOF-translated by the CRT. */
@@ -974,7 +974,7 @@ int main(int argc, char **argv) {
  * wrapped in extern "C" so the sanitizer resolves the unmangled callback names;
  * layout MUST stay in sync with direct_harness.c.tera and CmpShmReader in
  * crates/cli/src/fuzz.rs. */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1007,7 +1007,7 @@ int main(int argc, char **argv) {
  * MapViewOfFile, which writes through to the backing file so the engine reads the
  * same bytes (under wine the host sees the same file). */
 BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1031,7 +1031,7 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 #endif
 }
 
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* Report only unhandled exceptions. First-chance exceptions can be handled by
  * the target or by ASan (including its shadow-memory allocation), so treating
  * them as crashes makes a valid sanitized harness reject every input. Chain
@@ -1243,7 +1243,7 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
         bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
 }
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* mingw-w64 gcc has no `trace-pc-guard`; the Windows build instruments with
  * `-fsanitize-coverage=trace-pc`, which calls this guard-less hook at each edge.
  * Hash the return address into the SAME bitmap the guard path fills so the
@@ -1265,7 +1265,7 @@ BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_cmp_
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* mingw g++ has a builtin __sanitizer_cov_trace_switch(uint64_t, void*); match
  * its pointer type so this definition does not "ambiguate the built-in
  * declaration", then recover the uint64_t* view. (clang/gcc accept uint64_t*.) */
@@ -1345,7 +1345,7 @@ int main(int argc, char **argv) {
     /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
      * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
      * per input. */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     /* Install the crash handler before any target code runs so a fault in either
      * the framed loop or the argv re-isolation path becomes a detectable exit. */
     bhf_win_install_crash_handler();
@@ -1361,7 +1361,7 @@ int main(int argc, char **argv) {
         int bhf_devnull;
         unsigned char ready = 1;
         if (bhf_ctrl_fd < 0) return 1;
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
         /* trace-pc has no guard-init to open the maps, so open them here; set
          * stdin + the control fd to binary so the framed {u32 len, bytes}
          * protocol is not CRLF/EOF-translated by the CRT. */

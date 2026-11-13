@@ -77,9 +77,7 @@ pub(crate) fn harness_for(work_dir: &Path, pick: &Pick) -> Option<PathBuf> {
     let own = pick.harness_id.as_deref().and_then(|hid| {
         crate::auto::layout::harness_dir_candidates(work_dir, hid)
             .into_iter()
-            .flat_map(|dir| {
-                ["main", "main_afl", "main.exe", "main_afl.exe"].map(|leaf| dir.join(leaf))
-            })
+            .flat_map(|dir| crate::auto::layout::harness_exe_leaves().map(|leaf| dir.join(leaf)))
             .find(|p| p.is_file())
     });
     own.or_else(|| {

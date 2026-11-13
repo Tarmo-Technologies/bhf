@@ -155,6 +155,15 @@ else
 BHF_DEFAULT_SECTION_LDFLAGS = $(BHF_GC_LDFLAGS_GNU)
 endif
 BHF_SECTION_LDFLAGS = $(if $(filter undefined,$(origin SECTION_LDFLAGS)),$(call BHF_DEFAULT_SECTION_LDFLAGS,$(1)),$(SECTION_LDFLAGS))
+# Each binary's file name: `main.exe`, `main_cov.exe`, ... on Windows, where cmd
+# and PowerShell run a program by its path only with an executable extension
+# (an extensionless file starts only through CreateProcess). The bare goal
+# names (`make main`, `make cov`, `make main_afl`) build them there too.
+ifeq ($(OS),Windows_NT)
+EXEEXT := .exe
+else
+EXEEXT :=
+endif
 # AFL's compiler driver reserves the AFL_ env-var namespace, so the AFL
 # build knobs use the AFLPP_ prefix to avoid colliding with it.
 AFLPP_CXX ?= afl-clang-fast++
@@ -226,7 +235,13 @@ $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
 .PHONY: all afl libfuzzer cov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
-all: main
+all: main$(EXEEXT)
+# The bare goal names, for the binaries named with $(EXEEXT).
+BHF_BINARIES = main main_afl main_libfuzzer main_cov main_diff
+ifneq ($(EXEEXT),)
+.PHONY: $(BHF_BINARIES)
+$(BHF_BINARIES): %: %$(EXEEXT)
+endif
 
 bhf_toolchain.stamp: FORCE_TOOLCHAIN_STAMP
 	@bhf_id='$(subst ','\'',$(BHF_TOOLCHAIN_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
@@ -248,7 +263,7 @@ bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_
 bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
 	$(DIFF_CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
-main: main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+main$(EXEEXT): main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 # Semantic check only: the same translation units under the same flags as
@@ -262,20 +277,20 @@ main: main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR
 syntaxcheck: main.cpp
 	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
 
-afl: main_afl
+afl: main_afl$(EXEEXT)
 
-main_afl: main.cpp $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
+main_afl$(EXEEXT): main.cpp $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
 	$(AFLPP_CXX) $(AFLPP_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(AFLPP_CXXFLAGS)) -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(AFLPP_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 # Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
-libfuzzer: main_libfuzzer
+libfuzzer: main_libfuzzer$(EXEEXT)
 {%- if passthrough_libfuzzer_entrypoint is defined and passthrough_libfuzzer_entrypoint %}
 
 # The project's own source defines `LLVMFuzzerTestOneInput`, so libFuzzer drives
 # it directly: the project sources are linked with `-fsanitize=fuzzer` and neither
 # main.cpp (bhf's driver around the same entry point) nor a shim is compiled.
 # See PORTABILITY.md.
-main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+main_libfuzzer$(EXEEXT): $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CXXFLAGS)) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(LIBFUZZER_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- else %}
 
@@ -284,20 +299,20 @@ main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 bhf_libfuzzer.o: bhf_libfuzzer.c
 	$(LIBFUZZER_CXX) -x c -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -c -o $@ bhf_libfuzzer.c
 
-main_libfuzzer: main.cpp bhf_libfuzzer.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+main_libfuzzer$(EXEEXT): main.cpp bhf_libfuzzer.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp bhf_libfuzzer.o{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(LIBFUZZER_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- endif %}
 
-cov: main_cov
+cov: main_cov$(EXEEXT)
 
-main_cov: main.cpp bhf_driver_cov.o $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
+main_cov$(EXEEXT): main.cpp bhf_driver_cov.o $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
 	$(COV_CXX) $(COV_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(COV_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_cov.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(COV_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
-diff: main_diff
+diff: main_diff$(EXEEXT)
 
-main_diff: main.cpp bhf_driver_diff.o $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS)
+main_diff$(EXEEXT): main.cpp bhf_driver_diff.o $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS)
 	$(DIFF_CXX) $(DIFF_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(DIFF_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_diff.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(DIFF_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 clean:
-	rm -f main main_afl main_libfuzzer main_cov main_diff bhf_driver.o bhf_driver_cov.o bhf_driver_diff.o bhf_libfuzzer.o bhf_toolchain.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_libfuzzer$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main main_afl main_libfuzzer main_cov main_diff bhf_driver.o bhf_driver_cov.o bhf_driver_diff.o bhf_libfuzzer.o bhf_toolchain.stamp
 	rm -rf context_objs repair_context_objs

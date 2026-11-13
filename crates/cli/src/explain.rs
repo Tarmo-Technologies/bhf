@@ -444,8 +444,8 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     };
     // One shell word each: a work dir may hold a space or `&`
     // (`C:\Users\a b\work`, `R&D files/`).
-    let work = repro_lane::sh_word(&work_dir.to_string_lossy());
-    let id = repro_lane::sh_word(&f.id);
+    let work = repro_lane::host_word(&work_dir.to_string_lossy());
+    let id = repro_lane::host_word(&f.id);
     let capsule = work_dir.join("capsules").join(format!("capsule_{}", f.id));
     let replay = f.dir.join("replay.py");
     let mut lines = Vec::new();
@@ -479,7 +479,7 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             ));
             lines.push(format!(
                 "bhf verify-poc {}",
-                repro_lane::sh_word(&capsule.to_string_lossy())
+                repro_lane::host_word(&capsule.to_string_lossy())
             ));
             lines.push(
                 "  (the capsule records whether its offline rebuild reproduced the crash;"
@@ -495,7 +495,7 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                 let python = if cfg!(windows) { "python" } else { "python3" };
                 lines.push(format!(
                     "{python} {}{caveat}",
-                    repro_lane::sh_word(&replay.to_string_lossy())
+                    repro_lane::host_word(&replay.to_string_lossy())
                 ));
             }
         }
@@ -514,24 +514,41 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             }
         }
     }
-    // A Windows harness needs its sanitizer runtime DLL directory on PATH;
-    // replay.py adds it, a direct run of the binary has to as well.
+    // A Windows harness (`main.exe`) run directly from PowerShell, with its
+    // sanitizer runtime DLL directory on PATH first: replay.py adds it, a
+    // direct run of the binary has to as well.
     let harness_id = str_at(&f.raw, "/harness_id").unwrap_or_default();
     if !harness_id.is_empty() {
         let sidecar = crate::auto::layout::harness_dir(work_dir, harness_id)
             .join(crate::build::RUNTIME_PATH_FILE);
-        if let Ok(text) = std::fs::read_to_string(&sidecar) {
-            let dirs: Vec<&str> = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect();
-            if !dirs.is_empty() {
-                lines.push(
-                    "To run the harness binary directly, first put its sanitizer runtime on PATH:"
-                        .to_owned(),
+        let text = std::fs::read_to_string(&sidecar).unwrap_or_default();
+        let dirs: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let binary = repro_lane::native_harness_binary(work_dir, harness_id);
+        // The input `repro_lane::alternative` runs: the recorded testcase.
+        let input = repro_lane::crash_inputs(&f.dir).pop();
+        if let (Some(binary), Some(input)) = (binary, input) {
+            if cfg!(windows) || !dirs.is_empty() {
+                let command = repro_lane::powershell_direct_command(
+                    work_dir,
+                    &binary,
+                    &input,
+                    crate::replay::is_leak_finding(&f.raw),
                 );
-                lines.push(format!("  $env:Path = \"{};$env:Path\"", dirs.join(";")));
+                let path_line = runtime_path_line(&dirs);
+                // Already offered as the way to reproduce it (no capsule, no
+                // replay.py): put the runtime on PATH just before it.
+                match lines.iter().position(|line| line.trim() == command) {
+                    Some(at) => {
+                        if let Some(path_line) = path_line {
+                            lines.insert(at, path_line);
+                        }
+                    }
+                    None => lines.extend(powershell_direct_run(path_line, &command)),
+                }
             }
         }
     }
@@ -547,6 +564,38 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             }
         ));
     }
+    lines
+}
+
+/// The PowerShell line that puts a Windows harness's sanitizer runtime dirs
+/// first on PATH, `None` when the build recorded none. The dirs are a literal,
+/// so a `$` or a backtick in one is not expanded.
+fn runtime_path_line(runtime_dirs: &[&str]) -> Option<String> {
+    (!runtime_dirs.is_empty()).then(|| {
+        format!(
+            "  $env:Path = {} + $env:Path",
+            crate::repro_lane::windows::ps_literal(&format!("{};", runtime_dirs.join(";")))
+        )
+    })
+}
+
+/// The lines that run a Windows harness binary directly in PowerShell: the
+/// [`runtime_path_line`] first when there is one, then `command`
+/// ([`crate::repro_lane::powershell_direct_command`]).
+fn powershell_direct_run(path_line: Option<String>, command: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    match path_line {
+        None => lines.push("To run the harness binary directly in PowerShell:".to_owned()),
+        Some(path_line) => {
+            lines.push(
+                "To run the harness binary directly in PowerShell, first put its sanitizer \
+                 runtime on PATH:"
+                    .to_owned(),
+            );
+            lines.push(path_line);
+        }
+    }
+    lines.push(format!("  {command}"));
     lines
 }
 
@@ -622,7 +671,7 @@ fn argument_lines(
         {
             lines.push(format!(
                 "  bhf replay --show-args {}   # re-run the harness with the trace",
-                crate::repro_lane::sh_word(&f.dir.to_string_lossy())
+                crate::repro_lane::host_word(&f.dir.to_string_lossy())
             ));
         }
         return lines;
@@ -2327,12 +2376,29 @@ mod tests {
         .unwrap();
         let out = explain_one(work.path(), &finding, &[], false);
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        // A literal: a `$` or backtick in a dir is not expanded.
         assert!(
             reproduce.contains(
-                "$env:Path = \"C:/Program Files/LLVM/lib/clang/23/lib/windows;$env:Path\""
+                "$env:Path = 'C:/Program Files/LLVM/lib/clang/23/lib/windows;' + $env:Path"
             ),
             "{reproduce}"
         );
+        // ... and then names the binary and the input to run it on, as a
+        // PowerShell call of the file the build wrote.
+        let call = crate::repro_lane::powershell_harness_command(
+            &crate::repro_lane::native_harness_binary(work.path(), "H-C0001").unwrap(),
+            &finding_dir.join("testcase.bin"),
+            false,
+        );
+        let after_path = reproduce.split("$env:Path = ").nth(1).unwrap();
+        assert!(after_path.contains(&call), "{reproduce}");
+        // Printed once: on Windows the capsule refusal's own way to reproduce
+        // it is this same command, and the PATH line goes just before it.
+        if cfg!(windows) {
+            assert_eq!(reproduce.matches(&call).count(), 1, "{reproduce}");
+        }
+        assert!(call.contains("testcase.bin"), "{call}");
+        assert!(call.contains("$env:ASAN_OPTIONS = '"), "{call}");
         std::fs::remove_file(harness.join(crate::build::RUNTIME_PATH_FILE)).unwrap();
 
         // A packageable C harness: capsule and verify-poc.
@@ -2347,7 +2413,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
-                crate::repro_lane::sh_word(&work.path().to_string_lossy())
+                crate::repro_lane::host_word(&work.path().to_string_lossy())
             )),
             "{reproduce}"
         );
@@ -2368,7 +2434,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf cartography --work-dir {} --finding-id F-0001-0a0b0c0d",
-                crate::repro_lane::sh_word(&work.path().to_string_lossy())
+                crate::repro_lane::host_word(&work.path().to_string_lossy())
             )),
             "{reproduce}"
         );
@@ -2461,7 +2527,7 @@ mod tests {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .collect();
-        let quoted = crate::repro_lane::sh_word(&work.to_string_lossy());
+        let quoted = crate::repro_lane::host_word(&work.to_string_lossy());
         assert!(quoted.starts_with('\''), "{quoted}");
         assert!(
             lines[0].starts_with(&format!(
@@ -2573,7 +2639,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
-                crate::repro_lane::sh_word(&work.path().to_string_lossy())
+                crate::repro_lane::host_word(&work.path().to_string_lossy())
             )) && reproduce.contains("bhf verify-poc"),
             "{reproduce}"
         );

@@ -69,7 +69,7 @@ pub fn run_mem_profile(work_dir: &Path) -> usize {
 fn profile_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize) -> usize {
     // The ASan `main` built during fuzzing is the replay binary; the bhf C/Ada
     // driver replays a single input passed as argv[1].
-    let bin = hdir.join("main");
+    let bin = crate::auto::layout::harness_exe(hdir, "main");
     if !bin.is_file() {
         return 0;
     }

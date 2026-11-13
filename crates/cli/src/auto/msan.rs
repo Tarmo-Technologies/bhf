@@ -60,7 +60,7 @@ fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize)
     )
     .map(|o| o.status.success())
     .unwrap_or(false);
-    let bin = hdir.join("main_msan");
+    let bin = crate::auto::layout::harness_exe(hdir, "main_msan");
     if !built || !bin.is_file() {
         return 0;
     }

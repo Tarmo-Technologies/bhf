@@ -2607,8 +2607,9 @@ mod tests {
         let main = fs::read_to_string(&result.main_cpp).unwrap();
         assert!(main.contains("LLVMFuzzerTestOneInput"));
         assert!(
-            main.contains("#if defined(_WIN32)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)")
-                && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
+            main.contains(
+                "#if defined(BHF_WINDOWS_CRT)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
+            ) && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
             "Windows harnesses must omit the Linux-only weak runtrace hook:\n{main}"
         );
         // A forward declaration must precede the entrypoint definition so the
@@ -3698,6 +3699,106 @@ mod tests {
         assert!(main.contains("_bhf_receiver.read("), "{main}");
     }
 
+    /// The C++ Makefile names its binaries with `.exe` on Windows, as the C one
+    /// does, and keeps the goal names bhf uses (`make main`, `make cov`).
+    #[cfg(unix)]
+    #[test]
+    fn windows_cpp_builds_name_each_binary_with_the_exe_suffix() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-exe-suffix");
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-EXE".to_owned(),
+            output_dir: out.clone(),
+            source_path: PathBuf::from("/tmp/source.cpp"),
+            target: cppfunction("parse"),
+            params: vec![CppParameter {
+                name: "input".to_owned(),
+                cpp_type: "const std::string &".to_owned(),
+            }],
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: Vec::new(),
+            target_sources: vec![PathBuf::from("/tmp/source.cpp")],
+            compile_flags: Vec::new(),
+            c_runtime_include: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../c_runtime")
+                .canonicalize()
+                .expect("c_runtime dir"),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        // A compiler that says it targets MSVC, so the Makefile's
+        // `-dumpmachine` probe has an answer.
+        let cxx = out.join("msvc-cxx");
+        fs::write(
+            &cxx,
+            "#!/bin/sh\nif [ \"$1\" = -dumpmachine ]; then echo x86_64-pc-windows-msvc; fi\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cxx, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cxx = cxx.to_str().unwrap();
+        let link = |goal: &str, windows: bool| -> String {
+            let mut command = std::process::Command::new("make");
+            command.arg("-C").arg(&out).args(["-n", goal]);
+            for key in ["OS", "CXX", "COV_CXX", "DIFF_CXX", "AFLPP_CXX"] {
+                command.env_remove(key);
+            }
+            command
+                .env("CXX", cxx)
+                .env("COV_CXX", cxx)
+                .env("DIFF_CXX", cxx)
+                .env("AFLPP_CXX", cxx);
+            if windows {
+                command.env("OS", "Windows_NT");
+            }
+            let output = command.output().expect("run make -n");
+            assert!(output.status.success(), "{goal}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        for (goal, binary) in [
+            ("main", "main.exe"),
+            ("all", "main.exe"),
+            ("cov", "main_cov.exe"),
+            ("main_cov", "main_cov.exe"),
+            ("diff", "main_diff.exe"),
+            ("afl", "main_afl.exe"),
+            ("main_afl", "main_afl.exe"),
+        ] {
+            let text = link(goal, true);
+            assert!(
+                text.contains(&format!(" -o {binary} main.cpp")),
+                "{goal}: {text}"
+            );
+        }
+        for (goal, binary) in [("main", "main"), ("cov", "main_cov")] {
+            let text = link(goal, false);
+            assert!(
+                text.contains(&format!(" -o {binary} main.cpp")),
+                "{goal}: {text}"
+            );
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     #[test]
     fn generate_cpp_direct_harness_makefile_includes_afl_target() {
         let out = temp_dir("cpp-emit-afl");
@@ -3763,7 +3864,7 @@ mod tests {
         // The afl target is declared; target sources live in the recipe, not the
         // prerequisites (an absolute Windows source path carries a drive-letter
         // colon that GNU make would parse as a target:prereq separator).
-        assert!(makefile.contains("main_afl: main.cpp"));
+        assert!(makefile.contains("main_afl$(EXEEXT): main.cpp"));
         // …and the afl recipe still compiles the target source alongside main.cpp.
         assert!(makefile.contains("-o $@ main.cpp /tmp/source.cpp"));
         assert!(makefile.contains("$(AFLPP_CXX) $(AFLPP_CXXFLAGS)"));
@@ -7039,7 +7140,7 @@ mod tests {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        let bin = out.join("main_libfuzzer");
+        let bin = out.join(format!("main_libfuzzer{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.is_file(), "main_libfuzzer not produced");
 
         let ok = out.join("ok.bin");
@@ -7146,7 +7247,7 @@ mod tests {
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
-        let bin = out.join("main_libfuzzer");
+        let bin = out.join(format!("main_libfuzzer{}", std::env::consts::EXE_SUFFIX));
         let ok = out.join("ok.bin");
         fs::write(&ok, b"hi").unwrap();
         let clean = crate::harness_command(&bin).arg(&ok).output().unwrap();

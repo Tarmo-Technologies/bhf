@@ -162,15 +162,35 @@ if (-not (Test-Path "$work\results\INDEX.md") -or
     -not (Test-Path "$work\auto\summary.txt")) {
     throw "Default Windows first run did not produce the documented results"
 }
+# The harness binary is main.exe, which PowerShell and cmd run by its path (an
+# extensionless one starts only through CreateProcess).
+$firstHarness = Get-ChildItem "$work\harnesses\*\main.exe" | Select-Object -First 1
+if (-not $firstHarness -or (Test-Path (Join-Path $firstHarness.DirectoryName "main"))) {
+    throw "The default lane did not build its harness as main.exe"
+}
+$plainInput = Join-Path $env:RUNNER_TEMP "bhf-plain-input.bin"
+[IO.File]::WriteAllBytes($plainInput, [byte[]](0x41, 0x41, 0x41, 0x41))
+& $firstHarness.FullName $plainInput
+if ($LASTEXITCODE -ne 0) { throw "PowerShell could not run $($firstHarness.FullName) (exit $LASTEXITCODE)" }
+cmd /c "`"$($firstHarness.FullName)`" `"$plainInput`""
+if ($LASTEXITCODE -ne 0) { throw "cmd could not run $($firstHarness.FullName) (exit $LASTEXITCODE)" }
+
+# The lanes below are checked for the bug each fixture plants. They start from
+# an input that reaches it, so the steps check that each lane builds, runs and
+# reports it, whatever the runner's speed: on a loaded runner a lane can run
+# only a few dozen inputs in its budget, too few to find it by fuzzing.
 
 # A Visual Studio solution in a directory with spaces: the project import reads
 # its include dirs and defines (it runs nothing), and the planted heap overflow
-# is found with the clang lane and with the MSVC cl.exe lane.
+# is found with the clang lane and with the MSVC cl.exe lane. The seed is the
+# magic byte, a count of 16 and 16 slot bytes: twice the table's 8 slots.
+$solutionSeed = Join-Path $env:RUNNER_TEMP "bhf-vs-solution-seed.bin"
+[IO.File]::WriteAllBytes($solutionSeed, [byte[]](@(0x57, 16) + @(0x41) * 16))
 $solutionRoot = Join-Path $env:RUNNER_TEMP "My Projects\vs solution"
 Remove-Item -Recurse -Force $solutionRoot -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $solutionRoot | Out-Null
 Copy-Item -Recurse (Join-Path $repoRoot "tests\fixtures\windows\vs_solution\*") $solutionRoot
-foreach ($lane in @(@{ Name = "clang"; Extra = @() }, @{ Name = "cl"; Extra = @("--cc", "cl") })) {
+foreach ($lane in @(@{ Name = "clang"; Extra = @("--seed-file", $solutionSeed) }, @{ Name = "cl"; Extra = @("--cc", "cl", "--seed-file", $solutionSeed) })) {
     $laneWork = Join-Path $env:RUNNER_TEMP "My Projects\work $($lane.Name)"
     $run = Invoke-BhfAuto $solutionRoot $laneWork $lane.Extra
     if ($run.Log -notmatch "read 2 ClCompile entries from vs\\Widget\.sln \(config Debug\|x64, static evaluation\)") {
@@ -213,8 +233,11 @@ if ($run.Log -notmatch "--build-command: recorded 2 translation unit\(s\)") {
     throw "The MSBuild capture did not record the solution's two translation units"
 }
 
-# C++, with both lanes.
-foreach ($lane in @(@{ Name = "clang"; Extra = @() }, @{ Name = "cl"; Extra = @("--cc", "cl") })) {
+# C++, with both lanes. The seed is a record of four tokens, whose count
+# indexes past the four-entry weight table.
+$cppSeed = Join-Path $env:RUNNER_TEMP "bhf-cpp-tokens-seed.bin"
+[IO.File]::WriteAllBytes($cppSeed, [Text.Encoding]::ASCII.GetBytes("T,,,"))
+foreach ($lane in @(@{ Name = "clang"; Extra = @("--seed-file", $cppSeed) }, @{ Name = "cl"; Extra = @("--cc", "cl", "--seed-file", $cppSeed) })) {
     $cppWork = "$env:RUNNER_TEMP\bhf-windows-cpp-$($lane.Name)"
     $null = Invoke-BhfAuto (Join-Path $repoRoot "tests\fixtures\windows\cpp_tokens") $cppWork $lane.Extra "cpp"
     $findings = Get-Content "$cppWork\results\findings.json" -Raw | ConvertFrom-Json
@@ -255,14 +278,13 @@ $aflBuild = & make main_afl AFLPP_CC=clang "AFLPP_CFLAGS=-g -O1 -fsanitize=addre
     ForEach-Object { "$_" } | Out-String
 $ErrorActionPreference = "Stop"
 $aflBuild | Out-Host
-if (-not (Test-Path main_afl)) {
-    throw "The sequence template's own driver did not build"
+if (-not (Test-Path main_afl.exe)) {
+    throw "The sequence template's own driver did not build main_afl.exe"
 }
 Assert-NoGnuOnlyLinkWarning $aflBuild "make main_afl"
-Copy-Item main_afl standalone.exe -Force
 [IO.File]::WriteAllBytes((Join-Path $sequenceHarness "plain.bin"), [byte[]](1, 2, 3, 4, 5, 6, 7, 8))
 $ErrorActionPreference = "Continue"
-$plainOutput = & .\standalone.exe plain.bin 2>&1 | ForEach-Object { "$_" } | Out-String
+$plainOutput = & .\main_afl.exe plain.bin 2>&1 | ForEach-Object { "$_" } | Out-String
 $plainExit = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 if ($plainExit -ne 0) {
@@ -272,7 +294,7 @@ $crash = Get-ChildItem "$sequenceWork\results\findings\*\testcase.bin" -ErrorAct
     Select-Object -First 1
 if ($crash) {
     $ErrorActionPreference = "Continue"
-    $crashOutput = & .\standalone.exe $crash.FullName 2>&1 | ForEach-Object { "$_" } | Out-String
+    $crashOutput = & .\main_afl.exe $crash.FullName 2>&1 | ForEach-Object { "$_" } | Out-String
     $ErrorActionPreference = "Stop"
     # The crash run is expected to exit non-zero (ASan aborts). Clear its exit
     # code so the step does not inherit it as the script's result.

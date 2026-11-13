@@ -168,10 +168,12 @@ fn inputs(args: &DecodeArgsArgs) -> Result<Inputs, String> {
     };
     let (binary, mut layout_dirs) = match &args.harness {
         Some(path) if path.is_dir() => {
-            let binary = ["main", "main.exe"]
-                .iter()
-                .map(|leaf| path.join(leaf))
-                .find(|candidate| candidate.is_file());
+            let binary = [
+                crate::auto::layout::harness_exe(path, "main"),
+                path.join("main.exe"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.is_file());
             (binary, vec![path.clone()])
         }
         Some(path) => (

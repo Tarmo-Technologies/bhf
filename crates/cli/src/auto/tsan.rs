@@ -130,7 +130,7 @@ fn replay_one(
     )
     .map(|o| o.status.success())
     .unwrap_or(false);
-    let bin = hdir.join("main_tsan");
+    let bin = crate::auto::layout::harness_exe(hdir, "main_tsan");
     if !built || !bin.is_file() {
         return TsanReplay::default();
     }

@@ -357,11 +357,12 @@ fn replay_one(
             *source = coverage;
         }
     }
-    let bin = hdir.join("main_cov");
     // AUTO_EXTRA_SOURCES is not a Make prerequisite, so an old main_cov can look
     // up-to-date after the repair closure changes. Force this generated lane to
     // relink from the checkpointed recipe.
-    let _ = std::fs::remove_file(&bin);
+    for stale in [hdir.join("main_cov"), hdir.join("main_cov.exe")] {
+        let _ = std::fs::remove_file(stale);
+    }
     let runtime_libraries = COVERAGE_RUNTIME_LIBRARIES.join(" ");
     let build_output = crate::build::try_run_c_make_build_with_target_and_ldflags(
         work_dir,
@@ -373,6 +374,7 @@ fn replay_one(
         recipe.standard.as_deref(),
         (!runtime_libraries.is_empty()).then_some(runtime_libraries.as_str()),
     );
+    let bin = crate::auto::layout::harness_exe(hdir, "main_cov");
     if !build_output.status.success() || !bin.is_file() {
         let stdout = diagnostic_tail(&build_output.stdout);
         let stderr = diagnostic_tail(&build_output.stderr);

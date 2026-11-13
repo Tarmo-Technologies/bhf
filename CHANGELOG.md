@@ -5,6 +5,39 @@
 ## Unreleased
 
 ### Fixed
+- Windows: every harness binary is now named with `.exe` (`main.exe`,
+  `main_cov.exe`, `main_afl.exe`, the Go lane's `main.exe`). The default
+  clang lane wrote an extensionless `main`, which cmd ("is not recognized as
+  an internal or external command") and PowerShell ("Cannot run a document
+  in the middle of a pipeline") could not start, so the documented direct run
+  of a harness failed there. `make main`, `make cov` and `make main_afl` still
+  build them, a work dir built before keeps working, and `replay.py` looks
+  for `main.exe` first. On Windows `bhf explain` quotes the commands it
+  prints for PowerShell (an apostrophe in a path broke them), and prints the
+  direct run as a PowerShell command naming the binary and the recorded
+  testcase, once: on stdin through cmd for a harness that reads stdin, and
+  through `Start-Process` for an older work dir's extensionless binary.
+- A target built under the Windows platform stub on a Linux host (a Windows
+  branch, MFC `CString`, Win32 typedefs) builds again: the stub defines
+  `_WIN32` over glibc, and the harness took the Windows C runtime's
+  `_tempnam`/`fopen_s` for a `FILE *` stream ("called object type 'int' is
+  not a function"). The harness's Windows code is now chosen by the Windows C
+  runtime (a compiler for a Windows target), not by `_WIN32`, so such a build
+  also keeps the runtrace input hook and the POSIX driver of an AFL++ build.
+- The repair loop no longer stubs a symbol of the compiler's own runtimes
+  (`__asan_*`, `__sanitizer_*`, `__llvm_profile_*`, `__gcov_*`, `__cxa_*`,
+  `_Unwind_*`, `__stack_chk_fail`), and on a link against the Windows C
+  runtime (Windows, or a MinGW cross build) none of that runtime's or MinGW's
+  names (`_dup`, `__mingw_fprintf`, `__main`, `__chkstk`, `__imp_*`). An
+  undefined one means the link left a runtime out or mixed objects of two
+  toolchains; a stub returning 0 made such a target build "STUB-ONLY" with
+  bhf's own driver broken. The build now fails with the linker's error. A
+  definition in the scanned tree is still linked, and off Windows names like
+  `_write` and `_read` (a newlib port's syscall hooks) are stubbed as before.
+- Windows release smoke: each step that checks for a fixture's planted bug
+  (the Visual Studio solution's clang and cl lanes, the C++ clang and cl
+  lanes) starts from an input that reaches it, so a slow runner, where a lane
+  can run only a few dozen inputs in its budget, no longer fails it.
 - A finding from a build with fabricated inputs, or from a forced stub build,
   now has `actionability.confidence` `low` in its `finding.json`, the level
   findings.json, findings.csv, INDEX.md and `bhf explain` already gave it; it

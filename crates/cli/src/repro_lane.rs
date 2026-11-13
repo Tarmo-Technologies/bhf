@@ -631,26 +631,34 @@ pub(crate) fn alternative(
     // replay.py looks the harness up where this lookup did: it would not
     // find it either. Nor would `bhf build`, which builds a harness dir.
     if let Refusal::HarnessNotFound { harness_id, .. } = refusal {
-        let work = sh_word(&work_dir.to_string_lossy());
-        let id = sh_word(harness_id);
+        let work = host_word(&work_dir.to_string_lossy());
+        let id = host_word(harness_id);
         return Some(format!(
             "bhf replay --finding {} --harness <harness binary>, given a binary of the \
              harness; or get the harness back first: bhf auto <source tree> --work-dir \
              {work} generates and builds it again, or bhf generate-harness <source> \
              --target <function> --id {id} --output {} and then bhf build {work} \
              --harness {id}",
-            sh_word(&finding.dir.to_string_lossy()),
-            sh_word(&work_dir.join("harnesses").to_string_lossy()),
+            host_word(&finding.dir.to_string_lossy()),
+            host_word(&work_dir.join("harnesses").to_string_lossy()),
         ));
     }
     let replay = finding.dir.join("replay.py");
     if replay.is_file() && replay_py_finds_harness(work_dir, finding) {
         // Windows' Python installer provides `python`, not `python3`.
         let python = if cfg!(windows) { "python" } else { "python3" };
-        return Some(format!("{python} {}", sh_word(&replay.to_string_lossy())));
+        return Some(format!("{python} {}", host_word(&replay.to_string_lossy())));
     }
     let binary = native_harness_binary(work_dir, harness_id?)?;
     let input = crash_inputs(&finding.dir).pop()?;
+    if cfg!(windows) {
+        return Some(powershell_direct_command(
+            work_dir,
+            &binary,
+            &input,
+            crate::replay::is_leak_finding(&finding.raw),
+        ));
+    }
     // An Ada harness reads its input from stdin and reports through its event
     // log; the shared detector says which protocol the binary speaks.
     let detection = crate::protocol_detect::detect(&binary, &[work_dir]);
@@ -691,7 +699,7 @@ pub(crate) fn replay_py_finds_harness(work_dir: &Path, finding: &FindingRecord) 
         .any(|path| path.is_file())
         || harness_id.is_some_and(|id| {
             harness_dir_candidates(work_dir, id).iter().any(|dir| {
-                ["main", "main_afl", "main.exe", "main_afl.exe"]
+                crate::auto::layout::harness_exe_leaves()
                     .iter()
                     .any(|leaf| dir.join(leaf).is_file())
             })
@@ -708,6 +716,9 @@ pub(crate) fn replay_py_finds_harness(work_dir: &Path, finding: &FindingRecord) 
 /// harness built for another platform runs under the emulator recorded beside
 /// it (`bhf_runner.json`), with the options of an emulated replay.
 pub(crate) fn direct_harness_command(binary: &Path, input: &Path, leak: bool) -> String {
+    if cfg!(windows) {
+        return powershell_harness_command(binary, input, leak);
+    }
     let emulated = crate::gate_evidence::recorded_runner(binary).is_some();
     let mut words: Vec<String> = crate::fuzz::sanitizer_child_env_for(leak, emulated)
         .into_iter()
@@ -716,6 +727,74 @@ pub(crate) fn direct_harness_command(binary: &Path, input: &Path, leak: bool) ->
     words.extend(runner_words(binary));
     words.push(sh_word(&input.to_string_lossy()));
     words.join(" ")
+}
+
+/// [`direct_harness_command`] as a PowerShell line, the shell bhf's Windows
+/// instructions use: the sanitizer options set as `$env:` variables, then the
+/// binary (`main.exe`, which PowerShell and cmd run by its path) called with
+/// `&` on the input.
+pub(crate) fn powershell_harness_command(binary: &Path, input: &Path, leak: bool) -> String {
+    use crate::repro_lane::windows::ps_literal;
+    let runner = crate::gate_evidence::recorded_runner(binary);
+    let mut parts: Vec<String> = crate::fuzz::sanitizer_child_env_for(leak, runner.is_some())
+        .into_iter()
+        .map(|(key, value)| format!("$env:{key} = {}", ps_literal(&value)))
+        .collect();
+    let by_path = binary.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+    });
+    if runner.is_none() && !by_path {
+        // An extensionless binary (a work dir built before harness binaries
+        // were named `.exe`): PowerShell's `&` will not run it ("Cannot run a
+        // document in the middle of a pipeline"), Start-Process does.
+        parts.push(format!(
+            "Start-Process -Wait -NoNewWindow -FilePath {} -ArgumentList {}",
+            ps_literal(&binary.to_string_lossy()),
+            ps_literal(&format!("\"{}\"", input.display()))
+        ));
+        return parts.join("; ");
+    }
+    let mut call = vec!["&".to_owned()];
+    if let Some(runner) = runner {
+        call.push(ps_literal(&runner.program.to_string_lossy()));
+        call.extend(runner.args.iter().map(|arg| ps_literal(arg)));
+    }
+    call.push(ps_literal(&binary.to_string_lossy()));
+    call.push(ps_literal(&input.to_string_lossy()));
+    parts.push(call.join(" "));
+    parts.join("; ")
+}
+
+/// A harness that reads its input from stdin (an Ada harness, which reports
+/// through its event log) run on `input` from PowerShell: through cmd, whose
+/// `<` hands the file's bytes over unchanged (Windows PowerShell pipes text),
+/// with the event log in a temporary file. `--%` passes the cmd line on as
+/// written.
+pub(crate) fn powershell_stdin_command(binary: &Path, input: &Path) -> String {
+    format!(
+        "$env:BHF_EVENTS_PATH = Join-Path $env:TEMP 'bhf-events.log'; cmd --% /c \"\"{}\" < \"{}\"\"",
+        binary.display(),
+        input.display()
+    )
+}
+
+/// The PowerShell command that runs `binary` directly on `input` as its
+/// protocol expects: on stdin for a harness that reads stdin
+/// ([`powershell_stdin_command`]), else with the input's path and the
+/// replay's sanitizer options ([`powershell_harness_command`]).
+pub(crate) fn powershell_direct_command(
+    work_dir: &Path,
+    binary: &Path,
+    input: &Path,
+    leak: bool,
+) -> String {
+    let detection = crate::protocol_detect::detect(binary, &[work_dir]);
+    if detection.protocol == crate::protocol_detect::HarnessProtocol::StdinEventLog
+        && detection.basis != crate::protocol_detect::ProtocolBasis::Default
+    {
+        return powershell_stdin_command(binary, input);
+    }
+    powershell_harness_command(binary, input, leak)
 }
 
 /// `binary` as shell words, behind the emulator recorded beside it when there
@@ -751,16 +830,16 @@ pub(crate) fn harness_dirs(work_dir: &Path, harness_id: &str) -> Vec<PathBuf> {
 }
 
 /// The built executable of a native harness: `build/<id>/main` (`bhf build`),
-/// then `main` in the harness dirs (`bhf auto` builds in place).
+/// then `main` in the harness dirs (`bhf auto` builds in place); `main.exe`
+/// on Windows.
 pub(crate) fn native_harness_binary(work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
     let build = work_dir.join("build").join(harness_id);
-    [build.join("main"), build.join("obj").join("main")]
+    [build.clone(), build.join("obj")]
         .into_iter()
-        .chain(
-            crate::auto::layout::harness_dir_candidates(work_dir, harness_id)
-                .into_iter()
-                .map(|dir| dir.join("main")),
-        )
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .map(|dir| crate::auto::layout::harness_exe(&dir, "main"))
         .find(|path| path.is_file())
 }
 
@@ -2189,7 +2268,7 @@ impl CFamilyLane {
                     .into_iter()
                     .next();
             }
-            if line.starts_with("main:") {
+            if crate::build::is_main_rule(line) {
                 in_main = true;
                 continue;
             }
@@ -2399,9 +2478,10 @@ impl CFamilyLane {
                 source: "environment",
             };
         }
-        let built = [harness_dir.join("main"), harness_dir.join("obj/main")]
+        let built = [harness_dir.to_path_buf(), harness_dir.join("obj")]
             .iter()
-            .find_map(|binary| binary_compiler_family(binary))
+            .map(|dir| crate::auto::layout::harness_exe(dir, "main"))
+            .find_map(|binary| binary_compiler_family(&binary))
             .map(|family| (family, "harness binary"))
             .or_else(|| recorded.map(|family| (family, "build recipe")));
         match built {
@@ -3997,6 +4077,32 @@ fn common_ancestor<'a>(dirs: impl Iterator<Item = &'a Path>) -> Option<PathBuf> 
 /// One POSIX shell word for `value`: unchanged when every character is plain,
 /// otherwise single-quoted, with each `'` written as `'\''`. Source names come
 /// from the scanned tree and may carry spaces or apostrophes (`rec ord.c`).
+/// `value` as one word of the operator's shell: PowerShell's on Windows, where
+/// bhf's instructions are PowerShell ([`ps_word`]), POSIX sh's elsewhere
+/// ([`sh_word`]).
+pub(crate) fn host_word(value: &str) -> String {
+    if cfg!(windows) {
+        ps_word(value)
+    } else {
+        sh_word(value)
+    }
+}
+
+/// `value` as one PowerShell word: bare when it is made only of letters,
+/// digits, `.`, `_` and `-`, else a single-quoted literal (a path, with its
+/// drive colon and backslashes, always is).
+pub(crate) fn ps_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        value.to_owned()
+    } else {
+        crate::repro_lane::windows::ps_literal(value)
+    }
+}
+
 pub(crate) fn sh_word(value: &str) -> String {
     let plain = !value.is_empty()
         && value.chars().all(|c| {
@@ -4568,7 +4674,11 @@ mod tests {
     fn the_direct_harness_command_takes_the_replay_sanitizer_options() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        let binary = work.join("harnesses").join("H-X0001").join("main");
+        // The binary as a build names it: `main.exe` on Windows.
+        let binary = work
+            .join("harnesses")
+            .join("H-X0001")
+            .join(crate::auto::layout::harness_exe_name("main"));
         write(&binary, "\x7fELF");
         let fdir = work.join("results/findings/F-1");
         let input = fdir.join("testcase.bin");
@@ -4591,19 +4701,142 @@ mod tests {
                 .into_iter()
                 .map(|(key, value)| format!("{key}={}", sh_word(&value)))
                 .collect();
-            assert_eq!(
-                command,
+            // In the host shell's own spelling: PowerShell on Windows.
+            let expected = if cfg!(windows) {
+                let options: Vec<String> = crate::fuzz::sanitizer_child_env(leaks)
+                    .into_iter()
+                    .map(|(key, value)| format!("$env:{key} = '{value}'"))
+                    .collect();
+                // The temp dir's path holds no quote, so each is '<path>'.
+                format!(
+                    "{}; & '{}' '{}'",
+                    options.join("; "),
+                    binary.display(),
+                    input.display()
+                )
+            } else {
                 format!(
                     "{} {} {}",
                     options.join(" "),
                     sh_word(&binary.to_string_lossy()),
                     sh_word(&input.to_string_lossy())
                 )
-            );
+            };
+            assert_eq!(command, expected);
             assert!(command.contains(":halt_on_error=1"), "{command}");
             assert!(command.contains("report_error_type=1"), "{command}");
             assert_eq!(command.contains("detect_leaks=1"), leaks, "{command}");
         }
+    }
+
+    /// The PowerShell form of the direct run: each sanitizer option as an
+    /// `$env:` assignment, then the binary called with `&` on the input, every
+    /// path one single-quoted word however it is spelled (`R&D`, `O'Brien`).
+    #[test]
+    fn a_powershell_direct_run_quotes_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = dir.path().join("R&D files").join("O'Brien");
+        std::fs::create_dir_all(&harness).unwrap();
+        let binary = harness.join("main.exe");
+        std::fs::write(&binary, b"MZ").unwrap();
+        let input = dir.path().join("in put.bin");
+        let command = powershell_harness_command(&binary, &input, false);
+        let call = command.rsplit("; ").next().unwrap();
+        assert_eq!(
+            call,
+            format!(
+                "& {} {}",
+                windows::ps_literal(&binary.to_string_lossy()),
+                windows::ps_literal(&input.to_string_lossy())
+            )
+        );
+        assert!(call.contains("O''Brien"), "{call}");
+        for (key, value) in crate::fuzz::sanitizer_child_env_for(false, false) {
+            assert!(
+                command.contains(&format!("$env:{key} = {}", windows::ps_literal(&value))),
+                "{command}"
+            );
+        }
+    }
+
+    /// A PowerShell word: a bare id, a path single-quoted with its apostrophes
+    /// doubled, so a printed command pastes into PowerShell whatever the path.
+    #[test]
+    fn a_powershell_word_quotes_paths_and_doubles_apostrophes() {
+        assert_eq!(ps_word("F-0001-0a0b0c0d"), "F-0001-0a0b0c0d");
+        assert_eq!(
+            ps_word(r"C:\R&D files\O'Brien\x.bin"),
+            r"'C:\R&D files\O''Brien\x.bin'"
+        );
+        assert_eq!(ps_word(""), "''");
+        if cfg!(windows) {
+            assert_eq!(host_word(r"C:\w\it's"), r"'C:\w\it''s'");
+        } else {
+            assert_eq!(host_word("/w/it's"), "'/w/it'\\''s'");
+        }
+    }
+
+    /// An extensionless harness binary (a work dir built before harness
+    /// binaries were named `.exe`) is run through Start-Process, which runs it;
+    /// PowerShell's `&` does not. A `.exe` is called with `&`.
+    #[test]
+    fn an_extensionless_harness_runs_through_start_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in put.bin");
+        for (name, expected) in [
+            (
+                "main",
+                format!(
+                    "Start-Process -Wait -NoNewWindow -FilePath '{}' -ArgumentList '\"{}\"'",
+                    dir.path().join("main").display(),
+                    input.display()
+                ),
+            ),
+            (
+                "main.exe",
+                format!(
+                    "& '{}' '{}'",
+                    dir.path().join("main.exe").display(),
+                    input.display()
+                ),
+            ),
+        ] {
+            let binary = dir.path().join(name);
+            std::fs::write(&binary, b"MZ").unwrap();
+            let command = powershell_harness_command(&binary, &input, false);
+            assert!(command.ends_with(&expected), "{command}");
+        }
+    }
+
+    /// A harness that reads stdin (an Ada harness, with its event log) is run
+    /// from PowerShell on stdin, through cmd, not handed the input's path.
+    #[test]
+    fn a_stdin_harness_is_run_on_stdin_from_powershell() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses").join("H-A0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        let binary = harness.join("main.exe");
+        std::fs::write(&binary, b"MZ\0GNAT Version: 14\0BHF_EVENTS_PATH\0").unwrap();
+        let input = work.path().join("testcase.bin");
+        let command = powershell_direct_command(work.path(), &binary, &input, false);
+        assert_eq!(
+            command,
+            format!(
+                "$env:BHF_EVENTS_PATH = Join-Path $env:TEMP 'bhf-events.log'; \
+                 cmd --% /c \"\"{}\" < \"{}\"\"",
+                binary.display(),
+                input.display()
+            )
+        );
+        // A framed C harness gets the input's path.
+        let c_binary = harness.join("c.exe");
+        std::fs::write(&c_binary, b"MZ").unwrap();
+        std::fs::write(harness.join("main.c"), "/* BHF_FRAMED */\n").unwrap();
+        let command = powershell_direct_command(work.path(), &c_binary, &input, false);
+        assert!(
+            command.contains(&format!("& '{}'", c_binary.display())),
+            "{command}"
+        );
     }
 
     /// A finding whose harness is gone from the work dir gets no replay.py
@@ -4629,7 +4862,8 @@ mod tests {
         assert!(!hint.contains("replay.py"), "{hint}");
         // `bhf build` alone has no harness dir to build from: the hint
         // regenerates the harness first, or replays a binary the reader has.
-        let quoted = sh_word(&work.to_string_lossy());
+        // Each path one word of the host's shell (PowerShell on Windows).
+        let quoted = host_word(&work.to_string_lossy());
         assert!(
             !hint.starts_with("bhf build") && !hint.contains("after rebuilding"),
             "{hint}"
@@ -4638,12 +4872,12 @@ mod tests {
             format!("bhf auto <source tree> --work-dir {quoted}"),
             format!(
                 "bhf generate-harness <source> --target <function> --id H-C0001 --output {}",
-                sh_word(&work.join("harnesses").to_string_lossy())
+                host_word(&work.join("harnesses").to_string_lossy())
             ),
             format!("bhf build {quoted} --harness H-C0001"),
             format!(
                 "bhf replay --finding {} --harness <harness binary>",
-                sh_word(&fdir.to_string_lossy())
+                host_word(&fdir.to_string_lossy())
             ),
         ] {
             assert!(hint.contains(&command), "{command}\n{hint}");
@@ -4750,6 +4984,17 @@ mod tests {
         };
         let raw = json!({"id": "F-1", "classification": "unhandled", "harness_id": "H-C0001"});
         let command = alternative(work, &finding(&fdir, raw), &refusal).unwrap();
+        assert!(command.contains("abort_on_error=0"), "{command}");
+        if cfg!(windows) {
+            // PowerShell's spelling: the emulator called with `&`, every word
+            // quoted.
+            assert_eq!(command, powershell_harness_command(&binary, &input, false));
+            assert!(
+                command.contains("& 'qemu-aarch64' '-L' '/usr/aarch64-linux-gnu' '"),
+                "{command}"
+            );
+            return;
+        }
         let options: Vec<String> = crate::fuzz::sanitizer_child_env_for(false, true)
             .into_iter()
             .map(|(key, value)| format!("{key}={}", sh_word(&value)))

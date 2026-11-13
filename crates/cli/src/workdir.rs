@@ -28,7 +28,7 @@ fn prepare_with(work_dir: &Path, rebuilds_results: bool) -> anyhow::Result<()> {
             lines.push(format!(
                 "bhf:   this command does not rebuild results/; to rebuild it, run: bhf report \
                  --work-dir {}",
-                crate::repro_lane::sh_word(&work_dir.to_string_lossy())
+                crate::repro_lane::host_word(&work_dir.to_string_lossy())
             ));
         }
         for line in lines {

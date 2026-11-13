@@ -20144,6 +20144,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         make_dry_run_goal(dir, "main", vars)
     }
 
+    /// How a dry run spells the `main` link's output: `-o main.exe` on Windows.
+    const MAIN_LINK: &str = if cfg!(windows) { "main.exe " } else { "main " };
+
     /// [`make_dry_run`] for the make goal `goal`.
     fn make_dry_run_goal(dir: &Path, goal: &str, vars: &[(&str, &str)]) -> String {
         let mut command = std::process::Command::new("make");
@@ -20184,6 +20187,35 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .unwrap_or_else(|| panic!("no recipe for {object} in:\n{dry_run}"))
     }
 
+    /// The readers of a generated Makefile (the capsule's recipe, `bhf
+    /// build`'s link hints) find its `main` rule, which is spelled
+    /// `main$(EXEEXT):` so a Windows build names the binary `main.exe`, and
+    /// not the bare-goal rule that builds it under that name.
+    #[test]
+    fn makefile_readers_find_the_main_rule_and_its_sources() {
+        let root = temp_dir("makefile-main-rule");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&c_source, "parse_record", "H-MAIN-RULE", &root);
+        let text = fs::read_to_string(dir.join("Makefile")).unwrap();
+        let facts = crate::repro_lane::C_LANE.parse_makefile(&text);
+        assert!(facts.has_main_rule, "{text}");
+        assert_eq!(facts.target_sources.len(), 1, "{text}");
+        assert!(
+            facts.target_sources[0].ends_with("widget.c"),
+            "{:?}\n{text}",
+            facts.target_sources
+        );
+        let (sources, _) = crate::build::makefile_target_context(&dir);
+        assert_eq!(sources, facts.target_sources);
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The toolchain's preprocessor words and library operands reach every
     /// lane of both Makefiles, not just `main`: a lane built with another
     /// compiler (coverage, AFL++, libFuzzer, MSan, TSan, differential) that
@@ -20208,18 +20240,20 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("BHF_TOOLCHAIN_CXX_CPPFLAGS", "-include iostream"),
             ("BHF_TOOLCHAIN_LIBS", "-L/opt/vend/lib -lvendor"),
         ];
+        // Each binary carries the platform's executable suffix (`.exe` on Windows).
+        let exe = |stem: &str| format!("{stem}{} ", std::env::consts::EXE_SUFFIX);
         for (goal, binary) in [
-            ("main", "main "),
-            ("prov", "main_prov "),
-            ("afl", "main_afl "),
-            ("libfuzzer", "main_libfuzzer "),
-            ("msan", "main_msan "),
-            ("tsan", "main_tsan "),
-            ("cov", "main_cov "),
-            ("diff", "main_diff "),
+            ("main", "main"),
+            ("prov", "main_prov"),
+            ("afl", "main_afl"),
+            ("libfuzzer", "main_libfuzzer"),
+            ("msan", "main_msan"),
+            ("tsan", "main_tsan"),
+            ("cov", "main_cov"),
+            ("diff", "main_diff"),
         ] {
             let dry_run = make_dry_run_goal(&c_dir, goal, &vars);
-            let link = recipe_for(&dry_run, binary);
+            let link = recipe_for(&dry_run, &exe(binary));
             assert!(
                 link.contains("-DBOARD_REV=7") && link.contains("-L/opt/vend/lib -lvendor"),
                 "C {goal}: {link}"
@@ -20237,14 +20271,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         .unwrap();
         let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-LANES-CPP", &cpp_root);
         for (goal, binary) in [
-            ("main", "main "),
-            ("afl", "main_afl "),
-            ("libfuzzer", "main_libfuzzer "),
-            ("cov", "main_cov "),
-            ("diff", "main_diff "),
+            ("main", "main"),
+            ("afl", "main_afl"),
+            ("libfuzzer", "main_libfuzzer"),
+            ("cov", "main_cov"),
+            ("diff", "main_diff"),
         ] {
             let dry_run = make_dry_run_goal(&cpp_dir, goal, &vars);
-            let link = recipe_for(&dry_run, binary);
+            let link = recipe_for(&dry_run, &exe(binary));
             assert!(
                 link.contains("-include iostream") && link.contains("-L/opt/vend/lib -lvendor"),
                 "C++ {goal}: {link}"
@@ -20340,7 +20374,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                     ("BHF_TOOLCHAIN_C_CPPFLAGS", "-Wp,-D_FORTIFY_SOURCE=2"),
                 ],
             );
-            let main = recipe_for(&c, "main ");
+            let main = recipe_for(&c, MAIN_LINK);
             assert!(main.contains(&off), "C {family}: {main}");
             // Not even the build context's or a toolchain's own define turns
             // it back on.
@@ -20352,7 +20386,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                 &cpp_dir,
                 &[("BHF_CXX_FAMILY", family), ("BHF_CC_FAMILY", family)],
             );
-            let cpp_main = recipe_for(&cpp, "main ");
+            let cpp_main = recipe_for(&cpp, MAIN_LINK);
             assert!(cpp_main.contains(&off), "C++ {family}: {cpp_main}");
             if have_tool(family) {
                 for (language, recipe) in [("C", main), ("C++", cpp_main)] {
@@ -20368,11 +20402,11 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // The other sanitized lanes too.
         let text = fs::read_to_string(c_dir.join("Makefile")).unwrap();
         for lane in [
-            "main_afl:",
-            "main_msan:",
-            "main_tsan:",
-            "main_diff:",
-            "main_prov:",
+            "main_afl$(EXEEXT):",
+            "main_msan$(EXEEXT):",
+            "main_tsan$(EXEEXT):",
+            "main_diff$(EXEEXT):",
+            "main_prov$(EXEEXT):",
         ] {
             let recipe = text
                 .lines()
@@ -20386,7 +20420,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         }
         // A build without a sanitizer keeps the platform's fortification.
         let plain = make_dry_run(&c_dir, &[("BHF_CC_FAMILY", "gcc"), ("CFLAGS", "-O1 -g")]);
-        assert!(!recipe_for(&plain, "main ").contains(&off), "{plain}");
+        assert!(!recipe_for(&plain, MAIN_LINK).contains(&off), "{plain}");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -20411,7 +20445,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let front_end = "C:/Users/Some One/bhf/bhf-cl.exe";
         let c_dir = generate_for_make_test(&c_source, "parse_record", "H-MSVC-C", &root);
         let dry_run = make_dry_run(&c_dir, &[("CC", &format!("\"{front_end}\""))]);
-        let main = recipe_for(&dry_run, "main ");
+        let main = recipe_for(&dry_run, MAIN_LINK);
         assert!(
             main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
             "{main}"
@@ -20432,7 +20466,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-MSVC-CPP", &cpp_root);
         let quoted = format!("\"{front_end}\"");
         let dry_run = make_dry_run(&cpp_dir, &[("CXX", &quoted), ("CC", &quoted)]);
-        let main = recipe_for(&dry_run, "main ");
+        let main = recipe_for(&dry_run, MAIN_LINK);
         assert!(
             main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
             "{main}"
@@ -20479,7 +20513,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             !driver.contains("-std=gnu89") && !driver.contains("-Werror"),
             "{driver}"
         );
-        let main = recipe_for(&dry_run, "main ");
+        let main = recipe_for(&dry_run, MAIN_LINK);
         assert!(
             main.contains("-DWIDGET_ABI_MARK=1") && main.contains("-std=gnu89"),
             "{main}"
@@ -20521,7 +20555,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "{driver}"
         );
         assert!(
-            recipe_for(&dry_run, "main ").contains("-include iostream"),
+            recipe_for(&dry_run, MAIN_LINK).contains("-include iostream"),
             "{dry_run}"
         );
         fs::remove_dir_all(&root).ok();

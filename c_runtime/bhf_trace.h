@@ -49,7 +49,10 @@
 #define BHF_TRACE_ASAN 1
 #endif
 #endif
-#if !defined(BHF_TRACE_ASAN) && defined(__SANITIZE_ADDRESS__) && !defined(_MSC_VER)
+/* gcc's spelling; MSVC defines it too but has no allocator queries. A gcc
+ * build under bhf's Windows platform stub (a stand-in _MSC_VER) is gcc's. */
+#if !defined(BHF_TRACE_ASAN) && defined(__SANITIZE_ADDRESS__) && \
+    (!defined(_MSC_VER) || defined(__GNUC__))
 #define BHF_TRACE_ASAN 1
 #endif
 

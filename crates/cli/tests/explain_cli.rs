@@ -287,3 +287,133 @@ fn explain_offers_replay_py_by_the_work_dir_not_the_current_dir() {
         );
     }
 }
+
+/// An overflow behind the magic bytes "BOOM".
+#[cfg(windows)]
+const OVERFLOW_C: &str = "\
+#include <string.h>
+int handle(const char *data, unsigned int len) {
+    char buf[8];
+    if (len < 4 || data[0] != 'B' || data[1] != 'O' || data[2] != 'O' || data[3] != 'M') return 0;
+    memcpy(buf, data, len);
+    return buf[0];
+}
+";
+
+/// On Windows a harness binary is `main.exe`, which cmd and PowerShell run by
+/// its path (an extensionless `main` starts only through CreateProcess:
+/// "is not recognized as an internal or external command"), and the direct
+/// run `bhf explain` prints is a PowerShell command that reproduces the crash
+/// as printed.
+#[cfg(windows)]
+#[test]
+fn the_printed_direct_run_starts_the_harness_from_powershell_and_cmd() {
+    if !clang_available() || which::which("make").is_err() {
+        eprintln!("skipping: clang/make not on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let src = root.path().join("overflow.c");
+    std::fs::write(&src, OVERFLOW_C).unwrap();
+    let out = {
+        let _guard = support::fuzz_serial_guard();
+        bhf()
+            .arg("snippet")
+            .arg(&src)
+            .args(["--lang", "c", "--per-target-time", "20", "--work-dir"])
+            .arg(&work)
+            .output()
+            .expect("run bhf snippet")
+    };
+    assert!(
+        finding_dir_nonempty(&work),
+        "snippet produced no crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let harnesses: Vec<_> = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("Makefile").is_file())
+        .collect();
+    assert_eq!(harnesses.len(), 1, "{harnesses:?}");
+    let binary = harnesses[0].join("main.exe");
+    assert!(
+        binary.is_file(),
+        "no main.exe in {}",
+        harnesses[0].display()
+    );
+    assert!(
+        !harnesses[0].join("main").exists(),
+        "an extensionless binary beside main.exe"
+    );
+
+    let explain = bhf()
+        .arg("explain")
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run bhf explain");
+    let text = String::from_utf8_lossy(&explain.stdout).into_owned();
+    let mut lines = text
+        .lines()
+        .skip_while(|line| !line.contains("To run the harness binary directly in PowerShell"))
+        .skip(1);
+    let mut script = Vec::new();
+    for line in lines.by_ref() {
+        let line = line.trim();
+        script.push(line.to_owned());
+        if line.contains("& '") {
+            break;
+        }
+    }
+    let call = script.last().cloned().unwrap_or_default();
+    let harness_id = harnesses[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        call.contains(&format!("{harness_id}\\main.exe' '")),
+        "the direct run names main.exe: {script:?}\n{text}"
+    );
+    let ran = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(script.join("; "))
+        .output()
+        .expect("run powershell");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        output.contains("AddressSanitizer"),
+        "the printed PowerShell run did not reproduce: {script:?}\n{output}"
+    );
+
+    // cmd runs it by its path too; bhf put the ASan runtime DLL beside it.
+    let input = call
+        .rsplit(" '")
+        .next()
+        .and_then(|word| word.strip_suffix('\''))
+        .expect("the input word")
+        .replace("''", "'");
+    let ran = Command::new("cmd")
+        .arg("/c")
+        .arg(&binary)
+        .arg(&input)
+        .output()
+        .expect("run cmd");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        output.contains("AddressSanitizer"),
+        "cmd /c {} {input} did not run the harness:\n{output}",
+        binary.display()
+    );
+}

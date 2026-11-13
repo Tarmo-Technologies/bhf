@@ -6,7 +6,21 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
-#if defined(_WIN32)
+
+/* BHF_WINDOWS_CRT: the harness is built for Windows, against its C runtime
+ * (MSVC's UCRT or MinGW-w64's): by cl, clang-cl, clang for *-windows-msvc, or
+ * MinGW's gcc or clang, each of which defines _WIN32 with _MSC_VER or
+ * __MINGW32__ and none of which builds an ELF or Mach-O object. `_WIN32` alone
+ * does not say so: bhf's Windows platform stub defines it, with a stand-in
+ * _MSC_VER, over the host's own C library, so a target's Windows branch
+ * builds on Linux, and that build has POSIX's calls and not Windows'. The
+ * harness templates select their Windows code by it too. */
+#if !defined(BHF_WINDOWS_CRT) && defined(_WIN32) && \
+    (defined(_MSC_VER) || defined(__MINGW32__)) && \
+    !defined(__unix__) && !defined(__ELF__) && !defined(__APPLE__)
+#define BHF_WINDOWS_CRT 1
+#endif
+#if defined(BHF_WINDOWS_CRT)
 #include <stdio.h>
 #endif
 
@@ -284,7 +298,7 @@ static inline wchar_t *bhf_wc_string(bhf_cursor *c, size_t max) {
  * temporary file that is deleted when the stream is closed, rewound to its
  * start. A macro, so a translation unit that never opens a stream does not
  * need fmemopen declared (a -std=c89 build does not declare it). */
-#if defined(_WIN32)
+#if defined(BHF_WINDOWS_CRT)
 static inline FILE *bhf_win_fmemopen(const unsigned char *buf, size_t size) {
     FILE *stream = NULL;
     char *name = _tempnam(NULL, "bhf_in");

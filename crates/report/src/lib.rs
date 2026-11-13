@@ -2749,6 +2749,16 @@ def fixture_fallback(fixture, work):
         yield path
 
 
+def harness_leaves(windows=None):
+    # A Windows build names its binaries main.exe and main_afl.exe (an
+    # extensionless main beside one is left from an older build); elsewhere
+    # the bare name is the harness and a .exe is a MinGW cross build.
+    windows = (os.name == "nt") if windows is None else windows
+    bare = ("main", "main_afl")
+    exe = ("main.exe", "main_afl.exe")
+    return exe + bare if windows else bare + exe
+
+
 def candidate_harnesses(finding):
     # 1) explicit override on the command line
     if len(sys.argv) > 1:
@@ -2769,7 +2779,7 @@ def candidate_harnesses(finding):
             roots.append(HERE.parent)
         for root in roots:
             for sub in ("harnesses", "auto", "generated_harnesses", "build"):
-                for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
+                for leaf in harness_leaves():
                     yield root / sub / hid / leaf
     # 4) a fixture_path into another work dir, as recorded
     for fixture in fixtures:
@@ -5004,6 +5014,59 @@ mod tests {
             "the existing sidecar dir goes first; a missing one is skipped"
         );
         assert_eq!(paths[1], "/usr/bin", "PATH is untouched off Windows");
+    }
+
+    /// replay.py looks for the binary a Windows build writes (`main.exe`) before
+    /// an extensionless `main` an older build left beside it; elsewhere the bare
+    /// name first.
+    #[test]
+    fn repro_py_prefers_the_platforms_binary_name() {
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let extra_env = serde_json::Map::new();
+        let script = super::render_repro_py(&super::ReproScript {
+            testcase_name: "testcase.bin",
+            harness_id: "h1",
+            extra_env: &extra_env,
+            ..Default::default()
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let finding = tmp.path().join("results/findings/F-0001-0a0b0c0d");
+        let harness_dir = tmp.path().join("harnesses/h1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        for leaf in ["main", "main.exe"] {
+            std::fs::write(harness_dir.join(leaf), b"MZ").unwrap();
+        }
+        std::fs::write(finding.join("replay.py"), &script).unwrap();
+        let probe = format!(
+            "import importlib.util, json, sys\n\
+             sys.argv = ['replay.py']\n\
+             spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
+             replay = importlib.util.module_from_spec(spec)\n\
+             spec.loader.exec_module(replay)\n\
+             first = {{}}\n\
+             for windows in (True, False):\n\
+             \x20   replay.harness_leaves.__defaults__ = (windows,)\n\
+             \x20   found = next(c for c in replay.candidate_harnesses({{}}) if c.is_file())\n\
+             \x20   first[str(windows)] = found.name\n\
+             print(json.dumps(first))\n",
+            script = finding.join("replay.py").display().to_string(),
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let first: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(first["True"], "main.exe", "{first}");
+        assert_eq!(first["False"], "main", "{first}");
     }
 
     #[cfg(unix)]

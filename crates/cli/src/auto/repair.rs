@@ -258,6 +258,12 @@ pub enum Repair {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct RepairManifest {
     pub repairs: Vec<Repair>,
+    /// The harness links against the Windows C runtime (a native Windows
+    /// build, or a MinGW cross build): the C runtime's and MinGW's own names
+    /// are then never stubbed. Elsewhere they are ordinary symbols (a newlib
+    /// port's `_write`).
+    #[serde(skip)]
+    pub windows_abi_link: bool,
 }
 
 impl RepairManifest {
@@ -3332,6 +3338,23 @@ pub(crate) fn plan_repair_forced_with_source_policy(
             if name == "main" {
                 return None;
             }
+            // A compiler or sanitizer runtime name, or on a Windows-ABI link a
+            // C runtime or MinGW one: the link left a runtime out or mixed
+            // objects of two toolchains, and a stub would link a harness whose
+            // runtime (bhf's own driver included) is broken. Only the tree's
+            // own definition is linked; otherwise the build fails with the
+            // real error.
+            if c_stub_gen::is_toolchain_runtime_symbol(name)
+                || (attempted.windows_abi_link && c_stub_gen::is_windows_runtime_symbol(name))
+            {
+                let source_path = decl_index.lookup_c_definition_source(name)?;
+                return (allow_source_addition
+                    && !attempted.already_attempted(&source_path.display().to_string()))
+                .then(|| Repair::AddSource {
+                    symbol: name.clone(),
+                    source_path: source_path.to_path_buf(),
+                });
+            }
             // A POSIX function whose prototype was hidden by the project's
             // feature/config macros must resolve from its host header before a
             // same-leaf project symbol is considered. Declaration indexes can
@@ -4714,6 +4737,7 @@ mod tests {
         // what must not recur.)
         let attempted = RepairManifest {
             repairs: vec![Repair::Win32Pack],
+            ..RepairManifest::default()
         };
         assert!(!matches!(
             plan_repair_with_attempts(&dword, &idx, &attempted),
@@ -4730,6 +4754,7 @@ mod tests {
         let idx = crate::auto::decl_index::DeclarationIndex::build(&tmpdir()).unwrap();
         let attempted = RepairManifest {
             repairs: vec![Repair::Win32Pack],
+            ..RepairManifest::default()
         };
         // The pack defines these with their real underlying types (`PUCHAR` is
         // `UCHAR *`, `DWORD` is `unsigned long`). A generic `typedef void *X`
@@ -4818,6 +4843,144 @@ mod tests {
             repair.is_none(),
             "main must never be stubbed; got: {repair:?}"
         );
+    }
+
+    /// A symbol of the compiler's own runtimes (sanitizers, coverage and
+    /// profiling, the C++ ABI and unwinder, stack protection) is never stubbed,
+    /// forced or not, on any link: an unresolved one means a runtime library was
+    /// left out, and a stub links a harness whose runtime is broken.
+    ///
+    /// The Windows C runtime's and MinGW's names (`_dup`, `__mingw_fprintf`,
+    /// `__main`, `__chkstk`, ...) are refused only for a Windows-ABI link, where
+    /// an undefined one means objects of two toolchains were mixed (a MinGW gcc
+    /// object in an MSVC-ABI link). Elsewhere they are ordinary symbols: a
+    /// newlib port's `_write` and `_read` are its board's syscall hooks, stubbed
+    /// like any other declared function. A tree's own definition is linked
+    /// either way.
+    #[test]
+    fn runtime_symbols_are_never_stubbed() {
+        let root = tmpdir();
+        let idx = crate::auto::decl_index::DeclarationIndex::build(&root).unwrap();
+        let windows_link = RepairManifest {
+            windows_abi_link: true,
+            ..RepairManifest::default()
+        };
+        let plan = |name: &str, manifest: &RepairManifest, force: bool| {
+            plan_repair_forced(
+                &BuildErrorKind::UndefinedSymbol {
+                    name: name.to_owned(),
+                },
+                &idx,
+                manifest,
+                force,
+            )
+        };
+        for name in [
+            "__stack_chk_fail",
+            "__asan_report_load4",
+            "__ubsan_handle_add_overflow",
+            "__sanitizer_cov_trace_pc_guard",
+            "__llvm_profile_runtime",
+            "__gcov_init",
+            "__cxa_pure_virtual",
+            "_Unwind_Resume",
+        ] {
+            for manifest in [&RepairManifest::default(), &windows_link] {
+                for force in [false, true] {
+                    let repair = plan(name, manifest, force);
+                    assert!(
+                        repair.is_none(),
+                        "{name} (force {force}, windows {}) must not be stubbed; got: {repair:?}",
+                        manifest.windows_abi_link
+                    );
+                }
+            }
+        }
+        for name in [
+            "__mingw_fprintf",
+            "__mingw_vsnprintf",
+            "__main",
+            "_dup",
+            "_dup2",
+            "_fileno",
+            "_setmode",
+            "_get_osfhandle",
+            "__acrt_iob_func",
+            "__stdio_common_vfprintf",
+            "__imp_widget_open",
+            "___chkstk_ms",
+            "__chkstk",
+            "__security_check_cookie",
+            "_initterm",
+            "_write",
+        ] {
+            for force in [false, true] {
+                let repair = plan(name, &windows_link, force);
+                assert!(
+                    repair.is_none(),
+                    "{name} (force {force}) must not be stubbed for a Windows link; got: {repair:?}"
+                );
+            }
+            assert!(
+                matches!(plan(name, &RepairManifest::default(), false),
+                    Some(Repair::StubBlind { ref symbol }) if symbol == name),
+                "{name} is an ordinary symbol off Windows: {:?}",
+                plan(name, &RepairManifest::default(), false)
+            );
+        }
+        // A header that declares a newlib port's syscall hook: stubbed with its
+        // declared type off Windows, as before the refusal existed.
+        fs::write(
+            root.join("board.h"),
+            "int _write(int fd, const char *buf, int len);\n",
+        )
+        .unwrap();
+        let idx_with_hook = crate::auto::decl_index::DeclarationIndex::build(&root).unwrap();
+        let write = BuildErrorKind::UndefinedSymbol {
+            name: "_write".to_owned(),
+        };
+        assert!(
+            matches!(
+                plan_repair(&write, &idx_with_hook),
+                Some(Repair::StubDeclared { ref symbol, .. }) if symbol == "_write"
+            ),
+            "{:?}",
+            plan_repair(&write, &idx_with_hook)
+        );
+        assert!(plan_repair_forced(&write, &idx_with_hook, &windows_link, true).is_none());
+        // A tree that defines one itself (a newlib port's syscalls) links it,
+        // on a Windows link too.
+        fs::write(
+            root.join("syscalls.c"),
+            "int _write(int fd, const char *buf, int len) { (void)fd; (void)buf; return len; }\n",
+        )
+        .unwrap();
+        let idx_with_syscalls = crate::auto::decl_index::DeclarationIndex::build(&root).unwrap();
+        for manifest in [&RepairManifest::default(), &windows_link] {
+            let repair = plan_repair_forced(&write, &idx_with_syscalls, manifest, false);
+            assert!(
+                matches!(&repair, Some(Repair::AddSource { source_path, .. })
+                    if source_path.ends_with("syscalls.c")),
+                "{repair:?}"
+            );
+        }
+        let attempted = RepairManifest {
+            repairs: vec![plan_repair(&write, &idx_with_syscalls).unwrap()],
+            windows_abi_link: true,
+        };
+        assert!(
+            plan_repair_forced(&write, &idx_with_syscalls, &attempted, true).is_none(),
+            "once its source is linked, it is not stubbed either"
+        );
+        for name in ["widget_reset", "_widget_private", "__widget_internal"] {
+            for manifest in [&RepairManifest::default(), &windows_link] {
+                let repair = plan(name, manifest, false);
+                assert!(
+                    matches!(&repair, Some(Repair::StubBlind { symbol }) if symbol == name),
+                    "{name}: {repair:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5027,6 +5190,7 @@ mod tests {
                 as_value: false,
                 function_like: false,
             }],
+            ..RepairManifest::default()
         };
         let repair = plan_repair_with_attempts(
             &BuildErrorKind::UndeclaredFunction {
@@ -7141,6 +7305,7 @@ mod tests {
                 symbol: "read".to_owned(),
                 header: "unistd.h".to_owned(),
             }],
+            ..RepairManifest::default()
         };
         assert!(
             plan_repair_forced(
@@ -7328,6 +7493,7 @@ mod tests {
                     provenance: "test".to_owned(),
                 },
             ],
+            ..RepairManifest::default()
         };
 
         assert!(manifest.already_attempted("ada-spec:Aux_Pkg"));
@@ -7479,6 +7645,7 @@ mod tests {
             repairs: vec![Repair::StubGprImport {
                 project: "gnatcoll".to_owned(),
             }],
+            ..RepairManifest::default()
         };
         assert!(
             plan_repair_forced_with_source_policy(&err, &idx, &attempted, true, true).is_none(),

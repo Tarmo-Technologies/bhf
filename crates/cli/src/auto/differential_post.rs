@@ -206,11 +206,11 @@ fn build_side(hdir: &Path, is_cpp: bool, cc: &str, cxx: &str, tag: &str) -> Opti
     )
     .map(|o| o.status.success())
     .unwrap_or(false);
-    let produced = hdir.join("main_diff");
+    let produced = crate::auto::layout::harness_exe(hdir, "main_diff");
     if !ok || !produced.is_file() {
         return None;
     }
-    let tagged = hdir.join(format!("main_diff.{tag}"));
+    let tagged = hdir.join(format!("main_diff.{tag}{}", std::env::consts::EXE_SUFFIX));
     if std::fs::copy(&produced, &tagged).is_err() {
         return None;
     }

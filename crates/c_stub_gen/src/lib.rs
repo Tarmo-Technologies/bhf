@@ -1181,6 +1181,140 @@ pub fn is_config_header(path: &str) -> bool {
     matches!(base, "config.h" | "config_h.h" | "auto_config.h")
 }
 
+/// Whether `name` belongs to a compiler's own runtime on any platform: the
+/// sanitizer, coverage and profiling runtimes (`__asan_*`, `__sanitizer_*`,
+/// `__llvm_profile_*`, `__gcov_*`), the C++ ABI and unwinder (`__cxa_*`,
+/// `_Unwind_*`) and stack protection (`__stack_chk_fail`). An undefined
+/// reference to one is never a missing project dependency: the link left a
+/// runtime library out, and a stub for it links a program whose runtime is
+/// silently broken, so the repair loop must leave the build failing instead.
+pub fn is_toolchain_runtime_symbol(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "__asan_",
+        "__ubsan_",
+        "__msan_",
+        "__tsan_",
+        "__lsan_",
+        "__hwasan_",
+        "__sanitizer_",
+        "__sancov_",
+        "__llvm_profile_",
+        "__llvm_prf_",
+        "__gcov_",
+        "__cxa_",
+        "__gxx_personality_",
+        "_Unwind_",
+        "__emutls_",
+    ];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || matches!(name, "__stack_chk_fail" | "__stack_chk_guard")
+}
+
+/// Whether `name` belongs to the Windows C runtime or MinGW's: the MSVC C
+/// runtime's POSIX-compatible and internal names (`_dup`, `_fileno`,
+/// `__acrt_iob_func`, `__stdio_common_vfprintf`), the MinGW runtime
+/// (`__mingw_*`, gcc's `__main`), import thunks (`__imp_*`), stack probes and
+/// `/GS` checks (`__chkstk`, `__security_check_cookie`) and CRT start-up
+/// (`_initterm`). On a link against the Windows C runtime an undefined one
+/// means objects built for another toolchain were mixed in (a MinGW gcc object
+/// in an MSVC-ABI link) and must not be stubbed. On any other platform these
+/// are ordinary symbols: a newlib port defines `_write`, `_read` and `_close`
+/// as its board's syscall hooks.
+pub fn is_windows_runtime_symbol(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "__mingw_",
+        "__mingwthr_",
+        "__imp_",
+        "__acrt_",
+        "__stdio_common_",
+        "__conio_common_",
+        "__security_",
+        "_CrtDbg",
+        "_CrtSet",
+    ];
+    if PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+        return true;
+    }
+    matches!(
+        name,
+        // gcc's main-entry initializer, stack probes, /GS and SEH support.
+        "__main"
+            | "___chkstk_ms"
+            | "__chkstk"
+            | "_chkstk"
+            | "__alloca"
+            | "_alloca"
+            | "__report_gsfailure"
+            | "__GSHandlerCheck"
+            | "__C_specific_handler"
+            | "__CxxFrameHandler3"
+            | "__CxxFrameHandler4"
+            | "__std_terminate"
+            | "_purecall"
+            | "_fltused"
+            | "__iob_func"
+            | "_errno"
+            | "_initterm"
+            | "_initterm_e"
+            | "mainCRTStartup"
+            | "_setjmp"
+            | "_longjmp"
+            // The MSVC C runtime's POSIX-compatible I/O, process and string calls.
+            | "_dup"
+            | "_dup2"
+            | "_open"
+            | "_wopen"
+            | "_close"
+            | "_read"
+            | "_write"
+            | "_lseek"
+            | "_lseeki64"
+            | "_tell"
+            | "_telli64"
+            | "_fileno"
+            | "_isatty"
+            | "_setmode"
+            | "_get_osfhandle"
+            | "_open_osfhandle"
+            | "_pipe"
+            | "_unlink"
+            | "_access"
+            | "_chsize"
+            | "_chsize_s"
+            | "_commit"
+            | "_fdopen"
+            | "_wfopen"
+            | "_fsopen"
+            | "_fstat"
+            | "_fstat64"
+            | "_fstat64i32"
+            | "_stat"
+            | "_stat64"
+            | "_stat64i32"
+            | "_getpid"
+            | "_getcwd"
+            | "_chdir"
+            | "_mkdir"
+            | "_rmdir"
+            | "_putenv"
+            | "_mktemp"
+            | "_tempnam"
+            | "_fullpath"
+            | "_snprintf"
+            | "_vsnprintf"
+            | "_strdup"
+            | "_stricmp"
+            | "_strnicmp"
+            | "_beginthreadex"
+            | "_endthreadex"
+            | "_aligned_malloc"
+            | "_aligned_free"
+            | "_msize"
+            | "_set_abort_behavior"
+            | "_set_invalid_parameter_handler"
+    )
+}
+
 /// Whether `name` is a standard C / POSIX library FUNCTION that the C runtime
 /// always provides at link time. Such a symbol must never be blind-stubbed (a
 /// bogus `void name(void)` mismatches the real signature and breaks the link / is

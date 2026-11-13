@@ -48,8 +48,10 @@ bhf clean bhf_work --build --corpus --reports
 
 The replay and minimize lines show the Ada layout. A C or C++ harness replays
 from the `build/<id>/main` that `bhf build` stages or from
-`bhf_work/harnesses/<id>/main`; without `--harness`, `bhf replay` resolves the
-finding's harness in its work dir, and `bhf minimize` asks for `--harness`.
+`bhf_work/harnesses/<id>/main` (`main.exe` on Windows, as every harness
+binary there is named: `main_cov.exe`, `main_afl.exe`, ...); without
+`--harness`, `bhf replay` resolves the finding's harness in its work dir, and
+`bhf minimize` asks for `--harness`.
 
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same

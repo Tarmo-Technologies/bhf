@@ -226,7 +226,7 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
             row.rule_id,
             msg,
             // One shell word, so a work dir with a space pastes as one argument.
-            crate::repro_lane::sh_word(&row.dir.to_string_lossy()),
+            crate::repro_lane::host_word(&row.dir.to_string_lossy()),
         ));
     }
     out

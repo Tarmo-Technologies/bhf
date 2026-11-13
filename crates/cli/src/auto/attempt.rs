@@ -2929,6 +2929,12 @@ fn run_attempt(
         },
         None => ForeignStrategy::Native,
     };
+    // The link is against the Windows C runtime on Windows itself and in a
+    // MinGW cross build; the repair loop never stubs that runtime's names
+    // there (elsewhere they are ordinary symbols, such as a newlib port's
+    // `_write`).
+    manifest.windows_abi_link =
+        cfg!(windows) || matches!(&strategy, ForeignStrategy::Cross(target) if target.is_windows());
     let cross_compiler = match &strategy {
         ForeignStrategy::Cross(target) => {
             // A guard-driven cross build replaces the operator's own compilers
@@ -3375,7 +3381,7 @@ fn run_attempt(
                 // it is also given behind that many zero bytes, so the buffer
                 // starts with it (the seed itself stays as it is).
                 if let Some(prefix) = crate::fuzz::layout_seed_prefix(
-                    &harness_dir.join("main"),
+                    &crate::auto::layout::harness_exe(&harness_dir, "main"),
                     work_dir,
                     &candidate.harness_id,
                 ) {
@@ -6263,7 +6269,10 @@ fn try_build(
         // The Go lane compiled its harness binary (`harnesses/<id>/main`) in Step 0;
         // pass-through reports Success iff that binary exists.
         Lang::Go => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
+            let main_bin = crate::auto::layout::harness_exe(
+                &crate::auto::layout::harness_dir(work_dir, harness_id),
+                "main",
+            );
             if main_bin.is_file() {
                 BuildOutcome::Success
             } else {

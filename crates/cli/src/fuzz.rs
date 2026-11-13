@@ -7525,32 +7525,41 @@ pub(crate) fn find_harness_executable(
     // `bhf auto` (try_run_c_make_build_with_extras) which builds
     // in-place; check it as well so the auto attempt loop can locate
     // the binary it just built.
-    let candidates: Vec<PathBuf> = match engine {
-        FuzzEngine::AflPlusPlus => vec![
-            build_dir.join("main_afl"),
-            build_dir.join("main_afl.exe"),
-            build_dir.join("main"),
-            build_dir.join("main.exe"),
-            harness_dir.join("main_afl"),
-            harness_dir.join("main_afl.exe"),
-            harness_dir.join("main"),
-            harness_dir.join("main.exe"),
-            legacy_auto_dir.join("main_afl"),
-            legacy_auto_dir.join("main_afl.exe"),
-            legacy_auto_dir.join("main"),
-            legacy_auto_dir.join("main.exe"),
-        ],
-        FuzzEngine::Builtin => vec![
-            build_dir.join("main"),
-            build_dir.join("main.exe"),
-            build_dir.join("obj").join("main"),
-            build_dir.join("obj").join("main.exe"),
-            harness_dir.join("main"),
-            harness_dir.join("main.exe"),
-            legacy_auto_dir.join("main"),
-            legacy_auto_dir.join("main.exe"),
-        ],
+    // Each name with and without `.exe`, the platform's own spelling first: a
+    // Windows build writes `main.exe` (an extensionless `main` beside it is
+    // left from an older build), a MinGW cross build elsewhere `main.exe` too.
+    let spellings = |dir: &Path, stem: &str| {
+        let bare = dir.join(stem);
+        let exe = dir.join(format!("{stem}.exe"));
+        if cfg!(windows) {
+            [exe, bare]
+        } else {
+            [bare, exe]
+        }
     };
+    let (stems, dirs): (&[&str], Vec<PathBuf>) = match engine {
+        FuzzEngine::AflPlusPlus => (
+            &["main_afl", "main"],
+            vec![
+                build_dir.clone(),
+                harness_dir.clone(),
+                legacy_auto_dir.clone(),
+            ],
+        ),
+        FuzzEngine::Builtin => (
+            &["main"],
+            vec![
+                build_dir.clone(),
+                build_dir.join("obj"),
+                harness_dir.clone(),
+                legacy_auto_dir.clone(),
+            ],
+        ),
+    };
+    let candidates: Vec<PathBuf> = dirs
+        .iter()
+        .flat_map(|dir| stems.iter().flat_map(|stem| spellings(dir, stem)))
+        .collect();
 
     for candidate in candidates {
         if candidate.is_file() {

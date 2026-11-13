@@ -524,7 +524,7 @@ C / C++ (`crates/c_stub_gen`):
 |---|---|
 | `MissingHeader{path}` | Synthesised placeholder header under `<harness>/repairs/auto_includes/<path>`, added to `-I` |
 | `MissingType{name}` | `typedef void *T;` appended to `<harness>/repairs/auto_types.h` |
-| `UndefinedSymbol{name}` | Looked up in the declaration index. Match → declared stub. No match → blind `void(void)` stub. Appended to `<harness>/repairs/auto_stubs.c` |
+| `UndefinedSymbol{name}` | Looked up in the declaration index. Match → declared stub. No match → blind `void(void)` stub. Appended to `<harness>/repairs/auto_stubs.c`. A name of a compiler or sanitizer runtime (`__asan_*`, `__llvm_profile_*`, `__cxa_*`, `__stack_chk_fail`) is never stubbed, nor, on a link against the Windows C runtime, a name of that runtime or MinGW's (`_dup`, `__mingw_fprintf`, `__main`, `__chkstk`): only the tree's own definition of it is linked, otherwise the build fails with the linker's error, since such a reference means a runtime library is missing or objects of two toolchains were mixed. Off Windows, `_write` and `_read` (a newlib port's syscall hooks) are ordinary symbols |
 | `MissingSharedLib{name}` | Not auto-repaired. Flows to `needed_for_build.missing_libraries` and the `missing-deps` manifest; the target is marked `unrecoverable_link` |
 | `ConfigGuardError{file,line}` | A `#error` a build-config guard reached (libssh's `#error "no strtoull function found"`). The conditional owning the `#error` is read and the macro it tests is `#define`d into `auto_defines.h`, with the value the guard requires (`#if (DEPTH != 8)` → `8`, a plain feature test → `1`). An undecidable guard — a comparison, a compound condition, or an error that fires *because* a macro is defined — is refused rather than guessed |
 

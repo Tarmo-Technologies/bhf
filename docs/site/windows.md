@@ -180,8 +180,16 @@ python C:\Temp\bhf-work\results\findings\<id>\replay.py
 
 `replay.py` also puts the recorded directories on `PATH` (falling back to
 `clang -print-resource-dir`). `results\INDEX.md` names `python` rather than
-`python3` on Windows, and `bhf explain` prints the `$env:Path` line for a direct
-run.
+`python3` on Windows, and `bhf explain` prints its commands for PowerShell
+(each path a single-quoted literal) and the direct run as PowerShell lines:
+`$env:Path = '<runtime dirs>;' + $env:Path`, then the sanitizer options and
+`& '...\harnesses\<id>\main.exe' '...\results\findings\<id>\testcase.bin'`,
+on the recorded testcase. A harness that reads stdin (Ada's) runs through
+`cmd --% /c ""<harness>" < "<testcase>""`, and the extensionless binary of a
+work dir built before binaries had the suffix through `Start-Process`. Every
+harness binary is named with `.exe` (`main.exe`, `main_cov.exe`,
+`main_afl.exe`), so cmd and PowerShell run it by its path; `make main`,
+`make cov` and `make main_afl` in a harness dir still build them.
 
 A C or C++ finding packages into a capsule that rebuilds natively, with no
 POSIX shell: `bhf capsule` writes `build.ps1` beside `build.sh`, and on
@@ -454,6 +462,18 @@ cmplog, and ASan all work natively on Windows.
   reported static-only with that reason, pointing at WSL.
 - The persistent fork-server + coverage-guided engine run on Windows the same as
   on Linux (shared-memory coverage via Win32 file mapping).
+- Microsoft Defender's real-time scanning does not slow fuzzing down, and a
+  Defender exclusion for the work dir is not needed for speed. Measured on a
+  Windows Server 2022 VM (6 cores) with a small C harness under `bhf fuzz`:
+  2483 executions/s with the work dir scanned and 2432 with it excluded
+  (persistent fork server); 7.0 and 7.2/s when every input starts a new
+  process (`--no-fork-server`, about 140 ms per ASan process start). Defender
+  adds about 100 ms to the first start of a newly built binary, once. What
+  does slow a run down is an oversubscribed CPU: with twice as many busy
+  processes as cores the same harness ran 0.4 executions/s, and with four
+  times as many its first start took over 2 s, past the fork-server
+  handshake, so the run fell back to one process per input. Give a campaign
+  the cores it fuzzes with (`--jobs`), and do not share them with builds.
 - The LD_PRELOAD runtrace shim is Linux-only (an empty stub on Windows), so the
   behavioral and taint oracles (BHF-405 path control, BHF-304 command injection,
   BHF-417 insecure temp, BHF-305 sensitive env) do not fire on native Windows via

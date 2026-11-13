@@ -111,7 +111,7 @@ fn profile_one(
     static_sinks: &[StaticSink],
     index: &mut usize,
 ) -> Option<HarnessProfile> {
-    let bin = hdir.join("main");
+    let bin = crate::auto::layout::harness_exe(hdir, "main");
     if !bin.is_file() || !is_native_harness(hdir, harness_id) {
         return None;
     }
