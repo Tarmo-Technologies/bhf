@@ -206,7 +206,7 @@ pub fn run(args: ReplayArgs) -> i32 {
     }
     // The finding already records where its harness was built; resolve it so the
     // user does not have to repeat `--harness`. An explicit `--harness` always wins.
-    let harness = match resolve_harness(&finding_dir, args.harness) {
+    let harness = match resolve_harness(&finding_dir, args.harness, PASS_HARNESS_HINT) {
         Ok(harness) => harness,
         Err(error) => return report_error(&output, &finding_dir, &error),
     };
@@ -363,8 +363,13 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// `<work>/auto/<harness_id>/main` layout — trying a couple of work-root
 /// candidates relative to the finding directory — and only then a
 /// `fixture_path` that points into another work dir. Errors naming every path
-/// tried, and telling the user to pass `--harness`, when nothing resolves.
-fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+/// tried, and ending with `hint` (what the caller's command can do about it),
+/// when nothing resolves.
+fn resolve_harness(
+    finding_dir: &Path,
+    explicit: Option<PathBuf>,
+    hint: &str,
+) -> Result<PathBuf, String> {
     if let Some(harness) = explicit {
         return Ok(explicit_harness(harness));
     }
@@ -374,7 +379,7 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| {
             format!(
-                "cannot read {} to auto-resolve the harness; pass --harness <path>",
+                "cannot read {} to auto-resolve the harness. {hint}",
                 finding_path.display()
             )
         })?;
@@ -453,8 +458,7 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         looked.join("; ")
     };
     Err(format!(
-        "could not auto-resolve the harness binary for finding {}; {looked}. \
-         Pass --harness <path>.",
+        "could not auto-resolve the harness binary for finding {}; {looked}. {hint}",
         finding_dir.display()
     ))
 }
@@ -475,7 +479,16 @@ pub(crate) fn explicit_harness(path: PathBuf) -> PathBuf {
 /// (see [`corpus::finding::fixture_path_candidates`]), then its `harness_id`
 /// under `harnesses/`, `auto/`, `generated_harnesses/` and `build/`.
 pub(crate) fn recorded_harness(finding_dir: &Path) -> Result<PathBuf, String> {
-    resolve_harness(finding_dir, None)
+    recorded_harness_or(finding_dir, PASS_HARNESS_HINT)
+}
+
+/// The advice that ends the "no harness" error of a command with `--harness`.
+const PASS_HARNESS_HINT: &str = "Pass --harness <path>.";
+
+/// [`recorded_harness`], whose error ends with `hint`: for a command that has
+/// no `--harness` to pass.
+pub(crate) fn recorded_harness_or(finding_dir: &Path, hint: &str) -> Result<PathBuf, String> {
+    resolve_harness(finding_dir, None, hint)
 }
 
 /// The input-format note for a generated harness binary (see
@@ -2433,6 +2446,23 @@ mod tests {
         assert!(!error.contains("results/harnesses"), "{error}");
         assert!(!error.contains("findings/harnesses"), "{error}");
         assert!(error.contains("--harness"), "{error}");
+    }
+
+    /// A caller without `--harness` (`bhf report --backfill`) gives its own
+    /// advice in the "no harness" error.
+    #[test]
+    fn the_no_harness_error_takes_the_callers_hint() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = work.path().join("results/findings/F-0001-aaaaaaaa");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("finding.json"), r#"{"harness_id":"H-1"}"#).unwrap();
+        let error = super::recorded_harness_or(&finding, "HINT").unwrap_err();
+        assert!(error.ends_with("HINT"), "{error}");
+        assert!(!error.contains("--harness"), "{error}");
+        std::fs::remove_file(finding.join("finding.json")).unwrap();
+        let error = super::recorded_harness_or(&finding, "HINT").unwrap_err();
+        assert!(error.ends_with("HINT"), "{error}");
+        assert!(!error.contains("--harness"), "{error}");
     }
 
     /// A harness whose metadata names no target function: the debugger

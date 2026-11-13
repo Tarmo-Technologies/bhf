@@ -277,6 +277,11 @@ fn report_backfill_replays_migrated_findings() {
             .find(|line| line.contains(id))
             .unwrap_or_else(|| panic!("no backfill line for {id}:\n{stderr}"));
         assert!(line.contains(reason), "{line}");
+        if id == "F-0002-bbbbbbbb" {
+            // `bhf report` has no --harness to pass.
+            assert!(!line.contains("Pass --harness"), "{line}");
+            assert!(line.contains("run the backfill again"), "{line}");
+        }
     }
     assert!(stderr.contains("1 updated"), "{stderr}");
 
@@ -291,6 +296,86 @@ fn report_backfill_replays_migrated_findings() {
         .unwrap()["evidence"]["files"]
         .to_string();
     assert!(files.contains("sanitizer.log"), "{files}");
+}
+
+/// Drop the recorded crash location of a 0.2.x finding: no frames, so
+/// nothing says where it crashed. Returns the record.
+fn drop_recorded_location(finding: &Path) -> serde_json::Value {
+    let path = finding.join("finding.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["exception"]["stack"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    record
+}
+
+/// A finding that records no crash location cannot tell its own crash from
+/// another one in the same class: a harness of another build that crashes
+/// in another function is not backfilled into it.
+#[test]
+fn report_backfill_leaves_a_location_less_finding_of_another_build_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let work = legacy_work_dir(root.path());
+    drop_recorded_location(&work.join("findings/F-0001-aaaaaaaa"));
+    write_harness(
+        &work.join("harnesses/H-1/main"),
+        &ASAN_REPORT.replace("Widget::copy_at", "Gadget::fill"),
+    );
+    // Migrate first, so the bytes compared below are the migrated record.
+    let out = bhf(&["report", "--work-dir", work.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let finding = work.join("results/findings/F-0001-aaaaaaaa");
+    let before = fs::read(finding.join("finding.json")).unwrap();
+
+    let out = bhf(&["report", "--backfill", "--work-dir", work.to_str().unwrap()]);
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!finding.join("sanitizer.log").exists(), "{stderr}");
+    assert_eq!(
+        fs::read(finding.join("finding.json")).unwrap(),
+        before,
+        "nothing is written into the finding"
+    );
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("F-0001-aaaaaaaa"))
+        .unwrap_or_else(|| panic!("no backfill line:\n{stderr}"));
+    assert!(line.contains("records no crash location"), "{line}");
+    assert!(line.contains("no build sha256"), "{line}");
+    assert!(stderr.contains("0 updated"), "{stderr}");
+}
+
+/// The same location-less finding is backfilled from the build it was
+/// recorded with.
+#[test]
+fn report_backfill_fills_a_location_less_finding_from_its_recorded_build() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let work = legacy_work_dir(root.path());
+    let harness = work.join("harnesses/H-1/main");
+    write_harness(&harness, ASAN_REPORT);
+    let legacy = work.join("findings/F-0001-aaaaaaaa");
+    let mut record = drop_recorded_location(&legacy);
+    record["build"] = serde_json::json!({"binary": {
+        "sha256": format!("{:x}", Sha256::digest(fs::read(&harness).unwrap())),
+    }});
+    fs::write(
+        legacy.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let out = bhf(&["report", "--backfill", "--work-dir", work.to_str().unwrap()]);
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let finding = work.join("results/findings/F-0001-aaaaaaaa");
+    assert!(finding.join("sanitizer.log").exists(), "{stderr}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    assert!(
+        !record["exception"]["stack"].as_array().unwrap().is_empty(),
+        "{record}"
+    );
+    assert!(stderr.contains("1 updated"), "{stderr}");
 }
 
 /// A migrated finding has no decoded.json; when its harness has the argument

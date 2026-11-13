@@ -4,8 +4,10 @@
 //! `sanitizer.log` (findings migrated from a bhf 0.2.x work dir, or recorded
 //! before bhf kept the log) the evidence a current run records. Each one is
 //! replayed against its harness the way `bhf replay` replays it, and only when
-//! the replay is the recorded crash (same rule, kind and sink or reported
-//! site) are its `sanitizer.log`, crash frames and memory access written. A
+//! the replay is a `MATCH` as `bhf replay` decides it (same rule, kind and
+//! sink or reported site; a finding that records no crash location matches
+//! only the build it was recorded with, its `build.binary.sha256`) are its
+//! `sanitizer.log`, crash frames and memory access written. A
 //! finding without `decoded.json` whose harness has the argument trace gets
 //! its decoded arguments too, from one more run with the trace on. The
 //! finding's id and signature never change. The caller rebuilds `results/`
@@ -157,7 +159,11 @@ fn backfill_finding(dir: &Path) -> Outcome {
     if !needs_log && !needs_arguments {
         return Outcome::NotNeeded;
     }
-    let harness = match crate::replay::recorded_harness(dir) {
+    let harness = match crate::replay::recorded_harness_or(
+        dir,
+        "Restore the harness binary, or rebuild it with `bhf build <work-dir> --harness \
+         <harness-id>`, and run the backfill again.",
+    ) {
         Ok(harness) => harness,
         Err(_) if !needs_log => return Outcome::NotNeeded,
         Err(error) => return Outcome::Skipped(format!("no harness to replay against: {error}")),
@@ -295,23 +301,21 @@ fn backfill_log(
             }
         ));
     };
-    let comparison = crash_identity::compare(raw, &report);
-    if !comparison.matches() {
-        return Err(format!(
-            "harness {} now reports a different crash ({})",
-            harness.display(),
-            comparison.difference_lines().join("; ")
-        ));
-    }
-    // An unsymbolized report proves neither where the crash is nor gives the
-    // frames the backfill is for.
-    if comparison.location_not_compared() {
-        return Err(format!(
-            "the replay against harness {} is unsymbolized, so it gives no frames and its \
-             location cannot be checked; put llvm-symbolizer on PATH or set ASAN_SYMBOLIZER_PATH \
-             and run the backfill again",
-            harness.display()
-        ));
+    // Only a MATCH, as `bhf replay` decides it, is the recorded crash.
+    let same_binary = crate::replay::recorded_build_matches(raw, harness);
+    let comparison = crash_identity::compare_with(raw, &report, same_binary);
+    match comparison.verdict() {
+        crash_identity::Verdict::Match => {}
+        crash_identity::Verdict::Mismatch => {
+            return Err(format!(
+                "harness {} now reports a different crash ({})",
+                harness.display(),
+                comparison.difference_lines().join("; ")
+            ))
+        }
+        crash_identity::Verdict::Unverified => {
+            return Err(unverified_reason(&comparison, &report, harness))
+        }
     }
     if let Err(error) = corpus::finding::write_sanitizer_log(dir, &run.stderr) {
         return Err(format!("cannot write sanitizer.log: {error}"));
@@ -326,6 +330,57 @@ fn backfill_log(
         return Err(format!("cannot update {}: {error}", path.display()));
     }
     Ok(report.stack.len())
+}
+
+/// Why an UNVERIFIED replay is not backfilled: what the comparison could not
+/// check.
+fn unverified_reason(
+    comparison: &crash_identity::Comparison,
+    report: &corpus::SanitizerReport,
+    harness: &Path,
+) -> String {
+    let fields = comparison.not_compared_fields();
+    let fields: Vec<&str> = fields.split(',').collect();
+    // An unsymbolized report proves neither where the crash is nor gives the
+    // frames the backfill is for.
+    if fields.iter().any(|field| matches!(*field, "sink" | "site")) {
+        return format!(
+            "the replay against harness {} is unsymbolized, so it gives no frames and its \
+             location cannot be checked; put llvm-symbolizer on PATH or set ASAN_SYMBOLIZER_PATH \
+             and run the backfill again",
+            harness.display()
+        );
+    }
+    let build = match comparison.same_binary {
+        Some(true) => String::new(),
+        Some(false) => format!(
+            " and harness {}'s sha256 differs from the recorded build",
+            harness.display()
+        ),
+        None => format!(
+            " and no build sha256 to check harness {} against",
+            harness.display()
+        ),
+    };
+    if fields.contains(&"pc") {
+        if report.pc_offset.is_none() {
+            return format!(
+                "the finding records where it faulted as a pc offset, and the replay against \
+                 harness {} printed none, so the replay cannot show it is the recorded crash; \
+                 nothing was written",
+                harness.display()
+            );
+        }
+        return format!(
+            "the finding records where it faulted as a pc offset in the recorded build{build}, \
+             so the offsets were not compared and the replay cannot show it is the recorded \
+             crash; nothing was written"
+        );
+    }
+    format!(
+        "the finding records no crash location (no frames, sink, site or pc){build}, so the \
+         replay cannot show it is the recorded crash; nothing was written"
+    )
 }
 
 fn exit_text(run: &crate::replay::CRun) -> String {
@@ -393,6 +448,71 @@ mod tests {
         assert!(!is_sanitizer_crash(&oracle));
         let runtime = json!({"rule_id": "BHF-201", "finding_kind": "runtime", "exception": {"name": "ASAN_X"}});
         assert!(!is_sanitizer_crash(&runtime));
+    }
+
+    /// The reason an UNVERIFIED replay is not backfilled names what could
+    /// not be compared and why.
+    #[test]
+    fn an_unverified_replay_is_skipped_with_what_was_not_compared() {
+        let harness = Path::new("/w/build/H-1/main");
+        let signal = |pc_offset: Option<u64>| corpus::SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            check: Some("SIGSEGV".to_owned()),
+            pc_offset,
+            ..Default::default()
+        };
+        let reason = |raw: &Value, report: &corpus::SanitizerReport, same: Option<bool>| {
+            let comparison = crash_identity::compare_with(raw, report, same);
+            assert_eq!(
+                comparison.verdict(),
+                crash_identity::Verdict::Unverified,
+                "{comparison:?}"
+            );
+            unverified_reason(&comparison, report, harness)
+        };
+        let located_nowhere = json!({
+            "rule_id": "BHF-210",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGSEGV", "stack": []},
+        });
+        let text = reason(&located_nowhere, &signal(None), None);
+        assert!(text.contains("records no crash location"), "{text}");
+        assert!(
+            text.contains("no build sha256 to check harness /w/build/H-1/main against"),
+            "{text}"
+        );
+        let text = reason(&located_nowhere, &signal(None), Some(false));
+        assert!(
+            text.contains("harness /w/build/H-1/main's sha256 differs from the recorded build"),
+            "{text}"
+        );
+
+        let at_pc = json!({
+            "rule_id": "BHF-210",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGSEGV", "pc_offset": "0x1b3c"},
+        });
+        let text = reason(&at_pc, &signal(Some(0x2a10)), Some(false));
+        assert!(text.contains("pc offset in the recorded build"), "{text}");
+        assert!(text.contains("sha256 differs"), "{text}");
+        assert!(!text.contains("unsymbolized"), "{text}");
+        let text = reason(&at_pc, &signal(None), Some(true));
+        assert!(text.contains("printed none"), "{text}");
+
+        let at_sink = json!({
+            "rule_id": "BHF-201",
+            "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "stack": [
+                {"function": "Widget::copy_at(char const*)", "file": "/src/widget/widget.cc", "line": 12},
+            ]},
+        });
+        let unsymbolized = corpus::parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x1 bp 0x2 sp 0x3\n\
+             WRITE of size 1 at 0x1 thread T0\n\
+             \x20   #0 0x4f5a2b  (/w/build/H-1/main+0x4f5a2b)\n",
+        )
+        .unwrap();
+        let text = reason(&at_sink, &unsymbolized, None);
+        assert!(text.contains("unsymbolized"), "{text}");
     }
 
     /// A finding recorded without frames gains them, its location and access,

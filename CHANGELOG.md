@@ -132,6 +132,13 @@
   replay's `shim_armed`), so a bhf installed without its shim, or a shim the
   dynamic loader refuses, records the environment as not observed and
   `bhf explain` says so.
+- `bhf report --backfill` writes a replay into a finding only when the replay
+  is a `MATCH` as `bhf replay` decides it. A finding that records no crash
+  location is backfilled only from the build it was recorded with; another
+  build's crash in the same class was written into it.
+- `bhf report --backfill` no longer tells you to pass `--harness`, which
+  `bhf report` does not have, when a finding's harness is gone; it says to
+  restore or rebuild the harness and run the backfill again.
 - Windows: cartography, provenance, the capability profiler and coverage
   replay no longer run a harness through `timeout`, which on Windows is the
   console pause command and ran nothing: cartography mapped no finding and no
