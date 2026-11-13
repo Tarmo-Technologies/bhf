@@ -3770,7 +3770,8 @@ mod tests {
         assert!(makefile.contains("-DBHF_AFL"));
         assert!(
             makefile.contains("SECTION_FLAGS ?= -ffunction-sections -fdata-sections")
-                && makefile.contains("SECTION_LDFLAGS ?= -Wl,--gc-sections"),
+                && makefile.contains("BHF_GC_LDFLAGS_GNU = -Wl,--gc-sections")
+                && makefile.contains("$(call BHF_SECTION_LDFLAGS,$(CXX))"),
             "C++ harnesses must discard unreachable dependency sections:\n{makefile}"
         );
     }

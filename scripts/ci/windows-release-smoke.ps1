@@ -78,6 +78,15 @@ foreach ($name in @("INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir")) {
     Remove-Item "Env:$name" -ErrorAction SilentlyContinue
 }
 
+# The MSVC linkers (link.exe, lld-link) ignore GNU-only link options with a
+# warning; the Makefile spells its dead-code flag for them (/OPT:REF).
+$gnuOnlyLinkWarning = "ignoring unknown argument '--gc-sections'|LNK4044"
+function Assert-NoGnuOnlyLinkWarning([string]$Text, [string]$What) {
+    if ($Text -match $gnuOnlyLinkWarning) {
+        throw "$What passed a GNU-only option to an MSVC linker: $($Matches[0])"
+    }
+}
+
 function Invoke-BhfAuto([string]$Source, [string]$Work, [string[]]$Extra, [string]$Languages = "c") {
     $log = "$Work.log"
     # bhf reports progress on stderr; capturing it must not stop the script
@@ -98,6 +107,19 @@ function Invoke-BhfAuto([string]$Source, [string]$Work, [string[]]$Extra, [strin
             Where-Object { $_.Name -in @("Makefile", "result.json", "c_build_output.log") } |
             ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName }
         throw "bhf auto $Source $Extra did not build and fuzz its target: $($report.summary | ConvertTo-Json -Compress)"
+    }
+    Assert-NoGnuOnlyLinkWarning $text "bhf auto $Source $Extra"
+    Get-ChildItem $Work -Recurse -File -Filter *.log |
+        ForEach-Object { Assert-NoGnuOnlyLinkWarning (Get-Content $_.FullName -Raw) $_.FullName }
+    # Every extra lane the run built (line coverage) built.
+    foreach ($target in @($report.targets)) {
+        if ($target.lanes) {
+            foreach ($lane in $target.lanes.PSObject.Properties) {
+                if (-not $lane.Value.built) {
+                    throw "bhf auto $Source $Extra lost the $($lane.Name) lane of $($target.harness_id): $($lane.Value.reason)"
+                }
+            }
+        }
     }
     return @{ Report = $report; Log = $text }
 }
@@ -229,12 +251,14 @@ foreach ($dir in @((Join-Path $env:ProgramFiles "LLVM\bin"), "C:\w64devkit\bin")
 }
 Push-Location $sequenceHarness
 $ErrorActionPreference = "Continue"
-& make main_afl AFLPP_CC=clang "AFLPP_CFLAGS=-g -O1 -fsanitize=address" 2>&1 |
-    ForEach-Object { "$_" } | Out-Host
+$aflBuild = & make main_afl AFLPP_CC=clang "AFLPP_CFLAGS=-g -O1 -fsanitize=address" 2>&1 |
+    ForEach-Object { "$_" } | Out-String
 $ErrorActionPreference = "Stop"
+$aflBuild | Out-Host
 if (-not (Test-Path main_afl)) {
     throw "The sequence template's own driver did not build"
 }
+Assert-NoGnuOnlyLinkWarning $aflBuild "make main_afl"
 Copy-Item main_afl standalone.exe -Force
 [IO.File]::WriteAllBytes((Join-Path $sequenceHarness "plain.bin"), [byte[]](1, 2, 3, 4, 5, 6, 7, 8))
 $ErrorActionPreference = "Continue"

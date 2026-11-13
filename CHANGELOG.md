@@ -5,6 +5,16 @@
 ## Unreleased
 
 ### Fixed
+- Windows: the generated Makefiles no longer pass `-Wl,--gc-sections` to an
+  MSVC-style linker, which ignored it with a warning (lld-link's `ignoring
+  unknown argument '--gc-sections'`, link.exe's LNK4044). Each lane's link
+  spells the dead-code flag for its own compiler's linker: `/OPT:REF` for a
+  compiler that targets `*-windows-msvc` (clang's default there) or bhf's cl
+  front end, `--gc-sections` for MinGW's gcc and every ELF link,
+  `-dead_strip` on macOS; `SECTION_LDFLAGS` still replaces it for every lane.
+  The line-coverage lane no longer links `-lm -ldl -lpthread` on Windows,
+  where `m.lib` does not exist and every coverage build failed. The Windows
+  release smoke fails on either warning and on a lane that did not build.
 - A build lane (`make cov`, `make afl`) is reported only for the attempt that
   built the harness: a target that `--resume` re-runs and that inherits a
   sibling's build verdict builds nothing, and no longer reports a lane an

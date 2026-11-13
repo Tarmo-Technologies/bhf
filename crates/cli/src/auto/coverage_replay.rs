@@ -158,6 +158,16 @@ pub(crate) fn work_dir_compat_flags(work_dir: &Path, cpp: bool) -> CompatFlags {
     }
 }
 
+/// The runtime libraries a coverage build links beyond the C library: `libm`,
+/// `libdl` and `libpthread` on Unix hosts. None on Windows, whose C runtime
+/// holds them, and where `-lm` names an `m.lib` no SDK ships, which failed
+/// every coverage lane there.
+const COVERAGE_RUNTIME_LIBRARIES: &[&str] = if cfg!(windows) {
+    &[]
+} else {
+    &["-lm", "-ldl", "-lpthread"]
+};
+
 /// Checkpoint the successful build closure while the repair loop still owns it.
 /// Coverage replay consumes this recipe through the same make/build-context path
 /// as the primary build, changing only the instrumentation lane to `cov`.
@@ -352,6 +362,7 @@ fn replay_one(
     // up-to-date after the repair closure changes. Force this generated lane to
     // relink from the checkpointed recipe.
     let _ = std::fs::remove_file(&bin);
+    let runtime_libraries = COVERAGE_RUNTIME_LIBRARIES.join(" ");
     let build_output = crate::build::try_run_c_make_build_with_target_and_ldflags(
         work_dir,
         harness_id,
@@ -360,7 +371,7 @@ fn replay_one(
         None,
         Some("cov"),
         recipe.standard.as_deref(),
-        Some("-lm -ldl -lpthread"),
+        (!runtime_libraries.is_empty()).then_some(runtime_libraries.as_str()),
     );
     if !build_output.status.success() || !bin.is_file() {
         let stdout = diagnostic_tail(&build_output.stdout);
@@ -1119,7 +1130,8 @@ fn build_and_replay_expert(
         command.arg(source);
     }
     command
-        .args(["-lm", "-ldl", "-lpthread", "-o"])
+        .args(COVERAGE_RUNTIME_LIBRARIES)
+        .arg("-o")
         .arg(&binary);
     let output = crate::command_output::output_with_timeout(&mut command, Duration::from_secs(300))
         .map_err(|error| format!("run expert compiler: {error}"))?;

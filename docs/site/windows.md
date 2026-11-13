@@ -482,6 +482,12 @@ cmplog, and ASan all work natively on Windows.
   the compiler receives them; `cmd` reads those escaped quotes as the end and
   the restart of its own quoting, so such a define is refused when it holds a
   backslash or its value holds one of `& | < > ^ ( ) % !`.
+- Each lane's link discards unreferenced code in the spelling of its linker:
+  `/OPT:REF` when the lane's compiler links with link.exe or lld-link (clang's
+  default `*-windows-msvc` target, or `--cc cl`), `--gc-sections` for MinGW's
+  gcc. Setting `SECTION_LDFLAGS` (even to nothing) replaces it for every lane.
+  The line-coverage lane links no Unix runtime library (`-lm`, `-ldl`,
+  `-lpthread`), which the Windows C runtime already holds.
 - A harness for a function that takes a `FILE *` gets its input through a
   temporary file deleted on close, since the Windows C runtime has no
   `fmemopen`.

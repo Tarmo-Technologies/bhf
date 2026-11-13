@@ -6404,6 +6404,124 @@ mod tests {
         fs::remove_dir_all(&out).ok();
     }
 
+    /// A stand-in compiler that answers `-dumpmachine` with `machine` and
+    /// accepts anything else, written as `dir/name`.
+    #[cfg(unix)]
+    fn machine_reporting_compiler(dir: &Path, name: &str, machine: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let compiler = dir.join(name);
+        fs::write(
+            &compiler,
+            format!("#!/bin/sh\n[ \"$1\" = -dumpmachine ] && echo {machine}\nexit 0\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler
+    }
+
+    /// The recipe `make -n <goal>` prints for the link of `binary`, with
+    /// exactly `vars` set (`OS` is removed unless given).
+    #[cfg(unix)]
+    fn dry_run_link(dir: &Path, goal: &str, binary: &str, vars: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).args(["-n", goal]);
+        for key in [
+            "OS",
+            "SECTION_LDFLAGS",
+            "CC",
+            "COV_CC",
+            "DIFF_CC",
+            "LIBFUZZER_CC",
+        ] {
+            command.env_remove(key);
+        }
+        command.env("BHF_CC_FAMILY", "clang");
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run make -n");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.contains(&format!(" -o {binary} main.c")))
+            .unwrap_or_else(|| panic!("no link of {binary} in {output:?}"))
+            .to_owned()
+    }
+
+    /// Each lane's link names the dead-code flag in the spelling of the linker
+    /// its compiler drives. On Windows an MSVC-target compiler (clang's default
+    /// there, or bhf's cl front end) links with link.exe or lld-link, which
+    /// ignore `--gc-sections` with a warning, so it gets `/OPT:REF`; MinGW's
+    /// gcc and every ELF link keep `--gc-sections`.
+    #[cfg(unix)]
+    #[test]
+    fn each_lane_links_with_the_dead_code_flag_of_its_linker() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_section_ldflags");
+        let mut args = direct_args("parse_record", out.clone());
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let msvc = machine_reporting_compiler(&out, "msvc-cc", "x86_64-pc-windows-msvc");
+        let mingw = machine_reporting_compiler(&out, "mingw-cc", "x86_64-w64-mingw32");
+        let front_end = machine_reporting_compiler(&out, "bhf-cl", "unused");
+        let (msvc, mingw, front_end) = (
+            msvc.to_str().unwrap(),
+            mingw.to_str().unwrap(),
+            front_end.to_str().unwrap(),
+        );
+        let gnu = "-Wl,--gc-sections";
+        let ms = "-Wl,/OPT:REF";
+
+        // Not on Windows: the compiler is not asked, and the link is GNU.
+        let main = dry_run_link(&out, "main", "main", &[("CC", msvc)]);
+        assert!(main.contains(gnu) && !main.contains(ms), "{main}");
+        for (cc, family, expected, other) in [
+            (msvc, "clang", ms, gnu),
+            (mingw, "gcc", gnu, ms),
+            (front_end, "msvc", ms, gnu),
+        ] {
+            let main = dry_run_link(
+                &out,
+                "main",
+                "main",
+                &[("OS", "Windows_NT"), ("CC", cc), ("BHF_CC_FAMILY", family)],
+            );
+            assert!(
+                main.contains(expected) && !main.contains(other),
+                "{cc}: {main}"
+            );
+        }
+        // Each lane by its own compiler.
+        let windows = [
+            ("OS", "Windows_NT"),
+            ("CC", msvc),
+            ("DIFF_CC", mingw),
+            ("COV_CC", msvc),
+        ];
+        let diff = dry_run_link(&out, "diff", "main_diff", &windows);
+        assert!(diff.contains(gnu) && !diff.contains(ms), "{diff}");
+        let cov = dry_run_link(&out, "cov", "main_cov", &windows);
+        assert!(cov.contains(ms) && !cov.contains(gnu), "{cov}");
+        // SECTION_LDFLAGS replaces the flag for every lane, even with nothing.
+        let mut none = windows.to_vec();
+        none.push(("SECTION_LDFLAGS", ""));
+        for (goal, binary) in [("main", "main"), ("cov", "main_cov")] {
+            let link = dry_run_link(&out, goal, binary, &none);
+            assert!(!link.contains(gnu) && !link.contains(ms), "{link}");
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// End-to-end proof of the portable libFuzzer target (#62): a generated C
     /// harness built with `make libfuzzer` is a real libFuzzer binary that drives
     /// the target through bhf's `bhf_run_one` (via the emitted `bhf_libfuzzer.c`
@@ -9105,7 +9223,8 @@ mod tests {
         );
         assert!(
             mk.contains("SECTION_FLAGS ?= -ffunction-sections -fdata-sections")
-                && mk.contains("SECTION_LDFLAGS ?= -Wl,--gc-sections"),
+                && mk.contains("BHF_GC_LDFLAGS_GNU = -Wl,--gc-sections")
+                && mk.contains("$(call BHF_SECTION_LDFLAGS,$(CC))"),
             "C harnesses must discard unreachable dependency sections:\n{mk}"
         );
         assert!(
@@ -9179,7 +9298,7 @@ mod tests {
         assert!(!links.is_empty(), "{mk}");
         for line in links {
             assert!(
-                line.contains("$(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS)"),
+                line.contains("$(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,"),
                 "{line}"
             );
         }
