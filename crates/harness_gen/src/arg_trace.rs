@@ -509,7 +509,14 @@ pub(crate) fn plan(
             Some(id) => {
                 let (data, len, _) = slice_locals(id);
                 let unsliced = unsliced(&emissions[index], id);
-                let traced = trace_param(group, index, &unsliced, declared, spans[index].clone());
+                let traced = trace_param(
+                    group,
+                    index,
+                    &unsliced,
+                    declared,
+                    spans[index].clone(),
+                    true,
+                );
                 (traced, data, len)
             }
             None => {
@@ -519,6 +526,7 @@ pub(crate) fn plan(
                     &emissions[index],
                     declared,
                     spans[index].clone(),
+                    false,
                 );
                 (traced, rest.clone(), rest_size.clone())
             }
@@ -967,12 +975,16 @@ struct Traced {
     after: Option<String>,
 }
 
+/// `sliced` says the parameter takes a slice of its own, so `emission` is
+/// its pre-slice decl: a view of `Data` there is really a heap copy of the
+/// slice, and a length from `Size` that copy's size.
 fn trace_param(
     group: &Group<'_>,
     index: usize,
     emission: &CParamEmission,
     declared: Option<&Declared>,
     span: Option<(String, String)>,
+    sliced: bool,
 ) -> Traced {
     let name = declared
         .map(|d| d.name.clone())
@@ -997,7 +1009,7 @@ fn trace_param(
         ("role", role),
         ("name", &name),
         ("type", &ty),
-        ("decoder", &decoder_label(&emission.decl)),
+        ("decoder", &traced_decoder_label(&emission.decl, sliced)),
     ]);
     let span_stmt = span
         .map(|(lo, hi)| format!(" bhf_tl_span((size_t)({lo}), (size_t)({hi}));"))
@@ -1302,6 +1314,22 @@ fn decoder_label(decl: &str) -> String {
         },
     };
     truncate(&label, MAX_DECODER)
+}
+
+/// [`decoder_label`] for a traced parameter. A sliced parameter's decl is
+/// the pre-slice one, so its `input view` is a sized heap copy of the slice
+/// (the buffer, which reads `Data`) or that copy's length (which reads only
+/// `Size`). Every other label stands.
+fn traced_decoder_label(decl: &str, sliced: bool) -> String {
+    let label = decoder_label(decl);
+    if !sliced || label != "input view" {
+        return label;
+    }
+    if identifiers(decl).contains(&"Data") {
+        "sized heap copy".to_owned()
+    } else {
+        "sized copy length".to_owned()
+    }
 }
 
 /// The first `bhf_*` runtime call in a decl and its top-level arguments.
@@ -1634,6 +1662,49 @@ mod tests {
             registry: Some(registry),
             defer_input: false,
             fresh_cursor: true,
+        }
+    }
+
+    /// A buffer that takes a slice is a heap copy of its own bytes, and its
+    /// length is that copy's size: the trace says so instead of calling them
+    /// views of the input. The last buffer still views the bytes left.
+    #[test]
+    fn sliced_buffers_are_labelled_as_sized_heap_copies() {
+        let registry = TypeRegistry::default();
+        let group = c_group(&registry);
+        let mut emissions = vec![
+            emission(
+                "const uint8_t * a = (const uint8_t *)Data",
+                "a",
+                "const uint8_t *",
+            ),
+            emission("size_t alen = (size_t)Size", "alen", "size_t"),
+            emission(
+                "const uint8_t * b = (const uint8_t *)Data",
+                "b",
+                "const uint8_t *",
+            ),
+            emission("size_t blen = (size_t)Size", "blen", "size_t"),
+        ];
+        slice_input_units(&mut emissions, &[0..2, 2..4], false);
+        let decode = plan(&group, &emissions, &[]).decode;
+        let trace_of = |name: &str| {
+            let key = format!("\\\"name\\\":\\\"{name}\\\"");
+            decode
+                .iter()
+                .find(|statement| statement.contains(&key))
+                .unwrap_or_else(|| panic!("no trace for {name}: {decode:#?}"))
+                .clone()
+        };
+        for (name, label) in [
+            ("a", "sized heap copy"),
+            ("alen", "sized copy length"),
+            ("b", "input view"),
+            ("blen", "input view"),
+        ] {
+            let trace = trace_of(name);
+            let want = format!("\\\"decoder\\\":\\\"{label}\\\"");
+            assert!(trace.contains(&want), "{name}: {trace}");
         }
     }
 

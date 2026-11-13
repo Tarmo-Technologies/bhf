@@ -1159,6 +1159,11 @@
   ordinal. Each ordinal is now reserved before its finding dir is made, in
   `results/.findings-ordinals/` beside the findings dir, so ordinals are
   unique too.
+- The argument trace (`BHF_TRACE_ARGS=1`) labelled a buffer that takes its
+  own slice of the input as `input view`, although the harness passes it a
+  heap copy of that slice. Such a buffer is now labelled `sized heap copy` and
+  its length `sized copy length`; the last buffer of a call still views the
+  rest of the input.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

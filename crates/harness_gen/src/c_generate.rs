@@ -5724,10 +5724,15 @@ mod tests {
         let a = traced(&args, "a", None);
         assert_eq!(a["span"], serde_json::json!([8, 10]), "{args:#?}");
         assert_eq!(a["preview_hex"], "a1a2");
-        assert_eq!(traced(&args, "alen", None)["value"], "2");
+        // `a` is a heap copy of its slice; only the last buffer views the input.
+        assert_eq!(a["decoder"], "sized heap copy", "{args:#?}");
+        let alen = traced(&args, "alen", None);
+        assert_eq!(alen["value"], "2");
+        assert_eq!(alen["decoder"], "sized copy length");
         let b = traced(&args, "b", None);
         assert_eq!(b["span"], serde_json::json!([10, 13]));
         assert_eq!(b["preview_hex"], "b1b2b3");
+        assert_eq!(b["decoder"], "input view");
         assert_eq!(traced(&args, "blen", None)["value"], "3");
         for input in [&short_tail[..], &input, b"", &[0xff; 40]] {
             assert_layout_matches_trace(&out, input);
