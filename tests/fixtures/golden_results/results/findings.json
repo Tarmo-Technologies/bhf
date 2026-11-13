@@ -125,8 +125,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "fc32a4bbd4c5cb1e4d2bf7d1c097e3364f82a0e1877bd82a072fa80f7f867f25",
-            "size": 2794
+            "sha256": "5c797d72d0914dcf4b501be7d41f72d343ea3573baa1a637195ea39b79400658",
+            "size": 3094
           },
           {
             "role": "testcase",
@@ -239,7 +239,12 @@
             "role": "param",
             "after_call_value": null
           }
-        ]
+        ],
+        "sanitizer_second_opinion": {
+          "check": "object-size",
+          "used": "asan",
+          "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink"
+        }
       },
       "static": null,
       "sca": null,
@@ -591,7 +596,8 @@
         "input_to_state_status": null,
         "input_to_state_reason": null,
         "input_to_state_search": null,
-        "arguments": null
+        "arguments": null,
+        "sanitizer_second_opinion": null
       },
       "static": null,
       "sca": null,
@@ -760,7 +766,8 @@
         "input_to_state_status": null,
         "input_to_state_reason": null,
         "input_to_state_search": null,
-        "arguments": null
+        "arguments": null,
+        "sanitizer_second_opinion": null
       },
       "static": null,
       "sca": null,

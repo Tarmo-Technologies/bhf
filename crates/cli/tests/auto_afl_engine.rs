@@ -135,3 +135,85 @@ fn auto_engine_afl_only_skips_builtin_cascade() {
         "AFL-only run must NOT record builtin passes"
     );
 }
+
+/// A store to a struct member past a 4-byte heap block, fuzzed by AFL++ alone
+/// (the only access through the struct type, so seeds that skip it do not
+/// crash: clang's check reports any member access through an undersized block).
+/// afl-clang-fast's UBSan object-size check reports the member access before
+/// ASan does; the crash ingestion re-runs the input with that check suppressed
+/// and reports ASan's heap-buffer-overflow, as the builtin engine does, saying
+/// so in the finding.
+#[test]
+fn an_afl_member_store_past_a_heap_block_is_an_asan_heap_buffer_overflow() {
+    if !afl_present() || !which("make") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("pair.c"),
+        "#include <stdlib.h>\n\
+         struct pair { int first; int second; };\n\
+         int store_pair(const unsigned char *d, size_t n) {\n\
+         \x20   int *slot = malloc(sizeof(int));\n\
+         \x20   if (!slot) return 0;\n\
+         \x20   *slot = 0;\n\
+         \x20   if (n > 2 && d[0] == 'P') ((struct pair *)slot)->second = d[1];\n\
+         \x20   int r = *slot;\n\
+         \x20   free(slot);\n\
+         \x20   return r;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--engine",
+            "afl++",
+            "--per-target-time",
+            "8",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+            "--no-discovery-cache",
+        ])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let findings: Vec<serde_json::Value> = std::fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path().join("finding.json")).ok()?;
+            serde_json::from_str(&text).ok()
+        })
+        .collect();
+    let overflow = findings
+        .iter()
+        .find(|finding| finding["exception"]["name"] == "ASAN_HEAP_BUFFER_OVERFLOW")
+        .unwrap_or_else(|| panic!("no heap-buffer-overflow: {findings:#?}\n{log}"));
+    assert_eq!(overflow["rule_id"], "BHF-201", "{overflow:#}");
+    let opinion = &overflow["sanitizer_second_opinion"];
+    assert_eq!(opinion["check"], "object-size", "{overflow:#}");
+    assert_eq!(opinion["used"], "asan", "{overflow:#}");
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding["rule_id"] == "BHF-227"),
+        "no object-size finding: {findings:#?}"
+    );
+}

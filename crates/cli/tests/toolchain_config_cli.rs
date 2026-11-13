@@ -98,6 +98,95 @@ fn auto_args<'a>(src: &'a Path, work: &'a Path) -> Vec<&'a std::ffi::OsStr> {
     ]
 }
 
+/// A directory holding a `gcc` that runs the host's gcc, and no `g++`.
+#[cfg(unix)]
+fn c_only_toolchain(dir: &Path) -> PathBuf {
+    let gcc = which::which("gcc").expect("gcc on PATH");
+    std::fs::create_dir_all(dir).unwrap();
+    let link = dir.join("gcc");
+    std::os::unix::fs::symlink(gcc, &link).unwrap();
+    link
+}
+
+/// A toolchain with only a C compiler builds a C harness: the C++ compiler
+/// derived from it (`g++` next to `gcc`) need not exist, since a C harness
+/// never runs it.
+#[cfg(unix)]
+#[test]
+fn a_c_only_toolchain_builds_a_c_harness() {
+    if !have("gcc") || !have("make") {
+        eprintln!("skip: gcc/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let gcc = c_only_toolchain(&tmp.path().join("cc-only"));
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-CONLY", &work);
+    let output = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-CONLY", "--cc"])
+        .arg(&gcc)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .env_remove("CFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    let main = work.join("build/H-CONLY/main");
+    let native = if std::env::consts::ARCH == "aarch64" {
+        EM_AARCH64
+    } else {
+        EM_X86_64
+    };
+    assert_eq!(elf_machine(&main), native, "{out}");
+}
+
+/// The same C-only toolchain sweeps a C-only tree; a tree with a C++
+/// candidate is refused, naming the missing C++ compiler.
+#[cfg(unix)]
+#[test]
+fn a_c_only_toolchain_sweeps_a_c_only_tree_and_refuses_cpp_candidates() {
+    if !have("gcc") {
+        eprintln!("skip: gcc unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let gcc = c_only_toolchain(&tmp.path().join("cc-only"));
+    let sweep = |work: &Path| {
+        bhf()
+            .args(auto_args(&src, work))
+            .arg("--dry-run")
+            .arg("--cc")
+            .arg(&gcc)
+            .env_remove("CC")
+            .env_remove("CXX")
+            .output()
+            .unwrap()
+    };
+    let output = sweep(&tmp.path().join("work-c"));
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(
+        out.contains("is not installed"),
+        "the missing CXX is noted: {out}"
+    );
+    std::fs::write(
+        src.join("widget.cpp"),
+        "#include <cstddef>\nint widget_parse(const unsigned char *d, std::size_t n) { return n > 0 ? d[0] : 0; }\n",
+    )
+    .unwrap();
+    let output = sweep(&tmp.path().join("work-cpp"));
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(out.contains("toolchain.cxx"), "{out}");
+}
+
 /// `bhf build --target <triple>` builds a C/C++ harness with the cross
 /// compiler for that triple. It used to build a host binary and say nothing.
 #[test]
@@ -306,12 +395,77 @@ fn auto_refuses_a_foreign_target_without_a_runner() {
         .args(["--dry-run", "--target-triple", foreign])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
     assert!(
         text(&output).contains("toolchain.runner"),
         "{}",
         text(&output)
     );
+}
+
+/// A toolchain compiler that is not installed is a usage error (exit 2).
+#[test]
+fn auto_exits_2_for_a_toolchain_compiler_that_is_not_installed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    let missing = tmp.path().join("missing/gcc");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .arg("--dry-run")
+        .arg("--cc")
+        .arg(&missing)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(out.contains("toolchain.cc"), "{out}");
+}
+
+/// An unknown `[toolchain]` key fails the config parse, a usage error (exit
+/// 2), as it is for `bhf build --config`.
+#[test]
+fn auto_exits_2_for_an_unknown_toolchain_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(&config, "[toolchain]\nbogus = 1\n").unwrap();
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .arg("--dry-run")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(out.contains("bogus"), "{out}");
+}
+
+/// A `[cross.<lane>]` table naming no lane bhf knows is a usage error (exit 2).
+#[test]
+fn auto_exits_2_for_an_unknown_cross_lane() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(&config, "[cross.nosuch]\ncc = \"gcc\"\n").unwrap();
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .arg("--dry-run")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(out.contains("unknown cross lane"), "{out}");
 }
 
 /// A C++ member declared with its own class's qualification (MSVC-only by
@@ -538,8 +692,45 @@ fn auto_refuses_a_runner_when_nothing_builds_for_another_target() {
         .output()
         .unwrap();
     let out = text(&output);
-    assert!(!output.status.success(), "{out}");
+    assert_eq!(output.status.code(), Some(2), "{out}");
     assert!(out.contains("toolchain.target"), "{out}");
+}
+
+/// A runner that is not installed is a usage error (exit 2).
+// The fake compilers are shell scripts.
+#[cfg(unix)]
+#[test]
+fn auto_exits_2_for_a_runner_that_is_not_installed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let foreign = if std::env::consts::ARCH == "aarch64" {
+        "x86_64-linux-gnu"
+    } else {
+        "aarch64-linux-gnu"
+    };
+    // Answer -dumpmachine like a cross gcc/g++ pair for `foreign` does.
+    let answer = format!(
+        "#!/bin/sh\nif [ \"$1\" = -dumpmachine ]; then echo {foreign}; exit 0; fi\nexit 1\n"
+    );
+    let cross_cc = tmp.path().join(format!("bin/{foreign}-gcc"));
+    write_script(&cross_cc, &answer);
+    write_script(&tmp.path().join(format!("bin/{foreign}-g++")), &answer);
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .arg("--dry-run")
+        .arg("--cc")
+        .arg(&cross_cc)
+        .arg("--runner")
+        .arg(tmp.path().join("missing/qemu-aarch64"))
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(out.contains("runner"), "{out}");
 }
 
 /// A C/C++ compiler that builds for another target, with no runner, is
@@ -576,7 +767,7 @@ fn auto_refuses_a_foreign_compiler_without_a_runner() {
         .output()
         .unwrap();
     let out = text(&from_flag);
-    assert!(!from_flag.status.success(), "{out}");
+    assert_eq!(from_flag.status.code(), Some(2), "{out}");
     assert!(
         out.contains("toolchain.runner") && out.contains(foreign),
         "{out}"
@@ -589,7 +780,7 @@ fn auto_refuses_a_foreign_compiler_without_a_runner() {
         .output()
         .unwrap();
     let out = text(&from_env);
-    assert!(!from_env.status.success(), "{out}");
+    assert_eq!(from_env.status.code(), Some(2), "{out}");
     assert!(
         out.contains("toolchain.runner") && out.contains("CC"),
         "{out}"
@@ -1556,6 +1747,183 @@ fn toolchain_libraries_reach_the_coverage_and_afl_lanes() {
     );
 }
 
+/// The `BHF_TOOLCHAIN_*` values a `bhf build` published, read off its
+/// `bhf build: NAME=value` notes, for a later `make` in the harness dir.
+fn published_toolchain_env(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| line.strip_prefix("bhf build: "))
+        .filter(|note| note.starts_with("BHF_TOOLCHAIN_"))
+        .filter_map(|note| note.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// A linker choice (`-fuse-ld=`) reaches every lane that gets the options
+/// written for that linker: `-Wl,--icf=all` is a gold option, and the coverage
+/// lane used to get it without `-fuse-ld=gold`, so GNU ld refused it.
+#[test]
+fn a_linker_choice_reaches_every_lane_with_its_options() {
+    if !have("clang") || !have("make") || !have("ld.gold") {
+        eprintln!("skip: clang/make/ld.gold unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-GOLD", &work);
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-GOLD", "--cc", "clang"])
+        .args(["--ldflags", "-fuse-ld=gold -Wl,--icf=all"])
+        .env_remove("CC")
+        .env_remove("CFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    let mut make = Command::new("make");
+    make.arg("main_cov")
+        .current_dir(work.join("harnesses/H-GOLD"))
+        .env("CC", "clang")
+        .env_remove("CFLAGS");
+    for (name, value) in published_toolchain_env(&out) {
+        make.env(name, value);
+    }
+    let cov = make.output().unwrap();
+    assert!(cov.status.success(), "{}\nbuild:\n{out}", text(&cov));
+}
+
+/// `--define` and `--toolchain-include` reach bhf's driver object, as the
+/// `-D`/`-I` words of `--cflags` do: an ABI define such as
+/// `_FILE_OFFSET_BITS=64` must hold for every object of the link.
+#[test]
+fn bhf_build_gives_the_driver_the_defines_and_include_dirs() {
+    if !have("clang") || !have("clang++") || !have("make") {
+        eprintln!("skip: clang/clang++/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sys = tmp.path().join("board-inc");
+    std::fs::create_dir_all(&sys).unwrap();
+    std::fs::write(sys.join("board.h"), "#define BOARD_SLOTS 4\n").unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let body = "int parse_record(const unsigned char *data, size_t size) {\n\
+                \x20   return size ? data[0] % BOARD_SLOTS : WIDGET_MODE;\n\
+                }\n";
+    std::fs::write(
+        src.join("widget.c"),
+        format!("#include <stddef.h>\n#include <board.h>\n{body}"),
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("gadget.cpp"),
+        format!("#include <cstddef>\n#include <board.h>\nusing std::size_t;\n{body}"),
+    )
+    .unwrap();
+    let include = format!("-I{}", sys.display());
+    for (source, id, driver_marker) in [
+        ("widget.c", "H-DRVDEF", "-o bhf_driver.o"),
+        ("gadget.cpp", "H-DRVDEFX", "-o bhf_driver.o"),
+    ] {
+        let work = tmp.path().join(format!("work-{id}"));
+        generate(&src.join(source), id, &work);
+        let built = bhf()
+            .arg("build")
+            .arg(&work)
+            .args(["--harness", id, "--cc", "clang", "--cxx", "clang++"])
+            .args(["--define", "WIDGET_MODE=2", "--toolchain-include"])
+            .arg(&sys)
+            .env_remove("CC")
+            .env_remove("CXX")
+            .env_remove("CFLAGS")
+            .env_remove("CXXFLAGS")
+            .output()
+            .unwrap();
+        let out = text(&built);
+        assert!(built.status.success(), "{out}");
+        let driver = out
+            .lines()
+            .find(|line| line.contains(driver_marker))
+            .unwrap_or_else(|| panic!("no driver compile in:\n{out}"));
+        if source.ends_with(".cpp") {
+            assert!(driver.contains("-x c"), "{driver}");
+        }
+        assert!(
+            driver.contains("-DWIDGET_MODE=2") && driver.contains(&include),
+            "{driver}"
+        );
+    }
+}
+
+/// The toolchain stamp describes the `main` build only: a lane built later
+/// with other flags (here the coverage lane, run with the Makefile's default
+/// flags) leaves it alone, and the lanes keep a stamp of their own. It used to
+/// be rewritten by whichever lane ran `make` last, so a sweep whose `main` was
+/// built without ASan recorded ASan flags.
+#[test]
+fn a_lane_build_leaves_the_main_toolchain_stamp_alone() {
+    if !have("clang") || !have("clang++") || !have("make") {
+        eprintln!("skip: clang/clang++/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    std::fs::write(
+        src.join("gadget.cpp"),
+        "#include <cstddef>\n\
+         int parse_record(const unsigned char *data, std::size_t size) {\n\
+         \x20   return size ? data[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let flags = "-O1 -g -fsanitize-coverage=trace-pc-guard,trace-cmp";
+    for (source, id, variable) in [
+        ("parse.c", "H-STAMP", "CFLAGS"),
+        ("gadget.cpp", "H-STAMPX", "CXXFLAGS"),
+    ] {
+        let work = tmp.path().join(format!("work-{id}"));
+        generate(&src.join(source), id, &work);
+        let built = bhf()
+            .arg("build")
+            .arg(&work)
+            .args(["--harness", id])
+            .env("CC", "clang")
+            .env("CXX", "clang++")
+            .env_remove("CFLAGS")
+            .env_remove("CXXFLAGS")
+            .env(variable, flags)
+            .output()
+            .unwrap();
+        let out = text(&built);
+        assert!(built.status.success(), "{out}");
+        let harness = work.join("harnesses").join(id);
+        let stamp = std::fs::read_to_string(harness.join("bhf_toolchain.stamp")).unwrap();
+        let segments: Vec<&str> = stamp.split(" | ").collect();
+        assert_eq!(segments.get(1).copied(), Some(flags), "{stamp}");
+        assert!(!stamp.contains("-fsanitize=address"), "{stamp}");
+        let cov = Command::new("make")
+            .arg("cov")
+            .current_dir(&harness)
+            .env("CC", "clang")
+            .env("CXX", "clang++")
+            .env_remove("CFLAGS")
+            .env_remove("CXXFLAGS")
+            .output()
+            .unwrap();
+        assert!(cov.status.success(), "{}", text(&cov));
+        assert_eq!(
+            std::fs::read_to_string(harness.join("bhf_toolchain.stamp")).unwrap(),
+            stamp,
+            "the coverage lane must not rewrite the main stamp"
+        );
+        assert!(harness.join("bhf_lanes.stamp").is_file());
+    }
+}
+
 /// `--engine afl++` without the builtin engine: a failed `make afl` leaves the
 /// target unfuzzed and says so, instead of "builtin results kept".
 #[test]
@@ -1583,6 +1951,10 @@ fn a_failed_afl_build_without_the_builtin_engine_says_the_target_was_not_fuzzed(
         "{out}"
     );
     assert!(!out.contains("builtin results kept"), "{out}");
+    assert!(
+        out.contains("Source files: 0 fuzzed / 1 with targets"),
+        "{out}"
+    );
     let target = target_with_outcome(&work, &["built"])
         .unwrap_or_else(|| panic!("the target is built, not fuzzed:\n{out}"));
     assert_eq!(target["lanes"]["afl"]["built"], false, "{target}");
@@ -1821,6 +2193,44 @@ fn write_ada_package(dir: &Path) {
     .unwrap();
 }
 
+/// `bhf auto` names the Ada toolchain overrides it was given, before it
+/// checks the tools, so a refused run still shows what was asked for. A run
+/// without any prints no such line.
+#[test]
+fn auto_announces_the_ada_toolchain_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_ada_package(&src);
+    let prefix = format!("{}-linux-gnu", std::env::consts::ARCH);
+    let output = bhf()
+        .args(auto_args(&src, &tmp.path().join("work")))
+        .args(["--languages", "ada", "--dry-run", "--ada-prefix", &prefix])
+        .args(["--ada-switch", "-gnata", "--ada-runtime", "light"])
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("bhf auto: Ada toolchain:"))
+        .unwrap_or_else(|| panic!("no Ada toolchain line:\n{out}"));
+    assert!(
+        line.contains(&format!("prefix={prefix}"))
+            && line.contains("-gnata")
+            && line.contains("runtime=light"),
+        "{line}"
+    );
+
+    let c_src = tmp.path().join("c-src");
+    write_parser(&c_src);
+    let output = bhf()
+        .args(auto_args(&c_src, &tmp.path().join("work-c")))
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(!out.contains("Ada toolchain:"), "{out}");
+}
+
 /// A probe backend other than `host_file` writes the Ada harness's events
 /// where a host sweep never reads them, so every finding would be lost: the
 /// configuration is refused up front, naming the key.
@@ -1870,6 +2280,19 @@ fn a_target_side_probe_backend_on_a_host_sweep_is_refused() {
         .arg(&work)
         .args(["--harness", "H-AMEM", "--config"])
         .arg(&config)
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert_eq!(built.status.code(), Some(2), "{out}");
+    assert!(
+        out.contains("toolchain.ada.probe-backend: memory_buffer needs an on-target transport"),
+        "{out}"
+    );
+    // The same backend from the command line is refused the same way.
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-AMEM", "--probe-backend", "memory_buffer"])
         .output()
         .unwrap();
     let out = text(&built);

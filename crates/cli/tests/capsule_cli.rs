@@ -473,7 +473,7 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
     // The clang-built capsule also rebuilds with g++, which declares the
     // SanitizerCoverage hooks as builtins with its own parameter types.
-    if gxx_links_static_asan() {
+    if links_static_asan("g++", "cpp") {
         let scratch = tempfile::tempdir().unwrap();
         let dest = scratch.path().join("cap");
         copy_tree(&cap, &dest);
@@ -1333,16 +1333,17 @@ fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
     }
 }
 
-/// Whether `g++` is installed and links a program with its static
-/// AddressSanitizer runtime (`-static-libasan`), which the GCC lane uses.
-fn gxx_links_static_asan() -> bool {
-    if which::which("g++").is_err() {
+/// Whether `compiler` is installed and links a `language` (`c`/`cpp`) program
+/// with its static AddressSanitizer runtime (`-static-libasan`), which the GCC
+/// lane uses.
+fn links_static_asan(compiler: &str, language: &str) -> bool {
+    if which::which(compiler).is_err() {
         return false;
     }
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("probe.cpp");
-    std::fs::write(&source, "int main() { return 0; }\n").unwrap();
-    Command::new("g++")
+    let source = dir.path().join(format!("probe.{language}"));
+    std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    Command::new(compiler)
         .args(["-fsanitize=address", "-static-libasan", "-o"])
         .arg(dir.path().join("probe"))
         .arg(&source)
@@ -1361,7 +1362,7 @@ fn gxx_links_static_asan() -> bool {
               cl; see docs/site/windows.md"
 )]
 fn a_gpp_built_cpp_harness_capsule_rebuilds_with_gpp() {
-    if !gxx_links_static_asan() {
+    if !links_static_asan("g++", "cpp") {
         eprintln!("skipping: g++ missing or cannot link -static-libasan");
         return;
     }
@@ -1430,6 +1431,169 @@ fn a_gpp_built_cpp_harness_capsule_rebuilds_with_gpp() {
             String::from_utf8_lossy(&verified.stderr)
         );
     }
+}
+
+/// A loop storing every input byte into a 4-byte heap block.
+const HEAP_STORE_C: &str = "\
+#include <stdlib.h>
+int fill(const unsigned char *d, size_t n) {
+    char *p = malloc(4);
+    if (!p) return 0;
+    for (size_t i = 0; i < n; i++) p[i] = (char)d[i];
+    int r = p[0];
+    free(p);
+    return r;
+}
+";
+
+/// A clang-built capsule of a heap store overflow verifies with gcc: the
+/// capsule's gcc flags leave bounds to AddressSanitizer, so the rebuild
+/// reports the heap-buffer-overflow clang recorded, not gcc's UBSan
+/// object-size error.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "gcc has no sanitizer runtime on Windows, where C harnesses build with clang or \
+              cl; see docs/site/windows.md"
+)]
+fn a_clang_built_heap_store_capsule_verifies_with_gcc() {
+    if !clang_available() || !links_static_asan("gcc", "c") {
+        eprintln!("skipping: clang, or gcc with a static libasan, unavailable");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("fill.c"), HEAP_STORE_C).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "6", "--no-discovery-cache"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .expect("run bhf auto");
+    let Some((id, _)) = crash_finding(&work, |_| true) else {
+        panic!(
+            "bhf auto found no crash: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let scratch = tempfile::tempdir().unwrap();
+    let dest = scratch.path().join("cap");
+    copy_tree(&cap, &dest);
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&dest)
+        .env("CC", "gcc")
+        .output()
+        .expect("run bhf verify-poc");
+    let verify_out = String::from_utf8_lossy(&verified.stdout);
+    let passed = verified.status.success() && verify_out.contains("PASS");
+    assert!(
+        passed && !verify_out.contains("MISMATCH"),
+        "verify-poc with CC=gcc must reproduce the recorded overflow; stdout:\n{verify_out}\n\
+         stderr:\n{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+/// The capsule of a finding from a gcc build with UBSan alone rebuilds with
+/// UBSan alone, and reproduces it: the same heap store is gcc's UBSan
+/// insufficient-object-size error there (BHF-227), which a rebuild that also
+/// armed ASan would report as ASan's heap-buffer-overflow instead.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "gcc has no sanitizer runtime on Windows, where C harnesses build with clang or \
+              cl; see docs/site/windows.md"
+)]
+fn a_gcc_ubsan_only_capsule_rebuilds_with_ubsan_alone() {
+    if !links_static_asan("gcc", "c") {
+        eprintln!("skipping: gcc with static sanitizer runtimes unavailable");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("fill.c"), HEAP_STORE_C).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "6", "--no-discovery-cache"])
+        .args(["--sanitizers", "ubsan"])
+        .env("CC", "gcc")
+        .env("CXX", "g++")
+        .output()
+        .expect("run bhf auto");
+    let Some((id, dir)) = crash_finding(&work, |_| true) else {
+        panic!(
+            "bhf auto found no crash: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(raw["rule_id"], "BHF-227", "{raw:#}");
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .arg("--finding-id")
+        .arg(&id)
+        .arg("--verbose")
+        .env("CC", "gcc")
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let build = std::fs::read_to_string(cap.join("build.sh")).unwrap();
+    let gcc_line = build
+        .lines()
+        .find(|line| line.contains("CC_FAMILY\" = gcc"))
+        .unwrap_or_else(|| panic!("no gcc sanitizer line:\n{build}"));
+    assert!(
+        gcc_line.contains("-fsanitize=undefined") && !gcc_line.contains("address"),
+        "{gcc_line}"
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let dest = scratch.path().join("cap");
+    copy_tree(&cap, &dest);
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&dest)
+        .env("CC", "gcc")
+        .output()
+        .expect("run bhf verify-poc");
+    let verify_out = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        verified.status.success()
+            && verify_out.contains("PASS")
+            && !verify_out.contains("MISMATCH"),
+        "stdout:\n{verify_out}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
 }
 
 /// On native Windows a C target whose compiler is gcc is refused, naming the

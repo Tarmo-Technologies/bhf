@@ -1442,7 +1442,10 @@ Exit codes: `0` at least one target built and ran, `1` discovery found
 candidates but none built, `2` no candidates discovered, or the toolchain
 configuration was refused (a compiler, runner or Ada tool that is not
 installed, a target with no runner to run it, a runner with nothing foreign
-to run, or a probe backend a host sweep cannot read), as for `bhf build`.
+to run, a probe backend a host sweep cannot read, a config file that cannot
+be read or parsed (an unknown key included) or that holds an invalid value
+(`max-corpus-mb = 0`, an unknown `languages` entry), or an unusable
+`[cross.*]` table), as for `bhf build`.
 
 The runtime audit and the shim's faking modes are Linux-only. On other hosts
 `bhf auto` still runs the build-time sweep but prints a one-line notice

@@ -7751,7 +7751,9 @@ fn native_override_for(
             // The `function`/`vptr`/`alignment` checks fire on pervasive
             // harmless patterns; subtract them only when UBSan is in the set (the
             // subtraction must follow `-fsanitize=undefined`), mirroring the
-            // Makefile default, in the spelling this family accepts.
+            // Makefile default, in the spelling this family accepts. gcc's
+            // object-size check stays, next to ASan too: it sees overflows of
+            // objects ASan does not track (a pool allocator's chunks).
             if has_ubsan && family.supports_ubsan() {
                 flags.push(family.ubsan_subtraction().to_owned());
             }
@@ -10485,6 +10487,9 @@ mod sanitizer_override_tests {
             );
             assert!(!has_flag(flags, "trace-pc-guard"), "{flags:?}");
             assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
+            // The object-size check stays next to ASan: it sees overflows of
+            // objects ASan does not track.
+            assert!(!has_flag(flags, "object-size"), "{flags:?}");
             assert!(!has_flag(flags, "function"), "{flags:?}");
             // A shared libasan aborts under the runtrace LD_PRELOAD shim.
             assert!(
@@ -10492,6 +10497,18 @@ mod sanitizer_override_tests {
                 "{flags:?}"
             );
             assert!(!has_flag(flags, "-Wno-reserved-user-defined-literal"));
+        }
+        // UBSan without ASan keeps the object-size check too.
+        let (ov, _) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=undefined".to_owned()),
+            true,
+            by_name,
+            |_, _| true,
+        );
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
+            assert!(!has_flag(flags, "object-size"), "{flags:?}");
         }
         // Coverage only keeps the operator's compiler too.
         let (ov, _) = native_override_for(

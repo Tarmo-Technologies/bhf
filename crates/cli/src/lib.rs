@@ -399,6 +399,29 @@ fn run_multicall(argv: &[std::ffi::OsString]) -> Option<i32> {
     None
 }
 
+/// Parse bhf's command line. For `bhf auto`, `bhf ci` and `bhf build`, also
+/// record which flags the command line gave, so a config file fills only the
+/// others.
+fn parse_args(argv: Vec<std::ffi::OsString>) -> Result<Args, clap::Error> {
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = Args::command().try_get_matches_from(argv)?;
+    let mut args =
+        Args::from_arg_matches(&matches).map_err(|error| error.format(&mut Args::command()))?;
+    match (&mut args.command, matches.subcommand()) {
+        (Some(Command::Auto(auto_args)), Some(("auto", sub))) => {
+            auto_args.given = auto::cli::given_arg_ids(sub);
+        }
+        (Some(Command::Ci(ci_args)), Some(("ci", sub))) => {
+            ci_args.given = auto::cli::given_arg_ids(sub);
+        }
+        (Some(Command::Build(build_args)), Some(("build", sub))) => {
+            build_args.toolchain_args.given = auto::cli::given_arg_ids(sub);
+        }
+        _ => {}
+    }
+    Ok(args)
+}
+
 pub fn run_from<I, T>(args: I) -> i32
 where
     I: IntoIterator<Item = T>,
@@ -408,7 +431,7 @@ where
     if let Some(code) = run_multicall(&argv) {
         return code;
     }
-    let args = match Args::try_parse_from(argv) {
+    let args = match parse_args(argv) {
         Ok(args) => args,
         Err(error) => {
             let _ = error.print();
@@ -1479,6 +1502,107 @@ mod tests {
         assert!(probe_body.contains("adafuzz_probe_memory_buffer"));
     }
 
+    /// The argv of a `bhf build` of the minimal Ada harness in `work_dir` with
+    /// `--probe-backend <backend>`, through fake `gprbuild`/`gnat` tools
+    /// written under `temp`, for another target when `foreign`.
+    #[cfg(unix)]
+    fn foreign_ada_build_argv(
+        temp: &Path,
+        work_dir: &Path,
+        backend: &str,
+        foreign: bool,
+    ) -> Vec<String> {
+        let tools = temp.join("tools");
+        fs::create_dir_all(&tools).expect("tool directory is created");
+        let gprbuild = tools.join("my-gprbuild");
+        let gnat = tools.join("my-gnat");
+        write_executable(&gprbuild, fake_build_compiler_script());
+        write_executable(&gnat, fake_raw_gnat_canary_script());
+        let mut argv: Vec<String> = ["bhf", "build"].map(str::to_owned).to_vec();
+        argv.push(work_dir.to_string_lossy().into_owned());
+        if foreign {
+            let target = if std::env::consts::ARCH == "aarch64" {
+                "x86_64-linux-gnu"
+            } else {
+                "aarch64-linux-gnu"
+            };
+            argv.extend(["--target".to_owned(), target.to_owned()]);
+        }
+        argv.extend([
+            "--ada-gprbuild".to_owned(),
+            gprbuild.to_string_lossy().into_owned(),
+            "--ada-gnat".to_owned(),
+            gnat.to_string_lossy().into_owned(),
+            "--probe-backend".to_owned(),
+            backend.to_owned(),
+        ]);
+        argv
+    }
+
+    /// A target-side probe backend for an Ada harness built for this host is
+    /// refused, from the flag as from the config file: a host run never
+    /// reads the events it keeps on the target.
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
+    #[test]
+    fn build_subcommand_refuses_a_target_side_probe_backend_for_a_host_build() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        let temp = temp_dir("build-host-memory-buffer-probe");
+        let work_dir = create_minimal_work_dir(&temp);
+
+        let exit = run_from(foreign_ada_build_argv(
+            &temp,
+            &work_dir,
+            "memory_buffer",
+            false,
+        ));
+
+        assert_eq!(exit, 2);
+        assert!(
+            !work_dir.join("build/H-TEST/adafuzz_runtime_src").exists(),
+            "nothing is staged for a refused build"
+        );
+    }
+
+    /// `--probe-backend` given on the command line wins over the config
+    /// file's `toolchain.ada.probe-backend`, its default value `host_file`
+    /// included: for a host build (which the config's target-side backend
+    /// alone would refuse) and for a build for another target.
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
+    #[test]
+    fn build_subcommand_probe_backend_flag_beats_the_config_even_at_its_default() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        for foreign in [false, true] {
+            let temp = temp_dir(&format!("build-probe-backend-flag-{foreign}"));
+            let work_dir = create_minimal_work_dir(&temp);
+            let config = temp.join("bhf.toml");
+            fs::write(
+                &config,
+                "[toolchain.ada]\nprobe-backend = \"memory_buffer\"\n",
+            )
+            .expect("config is written");
+            let mut argv = foreign_ada_build_argv(&temp, &work_dir, "host_file", foreign);
+            argv.extend(["--config".to_owned(), config.to_string_lossy().into_owned()]);
+
+            let exit = run_from(argv);
+
+            assert_eq!(exit, 0, "foreign target: {foreign}");
+            let probe_body = fs::read_to_string(
+                work_dir.join("build/H-TEST/adafuzz_runtime_src/adafuzz-probe.adb"),
+            )
+            .expect("selected probe body is readable");
+            assert!(
+                probe_body.contains("Ada.Streams.Stream_IO"),
+                "foreign target: {foreign}: the host-file probe body is staged"
+            );
+            assert!(
+                !probe_body.contains("adafuzz_probe_memory_buffer"),
+                "foreign target: {foreign}"
+            );
+        }
+    }
+
     // The fake `gprbuild` is a POSIX shell script.
     #[cfg(unix)]
     #[test]
@@ -1486,18 +1610,13 @@ mod tests {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
         let temp = temp_dir("build-memory-buffer-probe");
         let work_dir = create_minimal_work_dir(&temp);
-        let bin_dir = temp.join("bin");
-        fs::create_dir_all(&bin_dir).expect("fake compiler bin directory is created");
-        write_executable(&bin_dir.join("gprbuild"), fake_build_compiler_script());
-        let _path = PathEnvGuard::prepend(&bin_dir);
-
-        let exit = run_from([
-            "bhf",
-            "build",
-            work_dir.to_str().expect("work dir path is utf-8"),
-            "--probe-backend",
+        // A target-side backend belongs to a build for another target.
+        let exit = run_from(foreign_ada_build_argv(
+            &temp,
+            &work_dir,
             "memory_buffer",
-        ]);
+            true,
+        ));
 
         assert_eq!(exit, 0);
         let build_dir = work_dir.join("build/H-TEST");
@@ -1519,18 +1638,13 @@ mod tests {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
         let temp = temp_dir("build-semihosting-probe");
         let work_dir = create_minimal_work_dir(&temp);
-        let bin_dir = temp.join("bin");
-        fs::create_dir_all(&bin_dir).expect("fake compiler bin directory is created");
-        write_executable(&bin_dir.join("gprbuild"), fake_build_compiler_script());
-        let _path = PathEnvGuard::prepend(&bin_dir);
-
-        let exit = run_from([
-            "bhf",
-            "build",
-            work_dir.to_str().expect("work dir path is utf-8"),
-            "--probe-backend",
+        // A target-side backend belongs to a build for another target.
+        let exit = run_from(foreign_ada_build_argv(
+            &temp,
+            &work_dir,
             "semihosting",
-        ]);
+            true,
+        ));
 
         assert_eq!(exit, 0);
         let build_dir = work_dir.join("build/H-TEST");
@@ -1550,18 +1664,8 @@ mod tests {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
         let temp = temp_dir("build-stub-probe");
         let work_dir = create_minimal_work_dir(&temp);
-        let bin_dir = temp.join("bin");
-        fs::create_dir_all(&bin_dir).expect("fake compiler bin directory is created");
-        write_executable(&bin_dir.join("gprbuild"), fake_build_compiler_script());
-        let _path = PathEnvGuard::prepend(&bin_dir);
-
-        let exit = run_from([
-            "bhf",
-            "build",
-            work_dir.to_str().expect("work dir path is utf-8"),
-            "--probe-backend",
-            "stub",
-        ]);
+        // A target-side backend belongs to a build for another target.
+        let exit = run_from(foreign_ada_build_argv(&temp, &work_dir, "stub", true));
 
         assert_eq!(exit, 0);
         let build_dir = work_dir.join("build/H-TEST");

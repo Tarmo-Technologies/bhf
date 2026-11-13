@@ -4110,13 +4110,54 @@ fn run_builtin_with_progress(
                         prepared.deadline,
                     )
                 {
+                    // UBSan's object-size check reports an overflow ASan
+                    // would have reported first: emit ASan's report then.
+                    // Asked once per root cause: the key is consumed below.
+                    let opinion = object_size_second_opinion(
+                        &prepared.work_dir,
+                        report,
+                        &prepared.extra_env,
+                        prepared.per_input_timeout,
+                        pass_deadline,
+                        |env, timeout| {
+                            // No response deadline: the re-run asks only what
+                            // ASan reports.
+                            run_c_libfuzzer_single_input(
+                                &prepared.runner,
+                                &prepared.work_dir,
+                                &input,
+                                env,
+                                timeout,
+                                prepared.rss_limit_mb,
+                                None,
+                            )
+                            .map(|rerun| (rerun.sanitizer, rerun.stderr))
+                        },
+                    );
+                    let (report, stderr) = match opinion.as_ref().and_then(|o| o.asan.as_ref()) {
+                        Some((view, stderr)) => (view, stderr.as_deref()),
+                        None => (report, run.stderr.as_deref()),
+                    };
+                    if opinion.as_ref().is_some_and(|o| o.asan.is_some()) {
+                        match sanitizer_dedup.first_sighting(report) {
+                            Some(view_key) => sanitizer_dedup.consumed(view_key),
+                            None => {
+                                // That ASan report is a finding already.
+                                sanitizer_dedup.consumed(key);
+                                note_duplicate_of_existing(
+                                    &mut duplicates_of_existing,
+                                    existing_findings.clusters.get(&sanitizer_dedup.key(report)),
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let id = emitter
-                        .emit_sanitizer_crash_with_log(
-                            &input,
-                            report,
-                            run.stderr.as_deref().map(str::as_bytes),
-                        )
+                        .emit_sanitizer_crash_with_log(&input, report, stderr.map(str::as_bytes))
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
+                    if let Some(opinion) = &opinion {
+                        opinion.record(&prepared.work_dir, &id.0, &key);
+                    }
                     sanitizer_dedup.consumed(key);
                     record_finding_arguments(
                         &prepared.work_dir,
@@ -4641,6 +4682,65 @@ fn afl_crash_is_new(dedup: &mut SanitizerClusterDedup, report: &corpus::Sanitize
     }
 }
 
+/// Run the AFL++ persistent-mode harness `harness` on `input`. Such a harness
+/// reads its testcase from stdin (the `__AFL_LOOP` /
+/// `__AFL_FUZZ_TESTCASE_BUF` macros), so the bytes are piped: passing them as
+/// argv[1] has no effect. With a `timeout` a run still going then is killed,
+/// and its output carries no sanitizer report.
+fn replay_afl_input(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, String> {
+    let mut command = std::process::Command::new(harness);
+    command
+        .current_dir(ensure_harness_scratch(work_dir)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    apply_runaway_rlimits(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn '{}': {error}", harness.display()))?;
+    let stderr_reader = drain_child_stderr(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let wait_error = |error: std::io::Error| format!("wait for '{}': {error}", harness.display());
+    let Some(timeout) = timeout else {
+        let status = child.wait().map_err(wait_error)?;
+        return Ok(collected_child_output(status, stderr_reader));
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader)),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_process_group(&mut child);
+                let status = child.wait().map_err(wait_error)?;
+                let _ = stderr_reader.and_then(|reader| reader.join().ok());
+                return Ok(std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                let _ = stderr_reader.and_then(|reader| reader.join().ok());
+                return Err(wait_error(error));
+            }
+        }
+    }
+}
+
 /// #416: adopt a fresh-process re-run's result for an input the persistent
 /// fork-server ran without a report: the parsed report and the raw stderr it
 /// was parsed from, which becomes the finding's `sanitizer.log`.
@@ -5074,49 +5174,61 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             crash_count += 1;
             let input = fs::read(&path)
                 .map_err(|error| format!("read crash artifact '{}': {error}", path.display()))?;
-            // AFL persistent-mode harnesses read input from stdin (via the
-            // __AFL_LOOP / __AFL_FUZZ_TESTCASE_BUF macros). Piping the
-            // crash bytes is the only way to reproduce; passing them as
-            // argv[1] has no effect.
-            let mut replay_cmd = Command::new(&prepared.harness_path);
-            replay_cmd
-                .current_dir(ensure_harness_scratch(&prepared.work_dir)?)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-            for (k, v) in &prepared.extra_env {
-                replay_cmd.env(k, v);
-            }
-            apply_runaway_rlimits(&mut replay_cmd);
-            let mut child = replay_cmd.spawn().map_err(|error| {
-                format!(
-                    "spawn '{}' to replay '{}': {error}",
-                    prepared.harness_path.display(),
-                    path.display()
-                )
-            })?;
-            let stderr_reader = drain_child_stderr(child.stderr.take());
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(&input);
-            }
-            let status = child.wait().map_err(|error| {
-                format!(
-                    "wait for replay of '{}' against '{}': {error}",
-                    path.display(),
-                    prepared.harness_path.display()
-                )
-            })?;
-            let replay = collected_child_output(status, stderr_reader);
+            let replay = replay_afl_input(
+                &prepared.harness_path,
+                &prepared.work_dir,
+                &input,
+                &prepared.extra_env,
+                None,
+            )
+            .map_err(|error| format!("replay '{}': {error}", path.display()))?;
             let stderr = String::from_utf8_lossy(&replay.stderr);
             let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
                 continue;
             };
+            let key = afl_dedup.key(&report);
             if !afl_crash_is_new(&mut afl_dedup, &report) {
                 continue;
             }
+            // main_afl is a clang build (afl-clang-fast), whose UBSan
+            // object-size check reports a member access through an undersized
+            // heap block before ASan does: the builtin engine's second opinion,
+            // once per root cause (afl_crash_is_new consumed its key), within
+            // the per-input timeout and the pass's hard deadline.
+            let opinion = object_size_second_opinion(
+                &prepared.work_dir,
+                &report,
+                &prepared.extra_env,
+                prepared.per_input_timeout,
+                Some(hard_deadline),
+                |env, timeout| {
+                    let rerun = replay_afl_input(
+                        &prepared.harness_path,
+                        &prepared.work_dir,
+                        &input,
+                        env,
+                        Some(timeout),
+                    )?;
+                    let stderr = String::from_utf8_lossy(&rerun.stderr).into_owned();
+                    Ok((corpus::parse_sanitizer_report(&stderr), Some(stderr)))
+                },
+            );
+            let (report, log) = match opinion.as_ref().and_then(|o| o.asan.as_ref()) {
+                Some((view, log)) => (view, log.as_deref().unwrap_or_default()),
+                None => (&report, stderr.as_ref()),
+            };
+            if opinion.as_ref().is_some_and(|o| o.asan.is_some())
+                && !afl_crash_is_new(&mut afl_dedup, report)
+            {
+                // That ASan report is a finding already.
+                continue;
+            }
             let id = emitter
-                .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
+                .emit_sanitizer_crash_with_log(&input, report, Some(log.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
+            if let Some(opinion) = &opinion {
+                opinion.record(&prepared.work_dir, &id.0, &key);
+            }
             record_finding_arguments(
                 &prepared.work_dir,
                 &id.0,
@@ -6732,6 +6844,15 @@ impl ExistingFindings {
                 }
                 None => {}
             }
+            // A finding that carries ASan's report of an access UBSan's
+            // object-size check reported first stands for that UBSan report
+            // too: a later hit of it is a duplicate, not a new re-run.
+            if let Some(key) = record
+                .pointer("/sanitizer_second_opinion/replaced_cluster_key")
+                .and_then(|value| value.as_str())
+            {
+                keep_lowest_id(&mut existing.clusters, key.to_owned(), &id);
+            }
         }
         existing
     }
@@ -7050,6 +7171,180 @@ fn sanitizer_crash_reproduces(
             .as_ref()
             .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
+    }
+}
+
+/// The UBSan suppressions that turn its `object-size` check off at run time.
+const OBJECT_SIZE_SUPPRESSIONS: &str = "object-size:*\n";
+
+/// What re-running a UBSan insufficient-object-size report's input with that
+/// check suppressed showed, which decides the report a finding carries.
+#[derive(Debug)]
+struct ObjectSizeSecondOpinion {
+    /// ASan's report of the same access and the stderr it came in, when ASan
+    /// reported it: the finding carries it instead.
+    asan: Option<(corpus::SanitizerReport, Option<String>)>,
+    /// Why the finding carries the report it does.
+    reason: String,
+}
+
+impl ObjectSizeSecondOpinion {
+    /// The finding's `sanitizer_second_opinion`: the check, the report it
+    /// carries (`asan` or `ubsan`) and why. When it carries ASan's, also the
+    /// dedupe key of the UBSan report it replaced (`replaced_key`), so a later
+    /// pass counts a hit of that report against this finding without re-running
+    /// it ([`ExistingFindings::load`]).
+    fn to_json(&self, replaced_key: &str) -> serde_json::Value {
+        let mut opinion = serde_json::json!({
+            "check": "object-size",
+            "used": if self.asan.is_some() { "asan" } else { "ubsan" },
+            "reason": self.reason,
+        });
+        if self.asan.is_some() {
+            opinion["replaced_cluster_key"] = serde_json::json!(replaced_key);
+        }
+        opinion
+    }
+
+    /// Record [`Self::to_json`] in the finding `finding_id`.
+    fn record(&self, work_dir: &Path, finding_id: &str, replaced_key: &str) {
+        let path = corpus::layout::finding_dir(work_dir, finding_id).join("finding.json");
+        let recorded = fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                let mut finding: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                finding["sanitizer_second_opinion"] = self.to_json(replaced_key);
+                let bytes =
+                    serde_json::to_vec_pretty(&finding).map_err(|error| error.to_string())?;
+                crate::auto::report::atomic_write(&path, &bytes).map_err(|error| error.to_string())
+            });
+        if let Err(error) = recorded {
+            bhfeprintln!(
+                "warning: could not record the sanitizer second opinion of {finding_id}: {error}"
+            );
+        }
+    }
+}
+
+/// The second opinion on a UBSan insufficient-object-size `report`, or `None`
+/// for any other report. UBSan's object-size check guards the same access as
+/// ASan's own check and fires first when the compiler knows the object's size:
+/// in a gcc build for a heap or stack overflow, in a clang build for a member
+/// access through an undersized heap block. Either is the overflow ASan
+/// reports with clang. `rerun` runs the input once more in a fresh process
+/// with the environment and time limit it is given: the check suppressed, and
+/// the per-input timeout or what is left before `deadline` when that is less.
+/// An ASan report of the same sink and access direction is the overflow as
+/// ASan reports it. When ASan stays silent the UBSan report
+/// stands: memory ASan does not track (a pool allocator's chunks, which gcc's
+/// check sees through `alloc_size`), or an object smaller than its type whose
+/// accessed bytes are in bounds. The caller asks only for the first sighting
+/// of a root cause.
+fn object_size_second_opinion(
+    work_dir: &Path,
+    report: &corpus::SanitizerReport,
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    deadline: Option<Instant>,
+    rerun: impl FnOnce(
+        &[(String, String)],
+        Duration,
+    ) -> Result<(Option<corpus::SanitizerReport>, Option<String>), String>,
+) -> Option<ObjectSizeSecondOpinion> {
+    if report.sanitizer != Some(corpus::Sanitizer::UndefinedBehaviorSanitizer)
+        || report.kind != "insufficient-object-size"
+    {
+        return None;
+    }
+    let stands = |why: String| {
+        Some(ObjectSizeSecondOpinion {
+            asan: None,
+            reason: format!("UBSan's object-size report stands: {why}"),
+        })
+    };
+    let timeout = match deadline {
+        Some(deadline) => per_input_timeout.min(deadline.saturating_duration_since(Instant::now())),
+        None => per_input_timeout,
+    };
+    if timeout.is_zero() {
+        return stands(
+            "the pass's time ran out before a re-run with the check suppressed".to_owned(),
+        );
+    }
+    let suppressions = work_dir.join("fuzz_inputs").join("bhf-object-size.supp");
+    let written = suppressions
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(&suppressions, OBJECT_SIZE_SUPPRESSIONS));
+    if let Err(error) = written {
+        return stands(format!(
+            "the suppressions file for a re-run could not be written: {error}"
+        ));
+    }
+    let mut env = extra_env.to_vec();
+    let option = format!("suppressions=\"{}\"", suppressions.display());
+    match env.iter_mut().find(|(key, _)| key == "UBSAN_OPTIONS") {
+        Some((_, value)) => {
+            value.push(':');
+            value.push_str(&option);
+        }
+        None => env.push((
+            "UBSAN_OPTIONS".to_owned(),
+            format!("{}:{option}", ubsan_child_options()),
+        )),
+    }
+    let started = Instant::now();
+    let (view, stderr) = match rerun(&env, timeout) {
+        Ok(rerun) => rerun,
+        Err(error) => {
+            return stands(format!(
+                "the re-run with the check suppressed failed: {error}"
+            ))
+        }
+    };
+    let direction = |report: &corpus::SanitizerReport| match &report.access {
+        Some(access) => access.direction,
+        None if report.message.contains("runtime error: store to ") => {
+            corpus::sanitizer::AccessDirection::Write
+        }
+        None if report.message.contains("runtime error: load of ") => {
+            corpus::sanitizer::AccessDirection::Read
+        }
+        None => corpus::sanitizer::AccessDirection::Unknown,
+    };
+    let sink = crate::crash_identity::replayed_sink(report);
+    let same_access = |view: &corpus::SanitizerReport| {
+        let unknown = corpus::sanitizer::AccessDirection::Unknown;
+        view.sanitizer == Some(corpus::Sanitizer::AddressSanitizer)
+            && sink.is_some()
+            && crate::crash_identity::replayed_sink(view) == sink
+            && (direction(report) == unknown
+                || direction(view) == unknown
+                || direction(report) == direction(view))
+    };
+    match view {
+        Some(view) if same_access(&view) => Some(ObjectSizeSecondOpinion {
+            reason: format!(
+                "UBSan's object-size check reported this access before ASan; with the check \
+                 suppressed, AddressSanitizer reported {} at the same sink",
+                view.kind
+            ),
+            asan: Some((view, stderr)),
+        }),
+        Some(other) => stands(format!(
+            "with the check suppressed, the re-run reported {} ({}), not ASan's report of \
+             the same access",
+            other.kind, other.rule_id
+        )),
+        None if started.elapsed() >= timeout => stands(format!(
+            "the re-run with the check suppressed reached its {timeout:?} time limit"
+        )),
+        None => stands(
+            "with the check suppressed, the re-run reported no error: ASan saw no \
+             access outside the memory it tracks"
+                .to_owned(),
+        ),
     }
 }
 
@@ -9458,6 +9753,194 @@ mod auto_path_tests {
             0,
             None,
         ));
+    }
+
+    /// gcc's UBSan report of a store at `fill` (record.c:15).
+    fn object_size_report() -> corpus::SanitizerReport {
+        corpus::parse_sanitizer_report(
+            "/src/record.c:15:5: runtime error: store to address 0x602000000014 with insufficient space for an object of type 'char'\n\
+             \x20   #0 0x1 in fill /src/record.c:15:5\n\
+             \x20   #1 0x2 in LLVMFuzzerTestOneInput /src/h.c:20:3\n\
+             SUMMARY: UndefinedBehaviorSanitizer: insufficient-object-size /src/record.c:15:5\n",
+        )
+        .expect("ubsan report")
+    }
+
+    /// ASan's report of the store [`object_size_report`] reports, at `function`,
+    /// and the stderr it came in.
+    fn asan_store_at(function: &str) -> (Option<corpus::SanitizerReport>, Option<String>) {
+        let stderr = format!(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014 at pc 0x1 bp 0x2 sp 0x3\n\
+             WRITE of size 1 at 0x602000000014 thread T0\n\
+             \x20   #0 0x1 in {function} /src/record.c:15:5\n\
+             \x20   #1 0x2 in LLVMFuzzerTestOneInput /src/h.c:20:3\n\
+             SUMMARY: AddressSanitizer: heap-buffer-overflow /src/record.c:15:5 in {function}\n"
+        );
+        (corpus::parse_sanitizer_report(&stderr), Some(stderr))
+    }
+
+    /// Once the pass's time is spent the input is not re-run, and the finding
+    /// records that UBSan's report stands for that reason. Before then the
+    /// re-run gets what is left of the pass, at most the per-input timeout.
+    #[test]
+    fn an_expired_pass_deadline_skips_the_object_size_re_run_and_records_why() {
+        let work = tmpdir();
+        let report = object_size_report();
+        let reruns = std::cell::Cell::new(0);
+        let opinion = object_size_second_opinion(
+            &work,
+            &report,
+            &[],
+            Duration::from_secs(5),
+            Some(Instant::now()),
+            |_, _| {
+                reruns.set(reruns.get() + 1);
+                Ok(asan_store_at("fill"))
+            },
+        )
+        .expect("an object-size report gets a second opinion");
+        assert_eq!(reruns.get(), 0, "no re-run once the pass's time is spent");
+        assert!(opinion.asan.is_none(), "{opinion:?}");
+
+        let id = "F-0000-0badc0de";
+        let dir = corpus::layout::finding_dir(&work, id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("finding.json"),
+            r#"{"id": "F-0000-0badc0de", "rule_id": "BHF-227"}"#,
+        )
+        .unwrap();
+        opinion.record(&work, id, "object-size-key");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(record["rule_id"], "BHF-227", "{record:#}");
+        let recorded = &record["sanitizer_second_opinion"];
+        assert_eq!(recorded["check"], "object-size", "{record:#}");
+        assert_eq!(recorded["used"], "ubsan", "{record:#}");
+        assert!(
+            recorded["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("time ran out")),
+            "{record:#}"
+        );
+        assert!(recorded.get("replaced_cluster_key").is_none(), "{record:#}");
+
+        for (per_input, left, bound) in [
+            (
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+            ),
+        ] {
+            let mut given = None;
+            object_size_second_opinion(
+                &work,
+                &report,
+                &[],
+                per_input,
+                Some(Instant::now() + left),
+                |env, timeout| {
+                    given = Some(timeout);
+                    assert!(
+                        env.iter().any(|(key, value)| key == "UBSAN_OPTIONS"
+                            && value.contains("bhf-object-size.supp")),
+                        "{env:?}"
+                    );
+                    Ok((None, None))
+                },
+            );
+            let given = given.expect("the input is re-run while time is left");
+            assert!(
+                given <= bound && given > bound / 2,
+                "{given:?} for {per_input:?}/{left:?}"
+            );
+        }
+    }
+
+    /// The report a finding carries after the object-size re-run, and the
+    /// reason it records: ASan's of the same access, else UBSan's, saying what
+    /// the re-run showed.
+    #[test]
+    fn the_object_size_second_opinion_names_the_report_it_keeps_and_why() {
+        type Rerun<'a> =
+            &'a dyn Fn(
+                Duration,
+            )
+                -> Result<(Option<corpus::SanitizerReport>, Option<String>), String>;
+        let work = tmpdir();
+        let report = object_size_report();
+        let opinion = |rerun: Rerun| {
+            object_size_second_opinion(
+                &work,
+                &report,
+                &[],
+                Duration::from_millis(50),
+                None,
+                |_, timeout| rerun(timeout),
+            )
+            .expect("an object-size report gets a second opinion")
+        };
+
+        let asan = opinion(&|_| Ok(asan_store_at("fill")));
+        let (view, stderr) = asan.asan.as_ref().expect("ASan's report is used");
+        assert_eq!(view.rule_id, "BHF-201");
+        assert!(stderr
+            .as_deref()
+            .is_some_and(|log| log.contains("AddressSanitizer")));
+        assert!(
+            asan.reason.contains("heap-buffer-overflow"),
+            "{}",
+            asan.reason
+        );
+        let json = asan.to_json("object-size-key");
+        assert_eq!(json["used"], "asan");
+        assert_eq!(json["replaced_cluster_key"], "object-size-key");
+
+        let cases: [(Rerun, &str); 4] = [
+            (&|_| Ok((None, None)), "reported no error"),
+            (
+                &|_| Ok(asan_store_at("other_function")),
+                "not ASan's report",
+            ),
+            (
+                &|timeout| {
+                    std::thread::sleep(timeout);
+                    Ok((None, None))
+                },
+                "time limit",
+            ),
+            (&|_| Err("no such harness".to_owned()), "no such harness"),
+        ];
+        for (rerun, why) in cases {
+            let stands = opinion(rerun);
+            assert!(stands.asan.is_none(), "{stands:?}");
+            assert!(
+                stands
+                    .reason
+                    .starts_with("UBSan's object-size report stands: ")
+                    && stands.reason.contains(why),
+                "{why}: {}",
+                stands.reason
+            );
+            assert_eq!(stands.to_json("object-size-key")["used"], "ubsan");
+        }
+
+        // Any other report gets no second opinion, and no re-run.
+        let other = sanitizer_report("BHF-201", vec!["fill"]);
+        assert!(object_size_second_opinion(
+            &work,
+            &other,
+            &[],
+            Duration::from_secs(1),
+            None,
+            |_, _| panic!("re-ran a report that is not an object-size report"),
+        )
+        .is_none());
     }
 
     #[cfg(unix)]

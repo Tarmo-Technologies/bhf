@@ -247,6 +247,167 @@ fn a_gcc_strcpy_overflow_is_an_asan_stack_buffer_overflow_at_its_line() {
     );
 }
 
+/// A loop that stores past a 4-byte heap block, built by gcc. gcc's UBSan
+/// object-size check sees the store too and reports it first, as a BHF-227
+/// insufficient-object-size error; bhf re-runs the input with that check
+/// suppressed, and reports the heap-buffer-overflow ASan then reports, as
+/// clang does.
+#[test]
+fn a_gcc_direct_heap_store_overflow_is_an_asan_heap_buffer_overflow() {
+    if !have("make") || !have("gcc") || !links_static_asan("gcc", "c") {
+        eprintln!("skip: make or gcc with a static libasan unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fill.c"), HEAP_STORE_C).unwrap();
+    let work = tmp.path().join("work");
+    let run = auto(&src, &work, &[("CC", "gcc"), ("CXX", "g++")], "1");
+    let log = text(&run);
+    let all = findings(&work);
+    let overflow = all
+        .iter()
+        .find(|finding| finding["exception"]["name"] == "ASAN_HEAP_BUFFER_OVERFLOW")
+        .unwrap_or_else(|| panic!("no heap-buffer-overflow: {all:#?}\n{log}"));
+    assert_eq!(overflow["rule_id"], "BHF-201", "{overflow:#}");
+    assert_eq!(
+        site(overflow).map(|(_, file, line)| (file, line)),
+        Some(("fill.c".to_owned(), HEAP_STORE_LINE)),
+        "{overflow:#}"
+    );
+    assert!(
+        !all.iter().any(|finding| finding["rule_id"] == "BHF-227"),
+        "no object-size finding: {all:#?}"
+    );
+    // The finding says which report it carries, and why.
+    let opinion = &overflow["sanitizer_second_opinion"];
+    assert_eq!(opinion["check"], "object-size", "{overflow:#}");
+    assert_eq!(opinion["used"], "asan", "{overflow:#}");
+    assert!(
+        opinion["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("heap-buffer-overflow")),
+        "{overflow:#}"
+    );
+    assert!(
+        opinion["replaced_cluster_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty() && overflow["cluster_key_full"] != key),
+        "{overflow:#}"
+    );
+    // The gcc binary keeps its object-size check, which still reports the
+    // store first on a replay: the same overflow, so it reproduces.
+    let finding_dir = work
+        .join("results/findings")
+        .join(overflow["id"].as_str().unwrap());
+    let replay = bhf()
+        .arg("replay")
+        .arg(&finding_dir)
+        .output()
+        .expect("run bhf replay");
+    let replayed = text(&replay);
+    assert!(
+        replay.status.success() && !replayed.contains("MISMATCH"),
+        "{replayed}"
+    );
+    // So does its capsule, rebuilt with gcc as the harness was.
+    let capsule = bhf()
+        .args(["capsule", "--work-dir"])
+        .arg(&work)
+        .args(["--finding-id", overflow["id"].as_str().unwrap()])
+        .output()
+        .expect("run bhf capsule");
+    let packaged = text(&capsule);
+    assert!(
+        capsule.status.success() && packaged.contains("1 verified to reproduce"),
+        "{packaged}"
+    );
+}
+
+/// A store loop that runs past an 8-byte chunk of a pool allocator declared
+/// `alloc_size`, built by gcc. ASan has no redzone inside the pool's static
+/// arena, so gcc's UBSan object-size check is the only one that sees the
+/// overflow: the gcc lane keeps it next to ASan, and reports BHF-227 at the
+/// store.
+#[test]
+fn a_gcc_pool_chunk_overflow_is_found_by_the_object_size_check() {
+    if !have("make") || !have("gcc") || !links_static_asan("gcc", "c") {
+        eprintln!("skip: make or gcc with a static libasan unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("pool.c"), POOL_STORE_C).unwrap();
+    let work = tmp.path().join("work");
+    let run = auto(&src, &work, &[("CC", "gcc"), ("CXX", "g++")], "1");
+    let log = text(&run);
+    let all = findings(&work);
+    let overflow = all
+        .iter()
+        .find(|finding| finding["rule_id"] == "BHF-227")
+        .unwrap_or_else(|| panic!("no object-size finding: {all:#?}\n{log}"));
+    assert_eq!(
+        overflow["exception"]["name"], "UBSAN_INSUFFICIENT_OBJECT_SIZE",
+        "{overflow:#}"
+    );
+    assert_eq!(
+        site(overflow).map(|(_, file, line)| (file, line)),
+        Some(("pool.c".to_owned(), POOL_STORE_LINE)),
+        "{overflow:#}"
+    );
+    // The re-run with the check suppressed was clean: UBSan's report stands,
+    // and the finding says so.
+    let opinion = &overflow["sanitizer_second_opinion"];
+    assert_eq!(opinion["check"], "object-size", "{overflow:#}");
+    assert_eq!(opinion["used"], "ubsan", "{overflow:#}");
+    assert!(
+        opinion["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no error")),
+        "{overflow:#}"
+    );
+    assert!(
+        opinion.get("replaced_cluster_key").is_none(),
+        "{overflow:#}"
+    );
+}
+
+/// A pool allocator over a static arena, declared `alloc_size` as allocators
+/// such as PHP's are, and a loop storing up to 64 input bytes into an 8-byte
+/// chunk of it at [`POOL_STORE_LINE`] (never past the arena, where ASan would
+/// see it).
+const POOL_STORE_C: &str = "\
+#include <stddef.h>
+static unsigned char arena[256];
+__attribute__((noinline, malloc, alloc_size(1))) static void *pool_alloc(size_t n) {
+    return n <= sizeof arena ? arena : NULL;
+}
+int fill(const unsigned char *d, size_t n) {
+    char *p = pool_alloc(8);
+    if (!p) return 0;
+    for (size_t i = 0; i < n && i < 64; i++) p[i] = (char)d[i];
+    return p[0];
+}
+";
+const POOL_STORE_LINE: u64 = 9;
+
+/// A loop storing every input byte into a 4-byte heap block, at
+/// [`HEAP_STORE_LINE`].
+const HEAP_STORE_C: &str = "\
+#include <stdlib.h>
+int fill(const unsigned char *d, size_t n) {
+    char *p = malloc(4);
+    if (!p) return 0;
+    for (size_t i = 0; i < n; i++) p[i] = (char)d[i];
+    int r = p[0];
+    free(p);
+    return r;
+}
+";
+const HEAP_STORE_LINE: u64 = 5;
+
 /// A build context that defines `_FORTIFY_SOURCE` itself, in either spelling
 /// (`-D_FORTIFY_SOURCE=2`, or the `-Wp,-D_FORTIFY_SOURCE=2` of Fedora's
 /// build flags): the gcc lane's harness, and the finding's capsule rebuilt

@@ -1648,17 +1648,110 @@ pub(crate) static CPP_LANE: CFamilyLane = CFamilyLane {
 /// flags without the fuzzing-only coverage instrumentation).
 const OPT_FLAGS: &[&str] = &["-O1", "-g"];
 
-/// The sanitizer flags of `family`'s compilers, as the harness Makefile spells
-/// them: gcc has no `function` UBSan check and links its sanitizer runtimes
-/// statically, as clang does.
-pub(crate) fn family_sanitizer_flags(family: CompilerFamily) -> Vec<String> {
-    let mut flags = vec![
-        "-fsanitize=address,undefined".to_owned(),
-        family.ubsan_subtraction().to_owned(),
-    ];
+/// The sanitizers the harness's `main` was built with, which a capsule
+/// rebuild arms too: a finding of a UBSan-only build replays under UBSan
+/// alone, where an ASan report could pre-empt it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedSanitizers {
+    pub(crate) asan: bool,
+    pub(crate) ubsan: bool,
+    /// Whether a gcc rebuild with both keeps gcc's UBSan `object-size` check,
+    /// which fires before ASan on the same access: as a gcc build recorded
+    /// it, and off for another family's build, whose ASan reported the bounds
+    /// errors that check would pre-empt.
+    pub(crate) gcc_object_size: bool,
+}
+
+impl Default for RecordedSanitizers {
+    /// Both, as the harness Makefile arms them by default.
+    fn default() -> Self {
+        Self {
+            asan: true,
+            ubsan: true,
+            gcc_object_size: true,
+        }
+    }
+}
+
+/// The sanitizers the toolchain stamp says `main` was built with
+/// (`bhf_toolchain.stamp`: the compilers and the family, then `main`'s
+/// language flags). A missing stamp, or flags that arm neither ASan nor UBSan,
+/// give the default; a family without UBSan (MSVC) leaves UBSan to the
+/// families that have it.
+pub(crate) fn recorded_sanitizers(harness_dir: &Path) -> RecordedSanitizers {
+    let Ok(stamp) = std::fs::read_to_string(harness_dir.join("bhf_toolchain.stamp")) else {
+        return RecordedSanitizers::default();
+    };
+    let mut fields = stamp.lines().next().unwrap_or_default().split(" | ");
+    let compilers = fields.next().unwrap_or_default();
+    let flags = fields.next().unwrap_or_default();
+    let family = crate::generate_harness::split_compile_command(compilers)
+        .get(1)
+        .and_then(|word| CompilerFamily::from_make_value(word));
+    let words = crate::generate_harness::split_compile_command(flags);
+    let checks = |prefix: &str| -> BTreeSet<String> {
+        words
+            .iter()
+            .filter_map(|word| word.strip_prefix(prefix))
+            .flat_map(|list| list.split(','))
+            .map(str::to_owned)
+            .collect()
+    };
+    let armed = checks("-fsanitize=");
+    let recorded = RecordedSanitizers {
+        asan: armed.contains("address"),
+        ubsan: armed.contains("undefined") || family.is_some_and(|f| !f.supports_ubsan()),
+        gcc_object_size: match family {
+            Some(CompilerFamily::Gcc) => !checks("-fno-sanitize=").contains("object-size"),
+            Some(_) => false,
+            None => true,
+        },
+    };
+    if recorded.asan || recorded.ubsan {
+        recorded
+    } else {
+        RecordedSanitizers::default()
+    }
+}
+
+/// The sanitizer flags of `family`'s compilers for the `sanitizers` a build
+/// armed, as the harness Makefile spells them: gcc has no `function` UBSan
+/// check and links its sanitizer runtimes statically, as clang does; it drops
+/// its `object-size` check next to ASan only to replay another family's
+/// build.
+pub(crate) fn family_sanitizer_flags(
+    family: CompilerFamily,
+    sanitizers: RecordedSanitizers,
+) -> Vec<String> {
+    let RecordedSanitizers {
+        asan,
+        ubsan,
+        gcc_object_size,
+    } = match sanitizers {
+        RecordedSanitizers {
+            asan: false,
+            ubsan: false,
+            ..
+        } => RecordedSanitizers::default(),
+        armed => armed,
+    };
+    let (set, subtraction) = match (asan, ubsan) {
+        (true, false) => ("address", ""),
+        (false, true) => ("undefined", family.ubsan_subtraction()),
+        _ if gcc_object_size => ("address,undefined", family.ubsan_subtraction()),
+        _ => ("address,undefined", family.asan_ubsan_subtraction()),
+    };
+    let mut flags = vec![format!("-fsanitize={set}")];
+    if !subtraction.is_empty() {
+        flags.push(subtraction.to_owned());
+    }
     if family == CompilerFamily::Gcc {
-        flags.push("-static-libasan".to_owned());
-        flags.push("-static-libubsan".to_owned());
+        if asan {
+            flags.push("-static-libasan".to_owned());
+        }
+        if ubsan {
+            flags.push("-static-libubsan".to_owned());
+        }
     }
     flags
 }
@@ -2215,6 +2308,8 @@ pub(crate) struct BuildModel {
     extra_link_flags: Vec<Arg>,
     recorded_recipe: bool,
     pub(crate) compiler: CapsuleCompiler,
+    /// The sanitizers the recorded `main` build armed.
+    pub(crate) sanitizers: RecordedSanitizers,
     /// The compiler build.ps1 rebuilds with by default.
     pub(crate) windows_compiler: windows::WindowsCompiler,
     /// bhf's driver source the Makefile links (`BHF_DRIVER_SOURCE`).
@@ -2429,6 +2524,7 @@ impl CFamilyLane {
                     .and_then(CompilerFamily::from_make_value),
             ),
             windows_compiler: self.windows_compiler(&harness_dir, recipe.as_ref()),
+            sanitizers: recorded_sanitizers(&harness_dir),
             driver_source: facts
                 .driver_source
                 .as_deref()
@@ -2585,9 +2681,14 @@ impl CFamilyLane {
         flags
     }
 
-    /// The sanitizer (and clang-only lane) flags `family` takes.
-    fn sanitize_flags(&self, family: CompilerFamily) -> Vec<String> {
-        let mut flags = family_sanitizer_flags(family);
+    /// The sanitizer (and clang-only lane) flags `family` takes for the
+    /// recorded build's `sanitizers`.
+    fn sanitize_flags(
+        &self,
+        family: CompilerFamily,
+        sanitizers: RecordedSanitizers,
+    ) -> Vec<String> {
+        let mut flags = family_sanitizer_flags(family, sanitizers);
         if family == CompilerFamily::Clang {
             flags.extend(self.clang_lane_flags.iter().map(|f| (*f).to_owned()));
         }
@@ -2659,7 +2760,7 @@ impl CFamilyLane {
         }
         let compiler = &model.compiler.command;
         let family = model.compiler.family;
-        let scan_sanitize = self.sanitize_flags(family);
+        let scan_sanitize = self.sanitize_flags(family, model.sanitizers);
         // A clang++ that picked a GCC install without its libstdc++ headers
         // cannot compile `<string>`; bhf's C++ builds then add the newest
         // installed libstdc++ headers (crate::build), and so does the scan
@@ -2979,7 +3080,7 @@ impl CFamilyLane {
             describe_requirements(&self.requirements(model)),
             sh_double_quoted(compiler),
             compiler_runner(compiler_var),
-            self.sanitize_selection(family),
+            self.sanitize_selection(family, model.sanitizers),
             compat_selection(&model.compat),
         );
         let (stdlib_cflags, stdlib_ldflags) = if self.recovers_cpp_stdlib {
@@ -3255,7 +3356,7 @@ impl CFamilyLane {
                 commands.push(("link".to_owned(), args));
                 commands
             };
-        let mut clang_sanitize = self.sanitize_flags(CompilerFamily::Clang);
+        let mut clang_sanitize = self.sanitize_flags(CompilerFamily::Clang, model.sanitizers);
         clang_sanitize.push(CompilerFamily::Clang.coverage_flag().to_owned());
         let msvc_sanitize = vec![
             "-fsanitize=address".to_owned(),
@@ -3364,10 +3465,15 @@ impl CFamilyLane {
     }
 
     /// The build.sh lines that set `$SANITIZE` to the sanitizer flags of the
-    /// compiler that runs the script, asking it which family it is
-    /// (`-dM -E`), as the harness Makefile does; `recorded` when it cannot say.
-    fn sanitize_selection(&self, recorded: CompilerFamily) -> String {
-        let flags = |family: CompilerFamily| self.sanitize_flags(family).join(" ");
+    /// compiler that runs the script for the recorded build's `sanitizers`,
+    /// asking it which family it is (`-dM -E`), as the harness Makefile does;
+    /// `recorded` when it cannot say.
+    fn sanitize_selection(
+        &self,
+        recorded: CompilerFamily,
+        sanitizers: RecordedSanitizers,
+    ) -> String {
+        let flags = |family: CompilerFamily| self.sanitize_flags(family, sanitizers).join(" ");
         format!(
             "# The sanitizer flags of the compiler that runs: gcc spells them differently\n\
              # from clang (it has no `function` UBSan check).\n\
@@ -5386,7 +5492,8 @@ mod tests {
             plan.build_script
         );
 
-        let sanitize = CPP_LANE.sanitize_flags(CompilerFamily::Clang);
+        let sanitize =
+            CPP_LANE.sanitize_flags(CompilerFamily::Clang, RecordedSanitizers::default());
         let leading = CPP_LANE.leading_flags(Some("gnu++14"), &sanitize);
         assert!(leading.contains(&"-std=gnu++14".to_owned()));
         assert!(leading.contains(&"-Wno-reserved-user-defined-literal".to_owned()));
@@ -5781,7 +5888,7 @@ mod tests {
         let original = |path: &Path| path.to_string_lossy().into_owned();
         for sanitize in [
             vec![SANITIZE_WORD.to_owned()],
-            C_LANE.sanitize_flags(CompilerFamily::Gcc),
+            C_LANE.sanitize_flags(CompilerFamily::Gcc, RecordedSanitizers::default()),
         ] {
             for args in [
                 C_LANE.main_args(&model, &sanitize, &[], &original),
@@ -5825,7 +5932,7 @@ mod tests {
             let script = format!(
                 "set -e\n{}{}echo \"$CC_FAMILY|$SANITIZE\"\n",
                 compiler_runner("CC"),
-                C_LANE.sanitize_selection(CompilerFamily::Clang)
+                C_LANE.sanitize_selection(CompilerFamily::Clang, RecordedSanitizers::default())
             );
             let out = Command::new("sh")
                 .arg("-c")
@@ -5844,10 +5951,97 @@ mod tests {
             "clang|-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment"
         );
         // The C++ lane's clang-only switch stays out of a gcc build.
-        let cpp_gcc = CPP_LANE.sanitize_flags(CompilerFamily::Gcc);
+        let cpp_gcc = CPP_LANE.sanitize_flags(CompilerFamily::Gcc, RecordedSanitizers::default());
         assert!(!cpp_gcc
             .iter()
             .any(|flag| flag.contains("user-defined-literal")));
+    }
+
+    /// The sanitizers a capsule rebuild arms are those the recorded `main`
+    /// build armed, as its toolchain stamp records its flags: a UBSan-only
+    /// build's finding replays under UBSan alone (with gcc's `object-size`
+    /// check, its only bounds check there), an ASan-only one under ASan. A
+    /// stamp that names neither arms both, as the harness Makefile does.
+    #[test]
+    fn a_capsule_rebuild_arms_the_sanitizers_main_was_built_with() {
+        let temp = tempfile::tempdir().unwrap();
+        let stamped = |name: &str, stamp: Option<&str>| {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(stamp) = stamp {
+                write(&dir.join("bhf_toolchain.stamp"), &format!("{stamp}\n"));
+            }
+            recorded_sanitizers(&dir)
+        };
+        let flags = |recorded: RecordedSanitizers, family: CompilerFamily| {
+            family_sanitizer_flags(family, recorded).join(" ")
+        };
+        let ubsan = stamped(
+            "ubsan",
+            Some(
+                "gcc gcc | -O1 -g -fsanitize=undefined -static-libubsan -fno-sanitize=alignment \
+                 -fsanitize-coverage=trace-pc,trace-cmp |   | -O1 -g |  |  |  |  |  |  | ",
+            ),
+        );
+        assert_eq!(
+            flags(ubsan, CompilerFamily::Gcc),
+            "-fsanitize=undefined -fno-sanitize=alignment -static-libubsan"
+        );
+        assert_eq!(
+            flags(ubsan, CompilerFamily::Clang),
+            "-fsanitize=undefined -fno-sanitize=function,vptr,alignment"
+        );
+        let asan = stamped(
+            "asan",
+            Some("clang clang | -O1 -g -fsanitize=address -fsanitize-coverage=trace-pc-guard | "),
+        );
+        assert_eq!(
+            flags(asan, CompilerFamily::Gcc),
+            "-fsanitize=address -static-libasan"
+        );
+        assert_eq!(flags(asan, CompilerFamily::Clang), "-fsanitize=address");
+        // With both, a gcc rebuild keeps gcc's object-size check as a gcc
+        // build recorded it, and drops it to replay a clang build, whose ASan
+        // reported the overflows that check would pre-empt.
+        let gcc_both = stamped(
+            "gcc-both",
+            Some(
+                "gcc gcc | -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment \
+                 -static-libasan -static-libubsan | ",
+            ),
+        );
+        assert_eq!(
+            flags(gcc_both, CompilerFamily::Gcc),
+            "-fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan"
+        );
+        let clang_both = stamped(
+            "clang-both",
+            Some(
+                "clang clang | -O1 -g -fsanitize=address,undefined \
+                 -fno-sanitize=function,vptr,alignment | ",
+            ),
+        );
+        assert_eq!(
+            flags(clang_both, CompilerFamily::Gcc),
+            "-fsanitize=address,undefined -fno-sanitize=alignment,object-size -static-libasan \
+             -static-libubsan"
+        );
+        assert_eq!(
+            flags(clang_both, CompilerFamily::Clang),
+            "-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment"
+        );
+        // cl has no UBSan: its ASan-only build leaves UBSan to the others.
+        for (name, stamp) in [
+            ("none", None),
+            ("unsanitized", Some("gcc gcc | -O2 | ")),
+            ("cl", Some("cl msvc clang | -O1 -g -fsanitize=address | ")),
+        ] {
+            assert_eq!(
+                flags(stamped(name, stamp), CompilerFamily::Clang),
+                "-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment",
+                "{name}"
+            );
+        }
     }
 
     /// A C++ harness in bhf's layout whose target needs the work dir's

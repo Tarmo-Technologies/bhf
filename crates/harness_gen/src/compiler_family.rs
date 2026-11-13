@@ -75,6 +75,24 @@ impl CompilerFamily {
         }
     }
 
+    /// The UBSan checks to subtract from a compile with both ASan and UBSan
+    /// that must report a bounds error the way ASan does:
+    /// [`Self::ubsan_subtraction`], and for GCC its `object-size` check too.
+    /// GCC's check guards the same access as ASan's and fires first, so a
+    /// heap or stack overflow ASan would report comes out as UBSan's
+    /// insufficient-object-size error; clang's ASan reports it either way.
+    /// The check is not redundant with ASan, though: through `alloc_size` it
+    /// also sees memory ASan does not track (a pool allocator's chunks in a
+    /// static arena), which goes unreported without it. bhf's GCC lanes keep
+    /// it ([`Self::ubsan_subtraction`]); only a GCC rebuild of a finding
+    /// another family recorded drops it, to replay what that build reported.
+    pub fn asan_ubsan_subtraction(self) -> &'static str {
+        match self {
+            Self::Gcc => "-fno-sanitize=alignment,object-size",
+            Self::Clang | Self::Msvc => self.ubsan_subtraction(),
+        }
+    }
+
     /// Whether this family has UndefinedBehaviorSanitizer.
     pub fn supports_ubsan(self) -> bool {
         !matches!(self, Self::Msvc)
@@ -248,6 +266,23 @@ pub fn family_from_predefined_macros(macros: &str) -> Option<CompilerFamily> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the ASan-first subtraction turns gcc's object-size check off; the
+    /// lanes' own subtraction keeps it.
+    #[test]
+    fn only_the_asan_first_subtraction_turns_gccs_object_size_check_off() {
+        assert!(CompilerFamily::Gcc
+            .asan_ubsan_subtraction()
+            .contains("object-size"));
+        assert!(!CompilerFamily::Gcc
+            .ubsan_subtraction()
+            .contains("object-size"));
+        assert_eq!(
+            CompilerFamily::Clang.asan_ubsan_subtraction(),
+            CompilerFamily::Clang.ubsan_subtraction()
+        );
+        assert_eq!(CompilerFamily::Msvc.asan_ubsan_subtraction(), "");
+    }
 
     #[test]
     fn normalises_versions_triples_paths_and_exe_suffixes() {

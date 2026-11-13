@@ -24,7 +24,8 @@ use harness_gen::compiler_family::{self, CompilerFamily};
 pub(crate) const ENV_CFLAGS: &str = "BHF_TOOLCHAIN_CFLAGS";
 /// The C++ counterpart of [`ENV_CFLAGS`].
 pub(crate) const ENV_CXXFLAGS: &str = "BHF_TOOLCHAIN_CXXFLAGS";
-/// Defines and include directories, applied to every lane.
+/// Defines and include directories, applied to every lane and to bhf's
+/// driver object.
 pub(crate) const ENV_CPPFLAGS: &str = "BHF_TOOLCHAIN_CPPFLAGS";
 /// The preprocessor words of `cflags` (`-D`, `-U`, `-I`, `-isystem`,
 /// `-include`, ...), applied to every lane of a C harness and to the C units
@@ -42,8 +43,8 @@ pub(crate) const ENV_DRIVER_CFLAGS: &str = "BHF_TOOLCHAIN_DRIVER_CFLAGS";
 /// operands ([`ENV_LIBS`]).
 pub(crate) const ENV_LDFLAGS: &str = "BHF_TOOLCHAIN_LDFLAGS";
 /// The library operands of `ldflags` (`-L`, `-l`, archives, objects, linker
-/// options `-Wl,...`/`-Xlinker ...`, `-pthread`), in their order, for the
-/// link of every lane.
+/// options `-Wl,...`/`-Xlinker ...`, `-pthread`) and the linker choice
+/// (`-fuse-ld=`, `--ld-path=`), in their order, for the link of every lane.
 pub(crate) const ENV_LIBS: &str = "BHF_TOOLCHAIN_LIBS";
 /// `--sysroot=`/`--target=`, for every compile and link of the `$(CC)` lanes.
 pub(crate) const ENV_TARGET_FLAGS: &str = "BHF_TOOLCHAIN_TARGET_FLAGS";
@@ -399,32 +400,59 @@ pub(crate) struct Published {
     /// One line per setting that took effect, and per environment value it
     /// replaced.
     pub notes: Vec<String>,
+    /// A C++ compiler the toolchain derived from its C compiler (or target)
+    /// that is not installed: the error a C++ harness is refused with. `CXX`
+    /// is then left as it was, since a C harness never runs it.
+    pub missing_cxx: Option<String>,
+}
+
+/// Why the toolchain's `variable` (`CC` or `CXX`) compiler `compiler` cannot
+/// be used: it is not installed.
+fn missing_compiler_error(config: &ToolchainConfig, variable: &str, compiler: &str) -> String {
+    format!(
+        "the toolchain's {variable} `{compiler}` was not found{}; install it or set \
+         toolchain.{} (--{})",
+        config
+            .target
+            .as_deref()
+            .filter(|_| config.cc.is_none() && config.cxx.is_none())
+            .map(|target| format!(" (derived from target {target})"))
+            .unwrap_or_default(),
+        variable.to_ascii_lowercase(),
+        variable.to_ascii_lowercase(),
+    )
 }
 
 /// Publish the C/C++ part of `config` to this process's environment. Must run
 /// before any thread that reads the environment starts. Returns notes naming
 /// what was set and which environment values it replaced; fails when a
-/// selected compiler is not installed.
+/// selected compiler is not installed, except a C++ compiler derived from the
+/// C compiler or the target: that one is left out of the environment and
+/// reported in [`Published::missing_cxx`], for the caller to refuse a C++
+/// harness with (a C harness never runs it). A derived C compiler must exist:
+/// a C++ harness compiles its C units with it.
 pub(crate) fn publish(config: &ToolchainConfig) -> Result<Published, String> {
     let mut published = Published::default();
-    let (cc, cxx) = selected_compilers(config);
+    let (cc, mut cxx) = selected_compilers(config);
+    if let (Some(compiler), None) = (&cxx, &config.cxx) {
+        if !program_exists(compiler) {
+            published.missing_cxx = Some(missing_compiler_error(config, "CXX", compiler));
+        }
+    }
+    let shown_cxx = match (&cxx, &published.missing_cxx) {
+        (Some(compiler), Some(_)) => Some(format!("{compiler} (not installed)")),
+        (compiler, None) => compiler.clone(),
+        (None, Some(_)) => None,
+    };
+    if published.missing_cxx.is_some() {
+        cxx = None;
+    }
     for (variable, compiler) in [("CC", &cc), ("CXX", &cxx)] {
         let Some(compiler) = compiler else {
             continue;
         };
         if !program_exists(compiler) {
-            return Err(format!(
-                "the toolchain's {variable} `{compiler}` was not found{}; install it or set \
-                 toolchain.{} (--{})",
-                config
-                    .target
-                    .as_deref()
-                    .filter(|_| config.cc.is_none() && config.cxx.is_none())
-                    .map(|target| format!(" (derived from target {target})"))
-                    .unwrap_or_default(),
-                variable.to_ascii_lowercase(),
-                variable.to_ascii_lowercase(),
-            ));
+            return Err(missing_compiler_error(config, variable, compiler));
         }
         if let Ok(previous) = std::env::var(variable) {
             if previous != *compiler {
@@ -440,7 +468,7 @@ pub(crate) fn publish(config: &ToolchainConfig) -> Result<Published, String> {
         published.notes.push(format!(
             "C/C++ toolchain: CC={} CXX={}",
             cc.as_deref().unwrap_or("(environment)"),
-            cxx.as_deref().unwrap_or("(environment)")
+            shown_cxx.as_deref().unwrap_or("(environment)")
         ));
     }
     if let Some(note) = route_msvc_through_front_end()? {
@@ -654,11 +682,15 @@ fn split_preprocessor_words(flags: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 /// Whether a link flag group is a library operand: a library search dir, a
-/// library, an archive, shared object or object file, `-pthread`, or a linker
-/// option (`-Wl,...`, `-Xlinker ...`). Linker options go with the libraries
-/// because many act on the operands that follow them (`--whole-archive`,
-/// `-Bstatic`, `--as-needed`, link groups), so the two keep their order; any
-/// compiler driver hands them to the linker unchanged.
+/// library, an archive, shared object or object file, `-pthread`, a linker
+/// option (`-Wl,...`, `-Xlinker ...`), or the linker choice (`-fuse-ld=...`,
+/// `--ld-path=...`). Linker options go with the libraries because many act on
+/// the operands that follow them (`--whole-archive`, `-Bstatic`,
+/// `--as-needed`, link groups), so the two keep their order; any compiler
+/// driver hands them to the linker unchanged. The linker choice goes with
+/// them so that every lane given the options written for a linker links with
+/// that linker (a driver option, its position does not matter).
+/// `--ld-path=` is clang-only, as it already was for `main`.
 fn is_library_group(group: &[String]) -> bool {
     let flag = group[0].as_str();
     let is_file = |word: &str| {
@@ -673,6 +705,8 @@ fn is_library_group(group: &[String]) -> bool {
     flag.starts_with("-L")
         || flag.starts_with("-l")
         || flag.starts_with("-Wl,")
+        || flag.starts_with("-fuse-ld=")
+        || flag.starts_with("--ld-path=")
         || matches!(flag, "-Xlinker" | "-pthread")
         || is_file(flag)
 }
@@ -950,6 +984,33 @@ impl AdaBuildSettings {
                 .filter(|prefix| project_synth::gpr_toolchain_name(prefix).is_none())
                 .map(|prefix| prefix.trim_end_matches('-').to_owned())
         })
+    }
+
+    /// The Ada toolchain overrides, for the run log: `Ada toolchain: ...`
+    /// naming each setting that is not its default, or `None` without any.
+    pub(crate) fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        for (name, value) in [
+            ("prefix", &self.prefix),
+            ("target", &self.target),
+            ("runtime", &self.runtime),
+            ("gprbuild", &self.gprbuild),
+            ("gnat", &self.gnat),
+        ] {
+            if let Some(value) = value {
+                parts.push(format!("{name}={value}"));
+            }
+        }
+        if !self.switches.is_empty() {
+            parts.push(format!("switches={}", self.switches.join(" ")));
+        }
+        if self.probe_backend != crate::probe_backend::ProbeBackend::HostFile {
+            let name = clap::ValueEnum::to_possible_value(&self.probe_backend)
+                .map(|value| value.get_name().to_owned())
+                .unwrap_or_else(|| format!("{:?}", self.probe_backend));
+            parts.push(format!("probe-backend={name}"));
+        }
+        (!parts.is_empty()).then(|| format!("Ada toolchain: {}", parts.join(" ")))
     }
 
     /// Whether an Ada harness built with these settings runs on this host.
@@ -1297,6 +1358,91 @@ pub(crate) fn triple_runs_natively(triple: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The Ada toolchain line names only the settings that differ from the
+    /// defaults, and there is none without any.
+    #[test]
+    fn ada_settings_describe_only_what_was_set() {
+        assert_eq!(AdaBuildSettings::default().describe(), None);
+        let settings = AdaBuildSettings {
+            prefix: Some("arm-eabi".to_owned()),
+            switches: vec!["-gnata".to_owned(), "-O1".to_owned()],
+            ..AdaBuildSettings::default()
+        };
+        assert_eq!(
+            settings.describe().as_deref(),
+            Some("Ada toolchain: prefix=arm-eabi switches=-gnata -O1")
+        );
+        let settings = AdaBuildSettings {
+            target: Some("aarch64-linux-gnu".to_owned()),
+            runtime: Some("light".to_owned()),
+            gprbuild: Some("/opt/gnat/bin/gprbuild".to_owned()),
+            gnat: Some("/opt/gnat/bin/gnat".to_owned()),
+            probe_backend: crate::probe_backend::ProbeBackend::MemoryBuffer,
+            ..AdaBuildSettings::default()
+        };
+        assert_eq!(
+            settings.describe().as_deref(),
+            Some(
+                "Ada toolchain: target=aarch64-linux-gnu runtime=light \
+                 gprbuild=/opt/gnat/bin/gprbuild gnat=/opt/gnat/bin/gnat \
+                 probe-backend=memory_buffer"
+            )
+        );
+    }
+
+    /// A C++ compiler derived from `cc` need not exist: `publish` leaves CXX
+    /// alone and says what is missing, for a C++ harness to refuse. One the
+    /// toolchain names explicitly must exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_derived_cxx_is_reported_not_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let saved: Vec<_> = ["CC", "CXX"]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let gcc = dir.path().join("gcc");
+        std::fs::write(&gcc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gcc = gcc.to_string_lossy().into_owned();
+        let derived = dir.path().join("g++").to_string_lossy().into_owned();
+        std::env::set_var("CXX", "sentinel-cxx");
+
+        let published = publish(&ToolchainConfig {
+            cc: Some(gcc.clone()),
+            ..ToolchainConfig::default()
+        });
+        let cxx_after = std::env::var("CXX").ok();
+        let cc_after = std::env::var("CC").ok();
+        let explicit = publish(&ToolchainConfig {
+            cc: Some(gcc.clone()),
+            cxx: Some(derived.clone()),
+            ..ToolchainConfig::default()
+        });
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let published = published.expect("a C-only toolchain publishes");
+        let missing = published.missing_cxx.expect("the missing CXX is reported");
+        assert!(
+            missing.contains(&derived) && missing.contains("toolchain.cxx"),
+            "{missing}"
+        );
+        assert_eq!(cc_after.as_deref(), Some(gcc.as_str()));
+        assert_eq!(
+            cxx_after.as_deref(),
+            Some("sentinel-cxx"),
+            "a missing CXX is not published"
+        );
+        let refused = explicit.expect_err("an explicit CXX must exist");
+        assert!(refused.contains(&derived), "{refused}");
+    }
+
     #[test]
     fn a_target_selects_the_prefixed_gcc_pair_unless_a_compiler_is_given() {
         let config = ToolchainConfig {
@@ -1446,16 +1592,27 @@ mod tests {
             "-DBOARD=3 -isystem /opt/vend/include"
         );
         // Linker options keep their order with the libraries they act on
-        // (`--whole-archive`, `-Bstatic`, `--as-needed`).
+        // (`--whole-archive`, `-Bstatic`, `--as-needed`), and the linker choice
+        // goes with them: a lane given the options written for a linker links
+        // with that linker.
         assert_eq!(
             values[ENV_LIBS],
-            "-L/opt/vend/lib -lvendor -L /opt/more -l z libextra.a /opt/obj/glue.o \
-             libshared.so.2 -Wl,-rpath,/opt/vend/lib -Wl,--start-group -lcore \
+            "-fuse-ld=lld -L/opt/vend/lib -lvendor -L /opt/more -l z libextra.a \
+             /opt/obj/glue.o libshared.so.2 -Wl,-rpath,/opt/vend/lib -Wl,--start-group -lcore \
              -Wl,--end-group -pthread -Wl,--as-needed -Wl,-rpath -Wl,/opt/more \
              -Wl,--whole-archive libregistry.a -Wl,--no-whole-archive -Xlinker -Bstatic \
              -lfoo -Xlinker -Bdynamic"
         );
-        assert_eq!(values[ENV_LDFLAGS], "-fuse-ld=lld -static-libgcc");
+        assert_eq!(values[ENV_LDFLAGS], "-static-libgcc");
+        let ld_path = ToolchainConfig {
+            ldflags: words("--ld-path=/opt/ld.lld -Wl,--icf=all -static-libgcc"),
+            ..ToolchainConfig::default()
+        };
+        let values: HashMap<_, _> = make_values(&ld_path, Some(CompilerFamily::Clang))
+            .into_iter()
+            .collect();
+        assert_eq!(values[ENV_LIBS], "--ld-path=/opt/ld.lld -Wl,--icf=all");
+        assert_eq!(values[ENV_LDFLAGS], "-static-libgcc");
     }
 
     #[test]

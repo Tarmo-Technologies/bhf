@@ -21,7 +21,10 @@ bhf build bhf_work --harness H-C0001 --target aarch64-linux-gnu
 (`--toolchain <prefix>` does the same for a prefix), unless `--cc`/`--cxx` name
 the compilers; a clang compiler gets `--target=<triple>` instead. `--sysroot`,
 `--cflags`, `--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`
-complete the toolchain. bhf announces the compilers it uses, and the generated
+complete the toolchain. A compiler derived from `--cc` or `--target` (`g++`
+next to a `--cc gcc`) must exist only when a C++ harness needs it, so a
+toolchain with only a C compiler builds C harnesses. bhf announces the
+compilers it uses, and the generated
 Makefile picks GCC- or clang-spelled coverage and sanitizer flags from the
 compiler that actually runs. Whenever the selected compiler builds for a target
 this host cannot run (its `-dumpmachine`, so a `--toolchain` prefix or a cross
@@ -67,7 +70,12 @@ switches to bhf's own. `--runner` / `toolchain.runner` apply to an Ada harness
 built for another target (the Ada target, else the prefix): bhf records the
 runner beside the binary (`build/<id>/obj/bhf_runner.json`) and beside the
 harness, where the same commands find it. A runner for an Ada harness built for this host is an error, as for a
-C/C++ one.
+C/C++ one. A `--probe-backend` (or `toolchain.ada.probe-backend`) other than
+`host_file` keeps the probe events on the target, so it needs a foreign
+`--target`: for an Ada harness built for this host `bhf build` refuses it
+(exit 2), from the flag as from the config file. A `--probe-backend` given on
+the command line wins over the config key, `--probe-backend host_file`
+included.
 
 The generated project `extends` the governing project, so its `Target`,
 `Runtime` and source settings are inherited. When the parent declares a

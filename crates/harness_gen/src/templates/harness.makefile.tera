@@ -78,9 +78,11 @@ endif
 # include dirs), BHF_TOOLCHAIN_C_CPPFLAGS (the preprocessor words of the C
 # flags: -D, -U, -I, -isystem, -include) and BHF_TOOLCHAIN_LIBS (the library
 # operands of the link flags: -L, -l, archives and objects, -Wl,-rpath,
-# -pthread), so the coverage, AFL++, libFuzzer, MemorySanitizer,
-# ThreadSanitizer and differential builds see the same headers and libraries
-# as `main`. The rest of the C and link flags, which may be specific to the
+# -pthread, and the linker choice, -fuse-ld= and --ld-path=, that the linker
+# options are written for), so the coverage, AFL++, libFuzzer,
+# MemorySanitizer, ThreadSanitizer and differential builds see the same
+# headers and libraries as `main`, and bhf's driver object the same defines
+# and include dirs. The rest of the C and link flags, which may be specific to the
 # toolchain's compiler, reach only the lanes built with $(CC).
 BHF_TOOLCHAIN_CFLAGS ?=
 BHF_TOOLCHAIN_CPPFLAGS ?=
@@ -218,8 +220,11 @@ BUILD_CONTEXT_LDFLAGS = {% for flag in link_flags %}{{ flag }}{% if not loop.las
 # it is rewritten only when the compiler or its flags change. Switching
 # compilers in the same harness directory (bhf's gcc retry, a cross build, a
 # different CC= between runs) therefore rebuilds bhf_driver.o and relinks,
-# instead of linking objects the previous compiler produced.
-BHF_TOOLCHAIN_ID = $(CC) $(BHF_CC_FAMILY) $(MSAN_CC) $(TSAN_CC) $(COV_CC) $(DIFF_CC) | $(CFLAGS) | $(C_COMPAT_FLAGS) $(C_STD) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS) | $(BHF_TOOLCHAIN_LIBS)
+# instead of linking objects the previous compiler produced. It describes the
+# `main` build only; the lanes built with their own compiler have their own
+# stamp, so a later `make cov`/`make tsan` with other flags leaves it alone.
+BHF_TOOLCHAIN_ID = $(CC) $(BHF_CC_FAMILY) | $(CFLAGS) | $(C_COMPAT_FLAGS) $(C_STD) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS) | $(BHF_TOOLCHAIN_LIBS)
+BHF_LANE_TOOLCHAIN_ID = $(MSAN_CC) $(TSAN_CC) $(COV_CC) $(DIFF_CC) | $(BHF_DRIVER_CFLAGS)
 -include build_context_objects.mk
 -include repair_context_objects.mk
 CONTEXT_MAIN_OBJECTS ?=
@@ -255,6 +260,9 @@ endif
 bhf_toolchain.stamp: FORCE_TOOLCHAIN_STAMP
 	@bhf_id='$(subst ','\'',$(BHF_TOOLCHAIN_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
 
+bhf_lanes.stamp: FORCE_TOOLCHAIN_STAMP
+	@bhf_id='$(subst ','\'',$(BHF_LANE_TOOLCHAIN_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
+
 # Target sources stay OUT of the prerequisites and live only in the recipe: an
 # absolute Windows source path carries a drive-letter colon (`C:\...`) which GNU
 # make parses as a target:prereq separator ("multiple target patterns"). In the
@@ -264,25 +272,25 @@ bhf_toolchain.stamp: FORCE_TOOLCHAIN_STAMP
 # shell as one word. (bhf regenerates the harness dir per attempt, so `main` is
 # always built.)
 bhf_driver.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
-	$(CC) $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
+	$(CC) $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 # The lanes built with their own compiler (MemorySanitizer, ThreadSanitizer,
 # source coverage, differential) link a driver object from that compiler, so an
 # operator's gcc or cross $(CC) never mixes into those binaries.
-bhf_driver_msan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
+bhf_driver_msan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_lanes.stamp
 	$(MSAN_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
-bhf_driver_tsan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
+bhf_driver_tsan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_lanes.stamp
 	$(TSAN_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
-bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
+bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_lanes.stamp
 	$(COV_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
-bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
+bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_lanes.stamp
 	$(DIFF_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 bhf_driver_winafl.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
-	$(CC) $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(FEATURE_TEST_FLAGS) -DBHF_WINAFL -c -o $@ $(BHF_DRIVER_SOURCE)
+	$(CC) $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS) $(FEATURE_TEST_FLAGS) -DBHF_WINAFL -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
@@ -366,5 +374,5 @@ main_prov$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_PROV_OBJEC
 BHF_WINAFL_RUN_MARKERS = $(wildcard main_winafl-*.bhf-run)
 
 clean:
-	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp
 	rm -rf context_objs repair_context_objs

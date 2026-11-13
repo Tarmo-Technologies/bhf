@@ -34,6 +34,11 @@ pub(crate) enum Outcome {
     Equal,
     /// Equal under the name an earlier bhf release gave the same report.
     Legacy,
+    /// The same out-of-bounds access, reported by the other sanitizer: gcc's
+    /// UBSan object-size check guards the access ASan reports, and fires
+    /// first (an ASan rebuild, or bhf's re-run with that check off, reports
+    /// the overflow; the gcc binary reports `insufficient-object-size`).
+    SameAccess,
     Differs,
     /// The finding records nothing to compare this field with.
     NotRecorded,
@@ -84,6 +89,11 @@ impl Check {
         match self.outcome {
             Outcome::Equal => format!("{} {recorded}", self.field),
             Outcome::Legacy => format!("{} {recorded} (earlier name of {replayed})", self.field),
+            Outcome::SameAccess => format!(
+                "{} {recorded} (the same out-of-bounds access as {replayed}, which gcc's \
+                 object-size check reports first)",
+                self.field
+            ),
             Outcome::Differs => format!("{}: recorded {recorded}, replayed {replayed}", self.field),
             Outcome::NotRecorded => format!("{} not recorded", self.field),
             Outcome::NotComparable => format!(
@@ -521,14 +531,38 @@ fn legacy_kind(report: &SanitizerReport) -> Option<String> {
     Some(kind.to_owned())
 }
 
-fn check_rule(recorded: &Identity, report: &SanitizerReport) -> Check {
-    let replayed = Some(report.rule_id.to_owned());
+/// The kinds of an ASan out-of-bounds report whose access gcc's UBSan
+/// object-size check also guards, and reports first as
+/// [`OBJECT_SIZE_KIND`].
+const ASAN_BOUNDS_KINDS: &[&str] = &[
+    "heap-buffer-overflow",
+    "stack-buffer-overflow",
+    "global-buffer-overflow",
+];
+const OBJECT_SIZE_KIND: &str = "insufficient-object-size";
+
+/// Whether `recorded` and `replayed` are one bounds error seen by the two
+/// sanitizers: an ASan overflow and UBSan's insufficient-object-size, either
+/// way round. Where it happened is compared as for any report.
+fn same_access(recorded: &Identity, replayed: &Identity) -> bool {
+    let bounds = |kind: &str| ASAN_BOUNDS_KINDS.contains(&kind);
+    match (recorded.kind.as_deref(), replayed.kind.as_deref()) {
+        (Some(a), Some(b)) => {
+            (bounds(a) && b == OBJECT_SIZE_KIND) || (a == OBJECT_SIZE_KIND && bounds(b))
+        }
+        _ => false,
+    }
+}
+
+fn check_rule(recorded: &Identity, replayed: &Identity, report: &SanitizerReport) -> Check {
     let outcome = match recorded.rule.as_deref() {
         None => Outcome::NotRecorded,
         Some(rule) if rule == report.rule_id => Outcome::Equal,
         Some(rule) if corpus::sanitizer::rule_matches(rule, report) => Outcome::Legacy,
+        Some(_) if same_access(recorded, replayed) => Outcome::SameAccess,
         Some(_) => Outcome::Differs,
     };
+    let replayed = Some(report.rule_id.to_owned());
     Check {
         field: "rule",
         recorded: recorded.rule.clone(),
@@ -543,6 +577,7 @@ fn check_kind(recorded: &Identity, replayed: &Identity, report: &SanitizerReport
         (None, _) => Outcome::NotRecorded,
         (Some(a), Some(b)) if a == b => Outcome::Equal,
         (Some(a), _) if legacy_kind(report).as_deref() == Some(a.as_str()) => Outcome::Legacy,
+        _ if same_access(recorded, replayed) => Outcome::SameAccess,
         _ => Outcome::Differs,
     };
     Check {
@@ -673,7 +708,7 @@ pub(crate) fn compare_with(
     let recorded = recorded_identity(raw);
     let replayed = replayed_identity(report);
     let mut checks = vec![
-        check_rule(&recorded, report),
+        check_rule(&recorded, &replayed, report),
         check_kind(&recorded, &replayed, report),
     ];
     checks.extend(check_signal(&recorded, &replayed));
@@ -711,7 +746,7 @@ pub(crate) fn same_crash(original: &SanitizerReport, fresh: &SanitizerReport) ->
         && comparison
             .checks
             .iter()
-            .all(|check| check.outcome != Outcome::Legacy)
+            .all(|check| !matches!(check.outcome, Outcome::Legacy | Outcome::SameAccess))
 }
 
 /// The finding's recorded sink, rendered, for the replay summary.
@@ -790,6 +825,51 @@ mod tests {
             lines,
             ["sink: recorded Widget::copy_at (widget/widget.cc:12), replayed Widget::other (widget/widget.cc:8)"]
         );
+    }
+
+    /// gcc's UBSan report of the store [`asan`] reports: its object-size
+    /// check guards the same access and fires first.
+    fn object_size(frame: &str) -> SanitizerReport {
+        corpus::parse_sanitizer_report(&format!(
+            "/src/widget/widget.cc:12:5: runtime error: store to address 0x602000000031 with insufficient space for an object of type 'char'\n\
+             {frame}\
+                 #2 0x4 in main /w/harnesses/H-1/main.cpp:90:3\n\
+             SUMMARY: UndefinedBehaviorSanitizer: insufficient-object-size /src/widget/widget.cc:12:5\n"
+        ))
+        .expect("ubsan report")
+    }
+
+    /// An ASan overflow and gcc's object-size report of the same access are
+    /// the same crash, either way round (a finding bhf recorded from ASan's
+    /// view replayed on the gcc binary, a gcc finding rebuilt with clang); at
+    /// another sink, or against another UBSan check, they are not. The fuzz
+    /// loop's same-binary confirmation never takes one for the other.
+    #[test]
+    fn an_overflow_and_gccs_object_size_report_of_it_are_the_same_crash() {
+        let overflow = asan(COPY_AT);
+        let mut gcc_record = report_record(&object_size(COPY_AT));
+        gcc_record["exception"]["name"] = json!("UBSAN_INSUFFICIENT_OBJECT_SIZE");
+        gcc_record["exception"]["sanitizer"] = json!("ubsan");
+        assert_eq!(object_size(COPY_AT).rule_id, "BHF-227");
+        for (record, replayed) in [
+            (recorded_from(&overflow), object_size(COPY_AT)),
+            (gcc_record.clone(), asan(COPY_AT)),
+        ] {
+            let comparison = compare(&record, &replayed);
+            assert_eq!(comparison.verdict(), Verdict::Match, "{comparison:?}");
+            assert!(
+                comparison
+                    .compared_line()
+                    .contains("the same out-of-bounds access"),
+                "{}",
+                comparison.compared_line()
+            );
+        }
+        let elsewhere = compare(&recorded_from(&overflow), &object_size(OTHER));
+        assert_eq!(elsewhere.differing_fields(), "sink");
+        let other_check = compare(&recorded_from(&overflow), &ubsan(COPY_AT));
+        assert_eq!(other_check.differing_fields(), "rule,kind");
+        assert!(!same_crash(&overflow, &object_size(COPY_AT)));
     }
 
     fn ubsan(stack: &str) -> SanitizerReport {

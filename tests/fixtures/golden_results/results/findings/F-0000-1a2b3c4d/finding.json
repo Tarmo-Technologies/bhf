@@ -124,6 +124,12 @@
   "harness_id": "H-C-parse",
   "id": "F-0000-1a2b3c4d",
   "rule_id": "BHF-201",
+  "sanitizer_second_opinion": {
+    "check": "object-size",
+    "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
+    "replaced_cluster_key": "0bj5123e0bj5123e",
+    "used": "asan"
+  },
   "schema_version": "bhf.finding.v1",
   "signature": "aa11bb22"
 }

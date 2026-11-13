@@ -383,7 +383,9 @@ fn target_fidelity(
 
 /// The target triple a harness was built for, from its toolchain stamp
 /// (`bhf_toolchain.stamp`): a `--target=<triple>` (or `-target <triple>`)
-/// flag, else the prefix of a cross compiler (`aarch64-linux-gnu-gcc`).
+/// flag, else the prefix of a cross compiler (`aarch64-linux-gnu-gcc`). The
+/// stamp describes the `main` build only (the other lanes keep
+/// `bhf_lanes.stamp`).
 fn stamp_target_triple(stamp: &str) -> Option<String> {
     let words: Vec<&str> = stamp.split_whitespace().collect();
     if let Some(triple) = words.iter().enumerate().find_map(|(index, word)| {

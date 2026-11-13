@@ -28,7 +28,7 @@
     },
     {
       "digest": {
-        "sha256": "4bf6a29a3f8f60f41ed2560b2543afa48959810c52a5d26beacfd704cf7fb732"
+        "sha256": "bc8c7ac0e356c0161f657e69b8f6e891aab713eef9b648ea8b6bc720192a2780"
       },
       "name": "findings.json"
     },
@@ -52,7 +52,7 @@
     },
     {
       "digest": {
-        "sha256": "fc32a4bbd4c5cb1e4d2bf7d1c097e3364f82a0e1877bd82a072fa80f7f867f25"
+        "sha256": "5c797d72d0914dcf4b501be7d41f72d343ea3573baa1a637195ea39b79400658"
       },
       "name": "findings/F-0000-1a2b3c4d/finding.json"
     },

@@ -130,6 +130,38 @@ as `src/zoom/` or `src/timeout/` never changes it.
 | `invalid-builtin-use` | `invalid-builtin-use` | BHF-228 | CWE-758 |
 | any other | `undefined-behavior` | BHF-213 | CWE-758 |
 
+In a gcc build with both ASan and UBSan, gcc's `object-size` check (BHF-227)
+guards the same access as ASan's own check and fires first, so a heap or stack
+overflow first comes out as BHF-227. clang's check does the same for a member
+access through a heap block smaller than its struct. bhf then re-runs that
+input with the check suppressed: when ASan reports the same access, the
+finding is ASan's (BHF-201, BHF-203), as with clang. When ASan stays silent the
+BHF-227 finding stands: the check also sees memory ASan does not track, such
+as a chunk of a pool allocator declared `alloc_size`, so the gcc lanes keep it
+on. A replay of either kind on the gcc binary, which reports BHF-227, is the
+same crash.
+
+This second opinion applies to the builtin engine's crashes and to those an
+AFL++ pass finds. It runs once per root cause: the first hit of a BHF-227
+report is re-run, within the per-input timeout and what is left of the pass's
+time, and later hits of it, in this pass or a later one over the same work
+dir, count against the finding without another re-run. The finding's
+`finding.json` says which report it carries and why:
+
+```json
+"sanitizer_second_opinion": {
+  "check": "object-size",
+  "used": "asan",
+  "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
+  "replaced_cluster_key": "..."
+}
+```
+
+`used` is `ubsan` when the BHF-227 report stands, and `reason` then says why:
+the re-run reported no error, reported something else, reached its time limit,
+or was skipped because the pass's time had run out. `results/findings.json`
+carries `{check, used, reason}` as `fuzz.sanitizer_second_opinion`.
+
 An ASan SEGV in the first memory page (ASan's "zero page" hint, or an address
 below `0x1000`) is a NULL dereference, BHF-206 / CWE-476. Any other SEGV is a
 wild or corrupted pointer, BHF-223: CWE-125 for a READ, CWE-787 for a WRITE,

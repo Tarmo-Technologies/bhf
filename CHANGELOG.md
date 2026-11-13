@@ -1311,6 +1311,81 @@
   failed with "ambiguates built-in declaration". The C drivers take `void *`
   too, so a `-Werror` toolchain flag cannot fail their standalone compile
   under gcc.
+- `bhf auto` exits 2, as documented and as `bhf build` does, when it refuses a
+  toolchain: a `--cc`/`--cxx` or runner that is not installed, a runner with
+  nothing foreign to run, an unusable `[cross.*]` table, and a config file
+  that cannot be read or parsed (an unknown key included) or that holds an
+  invalid value. These used to exit 1.
+- A `bhf auto` config key (`jobs`, `per-target-time`, `engine`, `max-len`,
+  `max-corpus-mb`, `max-work-dir-mb`, `rss-limit-mb`) fills a flag the command
+  line did not give, whatever value it defaults to. `jobs` in a config was
+  ignored on any host with four or more cores, whose default job count is not
+  1, and a flag given with its default value (`--per-target-time 60`,
+  `--engine builtin`) lost to the config. A `--per-target-time` given to
+  `bhf ci` wins over the tree's config the same way. The concurrency line
+  names what set the job count (`--jobs`, the config, or the host default).
+- A heap or stack overflow in a target built with gcc is reported as
+  AddressSanitizer's heap- or stack-buffer-overflow (BHF-201, BHF-203), as
+  with clang, not as UBSan's insufficient-object-size (BHF-227). gcc's UBSan
+  `object-size` check guards the same access as ASan and fires first; bhf now
+  re-runs such a report's input with that check suppressed and reports what
+  ASan then reports at the same sink. clang's check does the same for a
+  member access through an undersized heap block, so this applies to every
+  compiler, and to the crashes an AFL++ pass finds as well as the builtin
+  engine's. The re-run happens once per root cause, within the per-input
+  timeout and the pass's remaining time; a later hit, or a later pass over
+  the same work dir, counts against the finding without another re-run. The
+  finding records which report it carries and why as
+  `sanitizer_second_opinion` (`{check, used, reason}`; `fuzz.sanitizer_second_opinion`
+  in `findings.json`). The check stays on, so an overflow only
+  it sees (a chunk of a pool allocator declared `alloc_size`, which ASan does
+  not track) is still reported as BHF-227. `bhf replay`, `bhf capsule` and
+  `bhf verify-poc` count an ASan overflow and gcc's object-size report of the
+  same access as the same crash, and a gcc rebuild of a clang-built capsule
+  turns the check off, so `CC=gcc bhf verify-poc` of a clang-built capsule no
+  longer reports MISMATCH.
+- A capsule's build.sh arms the sanitizers the harness's `main` was built
+  with, as its toolchain stamp records them, instead of always ASan and
+  UBSan: the capsule of a `--sanitizers ubsan` finding rebuilds with UBSan
+  alone and reproduces it, where ASan used to report the same overflow first
+  ("not reproduced", rule BHF-227 recorded, BHF-201 replayed).
+- A toolchain with only a C compiler (`--cc <dir>/gcc` with no `g++` beside
+  it, or a `--target` with no `<triple>-g++`) builds C harnesses: the C++
+  compiler derived from it must exist only when a C++ harness needs it.
+  `bhf build` of a C++ harness and `bhf auto` with a C++ candidate refuse it
+  (exit 2) naming `toolchain.cxx`; a C-only sweep notes that the derived C++
+  compiler is not installed. These used to refuse every build.
+- A linker choice in the toolchain's link flags (`-fuse-ld=...`,
+  `--ld-path=...`) reaches every build lane with the linker options written
+  for it. It used to reach only `main`, while `-Wl,` options went to every
+  lane, so `--ldflags "-fuse-ld=gold -Wl,--icf=all"` failed the coverage
+  lane's link ("unrecognized option --icf=all").
+- `--define` and `--toolchain-include` (`toolchain.defines`,
+  `toolchain.include-dirs`) reach bhf's driver object, as the `-D`/`-I` words
+  of `--cflags` already did, so an ABI define such as `_FILE_OFFSET_BITS=64`
+  holds for every object of the link.
+- `bhf auto` announces the Ada toolchain overrides it was given
+  (`bhf auto: Ada toolchain: prefix=... target=... runtime=... switches=...`,
+  listing only what was set), before it checks the Ada tools, so a refused run
+  still shows what was asked for.
+- A harness's `bhf_toolchain.stamp` describes the compiler and flags `main`
+  was built with. The lanes built with their own compiler (MSan, TSan,
+  coverage, differential) keep their own `bhf_lanes.stamp`, so a later
+  `make tsan` or `make cov` with the Makefile's default flags no longer
+  rewrites it (a cross sweep's stamp used to claim ASan flags its `main` was
+  built without) or forces `main` to relink. The stub-provenance pass skips a
+  harness built for another platform, whose `main_prov` could not run here.
+- `bhf build --probe-backend memory_buffer` (or `semihosting`, `stub`) of an
+  Ada harness built for this host is refused (exit 2) as the same
+  `toolchain.ada.probe-backend` config key already was, instead of staging a
+  probe body whose events a host run never reads; the message says to pass
+  `--target <triple>` for an on-target build. A `--probe-backend` given on the
+  command line wins over the config key even at its default, `host_file`; it
+  used to lose to it.
+- The `bhf auto` summary's "Source files: N fuzzed" counts only the files of
+  built+fuzzed targets: a target that was built but not fuzzed (a failed
+  `make afl` with `--engine afl++`) or that never entered the target no longer
+  counts its file as fuzzed.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

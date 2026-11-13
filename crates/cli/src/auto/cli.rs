@@ -144,6 +144,16 @@ pub struct AutoArgs {
     #[arg(skip)]
     pub(crate) config_cross: Option<config::CrossConfig>,
 
+    /// The clap ids (the field names) of the flags the command line gave, so
+    /// a config key fills only a flag the command line left out, whatever
+    /// value clap gave it ([`given_arg_ids`]).
+    #[arg(skip)]
+    pub(crate) given: std::collections::BTreeSet<String>,
+
+    /// The clap ids of the flags a config file filled.
+    #[arg(skip)]
+    pub(crate) from_config: std::collections::BTreeSet<String>,
+
     #[command(flatten)]
     pub(crate) toolchain: crate::toolchain::AutoToolchainArgs,
 
@@ -1172,8 +1182,17 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
 
     // Project config (--config <PATH>, or an auto-loaded .bhf.toml in the tree):
     // fill options the CLI left at their default. Applied BEFORE the env-publish and
-    // build-recovery blocks below, which read the resulting args.
-    for note in crate::auto::config::apply(&mut args, &path).map_err(|e| anyhow::anyhow!("{e}"))? {
+    // build-recovery blocks below, which read the resulting args. A config
+    // file that cannot be read or parsed is a usage error (exit 2, as in bhf
+    // build).
+    let config_notes = match crate::auto::config::apply(&mut args, &path) {
+        Ok(notes) => notes,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
+    for note in config_notes {
         bhfeprintln!("bhf auto: {note}");
     }
     if args.max_corpus_mb == 0 {
@@ -1312,21 +1331,36 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 return Ok(2);
             }
         };
-    let published =
-        crate::toolchain::publish(&toolchain).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let published = match crate::toolchain::publish(&toolchain) {
+        Ok(published) => published,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
     for note in &published.notes {
         bhfeprintln!("bhf auto: {note}");
     }
-    let cross_sweep = crate::toolchain::cross_sweep_target(&toolchain)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let cross_sweep = match crate::toolchain::cross_sweep_target(&toolchain) {
+        Ok(cross_sweep) => cross_sweep,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
     // The guard-driven cross lanes: an explicit --config's [cross.<guard>]
     // tables replace bhf's built-in compilers, sysroot and emulator for the
     // lanes they name. Installed before anything resolves a guard (the
     // dependency scan, every attempt), and replaced on every run.
-    let cross_overrides = crate::auto::cross_target::CrossOverrides::from_config(
+    let cross_overrides = match crate::auto::cross_target::CrossOverrides::from_config(
         args.config_cross.take().unwrap_or_default(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    ) {
+        Ok(cross_overrides) => cross_overrides,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return Ok(2);
+        }
+    };
     for line in cross_overrides.describe() {
         bhfeprintln!("bhf auto: {line}");
     }
@@ -1349,6 +1383,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
     }
     let mut ada_toolchain = crate::toolchain::AdaBuildSettings::from_config(&toolchain);
+    // Announced before the Ada tools are checked, so a refused run still shows
+    // what was asked for.
+    if let Some(line) = ada_toolchain.describe() {
+        bhfeprintln!("bhf auto: {line}");
+    }
     ada_toolchain.runner = crate::toolchain::ada_runner(&toolchain, cross_sweep.as_ref());
     if let (Some(runner), Some(target)) = (&ada_toolchain.runner, ada_toolchain.effective_target())
     {
@@ -1753,6 +1792,33 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     crate::auto::discovery::bhfprof("auto:dependency_checkpoint", _tdc);
     let _tmid = std::time::Instant::now();
 
+    // A C++ compiler derived from the toolchain's C compiler that is not
+    // installed would fail every C++ build: refuse the plan, the dry run
+    // included, when there is a C++ candidate; the C candidates do not need it.
+    if let Some(missing) = &published.missing_cxx {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.lang == crate::auto::candidate::Lang::Cpp)
+        {
+            bhfeprintln!("error: {missing}");
+            finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+            return Ok(2);
+        }
+        bhfeprintln!(
+            "bhf auto: note: the toolchain's CXX `{}` (derived from {}) is not installed; the \
+             C candidates build with CC={}",
+            crate::toolchain::selected_compilers(&toolchain)
+                .1
+                .unwrap_or_default(),
+            if toolchain.cc.is_some() {
+                "CC"
+            } else {
+                "the target"
+            },
+            crate::toolchain::effective_compilers().cc
+        );
+    }
+
     // An Ada toolchain that is not installed would fail every Ada build: refuse
     // the plan, the dry run included, naming the key.
     if candidates
@@ -2046,10 +2112,10 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let jobs = args.jobs.max(1);
     if jobs > 1 {
         bhfeprintln!(
-            "bhf auto: running up to {jobs} candidate(s) concurrently (--jobs {jobs}, \
-             default: half the host's cores); child RSS allowance = jobs x rss-limit-mb = {} MB, \
-             plus parent/index/build/report overhead — size the total to the host, or pass \
-             `--jobs 1` for a serial sweep",
+            "bhf auto: running up to {jobs} candidate(s) concurrently ({}); child RSS \
+             allowance = jobs x rss-limit-mb = {} MB, plus parent/index/build/report overhead \
+             — size the total to the host, or pass `--jobs 1` for a serial sweep",
+            jobs_source(&args),
             jobs.saturating_mul(args.rss_limit_mb)
         );
         if candidates
@@ -4339,7 +4405,10 @@ impl AutoSummary {
                     report_only_finding_ids.extend(finding_ids.iter().cloned());
                 }
             }
-            if is_built(&r.outcome) {
+            // A fuzzed source file is one with a built+fuzzed target, as the
+            // headline counts them: a target built but never fuzzed, or never
+            // entered, does not count.
+            if matches!(r.outcome, BuiltAndFuzzed { .. }) {
                 files_fuzzed.insert(r.candidate.source_path.as_path());
             }
         }
@@ -4796,6 +4865,30 @@ fn diversify_candidates_across_sources(
         }
     }
     diversified
+}
+
+/// What set the job count, for the concurrency line: the command line, the
+/// config file, or the host default.
+fn jobs_source(args: &AutoArgs) -> String {
+    if args.given.contains("jobs") {
+        format!("--jobs {}", args.jobs)
+    } else if args.from_config.contains("jobs") {
+        format!("jobs = {} from the config", args.jobs)
+    } else {
+        "default: half the host's cores".to_owned()
+    }
+}
+
+/// The ids of the arguments in `matches` the command line gave (not a default
+/// or an environment value).
+pub(crate) fn given_arg_ids(matches: &clap::ArgMatches) -> std::collections::BTreeSet<String> {
+    matches
+        .ids()
+        .filter(|id| {
+            matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
+        })
+        .map(|id| id.as_str().to_owned())
+        .collect()
 }
 
 /// Default candidate concurrency: half the host's parallelism, at least 1.
@@ -7148,6 +7241,73 @@ mod tests {
             .per_language
             .iter()
             .all(|(_, targets, built)| *targets == 1 && *built == 0));
+    }
+
+    /// A target that built but was never fuzzed (`Built`), or that ran but
+    /// never entered the target (`BuiltNotEntered`), does not make its source
+    /// file a fuzzed one: the count matches the built+fuzzed headline.
+    #[test]
+    fn a_built_but_unfuzzed_target_is_not_a_fuzzed_source_file() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::candidate::{Candidate, Lang};
+        let mk = |src: &str, outcome| AttemptResult {
+            candidate: Candidate {
+                harness_id: "H".to_owned(),
+                lang: Lang::C,
+                source_path: PathBuf::from(src),
+                line: 1,
+                name: "f".to_owned(),
+                score: 0,
+                is_static: false,
+                foreign_guard: None,
+                input_reachability: None,
+                input_reachability_basis: None,
+                dialect: None,
+            },
+            outcome,
+            harness_dir: PathBuf::from("/h"),
+        };
+        let results = vec![
+            mk(
+                "/s/a.c",
+                Outcome::Built {
+                    repairs: vec![],
+                    retries: 0,
+                },
+            ),
+            mk(
+                "/s/b.c",
+                Outcome::BuiltNotEntered {
+                    repairs: vec![],
+                    retries: 0,
+                    passes: vec![],
+                    per_pass_budget_secs: 60,
+                    total_wall_budget_secs: 60,
+                    executions_per_sec: 0.0,
+                    runtrace_events: vec![],
+                    entry_miss: "decode_or_bailout".to_owned(),
+                    reason: "never entered".to_owned(),
+                },
+            ),
+        ];
+        let summary = AutoSummary::collect(
+            Path::new("/s"),
+            Path::new("/w"),
+            actionability::RunMode::Reporting,
+            std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
+            &results,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(summary.files_with_targets, 2);
+        assert_eq!(summary.files_fuzzed, 0);
+        let rendered = summary.render();
+        assert!(
+            rendered.contains("Source files: 0 fuzzed / 2 with targets"),
+            "{rendered}"
+        );
     }
 
     #[test]

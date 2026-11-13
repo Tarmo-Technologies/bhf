@@ -108,6 +108,24 @@
         }
       }
     },
+    "sanitizer_second_opinion": {
+      "description": "A sanitizer finding whose first report was UBSan's insufficient-object-size, which fires before ASan on the same access: bhf re-ran the input once with that check suppressed and says which report the finding carries and why. Absent for every other finding, and in findings recorded before it was kept.",
+      "type": "object",
+      "required": ["check", "used", "reason"],
+      "properties": {
+        "check": { "description": "The UBSan check the re-run suppressed.", "enum": ["object-size"] },
+        "used": {
+          "description": "asan: the re-run's AddressSanitizer report of the same sink and access direction, which the finding carries; ubsan: the first report stands.",
+          "enum": ["asan", "ubsan"]
+        },
+        "reason": { "description": "Why the finding carries that report: what the re-run showed, or why it did not run.", "type": "string", "minLength": 1 },
+        "replaced_cluster_key": {
+          "description": "With used asan, the cluster_key_full of the UBSan report the finding replaced: a later hit of that report is a duplicate of this finding.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "decoded_args": {
       "description": "The arguments the harness decoded from the input and passed to the target (and the receiver object of a method), when traced.",
       "type": "array",

@@ -112,6 +112,38 @@ class SchemaFilesTest(unittest.TestCase):
         older["findings"][0]["fuzz"]["access"].pop("allocated_by_harness")
         self.assertEqual(_errors(findings, older), [])
 
+    def test_sanitizer_second_opinion_validates_in_both_documents(self):
+        opinion = {
+            "check": "object-size",
+            "used": "asan",
+            "reason": "with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
+        }
+        envelope = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "sanitizer_second_opinion": {**opinion, "replaced_cluster_key": "c0ffee00c0ffee00"},
+        }
+        finding = _validator("bhf.finding.v1.schema.json")
+        self.assertEqual(_errors(finding, envelope), [])
+        stands = {"check": "object-size", "used": "ubsan", "reason": "the re-run reported no error"}
+        self.assertEqual(_errors(finding, {**envelope, "sanitizer_second_opinion": stands}), [])
+        for bad in ({**opinion, "used": "msan"}, {**opinion, "check": "alignment"}, {"check": "object-size", "used": "asan"}):
+            with self.subTest(bad=bad):
+                self.assertNotEqual(_errors(finding, {**envelope, "sanitizer_second_opinion": bad}), [])
+
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["sanitizer_second_opinion"] = opinion
+        self.assertEqual(_errors(findings, doc), [])
+        # A document written before the field existed omits the key.
+        del doc["findings"][0]["fuzz"]["sanitizer_second_opinion"]
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["fuzz"]["sanitizer_second_opinion"] = {**opinion, "replaced_cluster_key": "c0ffee"}
+        self.assertNotEqual(_errors(findings, bad), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

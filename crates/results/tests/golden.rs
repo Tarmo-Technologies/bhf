@@ -60,7 +60,10 @@ fn build(work: &Path) {
             "gate_capture": {"input": "min_testcase.bin", "input_len": 1, "status": "recorded", "reason": null,
                              "comparisons": 2, "truncated": false, "unconfirmed": 0, "runs": 6, "shim_armed": false,
                              "derived_search": "done", "searched_bytes": 1},
-            "build": {"binary": {"sha256": "2222222222222222222222222222222222222222222222222222222222222222", "build_id": "abcdef01"}}
+            "build": {"binary": {"sha256": "2222222222222222222222222222222222222222222222222222222222222222", "build_id": "abcdef01"}},
+            "sanitizer_second_opinion": {"check": "object-size", "used": "asan",
+                                         "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
+                                         "replaced_cluster_key": "0bj5123e0bj5123e"}
         }),
     );
     put(&f.join("F-0000-1a2b3c4d/testcase.bin"), b"AAAA");

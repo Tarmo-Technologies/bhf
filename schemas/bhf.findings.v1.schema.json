@@ -464,6 +464,22 @@
                 "arguments": {
                   "description": "The values the harness decoded from the input and passed to the target, when traced. Added after the first v1 release.",
                   "oneOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/argument" } }]
+                },
+                "sanitizer_second_opinion": {
+                  "description": "Which report a finding first reported as UBSan's insufficient-object-size carries, after a re-run with that check suppressed (finding.json sanitizer_second_opinion): used asan when AddressSanitizer reported the same access, ubsan when the first report stands; reason says why. null for every other finding. Added after the first v1 release, so documents written before it omit the key.",
+                  "oneOf": [
+                    { "type": "null" },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["check", "used", "reason"],
+                      "properties": {
+                        "check": { "enum": ["object-size"] },
+                        "used": { "enum": ["asan", "ubsan"] },
+                        "reason": { "type": "string", "minLength": 1 }
+                      }
+                    }
+                  ]
                 }
               }
             }

@@ -7,7 +7,7 @@ use crate::model::{
     AccessParameter, AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence,
     Confirmation, ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding,
     Fingerprint, Frame, FuzzBlock, InputToState, InputToStateSearch, Kind, Location, MemoryAccess,
-    PatchHint, Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
+    PatchHint, Reproduce, RuleRef, SanitizerSecondOpinion, ScaBlock, StaticBlock, TraceStep,
 };
 use crate::severity;
 use serde_json::Value;
@@ -302,6 +302,7 @@ pub fn from_finding_report(
             }),
             input_to_state_search: input_to_state_search(raw),
             arguments: raw.get("decoded_args").and_then(arguments),
+            sanitizer_second_opinion: sanitizer_second_opinion(raw),
         }),
         static_: (kind == Kind::Static).then(|| StaticBlock {
             engine: str_at(raw, &["analysis", "engine"]).or_else(|| Some("bhf-static".to_owned())),
@@ -407,6 +408,18 @@ fn input_to_state_search(raw: &Value) -> Option<InputToStateSearch> {
         state,
         searched_bytes: capture.get("searched_bytes").and_then(Value::as_u64)?,
         input_len: capture.get("input_len").and_then(Value::as_u64)?,
+    })
+}
+
+/// `finding.json` `sanitizer_second_opinion`, when it is well formed: a
+/// known check and report, with a reason.
+fn sanitizer_second_opinion(raw: &Value) -> Option<SanitizerSecondOpinion> {
+    let opinion = raw.get("sanitizer_second_opinion")?;
+    Some(SanitizerSecondOpinion {
+        check: str_at(opinion, &["check"]).filter(|check| check == "object-size")?,
+        used: str_at(opinion, &["used"])
+            .filter(|used| matches!(used.as_str(), "asan" | "ubsan"))?,
+        reason: str_at(opinion, &["reason"])?,
     })
 }
 
@@ -1868,6 +1881,56 @@ mod tests {
         )
         .unwrap();
         assert!(old.parameter.is_none());
+    }
+
+    /// `finding.json` `sanitizer_second_opinion` reaches `fuzz` as
+    /// `{check, used, reason}` (its dedupe key stays in the record); a
+    /// malformed one, or none, is `null`, and a document written before the
+    /// field existed still reads.
+    #[test]
+    fn the_sanitizer_second_opinion_is_kept_only_when_well_formed() {
+        let opinion_of = |opinion: Option<Value>| {
+            let mut raw = asan_record();
+            if let Some(opinion) = opinion {
+                raw["sanitizer_second_opinion"] = opinion;
+            }
+            normalize(raw, None).fuzz.unwrap().sanitizer_second_opinion
+        };
+        let kept = opinion_of(Some(json!({
+            "check": "object-size", "used": "asan",
+            "reason": "AddressSanitizer reported heap-buffer-overflow at the same sink",
+            "replaced_cluster_key": "c0ffee"
+        })))
+        .expect("a well-formed second opinion is kept");
+        assert_eq!(
+            (kept.check.as_str(), kept.used.as_str()),
+            ("object-size", "asan")
+        );
+        assert!(
+            kept.reason.contains("heap-buffer-overflow"),
+            "{}",
+            kept.reason
+        );
+        let text = serde_json::to_string(&kept).unwrap();
+        assert!(!text.contains("c0ffee"), "{text}");
+        for malformed in [
+            json!({"check": "object-size", "used": "msan", "reason": "x"}),
+            json!({"check": "alignment", "used": "ubsan", "reason": "x"}),
+            json!({"check": "object-size", "used": "ubsan", "reason": " "}),
+            json!("asan"),
+        ] {
+            assert!(opinion_of(Some(malformed.clone())).is_none(), "{malformed}");
+        }
+        assert!(opinion_of(None).is_none());
+        let fuzz = normalize(asan_record(), None).fuzz.unwrap();
+        let text = serde_json::to_string(&fuzz).unwrap();
+        assert!(text.contains("\"sanitizer_second_opinion\":null"), "{text}");
+        let mut old = serde_json::to_value(&fuzz).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("sanitizer_second_opinion");
+        let old: FuzzBlock = serde_json::from_value(old).unwrap();
+        assert!(old.sanitizer_second_opinion.is_none());
     }
 
     /// `null` means no capture ran; `[]` means one ran and found nothing.

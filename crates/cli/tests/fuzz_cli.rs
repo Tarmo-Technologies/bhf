@@ -469,6 +469,117 @@ fn install_crashing_script_harness(dir: &Path, function: &str) {
     make_executable(&main);
 }
 
+/// A libFuzzer-style shell harness in `dir` that writes one line to `hits` per
+/// run and reports the store at `fill` (record.c:15) as gcc's UBSan
+/// object-size check does, or as ASan's heap-buffer-overflow when its
+/// UBSAN_OPTIONS suppress that check (a line to `reruns` each time).
+#[cfg(unix)]
+fn install_object_size_script_harness(dir: &Path, hits: &Path, reruns: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("main.c"), "// marker for libFuzzer detection\n").unwrap();
+    let main = dir.join("main");
+    fs::write(
+        &main,
+        format!(
+            r#"#!/bin/sh
+echo hit >> '{hits}'
+case "$UBSAN_OPTIONS" in
+*bhf-object-size.supp*)
+    echo rerun >> '{reruns}'
+    >&2 echo '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014 at pc 0x1 bp 0x2 sp 0x3'
+    >&2 echo 'WRITE of size 1 at 0x602000000014 thread T0'
+    >&2 echo '    #0 0x333 in fill /src/record.c:15:5'
+    >&2 echo '    #1 0x334 in LLVMFuzzerTestOneInput /src/h.c:20'
+    >&2 echo '0x602000000014 is located 0 bytes after 4-byte region [0x602000000010,0x602000000014)'
+    >&2 echo 'SUMMARY: AddressSanitizer: heap-buffer-overflow /src/record.c:15:5 in fill'
+    exit 1;;
+esac
+>&2 echo "/src/record.c:15:5: runtime error: store to address 0x602000000014 with insufficient space for an object of type 'char'"
+>&2 echo '    #0 0x333 in fill /src/record.c:15:5'
+>&2 echo '    #1 0x334 in LLVMFuzzerTestOneInput /src/h.c:20'
+>&2 echo 'SUMMARY: UndefinedBehaviorSanitizer: insufficient-object-size /src/record.c:15:5'
+exit 1
+"#,
+            hits = hits.display(),
+            reruns = reruns.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&main);
+}
+
+/// Lines in `path`, 0 when it does not exist.
+#[cfg(unix)]
+fn line_count(path: &Path) -> usize {
+    fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+/// Every hit of a gcc object-size report is the same root cause: the input is
+/// re-run with the check suppressed for its first sighting only, not for each
+/// later hit, nor again in a later pass over the same work dir, which counts
+/// those hits against the ASan finding the first re-run produced.
+#[cfg(unix)]
+#[test]
+fn an_object_size_report_is_re_run_once_per_root_cause_not_per_hit() {
+    let temp = temp_dir("object-size-once");
+    let work_dir = temp.join("bhf_work");
+    let hits = temp.join("hits.log");
+    let reruns = temp.join("reruns.log");
+    install_object_size_script_harness(&work_dir.join("build/H-OSIZE"), &hits, &reruns);
+    let args = [
+        "--harness",
+        "H-OSIZE",
+        "--iterations",
+        "12",
+        "--seed-input",
+        "AAAAAAAA",
+    ];
+
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        line_count(&hits) > 4,
+        "the store is hit again and again: {stderr}"
+    );
+    assert_eq!(
+        line_count(&reruns),
+        1,
+        "one re-run for the root cause: {stderr}"
+    );
+    let ids = finding_ids(&work_dir);
+    assert_eq!(ids.len(), 1, "{stderr}");
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            work_dir
+                .join("results/findings")
+                .join(&ids[0])
+                .join("finding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["rule_id"], "BHF-201", "{record:#}");
+    assert_eq!(
+        record["exception"]["name"], "ASAN_HEAP_BUFFER_OVERFLOW",
+        "{record:#}"
+    );
+    assert_eq!(
+        record["sanitizer_second_opinion"]["used"], "asan",
+        "{record:#}"
+    );
+
+    let hits_before = line_count(&hits);
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(line_count(&hits) > hits_before, "{stderr}");
+    assert_eq!(
+        line_count(&reruns),
+        1,
+        "a later pass counts the hits against the finding without a re-run: {stderr}"
+    );
+    assert_eq!(finding_ids(&work_dir), ids, "{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn fuzz_workers_run_the_harness_the_parent_resolves_after_it_moves() {

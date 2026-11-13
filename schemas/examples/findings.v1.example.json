@@ -90,7 +90,8 @@
         "arguments": [
           { "name": "data", "type": "const uint8_t *", "value": null, "len": 12, "span": [0, 12], "preview_hex": "48445231", "role": "param", "after_call_value": null },
           { "name": "flags", "type": "unsigned int", "value": "7", "len": null, "span": [12, 16], "preview_hex": null, "role": "param", "after_call_value": null }
-        ]
+        ],
+        "sanitizer_second_opinion": null
       },
       "static": null,
       "sca": null,

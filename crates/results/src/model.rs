@@ -468,6 +468,26 @@ pub struct FuzzBlock {
     /// (`decoded_args` in `finding.json`). `null` when they were not traced.
     #[serde(default)]
     pub arguments: Option<Vec<Argument>>,
+    /// Which report a finding UBSan first reported as insufficient-object-size
+    /// carries after a re-run with that check suppressed (`finding.json`
+    /// `sanitizer_second_opinion`). `null` for every other finding. Added
+    /// after the first v1 release, like `access`.
+    #[serde(default)]
+    pub sanitizer_second_opinion: Option<SanitizerSecondOpinion>,
+}
+
+/// The re-run that decides whether a UBSan object-size finding carries ASan's
+/// report of the same access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizerSecondOpinion {
+    /// The UBSan check the re-run suppressed: `object-size`.
+    pub check: String,
+    /// `asan` (the finding carries ASan's report) or `ubsan` (the first report
+    /// stands).
+    pub used: String,
+    /// What the re-run showed, or why it did not run.
+    pub reason: String,
 }
 
 /// How far a capture's search for operands computed from input bytes got.

@@ -4,8 +4,8 @@
 //! `.bhf.toml` in the scanned tree root): persist common flags so a project's runs
 //! are reproducible without re-typing them.
 //!
-//! Merge rule: the CLI always overrides the config — the config only fills a field left
-//! at its default/unset value. Relative paths in the file resolve against the file's
+//! Merge rule: the CLI always overrides the config — the config only fills a field the
+//! command line did not give (a flag given with its default value still wins). Relative paths in the file resolve against the file's
 //! own directory, so a config means the same thing whatever directory bhf runs from.
 //! SECURITY: an AUTO-loaded `.bhf.toml` comes from the scanned, possibly-untrusted
 //! tree, so it honors ONLY safe knobs; the fields that make bhf EXECUTE something the
@@ -22,13 +22,6 @@ use super::cli::AutoArgs;
 
 /// The default file name auto-loaded from the scanned tree root.
 pub const CONFIG_FILE_NAME: &str = ".bhf.toml";
-
-// Mirror the clap defaults so "still at default" can be detected for the merge.
-const DEFAULT_PER_TARGET_TIME: u64 = 60;
-const DEFAULT_JOBS: usize = 1;
-const DEFAULT_MAX_LEN: &str = "auto";
-const DEFAULT_MAX_CORPUS_MIB: usize = 64;
-const DEFAULT_ENGINE: &str = "builtin";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -288,9 +281,19 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     let base = base_dir.as_path();
     let mut notes = Vec::new();
 
-    // --- Safe knobs: apply only where the arg is still at its default/unset. ---
+    // --- Safe knobs: apply only where the command line left the arg out. ---
+    // A flag with a default value is filled unless the command line gave it
+    // (`args.given`), whatever value clap filled in; an `Option` or list flag is
+    // filled while it is unset or empty.
+    fn fills(args: &mut AutoArgs, id: &str) -> bool {
+        let fills = !args.given.contains(id);
+        if fills {
+            args.from_config.insert(id.to_owned());
+        }
+        fills
+    }
     if let Some(v) = config.per_target_time {
-        if args.per_target_time == DEFAULT_PER_TARGET_TIME {
+        if fills(args, "per_target_time") {
             args.per_target_time = v;
         }
     }
@@ -300,17 +303,17 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         }
     }
     if let Some(v) = config.jobs {
-        if args.jobs == DEFAULT_JOBS {
+        if fills(args, "jobs") {
             args.jobs = v;
         }
     }
     if let Some(v) = config.rss_limit_mb {
-        if args.rss_limit_mb == super::cli::default_auto_rss_limit_mb() {
+        if fills(args, "rss_limit_mb") {
             args.rss_limit_mb = v;
         }
     }
     if let Some(v) = config.max_work_dir_mb {
-        if args.max_work_dir_mb == super::storage::DEFAULT_MAX_WORK_DIR_MIB {
+        if fills(args, "max_work_dir_mb") {
             args.max_work_dir_mb = v;
         }
     }
@@ -318,7 +321,7 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         if v == 0 {
             return Err("max-corpus-mb must be at least 1".to_owned());
         }
-        if args.max_corpus_mb == DEFAULT_MAX_CORPUS_MIB {
+        if fills(args, "max_corpus_mb") {
             args.max_corpus_mb = v;
         }
     }
@@ -328,7 +331,7 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         }
     }
     if let Some(v) = config.max_len {
-        if args.max_len == DEFAULT_MAX_LEN {
+        if fills(args, "max_len") {
             args.max_len = v;
         }
     }
@@ -373,7 +376,7 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         }
     }
     if let Some(v) = config.engine {
-        if args.engine == DEFAULT_ENGINE {
+        if fills(args, "engine") {
             args.engine = v;
         }
     }
@@ -825,14 +828,125 @@ mod tests {
             .contains("cobolx"));
     }
 
+    /// Parse `argv` as `bhf auto` does: the arguments, plus the ids of the
+    /// flags the command line gave.
     fn parse_auto_args(argv: &[&str]) -> AutoArgs {
-        use clap::Parser;
+        use clap::{CommandFactory, FromArgMatches, Parser};
         #[derive(Parser)]
         struct TestCli {
             #[command(flatten)]
             auto: AutoArgs,
         }
-        TestCli::try_parse_from(argv).unwrap().auto
+        let matches = TestCli::command().try_get_matches_from(argv).unwrap();
+        let mut args = TestCli::from_arg_matches(&matches).unwrap().auto;
+        args.given = crate::auto::cli::given_arg_ids(&matches);
+        args
+    }
+
+    /// A config key fills a flag the command line did not give, whatever value
+    /// clap filled it with, and never one the command line gave, even with the
+    /// flag's default value.
+    #[test]
+    fn a_config_key_fills_only_a_flag_the_command_line_did_not_give() {
+        let tree = tempfile::tempdir().unwrap();
+        let config_path = tree.path().join(CONFIG_FILE_NAME);
+        let applied = |config: &str, argv: &[&str]| {
+            std::fs::write(&config_path, config).unwrap();
+            let mut args = parse_auto_args(argv);
+            apply(&mut args, tree.path()).unwrap();
+            args
+        };
+
+        // The host default is not what the config says: the config still wins
+        // over a value the command line did not give.
+        std::fs::write(&config_path, "jobs = 1\n").unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        args.jobs = 3;
+        apply(&mut args, tree.path()).unwrap();
+        assert_eq!(args.jobs, 1);
+        assert!(args.from_config.contains("jobs"), "{:?}", args.from_config);
+        let args = applied("jobs = 1\n", &["bhf", "tree", "--jobs", "3"]);
+        assert_eq!(args.jobs, 3);
+        assert!(!args.from_config.contains("jobs"), "{:?}", args.from_config);
+        assert_eq!(
+            applied("jobs = 2\n", &["bhf", "tree", "--jobs", "1"]).jobs,
+            1
+        );
+
+        assert_eq!(
+            applied("per-target-time = 10\n", &["bhf", "tree"]).per_target_time,
+            10
+        );
+        assert_eq!(
+            applied(
+                "per-target-time = 10\n",
+                &["bhf", "tree", "--per-target-time", "60"]
+            )
+            .per_target_time,
+            60
+        );
+        assert_eq!(
+            applied("engine = \"builtin,afl++\"\n", &["bhf", "tree"]).engine,
+            "builtin,afl++"
+        );
+        assert_eq!(
+            applied(
+                "engine = \"builtin,afl++\"\n",
+                &["bhf", "tree", "--engine", "builtin"]
+            )
+            .engine,
+            "builtin"
+        );
+        assert_eq!(
+            applied("max-len = \"4096\"\n", &["bhf", "tree"]).max_len,
+            "4096"
+        );
+        assert_eq!(
+            applied(
+                "max-len = \"4096\"\n",
+                &["bhf", "tree", "--max-len", "auto"]
+            )
+            .max_len,
+            "auto"
+        );
+        assert_eq!(
+            applied("max-corpus-mb = 8\n", &["bhf", "tree"]).max_corpus_mb,
+            8
+        );
+        assert_eq!(
+            applied(
+                "max-corpus-mb = 8\n",
+                &["bhf", "tree", "--max-corpus-mb", "64"]
+            )
+            .max_corpus_mb,
+            64
+        );
+        assert_eq!(
+            applied("max-work-dir-mb = 100\n", &["bhf", "tree"]).max_work_dir_mb,
+            100
+        );
+        let default_work_mb = crate::auto::storage::DEFAULT_MAX_WORK_DIR_MIB.to_string();
+        assert_eq!(
+            applied(
+                "max-work-dir-mb = 100\n",
+                &["bhf", "tree", "--max-work-dir-mb", &default_work_mb]
+            )
+            .max_work_dir_mb,
+            crate::auto::storage::DEFAULT_MAX_WORK_DIR_MIB
+        );
+        assert_eq!(
+            applied("rss-limit-mb = 7\n", &["bhf", "tree"]).rss_limit_mb,
+            7
+        );
+        let default_rss = crate::auto::cli::default_auto_rss_limit_mb().to_string();
+        assert_eq!(
+            applied(
+                "rss-limit-mb = 7\n",
+                &["bhf", "tree", "--rss-limit-mb", &default_rss]
+            )
+            .rss_limit_mb,
+            crate::auto::cli::default_auto_rss_limit_mb()
+        );
     }
 
     #[test]

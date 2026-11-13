@@ -113,6 +113,15 @@ fn provenance_one(
     if !hdir.join("Makefile").is_file() {
         return stats;
     }
+    // A harness built for another platform runs under its recorded runner: a
+    // `make prov` here would build a foreign `main_prov` that cannot run, with
+    // the host's default flags, and rewrite the toolchain stamp of its `main`.
+    // (A harness the gcc retry built is rebuilt here with the Makefile's
+    // defaults; passing that attempt's compiler override to `make prov` is a
+    // separate follow-up.)
+    if crate::gate_evidence::recorded_runner(&hdir.join("main")).is_some() {
+        return stats;
+    }
     // Only the C lane's weak-stub file is handled today (C++ stub poisoning is a
     // follow-up). No stub file -> nothing was fabricated -> nothing to attribute.
     let stub_src = hdir.join("repairs").join("auto_stubs.c");
@@ -490,6 +499,44 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
     return 0;
 }
 ";
+
+    /// A harness built for another platform (it has a recorded runner) is not
+    /// rebuilt for provenance: its `main_prov` would be a foreign build that
+    /// cannot run here, and `make prov` would rewrite the toolchain stamp of
+    /// its `main` with the host defaults.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_with_a_recorded_runner_is_not_rebuilt_for_provenance() {
+        let work = tempfile::tempdir().unwrap();
+        let hdir = work.path().join("harnesses/H-X");
+        std::fs::create_dir_all(hdir.join("repairs")).unwrap();
+        std::fs::write(hdir.join("Makefile"), "prov:\n\ttouch prov-ran\n").unwrap();
+        std::fs::write(hdir.join("repairs/auto_stubs.c"), STUBS).unwrap();
+        let finding = corpus::layout::findings_dir(work.path()).join("F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            r#"{"classification":"unhandled","harness_id":"H-X"}"#,
+        )
+        .unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+
+        // Without a runner the provenance build runs (the fixture is real).
+        provenance_one(work.path(), &hdir, "H-X", RunMode::Reporting);
+        assert!(hdir.join("prov-ran").is_file());
+        std::fs::remove_file(hdir.join("prov-ran")).unwrap();
+
+        let runner = crate::gate_evidence::HarnessRunner {
+            program: std::path::PathBuf::from("qemu-aarch64"),
+            args: Vec::new(),
+        };
+        crate::gate_evidence::record_runner(&hdir, Some(&runner)).unwrap();
+        provenance_one(work.path(), &hdir, "H-X", RunMode::Reporting);
+        assert!(
+            !hdir.join("prov-ran").exists(),
+            "a foreign harness must not be rebuilt"
+        );
+    }
 
     #[test]
     fn parses_weak_stub_openings() {

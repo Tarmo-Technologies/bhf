@@ -256,6 +256,11 @@ pub(crate) struct BuildToolchainArgs {
     /// key: `toolchain.ada.switches`.
     #[arg(long = "ada-switch", value_name = "SWITCH", allow_hyphen_values = true)]
     pub(crate) ada_switches: Vec<String>,
+
+    /// The clap ids of the `bhf build` flags the command line gave, so a flag
+    /// given with its default value still wins over the config file.
+    #[arg(skip)]
+    pub(crate) given: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -309,11 +314,12 @@ pub fn run(args: BuildArgs) -> i32 {
         }
     };
     let runs_natively = crate::toolchain::AdaBuildSettings::from_config(&toolchain).runs_natively();
-    // A probe backend from the config file that keeps the events on the
-    // target, for a harness built for this host: nothing would read them.
-    if args.probe_backend == ProbeBackend::HostFile && runs_natively {
+    // A probe backend that keeps the events on the target (from the flag or
+    // the config file, merged into the toolchain), for a harness built for
+    // this host: nothing would read them.
+    if runs_natively {
         if let Err(error) = crate::toolchain::check_host_probe_backend(&toolchain) {
-            bhfeprintln!("bhf build: {error}");
+            bhfeprintln!("bhf build: {error}; for an on-target build pass --target <triple>");
             return 2;
         }
     }
@@ -416,7 +422,7 @@ fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, 
     cli.ada.gprbuild = args.toolchain_args.ada_gprbuild.clone();
     cli.ada.gnat = args.toolchain_args.ada_gnat.clone();
     cli.ada.switches = args.toolchain_args.ada_switches.clone();
-    if args.probe_backend != ProbeBackend::HostFile {
+    if probe_backend_given(args) {
         cli.ada.probe_backend = Some(
             clap::ValueEnum::to_possible_value(&args.probe_backend).map_or_else(
                 || "host_file".to_owned(),
@@ -425,6 +431,13 @@ fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, 
         );
     }
     crate::toolchain::resolve(file, cli)
+}
+
+/// Whether `--probe-backend` chose the backend: given on the command line
+/// (its default `host_file` included), or set to another backend in code.
+fn probe_backend_given(args: &BuildArgs) -> bool {
+    args.probe_backend != ProbeBackend::HostFile
+        || args.toolchain_args.given.contains("probe_backend")
 }
 
 /// The note for a config file whose `[cross.<guard>]` tables `bhf build`
@@ -552,7 +565,7 @@ fn ada_only_flags_given(args: &BuildArgs) -> Vec<&'static str> {
     if args.runtime.is_some() {
         given.push("--runtime");
     }
-    if args.probe_backend != ProbeBackend::HostFile {
+    if probe_backend_given(args) {
         given.push("--probe-backend");
     }
     if args.toolchain_args.ada_gprbuild.is_some() {
@@ -1162,6 +1175,15 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
         Ok(published) => {
             for note in published.notes {
                 bhfeprintln!("bhf build: {note}");
+            }
+            // A C++ compiler derived from the C compiler need exist only for
+            // a C++ harness.
+            if let Some(missing) = published
+                .missing_cxx
+                .filter(|_| harness_dir.join("main.cpp").is_file())
+            {
+                bhfeprintln!("bhf build: {missing}");
+                return Some(2);
             }
         }
         Err(error) => {
