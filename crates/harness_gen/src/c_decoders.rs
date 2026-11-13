@@ -1127,6 +1127,23 @@ struct DecodeContext<'a> {
     /// Configurable struct/array synthesis caps (§27.11); [`DecoderLimits::default`]
     /// reproduces the historical hardcoded behavior byte-for-byte.
     limits: DecoderLimits,
+    /// Set while the statements decode one element of a typed array inside
+    /// the loop over its elements: the loop's index and element count. A
+    /// pointer field's pointee then gets one slot per element in storage
+    /// allocated before the loop ([`Self::hoisted`]), because a local
+    /// declared in the loop body would not outlive it.
+    each_element: Option<(String, String)>,
+    /// Statements that run before the element loop, the cleanups of what
+    /// they allocate, and the allocations the loop runs only when they
+    /// succeeded.
+    hoisted: Vec<String>,
+    hoisted_cleanups: Vec<String>,
+    hoisted_guards: Vec<String>,
+    /// Set while the statements fill heap storage the harness allocated (the
+    /// elements of a typed array, and what they point to), in C: a `const`
+    /// member, which cannot be assigned, is then decoded into a local and
+    /// copied into place. Anywhere else a `const` member is left zero.
+    const_members_writable: bool,
 }
 
 impl<'a> DecodeContext<'a> {
@@ -1140,6 +1157,11 @@ impl<'a> DecodeContext<'a> {
             cpp,
             header_complete: None,
             limits,
+            each_element: None,
+            hoisted: Vec::new(),
+            hoisted_cleanups: Vec::new(),
+            hoisted_guards: Vec::new(),
+            const_members_writable: false,
         }
     }
 
@@ -1233,7 +1255,14 @@ fn emit_top_level_value(
                     "array parameter '{name}' of type '{c_type}' needs declarator support"
                 )));
             };
-            ctx.push(format!("{base} {name}[{len}]"));
+            // In C++ an array of a type with a `const` member must be
+            // initialized to be declared at all.
+            let init = if ctx.cpp && const_member_within(elem, false) {
+                "{}"
+            } else {
+                ""
+            };
+            ctx.push(format!("{base} {name}[{len}]{init}"));
             emit_array_decode(ctx, name, base, elem, *len, 0);
             Ok(name.to_owned())
         }
@@ -1334,6 +1363,30 @@ fn emit_top_level_pointer(
                 )));
             };
             let storage_type = storage_c_type(&base);
+            // A `const` member can be decoded only into heap storage: give
+            // the pointee the storage of a one-element typed array.
+            if !ctx.cpp && has_const_member(inner) {
+                if let Some(element) = typed_array_element_decode(
+                    name,
+                    &storage_type,
+                    "1",
+                    ctx.registry,
+                    false,
+                    ctx.limits,
+                ) {
+                    ctx.push(format!(
+                        "{c_type} {name} = ({c_type})calloc(1, sizeof({storage_type}))"
+                    ));
+                    ctx.push(element.decl);
+                    ctx.support.extend(element.support);
+                    let free = format!("free((void *){name})");
+                    ctx.cleanups.push(match element.cleanup {
+                        Some(cleanup) => format!("{cleanup}; {free}"),
+                        None => free,
+                    });
+                    return Ok(name.to_owned());
+                }
+            }
             let storage = format!("_bhf_value_{name}");
             ctx.push(format!("{storage_type} {storage}{}", ctx.value_init_suffix()));
             emit_struct_init(ctx, &storage, struct_name, fields, 0);
@@ -1653,6 +1706,15 @@ fn emit_struct_init(
         }
         let field_lvalue = format!("{lvalue}.{}", field.name);
         let before = ctx.clone();
+        if is_const_object_type(&field.c_type) {
+            if let Err(err) = emit_const_member(ctx, &field_lvalue, field, depth + 1) {
+                *ctx = before;
+                ctx.push(format!(
+                    "/* bhf: const field {field_lvalue} left zeroed: {err} */"
+                ));
+            }
+            continue;
+        }
         if let Err(err) =
             emit_lvalue_decode(ctx, &field_lvalue, &field.c_type, &field.shape, depth + 1)
         {
@@ -1685,15 +1747,18 @@ fn emit_union_init(
         }
         let mut attempt = ctx.clone();
         let field_lvalue = format!("{lvalue}.{}", field.name);
-        if emit_lvalue_decode(
-            &mut attempt,
-            &field_lvalue,
-            &field.c_type,
-            &field.shape,
-            depth + 1,
-        )
-        .is_ok()
-        {
+        let decoded = if is_const_object_type(&field.c_type) {
+            emit_const_member(&mut attempt, &field_lvalue, field, depth + 1)
+        } else {
+            emit_lvalue_decode(
+                &mut attempt,
+                &field_lvalue,
+                &field.c_type,
+                &field.shape,
+                depth + 1,
+            )
+        };
+        if decoded.is_ok() {
             *ctx = attempt;
             return Ok(());
         }
@@ -1706,6 +1771,148 @@ fn emit_union_init(
         "/* bhf: union {lvalue} left zeroed: no decodable member */"
     ));
     Ok(())
+}
+
+/// Decode the `const` member `field` at `lvalue`, which cannot be assigned:
+/// into a local of its unqualified type, then copied into place with
+/// `memcpy`. That is sound only where the member lives in heap storage the
+/// harness allocated, in C ([`DecodeContext::const_members_writable`]);
+/// anywhere else, and in C++, where writing a `const` subobject of a live
+/// object is undefined, it fails and the caller leaves the member zero.
+fn emit_const_member(
+    ctx: &mut DecodeContext<'_>,
+    lvalue: &str,
+    field: &Field,
+    depth: usize,
+) -> Result<(), CDecoderError> {
+    if ctx.cpp {
+        return Err(CDecoderError::new(
+            "a const member of a C++ object is not written",
+        ));
+    }
+    if !ctx.const_members_writable {
+        return Err(CDecoderError::new(
+            "a const member is written only into heap storage",
+        ));
+    }
+    let unqualified = storage_c_type(&field.c_type);
+    if unqualified.contains('(') {
+        return Err(CDecoderError::new(
+            "a const function pointer spelled inline cannot be copied through a local",
+        ));
+    }
+    if unqualified.split_whitespace().any(|token| token == ":") {
+        return Err(CDecoderError::new("a const bit-field has no address"));
+    }
+    let (base, suffix) = match unqualified.find('[') {
+        Some(open) => (unqualified[..open].trim(), &unqualified[open..]),
+        None => (unqualified.trim(), ""),
+    };
+    let local = format!("_bhf_cm_{}", sanitize_ident(lvalue));
+    ctx.push(format!("{base} {local}{suffix}"));
+    ctx.push(format!("memset(&{local}, 0, sizeof {local})"));
+    let cleanups = ctx.cleanups.len();
+    // The local is no heap storage: a `const` member inside it stays zero.
+    let writable = std::mem::replace(&mut ctx.const_members_writable, false);
+    let decoded = emit_lvalue_decode(ctx, &local, &unqualified, &field.shape, depth);
+    ctx.const_members_writable = writable;
+    decoded?;
+    // What the local owns is the member's once copied: free it through the
+    // member, which outlives the local.
+    for cleanup in &mut ctx.cleanups[cleanups..] {
+        *cleanup = replace_identifier(cleanup, &local, lvalue);
+    }
+    ctx.push(format!(
+        "memcpy((void *)&{lvalue}, &{local}, sizeof {local})"
+    ));
+    Ok(())
+}
+
+/// `text` with every identifier token equal to `from` replaced by `to`.
+fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(if word == from { to } else { word.as_str() });
+        word.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Whether a value of `shape` holds a member that is itself `const`
+/// (`const int id;`, `char *const p;`), directly or in a nested aggregate,
+/// array or pointee its decoder fills.
+fn has_const_member(shape: &TypeShape) -> bool {
+    const_member_within(shape, true)
+}
+
+/// [`has_const_member`], through the pointees a decoder fills only when
+/// `through_pointers`; without it, whether the object itself has a `const`
+/// subobject.
+fn const_member_within(shape: &TypeShape, through_pointers: bool) -> bool {
+    match shape {
+        TypeShape::Struct { fields, .. } | TypeShape::Union { fields, .. } => {
+            fields.iter().any(|field| {
+                is_const_object_type(&field.c_type)
+                    || const_member_within(&field.shape, through_pointers)
+            })
+        }
+        TypeShape::Array { elem, .. } => const_member_within(elem, through_pointers),
+        TypeShape::Pointer(inner) if through_pointers => const_member_within(inner, true),
+        _ => false,
+    }
+}
+
+/// The initializer of C++ `new T[n]` storage of zeroed elements of `shape`:
+/// `()` value-initializes them, but a type with a `const` subobject has no
+/// default constructor, so it gets `{}`, which zeroes it as an aggregate
+/// (and which a class with an `explicit` default constructor would reject).
+pub(crate) fn cpp_new_array_init(shape: &TypeShape) -> &'static str {
+    if const_member_within(shape, false) {
+        "{}"
+    } else {
+        "()"
+    }
+}
+
+/// Whether an object of type `c_type` (a member's type as the C parser
+/// spells it) is itself `const`, `const int`, `char * const` or `void
+/// (*const)(int)`, not merely a pointer to `const` or a callback taking one.
+fn is_const_object_type(c_type: &str) -> bool {
+    // A template's arguments (`std::pair<const int, int>`) qualify other
+    // types.
+    let mut depth = 0usize;
+    let outer: String = c_type
+        .chars()
+        .filter(|&ch| match ch {
+            '<' => {
+                depth += 1;
+                false
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            _ => depth == 0,
+        })
+        .collect();
+    // A function pointer's own qualifiers sit inside its declarator group,
+    // `(*const)`; any other `const` qualifies its return or parameter types.
+    let own = match outer.find("(*") {
+        Some(open) => outer[open..].split(')').next().unwrap_or_default(),
+        None => outer.rsplit('*').next().unwrap_or_default(),
+    };
+    own.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == "const")
 }
 
 fn emit_lvalue_decode(
@@ -1826,6 +2033,17 @@ fn emit_pointer_field_storage(
     };
     let storage_type = storage_c_type(&base);
     let storage = format!("_bhf_pf_{}", sanitize_ident(lvalue));
+    if let Some((index, count)) = ctx.each_element.clone() {
+        return emit_element_pointee_storage(
+            ctx,
+            lvalue,
+            &storage_type,
+            &storage,
+            (&index, &count),
+            inner,
+            depth,
+        );
+    }
     match inner {
         TypeShape::Scalar(kind) => {
             ctx.push(format!(
@@ -1858,6 +2076,135 @@ fn emit_pointer_field_storage(
     }
     ctx.push(format!("{lvalue} = &{storage}"));
     Ok(())
+}
+
+/// [`emit_pointer_field_storage`] for a field of a typed-array element
+/// decoded in the loop over the elements: the pointee of every element's
+/// field is a slot of one array allocated before the loop, `count` slots
+/// long, so each element's pointer outlives the loop. The array is freed with
+/// the elements; the loop runs only when it was allocated.
+fn emit_element_pointee_storage(
+    ctx: &mut DecodeContext<'_>,
+    lvalue: &str,
+    storage_type: &str,
+    storage: &str,
+    (index, count): (&str, &str),
+    inner: &TypeShape,
+    depth: usize,
+) -> Result<(), CDecoderError> {
+    if ctx.cpp {
+        ctx.hoisted.push(format!(
+            "{storage_type} *{storage} = new {storage_type}[{count} ? {count} : 1]{}",
+            cpp_new_array_init(inner)
+        ));
+        ctx.hoisted_cleanups.push(format!("delete[] {storage}"));
+    } else {
+        ctx.hoisted.push(format!(
+            "{storage_type} *{storage} = ({storage_type} *)calloc({count} ? {count} : 1, \
+             sizeof({storage_type}))"
+        ));
+        ctx.hoisted_cleanups
+            .push(format!("free((void *){storage})"));
+        ctx.hoisted_guards.push(storage.to_owned());
+    }
+    let slot = format!("{storage}[{index}]");
+    match inner {
+        TypeShape::Scalar(kind) => {
+            ctx.push(format!(
+                "{slot} = {}",
+                scalar_expr(*kind, storage_type, lvalue)
+            ));
+        }
+        TypeShape::Enum { members, .. } => {
+            emit_enum_decode(ctx, &slot, storage_type, members, false);
+        }
+        TypeShape::Struct { name, fields } => {
+            emit_struct_init(ctx, &slot, name, fields, depth);
+        }
+        TypeShape::Union { fields, .. } => {
+            emit_union_init(ctx, &slot, fields, depth)?;
+        }
+        _ => {
+            return Err(CDecoderError::new(format!(
+                "pointer field '{lvalue}' to '{storage_type}' needs declarator support"
+            )))
+        }
+    }
+    ctx.push(format!("{lvalue} = &{slot}"));
+    Ok(())
+}
+
+/// How [`typed_array_element_decode`] decodes a typed array's elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElementDecode {
+    /// Statements that run once the array is allocated.
+    pub decl: String,
+    /// Statements that run before the array is freed.
+    pub cleanup: Option<String>,
+    /// File-scope code the statements use (callback trampolines).
+    pub support: Option<String>,
+}
+
+/// The statements that decode each of the first `count` elements of the
+/// typed array `array` (of element type `elem_type`, unqualified) from the
+/// input, field by field, as the standalone decoder decodes a lone value of
+/// that type: one element after another, in a loop. `None` when an element
+/// cannot be decoded that way (an opaque element, or a body past
+/// [`DecoderLimits::decl_bytes`]); the elements then stay zeroed. Like the
+/// standalone decoder, it assigns every member it decodes.
+pub(crate) fn typed_array_element_decode(
+    array: &str,
+    elem_type: &str,
+    count: &str,
+    registry: &TypeRegistry,
+    cpp: bool,
+    limits: DecoderLimits,
+) -> Option<ElementDecode> {
+    let shape = registry.resolve(elem_type);
+    if !matches!(
+        shape,
+        TypeShape::Scalar(_)
+            | TypeShape::Enum { .. }
+            | TypeShape::Struct { .. }
+            | TypeShape::Union { .. }
+    ) {
+        return None;
+    }
+    let elems = format!("_bhf_elems_{array}");
+    let index = format!("_bhf_e_{array}");
+    let mut ctx = DecodeContext::new(registry, cpp, limits);
+    ctx.each_element = Some((index.clone(), count.to_owned()));
+    ctx.const_members_writable = !cpp;
+    emit_lvalue_decode(&mut ctx, &format!("{elems}[{index}]"), elem_type, &shape, 0).ok()?;
+    let condition: String = std::iter::once(&elems)
+        .chain(&ctx.hoisted_guards)
+        .map(|guard| format!("{guard} && "))
+        .collect::<String>()
+        + &format!("{index} < {count}");
+    let each = |statements: &[String]| {
+        format!(
+            "for ({index} = 0; {condition}; ++{index}) {{ {}; }}",
+            statements.join("; ")
+        )
+    };
+    let mut decl = vec![format!("{elem_type} *{elems} = ({elem_type} *){array}")];
+    decl.extend(ctx.hoisted.iter().cloned());
+    decl.push(format!("size_t {index}"));
+    decl.push(each(&ctx.statements));
+    let decl = decl.join("; ");
+    if decl.len() > limits.decl_bytes {
+        return None;
+    }
+    let mut cleanup = Vec::new();
+    if !ctx.cleanups.is_empty() {
+        cleanup.push(each(&ctx.cleanups));
+    }
+    cleanup.extend(ctx.hoisted_cleanups.iter().rev().cloned());
+    Some(ElementDecode {
+        decl,
+        cleanup: (!cleanup.is_empty()).then(|| cleanup.join("; ")),
+        support: (!ctx.support.is_empty()).then(|| ctx.support.join("\n")),
+    })
 }
 
 fn emit_array_decode(
@@ -4529,6 +4876,181 @@ mod tests {
         assert!(select_c_decoder_with_registry("int)", "x", &reg).is_err());
         // A balanced scalar type is unaffected.
         assert!(select_c_decoder_with_registry("int", "n", &reg).is_ok());
+    }
+
+    /// A member that is itself `const` is decoded into a local and copied
+    /// into heap storage with `memcpy` (a lone pointee gets the heap storage
+    /// of a one-element array), what it owns is freed through the member, and
+    /// the other members are assigned as before. In a by-value local, and in
+    /// C++, it is left zero.
+    #[test]
+    fn const_members_are_copied_into_heap_storage_and_left_zero_elsewhere() {
+        let reg =
+            registry("typedef struct item_t { const int id; char *const tag; int a; } item_t;");
+        let lone = select_c_decoder_with_registry("const item_t *", "item", &reg).unwrap();
+        let slot = "_bhf_elems_item[_bhf_e_item]";
+        let local = "_bhf_cm__bhf_elems_item__bhf_e_item__id";
+        for part in [
+            "const item_t * item = (const item_t *)calloc(1, sizeof(item_t))".to_owned(),
+            format!("int {local}; memset(&{local}, 0, sizeof {local}); {local} = bhf_i32(&Cur)"),
+            format!("memcpy((void *)&{slot}.id, &{local}, sizeof {local})"),
+            format!("{slot}.a = bhf_i32(&Cur)"),
+        ] {
+            assert!(lone.decl.contains(&part), "{part}\n{}", lone.decl);
+        }
+        assert!(
+            !lone.decl.contains(&format!("{slot}.id =")),
+            "{}",
+            lone.decl
+        );
+        let free = lone.free.as_deref().unwrap();
+        assert!(
+            free.contains(&format!("free((void *){slot}.tag)"))
+                && free.ends_with("free((void *)item)"),
+            "{free}"
+        );
+
+        let by_value = select_c_decoder_with_registry("item_t", "item", &reg).unwrap();
+        assert!(
+            by_value
+                .decl
+                .contains("/* bhf: const field item.id left zeroed"),
+            "{}",
+            by_value.decl
+        );
+        assert!(!by_value.decl.contains("item.id ="), "{}", by_value.decl);
+        assert!(
+            by_value.decl.contains("item.a = bhf_i32(&Cur)"),
+            "{}",
+            by_value.decl
+        );
+
+        let cpp = select_c_decoder_with_registry_cpp("const item_t *", "item", &reg).unwrap();
+        assert!(
+            cpp.decl.contains("item_t _bhf_value_item{}"),
+            "{}",
+            cpp.decl
+        );
+        assert!(
+            cpp.decl
+                .contains("/* bhf: const field _bhf_value_item.id left zeroed"),
+            "{}",
+            cpp.decl
+        );
+        assert!(
+            cpp.decl.contains("_bhf_value_item.a = bhf_i32(&Cur)"),
+            "{}",
+            cpp.decl
+        );
+
+        // A struct without a `const` member keeps its stack storage.
+        let plain = registry("typedef struct plain_t { int id; int a; } plain_t;");
+        let lone = select_c_decoder_with_registry("plain_t *", "p", &plain).unwrap();
+        assert!(lone.decl.contains("plain_t _bhf_value_p"), "{}", lone.decl);
+        assert!(!lone.decl.contains("calloc"), "{}", lone.decl);
+    }
+
+    /// A `const` function pointer spelled inline and a `const` bit-field
+    /// cannot be copied into place (no local can be declared of the first,
+    /// the second has no address), so even in heap storage they stay zero.
+    /// A callback whose parameter is `const` is no `const` member: it still
+    /// gets its trampoline.
+    #[test]
+    fn const_function_pointers_and_bit_fields_stay_zero_in_heap_storage() {
+        let reg = registry(
+            "typedef struct edge_t { int a; void (*cb)(const int); \
+             void (*const hook)(int); void (*const table[2])(int); \
+             const unsigned flags : 3; } edge_t;",
+        );
+        let lone = select_c_decoder_with_registry("edge_t *", "e", &reg).unwrap();
+        let slot = "_bhf_elems_e[_bhf_e_e]";
+        assert!(
+            lone.decl.contains("calloc(1, sizeof(edge_t))"),
+            "{}",
+            lone.decl
+        );
+        assert!(
+            lone.decl.contains(&format!("{slot}.a = bhf_i32(&Cur)")),
+            "{}",
+            lone.decl
+        );
+        assert!(
+            lone.decl.contains(&format!("{slot}.cb = ")),
+            "{}",
+            lone.decl
+        );
+        for member in ["hook", "table", "flags"] {
+            assert!(
+                lone.decl
+                    .contains(&format!("/* bhf: const field {slot}.{member} left zeroed")),
+                "{member}: {}",
+                lone.decl
+            );
+            for write in [format!("{slot}.{member} ="), format!("&{slot}.{member},")] {
+                assert!(!lone.decl.contains(&write), "{write}: {}", lone.decl);
+            }
+        }
+        assert!(!lone.decl.contains("memcpy"), "{}", lone.decl);
+    }
+
+    /// Only a `const` that qualifies the member itself makes it a `const`
+    /// member.
+    #[test]
+    fn is_const_object_type_reads_the_members_own_qualifier() {
+        for (c_type, own) in [
+            ("const int", true),
+            ("const int[4]", true),
+            ("char * const", true),
+            ("unsigned char * const [2]", true),
+            ("void (*const)(int)", true),
+            ("void (*const)(int)[2]", true),
+            ("const unsigned : 3", true),
+            ("const std::pair<int, int>", true),
+            ("const char *", false),
+            ("char * const *", false),
+            ("void (*)(const int)", false),
+            ("const char *(*)(void)", false),
+            ("std::pair<const int, int>", false),
+            ("int", false),
+        ] {
+            assert_eq!(is_const_object_type(c_type), own, "{c_type}");
+        }
+    }
+
+    /// C++ storage of zeroed elements is value-initialized with `()`, which
+    /// a class with an `explicit` default constructor accepts; a type with
+    /// a `const` member has no default constructor, so its storage is
+    /// aggregate-initialized with `{}` instead.
+    #[test]
+    fn cpp_element_storage_braces_only_types_with_const_members() {
+        let reg = registry(
+            "typedef struct in_t { const int id; int v; } in_t; \
+             typedef struct out_t { in_t *in; int *n; } out_t;",
+        );
+        let elements = typed_array_element_decode(
+            "arr",
+            "out_t",
+            "_bhf_n_arr",
+            &reg,
+            true,
+            DecoderLimits::default(),
+        )
+        .unwrap();
+        for hoisted in [
+            "new in_t[_bhf_n_arr ? _bhf_n_arr : 1]{}",
+            "new int[_bhf_n_arr ? _bhf_n_arr : 1]()",
+        ] {
+            assert!(
+                elements.decl.contains(hoisted),
+                "{hoisted}: {}",
+                elements.decl
+            );
+        }
+        assert!(!elements.decl.contains(".id ="), "{}", elements.decl);
+        assert_eq!(cpp_new_array_init(&reg.resolve("in_t")), "{}");
+        // A pointer to such a type is no `const` subobject.
+        assert_eq!(cpp_new_array_init(&reg.resolve("out_t")), "()");
+        assert_eq!(cpp_new_array_init(&reg.resolve("int")), "()");
     }
 
     #[test]

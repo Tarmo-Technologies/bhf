@@ -727,6 +727,43 @@ fn build_cpp_param_decoders(
             i += 2;
             continue;
         }
+        // Typed-element array and its element count (`T *items, size_t n`),
+        // with the C lane's gates: the array is sized to the count so a
+        // callee walking `items[0..n)` stays inside it, instead of a
+        // one-element array beside an independent count.
+        if i + 1 < params.len()
+            && crate::c_generate::is_typed_array_pointer(&params[i].cpp_type, registry)
+            && (is_length_cpp_param(&params[i + 1].cpp_type)
+                || crate::c_generate::registry_resolves_to_length(
+                    &params[i + 1].cpp_type,
+                    registry,
+                ))
+            && crate::c_generate::looks_like_count_name(&params[i + 1].name)
+        {
+            if let Some((arr, count)) =
+                pair_cpp_typed_array_count(&params[i], &params[i + 1], registry)
+            {
+                out.push(arr);
+                out.push(count);
+                i += 2;
+                continue;
+            }
+        }
+        // The same contract in reverse order (`size_t nmatch, T *pmatch`).
+        if i + 1 < params.len()
+            && is_length_cpp_param(&params[i].cpp_type)
+            && crate::c_generate::looks_like_count_name(&params[i].name)
+            && crate::c_generate::is_typed_array_pointer(&params[i + 1].cpp_type, registry)
+        {
+            if let Some((count, arr)) =
+                pair_cpp_reverse_typed_array_count(&params[i], &params[i + 1], registry)
+            {
+                out.push(count);
+                out.push(arr);
+                i += 2;
+                continue;
+            }
+        }
         let emission = match select_cpp_decoder_with_registry_limited(
             &params[i].cpp_type,
             &params[i].name,
@@ -776,6 +813,99 @@ fn build_cpp_param_decoders(
     }
     crate::arg_trace::slice_input_units(&mut out, &units, crate::buffer_len_dimension_enabled());
     Ok(out)
+}
+
+/// The storage of a typed array sized by its element count, as the C lane's
+/// `pair_typed_array_count` gives it: the array's type, the decl allocating
+/// `_bhf_n_<array>` value-initialized elements (`new T[n]()` zeroes a plain
+/// struct as `calloc` does and constructs a class; a struct with a `const`
+/// member gets `new T[n]{}`, see [`crate::c_decoders::cpp_new_array_init`])
+/// and then decoding each from the input as a lone `T` is decoded, and how
+/// its elements are decoded. The `_bhf_n_<array>` name is the array's length
+/// to the argument trace. `None` when the registry cannot spell the element
+/// type.
+fn cpp_typed_array_storage(
+    array: &CppParameter,
+    registry: &TypeRegistry,
+) -> Option<(String, String, Option<crate::c_decoders::ElementDecode>)> {
+    let elem = crate::c_generate::typed_array_element_type(&array.cpp_type, registry)?;
+    let arr_type = normalize_cpp_pointer(&array.cpp_type);
+    let arr = &array.name;
+    let n = format!("_bhf_n_{arr}");
+    let elements = crate::c_decoders::typed_array_element_decode(
+        arr,
+        &elem,
+        &n,
+        registry,
+        true,
+        crate::c_decoders::DecoderLimits::default(),
+    );
+    let decl = format!(
+        "size_t {n} = bhf_bounded_length(&Cur, 0, 64); \
+         {arr_type} {arr} = new {elem}[{n} ? {n} : 1]{}{}",
+        crate::c_decoders::cpp_new_array_init(&registry.resolve(&elem)),
+        crate::c_generate::elements_decl(elements.as_ref())
+    );
+    Some((arr_type, decl, elements))
+}
+
+/// `(T *array, count)`: the array sized to the count it is passed with.
+fn pair_cpp_typed_array_count(
+    array: &CppParameter,
+    count: &CppParameter,
+    registry: &TypeRegistry,
+) -> Option<(CParamEmission, CParamEmission)> {
+    let (arr_type, arr_decl, elements) = cpp_typed_array_storage(array, registry)?;
+    let count_type = count
+        .cpp_type
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let count_decl = format!(
+        "{count_type} {} = ({count_type})_bhf_n_{}",
+        count.name, array.name
+    );
+    Some((
+        CParamEmission {
+            support: elements.as_ref().and_then(|e| e.support.clone()),
+            decl: arr_decl,
+            arg: array.name.clone(),
+            c_type: arr_type,
+            free: Some(crate::c_generate::elements_free(
+                elements.as_ref(),
+                format!("delete[] {}", array.name),
+            )),
+        },
+        CParamEmission {
+            support: None,
+            decl: count_decl,
+            arg: count.name.clone(),
+            c_type: count_type,
+            free: None,
+        },
+    ))
+}
+
+/// `(count, T *array)`: as [`pair_cpp_typed_array_count`]; the count's decl
+/// declares the array too, so the argument list keeps its order.
+fn pair_cpp_reverse_typed_array_count(
+    count: &CppParameter,
+    array: &CppParameter,
+    registry: &TypeRegistry,
+) -> Option<(CParamEmission, CParamEmission)> {
+    let (arr, count) = pair_cpp_typed_array_count(array, count, registry)?;
+    Some((
+        CParamEmission {
+            support: arr.support,
+            decl: format!("{}; {}", arr.decl, count.decl),
+            ..count
+        },
+        CParamEmission {
+            support: None,
+            decl: crate::c_generate::BACKING_ARRAY_DECL.to_owned(),
+            ..arr
+        },
+    ))
 }
 
 /// Collapse whitespace and separate a pointer declarator from its base type
@@ -4700,6 +4830,89 @@ mod tests {
         type_model::TypeRegistry::from_defs(std::iter::once(&defs))
     }
 
+    /// A typed array next to an element count is sized to that count, in
+    /// either order, as in the C lane: `new T[n]()` storage whose count is the
+    /// array's own length, never a one-element array with a count of its own.
+    #[test]
+    fn cpp_typed_array_pairs_with_its_count() {
+        let registry = typedef_registry("typedef struct item_t { int a; int b; } item_t;");
+        let forward =
+            "size_t _bhf_n_arr = bhf_bounded_length(&Cur, 0, 64); item_t * arr = new item_t[";
+        let decls = cpp_param_decls(&registry, &[("arr", "item_t *"), ("nMemb", "size_t")]);
+        assert!(decls[0].starts_with(forward), "{decls:#?}");
+        assert_eq!(decls[1], "size_t nMemb = (size_t)_bhf_n_arr");
+
+        let decls = cpp_param_decls(
+            &registry,
+            &[("items", "const item_t *"), ("count", "std::size_t")],
+        );
+        assert!(
+            decls[0].starts_with(
+                "size_t _bhf_n_items = bhf_bounded_length(&Cur, 0, 64); \
+                 const item_t * items = new item_t["
+            ),
+            "{decls:#?}"
+        );
+        assert_eq!(decls[1], "std::size_t count = (std::size_t)_bhf_n_items");
+
+        let decls = cpp_param_decls(
+            &registry,
+            &[("nmatch", "std::size_t"), ("pmatch", "item_t *")],
+        );
+        assert!(
+            decls[0].starts_with(
+                "size_t _bhf_n_pmatch = bhf_bounded_length(&Cur, 0, 64); \
+                 item_t * pmatch = new item_t["
+            ) && decls[0].ends_with("std::size_t nmatch = (std::size_t)_bhf_n_pmatch"),
+            "{decls:#?}"
+        );
+        assert_eq!(
+            decls[1],
+            "/* backing array declared with its preceding count */"
+        );
+
+        // A non-count neighbour leaves the pointer to the standalone decoder.
+        let decls = cpp_param_decls(&registry, &[("out", "item_t *"), ("flags", "int")]);
+        assert!(decls[0].contains("_bhf_value_out"), "{decls:#?}");
+        // A byte buffer still binds to the input.
+        let decls = cpp_param_decls(&registry, &[("buf", "const uint8_t *"), ("len", "size_t")]);
+        assert_eq!(decls[0], "const uint8_t * buf = (const uint8_t *)Data");
+        assert_eq!(decls[1], "size_t len = (size_t)Size");
+    }
+
+    /// The emissions of a typed-array pair free the array with `delete[]`.
+    #[test]
+    fn cpp_typed_array_pair_frees_with_delete_array() {
+        let registry = typedef_registry("typedef struct item_t { int a; int b; } item_t;");
+        let params = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, cpp_type)| CppParameter {
+                    name: (*name).to_owned(),
+                    cpp_type: (*cpp_type).to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = |pairs: &[(&str, &str)]| {
+            build_cpp_param_decoders(
+                &params(pairs),
+                &registry,
+                &[],
+                &CppDecoderLimits::default(),
+                false,
+                false,
+            )
+            .expect("decoders")
+        };
+        let forward = build(&[("arr", "const item_t *"), ("n", "size_t")]);
+        assert_eq!(forward[0].free.as_deref(), Some("delete[] arr"));
+        assert_eq!(forward[1].free, None);
+        let reverse = build(&[("n", "size_t"), ("arr", "item_t *")]);
+        assert_eq!(reverse[0].free, None);
+        assert_eq!(reverse[1].arg, "arr");
+        assert_eq!(reverse[1].free.as_deref(), Some("delete[] arr"));
+    }
+
     /// With the buffer-length dimension a lone read-only byte buffer takes
     /// a sized slice and is an exact copy of it, in C++ as in C.
     #[test]
@@ -6715,6 +6928,350 @@ mod tests {
                     cpp_traced(&args, params[1].0, None)["value"],
                     input.len().to_string(),
                     "{name} on {input:02x?}: {args:#?}"
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// A built C++ harness gives a typed array as many elements as its count
+    /// says, in either parameter order, so a correct function that walks the
+    /// array for its count runs clean on every input.
+    #[test]
+    fn built_cpp_harness_sizes_a_typed_array_to_its_count() {
+        let header = "#pragma once\n#include <cstddef>\n\
+             typedef struct item_t { int a; int b; } item_t;\n\
+             inline int sum_items(item_t *arr, std::size_t nMemb) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (std::size_t i = 0; i < nMemb; i++) s += arr[i].a;\n\
+             \x20   return s;\n\
+             }\n\
+             inline int fill_first(std::size_t nmatch, item_t *pmatch) {\n\
+             \x20   for (std::size_t i = 0; i < nmatch; i++) pmatch[i].a = (int)i;\n\
+             \x20   return (int)nmatch;\n\
+             }\n";
+        for (name, params, count, array) in [
+            (
+                "sum_items",
+                [("arr", "item_t *"), ("nMemb", "std::size_t")],
+                "nMemb",
+                "arr",
+            ),
+            (
+                "fill_first",
+                [("nmatch", "std::size_t"), ("pmatch", "item_t *")],
+                "nmatch",
+                "pmatch",
+            ),
+        ] {
+            let out = temp_dir(&format!("cpp-typed-array-{name}"));
+            let mut args =
+                cpp_args_for(&out, "H-CPP-ARRAY", cppfunction(name), &params, &[], header);
+            args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            let two = 2u64.to_le_bytes();
+            for (at, input) in [&two[..], b"", &[0xff; 8], &[0x41; 16]]
+                .into_iter()
+                .enumerate()
+            {
+                let args = cpp_traced_args(&out, input);
+                let count_value = cpp_traced(&args, count, None)["value"].clone();
+                if at == 0 {
+                    assert_eq!(count_value, "2", "{name}: {args:#?}");
+                }
+                let len = cpp_traced(&args, array, None)["len"].clone();
+                assert_eq!(
+                    count_value,
+                    serde_json::json!(len.as_u64().map(|len| len.to_string())),
+                    "{name} on {input:02x?}: the count is the array's length: {args:#?}"
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// The standalone driver a C++ harness carries for a capsule replay
+    /// passes each input in exactly its size too, in a direct harness and in
+    /// one for a project's own `LLVMFuzzerTestOneInput` alike.
+    #[test]
+    fn standalone_cpp_drivers_report_a_read_one_past_the_input() {
+        for (name, linkage) in [
+            ("sum_incl", ""),
+            ("LLVMFuzzerTestOneInput", "extern \"C\" "),
+        ] {
+            let out = temp_dir(&format!("cpp-standalone-{name}"));
+            let header = format!(
+                "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
+                 {linkage}int {name}(const uint8_t *buf, std::size_t len);\n"
+            );
+            fs::write(
+                out.join("target.cpp"),
+                format!(
+                    "#include \"widget.hpp\"\n\
+                     {linkage}int {name}(const uint8_t *buf, std::size_t len) {{\n\
+                     \x20   int s = 0;\n\
+                     \x20   for (std::size_t i = 0; i <= len; i++) s += buf[i];\n\
+                     \x20   return s;\n\
+                     }}\n"
+                ),
+            )
+            .unwrap();
+            let mut args = cpp_args_for(
+                &out,
+                "H-CPP-STANDALONE",
+                cppfunction(name),
+                &[("buf", "const uint8_t *"), ("len", "std::size_t")],
+                &[],
+                &header,
+            );
+            args.target_sources = vec![out.join("target.cpp")];
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            let main = fs::read_to_string(out.join("main.cpp")).unwrap();
+            assert_eq!(
+                main.contains("return LLVMFuzzerTestOneInput(Data, Size);"),
+                name == "LLVMFuzzerTestOneInput",
+                "{main}"
+            );
+            let Some(program) = crate::standalone_driver::build(
+                &out,
+                "clang++",
+                "main.cpp",
+                &[out.join("target.cpp")],
+            ) else {
+                return;
+            };
+            crate::standalone_driver::assert_reports_a_read_one_past_the_input(&program);
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// A struct with a `const` member builds in the C++ lane too, as a
+    /// typed-array element and as a lone pointee, with the type definitions
+    /// the C++ parser gives the lane: its `const` members keep their
+    /// value-initialized zero, since writing a `const` subobject of a live
+    /// C++ object is undefined, its `static` member (declared, never defined)
+    /// is not touched, a pointee of a type with a `const` member gets storage
+    /// it can be declared with, and its other members come from the input.
+    /// A class whose default constructor is `explicit` still builds as a
+    /// typed-array element.
+    #[test]
+    fn built_cpp_harness_decodes_structs_with_const_members() {
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdlib>\n\
+             struct inner_t { const int k; int v; };\n\
+             struct item_t { const int id; int a; static int count; inner_t *in; };\n\
+             struct knob_t { explicit knob_t() : a(0) {} int a; };\n\
+             inline int check_items(const item_t *items, std::size_t count) {\n\
+             \x20   for (std::size_t i = 0; i < count; i++)\n\
+             \x20       if (items[i].id == 0 && items[i].in && items[i].in->k == 0\n\
+             \x20           && items[i].a == 0x41414141) std::abort();\n\
+             \x20   return 0;\n\
+             }\n\
+             inline int check_one(const item_t *item) {\n\
+             \x20   if (item->id == 0 && item->in && item->in->k == 0\n\
+             \x20       && item->a == 0x41414141) std::abort();\n\
+             \x20   return 0;\n\
+             }\n\
+             inline int check_knobs(const knob_t *knobs, std::size_t count) {\n\
+             \x20   for (std::size_t i = 0; i < count; i++)\n\
+             \x20       if (knobs[i].a == 0x41414141) std::abort();\n\
+             \x20   return 0;\n\
+             }\n";
+        // Two elements: the first's `a` and `in->v`, then the second's `a`.
+        let items = |a: &[u8; 4]| [&2u64.to_le_bytes()[..], &[0; 8], a].concat();
+        let knobs = |a: &[u8; 4]| [&2u64.to_le_bytes()[..], &[0; 4], a].concat();
+        let cases = [
+            (
+                "check_items",
+                vec![("items", "const item_t *"), ("count", "std::size_t")],
+                items(b"AAAA"),
+                items(b"AAAB"),
+            ),
+            (
+                "check_one",
+                vec![("item", "const item_t *")],
+                b"AAAA".to_vec(),
+                b"AAAB".to_vec(),
+            ),
+            (
+                "check_knobs",
+                vec![("knobs", "const knob_t *"), ("count", "std::size_t")],
+                knobs(b"AAAA"),
+                knobs(b"AAAB"),
+            ),
+        ];
+        for (name, params, reached, clean) in cases {
+            let out = temp_dir(&format!("cpp-const-member-{name}"));
+            let mut args = cpp_args_for(
+                &out,
+                "H-CPP-CONST-MEMBER",
+                cppfunction(name),
+                &params,
+                &[],
+                header,
+            );
+            args.type_defs = vec![cpp_parser::parse_cpp_type_defs(header).unwrap()];
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            let run = |input: &[u8]| {
+                let path = out.join("const-member.bin");
+                fs::write(&path, input).unwrap();
+                crate::harness_command(out.join("main"))
+                    .arg(&path)
+                    .env_remove("BHF_TRACE_ARGS")
+                    .output()
+                    .unwrap()
+            };
+            let hit = run(&reached);
+            assert!(
+                !hit.status.success(),
+                "{name}: the non-const member comes from the input: {}",
+                String::from_utf8_lossy(&hit.stderr)
+            );
+            for input in [clean, Vec::new()] {
+                let ok = run(&input);
+                let stderr = String::from_utf8_lossy(&ok.stderr);
+                assert!(
+                    ok.status.success() && !stderr.contains("Sanitizer"),
+                    "{name} on {input:02x?}: {}: {stderr}",
+                    ok.status
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// The C++ AFL++ lane poisons the bytes of AFL++'s testcase buffer past
+    /// the input, so a read one past a buffer that views the input is
+    /// reported there too, and makes them addressable before the next input.
+    #[test]
+    fn built_cpp_afl_lane_reports_a_read_one_past_the_input() {
+        let out = temp_dir("cpp-afl-probe");
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
+                      int probe(const uint8_t *buf, std::size_t len);\n";
+        fs::write(
+            out.join("target.cpp"),
+            format!(
+                "#include <cstdio>\n#include \"widget.hpp\"\n\
+                 int probe(const uint8_t *buf, std::size_t len) {{\n{}}}\n",
+                crate::standalone_driver::AFL_PROBE_BODY
+            ),
+        )
+        .unwrap();
+        let mut args = cpp_args_for(
+            &out,
+            "H-CPP-AFL",
+            cppfunction("probe"),
+            &[("buf", "const uint8_t *"), ("len", "std::size_t")],
+            &[],
+            header,
+        );
+        args.target_sources = vec![out.join("target.cpp")];
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        for compiler in ["clang++", "afl-clang-fast++"] {
+            if let Some(program) = crate::standalone_driver::build_afl(&out, "AFLPP_CXX", compiler)
+            {
+                crate::standalone_driver::assert_afl_reports_a_read_one_past_the_input(&program);
+            }
+        }
+        if let Some(program) = crate::standalone_driver::build_afl_loop(
+            &out,
+            "clang++",
+            "main.cpp",
+            &[out.join("target.cpp")],
+            crate::standalone_driver::AFL_LOOP_INPUTS,
+        ) {
+            crate::standalone_driver::assert_afl_loop_poisons_only_past_each_input(&program);
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Every element of a C++ typed array is decoded from the input as the
+    /// standalone decoder decodes a lone element (its pointer fields
+    /// included), in either parameter order, instead of staying
+    /// value-initialized: a check on the second element's fields is
+    /// reachable, and the strings the elements own are freed.
+    #[test]
+    fn built_cpp_harness_decodes_every_element_of_a_typed_array() {
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdlib>\n#include <cstring>\n\
+             typedef struct item_t { int a; int b; const char *label; int *weight; } item_t;\n\
+             inline int check_each(const item_t *items, std::size_t count) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (std::size_t i = 0; i < count; i++) {\n\
+             \x20       if (items[i].label) s += (int)std::strlen(items[i].label);\n\
+             \x20       if (items[i].a == 0x41414141 && items[i].weight && *items[i].weight == 7)\n\
+             \x20           std::abort();\n\
+             \x20   }\n\
+             \x20   return s;\n\
+             }\n\
+             inline int check_items(const item_t *items, std::size_t count) {\n\
+             \x20   return check_each(items, count);\n\
+             }\n\
+             inline int check_rev(std::size_t nmatch, item_t *pmatch) {\n\
+             \x20   return check_each(pmatch, nmatch);\n\
+             }\n";
+        // A count of 2, element 0 all zero, then element 1 with `a` =
+        // `second_a` and a weight of 7. Per element: `a`, `b`, a 16-bit LE
+        // label length (0) and the weight.
+        let two_elements = |second_a: &[u8; 4]| {
+            let mut input = 2u64.to_le_bytes().to_vec();
+            input.extend_from_slice(&[0; 4 + 4 + 2 + 4]);
+            input.extend_from_slice(second_a);
+            input.extend_from_slice(&[0; 4 + 2]);
+            input.extend_from_slice(&7i32.to_le_bytes());
+            input
+        };
+        for (name, params) in [
+            (
+                "check_items",
+                [("items", "const item_t *"), ("count", "std::size_t")],
+            ),
+            (
+                "check_rev",
+                [("nmatch", "std::size_t"), ("pmatch", "item_t *")],
+            ),
+        ] {
+            let out = temp_dir(&format!("cpp-typed-array-elements-{name}"));
+            let mut args = cpp_args_for(
+                &out,
+                "H-CPP-ELEMENTS",
+                cppfunction(name),
+                &params,
+                &[],
+                header,
+            );
+            args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            let run = |input: &[u8]| {
+                let path = out.join("elements.bin");
+                fs::write(&path, input).unwrap();
+                crate::harness_command(out.join("main"))
+                    .arg(&path)
+                    .env_remove("BHF_TRACE_ARGS")
+                    .output()
+                    .unwrap()
+            };
+            let reached = run(&two_elements(b"AAAA"));
+            assert!(
+                !reached.status.success(),
+                "{name}: the second element's fields come from the input: {}",
+                String::from_utf8_lossy(&reached.stderr)
+            );
+            for input in [two_elements(b"AAAB"), Vec::new(), vec![0xff; 8]] {
+                let clean = run(&input);
+                let stderr = String::from_utf8_lossy(&clean.stderr);
+                assert!(
+                    clean.status.success() && !stderr.contains("Sanitizer"),
+                    "{name} on {input:02x?}: {}: {stderr}",
+                    clean.status
                 );
             }
             fs::remove_dir_all(&out).ok();

@@ -136,11 +136,11 @@ fn fork_server_finds_the_same_fault_as_per_spawn() {
     );
 }
 
-/// The persistent driver reuses one large input buffer, so an over-read just
-/// past the input stays inside it and the fork-server reports nothing. The
-/// fuzz loop re-runs such an input in a fresh process, whose exact-size buffer
-/// makes AddressSanitizer report it, and hands that run's stderr over with its
-/// report: the finding has a `sanitizer.log`.
+/// A crash the persistent fork-server never sees (the target only faults
+/// outside the framed loop, which is all a fresh process runs) is still kept:
+/// the fuzz loop re-runs the input in a fresh process, where
+/// AddressSanitizer reports it, and hands that run's stderr over with its
+/// report, so the finding has a `sanitizer.log`.
 #[test]
 fn a_crash_only_a_fresh_process_sees_keeps_its_sanitizer_log() {
     let clang_runs = std::process::Command::new("clang")
@@ -157,12 +157,13 @@ fn a_crash_only_a_fresh_process_sees_keeps_its_sanitizer_log() {
     fs::create_dir_all(&harness_dir).unwrap();
     fs::write(
         harness_dir.join("target.c"),
-        "#include <stddef.h>\n#include <stdint.h>\n\
+        "#include <stddef.h>\n#include <stdint.h>\n#include <stdlib.h>\n\
          __attribute__((noinline)) int read_trailer(const uint8_t *data, size_t len) {\n\
              return data[len + 2];\n\
          }\n\
          int bhf_run_one(const uint8_t *data, size_t size) {\n\
-             if (size >= 4 && data[0] == 'R' && data[1] == 'E') return read_trailer(data, size);\n\
+             if (size >= 4 && data[0] == 'R' && data[1] == 'E' && !getenv(\"BHF_FRAMED\"))\n\
+                 return read_trailer(data, size);\n\
              return 0;\n\
          }\n",
     )

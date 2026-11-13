@@ -1103,13 +1103,13 @@ static void bhf_run_file(const char *path) {
     long n = ftell(f);
     if (n < 0) n = 0;
     rewind(f);
-    /* Match the persistent path: over-allocate and NUL-terminate so a harness
-     * that deliberately feeds a C-string API cannot read beyond an exact-size
-     * replay allocation. */
-    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1) + 1);
+    /* Pass the input in a heap allocation of exactly its size, as libFuzzer
+     * passes it and as the framed loop does, so a read one past a buffer that
+     * views the input is reported on replay too. An empty input gets one byte
+     * (ASan's malloc(0) is one addressable byte as well). */
+    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1));
     if (!b) { fclose(f); return; }
     size_t r = fread(b, 1, (size_t)n, f);
-    b[r] = 0;
     fclose(f);
     bhf_run_one_bytes(b, r);
     free(b);
@@ -1210,18 +1210,22 @@ int main(int argc, char **argv) {
         }
         if (bhf_write(bhf_ctrl_fd, &ready, 1) != 1) return 1;
         size_t cap = 1u << 20;
-        uint8_t *buf = (uint8_t *)malloc(cap);
-        if (!buf) return 1;
         for (;;) {
             uint32_t len;
             if (!bhf_read_n(0, &len, 4)) break;
             if ((size_t)len > cap) len = (uint32_t)cap;
-            if (len && !bhf_read_n(0, buf, len)) break;
-            bhf_run_one_bytes(buf, len);
+            /* Each input in a heap allocation of exactly its size, read straight
+             * into it, as libFuzzer passes it and as a file replay does: a read
+             * one past a buffer that views the input is reported here too. An
+             * empty input gets one byte (ASan's malloc(0) is one as well). */
+            uint8_t *input = (uint8_t *)malloc(len ? (size_t)len : 1);
+            if (!input) return 1;
+            if (len && !bhf_read_n(0, input, len)) { free(input); break; }
+            bhf_run_one_bytes(input, len);
+            free(input);
             unsigned char sync = 1;
             if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;
         }
-        free(buf);
         return 0;
     }
     if (argc < 2) return 0;

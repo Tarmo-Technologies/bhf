@@ -1402,12 +1402,19 @@ fn normalize_space(text: &str) -> String {
 /// Only the harness's `Size` and the helper variables the decoders declare at
 /// the decl's top level (`_bhf_cap_<name>`, `_bhf_copy_<name>`,
 /// `_bhf_ntlen_<name>`, `_bhf_n_<name>`) are used, so the expression always
-/// names something declared where the trace runs.
+/// names something declared where the trace runs. The one exception is a
+/// reverse typed-array pair ([`crate::c_generate::BACKING_ARRAY_DECL`]),
+/// whose preceding count's decl declares `_bhf_n_<name>`.
 fn known_len(decl: &str, arg: &str) -> String {
     let none = "BHF_TRACE_NO_LEN".to_owned();
     let name = arg.trim_start_matches('&').trim();
     if !is_identifier(name) {
         return none;
+    }
+    // A reverse typed-array pair: its preceding count's decl, already run
+    // where this one is traced, declares the array and its element count.
+    if decl.trim() == crate::c_generate::BACKING_ARRAY_DECL {
+        return format!("(size_t)(_bhf_n_{name})");
     }
     let declared_helper = |candidate: &str| {
         let helpers = [
@@ -1467,7 +1474,14 @@ fn nul_flag(decl: &str) -> &'static str {
 /// A pointer the decl points at storage the harness declared (`= &_bhf_x`),
 /// so its pointee is always valid to read.
 fn is_storage_backed(decl: &str, arg: &str) -> bool {
-    arg.starts_with("&_bhf_") || (is_identifier(arg) && decl.contains(&format!("{arg} = &_bhf_")))
+    arg.starts_with("&_bhf_")
+        || (is_identifier(arg)
+            && (decl.contains(&format!("{arg} = &_bhf_"))
+                // A lone struct with a `const` member gets a heap object.
+                || decl.split(';').any(|statement| {
+                    statement.contains(&format!(" {arg} = ("))
+                        && statement.contains(")calloc(1, sizeof(")
+                })))
 }
 
 /// A `const` qualifies what the outermost pointer points at.
@@ -1914,6 +1928,30 @@ mod tests {
         );
     }
 
+    /// A typed array's length is its element count, `_bhf_n_<array>`, in
+    /// either order: declared in the array's own decl, or in its preceding
+    /// count's decl when the array's decl only says so.
+    #[test]
+    fn a_typed_array_length_is_its_element_count_in_either_order() {
+        assert_eq!(
+            known_len(
+                "size_t _bhf_n_arr = bhf_bounded_length(&Cur, 0, 64); \
+                 item_t * arr = new item_t[_bhf_n_arr ? _bhf_n_arr : 1]()",
+                "arr"
+            ),
+            "(size_t)(_bhf_n_arr)"
+        );
+        assert_eq!(
+            known_len(crate::c_generate::BACKING_ARRAY_DECL, "pmatch"),
+            "(size_t)(_bhf_n_pmatch)"
+        );
+        // Any other decl without a top-level helper has no known length.
+        assert_eq!(
+            known_len("/* bound elsewhere */", "pmatch"),
+            "BHF_TRACE_NO_LEN"
+        );
+    }
+
     #[test]
     fn length_prefixed_strings_are_nul_flagged_and_writable_ones_are_outputs() {
         let registry = TypeRegistry::default();
@@ -1963,6 +2001,32 @@ mod tests {
         assert!(before.contains(r#"\"role\":\"out\""#));
         assert_eq!(plan.after.len(), 1);
         assert!(plan.after[0].contains("bhf_tr_i64((int64_t)(*(count)));"));
+    }
+
+    /// A writable pointer to a struct the harness decoded is an output,
+    /// traced after the call too, whether the struct lives on the stack or,
+    /// because it has a `const` member, in a heap allocation of its own.
+    #[test]
+    fn a_pointer_to_decoded_struct_storage_is_traced_after_the_call() {
+        let defs = c_parser::parse_c_type_defs(
+            "typedef struct plain_t { int a; } plain_t; \
+             typedef struct fixed_t { const int id; int a; } fixed_t;",
+        )
+        .unwrap();
+        let registry = TypeRegistry::from_defs([&defs]);
+        for c_type in ["plain_t *", "fixed_t *"] {
+            let emission =
+                crate::c_decoders::select_c_decoder_with_registry(c_type, "obj", &registry)
+                    .unwrap();
+            let plan = plan(
+                &c_group(&registry),
+                &[emission],
+                &[Declared::new("obj", c_type)],
+            );
+            let before = plan.decode.last().unwrap();
+            assert!(before.contains(r#"\"role\":\"out\""#), "{c_type}: {before}");
+            assert_eq!(plan.after.len(), 1, "{c_type}: {plan:#?}");
+        }
     }
 
     #[test]

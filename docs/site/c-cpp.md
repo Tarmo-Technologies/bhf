@@ -366,7 +366,15 @@ arguments. A few rules decide what a parameter can receive:
   without a typedef in the scanned tree. The typedef hides whether the bytes
   are const, so that buffer is always a heap copy of the input, and its
   length is the copy's size. Without a length partner it is decoded like a
-  read-only byte pointer (below): a NUL-terminated heap copy.
+  read-only byte pointer (below): a NUL-terminated heap copy. A scalar or
+  byte-pointer typedef that the target's own `.c` declares is resolved too,
+  whatever its name (`uchar` and `DWORD` included). The harness spells it as
+  the type it aliases, in the target's prototype and in the `.c`'s
+  function-pointer typedefs it copies, so it does not need to include the
+  `.c`. A struct or enum typedef that only the `.c` declares stays opaque, and
+  so does a name the `.c` also `#define`s or declares only in a preprocessor
+  branch that does not also hold the target (a typedef under `#if 0` is
+  ignored).
 - **Unsigned integers.** Unsigned parameters, struct fields and output-pointer
   values cover their full range, `size_t` included, so values with the top
   bit set (`0x80000000`..`0xffffffff`, wrap-around sizes, bit masks) are
@@ -403,8 +411,8 @@ it did not reach. The per-type rules are:
 | `fmt`, `format` and the last `char *` of a variadic function | 2 + L | as `const char *`, with every `%` replaced by a space |
 | `const wchar_t *` | 2 + L wide characters | a 16-bit prefix counting wide characters (4 bytes each on Linux), at most 2048 |
 | `const char **` with a count | 8, then strings | a count modulo 17, then that many length-prefixed strings of at most 256 bytes |
-| `T *items` with a count | 8 | a count modulo 65 sizes a zeroed array of that many elements |
-| struct or union | its fields' bytes | each field by its own rule, in declaration order, nested up to 4 deep; arrays fill at most 64 elements |
+| `T *items` with a count | 8, then elements | a count modulo 65 sizes a zeroed array of that many elements, then each element by its own rule |
+| struct or union | its fields' bytes | each field by its own rule, in declaration order, nested up to 4 deep; arrays fill at most 64 elements. A field that is itself `const` is decoded only in the heap storage of a C typed array's elements or of the struct a C pointer parameter points to (and what those point to); elsewhere (a by-value local, C++) it stays zero and reads no bytes, as a `const` bit-field and a `const` function pointer declared inline always do. A C++ `static` data member is not a field |
 | pointer to a scalar or enum | the scalar's bytes | the address of a local holding the decoded value |
 | C++ `T &` | `T`'s bytes | a local decoded as `T`, passed by reference |
 | C++ `std::string`, `std::string_view` | 2 + L | as `const char *` |
@@ -438,6 +446,13 @@ with no cursor parameter, that is the whole testcase:
   remaining input written to a temporary file;
 - a read-only pointer to a record bhf cannot construct: a view of the
   remaining input.
+
+bhf's driver passes each input in a heap allocation of exactly its size (one
+byte for an empty input), in the fuzz loop and on replay, as libFuzzer does.
+A read one past a view of the input is a heap overflow the sanitizer reports.
+The AFL++ lane passes AFL++'s own testcase buffer, which is larger than the
+input; under AddressSanitizer the bytes past the input are poisoned, so the
+same read is reported there as `use-after-poison`.
 
 So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
 bytes 4-7 and `data` the bytes from 8 on, and for
@@ -684,7 +699,10 @@ but the last a sized slice, above) instead of the same remaining input, and
 binds every `(buffer, length)` pair of a call, not only the first. It also
 pairs the counts named `nElem`, `numberOfElements` or a bare `cb`, gives a
 lone pointer-typedef buffer (`LPCBYTE`) a heap copy of the input instead of
-one byte, and renames a parameter named like a harness local. A testcase of
+one byte, renames a parameter named like a harness local, resolves the
+scalar typedefs a C target declares in its own `.c`, in C++ sizes a typed
+array to its element count as the C lane does, and in both lanes decodes
+each element of such an array from the input. A testcase of
 a call with any of these shapes decodes differently under format 3; any
 other harness decodes its inputs as format 3 did.
 

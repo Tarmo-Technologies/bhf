@@ -1170,6 +1170,51 @@
   its bytes (one byte when empty), with no NUL terminator, in C and C++; a
   writable buffer keeps its headroom for the callee's writes. The default
   (dimension off) is unchanged.
+- A C target whose own `.c` declares a scalar or byte-pointer typedef
+  (`typedef unsigned char u8;`) that its header does not had that type left
+  unresolved when the harness does not include the `.c`: a `(const u8 *buf,
+  size_t len)` pair stayed unpaired, so correct code read past a short
+  buffer, and a `u32` parameter failed generation as an opaque type. The
+  harness now spells such a type as the type it aliases, in its decoded
+  parameters, in the target's prototype and in the `.c`'s function-pointer
+  typedefs it copies, whatever the name (`uchar` and `DWORD` included), and
+  writes each qualifier once. A struct or enum typedef that only the `.c`
+  declares stays opaque, and so does a name the `.c` also `#define`s or
+  declares only in a preprocessor branch that does not also hold the target
+  (a typedef under `#if 0` is ignored).
+- A C++ typed array next to its element count (`T *arr, size_t nMemb`, or
+  `size_t nmatch, T *pmatch`) got a one-element array and an independent
+  count, so correct code walking the array overflowed it. As in the C lane,
+  the array now has as many value-initialized elements as the count it is
+  passed with, and the argument trace reports that count as its length in
+  both lanes.
+- The elements of a C or C++ typed array next to its count were all zero (in
+  C) or only the first was decoded (in C++), so a check on an element's
+  fields could be unreachable. Each element is now decoded from the input
+  after the count, field by field, as a lone value of its type is, pointer
+  fields included.
+- A struct with a member that is itself `const` (`const int id;`, `char
+  *const p;`) failed to build as a decoded parameter, because the harness
+  assigned the member. The C and C++ parsers now keep a member's own
+  `const`, and such a member is decoded through a copy into the heap storage
+  the harness gives a C typed array's elements or a lone pointee; in a
+  by-value local and in C++ it stays zero and reads no input bytes, as does
+  a `const` bit-field or a `const` function pointer declared inline. The
+  other members are decoded as before. C++ storage for elements of such a
+  type is zeroed with `{}`, since the type has no default constructor.
+- A C++ `static` data member was decoded as a member of each object of its
+  class, so a harness for a class that only declares one failed to link. It
+  is no longer treated as a member.
+- A read one past a C/C++ buffer that views the fuzz input went unreported:
+  bhf's driver held each input in a larger allocation (one NUL byte more on
+  replay, one reused 1 MiB buffer in the fuzz loop), so the read stayed inside
+  it. The driver, and the standalone driver a capsule builds, now pass each
+  input in a heap allocation of exactly its size (one byte when empty) in the
+  fuzz loop and on replay, as libFuzzer does, so AddressSanitizer reports a
+  heap overflow in every mode. The AFL++ lane, which passes AFL++'s own
+  testcase buffer, now poisons the bytes past the input under
+  AddressSanitizer, so the same read is reported there (as
+  `use-after-poison`).
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
@@ -1177,6 +1222,9 @@
   builtin engine's own loops, so such a run used to fuzz with the builtin
   engine instead of AFL++ without saying so. Leave out `--engine` (or pass
   `--engine builtin`) to keep that behavior.
+- Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
+  len)` pair as a C string now reports a heap overflow, as it does under
+  libFuzzer.
 - A target's repairs (`run.json` `targets[].outcome.repairs`, the harness's
   `result.json`) can name a new kind, `compiler_compat` (`clang`, `gcc`,
   `reason`): the compatibility flags its C++ build took.

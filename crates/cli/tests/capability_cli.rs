@@ -16,7 +16,8 @@ fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
 
-/// Command exec + path open gated behind the "RUN" magic bytes.
+/// Command exec + path open gated behind the "RUN" magic bytes. The command
+/// reads only the input's own `len` bytes: the input is not NUL-terminated.
 const GATED_EXEC_C: &str = "\
 #include <string.h>
 #include <stdlib.h>
@@ -25,7 +26,8 @@ int process_cmd(const char *data, unsigned int len) {
     if (len < 4) return 0;
     if (data[0]=='R' && data[1]=='U' && data[2]=='N') {
         char cmd[64];
-        snprintf(cmd, sizeof cmd, \"/bin/echo %.20s\", data + 3);
+        int n = len - 3 > 20 ? 20 : (int)(len - 3);
+        snprintf(cmd, sizeof cmd, \"/bin/echo %.*s\", n, data + 3);
         system(cmd);
         return 1;
     }

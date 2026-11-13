@@ -2850,7 +2850,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
     // `json_unpack_ex`), drive that wrapper instead: it creates a valid
     // `va_list` and immediately calls the selected target. This preserves real
     // target execution without inventing a non-portable decoder for `va_list`.
-    let invocation_function = if args.kind == "direct" {
+    let mut invocation_function = if args.kind == "direct" {
         c_va_list_variadic_wrapper(&function, &functions).unwrap_or_else(|| function.clone())
     } else {
         function.clone()
@@ -2861,14 +2861,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("H-C{:04X}", function.line));
     let output_dir = args.output.join(&id);
-    let params = invocation_function
-        .params
-        .iter()
-        .map(|p| harness_gen::c_generate::CParameter {
-            name: p.name.clone(),
-            c_type: p.c_type.clone(),
-        })
-        .collect();
+    let mut params = c_harness_parameters(&invocation_function);
     let c_runtime_include = locate_c_runtime();
 
     let target_dir = source_path
@@ -3170,6 +3163,31 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         &target_includes_dirs,
         parse_target_source_types,
     );
+    // A harness that does not include the `.c` cannot name a scalar or
+    // byte-pointer typedef only the `.c` declares (`typedef unsigned char
+    // u8;`): spell such a type as what it aliases, in the decoded parameters
+    // and in the target's prototype, so `(const u8 *buf, size_t len)` pairs
+    // and a `u32` decodes as an integer. A declaration spelled with the
+    // aliased type is compatible with the `.c`'s definition. Struct and enum
+    // typedefs of the `.c` stay opaque. `type_defs` holds only the header
+    // closure (and the `.c`'s function-pointer typedefs) here.
+    if args.kind == "direct" && !parse_target_source_types {
+        let aliases = source_local_scalar_aliases(&source, &type_defs, invocation_function.line);
+        if !aliases.is_empty() {
+            for param in &mut invocation_function.params {
+                param.c_type = respell_source_local_aliases(&param.c_type, &aliases);
+            }
+            invocation_function.return_type =
+                respell_source_local_aliases(&invocation_function.return_type, &aliases);
+            params = c_harness_parameters(&invocation_function);
+            // The `.c`'s function-pointer typedefs are copied into the harness
+            // (with a trampoline of the same signature), so their parameter
+            // and return types must be nameable there too.
+            for typedef in type_defs.iter_mut().flat_map(|defs| &mut defs.typedefs) {
+                typedef.underlying = respell_source_local_aliases(&typedef.underlying, &aliases);
+            }
+        }
+    }
     // Tree-wide fallback: appended last so `TypeRegistry::from_defs` (first-wins)
     // keeps any in-scope definition and only uses the tree-wide one to resolve a
     // type the include closure left opaque (e.g. an arch-gated `word_t`).
@@ -3841,6 +3859,20 @@ fn aggregate_complete_in(defs: &[c_parser::CTypeDefs], tag: &str) -> bool {
             .iter()
             .any(|def| def.complete && def.name == tag)
     })
+}
+
+/// The harness parameters of a C target, as its prototype spells them.
+fn c_harness_parameters(
+    function: &c_parser::CFunction,
+) -> Vec<harness_gen::c_generate::CParameter> {
+    function
+        .params
+        .iter()
+        .map(|p| harness_gen::c_generate::CParameter {
+            name: p.name.clone(),
+            c_type: p.c_type.clone(),
+        })
+        .collect()
 }
 
 fn collect_c_type_defs_for_harness(
@@ -11916,6 +11948,374 @@ fn simple_aliases(source: &str) -> Vec<c_parser::CTypedefDef> {
         }
     }
     aliases
+}
+
+/// The names `<stdint.h>` and `<stddef.h>` declare. Every harness includes
+/// both, so it can name these whatever a target's `.c` says about them, and a
+/// `.c` that includes either can only redefine one compatibly.
+const HARNESS_STANDARD_TYPE_NAMES: &[&str] = &[
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "int_least8_t",
+    "int_least16_t",
+    "int_least32_t",
+    "int_least64_t",
+    "uint_least8_t",
+    "uint_least16_t",
+    "uint_least32_t",
+    "uint_least64_t",
+    "int_fast8_t",
+    "int_fast16_t",
+    "int_fast32_t",
+    "int_fast64_t",
+    "uint_fast8_t",
+    "uint_fast16_t",
+    "uint_fast32_t",
+    "uint_fast64_t",
+    "intptr_t",
+    "uintptr_t",
+    "intmax_t",
+    "uintmax_t",
+    "size_t",
+    "ptrdiff_t",
+    "wchar_t",
+    "max_align_t",
+];
+
+/// Where each line of `source` sits among its preprocessor conditionals:
+/// `None` inside a branch no build compiles (`#if 0`, the `#else` of an `#if
+/// 1`), otherwise the branches that may or may not be compiled and enclose
+/// it, outermost first, as `(conditional, branch)` pairs. A branch every build
+/// compiles (`#if 1`, the `#else` of an `#if 0`) adds nothing, so a line under
+/// only such branches has an empty path, like a line outside any conditional.
+fn preprocessor_branches(source: &str) -> Vec<Option<Vec<(usize, usize)>>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Branch {
+        Never,
+        Always,
+        Maybe,
+    }
+    struct Conditional {
+        id: usize,
+        branch: usize,
+        state: Branch,
+        // A branch before the current one may have been compiled, or one
+        // certainly was, so no later branch is.
+        earlier_maybe: bool,
+        settled: bool,
+    }
+    let constant = |condition: &str| -> Option<bool> {
+        match strip_statement_comments(condition).trim() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        }
+    };
+    let mut stack: Vec<Conditional> = Vec::new();
+    let mut opened = 0;
+    let mut out = Vec::new();
+    for line in source.lines() {
+        if let Some(directive) = line.trim_start().strip_prefix('#') {
+            let directive = directive.trim_start();
+            let word_len = directive
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(directive.len());
+            let (word, condition) = directive.split_at(word_len);
+            match word {
+                "if" | "ifdef" | "ifndef" => {
+                    let value = if word == "if" {
+                        constant(condition)
+                    } else {
+                        None
+                    };
+                    let state = match value {
+                        Some(false) => Branch::Never,
+                        Some(true) => Branch::Always,
+                        None => Branch::Maybe,
+                    };
+                    stack.push(Conditional {
+                        id: opened,
+                        branch: 0,
+                        state,
+                        earlier_maybe: false,
+                        settled: state == Branch::Always,
+                    });
+                    opened += 1;
+                }
+                "elif" | "elifdef" | "elifndef" | "else" => {
+                    if let Some(top) = stack.last_mut() {
+                        top.earlier_maybe |= top.state == Branch::Maybe;
+                        top.branch += 1;
+                        let value = match word {
+                            "elif" => constant(condition),
+                            "else" => Some(true),
+                            _ => None,
+                        };
+                        top.state = if top.settled || value == Some(false) {
+                            Branch::Never
+                        } else if value == Some(true) && !top.earlier_maybe {
+                            Branch::Always
+                        } else {
+                            Branch::Maybe
+                        };
+                        top.settled |= value == Some(true);
+                    }
+                }
+                "endif" => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        out.push(
+            (!stack.iter().any(|open| open.state == Branch::Never)).then(|| {
+                stack
+                    .iter()
+                    .filter(|open| open.state == Branch::Maybe)
+                    .map(|open| (open.id, open.branch))
+                    .collect()
+            }),
+        );
+    }
+    out
+}
+
+/// The scalar and byte-pointer typedefs a C target's own `.c` declares that a
+/// harness which does not include the `.c` cannot name, each with the type it
+/// aliases: what [`respell_source_local_aliases`] spells them as.
+/// `target_line` is the line of the target's definition.
+///
+/// Spelling a `.c`'s own typedef as the type it aliases is sound whatever the
+/// name, `uchar` and `DWORD` included, so from the `.c`'s [`simple_aliases`]
+/// a name is dropped only:
+/// - when the harness can already name it: a typedef, struct or enum of
+///   `header_defs` (the headers the harness includes), or a name of the
+///   standard headers every harness includes ([`HARNESS_STANDARD_TYPE_NAMES`]);
+/// - when it may not be the definition the target is compiled with: the `.c`
+///   also `#define`s the name, defines it more than once with different
+///   types, or defines it inside a preprocessor conditional that does not also
+///   enclose the target (a typedef under `#if 0` is dead code and ignored);
+/// - when it does not resolve to a scalar, a C string or a pointer to a
+///   scalar. So an opaque handle (`typedef void *ctx_t;`), a struct or enum
+///   alias keep their spelling, and stay opaque.
+fn source_local_scalar_aliases(
+    source: &str,
+    header_defs: &[c_parser::CTypeDefs],
+    target_line: u32,
+) -> HashMap<String, String> {
+    let header_names: HashSet<&str> = header_defs
+        .iter()
+        .flat_map(|defs| {
+            defs.typedefs
+                .iter()
+                .map(|typedef| typedef.name.as_str())
+                .chain(defs.structs.iter().map(|def| def.name.as_str()))
+                .chain(defs.enums.iter().map(|def| def.name.as_str()))
+        })
+        .collect();
+    let branches = preprocessor_branches(source);
+    let branch_of = |line: u32| {
+        usize::try_from(line)
+            .ok()
+            .and_then(|line| line.checked_sub(1))
+            .and_then(|at| branches.get(at))
+    };
+    let target_branch: &[(usize, usize)] = match branch_of(target_line) {
+        Some(Some(path)) => path,
+        _ => &[],
+    };
+    // A name the `.c` also defines as a macro may not be its typedef.
+    let macros: HashSet<&str> = source
+        .lines()
+        .zip(&branches)
+        .filter(|(_, branch)| branch.is_some())
+        .filter_map(|(line, _)| {
+            let rest = line.trim_start().strip_prefix('#')?.trim_start();
+            let rest = rest.strip_prefix("define")?;
+            if !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let rest = rest.trim_start();
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            Some(&rest[..end])
+        })
+        .collect();
+    let mut spellings: HashMap<String, Option<String>> = HashMap::new();
+    let mut order: Vec<c_parser::CTypedefDef> = Vec::new();
+    for alias in simple_aliases(source) {
+        let certain = match branch_of(alias.line) {
+            // Dead code: no build sees this definition.
+            Some(None) => continue,
+            Some(Some(path)) => target_branch.starts_with(path),
+            None => false,
+        };
+        let underlying = alias
+            .underlying
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match spellings.get_mut(&alias.name) {
+            Some(seen) => {
+                if !certain || seen.as_deref() != Some(underlying.as_str()) {
+                    *seen = None;
+                }
+            }
+            None => {
+                spellings.insert(alias.name.clone(), certain.then(|| underlying.clone()));
+                order.push(c_parser::CTypedefDef {
+                    underlying,
+                    ..alias
+                });
+            }
+        }
+    }
+    let local: Vec<c_parser::CTypedefDef> = order
+        .into_iter()
+        .filter(|alias| spellings.get(&alias.name).is_some_and(Option::is_some))
+        .filter(|alias| {
+            let name = alias.name.as_str();
+            !header_names.contains(name)
+                && !macros.contains(name)
+                && !HARNESS_STANDARD_TYPE_NAMES.contains(&name)
+        })
+        .collect();
+    let local_defs = c_parser::CTypeDefs {
+        structs: Vec::new(),
+        enums: Vec::new(),
+        typedefs: local.clone(),
+    };
+    let registry =
+        type_model::TypeRegistry::from_defs(header_defs.iter().chain(std::iter::once(&local_defs)));
+    // The aliased type, not the name, decides: a `.c` may give a name bhf
+    // knows as a scalar (`uchar`) to a struct.
+    local
+        .into_iter()
+        .filter(|alias| {
+            use type_model::TypeShape;
+            match registry.resolve(&alias.underlying) {
+                TypeShape::Scalar(_) | TypeShape::CString => true,
+                TypeShape::Pointer(inner) => matches!(*inner, TypeShape::Scalar(_)),
+                _ => false,
+            }
+        })
+        .map(|alias| (alias.name, alias.underlying))
+        .collect()
+}
+
+/// `c_type` with every identifier that names one of `aliases` (see
+/// [`source_local_scalar_aliases`]) spelled as the type it aliases, repeated
+/// for a chain of aliases. An alias of a pointer type takes the `const` or
+/// `volatile` next to it after the pointer it stands for (`const bytes_t` is
+/// `unsigned char * const`); any other alias is replaced in place. A struct,
+/// union or enum tag is never an alias. A qualifier the replacement repeats
+/// is written once (`const cu8 *` with `typedef const unsigned char cu8;` is
+/// `const unsigned char *`). `c_type` comes back unchanged when it names no
+/// alias.
+fn respell_source_local_aliases(c_type: &str, aliases: &HashMap<String, String>) -> String {
+    // Each token with the whitespace before it, so everything but a
+    // replaced alias keeps its spelling (`int (*)(u8)`).
+    fn tokens(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut space = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                space.push(c);
+                chars.next();
+            } else if c.is_ascii_alphanumeric() || c == '_' {
+                let mut word = String::new();
+                while let Some(&c) = chars.peek() {
+                    if !(c.is_ascii_alphanumeric() || c == '_') {
+                        break;
+                    }
+                    word.push(c);
+                    chars.next();
+                }
+                out.push((std::mem::take(&mut space), word));
+            } else {
+                out.push((std::mem::take(&mut space), c.to_string()));
+                chars.next();
+            }
+        }
+        out
+    }
+    let is_qualifier = |token: &str| matches!(token, "const" | "volatile");
+    let mut current = c_type.to_owned();
+    let mut changed = false;
+    for _ in 0..8 {
+        let input = tokens(&current);
+        let mut out: Vec<(String, String)> = Vec::with_capacity(input.len());
+        let mut replaced = false;
+        let mut at = 0;
+        while at < input.len() {
+            let (space, token) = &input[at];
+            let tagged = out
+                .last()
+                .is_some_and(|(_, prev)| matches!(prev.as_str(), "struct" | "union" | "enum"));
+            let Some(underlying) = aliases.get(token).filter(|_| !tagged) else {
+                out.push((space.clone(), token.clone()));
+                at += 1;
+                continue;
+            };
+            replaced = true;
+            at += 1;
+            if !underlying.trim_end().ends_with('*') {
+                out.push((space.clone(), underlying.clone()));
+                continue;
+            }
+            // A pointer typedef: a qualifier next to it qualifies the pointer,
+            // so it goes after the pointer it stands for.
+            let mut lead = space.clone();
+            let mut qualifiers = Vec::new();
+            while out.last().is_some_and(|(_, prev)| is_qualifier(prev)) {
+                let (prev_space, prev) = out.pop().unwrap_or_default();
+                lead = prev_space;
+                qualifiers.insert(0, prev);
+            }
+            while input.get(at).is_some_and(|(_, next)| is_qualifier(next)) {
+                qualifiers.push(input[at].1.clone());
+                at += 1;
+            }
+            out.push((lead, underlying.trim_end().to_owned()));
+            out.extend(qualifiers.into_iter().map(|q| (" ".to_owned(), q)));
+        }
+        if !replaced {
+            break;
+        }
+        changed = true;
+        current = out
+            .into_iter()
+            .map(|(space, token)| space + &token)
+            .collect();
+    }
+    if !changed {
+        return c_type.to_owned();
+    }
+    // One qualifier of a kind per declarator level: a level ends at a `*` or
+    // at any bracket or separator.
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(current.len());
+    for (space, token) in tokens(&current) {
+        if is_qualifier(&token) {
+            if seen.contains(&token) {
+                continue;
+            }
+            seen.push(token.clone());
+        } else if matches!(token.as_str(), "*" | "(" | ")" | "," | "[" | "]" | "&") {
+            seen.clear();
+        }
+        out.push_str(&space);
+        out.push_str(&token);
+    }
+    out
 }
 
 /// `statement` without its `/* ... */` and `// ...` comments.
@@ -20903,6 +21303,359 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "static target source should not be linked as a separate translation unit:\n{makefile}"
         );
+    }
+
+    /// A command running the harness `dir/main` built by `make main`. On
+    /// Windows it puts clang's AddressSanitizer runtime DLL on the child's
+    /// PATH, as `bhf` does for the harnesses it runs.
+    fn built_harness_command(dir: &Path) -> std::process::Command {
+        #[allow(unused_mut)]
+        let mut command = std::process::Command::new(dir.join("main"));
+        #[cfg(windows)]
+        if let Some(output) = std::process::Command::new("clang")
+            .arg("-print-resource-dir")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+        {
+            let runtime =
+                Path::new(String::from_utf8_lossy(&output.stdout).trim()).join("lib/windows");
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let dirs = std::iter::once(runtime).chain(std::env::split_paths(&path));
+            command.env(
+                "PATH",
+                std::env::join_paths(dirs).expect("PATH entries join"),
+            );
+        }
+        command
+    }
+
+    /// Of the aliases a target's own `.c` declares, only those that resolve to
+    /// a scalar or a pointer to one are respelled, and every alias token in a
+    /// type is spelled as what it aliases, chains included. A pointer
+    /// typedef's own qualifier stays on the pointer.
+    #[test]
+    fn source_local_aliases_respell_only_scalar_and_pointer_typedefs() {
+        let source = "typedef unsigned char u8;\n\
+                      typedef u8 octet;\n\
+                      typedef unsigned int u32;\n\
+                      typedef const u8 *cbytes_t;\n\
+                      typedef unsigned char *bytes_t;\n\
+                      typedef void *ctx_t;\n\
+                      typedef struct widget widget_t;\n\
+                      typedef unsigned short hdr_t;\n\
+                      #if WIDE\n\
+                      typedef long word_t;\n\
+                      #else\n\
+                      typedef int word_t;\n\
+                      #endif\n";
+        let header = c_parser::parse_c_type_defs("typedef int hdr_t;\n").unwrap();
+        let aliases =
+            super::source_local_scalar_aliases(source, std::slice::from_ref(&header), u32::MAX);
+        let respell = |c_type: &str| super::respell_source_local_aliases(c_type, &aliases);
+        assert_eq!(respell("const octet *"), "const unsigned char *");
+        assert_eq!(respell("u32"), "unsigned int");
+        assert_eq!(respell("cbytes_t"), "const unsigned char *");
+        assert_eq!(respell("cbytes_t *"), "const unsigned char * *");
+        assert_eq!(respell("const bytes_t"), "unsigned char * const");
+        assert_eq!(respell("bytes_t const"), "unsigned char * const");
+        // Everything but the alias keeps its spelling.
+        assert_eq!(
+            respell("int (*)(u8, void *)"),
+            "int (*)(unsigned char, void *)"
+        );
+        assert_eq!(respell("const u8*"), "const unsigned char*");
+        // An opaque handle, a struct alias, a name the header defines and one
+        // the `.c` defines two ways keep their spelling.
+        for kept in ["ctx_t", "widget_t *", "hdr_t", "word_t", "struct u8 *"] {
+            assert_eq!(respell(kept), kept);
+        }
+        for name in ["ctx_t", "widget_t", "hdr_t", "word_t"] {
+            assert!(!aliases.contains_key(name), "{name}: {aliases:?}");
+        }
+    }
+
+    /// A `.c`-local scalar typedef in a pair's buffer type no longer leaves the
+    /// pair unbound: the harness spells it as the type it aliases, so the
+    /// buffer views the input and its length is the input's size, and a
+    /// correct function runs clean on every input.
+    #[test]
+    fn c_source_local_typedef_pair_binds_and_runs_clean() {
+        if !have_tool("make") || !have_tool("clang") {
+            eprintln!("skip: make or clang unavailable");
+            return;
+        }
+        let root = temp_dir("c-local-typedef-pair");
+        fs::write(
+            root.join("lib.h"),
+            "#include <stddef.h>\nint sum_pair(const unsigned char *buf, size_t len);\n",
+        )
+        .unwrap();
+        let source = root.join("lib.c");
+        fs::write(
+            &source,
+            "#include \"lib.h\"\n\
+             typedef unsigned char u8;\n\
+             int sum_pair(const u8 *buf, size_t len) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (size_t i = 0; i < len; i++) s += buf[i];\n\
+             \x20   return s;\n\
+             }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "sum_pair", "H-LOCAL-PAIR", &root);
+        let main = fs::read_to_string(dir.join("main.c")).unwrap();
+        assert!(
+            main.contains("const unsigned char * buf = (const unsigned char *)Data"),
+            "{main}"
+        );
+        assert!(main.contains("size_t len = (size_t)Size"), "{main}");
+        assert!(!main.contains("const u8 "), "{main}");
+        let built = make_main(&dir, &[("CC", "clang")]);
+        assert!(built.status.success(), "{}", output_text(&built));
+        for (name, input) in [
+            ("one.bin", &b"A"[..]),
+            ("empty.bin", b""),
+            ("many.bin", &[0x5a; 64]),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, input).unwrap();
+            let run = built_harness_command(&dir).arg(&path).output().unwrap();
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(
+                run.status.success() && !stderr.contains("AddressSanitizer"),
+                "{name}: {}: {stderr}",
+                run.status
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A by-value parameter of a `.c`-local unsigned typedef decodes as the
+    /// integer it aliases (it used to fail as an opaque type), and the result
+    /// is declared as the aliased type.
+    #[test]
+    fn c_source_local_unsigned_typedef_parameter_generates() {
+        if !have_tool("make") || !have_tool("clang") {
+            eprintln!("skip: make or clang unavailable");
+            return;
+        }
+        let root = temp_dir("c-local-typedef-scalar");
+        let source = root.join("lib.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             typedef unsigned int u32;\n\
+             u32 bit_at(const unsigned char *buf, size_t len, u32 bit) {\n\
+             \x20   if (len == 0) return 0;\n\
+             \x20   return (buf[(bit / 8) % len] >> (bit % 8)) & 1u;\n\
+             }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "bit_at", "H-LOCAL-SCALAR", &root);
+        let main = fs::read_to_string(dir.join("main.c")).unwrap();
+        assert!(main.contains("bhf_i32"), "{main}");
+        assert!(main.contains("unsigned int R ="), "{main}");
+        // The harness declares the target with the aliased type, which it can
+        // name and which is compatible with the `.c`'s definition.
+        assert!(
+            main.contains(
+                "extern unsigned int bit_at(const unsigned char *, size_t, unsigned int);"
+            ),
+            "{main}"
+        );
+        assert!(!main.contains("u32 bit"), "{main}");
+        let built = make_main(&dir, &[("CC", "clang")]);
+        assert!(built.status.success(), "{}", output_text(&built));
+        let path = root.join("bit.bin");
+        fs::write(&path, [0xff, 0xff, 0xff, 0xff, 0x41]).unwrap();
+        let run = built_harness_command(&dir)
+            .arg(&path)
+            .env("BHF_TRACE_ARGS", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{}: {stderr}", run.status);
+        let bit: serde_json::Value = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("BHF_ARG "))
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .find(|arg| arg["name"] == "bit")
+            .unwrap_or_else(|| panic!("no trace for bit: {stderr}"));
+        assert_eq!(bit["value"], "4294967295", "{bit}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `.c`'s own typedef is respelled even when bhf knows its name as a
+    /// scalar without a definition (`uchar`, `DWORD`, `BOOL`, a
+    /// project-prefixed `*_uint8_t`): the harness still cannot name it. Only
+    /// the names of the standard headers the harness includes keep their
+    /// spelling.
+    #[test]
+    fn source_local_aliases_respell_known_scalar_spellings_the_harness_cannot_name() {
+        let source = "typedef unsigned char uchar;\n\
+                      typedef unsigned int DWORD;\n\
+                      typedef int BOOL;\n\
+                      typedef unsigned char proj_uint8_t;\n\
+                      typedef unsigned char uint8_t;\n\
+                      typedef unsigned long size_t;\n";
+        let aliases = super::source_local_scalar_aliases(source, &[], u32::MAX);
+        let respell = |c_type: &str| super::respell_source_local_aliases(c_type, &aliases);
+        assert_eq!(respell("const uchar *"), "const unsigned char *");
+        assert_eq!(respell("DWORD"), "unsigned int");
+        assert_eq!(respell("BOOL"), "int");
+        assert_eq!(respell("const proj_uint8_t *"), "const unsigned char *");
+        for kept in ["const uint8_t *", "size_t"] {
+            assert_eq!(respell(kept), kept);
+        }
+    }
+
+    /// Only a typedef the compiler certainly sees with the target is
+    /// respelled: one in an `#if 0` block (or the `#else` of an `#if 1`) is
+    /// dead code, a name the `.c` also `#define`s is a macro, and one inside a
+    /// conditional that does not also enclose the target may not be the
+    /// definition the target was compiled with.
+    #[test]
+    fn source_local_aliases_skip_dead_conditional_and_macro_typedefs() {
+        let source = "#if 0\n\
+                      typedef int u8;\n\
+                      #endif\n\
+                      typedef unsigned char u8;\n\
+                      #ifdef USE_NARROW_WORD\n\
+                      typedef unsigned short word_t;\n\
+                      #else\n\
+                      #define word_t uint64_t\n\
+                      #endif\n\
+                      #ifndef HAVE_HALF\n\
+                      typedef unsigned short half_t;\n\
+                      #endif\n\
+                      #if 1\n\
+                      typedef unsigned short wide_t;\n\
+                      #else\n\
+                      typedef long wide_t;\n\
+                      #endif\n\
+                      #if defined(FEATURE_X)\n\
+                      typedef unsigned int feature_t;\n\
+                      int feature_fn(feature_t v);\n\
+                      #endif\n";
+        let inside = super::source_local_scalar_aliases(source, &[], 20);
+        assert_eq!(inside.get("u8").map(String::as_str), Some("unsigned char"));
+        assert_eq!(
+            inside.get("wide_t").map(String::as_str),
+            Some("unsigned short")
+        );
+        assert_eq!(
+            inside.get("feature_t").map(String::as_str),
+            Some("unsigned int")
+        );
+        for unsure in ["word_t", "half_t"] {
+            assert!(!inside.contains_key(unsure), "{unsure}: {inside:?}");
+        }
+        // Seen from a target outside the `FEATURE_X` block, its typedef is
+        // unsure too.
+        let outside = super::source_local_scalar_aliases(source, &[], 4);
+        assert!(!outside.contains_key("feature_t"), "{outside:?}");
+        assert!(outside.contains_key("u8"), "{outside:?}");
+    }
+
+    /// Respelling an alias whose type is already qualified never repeats the
+    /// qualifier (`const const unsigned char *` is an error under
+    /// `-Werror=duplicate-decl-specifier`).
+    #[test]
+    fn source_local_aliases_never_repeat_a_qualifier() {
+        let source = "typedef const unsigned char cu8;\n\
+                      typedef const unsigned char *cbytes_t;\n";
+        let aliases = super::source_local_scalar_aliases(source, &[], u32::MAX);
+        let respell = |c_type: &str| super::respell_source_local_aliases(c_type, &aliases);
+        assert_eq!(respell("const cu8 *"), "const unsigned char *");
+        assert_eq!(respell("cu8 const *"), "const unsigned char *");
+        assert_eq!(respell("const cu8 * const"), "const unsigned char * const");
+        assert_eq!(
+            respell("const cbytes_t const"),
+            "const unsigned char * const"
+        );
+        assert_eq!(respell("cbytes_t"), "const unsigned char *");
+    }
+
+    /// A `.c`'s own typedef with a name bhf knows as a scalar spelling
+    /// (`uchar`, `DWORD`), and the parameter types inside a `.c`
+    /// function-pointer typedef the harness copies, are spelled as what they
+    /// alias: the harness can name none of them, so each target builds and
+    /// runs.
+    #[test]
+    fn c_source_local_known_scalar_typedefs_build_and_run() {
+        if !have_tool("make") || !have_tool("clang") {
+            eprintln!("skip: make or clang unavailable");
+            return;
+        }
+        let root = temp_dir("c-local-known-scalars");
+        let source = root.join("lib.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             typedef unsigned char uchar;\n\
+             typedef unsigned int DWORD;\n\
+             typedef unsigned char u8;\n\
+             typedef const unsigned char cu8;\n\
+             typedef int (*visit_t)(u8 v);\n\
+             int sum_pair(const uchar *buf, size_t len) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (size_t i = 0; i < len; i++) s += buf[i];\n\
+             \x20   return s;\n\
+             }\n\
+             DWORD twice(DWORD x) { return x * 2u; }\n\
+             int each(visit_t visit, const cu8 *buf, size_t len) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (size_t i = 0; i < len; i++) s += visit ? visit(buf[i]) : buf[i];\n\
+             \x20   return s;\n\
+             }\n",
+        )
+        .unwrap();
+        let names = |text: &str| -> std::collections::HashSet<String> {
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(str::to_owned)
+                .collect()
+        };
+        for (target, id, prototype) in [
+            (
+                "sum_pair",
+                "H-LOCAL-UCHAR",
+                "extern int sum_pair(const unsigned char *, size_t);",
+            ),
+            (
+                "twice",
+                "H-LOCAL-DWORD",
+                "extern unsigned int twice(unsigned int);",
+            ),
+            (
+                "each",
+                "H-LOCAL-CALLBACK",
+                "extern int each(visit_t, const unsigned char *, size_t);",
+            ),
+        ] {
+            let dir = generate_for_make_test(&source, target, id, &root);
+            let main = fs::read_to_string(dir.join("main.c")).unwrap();
+            assert!(main.contains(prototype), "{target}:\n{main}");
+            // (The Windows driver code names `DWORD` itself.)
+            let spelled = names(&super::strip_statement_comments(&main));
+            for local in ["uchar", "u8", "cu8"] {
+                assert!(!spelled.contains(local), "{target} names {local}:\n{main}");
+            }
+            assert!(!main.contains("DWORD x"), "{target}:\n{main}");
+            assert!(!main.contains("const const"), "{target}:\n{main}");
+            let built = make_main(&dir, &[("CC", "clang")]);
+            assert!(built.status.success(), "{target}: {}", output_text(&built));
+            let input = root.join(format!("{target}.bin"));
+            fs::write(&input, b"ABCDEFGH").unwrap();
+            let run = built_harness_command(&dir).arg(&input).output().unwrap();
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(
+                run.status.success() && !stderr.contains("AddressSanitizer"),
+                "{target}: {}: {stderr}",
+                run.status
+            );
+        }
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -34,7 +34,10 @@ pub use generate::{
 ///   being decoded on its own). Counts named `nElem`, `numberOfItems` or a
 ///   bare Win32 `cb`/`cch`, and buffers spelled through a pointer typedef
 ///   (`LPCBYTE`), now pair, and a parameter named like a harness local
-///   (`Data`, `Size`, `Cur`) gets a local of its own.
+///   (`Data`, `Size`, `Cur`) gets a local of its own. It also resolves the
+///   scalar typedefs a C target declares in its own `.c`, in C++ sizes a
+///   typed array to its element count as the C lane does, and in both lanes
+///   decodes each element of such an array from the input.
 pub const HARNESS_FORMAT_VERSION: u32 = 4;
 
 /// The input format generated Ada harnesses decode. Formats 3 and 4 changed
@@ -152,6 +155,371 @@ fn clang_sanitizer_runtime_dir() -> Option<&'static std::path::PathBuf> {
         dir.is_dir().then_some(dir)
     })
     .as_ref()
+}
+
+/// Test helpers for a harness's framed fuzz loop, and for a harness built
+/// with its own standalone driver: the copy of bhf's driver in its
+/// `main.c`/`main.cpp`, compiled without `-DBHF_EXTERNAL_DRIVER`, as a
+/// capsule replays it.
+#[cfg(test)]
+pub(crate) mod standalone_driver {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Stdio};
+
+    /// Compile `out/<main>` and `sources` with `compiler` and
+    /// AddressSanitizer at `-O1`, as the generated Makefile builds a harness,
+    /// using the harness's own driver, into `out/standalone`. `None` (the
+    /// test skips) when `compiler` is missing.
+    pub(crate) fn build(
+        out: &Path,
+        compiler: &str,
+        main: &str,
+        sources: &[PathBuf],
+    ) -> Option<PathBuf> {
+        let present = Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !present {
+            eprintln!("skipping the standalone build: {compiler} unavailable");
+            return None;
+        }
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+        let program = out.join(format!("standalone{}", std::env::consts::EXE_SUFFIX));
+        let mut command = Command::new(compiler);
+        command.args([
+            "-g",
+            "-O1",
+            "-fsanitize=address",
+            "-D_GNU_SOURCE",
+            "-D_DEFAULT_SOURCE",
+        ]);
+        if cfg!(windows) {
+            command.arg("-D_CRT_SECURE_NO_WARNINGS");
+        }
+        let build = command
+            .arg("-I")
+            .arg(&runtime)
+            .arg("-I")
+            .arg(out)
+            .arg("-o")
+            .arg(&program)
+            .arg(out.join(main))
+            .args(sources)
+            .output()
+            .expect("run the compiler");
+        assert!(
+            build.status.success(),
+            "standalone build of {} failed:\n{}",
+            out.join(main).display(),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        Some(program)
+    }
+
+    /// Run `program`'s framed loop (`BHF_FRAMED=1`) over `frames`, one `{u32
+    /// LE length, bytes}` frame each: how many sync bytes came back before
+    /// the loop ended, then its exit status and stderr once stdin is closed.
+    pub(crate) fn run_framed(program: &Path, frames: &[&[u8]]) -> (usize, ExitStatus, String) {
+        use std::io::{Read, Write};
+        let mut child = crate::harness_command(program)
+            .env("BHF_FRAMED", "1")
+            .env_remove("BHF_TRACE_ARGS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the framed harness");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut byte = [0u8; 1];
+        stdout.read_exact(&mut byte).expect("ready byte");
+        assert_eq!(byte[0], 1, "ready byte");
+        let mut synced = 0;
+        for frame in frames {
+            let mut bytes = (frame.len() as u32).to_le_bytes().to_vec();
+            bytes.extend_from_slice(frame);
+            if stdin.write_all(&bytes).is_err() {
+                break;
+            }
+            match stdout.read(&mut byte) {
+                Ok(1) => synced += 1,
+                _ => break,
+            }
+        }
+        drop(stdin);
+        drop(stdout);
+        let output = child.wait_with_output().expect("framed harness exits");
+        (
+            synced,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// `program` runs a target that reads `buf[0..=len]` of a buffer viewing
+    /// the whole input, one byte past it. Its driver passes each input in a
+    /// heap allocation of exactly its size, so the read is a heap overflow
+    /// AddressSanitizer reports on file replay and in the framed loop alike,
+    /// and an empty input (one addressable byte) runs clean.
+    pub(crate) fn assert_reports_a_read_one_past_the_input(program: &Path) {
+        let dir = program.parent().expect("the program's dir");
+        let replay = |input: &[u8]| {
+            let path = dir.join("one-past.bin");
+            std::fs::write(&path, input).unwrap();
+            crate::harness_command(program)
+                .arg(&path)
+                .env_remove("BHF_TRACE_ARGS")
+                .output()
+                .unwrap()
+        };
+        let run = replay(b"ABCD");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.status.success()
+                && stderr.contains("heap-buffer-overflow")
+                && stderr.contains("4-byte region"),
+            "{}: file replay: {}: {stderr}",
+            program.display(),
+            run.status
+        );
+        let run = replay(b"");
+        assert!(
+            run.status.success(),
+            "{}: empty replay: {}",
+            program.display(),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let (synced, status, stderr) = run_framed(program, &[b"", b"ABCD"]);
+        assert_eq!(synced, 1, "{}: framed: {stderr}", program.display());
+        assert!(
+            !status.success()
+                && stderr.contains("heap-buffer-overflow")
+                && stderr.contains("4-byte region"),
+            "{}: framed: {status}: {stderr}",
+            program.display()
+        );
+    }
+
+    /// The target the AFL++ lane tests drive: it reports each run's length
+    /// on stderr, reads `buf[0..len)`, and reads one byte past the input when
+    /// it starts with `X`.
+    pub(crate) const AFL_PROBE_BODY: &str =
+        "\x20   fprintf(stderr, \"BHF_TEST_RUN %u\\n\", (unsigned)len);\n\
+         \x20   int s = 0;\n\
+         \x20   for (size_t i = 0; i < len; i++) s += buf[i];\n\
+         \x20   if (len && buf[0] == 'X') s += buf[len];\n\
+         \x20   return s;\n";
+
+    /// Build the AFL++ lane of the harness in `out` (`make main_afl`) with
+    /// `compiler` as its AFL++ compiler (`var` is `AFLPP_CC` or `AFLPP_CXX`).
+    /// `None` (the test skips) off Unix, where the lane does not exist, or
+    /// without `make` or `compiler`.
+    pub(crate) fn build_afl(out: &Path, var: &str, compiler: &str) -> Option<PathBuf> {
+        let present = |tool: &str| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if cfg!(windows) || !present("make") || !present(compiler) {
+            eprintln!("skipping the AFL++ lane build with {compiler}");
+            return None;
+        }
+        // Another compiler's build of the lane would look up to date.
+        std::fs::remove_file(out.join("main_afl")).ok();
+        let build = Command::new("make")
+            .arg("-C")
+            .arg(out)
+            .arg("main_afl")
+            .arg(format!("{var}={compiler}"))
+            .env("AFL_QUIET", "1")
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main_afl with {compiler} failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        Some(out.join("main_afl"))
+    }
+
+    /// Compile `out/<main>` and `sources` with `compiler` as the AFL++ lane
+    /// (`-DBHF_AFL`) at `-O1`, with its persistent loop driven over `inputs`: each
+    /// iteration writes the next input into the testcase buffer, as afl-fuzz
+    /// does, after the harness has made the buffer addressable again.
+    pub(crate) fn build_afl_loop(
+        out: &Path,
+        compiler: &str,
+        main: &str,
+        sources: &[PathBuf],
+        inputs: &[&[u8]],
+    ) -> Option<PathBuf> {
+        let present = Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if cfg!(windows) || !present {
+            eprintln!("skipping the AFL++ loop build with {compiler}");
+            return None;
+        }
+        let array = |input: &[u8]| {
+            let bytes: Vec<String> = input.iter().map(|b| format!("0x{b:02x}")).collect();
+            if bytes.is_empty() {
+                "0".to_owned()
+            } else {
+                bytes.join(", ")
+            }
+        };
+        let mut shim =
+            String::from("#include <stddef.h>\n#include <string.h>\n#include \"afl_loop.h\"\n");
+        for (at, input) in inputs.iter().enumerate() {
+            shim.push_str(&format!(
+                "static const unsigned char bhf_test_in{at}[] = {{ {} }};\n",
+                array(input)
+            ));
+        }
+        shim.push_str(&format!(
+            "static const unsigned char *const bhf_test_in[] = {{ {} }};\n\
+             static const size_t bhf_test_len[] = {{ {} }};\n\
+             static size_t bhf_test_at = 0;\n\
+             int bhf_test_loop(void) {{ return bhf_test_at < {}; }}\n\
+             size_t bhf_test_next(unsigned char *buf) {{\n\
+             \x20   size_t n = bhf_test_len[bhf_test_at];\n\
+             \x20   memcpy(buf, bhf_test_in[bhf_test_at], n);\n\
+             \x20   bhf_test_at++;\n\
+             \x20   return n;\n\
+             }}\n",
+            (0..inputs.len())
+                .map(|at| format!("bhf_test_in{at}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            inputs
+                .iter()
+                .map(|input| input.len().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            inputs.len()
+        ));
+        std::fs::write(
+            out.join("afl_loop.h"),
+            "#include <stddef.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\
+             int bhf_test_loop(void);\nsize_t bhf_test_next(unsigned char *buf);\n\
+             #ifdef __cplusplus\n}\n#endif\n",
+        )
+        .unwrap();
+        // Compiled as the main source's language, so its linkage matches.
+        let shim_path = out.join(if main.ends_with(".cpp") {
+            "afl_loop.cpp"
+        } else {
+            "afl_loop.c"
+        });
+        std::fs::write(&shim_path, shim).unwrap();
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+        let program = out.join("afl_loop");
+        let build = Command::new(compiler)
+            .args([
+                "-g",
+                "-O1",
+                "-fsanitize=address",
+                "-DBHF_AFL",
+                "-D_GNU_SOURCE",
+            ])
+            .arg("-include")
+            .arg(out.join("afl_loop.h"))
+            .arg("-D__AFL_LOOP(_n)=bhf_test_loop()")
+            .arg("-D__AFL_FUZZ_TESTCASE_LEN=bhf_test_next(buf)")
+            .arg("-I")
+            .arg(&runtime)
+            .arg("-I")
+            .arg(out)
+            .arg("-o")
+            .arg(&program)
+            .arg(out.join(main))
+            .args(sources)
+            .arg(&shim_path)
+            .output()
+            .expect("run the compiler");
+        assert!(
+            build.status.success(),
+            "AFL++ loop build of {} failed:\n{}",
+            out.join(main).display(),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        Some(program)
+    }
+
+    /// Run an AFL++ lane binary once outside afl-fuzz, with `input` on stdin,
+    /// as a crash is replayed.
+    pub(crate) fn run_afl(program: &Path, input: &[u8]) -> std::process::Output {
+        use std::io::Write;
+        let mut child = Command::new(program)
+            .env_remove("BHF_TRACE_ARGS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the AFL++ lane");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input)
+            .expect("write the input");
+        child.wait_with_output().expect("AFL++ lane exits")
+    }
+
+    /// `program` is an AFL++ lane of a target with [`AFL_PROBE_BODY`]: a
+    /// read one past the input is reported, though AFL++'s testcase buffer
+    /// is larger than any input, and a correct read of an input of any size
+    /// is not.
+    pub(crate) fn assert_afl_reports_a_read_one_past_the_input(program: &Path) {
+        for input in [&b"ABCD"[..], b""] {
+            let run = run_afl(program, input);
+            assert!(
+                run.status.success(),
+                "{} on {input:02x?}: {}",
+                program.display(),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+        let run = run_afl(program, b"XBCD");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.status.success() && stderr.contains("AddressSanitizer"),
+            "{}: the read one past the input: {}: {stderr}",
+            program.display(),
+            run.status
+        );
+    }
+
+    /// `program` was built with [`build_afl_loop`] over
+    /// [`AFL_LOOP_INPUTS`] for a target with [`AFL_PROBE_BODY`]: every input
+    /// runs clean however its length compares to the last one's, until the
+    /// last input's read one past it is reported.
+    pub(crate) fn assert_afl_loop_poisons_only_past_each_input(program: &Path) {
+        let run = Command::new(program)
+            .env_remove("BHF_TRACE_ARGS")
+            .output()
+            .expect("run the AFL++ loop");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let runs: Vec<&str> = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("BHF_TEST_RUN "))
+            .collect();
+        assert_eq!(runs, ["4", "8", "0", "8", "4"], "{stderr}");
+        assert!(
+            !run.status.success() && stderr.contains("AddressSanitizer"),
+            "{}: {stderr}",
+            run.status
+        );
+    }
+
+    /// The inputs [`assert_afl_loop_poisons_only_past_each_input`] expects:
+    /// a shorter, a longer, an empty and a longer input, then one that reads
+    /// one past itself.
+    pub(crate) const AFL_LOOP_INPUTS: &[&[u8]] = &[b"ABCD", b"ABCDEFGH", b"", b"ABCDEFGH", b"XBCD"];
 }
 
 #[cfg(test)]

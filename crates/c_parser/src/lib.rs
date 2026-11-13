@@ -2027,14 +2027,96 @@ fn struct_fields(body: tree_sitter::Node<'_>, source: &[u8]) -> Vec<CParamDescri
         // A field_declaration can carry several declarators
         // (`int x, *y, z[4];`); each gets its own descriptor with the
         // pointer/array decoration recovered from its wrapper nodes.
+        let leading_const = has_const_qualifier(child, source);
+        let bit_width = bit_field_width(child, source);
         let mut field_cursor = child.walk();
         for part in child.children(&mut field_cursor) {
-            if let Some(descriptor) = field_descriptor(part, source, &base_type) {
+            if let Some(mut descriptor) = field_descriptor(part, source, &base_type) {
+                if member_is_const(part, leading_const, source) {
+                    descriptor.c_type =
+                        const_member_spelling(&descriptor.c_type, bit_width.as_deref());
+                }
                 fields.push(descriptor);
             }
         }
     }
     fields
+}
+
+/// Whether `node` has a `const` among its own `type_qualifier` children
+/// (a declaration's leading `const`, or the one after a declarator's `*`).
+pub fn has_const_qualifier(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|child| {
+        child.kind() == "type_qualifier" && child.utf8_text(source).is_ok_and(|q| q == "const")
+    });
+    found
+}
+
+/// The width of a bit-field member declaration (`3` for `int f : 3;`),
+/// `None` for any other member.
+pub fn bit_field_width(field_declaration: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = field_declaration.walk();
+    let clause = field_declaration
+        .children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")?;
+    let width = clause.utf8_text(source).ok()?.trim_start_matches(':');
+    Some(width.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The pointer declarator that declares the member itself: the innermost of
+/// nested `pointer_declarator`s (`char *const *pp` is a pointer to const
+/// pointers; its own `*` is the inner one).
+pub fn own_pointer_declarator(declarator: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut own = declarator;
+    while let Some(inner) = own
+        .child_by_field_name("declarator")
+        .filter(|inner| inner.kind() == "pointer_declarator")
+    {
+        own = inner;
+    }
+    own
+}
+
+/// Whether the member a field declarator declares is itself `const`, so it
+/// cannot be assigned: `const int id;`, `const int tbl[4];` (`leading_const`
+/// and no pointer), `char *const p;` (a `const` on the declarator's own,
+/// innermost, `*`) or `void (*const cb)(int);`. A `const` that qualifies only
+/// a pointee or a return type (`const char *s`, `char *const *pp`, `const
+/// char *(*fn)(void)`) is not the member's.
+fn member_is_const(declarator: tree_sitter::Node<'_>, leading_const: bool, source: &[u8]) -> bool {
+    match declarator.kind() {
+        "field_identifier" | "array_declarator" => leading_const,
+        "pointer_declarator" => has_const_qualifier(own_pointer_declarator(declarator), source),
+        "function_declarator" => declarator
+            .child_by_field_name("declarator")
+            .and_then(first_pointer_declarator)
+            .is_some_and(|pointer| has_const_qualifier(own_pointer_declarator(pointer), source)),
+        _ => false,
+    }
+}
+
+/// `c_type` (a member type as the parser spells it) for a member that is
+/// itself `const`: `const int`, `const int[4]`, for a pointer member `char *
+/// const` or `unsigned char * const [2]` (spaced so the qualifier stays a
+/// token of its own), and for a function pointer `void (*const)(int)`. A
+/// bit-field's `bit_width` follows as ` : N`: such a member has no address,
+/// so a decoder must leave it alone.
+pub fn const_member_spelling(c_type: &str, bit_width: Option<&str>) -> String {
+    let spelled = if let Some(open) = c_type.find("(*)") {
+        format!("{}(*const){}", &c_type[..open], &c_type[open + 3..])
+    } else if !c_type.contains('*') {
+        format!("const {c_type}")
+    } else {
+        match c_type.find('[') {
+            Some(open) => format!("{} const {}", c_type[..open].trim_end(), &c_type[open..]),
+            None => format!("{} const", c_type.trim_end()),
+        }
+    };
+    match bit_width {
+        Some(width) => format!("{spelled} : {width}"),
+        None => spelled,
+    }
 }
 
 fn field_descriptor(
@@ -4568,6 +4650,49 @@ mod tests {
             .find(|f| f.name == "handlers")
             .expect("callback-array field must not be dropped");
         assert_eq!(handlers.c_type, "void (*)(int)[4]");
+    }
+
+    /// A member that is itself `const` keeps the qualifier in its type:
+    /// leading for a value or an array of values, after the `*` for a const
+    /// pointer or function pointer, and a const bit-field also keeps its
+    /// width. A `const` that only qualifies a pointee or a callback's
+    /// parameter is not the member's.
+    #[test]
+    fn struct_fields_keep_the_members_own_const() {
+        let defs = parse_c_type_defs(
+            "struct item { const int id; const char *name; char *const p; \
+             const char *const q; int a; const int tbl[4]; \
+             unsigned char *const bufs[2]; char *const *pp; volatile int v; \
+             void (*const hook)(int); void (*cb)(const int); \
+             void (*const table[2])(int); \
+             const unsigned flags : 3; unsigned bits : 2; };",
+        )
+        .expect("parses");
+        let item = defs.structs.iter().find(|s| s.name == "item").unwrap();
+        let types: Vec<(&str, &str)> = item
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.c_type.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("id", "const int"),
+                ("name", "char *"),
+                ("p", "char * const"),
+                ("q", "char * const"),
+                ("a", "int"),
+                ("tbl", "const int[4]"),
+                ("bufs", "unsigned char * const [2]"),
+                ("pp", "char * *"),
+                ("v", "int"),
+                ("hook", "void (*const)(int)"),
+                ("cb", "void (*)(const int)"),
+                ("table", "void (*const)(int)[2]"),
+                ("flags", "const unsigned : 3"),
+                ("bits", "unsigned"),
+            ]
+        );
     }
 
     #[test]

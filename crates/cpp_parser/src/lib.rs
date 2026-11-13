@@ -2305,7 +2305,10 @@ fn cpp_struct_fields(
         if !public {
             continue;
         }
-        if child.kind() != "field_declaration" || contains_kind(child, "function_declarator") {
+        if child.kind() != "field_declaration"
+            || contains_kind(child, "function_declarator")
+            || is_static_member(child, source)
+        {
             continue;
         }
         let Some(type_node) = child.child_by_field_name("type") else {
@@ -2318,14 +2321,50 @@ fn cpp_struct_fields(
         if base_type.is_empty() {
             continue;
         }
+        let leading_const = c_parser::has_const_qualifier(child, source);
+        let bit_width = c_parser::bit_field_width(child, source);
         let mut field_cursor = child.walk();
         for part in child.children(&mut field_cursor) {
-            if let Some(descriptor) = cpp_field_descriptor(part, source, &base_type) {
+            if let Some(mut descriptor) = cpp_field_descriptor(part, source, &base_type) {
+                if cpp_member_is_const(part, leading_const, source) {
+                    descriptor.c_type =
+                        c_parser::const_member_spelling(&descriptor.c_type, bit_width.as_deref());
+                }
                 fields.push(descriptor);
             }
         }
     }
     fields
+}
+
+/// A `static` data member: one object for the class, not a member of each.
+fn is_static_member(field_declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = field_declaration.walk();
+    let found = field_declaration.children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier"
+            && child.utf8_text(source).is_ok_and(|text| text == "static")
+    });
+    found
+}
+
+/// Whether the member a field declarator declares is itself `const` (the C
+/// parser's rule): `const int id;` and `const int tbl[4];` through
+/// `leading_const`, `char *const p;` through the `const` on its own `*`.
+fn cpp_member_is_const(
+    declarator: tree_sitter::Node<'_>,
+    leading_const: bool,
+    source: &[u8],
+) -> bool {
+    match declarator.kind() {
+        "field_identifier" | "identifier" | "array_declarator" => leading_const,
+        "pointer_declarator" => {
+            c_parser::has_const_qualifier(c_parser::own_pointer_declarator(declarator), source)
+        }
+        "init_declarator" => declarator
+            .child_by_field_name("declarator")
+            .is_some_and(|inner| cpp_member_is_const(inner, leading_const, source)),
+        _ => false,
+    }
 }
 
 /// C++ `using NAME = UNDERLYING;` alias. Modern C++ uses these instead of
@@ -5126,6 +5165,47 @@ struct MappedFile {
         assert_eq!(
             callback.underlying,
             "int (*)(void *opaque, const char *name)"
+        );
+    }
+
+    /// A member that is itself `const` keeps the qualifier in its type, as
+    /// the C parser spells it, so a decoder never assigns it; a `const` on a
+    /// pointee is not the member's. A `static` data member is not part of
+    /// each object, so it is not a field.
+    #[test]
+    fn parse_cpp_type_defs_keeps_the_members_own_const_and_skips_statics() {
+        let defs = parse_cpp_type_defs(
+            "struct Item {\n\
+             \x20   const int id;\n\
+             \x20   const char *name;\n\
+             \x20   char *const tag;\n\
+             \x20   const int level = 7;\n\
+             \x20   const std::uint16_t tbl[2];\n\
+             \x20   const unsigned flags : 3;\n\
+             \x20   unsigned bits : 2;\n\
+             \x20   static int count;\n\
+             \x20   static const int limit = 4;\n\
+             \x20   static constexpr int depth = 2;\n\
+             \x20   int a;\n\
+             };\n",
+        )
+        .expect("C++ type definitions parse");
+        let item = defs.structs.iter().find(|def| def.name == "Item").unwrap();
+        assert_eq!(
+            item.fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.c_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id", "const int"),
+                ("name", "char *"),
+                ("tag", "char * const"),
+                ("level", "const int"),
+                ("tbl", "const std::uint16_t[2]"),
+                ("flags", "const unsigned : 3"),
+                ("bits", "unsigned"),
+                ("a", "int"),
+            ]
         );
     }
 
