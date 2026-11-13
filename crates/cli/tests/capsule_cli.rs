@@ -471,6 +471,27 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     assert!(script.contains("'/fsanitize=address'"), "{script}");
     let (pass, verify) = verify_from_scratch(&cap, "cpp");
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+    // The clang-built capsule also rebuilds with g++, which declares the
+    // SanitizerCoverage hooks as builtins with its own parameter types.
+    if gxx_links_static_asan() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dest = scratch.path().join("cap");
+        copy_tree(&cap, &dest);
+        let verified = bhf()
+            .arg("verify-poc")
+            .arg(&dest)
+            .env("CXX", "g++")
+            .output()
+            .expect("run bhf verify-poc");
+        let verify_out = String::from_utf8_lossy(&verified.stdout);
+        assert!(
+            verified.status.success() && verify_out.contains("PASS"),
+            "verify-poc with CXX=g++ must rebuild the clang-built capsule; stdout:\n{verify_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+    } else {
+        eprintln!("skipping the g++ verify-poc step: g++ cannot link -static-libasan");
+    }
 
     // The manifest records the harness's input format and the finding's, and
     // a finding recorded against another format is flagged.
@@ -1307,6 +1328,105 @@ fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
         assert!(
             verified.status.success() && verify_out.contains("PASS"),
             "verify-poc with CC={cc:?} must rebuild with gcc's flags; stdout:\n{verify_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+    }
+}
+
+/// Whether `g++` is installed and links a program with its static
+/// AddressSanitizer runtime (`-static-libasan`), which the GCC lane uses.
+fn gxx_links_static_asan() -> bool {
+    if which::which("g++").is_err() {
+        return false;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("probe.cpp");
+    std::fs::write(&source, "int main() { return 0; }\n").unwrap();
+    Command::new("g++")
+        .args(["-fsanitize=address", "-static-libasan", "-o"])
+        .arg(dir.path().join("probe"))
+        .arg(&source)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// A C++ harness built with g++ packages into a capsule that rebuilds with
+/// g++: the standalone driver's SanitizerCoverage hooks match the types g++
+/// gives its builtin declarations of them, which it makes whenever ASan or
+/// SanitizerCoverage is on.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "gcc has no sanitizer runtime on Windows, where C++ harnesses build with clang or \
+              cl; see docs/site/windows.md"
+)]
+fn a_gpp_built_cpp_harness_capsule_rebuilds_with_gpp() {
+    if !gxx_links_static_asan() {
+        eprintln!("skipping: g++ missing or cannot link -static-libasan");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(tree.join("include")).unwrap();
+    std::fs::write(tree.join("include/widget.h"), WIDGET_H).unwrap();
+    std::fs::write(tree.join("widget.cpp"), WIDGET_CPP).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "cpp", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "6", "--no-discovery-cache"])
+        .env("CC", "gcc")
+        .env("CXX", "g++")
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .output()
+        .expect("run bhf auto");
+    let Some((id, _)) = crash_finding(&work, |h| h.starts_with("H-X")) else {
+        panic!(
+            "bhf auto (CXX=g++) found no C++ crash: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--finding-id", &id])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["build_recipe"]["compiler_family"], "gcc",
+        "{manifest}"
+    );
+    for cxx in [None, Some("g++")] {
+        let scratch = tempfile::tempdir().unwrap();
+        let dest = scratch.path().join("cap");
+        copy_tree(&cap, &dest);
+        let mut verify = bhf();
+        verify.arg("verify-poc").arg(&dest).env_remove("CC");
+        match cxx {
+            Some(cxx) => verify.env("CXX", cxx),
+            None => verify.env_remove("CXX"),
+        };
+        let verified = verify.output().expect("run bhf verify-poc");
+        let verify_out = String::from_utf8_lossy(&verified.stdout);
+        assert!(
+            verified.status.success() && verify_out.contains("PASS"),
+            "verify-poc with CXX={cxx:?} must rebuild with g++; stdout:\n{verify_out}\nstderr:\n{}",
             String::from_utf8_lossy(&verified.stderr)
         );
     }

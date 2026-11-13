@@ -1303,6 +1303,14 @@
   libFuzzer target even when a bhf driver source sits in the work dir's
   harness dirs for the same id; that source made it run as a bhf framed
   harness, without the libFuzzer note.
+- A C++ capsule of a harness built with g++ now rebuilds with g++
+  (`bhf capsule`, and `bhf verify-poc` with `CXX=g++`, of a clang-built
+  capsule too). The standalone driver defined `__sanitizer_cov_trace_switch`
+  with a `uint64_t *` operand, and g++ declares that hook as a builtin taking
+  `void *` whenever ASan or SanitizerCoverage is on, so the capsule's compile
+  failed with "ambiguates built-in declaration". The C drivers take `void *`
+  too, so a `-Werror` toolchain flag cannot fail their standalone compile
+  under gcc.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
