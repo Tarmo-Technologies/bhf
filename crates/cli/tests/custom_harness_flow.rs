@@ -466,6 +466,29 @@ mod linux {
         );
     }
 
+    /// The fuzz loop appends `abort_on_error=0` for an emulated child (its
+    /// options come from `--sanitizers` and `--env` too); only the printed
+    /// command and the replay, minimize and capture children name each of
+    /// bhf's keys once.
+    #[test]
+    fn the_sanitizer_guide_says_which_emulated_children_name_each_key_once() {
+        let guide = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/sanitizers.md"),
+        )
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+        assert!(
+            !guide.contains("A fuzz, minimization, replay or comparison-capture child"),
+            "sanitizers.md still says the fuzz loop names each key once"
+        );
+        assert!(
+            guide.contains("A fuzz child under an emulator gets `abort_on_error=0` appended"),
+            "sanitizers.md says how the fuzz loop turns aborting off"
+        );
+    }
+
     #[test]
     fn documented_passthrough_driver_flow_builds_fuzzes_and_replays() {
         if !cpp_toolchain() {

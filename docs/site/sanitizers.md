@@ -87,11 +87,16 @@ Common RTOS / partial-build false-positive killers:
 - `suppressions=<file>` — silence a specific known-benign report.
 
 Under qemu-user, a guest abort makes the emulator dump its own address space,
-which takes minutes. A fuzz, minimization, replay or comparison-capture child
-that runs under an emulator (`--qemu-user`, or the emulator recorded beside a
-cross-built harness in `bhf_runner.json`) therefore gets `abort_on_error=0`
-after bhf's other keys, and runs with core dumps off: the sanitizer still
-exits non-zero after its report, and that exit is classified as the crash.
+which takes minutes. A child that runs under an emulator (`--qemu-user`, or
+the emulator recorded beside a cross-built harness in `bhf_runner.json`)
+therefore does not abort on a report and runs with core dumps off: the
+sanitizer still exits non-zero after its report, and that exit is classified
+as the crash. A minimization, replay or comparison-capture child gets
+`abort_on_error=0` in place of `abort_on_error=1`, so each of bhf's keys
+appears once in its options and in the direct harness command `bhf explain`
+prints. A fuzz child under an emulator gets `abort_on_error=0` appended after
+the options it runs with (which can also come from `--sanitizers` and
+`--env`); the last value wins.
 The generated `replay.py` does the same whenever it runs the harness under a
 runner (its embedded `RUNNER`, the `bhf_runner.json` beside the harness, or a
 non-empty `BHF_REPLAY_RUNNER`); a native run keeps `abort_on_error=1`.

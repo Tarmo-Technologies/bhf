@@ -5788,8 +5788,9 @@ pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
 /// [`sanitizer_child_env`] for a child that runs under an emulator
 /// (`emulated`, a qemu-user runner) or natively. Under qemu-user a guest
 /// abort makes qemu re-raise SIGABRT and dump its own huge address space,
-/// which takes minutes, so an emulated child gets `abort_on_error=0`: the
-/// sanitizer exits non-zero after its report, which classifies it.
+/// which takes minutes, so an emulated child gets `abort_on_error=0` in place
+/// of `abort_on_error=1`: the sanitizer exits non-zero after its report,
+/// which classifies it.
 pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
     sanitizer_child_env_with(
         std::env::var("ASAN_OPTIONS").ok().as_deref(),
@@ -5810,20 +5811,19 @@ fn sanitizer_child_env_with(
     emulated: bool,
 ) -> Vec<(String, String)> {
     use corpus::sanitizer_options::{asan_required, merge, ubsan_required};
-    let mut env = vec![
+    // An emulated child's `abort_on_error=0` takes the place of
+    // `abort_on_error=1`, so each of bhf's keys appears once in the direct
+    // harness command bhf prints.
+    vec![
         (
             "ASAN_OPTIONS".to_owned(),
-            merge(asan, &asan_required(leak, false)),
+            merge(asan, &asan_required(leak, emulated)),
         ),
         (
             "UBSAN_OPTIONS".to_owned(),
-            merge(ubsan, &ubsan_required(false)),
+            merge(ubsan, &ubsan_required(emulated)),
         ),
-    ];
-    if emulated {
-        no_abort_on_error(&mut env);
-    }
-    env
+    ]
 }
 
 /// Turn `abort_on_error` off in the `ASAN_OPTIONS` and `UBSAN_OPTIONS` of
@@ -9079,6 +9079,29 @@ mod fuzz_child_env_tests {
             leak[0].1,
             "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=1"
         );
+    }
+
+    /// An emulated child's options name each of bhf's keys once:
+    /// `abort_on_error=0` in place of `abort_on_error=1`, not after it.
+    #[test]
+    fn an_emulated_child_names_each_bhf_key_once() {
+        let env = super::sanitizer_child_env_with(None, None, false, true);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            value("ASAN_OPTIONS"),
+            "abort_on_error=0:halt_on_error=1:symbolize=1"
+        );
+        let ubsan = value("UBSAN_OPTIONS");
+        let aborts: Vec<&str> = ubsan
+            .split(':')
+            .filter(|item| item.starts_with("abort_on_error="))
+            .collect();
+        assert_eq!(aborts, ["abort_on_error=0"], "{ubsan}");
     }
 }
 

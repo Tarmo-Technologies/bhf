@@ -281,6 +281,9 @@
 - The direct harness command a refusal or `bhf explain` prints for a
   cross-built harness runs it under the emulator recorded beside it
   (`bhf_runner.json`), with the sanitizer options of an emulated replay.
+- The direct harness command bhf prints for a cross-built harness names each
+  of bhf's sanitizer keys once: `abort_on_error=0` takes the place of
+  `abort_on_error=1` instead of following it.
 - The explicit buffer-length dimension (`BHF_BUFFER_LEN_DIMENSION=1`) is
   recorded only for a harness it gave a buffer a length: the source stamp,
   `arg-layout.json` and `generation-metadata.json` `buffer_len_dimension`,
