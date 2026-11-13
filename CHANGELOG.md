@@ -1154,6 +1154,11 @@
   Every `bhf auto` run now writes that record before anything else (a new work
   dir is recorded as `fresh`), which is how a later run or `bhf report` tells
   this release's work dirs from earlier ones.
+- Concurrent writers sharing one work dir (`bhf auto --jobs N`, or two runs)
+  could give two findings with different signatures the same `F-NNNN`
+  ordinal. Each ordinal is now reserved before its finding dir is made, in
+  `results/.findings-ordinals/` beside the findings dir, so ordinals are
+  unique too.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

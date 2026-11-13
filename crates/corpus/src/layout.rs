@@ -98,6 +98,14 @@ pub fn results_work_dir_for_finding(finding_dir: &Path) -> Option<PathBuf> {
 /// The single-core fuzz emitter allocates through this type too
 /// (`FindingEmitter::allocate_finding`), so its `F-NNNN-<sig>` names are
 /// exclusive against a concurrent writer sharing the work dir.
+///
+/// For a suffixed name the ordinal itself is exclusive too: before making
+/// `F-NNNN-<sig>`, the allocator reserves `F-NNNN` with `create_dir` in a
+/// sibling of the findings dir (`results/.findings-ordinals/` beside
+/// `results/findings/`), so two writers with different signatures never
+/// share an ordinal. Keeping the reservations outside the findings dir
+/// leaves that dir holding only findings. A writer that stops between the
+/// reservation and its finding dir leaves a gap; that ordinal is skipped.
 pub struct FamilyAllocator {
     dir: PathBuf,
     prefix: String,
@@ -160,20 +168,58 @@ impl FamilyAllocator {
             ));
         }
         std::fs::create_dir_all(&self.dir)?;
+        let reservations = match suffix {
+            Some(_) => {
+                let reservations = self.ordinal_reservations_dir();
+                std::fs::create_dir_all(&reservations)?;
+                Some(reservations)
+            }
+            None => None,
+        };
         loop {
-            let id = match suffix {
-                Some(suffix) => format!("{}{:04}-{suffix}", self.prefix, self.next),
-                None => format!("{}{:04}", self.prefix, self.next),
-            };
+            let ordinal = format!("{}{:04}", self.prefix, self.next);
             self.next = self.next.checked_add(1).ok_or_else(|| {
                 std::io::Error::other(format!("{} ordinals exhausted", self.prefix))
             })?;
+            // A suffixed name is exclusive only per full name, so the bare
+            // ordinal is reserved first; whoever makes the marker owns it.
+            let marker = reservations.as_ref().map(|dir| dir.join(&ordinal));
+            if let Some(marker) = &marker {
+                match std::fs::create_dir(marker) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let id = match suffix {
+                Some(suffix) => format!("{ordinal}-{suffix}"),
+                None => ordinal,
+            };
             let path = self.dir.join(&id);
             match std::fs::create_dir(&path) {
                 Ok(()) => return Ok((id, path)),
+                // A writer that predates the reservations took this name; the
+                // marker stays, as that ordinal is taken.
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // Nothing took the ordinal, so release it for a later try.
+                    if let Some(marker) = &marker {
+                        let _ = std::fs::remove_dir(marker);
+                    }
+                    return Err(error);
+                }
             }
+        }
+    }
+
+    /// Where suffixed ordinals are reserved: `<parent>/.<findings>-ordinals`,
+    /// a sibling of the findings dir so the findings dir holds only findings.
+    fn ordinal_reservations_dir(&self) -> PathBuf {
+        match (self.dir.parent(), self.dir.file_name()) {
+            (Some(parent), Some(name)) => {
+                parent.join(format!(".{}-ordinals", name.to_string_lossy()))
+            }
+            _ => self.dir.join(".ordinals"),
         }
     }
 }
@@ -366,6 +412,7 @@ mod tests {
     #[test]
     fn suffixed_ids_follow_the_emitter_format_and_ignore_other_families() {
         let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("findings");
         for name in [
             "F-0003-abcd1234",
             "F-DIFF-0009",
@@ -373,9 +420,9 @@ mod tests {
             "F-SCA-7",
             "H-0099",
         ] {
-            std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+            std::fs::create_dir_all(findings.join(name)).unwrap();
         }
-        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        let mut allocator = FamilyAllocator::new(&findings, "F-").unwrap();
         let (id, dir) = allocator.create_with_suffix("1a2b3c4d").unwrap();
         assert_eq!(id, "F-0004-1a2b3c4d");
         assert!(dir.is_dir());
@@ -388,8 +435,9 @@ mod tests {
     #[test]
     fn suffixed_ids_skip_a_name_another_writer_took() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
-        std::fs::create_dir(tmp.path().join("F-0000-cafe")).unwrap();
+        let findings = tmp.path().join("findings");
+        let mut allocator = FamilyAllocator::new(&findings, "F-").unwrap();
+        std::fs::create_dir_all(findings.join("F-0000-cafe")).unwrap();
         assert_eq!(
             allocator.create_with_suffix("cafe").unwrap().0,
             "F-0001-cafe"
@@ -418,10 +466,11 @@ mod tests {
     #[test]
     fn reserved_dir_names_only_real_dirs_of_the_family() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        let findings = tmp.path().join("findings");
+        let mut allocator = FamilyAllocator::new(&findings, "F-").unwrap();
         let (id, dir) = allocator.create_with_suffix("cafe").unwrap();
         assert_eq!(allocator.reserved_dir(&id), Some(dir));
-        std::fs::create_dir(tmp.path().join("F-DIFF-0000")).unwrap();
+        std::fs::create_dir(findings.join("F-DIFF-0000")).unwrap();
         for other in [
             "F-DIFF-0000",
             "F-0009-none",
@@ -432,7 +481,7 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(tmp.path(), tmp.path().join("F-0001-link")).unwrap();
+            std::os::unix::fs::symlink(tmp.path(), findings.join("F-0001-link")).unwrap();
             assert_eq!(allocator.reserved_dir("F-0001-link"), None, "a symlink");
         }
     }
@@ -468,6 +517,90 @@ mod tests {
         assert_eq!(ids.len(), 400);
         assert_eq!(unique.len(), 400, "an id was handed out twice");
         assert_eq!(std::fs::read_dir(&findings).unwrap().count(), 400);
+    }
+
+    #[test]
+    fn concurrent_suffixed_allocators_never_share_an_ordinal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("results/findings");
+        let threads: Vec<_> = (0..8u32)
+            .map(|t| {
+                let findings = findings.clone();
+                std::thread::spawn(move || {
+                    let mut allocator = FamilyAllocator::new(&findings, "F-").unwrap();
+                    let suffix = format!("{t:08x}");
+                    (0..25)
+                        .map(|_| allocator.create_with_suffix(&suffix).unwrap().0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: Vec<String> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        let ordinals: std::collections::BTreeSet<u64> = ids
+            .iter()
+            .map(|id| family_ordinal(id, "F-").unwrap())
+            .collect();
+        assert_eq!(ids.len(), 200);
+        assert_eq!(ordinals.len(), 200, "an ordinal was handed out twice");
+        assert_eq!(
+            std::fs::read_dir(&findings).unwrap().count(),
+            200,
+            "only finding dirs live in the findings dir"
+        );
+    }
+
+    #[test]
+    fn suffixed_ids_reserve_their_ordinal_beside_the_findings_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("results/findings");
+        let mut allocator = FamilyAllocator::new(&findings, "F-").unwrap();
+        let (id, dir) = allocator.create_with_suffix("cafe").unwrap();
+        assert_eq!(id, "F-0000-cafe");
+        assert!(tmp
+            .path()
+            .join("results/.findings-ordinals/F-0000")
+            .is_dir());
+        let names: Vec<String> = std::fs::read_dir(&findings)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["F-0000-cafe"]);
+        // A writer whose scan misses the taken ordinal (its dir is gone, the
+        // reservation stays) still never hands it out again.
+        std::fs::remove_dir(&dir).unwrap();
+        let mut again = FamilyAllocator::new(&findings, "F-").unwrap();
+        assert_eq!(again.create_with_suffix("beef").unwrap().0, "F-0001-beef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_suffixed_create_releases_its_ordinal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("results/findings");
+        std::fs::create_dir_all(&findings).unwrap();
+        let set_mode = |mode| {
+            std::fs::set_permissions(&findings, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set_mode(0o555);
+        if std::fs::create_dir(findings.join("probe")).is_ok() {
+            set_mode(0o755);
+            eprintln!("SKIP: permission bits not enforced (root)");
+            return;
+        }
+        let failed = FamilyAllocator::new(&findings, "F-")
+            .unwrap()
+            .create_with_suffix("cafe");
+        set_mode(0o755);
+        assert_eq!(
+            failed.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let mut again = FamilyAllocator::new(&findings, "F-").unwrap();
+        assert_eq!(again.create_with_suffix("cafe").unwrap().0, "F-0000-cafe");
     }
 
     #[test]
