@@ -73,7 +73,8 @@
           "region": { "kind": "heap", "size": 12, "offset": 12, "relation": "after", "distance": 0, "variable": null, "frame_offset": null },
           "alloc_stack": [{ "function": "parse", "file": "src/parse.c", "line": 80 }],
           "free_stack": [],
-          "parameter": { "name": "data", "offset": 12, "basis": "region_start" }
+          "parameter": { "name": "data", "offset": 12, "basis": "region_start" },
+          "allocated_by_harness": false
         },
         "input_to_state": [
           {

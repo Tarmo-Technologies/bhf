@@ -171,6 +171,10 @@
               }
             }
           ]
+        },
+        "allocated_by_harness": {
+          "description": "Whether bhf's generated harness allocated the buffer the access hit (its frames are left out of alloc_stack, which keeps project frames only): false for a project allocation or the fuzz driver's copy of the input, null when no allocation stack was recorded. Added after the first v1 release, so documents written before it omit the key.",
+          "type": ["boolean", "null"]
         }
       }
     },

@@ -375,6 +375,7 @@ fn memory_access(access: &Value, root: Option<&Path>) -> Option<MemoryAccess> {
         alloc_stack: frames("alloc_stack"),
         free_stack: frames("free_stack"),
         parameter: access.get("parameter").and_then(access_parameter),
+        allocated_by_harness: actionability::allocated_by_harness(access),
     })
 }
 
@@ -1946,6 +1947,56 @@ mod tests {
         let finding = normalize(asan_record(), None);
         assert_ne!(finding.verdict.as_deref(), Some("lab_only"));
         assert_eq!(finding.verdict_reason, None);
+    }
+
+    /// An allocation bhf's harness made is flagged without keeping its frames
+    /// (they name the work dir), so `alloc_stack` stays project frames only.
+    #[test]
+    fn a_harness_made_allocation_is_flagged_without_its_frames() {
+        let access_with = |alloc_stack: Option<serde_json::Value>| {
+            let mut raw = asan_record();
+            raw["exception"]["access"] = json!({
+                "direction": "read", "size": 4,
+                "region": {"kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0},
+            });
+            if let Some(stack) = alloc_stack {
+                raw["exception"]["access"]["alloc_stack"] = stack;
+            }
+            normalize(raw, Some("/src/demo"))
+        };
+        let malloc = json!({"function": "malloc",
+            "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68});
+        let harness = access_with(Some(json!([
+            malloc,
+            {"function": "bhf_c_string", "file": "/w/harnesses/H-X/bhf_decode.h", "line": 198},
+            {"function": "bhf_run_one", "file": "/w/harnesses/H-X/main.cpp", "line": 119}
+        ])));
+        let access = harness.fuzz.as_ref().unwrap().access.as_ref().unwrap();
+        assert!(access.alloc_stack.is_empty(), "{:?}", access.alloc_stack);
+        assert_eq!(access.allocated_by_harness, Some(true));
+        let text = serde_json::to_string(&harness).unwrap();
+        assert!(!text.contains("/w/harnesses"), "{text}");
+
+        let project = access_with(Some(json!([
+            malloc,
+            {"function": "parse", "file": "/src/demo/src/parse.c", "line": 80}
+        ])));
+        let access = project.fuzz.as_ref().unwrap().access.as_ref().unwrap();
+        assert_eq!(access.allocated_by_harness, Some(false));
+        assert_eq!(access.alloc_stack.len(), 1, "{:?}", access.alloc_stack);
+        assert_eq!(access.alloc_stack[0].function.as_deref(), Some("parse"));
+
+        // The driver's copy of the fuzz input is the target's real input.
+        let driver = access_with(Some(json!([
+            malloc,
+            {"function": "main", "file": "/w/harnesses/H-X/bhf_driver.c", "line": 1140}
+        ])));
+        let access = driver.fuzz.as_ref().unwrap().access.as_ref().unwrap();
+        assert_eq!(access.allocated_by_harness, Some(false));
+
+        let unknown = access_with(None);
+        let access = unknown.fuzz.as_ref().unwrap().access.as_ref().unwrap();
+        assert_eq!(access.allocated_by_harness, None);
     }
 
     /// The schema lists exactly the reason codes the verdict classifier gives.

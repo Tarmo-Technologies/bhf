@@ -52,7 +52,8 @@ omitted), and unknown keys are rejected. Keys added to v1 after its first
 release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
 `fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
 `fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
-`verdict_reason`, the `runtrace` evidence role)
+`verdict_reason`, `fuzz.access.allocated_by_harness`, the `runtrace`
+evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
 older schema rejects them. `reproduce.build.fidelity` is optional the same
@@ -109,7 +110,7 @@ records that failed to load — a bad record never aborts the rebuild).
 
 | Field | Type | Notes |
 |---|---|---|
-| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[], parameter}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). `parameter` is the harness parameter whose buffer the access hit, `{name, offset, basis}`, from `finding.json` `exception.access.parameter` when the argument trace named one, else `null`: `basis` `region_start` (the parameter's pointer is the region start; `offset` is the access's offset in it), `region_interior` (the pointer points into the region; `offset` is from the pointer) or `nearest_pointer` (no region was reported; `offset` is the faulting address minus the closest traced pointer below it). The raw address is left out (it differs run to run); the stacks keep the project's frames only, filtered as `stack` is (no allocator, libc, sanitizer, bhf harness or driver frames, no `_start`, paths relative to the source root and none outside it), at most 8 |
+| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[], parameter, allocated_by_harness}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). `parameter` is the harness parameter whose buffer the access hit, `{name, offset, basis}`, from `finding.json` `exception.access.parameter` when the argument trace named one, else `null`: `basis` `region_start` (the parameter's pointer is the region start; `offset` is the access's offset in it), `region_interior` (the pointer points into the region; `offset` is from the pointer) or `nearest_pointer` (no region was reported; `offset` is the faulting address minus the closest traced pointer below it). The raw address is left out (it differs run to run); the stacks keep the project's frames only, filtered as `stack` is (no allocator, libc, sanitizer, bhf harness or driver frames, no `_start`, paths relative to the source root and none outside it), at most 8. `allocated_by_harness` is `true` when bhf's generated harness allocated the buffer (a decoded C string, a copy of the input it sized), whose frames `alloc_stack` leaves out, so the overflow may depend on a precondition the harness could not see (see `verdict_reason`); `false` for a project allocation or the fuzz driver's copy of the input; `null` when no allocation stack was recorded |
 | `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized. Under AddressSanitizer the `memcmp`/`bcmp` interceptor reports itself as the site; the driver also records the frames above it, and the site is the first of them that is not the sanitizer runtime (the target's call), or the interceptor's own address, with no `site_location`, when none resolves (`finding.json` `gates[].site_unattributable`) |
 | `input_to_state_input` | string \| null | the finding file whose bytes the `input_to_state` offsets index: `min_testcase.bin` or `testcase.bin` (`finding.json` `gate_capture.input`); `null` when no capture named it |
 | `input_to_state_status` | string \| null | what the capture found (`finding.json` `gate_capture.status`): `recorded`, `no_input_comparisons` (comparisons ran but no input bytes fed one), `no_comparisons` or `unavailable` (the capture could not run); `null` when no capture ran |
@@ -188,7 +189,7 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status,verdict_reason
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status,verdict_reason,alloc_by_harness
 ```
 
 `cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
@@ -202,8 +203,10 @@ names the file those offsets index, `arguments` summarises `fuzz.arguments`,
 `reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
 built with fabricated inputs (empty otherwise), `input_to_state_status` is
 `fuzz.input_to_state_status` (why `input_to_state` is empty is in
-`findings.json` and `INDEX.md`), and `verdict_reason` is the finding's
-`verdict_reason` (empty when there is none). `arguments` is
+`findings.json` and `INDEX.md`), `verdict_reason` is the finding's
+`verdict_reason` (empty when there is none), and `alloc_by_harness` is
+`fuzz.access.allocated_by_harness` (`true`, `false`, or empty when not
+known). `arguments` is
 `name=value` per argument, `;`-separated: a buffer or string reads
 `len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
 (`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed

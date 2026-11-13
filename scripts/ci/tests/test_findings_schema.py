@@ -100,6 +100,18 @@ class SchemaFilesTest(unittest.TestCase):
             finding.pop("verdict_reason", None)
         self.assertEqual(_errors(findings, older), [])
 
+    def test_allocated_by_harness_is_an_optional_flag(self):
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["access"]["allocated_by_harness"] = True
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["fuzz"]["access"]["allocated_by_harness"] = "yes"
+        self.assertNotEqual(_errors(findings, bad), [])
+        older = json.loads(json.dumps(doc))
+        older["findings"][0]["fuzz"]["access"].pop("allocated_by_harness")
+        self.assertEqual(_errors(findings, older), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

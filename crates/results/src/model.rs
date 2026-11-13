@@ -502,6 +502,14 @@ pub struct MemoryAccess {
     /// written before it readable.
     #[serde(default)]
     pub parameter: Option<AccessParameter>,
+    /// Whether bhf's generated harness allocated the buffer the access hit
+    /// (its frames are left out of `alloc_stack`, which keeps project frames
+    /// only): `false` for a project allocation or the fuzz driver's copy of
+    /// the input, `None` when no allocation stack was recorded. Added after
+    /// the first v1 release: `#[serde(default)]` keeps documents written
+    /// before it readable.
+    #[serde(default)]
+    pub allocated_by_harness: Option<bool>,
 }
 
 /// The harness parameter a memory access hit.

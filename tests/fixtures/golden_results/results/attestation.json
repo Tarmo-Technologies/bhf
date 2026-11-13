@@ -22,13 +22,13 @@
     },
     {
       "digest": {
-        "sha256": "8c59fd058268be672041a52fbe0bf77e0fb6e59758cf18be3bb988b79dba2949"
+        "sha256": "086f2ca6b612277d5381e20ea71ba111f743d89be1ed32ecd187a69585393060"
       },
       "name": "findings.csv"
     },
     {
       "digest": {
-        "sha256": "146003579ee70516be9a799589ab225a6aa329a882c86d93a178b7cf3f4556a8"
+        "sha256": "4bf6a29a3f8f60f41ed2560b2543afa48959810c52a5d26beacfd704cf7fb732"
       },
       "name": "findings.json"
     },

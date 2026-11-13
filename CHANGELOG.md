@@ -54,6 +54,11 @@
   entry of kind `include_dir`, low confidence, a caveat in every report),
   and a copy of the header in the scanned tree wins over it. A dir named
   with `--extra-include` is not counted.
+- `findings.json` `fuzz.access.allocated_by_harness` (a key added to v1,
+  optional in the schema) and a last `findings.csv` column
+  `alloc_by_harness` say whether bhf's generated harness allocated the buffer
+  an access hit. `alloc_stack` keeps project frames only, so a harness-made
+  allocation used to leave it empty with nothing saying why.
 - SARIF result tags are the finding's own CWEs: a READ heap overflow is
   tagged `CWE-122` and `CWE-125`, no longer the rule's catalog `CWE-787` and
   its `cwe-top-25` rank. The rule's CWE and rank tags are added only when the

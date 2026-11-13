@@ -183,7 +183,8 @@
             "name": "data",
             "offset": 4,
             "basis": "region_start"
-          }
+          },
+          "allocated_by_harness": false
         },
         "input_to_state": [
           {

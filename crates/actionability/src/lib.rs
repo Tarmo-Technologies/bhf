@@ -2073,6 +2073,36 @@ const LENGTHLESS_STRING_DECODERS: &[&str] = &[
     "bhf_wc_string",
 ];
 
+/// Whether bhf's generated harness allocated the buffer a memory access hit
+/// (`access` is `finding.json` `exception.access`): the first allocation
+/// frame that is neither sanitizer runtime nor allocator is harness code (a
+/// `bhf_*` decode helper, the generated `bhf_run_one`). `Some(false)` for a
+/// project allocation and for the fuzz driver's own copy of the input, which
+/// is the target's real input, not state the harness made; `None` when the
+/// access records no allocation stack or no frame past the allocator.
+pub fn allocated_by_harness(access: &Value) -> Option<bool> {
+    let frame = access
+        .get("alloc_stack")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|frame| {
+            let function = string_at(frame, &["function"]).unwrap_or_default();
+            let file = string_at(frame, &["file"]);
+            !function.is_empty()
+                && !is_runtime_noise_frame(&function, file.as_deref())
+                && !is_allocator_frame(&function)
+        })?;
+    let function = string_at(frame, &["function"]).unwrap_or_default();
+    let file = string_at(frame, &["file"]);
+    if file
+        .as_deref()
+        .is_some_and(|file| file.replace('\\', "/").ends_with("bhf_driver.c"))
+    {
+        return Some(false);
+    }
+    Some(is_harness_frame(&function, file.as_deref()))
+}
+
 /// Whether [`harness_sized_buffer`] finds one.
 pub fn is_harness_sized_buffer_overflow(raw: &Value) -> bool {
     harness_sized_buffer(raw).is_some()
