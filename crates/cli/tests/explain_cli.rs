@@ -134,6 +134,22 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
         text.contains("bhf verify-poc"),
         "missing reproduce commands:\n{text}"
     );
+    // The crash depends only on the input: its replay was served no faked
+    // bytes (an environment variable is no faked resource), so env-capsule,
+    // which needs a served world, is not suggested.
+    let reproduce = text.split("REPRODUCE OFFLINE").nth(1).unwrap_or_default();
+    assert!(!reproduce.contains("bhf env-capsule"), "{text}");
+    assert!(
+        !reproduce.contains("replays without the faked environment"),
+        "{text}"
+    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            record["gate_capture"]["served_resources"],
+            serde_json::json!([]),
+            "{record:#}"
+        );
+    }
 
     // Determinism: a second run yields identical text.
     let explain2 = bhf()
@@ -415,5 +431,113 @@ fn the_printed_direct_run_starts_the_harness_from_powershell_and_cmd() {
         output.contains("AddressSanitizer"),
         "cmd /c {} {input} did not run the harness:\n{output}",
         binary.display()
+    );
+}
+
+/// Write `raw` as the `finding.json` of finding `id` in `work`.
+fn write_finding(work: &Path, id: &str, raw: serde_json::Value) {
+    let dir = work.join("results/findings").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+    std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+}
+
+/// `bhf explain --finding-id` for a finding it cannot explain exits 1 with
+/// the reason, as `bhf capsule` does; without an id an oracle-only work dir
+/// is explained.
+#[test]
+fn explain_refuses_a_finding_id_it_cannot_explain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    write_finding(
+        &work,
+        "F-0001-0a0b0c0d",
+        serde_json::json!({
+            "id": "F-0001-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0001",
+            "classification": "unhandled",
+            "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+                "message": "AddressSanitizer: heap-buffer-overflow", "stack": []}
+        }),
+    );
+    write_finding(
+        &work,
+        "F-0002-0a0b0c0d",
+        serde_json::json!({
+            "id": "F-0002-0a0b0c0d", "rule_id": "BHF-401", "classification": "static_scan"
+        }),
+    );
+    let explain = |id: Option<&str>, work: &Path| {
+        let mut command = bhf();
+        command.arg("explain").arg("--work-dir").arg(work);
+        if let Some(id) = id {
+            command.arg("--finding-id").arg(id);
+        }
+        command.output().expect("run bhf explain")
+    };
+    let findings_dir = work.join("results").join("findings");
+    for (id, reason) in [
+        (
+            "F-9999-deadbeef",
+            format!(
+                "no finding with id F-9999-deadbeef in {}",
+                findings_dir.display()
+            ),
+        ),
+        (
+            "F-0002-0a0b0c0d",
+            "its classification is `static_scan`, not a runtime crash or oracle finding; bhf \
+             report lists it"
+                .to_owned(),
+        ),
+    ] {
+        let output = explain(Some(id), &work);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{id}: {stderr}");
+        assert!(
+            stderr.contains(&format!("bhf explain: cannot explain {id}: {reason}")),
+            "{id}: {stderr}"
+        );
+    }
+    // A directory by that name without a readable finding.json.
+    std::fs::create_dir_all(findings_dir.join("F-0003-0a0b0c0d")).unwrap();
+    std::fs::write(findings_dir.join("F-0003-0a0b0c0d/finding.json"), "{").unwrap();
+    let output = explain(Some("F-0003-0a0b0c0d"), &work);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot explain F-0003-0a0b0c0d:")
+            && stderr.contains("is missing or is not valid JSON"),
+        "{stderr}"
+    );
+    let output = explain(Some("F-0001-0a0b0c0d"), &work);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("F-0001-0a0b0c0d"));
+
+    // An oracle finding alone is explained without an id.
+    let oracle_work = tmp.path().join("oracle-work");
+    write_finding(
+        &oracle_work,
+        "F-0004-0a0b0c0d",
+        serde_json::json!({
+            "id": "F-0004-0a0b0c0d", "rule_id": "BHF-408", "harness_id": "H-C0001",
+            "classification": "oracle_hit", "confirmation": "runtime",
+            "oracle": {"name": "format-string-runtime", "category": "injection", "api": "printf",
+                "message": "a fuzz-controlled printf format contains a conversion",
+                "evidence": [{"key": "format", "value": "%n"}]},
+            "exception": {"name": "ORACLE_FORMAT_STRING_RUNTIME",
+                "message": "a fuzz-controlled printf format contains a conversion"}
+        }),
+    );
+    let output = explain(None, &oracle_work);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("Oracle: format-string-runtime on printf"),
+        "{stdout}"
     );
 }

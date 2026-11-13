@@ -54,6 +54,29 @@
   entry of kind `include_dir`, low confidence, a caveat in every report),
   and a copy of the header in the scanned tree wins over it. A dir named
   with `--extra-include` is not counted.
+- `bhf explain` suggests `bhf env-capsule` only for a crash whose capture
+  replay crashed while the runtrace shim served it faked bytes, the rule
+  env-capsule accepts a finding on (now kept as
+  `gate_capture.served_resources`, recorded only for a replay that crashed),
+  and its FAKED ENVIRONMENT section names those resources. A finding of a
+  faking pass whose input touched no faked resource, or one with injected
+  environment variables only, no longer gets an env-capsule command that
+  refuses it. A faking-pass crash whose harness no capture replay could run
+  with the shim (an Ada harness reads its input on stdin) still gets the
+  env-capsule command, with a comment that it may reproduce the crash.
+- The "replays without the faked environment" note in REPRODUCE OFFLINE is a
+  trailing shell comment, so the `bhf capsule`, replay.py and alternative
+  command lines it follows paste as valid shell.
+- `bhf explain` explains oracle findings (`classification: oracle_hit`),
+  naming the oracle, the API and its evidence instead of a sanitizer verdict
+  or a crash, and the comparison-evidence capture now covers them too. Text
+  from a finding's run (oracle evidence, the FAKED ENVIRONMENT lines and the
+  resources served, decoded harness arguments, the target's report and stack
+  frames, comparison sites, a matching seed's path) is shown with control
+  characters escaped, so the input cannot drive the terminal. A
+  `--finding-id` explain cannot explain (no such finding, an unreadable
+  `finding.json`, or another classification) exits 1 with the reason instead
+  of 0.
 - The `no_comparisons` reason of a comparison-evidence capture no longer
   says the target was built without comparison instrumentation, which bhf
   does not check. It says the target made no comparison the driver recorded

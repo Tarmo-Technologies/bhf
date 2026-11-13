@@ -36,6 +36,52 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MAX_CANDIDATES: usize = 64;
+
+/// Most resource names [`served_resources`] returns.
+const MAX_SERVED_RESOURCES: usize = 16;
+
+/// The faked resources a recorded world (`BHF_ENVCAP_RECORD`, one
+/// `<resource_hex>:<bytes_hex>` line per serve) served bytes to, by name, each
+/// once in the order first served, at most 16. A missing or empty record
+/// gives none. A crash env-capsule can capture is one whose replay served
+/// some: this is that predicate, shared with the capture replay that
+/// `bhf explain` reads.
+pub(crate) fn served_resources(world: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(world) else {
+        return Vec::new();
+    };
+    let decode = |hex: &str| -> Option<Vec<u8>> {
+        hex.len()
+            .is_multiple_of(2)
+            .then(|| {
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+                    .collect()
+            })
+            .flatten()
+    };
+    let mut names: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((resource, bytes)) = line.trim().split_once(':') else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let Some(name) = decode(resource).filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&name).into_owned();
+        if !names.contains(&name) {
+            names.push(name);
+            if names.len() == MAX_SERVED_RESOURCES {
+                break;
+            }
+        }
+    }
+    names
+}
 /// Wall clock for one replay under the shim.
 const REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -236,10 +282,7 @@ fn build_env_capsule(
     for cand in candidates.iter().take(MAX_CANDIDATES) {
         let _ = std::fs::remove_file(&world_tmp);
         if replay_crashes(f, bin, cand, ld_preload, Some(&world_tmp), None)
-            && world_tmp.is_file()
-            && std::fs::metadata(&world_tmp)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+            && !served_resources(&world_tmp).is_empty()
         {
             recorded = Some(cand.clone());
             break;

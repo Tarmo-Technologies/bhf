@@ -74,6 +74,68 @@ fn env_capsule_replays_environment_driven_crash() {
         return;
     }
 
+    // The crash's capture replay recorded the faked resource the shim served
+    // it, so explain offers env-capsule first; the env-capsule run below shows
+    // that the suggestion applies.
+    let finding = crash_finding(&work).expect("the crash finding");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    if cfg!(target_os = "linux") {
+        let served = raw["gate_capture"]["served_resources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no served resources recorded: {raw:#}"));
+        assert!(
+            served
+                .iter()
+                .any(|resource| resource == "/etc/bhf_envcap_demo.conf"),
+            "{raw:#}"
+        );
+    }
+    let id = raw["id"].as_str().expect("finding id").to_owned();
+    let explain = || {
+        let explained = Command::new(env!("CARGO_BIN_EXE_bhf"))
+            .arg("explain")
+            .arg("--work-dir")
+            .arg(&work)
+            .arg("--finding-id")
+            .arg(&id)
+            .output()
+            .expect("run explain");
+        String::from_utf8_lossy(&explained.stdout).into_owned()
+    };
+    let first_reproduce_line = |text: &str| {
+        text.split("REPRODUCE OFFLINE")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no REPRODUCE OFFLINE section:\n{text}"))
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let text = explain();
+    assert!(
+        first_reproduce_line(&text).starts_with("bhf env-capsule"),
+        "{text}"
+    );
+    if cfg!(target_os = "linux") {
+        // The suggestion rests on what the capture recorded the shim serving
+        // this crash, which the environment section names; a capture that
+        // recorded nothing served gets no env-capsule suggestion.
+        assert!(
+            text.contains("served faked bytes for /etc/bhf_envcap_demo.conf"),
+            "{text}"
+        );
+        let finding_json = finding.join("finding.json");
+        let recorded = std::fs::read(&finding_json).unwrap();
+        let mut unserved = raw.clone();
+        unserved["gate_capture"]["served_resources"] = serde_json::json!([]);
+        std::fs::write(&finding_json, unserved.to_string()).unwrap();
+        let text = explain();
+        assert!(!text.contains("bhf env-capsule"), "{text}");
+        std::fs::write(&finding_json, recorded).unwrap();
+    }
+
     let cap = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("env-capsule")
         .current_dir(root.path())
@@ -121,6 +183,21 @@ fn has_crash_finding(work: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// The dir of the crash finding [`has_crash_finding`] looks for.
+fn crash_finding(work: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(work.join("results").join("findings"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("F-0000"))
+                && p.join("testcase.bin").is_file()
+        })
+        .min()
 }
 
 fn first_capsule(work: &Path) -> Option<std::path::PathBuf> {
@@ -374,6 +451,31 @@ fn env_capsule_replays_an_ada_environment_driven_crash() {
         crashed,
         "bhf auto must find the environment-driven Ada crash: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    // The Ada harness takes its input on stdin, so no comparison-evidence
+    // replay ran it with the shim and nothing recorded what it was served:
+    // explain still points at env-capsule, hedged, which captures it below.
+    let finding = crash_finding(&work).expect("the crash finding");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    assert!(raw["gate_capture"]["served_resources"].is_null(), "{raw:#}");
+    let explained = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("explain")
+        .arg("--work-dir")
+        .arg(&work)
+        .arg("--finding-id")
+        .arg(raw["id"].as_str().expect("finding id"))
+        .output()
+        .expect("run explain");
+    let text = String::from_utf8_lossy(&explained.stdout);
+    let reproduce = text.split("REPRODUCE OFFLINE").nth(1).unwrap_or_default();
+    assert!(
+        reproduce
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("bhf env-capsule --work-dir")
+                && line.ends_with("   # may reproduce this; the capture replay could not check")),
+        "{text}"
     );
     let cap = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("env-capsule")

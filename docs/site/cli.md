@@ -836,7 +836,14 @@ and explain it — all offline and deterministic (no LLM):
   Each block names its harness. Findings of one root
   cause (the same `cluster_key_full`, such as one site reached through several
   harnesses) are explained once, by the first, which lists the others and
-  their harnesses; `--all-members` explains each one.
+  their harnesses; `--all-members` explains each one. explain covers runtime
+  crashes (`classification: unhandled`) and oracle findings (`oracle_hit`);
+  an oracle finding's WHAT HAPPENED names the oracle, the API it watched and
+  its evidence (`Oracle:` and `Evidence:` lines) instead of a sanitizer
+  verdict. A `--finding-id` it cannot explain (no such finding, an unreadable
+  `finding.json`, or a finding of another classification, such as a static
+  scan row) exits 1 with the reason; without `--finding-id`, a work dir with
+  nothing to explain exits 0.
 - `bhf decode-args [TESTCASE] [--finding <id>] [--harness <bin-or-dir>]` —
   the value each C/C++ harness parameter receives from a testcase: from the
   harness's own argument trace (`BHF_TRACE_ARGS=1`) when its binary runs, else
@@ -884,12 +891,19 @@ resolved in the finding's work dir (not the current directory), or a built
 `main` in the harness dirs. `bhf explain` applies the same first check:
 it offers `bhf capsule`/`bhf verify-poc` only for findings whose lane and
 harness layout capsule takes, and `bhf cartography` for AddressSanitizer
-crashes it can map. For a crash that depended on the environment the
-runtrace shim faked (the shim was armed and the finding's pass served a fake
-world or injected variables; a variable read from the real environment does
-not count)
-it offers `bhf env-capsule` first, or says why it does not apply, and flags
-every other command as replaying without the faked environment. What capsule checks while it packages (dependencies in the
+crashes it can map. For a crash whose capture replay crashed while the
+runtrace shim served it faked bytes (a fake file's content, a socket peer's
+data, a stubbed dependency's return value; `finding.json`
+`gate_capture.served_resources`, recorded only for a replay that crashed, the
+same rule env-capsule accepts a finding on) it offers
+`bhf env-capsule` first, or says why it does not apply, and flags every
+other command, in a trailing `#` comment, as replaying without the faked
+environment. A finding of a faking pass (`rng`, `fuzz_driven`) whose
+capture did not record what was served gets that comment, and, when no
+capture replay ran its harness with the shim (a harness whose driver records
+no comparisons, such as an Ada one), a `bhf env-capsule` line whose comment
+says it may reproduce the crash and the capture replay could not check. Injected
+environment variables alone do not count: replay.py sets them too. What capsule checks while it packages (dependencies in the
 local cargo, module or NuGet cache, the size of the tree it ships, paths it
 cannot relocate) can still refuse a finding explain offered; capsule then says
 why.

@@ -420,6 +420,12 @@ pub(crate) struct CaptureSummary {
     /// The input bytes that search covered, of `input_len`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) searched_bytes: Option<usize>,
+    /// The faked resources the shim served bytes to while the baseline
+    /// replay ran, recorded only when that replay crashed (the rule `bhf
+    /// env-capsule` accepts a world on); `None` when the shim was not loaded
+    /// for it, the replay did not crash, or the capture predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) served_resources: Option<Vec<String>>,
 }
 
 impl CaptureSummary {
@@ -465,6 +471,7 @@ impl Capture {
                 runner: None,
                 derived_search: None,
                 searched_bytes: None,
+                served_resources: None,
             },
         }
     }
@@ -637,6 +644,7 @@ fn capture_in(
         runner: runner.emulator_label(),
         derived_search: None,
         searched_bytes: None,
+        served_resources: runner.served_resources.take(),
     };
     let mut gates = Vec::new();
     if input.is_empty() {
@@ -1425,6 +1433,10 @@ struct Runner<'a> {
     replay: &'a Replay<'a>,
     runs: usize,
     shim_armed: bool,
+    /// The faked resources the shim served bytes to on the shim-armed
+    /// baseline run ([`crate::env_capsule::served_resources`]), once it ran
+    /// and crashed.
+    served_resources: Option<Vec<String>>,
     /// Sites in the harness's own code, dropped from every run's records.
     excluded: BTreeSet<u32>,
     /// The emulator the harness runs under, recorded beside it.
@@ -1440,6 +1452,7 @@ impl<'a> Runner<'a> {
             replay,
             runs: 0,
             shim_armed: false,
+            served_resources: None,
             excluded: BTreeSet::new(),
             emulator: recorded_runner(replay.harness),
             symbols: symbolizer.map(|symbolizer| Symbols::new(replay.harness, symbolizer)),
@@ -1497,23 +1510,39 @@ impl<'a> Runner<'a> {
         }
         command.env_remove("LD_PRELOAD");
         command.env_remove("BHF_RUNTRACE_LOG");
+        // An inherited environment capsule would record or replace what the
+        // shim serves this run.
+        command.env_remove("BHF_ENVCAP_RECORD");
+        command.env_remove("BHF_ENVCAP_REPLAY");
         // The runtrace shim is a host library: it cannot load into a
         // harness that runs under an emulator.
         let mut armed_log = None;
+        let served_world = scratch.join("served-world.jsonl");
         if baseline && self.emulator.is_none() {
             if let Some(log) = &self.replay.runtrace_log {
                 // A log from an earlier capture would not describe this run.
                 let _ = std::fs::remove_file(log);
                 if let Some(shim) = crate::auto::shim_path::locate() {
+                    let _ = std::fs::remove_file(&served_world);
                     command
                         .env(
                             "LD_PRELOAD",
                             crate::auto::shim_path::ld_preload_value(&shim),
                         )
-                        .env("BHF_RUNTRACE_LOG", log);
+                        .env("BHF_RUNTRACE_LOG", log)
+                        // What the shim serves the faked resources, the
+                        // record `bhf env-capsule` captures a world from.
+                        .env("BHF_ENVCAP_RECORD", &served_world);
                     armed_log = Some(log.clone());
                 }
             }
+        }
+        // The armed run's report says whether it crashed, which a world it
+        // was served needs before `bhf env-capsule` would capture it. It is
+        // read through a pipe and only its head kept: the harness may write to
+        // stderr until it is killed.
+        if armed_log.is_some() {
+            command.stderr(std::process::Stdio::piped());
         }
         let mut child = command.spawn().map_err(|error| match &self.emulator {
             Some(runner) => format!(
@@ -1523,6 +1552,10 @@ impl<'a> Runner<'a> {
             ),
             None => format!("cannot run {}: {error}", self.replay.harness.display()),
         })?;
+        let report_reader = child
+            .stderr
+            .take()
+            .map(|pipe| replay_min::process::drain(pipe, MAX_REPORT_BYTES));
         let started = Instant::now();
         let limit = RUN_TIMEOUT.min(
             self.replay
@@ -1530,23 +1563,37 @@ impl<'a> Runner<'a> {
                 .saturating_duration_since(started)
                 .max(Duration::from_secs(1)),
         );
-        loop {
+        // The exit status of a run that ended on its own, not on the limit.
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break Some(status),
                 Ok(None) if started.elapsed() >= limit => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break;
+                    break None;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                 Err(error) => return Err(format!("wait for the harness: {error}")),
             }
-        }
+        };
         let _ = std::fs::remove_file(&input_path);
+        // A descendant of the harness may still hold the pipe open.
+        let report = report_reader
+            .and_then(|reader| {
+                replay_min::process::join_bounded(reader, replay_min::process::DRAIN_GRACE)
+            })
+            .unwrap_or_default();
         // The shim writes a marker when it first opens its log: no marker, no
         // shim, whatever LD_PRELOAD said.
-        if armed_log.is_some_and(|log| crate::auto::runtrace::log_shows_shim_loaded(&log)) {
-            self.shim_armed = true;
+        if let Some(log) = &armed_log {
+            if crate::auto::runtrace::log_shows_shim_loaded(log) {
+                self.shim_armed = true;
+                if status.is_some_and(|status| replay_crashed(&report, &status)) {
+                    self.served_resources =
+                        Some(crate::env_capsule::served_resources(&served_world));
+                }
+            }
+            let _ = std::fs::remove_file(&served_world);
         }
         let bytes = std::fs::read(&evidence).map_err(|_| {
             "the harness wrote no comparison evidence (its driver does not record \
@@ -1561,6 +1608,18 @@ impl<'a> Runner<'a> {
         log.records.retain(|r| !self.excluded.contains(&r.site));
         Ok(log)
     }
+}
+
+/// How much of an armed replay's stderr is kept for [`replay_crashed`]: a
+/// sanitizer's verdict is in its first lines. The rest is read and dropped.
+const MAX_REPORT_BYTES: usize = 256 * 1024;
+
+/// Whether a replay that ended with `status`, the head of its stderr in
+/// `report`, crashed the way `bhf env-capsule` requires of a world it
+/// captures: a sanitizer or language-runtime report, not a fatal signal alone.
+fn replay_crashed(report: &[u8], status: &std::process::ExitStatus) -> bool {
+    crate::repro_lane::report_signature(&String::from_utf8_lossy(report), status)
+        .is_some_and(|signature| signature != "signal:crash")
 }
 
 /// The environment of a capture replay: the fuzz child's sanitizer options
@@ -1947,10 +2006,13 @@ pub(crate) fn run_pass(work_dir: &Path) -> (usize, usize) {
         else {
             continue;
         };
-        if !matches!(
-            raw.get("classification").and_then(Value::as_str),
-            Some("unhandled" | "oracle")
-        ) {
+        if !raw
+            .get("classification")
+            .and_then(Value::as_str)
+            .is_some_and(|class| {
+                class == "unhandled" || crate::repro_lane::is_oracle_classification(class)
+            })
+        {
             continue;
         }
         let Some((name, bytes)) = preferred_input(&dir) else {
@@ -2039,6 +2101,80 @@ pub(crate) fn recorded(raw: &Value) -> Option<Capture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The finding schema describes every key a capture summary records.
+    #[test]
+    fn the_finding_schema_lists_every_gate_capture_key() {
+        let schema: Value = serde_json::from_slice(
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../schemas/bhf.finding.v1.schema.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let listed = schema
+            .pointer("/properties/gate_capture/properties")
+            .and_then(Value::as_object)
+            .expect("gate_capture properties");
+        let summary = CaptureSummary {
+            input: "testcase.bin".to_owned(),
+            input_len: 4,
+            status: "recorded".to_owned(),
+            reason: Some("why".to_owned()),
+            comparisons: 1,
+            truncated: false,
+            unconfirmed: 0,
+            runs: 1,
+            shim_armed: true,
+            runner: Some("qemu-aarch64".to_owned()),
+            derived_search: Some("done".to_owned()),
+            searched_bytes: Some(4),
+            served_resources: Some(vec!["/etc/widget.conf".to_owned()]),
+        };
+        let recorded = serde_json::to_value(&summary).unwrap();
+        for key in recorded.as_object().unwrap().keys() {
+            assert!(
+                listed.contains_key(key),
+                "the schema does not list gate_capture.{key}"
+            );
+        }
+    }
+
+    /// The resources a recorded world served bytes to, by name, in the order
+    /// first served, each once.
+    #[test]
+    fn served_resources_lists_each_resource_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let world = dir.path().join("served-world.jsonl");
+        assert_eq!(
+            crate::env_capsule::served_resources(&world),
+            Vec::<String>::new()
+        );
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        std::fs::write(
+            &world,
+            format!(
+                "{}:{}\n{}:{}\n{}:{}\n",
+                hex(b"/etc/widget.conf"),
+                hex(b"key=1"),
+                hex(b"/etc/widget.conf"),
+                hex(b"key=2"),
+                hex(b"mq:/sensor"),
+                hex(b"\x01\x02"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::env_capsule::served_resources(&world),
+            ["/etc/widget.conf", "mq:/sensor"]
+        );
+        std::fs::write(&world, b"").unwrap();
+        assert_eq!(
+            crate::env_capsule::served_resources(&world),
+            Vec::<String>::new()
+        );
+    }
 
     fn record_with(kind: u8, flags: u8, site: u32, callers: &[u32], a: &[u8], b: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; RECORD];
@@ -2204,6 +2340,7 @@ mod tests {
                 runner: None,
                 derived_search: state.map(str::to_owned),
                 searched_bytes: searched,
+                served_resources: None,
             };
         assert_eq!(
             summary(64, None, None).incomplete_derived_search(),
@@ -2319,6 +2456,7 @@ mod tests {
                 runner: Some("qemu-aarch64".to_owned()),
                 derived_search: Some("done".to_owned()),
                 searched_bytes: Some(6),
+                served_resources: None,
             },
         };
         let (gates, summary) = record_fields(&capture);
@@ -2593,6 +2731,186 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             .find(|path| path.is_file())
     }
 
+    /// A target that reads a config file the runtrace shim fakes, and on an
+    /// input starting with `C` overflows a heap buffer by the bytes it read.
+    const SERVED_WORLD_TARGET: &str = r#"
+#include <fcntl.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <unistd.h>
+extern void bhf_target_enter(void);
+int bhf_run_one(const uint8_t *data, size_t size) {
+    char buf[16];
+    char *copy;
+    long n;
+    int fd;
+    bhf_target_enter();
+    fd = open("/etc/widget_capture.conf", O_RDONLY);
+    if (fd < 0) return 0;
+    n = read(fd, buf, sizeof buf);
+    close(fd);
+    if (n > 4 && size > 0 && data[0] == 'C') {
+        copy = malloc(4);
+        copy[n] = buf[0];
+        free(copy);
+    }
+    return 0;
+}
+"#;
+
+    /// The capture records the faked resources the shim served its armed
+    /// replay only when that replay crashed, the rule `bhf env-capsule`
+    /// accepts a world on: a replay that was served bytes and exited cleanly
+    /// records none. An environment capsule the run inherits or the finding
+    /// injected does not replace what the shim serves the replay.
+    #[test]
+    fn served_resources_are_recorded_only_for_a_replay_that_crashed() {
+        let Some(shim) = built_shim() else {
+            eprintln!("skipping: runtrace shim not built");
+            return;
+        };
+        if !clang() {
+            eprintln!("skipping: clang not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(main) = build_target(dir.path(), SERVED_WORLD_TARGET) else {
+            eprintln!("skipping: clang cannot build an AddressSanitizer harness here");
+            return;
+        };
+        let previous = std::env::var_os("BHF_RUNTRACE_SHIM");
+        std::env::set_var("BHF_RUNTRACE_SHIM", &shim);
+        // A world that serves the config nothing, were it replayed.
+        let empty_world = dir.path().join("empty-world.jsonl");
+        std::fs::write(
+            &empty_world,
+            format!("{}:\n", hex(b"/etc/widget_capture.conf")),
+        )
+        .unwrap();
+        let capture = |input: &[u8], label: &str, injected: Value| {
+            let raw = json!({
+                "runtime_mode": {"pass": "rng", "shim_armed": true, "env_injected": injected}
+            });
+            let replay = Replay {
+                harness: &main,
+                raw: &raw,
+                scratch: dir.path().join(format!("capture-{label}")),
+                runtrace_log: Some(dir.path().join(format!("runtrace-{label}.jsonl"))),
+                deadline: Instant::now() + Duration::from_secs(60),
+            };
+            capture_with(&replay, input, "testcase.bin", None, Limits::default()).summary
+        };
+        let served = Some(vec!["/etc/widget_capture.conf".to_owned()]);
+        let crashed = capture(b"CRASH", "crashed", json!({}));
+        let clean = capture(b"NOCRASH", "clean", json!({}));
+        let pinned = capture(
+            b"CRASH",
+            "pinned",
+            json!({
+                "BHF_ENVCAP_REPLAY": empty_world.display().to_string(),
+                "BHF_ENVCAP_RECORD": dir.path().join("elsewhere.jsonl").display().to_string(),
+            }),
+        );
+        match previous {
+            Some(value) => std::env::set_var("BHF_RUNTRACE_SHIM", value),
+            None => std::env::remove_var("BHF_RUNTRACE_SHIM"),
+        }
+        assert!(crashed.shim_armed, "{crashed:?}");
+        assert_eq!(crashed.served_resources, served, "{crashed:?}");
+        assert!(clean.shim_armed, "{clean:?}");
+        assert_eq!(clean.served_resources, None, "{clean:?}");
+        assert_eq!(pinned.served_resources, served, "{pinned:?}");
+        assert!(!dir.path().join("elsewhere.jsonl").exists());
+    }
+
+    /// [`SERVED_WORLD_TARGET`], whose crash is followed by 8 MiB of output on
+    /// stderr (an AddressSanitizer death callback), and which does not crash
+    /// when its stderr is a file on disk.
+    const LOUD_SERVED_WORLD_TARGET: &str = r#"
+#include <fcntl.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sanitizer/common_interface_defs.h>
+extern void bhf_target_enter(void);
+static void flood(void) {
+    static char line[4096];
+    int i;
+    memset(line, 'x', sizeof line - 1);
+    line[sizeof line - 1] = '\n';
+    for (i = 0; i < 2048; i++) (void)!write(2, line, sizeof line);
+}
+int bhf_run_one(const uint8_t *data, size_t size) {
+    char buf[16];
+    char *copy;
+    long n;
+    int fd;
+    struct stat st;
+    bhf_target_enter();
+    if (fstat(2, &st) == 0 && S_ISREG(st.st_mode)) return 0;
+    fd = open("/etc/widget_capture.conf", O_RDONLY);
+    if (fd < 0) return 0;
+    n = read(fd, buf, sizeof buf);
+    close(fd);
+    if (n > 4 && size > 0 && data[0] == 'C') {
+        __sanitizer_set_death_callback(flood);
+        copy = malloc(4);
+        copy[n] = buf[0];
+        free(copy);
+    }
+    return 0;
+}
+"#;
+
+    /// The armed replay's report is read through a pipe, never written to a
+    /// file, and only its head is kept: a harness that keeps writing to
+    /// stderr after its crash report neither fills the disk nor blocks on a
+    /// full pipe, and the report at the head still counts as the crash
+    /// `bhf env-capsule` requires.
+    #[test]
+    fn the_armed_replay_keeps_only_the_head_of_its_report() {
+        let Some(shim) = built_shim() else {
+            eprintln!("skipping: runtrace shim not built");
+            return;
+        };
+        if !clang() {
+            eprintln!("skipping: clang not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(main) = build_target(dir.path(), LOUD_SERVED_WORLD_TARGET) else {
+            eprintln!("skipping: clang cannot build an AddressSanitizer harness here");
+            return;
+        };
+        std::env::set_var("BHF_RUNTRACE_SHIM", &shim);
+        let raw = json!({"runtime_mode": {"pass": "rng", "shim_armed": true}});
+        let replay = Replay {
+            harness: &main,
+            raw: &raw,
+            scratch: dir.path().join("capture"),
+            runtrace_log: Some(dir.path().join("runtrace.jsonl")),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let started = Instant::now();
+        let summary =
+            capture_with(&replay, b"CRASH", "testcase.bin", None, Limits::default()).summary;
+        assert!(summary.shim_armed, "{summary:?}");
+        assert_eq!(
+            summary.served_resources,
+            Some(vec!["/etc/widget_capture.conf".to_owned()]),
+            "{summary:?}"
+        );
+        assert!(
+            started.elapsed() < RUN_TIMEOUT,
+            "the armed replay ran to its time limit: {:?}",
+            started.elapsed()
+        );
+    }
+
     fn capture_for(harness: &Path, scratch: &Path, input: &[u8]) -> Capture {
         capture_limited(harness, scratch, input, Limits::default())
     }
@@ -2645,6 +2963,45 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             return None;
         };
         Some((dir, main))
+    }
+
+    /// The capture pass records comparison evidence for oracle findings
+    /// (`classification: oracle_hit`) as for runtime crashes, and skips
+    /// other findings.
+    #[test]
+    fn the_capture_pass_records_oracle_findings_too() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let work = dir.path().join("work");
+        let harness_dir = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::copy(&main, harness_dir.join("main")).unwrap();
+        let findings = corpus::layout::findings_dir(&work);
+        for (id, classification) in [
+            ("F-0001-0a0b0c0d", "oracle_hit"),
+            ("F-0002-0a0b0c0d", "static_scan"),
+        ] {
+            let finding = findings.join(id);
+            std::fs::create_dir_all(&finding).unwrap();
+            std::fs::write(finding.join("testcase.bin"), b"\x05\x00WIDGET").unwrap();
+            std::fs::write(
+                finding.join("finding.json"),
+                json!({"id": id, "harness_id": "H-C0001", "classification": classification})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(run_pass(&work), (1, 0));
+        let read = |id: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(findings.join(id).join("finding.json")).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            read("F-0001-0a0b0c0d")["gate_capture"]["status"],
+            "recorded"
+        );
+        assert!(read("F-0002-0a0b0c0d").get("gate_capture").is_none());
     }
 
     #[test]

@@ -76,6 +76,11 @@
           "description": "The input bytes that derived_search covered, of input_len.",
           "type": "integer",
           "minimum": 0
+        },
+        "served_resources": {
+          "description": "The faked resources the runtrace shim served bytes to while the input replayed and crashed ([] when none). Added after the first v1 release; absent when the shim was not loaded for the replay, the replay did not crash, or the capture predates it.",
+          "type": "array",
+          "items": { "type": "string" }
         }
       }
     },

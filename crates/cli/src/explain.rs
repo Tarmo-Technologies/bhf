@@ -70,6 +70,15 @@ pub fn run(args: ExplainArgs) -> i32 {
         }
     };
     if blocks.is_empty() {
+        // A finding asked for by id that cannot be explained is refused, as
+        // `bhf capsule` refuses one; with nothing asked for, nothing is wrong.
+        if let Some(id) = args.finding_id.as_deref() {
+            bhfeprintln!(
+                "bhf explain: cannot explain {id}: {}",
+                why_not_explained(&args.work_dir, id)
+            );
+            return 1;
+        }
         bhfeprintln!(
             "bhf explain: no runtime crash findings in {} to explain",
             args.work_dir.display()
@@ -165,7 +174,7 @@ fn collect(work_dir: &Path) -> anyhow::Result<Vec<Finding>> {
         // Runtime crashes / oracle hits — the things that "crashed". Static rows are
         // explained by their own report text, not this crash narrative.
         let class = raw.get("classification").and_then(Value::as_str);
-        if !matches!(class, Some("unhandled") | Some("oracle")) {
+        if !class.is_some_and(is_explained_classification) {
             continue;
         }
         let id = raw
@@ -177,6 +186,154 @@ fn collect(work_dir: &Path) -> anyhow::Result<Vec<Finding>> {
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
+}
+
+/// Whether `bhf explain` explains a finding of this classification: a runtime
+/// crash (`unhandled`) or an oracle finding.
+fn is_explained_classification(classification: &str) -> bool {
+    classification == "unhandled" || crate::repro_lane::is_oracle_classification(classification)
+}
+
+/// Why `bhf explain` rendered nothing for the requested finding `id`: no
+/// finding has that id, its `finding.json` cannot be read, or its
+/// classification is not one it explains.
+fn why_not_explained(work_dir: &Path, id: &str) -> String {
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    let found = std::fs::read_dir(&findings_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| read_json(&entry.path().join("finding.json")))
+        .find(|raw| raw.get("id").and_then(Value::as_str) == Some(id));
+    if let Some(raw) = found {
+        let classification = raw
+            .get("classification")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        return format!(
+            "its classification is `{classification}`, not a runtime crash or oracle finding; \
+             bhf report lists it"
+        );
+    }
+    let dir = findings_dir.join(id);
+    if corpus::layout::is_valid_finding_id(id) && dir.is_dir() {
+        return format!(
+            "{} is missing or is not valid JSON",
+            dir.join("finding.json").display()
+        );
+    }
+    format!("no finding with id {id} in {}", findings_dir.display())
+}
+
+/// Evidence lines an oracle finding's block shows at most.
+const MAX_ORACLE_EVIDENCE: usize = 6;
+
+/// Characters of an evidence value an `Evidence:` line shows at most.
+const MAX_EVIDENCE_CHARS: usize = 200;
+
+/// `text` safe to print to a terminal: control characters (an escape
+/// sequence, a bell, a carriage return or line break) and the bidirectional
+/// overrides that reorder what is shown are written as escapes (`\x1b`,
+/// `\r`, `\u{202e}`), every other character as it is. Text from a finding's
+/// run is shown through it: fuzz input bytes reach explain's output through
+/// oracle evidence, runtrace events, the resources the shim served, decoded
+/// arguments and the target's own report (an exception message quotes its
+/// input), and the run's stack and comparison sites are printed by the target.
+fn terminal_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x80 && c.is_control() => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c if c.is_control() || is_bidi_control(c) => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The marks and overrides that change the direction text is shown in.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// `Oracle:` and `Evidence:` lines of an oracle finding: the oracle, the API
+/// it watched, its message and its evidence (`oracle.evidence`), each made
+/// [`terminal_safe`].
+fn oracle_lines(raw: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(oracle) = raw.get("oracle") else {
+        return lines;
+    };
+    let field = |key: &str| oracle.get(key).and_then(Value::as_str).unwrap_or("").trim();
+    let name = match field("name") {
+        "" => "an oracle",
+        name => name,
+    };
+    let mut head = format!("  Oracle: {}", terminal_safe(name));
+    if !field("api").is_empty() {
+        let _ = write!(head, " on {}", terminal_safe(field("api")));
+    }
+    if let Some(message) = field("message").lines().next().filter(|m| !m.is_empty()) {
+        let _ = write!(head, ": {}", terminal_safe(message.trim()));
+    }
+    lines.push(head);
+    for item in oracle
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_ORACLE_EVIDENCE)
+    {
+        let key = item.get("key").and_then(Value::as_str).unwrap_or("?");
+        let value = match item.get("value") {
+            Some(Value::String(value)) => value.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        };
+        let mut value = terminal_safe(&value);
+        if let Some((cut, _)) = value.char_indices().nth(MAX_EVIDENCE_CHARS) {
+            value.truncate(cut);
+            value.push('…');
+        }
+        lines.push(format!("  Evidence: {} = {value}", terminal_safe(key)));
+    }
+    lines
+}
+
+/// What an oracle finding's WHAT HAPPENED says in place of the stored
+/// explanation, which is written for a crash: the oracle that flagged the
+/// program's call, and the input it was flagged on.
+fn oracle_happening(raw: &Value, input: Option<&str>) -> String {
+    let field = |key: &str| {
+        raw.pointer(&format!("/oracle/{key}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(terminal_safe)
+    };
+    let oracle = match field("name") {
+        Some(name) => format!("the runtime oracle `{name}`"),
+        None => "a runtime oracle".to_owned(),
+    };
+    let call = match field("api") {
+        Some(api) => format!("how the program called `{api}`"),
+        None => "what the program did".to_owned(),
+    };
+    let testcase = input.unwrap_or("testcase.bin");
+    format!(
+        "While processing a crafted input, {oracle} flagged {call}; it is not a crash. \
+         Triggered by the attached test input (`{testcase}`)."
+    )
 }
 
 /// Other members of a root-cause group listed by name in one block.
@@ -248,13 +405,23 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         .raw
         .pointer("/actionability/sink/line")
         .and_then(Value::as_u64);
+    let oracle =
+        str_at(&f.raw, "/classification").is_some_and(crate::repro_lane::is_oracle_classification);
     let _ = writeln!(s, "\nWHAT HAPPENED");
-    if let Some(expl) = str_at(&f.raw, "/actionability/explanation") {
-        let expl = match &input {
+    // The stored explanation describes a crash, which an oracle finding is not.
+    let explanation = if oracle {
+        Some(oracle_happening(
+            &f.raw,
+            input.as_ref().map(|(name, _)| *name),
+        ))
+    } else {
+        str_at(&f.raw, "/actionability/explanation").map(|expl| match &input {
             Some((name, _)) => retarget_trigger(expl, name),
             None => expl.to_owned(),
-        };
-        for line in wrap(&expl, 76) {
+        })
+    };
+    if let Some(expl) = explanation {
+        for line in wrap(&terminal_safe(&expl), 76) {
             let _ = writeln!(s, "  {line}");
         }
     }
@@ -273,7 +440,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         } else {
             where_
         };
-        let _ = writeln!(s, "  Sink: {sink}");
+        let _ = writeln!(s, "  Sink: {}", terminal_safe(&sink));
     }
     if let Some(frames) = f
         .raw
@@ -282,18 +449,29 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
     {
         let names: Vec<&str> = frames.iter().filter_map(Value::as_str).collect();
         if !names.is_empty() {
-            let _ = writeln!(s, "  Call frames: {}", dedup_chain(&names).join(" → "));
+            let _ = writeln!(
+                s,
+                "  Call frames: {}",
+                terminal_safe(&dedup_chain(&names).join(" → "))
+            );
         }
     }
-    if !exc.is_empty() {
-        let _ = writeln!(s, "  Sanitizer verdict: {exc}");
-    }
-    // The sanitizer's own report line: the exact check and site it names.
-    if let Some(message) = str_at(&f.raw, "/exception/message")
-        .and_then(|m| m.lines().next())
-        .filter(|m| !m.trim().is_empty())
-    {
-        let _ = writeln!(s, "  Sanitizer report: {}", message.trim());
+    if oracle {
+        // An oracle finding has no sanitizer verdict: it names its oracle.
+        for line in oracle_lines(&f.raw) {
+            let _ = writeln!(s, "{line}");
+        }
+    } else {
+        if !exc.is_empty() {
+            let _ = writeln!(s, "  Sanitizer verdict: {}", terminal_safe(exc));
+        }
+        // The sanitizer's own report line: the exact check and site it names.
+        if let Some(message) = str_at(&f.raw, "/exception/message")
+            .and_then(|m| m.lines().next())
+            .filter(|m| !m.trim().is_empty())
+        {
+            let _ = writeln!(s, "  Sanitizer report: {}", terminal_safe(message.trim()));
+        }
     }
     if let Some(access) = f.raw.pointer("/exception/access") {
         for line in access_lines(access, recorded_on.as_deref()) {
@@ -409,7 +587,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
             let _ = writeln!(s, "\nHOW TO FIX");
             for h in hints {
                 if let Some(g) = h.get("guidance").and_then(Value::as_str) {
-                    for line in wrap(g, 76) {
+                    for line in wrap(&terminal_safe(g), 76) {
                         let _ = writeln!(s, "  {line}");
                     }
                 }
@@ -419,7 +597,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
 
     // REPRODUCE
     let _ = writeln!(s, "\nREPRODUCE OFFLINE");
-    for line in reproduce_lines(work_dir, f) {
+    for line in reproduce_lines(work_dir, f, &evidence) {
         let _ = writeln!(s, "  {line}");
     }
     s
@@ -431,11 +609,14 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
 /// checks, such as dependencies in the local cache, it says when it refuses),
 /// otherwise why not and a command that does reproduce it; plus the finding's
 /// `replay.py` when it finds a harness to run and, for an AddressSanitizer
-/// crash cartography can map, `bhf cartography`. A crash that depended on the
-/// environment the runtrace shim faked is offered `bhf env-capsule` first
-/// (or told why it does not apply), and every other command is flagged as
-/// replaying without that environment.
-fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
+/// crash cartography can map, `bhf cartography`. A crash whose input made the
+/// runtrace shim serve faked bytes ([`EnvDependence::Served`]) is offered
+/// `bhf env-capsule` first (or told why it does not apply), and every other
+/// command says in a shell comment that it replays without that environment;
+/// a crash of a faking pass with no record of what was served gets the
+/// comment, and a hedged `bhf env-capsule` line when no capture replay ran
+/// its harness with the shim.
+fn reproduce_lines(work_dir: &Path, f: &Finding, evidence: &Evidence) -> Vec<String> {
     use crate::repro_lane::{self, FindingRecord, Tool};
     let record = FindingRecord {
         id: f.id.clone(),
@@ -449,18 +630,16 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     let capsule = work_dir.join("capsules").join(format!("capsule_{}", f.id));
     let replay = f.dir.join("replay.py");
     let mut lines = Vec::new();
-    let environment_driven = environment_driven(f);
-    const CAVEAT: &str = "(replays without the faked environment; may not reproduce)";
-    let caveat = if environment_driven {
-        format!("   {CAVEAT}")
-    } else {
-        String::new()
-    };
-    if environment_driven {
-        match repro_lane::assess(work_dir, &record, Tool::EnvCapsule) {
+    let dependence = environment_dependence(f, evidence);
+    // The commands below replay without the faked world: said in a shell
+    // comment, so each line stays a command that can be pasted.
+    let caveat = (dependence != EnvDependence::NotServed)
+        .then_some("replays without the faked environment; may not reproduce");
+    match dependence {
+        EnvDependence::Served(_) => match repro_lane::assess(work_dir, &record, Tool::EnvCapsule) {
             Ok(_) => lines.push(format!(
                 "bhf env-capsule --work-dir {work} --finding-id {id}   # replays the faked \
-                 environment the crash depended on"
+                 environment the crash used"
             )),
             Err(refusal) => {
                 let reason = format!(
@@ -470,12 +649,32 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                 );
                 push_wrapped(&mut lines, &reason);
             }
+        },
+        // No capture replay ran the harness with the shim (its driver records
+        // no comparisons, as an Ada harness's does not), so nothing says
+        // whether the crash needed the faked world: env-capsule, which checks
+        // that itself, is offered hedged. A replay that ran with the shim and
+        // did not crash leaves env-capsule, which needs that crash, out.
+        EnvDependence::Unknown
+            if !evidence
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.summary.shim_armed)
+                && repro_lane::assess(work_dir, &record, Tool::EnvCapsule).is_ok() =>
+        {
+            lines.push(format!(
+                "bhf env-capsule --work-dir {work} --finding-id {id}   # may reproduce this; \
+                 the capture replay could not check"
+            ));
         }
+        EnvDependence::Unknown | EnvDependence::NotServed => {}
     }
     match repro_lane::assess(work_dir, &record, Tool::Capsule) {
         Ok(_) => {
-            lines.push(format!(
-                "bhf capsule --work-dir {work} --finding-id {id}{caveat}"
+            lines.push(with_comment(
+                format!("bhf capsule --work-dir {work} --finding-id {id}"),
+                None,
+                caveat,
             ));
             lines.push(format!(
                 "bhf verify-poc {}",
@@ -493,9 +692,13 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             if replay.is_file() && repro_lane::replay_py_finds_harness(work_dir, &record) {
                 // Windows' Python installer provides `python`, not `python3`.
                 let python = if cfg!(windows) { "python" } else { "python3" };
-                lines.push(format!(
-                    "{python} {}{caveat}",
-                    repro_lane::host_word(&replay.to_string_lossy())
+                lines.push(with_comment(
+                    format!(
+                        "{python} {}",
+                        repro_lane::host_word(&replay.to_string_lossy())
+                    ),
+                    None,
+                    caveat,
                 ));
             }
         }
@@ -508,7 +711,7 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             match repro_lane::alternative(work_dir, &record, &refusal) {
                 Some(command) => {
                     lines.push("Reproduce it with:".to_owned());
-                    lines.push(format!("  {command}{caveat}"));
+                    lines.push(format!("  {}", with_comment(command, None, caveat)));
                 }
                 None => lines.push("No offline reproducer is available.".to_owned()),
             }
@@ -554,14 +757,10 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     }
     let asan = str_at(&f.raw, "/exception/sanitizer") == Some("asan");
     if asan && repro_lane::assess(work_dir, &record, Tool::Cartography).is_ok() {
-        lines.push(format!(
-            "bhf cartography --work-dir {work} --finding-id {id}   # which input bytes steer \
-             the access{}",
-            if environment_driven {
-                format!(" {CAVEAT}")
-            } else {
-                String::new()
-            }
+        lines.push(with_comment(
+            format!("bhf cartography --work-dir {work} --finding-id {id}"),
+            Some("which input bytes steer the access"),
+            caveat,
         ));
     }
     lines
@@ -610,27 +809,66 @@ fn push_wrapped(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-/// Whether the crash depended on the environment the runtrace shim faked:
-/// the shim was armed and the pass that found it served a fake world (`rng`
-/// or `fuzz_driven`; the empty pass and the observing pass-through serve
-/// none) or injected environment variables. The runtrace says nothing more:
-/// the shim logs the lookups a target makes of the real environment and
-/// fakes none of them, and it does not log its own fake files.
-fn environment_driven(f: &Finding) -> bool {
+/// Whether the shown input made the runtrace shim serve faked bytes, which is
+/// what `bhf env-capsule` captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvDependence {
+    /// The capture replay of the input made the shim serve bytes to these
+    /// faked resources.
+    Served(Vec<String>),
+    /// Nothing faked was served: the shim was not loaded, or the capture
+    /// replay recorded that it served nothing.
+    NotServed,
+    /// A faking pass (`rng`, `fuzz_driven`) found it, but no capture replay
+    /// recorded what the shim served the input.
+    Unknown,
+}
+
+/// What the faked environment did for the input shown: the resources the
+/// shim served bytes to on its capture replay (`gate_capture.served_resources`,
+/// kept only for a replay that crashed: the rule `bhf env-capsule` accepts a
+/// finding on). Without the shim
+/// nothing was faked; injected environment variables alone are no faked
+/// world, since replay.py sets them too.
+fn environment_dependence(f: &Finding, evidence: &Evidence) -> EnvDependence {
     let mode = f.raw.get("runtime_mode");
     let field = |key: &str| mode.and_then(|mode| mode.get(key));
     if field("shim_armed").and_then(Value::as_bool) != Some(true) {
-        return false;
+        return EnvDependence::NotServed;
     }
-    use crate::auto::pass::Pass;
-    let faking_pass = field("pass")
-        .and_then(Value::as_str)
-        .and_then(Pass::from_str)
-        .is_some_and(|pass| matches!(pass, Pass::Rng | Pass::FuzzDriven));
-    let injected = field("env_injected")
-        .and_then(Value::as_object)
-        .is_some_and(|env| !env.is_empty());
-    faking_pass || injected
+    match evidence
+        .capture
+        .as_ref()
+        .and_then(|capture| capture.summary.served_resources.as_ref())
+    {
+        Some(served) if !served.is_empty() => EnvDependence::Served(served.clone()),
+        Some(_) => EnvDependence::NotServed,
+        None => {
+            use crate::auto::pass::Pass;
+            let faking_pass = field("pass")
+                .and_then(Value::as_str)
+                .and_then(Pass::from_str)
+                .is_some_and(|pass| matches!(pass, Pass::Rng | Pass::FuzzDriven));
+            if faking_pass {
+                EnvDependence::Unknown
+            } else {
+                EnvDependence::NotServed
+            }
+        }
+    }
+}
+
+/// `command` with a trailing shell comment holding its own `note` and the
+/// `caveat`, joined with `; `; with neither, the command as it is. The note
+/// is passed apart from the command, never looked for in it: a quoted path
+/// can hold `   # ` too.
+fn with_comment(command: String, note: Option<&str>, caveat: Option<&str>) -> String {
+    let comment = match (note, caveat) {
+        (None, None) => return command,
+        (Some(note), Some(caveat)) => format!("{note}; {caveat}"),
+        (Some(text), None) | (None, Some(text)) => text.to_owned(),
+    };
+    format!("{command}   # {comment}")
 }
 
 /// The HARNESS ARGUMENTS section: the value the harness decoded for each
@@ -715,8 +953,12 @@ fn argument_lines(
         ),
     };
     let (tags, tag_note) = comparison_tags(f, evidence, &rows, rows_input, layout.as_ref());
+    // Names and values are the harness's print of the input: escaped before
+    // the table is laid out, so its columns stay aligned.
+    let shown_rows: Vec<corpus::decoded_args::TracedArg> =
+        rows.iter().map(terminal_safe_arg).collect();
     lines.extend(
-        corpus::decoded_args::render_table(&rows)
+        corpus::decoded_args::render_table(&shown_rows)
             .into_iter()
             .enumerate()
             .map(|(row, line)| {
@@ -731,7 +973,7 @@ fn argument_lines(
                 if extra.is_empty() {
                     format!("  {line}")
                 } else {
-                    format!("  {line}  {}", extra.join("  "))
+                    format!("  {line}  {}", terminal_safe(&extra.join("  ")))
                 }
             }),
     );
@@ -744,6 +986,22 @@ fn argument_lines(
         }
     }
     lines
+}
+
+/// `arg` with the text the harness printed for it made [`terminal_safe`].
+fn terminal_safe_arg(arg: &corpus::decoded_args::TracedArg) -> corpus::decoded_args::TracedArg {
+    let safe = |text: &Option<String>| text.as_deref().map(terminal_safe);
+    corpus::decoded_args::TracedArg {
+        call: terminal_safe(&arg.call),
+        role: terminal_safe(&arg.role),
+        name: terminal_safe(&arg.name),
+        ty: terminal_safe(&arg.ty),
+        decoder: safe(&arg.decoder),
+        value: safe(&arg.value),
+        ptr: safe(&arg.ptr),
+        after_call_value: safe(&arg.after_call_value),
+        ..arg.clone()
+    }
 }
 
 /// The traced arguments with each value and span replaced by the one
@@ -895,6 +1153,7 @@ fn comparison_tags(
                         None if gate.site_unattributable => UNATTRIBUTABLE_SITE.to_owned(),
                         None => gate.site.clone(),
                     };
+                    let site = terminal_safe(&site);
                     if !sites.contains(&site) {
                         sites.push(site);
                     }
@@ -1053,7 +1312,8 @@ fn access_lines(access: &Value, recorded_on: Option<&str>) -> Vec<String> {
             lines.push(format!("    {verb} {chain}"));
         }
     }
-    lines
+    // The address, its hint, the variable and the frames are the report's.
+    lines.iter().map(|line| terminal_safe(line)).collect()
 }
 
 /// `, 0 byte(s) after a 5-byte heap region (offset 5)`.
@@ -1163,6 +1423,8 @@ fn summarize_env(events: &[RuntraceEvent]) -> Vec<String> {
             }
             _ => continue,
         };
+        // Paths, commands and formats can carry fuzz input bytes.
+        let line = terminal_safe(&line);
         if seen.insert(line.clone()) {
             lines.push(line);
         }
@@ -1346,11 +1608,8 @@ impl StartingInput {
                 Some("user") => "your seed",
                 _ => "the seed mined from",
             },
-            path: seed
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-                .to_owned(),
+            // A mined seed's path is a file name of the scanned tree.
+            path: terminal_safe(seed.get("path").and_then(Value::as_str).unwrap_or("?")),
         })
     }
 }
@@ -1488,7 +1747,12 @@ fn evidence_lines(evidence: &Evidence, input_name: &str) -> Vec<String> {
             "  Comparison evidence for this input ({input_name}, {how}):"
         ));
         for gate in &capture.gates {
-            push_wrapped(&mut lines, &gate_line(gate), "    ", "      ");
+            push_wrapped(
+                &mut lines,
+                &terminal_safe(&gate_line(gate)),
+                "    ",
+                "      ",
+            );
         }
     }
     if let Some((_, searched)) = capture.summary.incomplete_derived_search() {
@@ -1605,13 +1869,17 @@ fn environment(
     harness_id: &str,
     evidence: &Evidence,
 ) -> (Option<String>, Vec<String>) {
+    let served = match environment_dependence(f, evidence) {
+        EnvDependence::Served(resources) => served_lines(&resources),
+        EnvDependence::NotServed | EnvDependence::Unknown => Vec::new(),
+    };
     if let (Some(events), Some(capture)) = (&evidence.own_events, &evidence.capture) {
-        let lines = summarize_env(events);
+        let mut lines = summarize_env(events);
         let source = format!(
             "observed while replaying {} with the runtrace shim",
             capture.summary.input
         );
-        if lines.is_empty() {
+        if lines.is_empty() && served.is_empty() {
             return (
                 Some(source),
                 vec![
@@ -1619,6 +1887,7 @@ fn environment(
                 ],
             );
         }
+        lines.extend(served);
         return (Some(source), lines);
     }
     let shim_armed = f
@@ -1636,11 +1905,12 @@ fn environment(
     } else {
         load_events(work_dir, harness_id)
     };
-    let lines = summarize_env(&events);
+    let mut lines = summarize_env(&events);
     let campaign = "runtrace events of the harness's last fuzz pass, across all of its inputs, \
                     not only this one"
         .to_owned();
-    if !lines.is_empty() {
+    if !lines.is_empty() || !served.is_empty() {
+        lines.extend(served);
         return (Some(campaign), lines);
     }
     match shim_armed {
@@ -1660,6 +1930,28 @@ fn environment(
             ],
         ),
     }
+}
+
+/// Resources [`served_lines`] names before it counts the rest.
+const MAX_SERVED_LINES: usize = 8;
+
+/// `served faked bytes for <resource>` per resource the shim served the
+/// input's replay, at most [`MAX_SERVED_LINES`], then `... and N more`. A
+/// resource is what the target opened, a path the input can name, so it is
+/// made [`terminal_safe`].
+fn served_lines(resources: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = resources
+        .iter()
+        .take(MAX_SERVED_LINES)
+        .map(|resource| format!("served faked bytes for {}", terminal_safe(resource)))
+        .collect();
+    if resources.len() > MAX_SERVED_LINES {
+        lines.push(format!(
+            "... and {} more",
+            resources.len() - MAX_SERVED_LINES
+        ));
+    }
+    lines
 }
 
 fn parsed_events(log: &Path) -> Vec<RuntraceEvent> {
@@ -2489,11 +2781,292 @@ mod tests {
 
         // An oracle hit is not a sanitizer crash: no capsule.
         let mut oracle = frameless_finding(&finding_dir);
-        oracle.raw["classification"] = serde_json::json!("oracle");
+        oracle.raw["classification"] = serde_json::json!("oracle_hit");
         let out = explain_one(work.path(), &oracle, &[], false);
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
         assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
         assert!(reproduce.contains("oracle finding"), "{reproduce}");
+    }
+
+    /// A finding record as `emit_oracle_hit` writes it.
+    fn oracle_hit_raw(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "rule_id": "BHF-408",
+            "classification": "oracle_hit",
+            "confirmation": "runtime",
+            "harness_id": "H-C0001",
+            "oracle": {
+                "name": "format-string-runtime",
+                "category": "injection",
+                "api": "printf",
+                "message": "a fuzz-controlled printf format contains a conversion",
+                "evidence": [
+                    {"key": "format", "value": "%n"},
+                    {"key": "input_controlled", "value": "true"}
+                ]
+            },
+            "exception": {
+                "name": "ORACLE_FORMAT_STRING_RUNTIME",
+                "message": "a fuzz-controlled printf format contains a conversion"
+            }
+        })
+    }
+
+    /// `bhf explain` explains runtime crashes and oracle findings, as their
+    /// classification is written, and nothing else.
+    #[test]
+    fn collect_keeps_oracle_hit_findings() {
+        let work = tempfile::tempdir().unwrap();
+        write_finding(work.path(), "F-0001-aaaaaaaa", "H-C0001", "site-a");
+        let oracle = corpus::layout::findings_dir(work.path()).join("F-0002-bbbbbbbb");
+        std::fs::create_dir_all(&oracle).unwrap();
+        std::fs::write(
+            oracle.join("finding.json"),
+            oracle_hit_raw("F-0002-bbbbbbbb").to_string(),
+        )
+        .unwrap();
+        let scan = corpus::layout::findings_dir(work.path()).join("F-0003-cccccccc");
+        std::fs::create_dir_all(&scan).unwrap();
+        std::fs::write(
+            scan.join("finding.json"),
+            serde_json::json!({"id": "F-0003-cccccccc", "rule_id": "BHF-401",
+                "classification": "static_scan"})
+            .to_string(),
+        )
+        .unwrap();
+        let ids: Vec<String> = collect(work.path())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, ["F-0001-aaaaaaaa", "F-0002-bbbbbbbb"]);
+    }
+
+    /// An oracle finding names the oracle, the API it watched and its
+    /// evidence, not a sanitizer verdict it does not have.
+    #[test]
+    fn an_oracle_hit_names_its_oracle_and_evidence() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = finding_in(work.path(), oracle_hit_raw("F-0001-0a0b0c0d"));
+        std::fs::write(finding.dir.join("testcase.bin"), b"A%n").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "  Oracle: format-string-runtime on printf: a fuzz-controlled printf format \
+                 contains a conversion\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("  Evidence: format = %n\n"), "{out}");
+        assert!(
+            out.contains("  Evidence: input_controlled = true\n"),
+            "{out}"
+        );
+        assert!(!out.contains("Sanitizer verdict"), "{out}");
+        assert!(!out.contains("Sanitizer report"), "{out}");
+    }
+
+    /// An oracle finding did not crash: WHAT HAPPENED says a runtime oracle
+    /// flagged it, not the crash paragraph its stored explanation carries.
+    #[test]
+    fn an_oracle_hit_is_not_described_as_a_crash() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = oracle_hit_raw("F-0001-0a0b0c0d");
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        raw["actionability"] = serde_json::to_value(record).unwrap();
+        let stored = raw["actionability"]["explanation"].as_str().unwrap_or("");
+        assert!(stored.contains("crash"), "{stored}");
+        let finding = finding_in(work.path(), raw);
+        std::fs::write(finding.dir.join("testcase.bin"), b"A%n").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let what = out
+            .split("WHAT HAPPENED")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .unwrap_or_default();
+        assert!(!what.contains("crash the program"), "{out}");
+        assert!(!what.contains("hit a fault"), "{out}");
+        let words = what.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "the runtime oracle `format-string-runtime` flagged how the program called \
+                 `printf`; it is not a crash"
+            ),
+            "{out}"
+        );
+        assert!(words.contains("`testcase.bin`"), "{out}");
+    }
+
+    /// Oracle evidence, the environment's events and the resources the shim
+    /// served carry fuzz input bytes: control characters in them reach the
+    /// terminal escaped, never raw, and an embedded line break does not split
+    /// the line.
+    #[test]
+    fn fuzz_bytes_in_oracle_and_environment_lines_are_escaped() {
+        let mut raw = oracle_hit_raw("F-0001-0a0b0c0d");
+        raw["oracle"]["evidence"] = serde_json::json!([
+            {"key": "format", "value": "\u{1b}]0;title\u{7}\u{1b}[2J%n\r\nmore"}
+        ]);
+        raw["oracle"]["api"] = serde_json::json!("printf\u{1b}[1m");
+        let lines = oracle_lines(&raw);
+        assert!(
+            lines.contains(
+                &"  Evidence: format = \\x1b]0;title\\x07\\x1b[2J%n\\r\\nmore".to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("  Oracle: format-string-runtime on printf\\x1b[1m"),
+            "{lines:?}"
+        );
+        let env = summarize_env(&[RuntraceEvent::FormatString {
+            api: "printf".into(),
+            format: "\u{1b}[2J%x\r\n%n\u{9b}\u{202e}".into(),
+            controlled: true,
+        }]);
+        assert_eq!(
+            env,
+            ["format string (INPUT-CONTROLLED): \\x1b[2J%x\\r\\n%n\\u{9b}\\u{202e}"],
+            "{env:?}"
+        );
+        // A served resource is the path the target opened, which the input
+        // can name.
+        let served =
+            served_lines(&["/tmp/cfg\u{1b}]0;owned\u{7}\u{1b}[2J\r\nFAKE LINE".to_owned()]);
+        assert_eq!(
+            served,
+            ["served faked bytes for /tmp/cfg\\x1b]0;owned\\x07\\x1b[2J\\r\\nFAKE LINE"],
+            "{served:?}"
+        );
+        for line in lines.iter().chain(&env).chain(&served) {
+            assert!(
+                !line.chars().any(|c| c.is_control() || is_bidi_control(c)),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// Every explain line that shows text from the finding's run escapes the
+    /// control characters in it: the sanitizer's report and stack, the
+    /// explanation and fix hint built from them, the memory access, the
+    /// harness arguments, the comparison sites, the seed the input matches and
+    /// the resources the shim served. No line of the output holds a control
+    /// character, and no line break inside a value starts a line of its own.
+    #[test]
+    fn run_derived_text_in_every_explain_line_is_escaped() {
+        const HOSTILE: &str = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{202e}\r\nFAKE LINE";
+        const SHOWN: &str = "\\x1b]0;owned\\x07\\x1b[2J\\u{202e}\\r\\nFAKE LINE";
+        let work = tempfile::tempdir().unwrap();
+        let input = b"WIDGET\x00\x01";
+        let mut raw = base_raw();
+        raw["exception"]["name"] = serde_json::json!(format!("ASAN_HEAP_BUFFER_OVERFLOW{HOSTILE}"));
+        raw["exception"]["message"] =
+            serde_json::json!(format!("heap-buffer-overflow in parse{HOSTILE}"));
+        raw["exception"]["access"] = serde_json::json!({
+            "direction": "read", "size": 1, "address": format!("0x5020{HOSTILE}"),
+            "address_hint": HOSTILE,
+            "parameter": {"name": format!("data{HOSTILE}"), "offset": 1, "basis": "region_start"},
+            "alloc_stack": [{"function": format!("make{HOSTILE}"), "file": "/src/widget/a.c", "line": 2}]
+        });
+        raw["actionability"] = serde_json::json!({
+            "sink": {"file": format!("/src/widget/parse{HOSTILE}.c"), "line": 3,
+                     "function": format!("parse{HOSTILE}")},
+            "explanation": format!(
+                "While processing a crafted input, parse{HOSTILE} read past a buffer. \
+                 Triggered by the attached test input (`testcase.bin`)."
+            ),
+            "patch_hints": [{"guidance": format!("Bound the read in parse{HOSTILE}.")}]
+        });
+        raw["cluster_normalized_frames"] = serde_json::json!([format!("parse{HOSTILE}"), "main"]);
+        raw["runtime_mode"] =
+            serde_json::json!({"pass": "fuzz_driven", "shim_armed": true, "env_injected": {}});
+        raw["gate_capture"] = serde_json::json!({
+            "input": "testcase.bin", "input_len": input.len(), "status": "recorded",
+            "reason": null, "comparisons": 2, "truncated": false, "unconfirmed": 0, "runs": 2,
+            "shim_armed": true, "served_resources": [format!("/tmp/cfg{HOSTILE}")]
+        });
+        raw["gates"] = serde_json::json!([{
+            "offset": 0, "len": 6, "operand_hex": "574944474554",
+            "compared_with_hex": "574944474554", "cmp_kind": "strcmp",
+            "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+            "location": {"file": format!("/src/widget/p{HOSTILE}.c"), "line": 12,
+                         "function": format!("match{HOSTILE}")}
+        }, {
+            "offset": 6, "len": 1, "operand_hex": "00", "compared_with_hex": "01",
+            "cmp_kind": "cmp", "site": format!("0x1a40{HOSTILE}"), "relation": "equal",
+            "operands_equal": false, "location": null
+        }]);
+        let finding = finding_in(work.path(), raw);
+        std::fs::write(finding.dir.join("testcase.bin"), input).unwrap();
+        std::fs::write(finding.dir.join(gate_evidence::FINDING_RUNTRACE), b"").unwrap();
+        let trace = format!(
+            "BHF_ARG {}\n",
+            serde_json::json!({"call": "target", "i": 0, "role": "param",
+                "name": format!("tag{HOSTILE}"), "type": format!("char *{HOSTILE}"),
+                "span": [0, 6], "value": format!("WIDGET{HOSTILE}")})
+        );
+        let args = corpus::decoded_args::parse_arg_trace(&trace);
+        assert_eq!(args.len(), 1, "{trace}");
+        // No finding.json beside it: decoded.json is written all the same.
+        let _ = corpus::decoded_args::record_trace(
+            &finding.dir,
+            input,
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        );
+        assert!(finding.dir.join("decoded.json").is_file());
+        let digest = {
+            use sha2::Digest;
+            sha2::Sha256::digest(input)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let manifest = crate::auto::seed_manifest::manifest_path(work.path());
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"schema_version": 1, "mining": "ran", "seeds": [{
+                "path": format!("tests/seed{HOSTILE}"), "source": "mined", "sha256": digest,
+                "size": input.len(), "bytes_used": input.len()
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let out = explain_one(work.path(), &finding, &[], false);
+        for line in out.lines() {
+            assert!(
+                !line.chars().any(|c| c.is_control() || is_bidi_control(c)),
+                "a control character reaches the terminal in {line:?}:\n{out}"
+            );
+            assert!(
+                !line.trim_start().starts_with("FAKE LINE"),
+                "a value's line break started a line:\n{out}"
+            );
+        }
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        for shown in [
+            format!("Sanitizer verdict: ASAN_HEAP_BUFFER_OVERFLOW{SHOWN}"),
+            "Sanitizer report: heap-buffer-overflow in parse\\x1b]0;owned".to_owned(),
+            format!("Sink: parse{SHOWN}()"),
+            format!("Call frames: parse{SHOWN} → main"),
+            format!("While processing a crafted input, parse{SHOWN} read past a buffer."),
+            format!("Bound the read in parse{SHOWN}."),
+            format!("Access: read of 1 byte(s) at 0x5020{SHOWN} ({SHOWN})"),
+            format!("parameter `data{SHOWN}`'s buffer"),
+            format!("allocated at make{SHOWN} (a.c:2)"),
+            format!("in match{SHOWN}, compared with"),
+            format!("reaches cmp at 0x1a40{SHOWN}, compared with"),
+            format!("[compared at p{SHOWN}.c:12]"),
+            "tag\\x1b]0;owned".to_owned(),
+            "WIDGET\\x1b]0;owned".to_owned(),
+            format!("the seed mined from tests/seed{SHOWN}"),
+            format!("served faked bytes for /tmp/cfg{SHOWN}"),
+        ] {
+            assert!(words.contains(&shown), "{shown:?} is not shown:\n{out}");
+        }
     }
 
     /// REPRODUCE OFFLINE quotes the work dir in the commands it suggests, so
@@ -2539,9 +3112,41 @@ mod tests {
         }
     }
 
-    /// A crash found while the runtrace shim served a faked world is offered
-    /// `bhf env-capsule` first, and the commands that replay without that
-    /// world say so; each path stays one shell word.
+    /// A `gate_capture` recorded for `testcase.bin` (4 bytes) whose baseline
+    /// replay ran with the shim, and the resources it served bytes to.
+    fn served_capture(served: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "input": "testcase.bin", "input_len": 4, "status": "no_comparisons",
+            "reason": "the run recorded no comparison at all", "comparisons": 0,
+            "truncated": false, "unconfirmed": 0, "runs": 1, "shim_armed": true,
+            "served_resources": served,
+        })
+    }
+
+    /// Every REPRODUCE OFFLINE command line is valid shell: a note after it is
+    /// a `#` comment, never a stray parenthesis.
+    #[cfg(unix)]
+    fn assert_commands_parse(lines: &[&str]) {
+        for line in lines
+            .iter()
+            .filter(|line| line.starts_with("bhf ") || line.starts_with("python"))
+        {
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(line)
+                .status()
+                .expect("run sh -n");
+            assert!(status.success(), "not valid shell: {line}");
+        }
+    }
+
+    /// A crash whose input made the runtrace shim serve faked bytes (its
+    /// capture replay recorded them) is offered `bhf env-capsule` first, and
+    /// the commands that replay without that world say so in a comment; each
+    /// path stays one shell word. A crash whose replay served nothing gets
+    /// neither; one from a faking pass with no record gets the caveat, and a
+    /// hedged env-capsule line when no capture replay could check it.
     #[test]
     fn reproduce_offline_puts_env_capsule_first_for_an_environment_driven_crash() {
         let root = tempfile::tempdir().unwrap();
@@ -2568,8 +3173,13 @@ mod tests {
         });
         finding.raw["runtime_mode"] =
             serde_json::json!({"pass": "rng", "shim_armed": true, "env_injected": {}});
-        let out = explain_one(&work, &finding, &[], false);
-        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        finding.raw["gate_capture"] = served_capture(&["/etc/widget.conf"]);
+        finding.raw["gates"] = serde_json::json!([]);
+        let reproduce_of = |finding: &Finding| {
+            let out = explain_one(&work, finding, &[], false);
+            out.split("REPRODUCE OFFLINE").nth(1).unwrap().to_owned()
+        };
+        let reproduce = reproduce_of(&finding);
         let lines: Vec<&str> = reproduce
             .lines()
             .map(str::trim)
@@ -2579,11 +3189,12 @@ mod tests {
         assert!(quoted.starts_with('\''), "{quoted}");
         assert!(
             lines[0].starts_with(&format!(
-                "bhf env-capsule --work-dir {quoted} --finding-id F-0001-0a0b0c0d"
+                "bhf env-capsule --work-dir {quoted} --finding-id F-0001-0a0b0c0d   # replays \
+                 the faked environment the crash used"
             )),
             "{reproduce}"
         );
-        let caveat = "(replays without the faked environment; may not reproduce)";
+        let caveat = "replays without the faked environment; may not reproduce";
         // Windows' Python installer provides `python`, not `python3`.
         let python = if cfg!(windows) { "python " } else { "python3 " };
         for command in [
@@ -2595,8 +3206,24 @@ mod tests {
                 .iter()
                 .find(|line| line.starts_with(command))
                 .unwrap_or_else(|| panic!("no {command} line in:\n{reproduce}"));
-            assert!(line.ends_with(caveat), "{line}");
+            let comment = line
+                .find("   # ")
+                .unwrap_or_else(|| panic!("no comment on {line}"));
+            assert!(
+                line[comment..].contains(caveat),
+                "the caveat is not in the comment: {line}"
+            );
+            assert!(!line.contains('('), "{line}");
         }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("bhf cartography --work-dir")
+                    && line.ends_with(&format!(
+                        "   # which input bytes steer the access; {caveat}"
+                    ))),
+            "{reproduce}"
+        );
         assert!(
             lines
                 .iter()
@@ -2604,45 +3231,172 @@ mod tests {
                     .starts_with(&format!("bhf capsule --work-dir {quoted} --finding-id"))),
             "{reproduce}"
         );
+        #[cfg(unix)]
+        assert_commands_parse(&lines);
 
-        // The empty pass serves nothing: no env-capsule, no caveat.
-        finding.raw["runtime_mode"] =
-            serde_json::json!({"pass": "empty", "shim_armed": true, "env_injected": {}});
-        let out = explain_one(&work, &finding, &[], false);
-        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        // The replay served nothing (a faking pass whose input touched no
+        // faked resource): no env-capsule, no caveat.
+        finding.raw["gate_capture"] = served_capture(&[]);
+        let reproduce = reproduce_of(&finding);
         assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
         assert!(!reproduce.contains(caveat), "{reproduce}");
-        // A variable the target read from the real environment is no faked
-        // value: the shim logs every lookup and fakes none.
-        std::fs::write(
-            finding_dir.join("runtrace.jsonl"),
-            "{\"e\":\"getenv\",\"n\":\"HOME\",\"r\":1}\n{\"e\":\"getenv\",\"n\":\"LANG\",\"r\":1}\n",
-        )
-        .unwrap();
-        let out = explain_one(&work, &finding, &[], false);
-        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
-        assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
-        assert!(!reproduce.contains(caveat), "{reproduce}");
-        std::fs::remove_file(finding_dir.join("runtrace.jsonl")).unwrap();
 
-        // An injected variable makes it environment-driven; with no built
-        // harness env-capsule says why it does not apply.
+        // A faking pass with no record of what the replay was served, its
+        // capture unable to run the harness (one whose driver records no
+        // comparisons): env-capsule is offered, hedged, and every other
+        // command carries the caveat.
+        finding.raw.as_object_mut().unwrap().remove("gate_capture");
+        finding.raw.as_object_mut().unwrap().remove("gates");
+        let reproduce = reproduce_of(&finding);
+        let lines: Vec<&str> = reproduce
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                "bhf env-capsule --work-dir {quoted} --finding-id F-0001-0a0b0c0d   # may \
+                 reproduce this; the capture replay could not check"
+            ),
+            "{reproduce}"
+        );
+        for command in ["bhf capsule --work-dir", python] {
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(command))
+                .unwrap_or_else(|| panic!("no {command} line in:\n{reproduce}"));
+            assert!(line.ends_with(&format!("   # {caveat}")), "{line}");
+        }
+        #[cfg(unix)]
+        assert_commands_parse(&lines);
+
+        // The capture replayed the input with the shim and it did not crash,
+        // so recorded nothing served: env-capsule, which needs that crash, is
+        // not offered; the caveat stays.
+        let mut unserved = served_capture(&[]);
+        unserved.as_object_mut().unwrap().remove("served_resources");
+        finding.raw["gate_capture"] = unserved;
+        finding.raw["gates"] = serde_json::json!([]);
+        let reproduce = reproduce_of(&finding);
+        assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
+        assert!(reproduce.contains(caveat), "{reproduce}");
+
+        // Injected variables alone are no faked world: replay.py sets them.
         finding.raw["runtime_mode"] = serde_json::json!(
             {"pass": "empty", "shim_armed": true, "env_injected": {"WIDGET_HOME": "/x"}}
         );
+        finding.raw["gate_capture"] = served_capture(&[]);
+        finding.raw["gates"] = serde_json::json!([]);
+        let reproduce = reproduce_of(&finding);
+        assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
+        assert!(!reproduce.contains(caveat), "{reproduce}");
+
+        // Served bytes but no built harness: env-capsule says why it does
+        // not apply.
+        finding.raw["runtime_mode"] =
+            serde_json::json!({"pass": "rng", "shim_armed": true, "env_injected": {}});
+        finding.raw["gate_capture"] = served_capture(&["/etc/widget.conf"]);
         std::fs::remove_file(harness.join("main")).unwrap();
-        let out = explain_one(&work, &finding, &[], false);
-        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let reproduce = reproduce_of(&finding);
         let words = reproduce.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             words.contains("env-capsule is not available for it")
                 && words.contains("has no built executable"),
             "{reproduce}"
         );
+
+        // No record and no built harness: the hedged env-capsule line is
+        // left out, with no refusal either.
+        finding.raw.as_object_mut().unwrap().remove("gate_capture");
+        finding.raw.as_object_mut().unwrap().remove("gates");
+        let reproduce = reproduce_of(&finding);
+        assert!(!reproduce.contains("env-capsule"), "{reproduce}");
+        assert!(reproduce.contains(caveat), "{reproduce}");
+    }
+
+    /// A work dir whose path itself holds `   # ` is one quoted shell word: the
+    /// caveat still goes into each command's trailing comment, so a pasted
+    /// line runs one command, never the caveat's words.
+    #[cfg(unix)]
+    #[test]
+    fn a_work_dir_that_looks_like_a_comment_keeps_the_caveat_in_the_comment() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("w   # d");
+        let finding_dir = work.join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+        let harness = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            b"main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        std::fs::write(harness.join("main"), b"\x7fELF").unwrap();
+        let mut finding = frameless_finding(&finding_dir);
+        finding.raw["exception"] = serde_json::json!({
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "AddressSanitizer: heap-buffer-overflow",
+            "stack": []
+        });
+        // A faking pass with no record of what was served: every command
+        // carries the caveat.
+        finding.raw["runtime_mode"] =
+            serde_json::json!({"pass": "rng", "shim_armed": true, "env_injected": {}});
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let commands: Vec<&str> = reproduce
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("bhf capsule") || line.starts_with("bhf cartography"))
+            .collect();
+        assert_eq!(commands.len(), 2, "{reproduce}");
+        for line in commands {
+            // `bhf` stands in for itself; any other word the line runs fails.
+            let run = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("bhf() {{ :; }}; {line}"))
+                .output()
+                .expect("run sh");
+            assert!(
+                run.status.success() && run.stderr.is_empty(),
+                "{line}\n{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(
+                line.ends_with("replays without the faked environment; may not reproduce"),
+                "{line}"
+            );
+        }
+    }
+
+    /// The FAKED ENVIRONMENT section names the resources the shim served this
+    /// input faked bytes to, and never says it touched none.
+    #[test]
+    fn the_environment_section_names_the_resources_the_shim_served() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = base_raw();
+        raw["runtime_mode"] =
+            serde_json::json!({"pass": "fuzz_driven", "shim_armed": true, "env_injected": {}});
+        raw["gate_capture"] = served_capture(&["/etc/widget.conf"]);
+        raw["gates"] = serde_json::json!([]);
+        let finding = finding_in(work.path(), raw);
+        std::fs::write(finding.dir.join("testcase.bin"), b"AAAA").unwrap();
+        std::fs::write(finding.dir.join("runtrace.jsonl"), b"").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let env = out
+            .split("FAKED ENVIRONMENT")
+            .nth(1)
+            .and_then(|rest| rest.split("REACHABILITY").next())
+            .unwrap_or_default();
         assert!(
-            !reproduce.contains(python),
-            "no harness for replay.py: {reproduce}"
+            env.contains("served faked bytes for /etc/widget.conf"),
+            "{out}"
         );
+        assert!(!env.contains("touched no external resource"), "{out}");
     }
 
     /// REPRODUCE OFFLINE offers capsule and verify-poc for a finding of every
