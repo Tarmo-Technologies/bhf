@@ -372,6 +372,28 @@ pub fn record_trace(
     input: &[u8],
     outcome: &TraceOutcome,
 ) -> std::io::Result<()> {
+    record_trace_of_run(finding_dir, input, outcome, None)
+}
+
+/// [`record_trace`] for the run that printed the trace, with that run's own
+/// sanitizer report (`run_report`), if it printed one.
+///
+/// The traced pointers are addresses in the trace run, which is a second run
+/// of the testcase. A second run need not place its allocations where the
+/// finding's run did: AddressSanitizer on Windows randomizes every process's
+/// heap, so a traced pointer matched against the finding's faulting address
+/// named no parameter there. The trace run's own access (`run_report`), when
+/// it is the same fault (the same crash frame, else the same reported location
+/// or faulting instruction) on the same object (same direction, width, region
+/// kind, size and offset), is in the traced pointers' address space and names
+/// the parameter; otherwise the finding's access is used, as on a host whose
+/// heap addresses repeat.
+pub fn record_trace_of_run(
+    finding_dir: &Path,
+    input: &[u8],
+    outcome: &TraceOutcome,
+    run_report: Option<&crate::sanitizer::SanitizerReport>,
+) -> std::io::Result<()> {
     let annotated;
     let outcome = match outcome {
         TraceOutcome::Traced(args) => {
@@ -396,12 +418,71 @@ pub fn record_trace(
         return Ok(());
     };
     object.insert("decoded_args".to_owned(), decoded_args_json(args));
+    let finding_site = record.get("exception").and_then(recorded_fault_site);
+    let run_report = run_report.filter(|run| {
+        finding_site.is_some() && reported_fault_site(run).as_ref() == finding_site.as_ref()
+    });
     if let Some(access) = record.pointer_mut("/exception/access") {
-        if let Some(parameter) = accessed_parameter(access, args) {
+        let parameter = run_report
+            .and_then(|run| run.access.as_deref())
+            .and_then(|run| serde_json::to_value(run).ok())
+            .filter(|run| same_object(run, access))
+            .and_then(|run| accessed_parameter(&run, args))
+            .or_else(|| accessed_parameter(access, args));
+        if let Some(parameter) = parameter {
             access["parameter"] = parameter;
         }
     }
     std::fs::write(&finding_path, serde_json::to_vec_pretty(&record)?)
+}
+
+/// Where a recorded finding faulted (its `exception`), in the form
+/// [`reported_fault_site`] gives a sanitizer report: its top crash frame
+/// (function, file, line), else the location the sanitizer localized it to,
+/// else the faulting instruction's offset in the executable. No address is in
+/// it: a second run of the testcase need not place anything where the first
+/// did, but it faults at the same place.
+fn recorded_fault_site(exception: &Value) -> Option<Value> {
+    if let Some(frame) = exception.pointer("/stack/0") {
+        return Some(json!({"frame": [
+            frame.get("function"), frame.get("file"), frame.get("line")
+        ]}));
+    }
+    if let Some(location) = exception.get("location") {
+        return Some(json!({"location": location}));
+    }
+    exception
+        .get("pc_offset")
+        .map(|offset| json!({"pc_offset": offset}))
+}
+
+/// [`recorded_fault_site`] of a sanitizer report.
+fn reported_fault_site(report: &crate::sanitizer::SanitizerReport) -> Option<Value> {
+    if let Some(frame) = report.stack.first() {
+        return Some(json!({"frame": [
+            Some(&frame.function), frame.file.as_ref(), frame.line.as_ref()
+        ]}));
+    }
+    if let Some(location) = &report.location {
+        return Some(json!({"location": location}));
+    }
+    report
+        .pc_offset
+        .map(|offset| json!({"pc_offset": format!("{offset:#x}")}))
+}
+
+/// Whether two recorded accesses describe the same fault on the same object,
+/// whatever address each run gave it.
+fn same_object(a: &Value, b: &Value) -> bool {
+    [
+        "/direction",
+        "/size",
+        "/region/kind",
+        "/region/size",
+        "/region/offset",
+    ]
+    .iter()
+    .all(|pointer| a.pointer(pointer) == b.pointer(pointer))
 }
 
 /// Longest type and value shown in a table cell.
@@ -554,6 +635,137 @@ BHF_ARG {not json\n\
         assert_eq!(
             accessed_parameter(&wild, &args),
             Some(json!({"name": "buffer", "offset": 0xa10010_u64, "basis": "nearest_pointer"}))
+        );
+    }
+
+    /// The trace run's report of an access at `address`, on `region` when
+    /// given, faulting in `function` at line `line` of `/src/parse.c`.
+    fn trace_run_report(
+        address: &str,
+        region: Option<crate::sanitizer::MemoryRegion>,
+        function: &str,
+        line: u32,
+    ) -> crate::sanitizer::SanitizerReport {
+        use crate::sanitizer::{AccessDirection, MemoryAccess, SanitizerReport, StackFrame};
+        SanitizerReport {
+            stack: vec![StackFrame {
+                function: function.to_owned(),
+                file: Some("/src/parse.c".to_owned()),
+                line: Some(line),
+            }],
+            access: Some(Box::new(MemoryAccess {
+                direction: AccessDirection::Read,
+                size: Some(1),
+                address: Some(address.to_owned()),
+                region,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// `finding` as `dir/finding.json`, then the parameter `record_trace_of_run`
+    /// names for the trace run reported by `run` (the finding's own address
+    /// alone when `None`).
+    fn parameter_named(
+        dir: &Path,
+        finding: &Value,
+        run: Option<&crate::sanitizer::SanitizerReport>,
+    ) -> Value {
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::to_vec(finding).unwrap(),
+        )
+        .unwrap();
+        let outcome = TraceOutcome::Traced(parse_arg_trace(TRACE));
+        record_trace_of_run(dir, b"AA", &outcome, run).unwrap();
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        record["exception"]["access"]["parameter"].clone()
+    }
+
+    /// The trace is a second run of the testcase, and on a host that
+    /// randomizes each process's heap (AddressSanitizer on Windows) its
+    /// allocations are not where the finding's run had them. The trace run's
+    /// own report of the same fault (same crash frame, and same access on the
+    /// same object) names the parameter; an access on another object, or the
+    /// same object reached from another frame, does not stand in for the
+    /// finding's.
+    #[test]
+    fn the_trace_runs_own_access_names_the_parameter_when_the_heap_moved() {
+        use crate::sanitizer::MemoryRegion;
+        let dir = tempfile::tempdir().unwrap();
+        let finding = json!({"exception": {
+            "stack": [{"function": "parse_record", "file": "/src/parse.c", "line": 12}],
+            "access": {
+                "direction": "read", "size": 1, "address": "0x1256d34a0031",
+                "region": {"kind": "heap", "size": 1, "offset": 1,
+                           "relation": "after", "distance": 0}}}});
+        let heap = |offset: i64| MemoryRegion {
+            kind: "heap".to_owned(),
+            size: Some(1),
+            offset: Some(offset),
+            relation: Some("after".to_owned()),
+            distance: Some(0),
+            ..Default::default()
+        };
+
+        // Matched against the finding's own address alone, nothing is named.
+        assert_eq!(parameter_named(dir.path(), &finding, None), Value::Null);
+
+        // The trace run reported the same overflow at its own address.
+        let same = trace_run_report("0x502000000031", Some(heap(1)), "parse_record", 12);
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&same)),
+            json!({"name": "buffer", "offset": 1, "basis": "region_start"})
+        );
+
+        // A trace run that faulted on another object is not used.
+        let other = trace_run_report("0x502000000032", Some(heap(2)), "parse_record", 12);
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&other)),
+            Value::Null
+        );
+
+        // Nor one that hit a like object from another frame.
+        let elsewhere = trace_run_report("0x502000000031", Some(heap(1)), "parse_trailer", 40);
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&elsewhere)),
+            Value::Null
+        );
+    }
+
+    /// A wild access names no region, so direction and width are all the two
+    /// accesses share: a trace run that crashed somewhere else must not lend
+    /// its address and name a parameter. The same crash frame makes it the
+    /// same fault, whose address in the trace run is nearest a traced pointer.
+    #[test]
+    fn a_wild_access_takes_the_trace_runs_address_only_from_the_same_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let finding = json!({"exception": {
+            "stack": [{"function": "parse_record", "file": "/src/parse.c", "line": 12}],
+            "access": {"direction": "read", "size": 1, "address": "0x10"}}});
+        assert_eq!(parameter_named(dir.path(), &finding, None), Value::Null);
+
+        let elsewhere = trace_run_report("0x502000000070", None, "parse_trailer", 40);
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&elsewhere)),
+            Value::Null,
+            "a trace run that faulted elsewhere names no parameter"
+        );
+
+        let mut unlocated = trace_run_report("0x502000000070", None, "", 0);
+        unlocated.stack.clear();
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&unlocated)),
+            Value::Null,
+            "a trace run whose report has no frame cannot be the same fault"
+        );
+
+        let same = trace_run_report("0x502000000070", None, "parse_record", 12);
+        assert_eq!(
+            parameter_named(dir.path(), &finding, Some(&same)),
+            json!({"name": "buffer", "offset": 64, "basis": "nearest_pointer"})
         );
     }
 

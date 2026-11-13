@@ -146,6 +146,15 @@
 - `bhf report --backfill` no longer tells you to pass `--harness`, which
   `bhf report` does not have, when a finding's harness is gone; it says to
   restore or rebuild the harness and run the backfill again.
+- Windows: a finding's `exception.access.parameter` names the parameter whose
+  buffer the access hit on Windows too. The arguments are traced in a second
+  run of the testcase, and AddressSanitizer on Windows places each run's heap
+  elsewhere, so the traced pointers never matched the finding's faulting
+  address. The parameter is now matched against the trace run's own report of
+  the same fault: the same crash frame (else the same reported location or
+  faulting instruction), and the same direction, width and region. A trace
+  run that crashed somewhere else lends no address, so a wild access, which
+  names no region, is not attributed from it.
 - Windows: the memory ceiling of target discovery and of the static scan
   (`BHF_MAX_MEMORY_KB`, `--max-memory-mb`) is enforced on Windows, against the
   process's working set, with a default of 80% of the available physical

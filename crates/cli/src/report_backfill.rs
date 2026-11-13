@@ -250,14 +250,18 @@ fn backfill_arguments(
         )],
     )
     .ok()?;
-    let traced = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&run.stderr));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let traced = corpus::decoded_args::parse_arg_trace(&stderr);
     if traced.is_empty() {
         return None;
     }
     let count = traced.len();
     let bytes = std::fs::read(&testcase).ok()?;
     let outcome = corpus::decoded_args::TraceOutcome::Traced(traced);
-    corpus::decoded_args::record_trace(dir, &bytes, &outcome).ok()?;
+    // The traced pointers are addresses in this run: its own report of the
+    // same fault names the parameter where the heap moved between runs.
+    let run_report = corpus::sanitizer::parse_sanitizer_report(&stderr);
+    corpus::decoded_args::record_trace_of_run(dir, &bytes, &outcome, run_report.as_ref()).ok()?;
     // record_trace rewrote finding.json; note what it added.
     let path = dir.join("finding.json");
     let mut record: Value = std::fs::read(&path)

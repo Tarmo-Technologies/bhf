@@ -572,7 +572,12 @@ arguments with `name`, `type`, `role`, `value` or `len`, `span`, `preview_hex`
 and `after_call_value`. When a heap access hits a region a traced buffer
 starts (`basis` `region_start`) or points into (`region_interior`, for a view
 that starts after the bytes other parameters took), `exception.access.parameter`
-names that parameter and the access offset from its pointer. For a wild access
+names that parameter and the access offset from its pointer. The trace is a
+second run of the testcase, so the parameter is matched against that run's own
+report of the access when it is the finding's fault (the same crash frame,
+else the same reported location or faulting instruction, and the same
+direction, width and region): on Windows, AddressSanitizer places each run's
+heap elsewhere. For a wild access
 with no region it names the nearest traced pointer below the faulting address
 (`nearest_pointer`). `bhf replay --show-args` re-runs the harness with the trace
 and prints the arguments as a table. `bhf explain` shows the same table under

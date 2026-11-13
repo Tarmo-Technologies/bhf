@@ -7513,7 +7513,10 @@ pub(crate) fn harness_has_arg_trace(harness: &Path) -> bool {
 
 /// Run `harness` once on `input` with its argument trace on and parse the
 /// `BHF_ARG` lines it prints. A harness without the trace, a failed run or a
-/// run that prints no trace lines is `Unavailable`, saying why.
+/// run that prints no trace lines is `Unavailable`, saying why. With it comes
+/// the trace run's own sanitizer report, when it printed one: the traced
+/// pointers are addresses in that run, not in the finding's (see
+/// [`corpus::decoded_args::record_trace_of_run`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_arguments(
     harness: &Path,
@@ -7523,7 +7526,10 @@ pub(crate) fn trace_arguments(
     extra_env: &[(String, String)],
     timeout: Duration,
     qemu_prefix: Option<(&Path, &[String])>,
-) -> corpus::decoded_args::TraceOutcome {
+) -> (
+    corpus::decoded_args::TraceOutcome,
+    Option<corpus::sanitizer::SanitizerReport>,
+) {
     use corpus::decoded_args::TraceOutcome;
     // A harness that hands the input to the project's own
     // `LLVMFuzzerTestOneInput` has no parameters to decode.
@@ -7540,13 +7546,19 @@ pub(crate) fn trace_arguments(
         source_dirs.extend(crate::auto::layout::harness_dir_candidates(work_dir, id));
     }
     if crate::replay::is_passthrough_harness(&source_dirs) {
-        return TraceOutcome::Unavailable(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned());
+        return (
+            TraceOutcome::Unavailable(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned()),
+            None,
+        );
     }
     if !harness_has_arg_trace(harness) {
-        return TraceOutcome::Unavailable(
-            "the harness was built without the argument trace; regenerate it with this bhf \
-             (or read the arguments under a debugger, see the C/C++ guide)"
-                .to_owned(),
+        return (
+            TraceOutcome::Unavailable(
+                "the harness was built without the argument trace; regenerate it with this bhf \
+                 (or read the arguments under a debugger, see the C/C++ guide)"
+                    .to_owned(),
+            ),
+            None,
         );
     }
     let mut env = extra_env.to_vec();
@@ -7563,18 +7575,26 @@ pub(crate) fn trace_arguments(
     };
     match stderr {
         Ok(stderr) => {
-            let args = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&stderr));
+            let text = String::from_utf8_lossy(&stderr);
+            let args = corpus::decoded_args::parse_arg_trace(&text);
             if args.is_empty() {
-                TraceOutcome::Unavailable(
-                    "the argument-trace run printed no BHF_ARG lines (the harness takes no \
-                     decoded arguments, or failed before decoding them)"
-                        .to_owned(),
+                (
+                    TraceOutcome::Unavailable(
+                        "the argument-trace run printed no BHF_ARG lines (the harness takes no \
+                         decoded arguments, or failed before decoding them)"
+                            .to_owned(),
+                    ),
+                    None,
                 )
             } else {
-                TraceOutcome::Traced(args)
+                let report = corpus::sanitizer::parse_sanitizer_report(&text);
+                (TraceOutcome::Traced(args), report)
             }
         }
-        Err(error) => TraceOutcome::Unavailable(format!("the argument-trace run failed: {error}")),
+        Err(error) => (
+            TraceOutcome::Unavailable(format!("the argument-trace run failed: {error}")),
+            None,
+        ),
     }
 }
 
@@ -7670,7 +7690,7 @@ fn record_finding_arguments(
     qemu_prefix: Option<(&Path, &[String])>,
 ) {
     let timeout = per_input_timeout.clamp(ARG_TRACE_TIMEOUT_MIN, ARG_TRACE_TIMEOUT_MAX);
-    let outcome = trace_arguments(
+    let (outcome, run_report) = trace_arguments(
         harness,
         work_dir,
         input,
@@ -7680,7 +7700,12 @@ fn record_finding_arguments(
         qemu_prefix,
     );
     let finding_dir = corpus::layout::finding_dir(work_dir, finding_id);
-    if let Err(error) = corpus::decoded_args::record_trace(&finding_dir, input, &outcome) {
+    if let Err(error) = corpus::decoded_args::record_trace_of_run(
+        &finding_dir,
+        input,
+        &outcome,
+        run_report.as_ref(),
+    ) {
         bhfeprintln!("warning: could not record the decoded arguments of {finding_id}: {error}");
     }
 }
@@ -10569,7 +10594,7 @@ exit 0
              [ \"$BHF_TRACE_ARGS\" = 1 ] && >&2 echo \"BHF_ARG {\\\"call\\\":\\\"target\\\",\\\"i\\\":0,\\\"role\\\":\\\"param\\\",\\\"name\\\":\\\"first\\\",\\\"type\\\":\\\"int\\\",\\\"value\\\":\\\"$bytes\\\"}\"\n\
              exit 0\n",
         );
-        let outcome = trace_arguments(
+        let (outcome, _) = trace_arguments(
             &harness,
             &work_dir,
             &[42],
