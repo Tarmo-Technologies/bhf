@@ -21,6 +21,9 @@ A COBOL subprogram — a `PROGRAM-ID` with a `LINKAGE SECTION` driven by
 2. **Translates** it to C with `cobc -C -debug -fec=all` (GnuCOBOL). Free vs fixed
    source format is detected automatically, and every `.cpy` copybook directory in
    the project is added as a `cobc -I` search path so `COPY` statements resolve.
+   The project is the git checkout holding the program inside the tree you pass
+   to `bhf auto`, else that tree; the search never goes above it, and it stops
+   after a bounded number of directory entries.
 3. **Generates a driver** (`LLVMFuzzerTestOneInput`) that fills the primary
    `PIC X` / `PIC X ANY LENGTH` buffer from the fuzz bytes, sets a length operand
    to the byte count, and zeroes the rest — so a real multi-operand program

@@ -132,6 +132,13 @@
   replay's `shim_armed`), so a bhf installed without its shim, or a shim the
   dynamic loader refuses, records the environment as not observed and
   `bhf explain` says so.
+- `bhf auto` keeps the COBOL copybook search inside the tree it scans. For a
+  tree that is not a git checkout it walked up to five directories above the
+  program, which could reach `/tmp`, `$HOME` or `/`, and then scanned that
+  directory: a COBOL target could spend minutes before its build, and another
+  project's copybooks could reach `cobc`'s include path. The search now starts
+  at the git checkout holding the program inside the scanned tree, or the
+  scanned tree itself, and stops after a bounded number of entries.
 - `bhf report --backfill` writes a replay into a finding only when the replay
   is a `MATCH` as `bhf replay` decides it. A finding that records no crash
   location is backfilled only from the build it was recorded with; another

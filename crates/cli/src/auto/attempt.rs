@@ -2517,10 +2517,17 @@ fn run_attempt(
     // with no fuzzable LINKAGE surface skips cleanly.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Cobol) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
+        // The copybook search stays inside the tree `bhf auto` scans.
+        let source_root = options
+            .source_root
+            .clone()
+            .or_else(|| candidate.source_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| work_dir.to_path_buf());
         match crate::auto::cobol_build::build_cobol_harness(
             candidate,
             work_dir,
             &candidate.harness_id,
+            &source_root,
         ) {
             crate::auto::cobol_build::CobolBuildResult::Built => {}
             crate::auto::cobol_build::CobolBuildResult::Skip(reason) => {

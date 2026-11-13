@@ -81,61 +81,94 @@ fn is_free_format(source: &str) -> bool {
     })
 }
 
+/// How deep below its search root the copybook search reads directories.
+const COPYBOOK_SEARCH_DEPTH: usize = 6;
+/// Most directory entries the copybook search visits.
+const COPYBOOK_SEARCH_ENTRIES: usize = 20_000;
+/// Most copybook directories passed to `cobc`.
+const COPYBOOK_SEARCH_DIRS: usize = 200;
+
 /// Directories to pass to `cobc` as copybook search paths (`-I`): the source
-/// file's own directory plus every directory under the project root that holds a
-/// `.cpy` copybook. Bounded so a huge tree can't stall discovery.
-fn copybook_includes(source_path: &Path) -> Vec<PathBuf> {
+/// file's own directory plus every directory under the search root that holds
+/// a `.cpy` copybook. The search root is the project holding the source (the
+/// nearest directory with `.git`) inside `scan_root`, the tree `bhf auto`
+/// scans, else `scan_root` itself: the search never goes above `scan_root`, so
+/// a tree that is not a git checkout does not reach a shared directory such
+/// as `/tmp`, or another project's copybooks. A source outside `scan_root`
+/// gets its own directory only. The walk is bounded by depth, by the entries
+/// it visits and by the directories it returns, and does not follow
+/// symlinked directories.
+fn copybook_includes(source_path: &Path, scan_root: &Path) -> Vec<PathBuf> {
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    if let Some(d) = source_path.parent() {
-        dirs.insert(d.to_path_buf());
-    }
-    // Walk up to a plausible project root (a `.git` dir, or up to 5 levels).
-    let mut chosen = source_path.parent().map(Path::to_path_buf);
-    let mut cursor = source_path.parent().map(Path::to_path_buf);
-    let mut levels = 0;
-    while let Some(d) = cursor {
-        chosen = Some(d.clone());
-        if d.join(".git").exists() {
-            break;
-        }
-        levels += 1;
-        if levels >= 5 {
-            break;
-        }
-        cursor = d.parent().map(Path::to_path_buf);
-    }
-    if let Some(root) = chosen {
-        collect_cpy_dirs(&root, 0, &mut dirs);
+    let Some(source_dir) = source_path.parent() else {
+        return Vec::new();
+    };
+    dirs.insert(source_dir.to_path_buf());
+    if let Some(root) = copybook_search_root(source_dir, scan_root) {
+        collect_cpy_dirs(&root, COPYBOOK_SEARCH_ENTRIES, &mut dirs);
     }
     dirs.into_iter().collect()
 }
 
-fn collect_cpy_dirs(dir: &Path, depth: usize, out: &mut BTreeSet<PathBuf>) {
-    if depth > 6 || out.len() > 200 {
-        return;
+/// The root of the copybook search for a source in `source_dir`: the nearest
+/// directory with `.git` from `source_dir` up to `scan_root` (a file's
+/// directory when `bhf auto` was given one file), else `scan_root`; `None`
+/// when `source_dir` is not inside `scan_root`.
+fn copybook_search_root(source_dir: &Path, scan_root: &Path) -> Option<PathBuf> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let source_dir = canonical(source_dir);
+    let mut scan_root = canonical(scan_root);
+    if scan_root.is_file() {
+        scan_root.pop();
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if matches!(name, ".git" | "target" | "node_modules" | ".svn") {
-                continue;
+    if !source_dir.starts_with(&scan_root) {
+        return None;
+    }
+    source_dir
+        .ancestors()
+        .take_while(|dir| dir.starts_with(&scan_root))
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+        .or(Some(scan_root))
+}
+
+/// Add every directory under `root` that holds a `.cpy` file to `out`,
+/// reading at most [`COPYBOOK_SEARCH_DEPTH`] levels and `max_entries`
+/// entries. Returns the number of entries visited.
+fn collect_cpy_dirs(root: &Path, max_entries: usize, out: &mut BTreeSet<PathBuf>) -> usize {
+    let mut visited = 0;
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if visited >= max_entries || out.len() > COPYBOOK_SEARCH_DIRS {
+                return visited;
             }
-            collect_cpy_dirs(&p, depth + 1, out);
-        } else if p
-            .extension()
-            .and_then(|x| x.to_str())
-            .map(|x| x.eq_ignore_ascii_case("cpy"))
-            .unwrap_or(false)
-        {
-            if let Some(d) = p.parent() {
-                out.insert(d.to_path_buf());
+            visited += 1;
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if depth < COPYBOOK_SEARCH_DEPTH
+                    && !matches!(name, ".git" | "target" | "node_modules" | ".svn")
+                {
+                    pending.push((path, depth + 1));
+                }
+            } else if path
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("cpy"))
+            {
+                out.insert(dir.clone());
             }
         }
     }
+    visited
 }
 
 /// Recover the C entry symbol GnuCOBOL emitted: `int   PROGID (cob_u8_t *...)`
@@ -387,10 +420,14 @@ pub(crate) fn multi_param_glue(entry: &str, params: &[CobolParam]) -> String {
 }
 
 /// Build the COBOL harness for `candidate` into `harnesses/<harness_id>/`.
+///
+/// `source_root` is the tree `bhf auto` scans: the copybook search never
+/// leaves it.
 pub fn build_cobol_harness(
     candidate: &Candidate,
     work_dir: &Path,
     harness_id: &str,
+    source_root: &Path,
 ) -> CobolBuildResult {
     if !have_cobc() {
         return CobolBuildResult::Skip(
@@ -426,7 +463,7 @@ pub fn build_cobol_harness(
     if is_free_format(&source) {
         cmd.arg("-free");
     }
-    for inc in copybook_includes(&candidate.source_path) {
+    for inc in copybook_includes(&candidate.source_path, source_root) {
         cmd.arg("-I").arg(inc);
     }
     cmd.arg("-o").arg(&target_c).arg(&candidate.source_path);
@@ -536,6 +573,100 @@ pub fn build_cobol_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"       01 REC PIC X(8).\n").unwrap();
+    }
+
+    /// A COBOL source in a tree that is not a git checkout, inside a shared
+    /// directory full of unrelated projects: the copybook search covers the
+    /// tree being scanned and nothing above it, so another project's
+    /// copybook is never put on the include path.
+    #[test]
+    fn the_copybook_search_stays_inside_the_scanned_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        for i in 0..400 {
+            std::fs::create_dir_all(outer.path().join(format!("other-{i}/src"))).unwrap();
+        }
+        touch(&outer.path().join("unrelated/copy/DECOY.cpy"));
+        let tree = outer.path().join("ws/team/project");
+        let source = tree.join("src/prog.cob");
+        touch(&source);
+        touch(&tree.join("copy/REC.cpy"));
+        touch(&tree.join("lib/shared/copybooks/HDR.cpy"));
+
+        let started = std::time::Instant::now();
+        let dirs = copybook_includes(&source, &tree);
+        let elapsed = started.elapsed();
+        let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+        let dirs: Vec<PathBuf> = dirs.into_iter().map(canonical).collect();
+        for wanted in ["src", "copy", "lib/shared/copybooks"] {
+            assert!(
+                dirs.contains(&canonical(tree.join(wanted))),
+                "{wanted} missing: {dirs:?}"
+            );
+        }
+        let tree = canonical(tree);
+        assert!(
+            dirs.iter().all(|dir| dir.starts_with(&tree)),
+            "the search left the scanned tree: {dirs:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// Within the scanned tree, a git checkout holding the source is its
+    /// project: copybooks are searched there, as before.
+    #[test]
+    fn the_copybook_search_uses_the_project_inside_the_scanned_tree() {
+        let tree = tempfile::tempdir().unwrap();
+        let project = tree.path().join("vendor/lib");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let source = project.join("src/prog.cob");
+        touch(&source);
+        touch(&project.join("copy/LIB.cpy"));
+        touch(&tree.path().join("other/copy/OTHER.cpy"));
+        let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+        let dirs: Vec<PathBuf> = copybook_includes(&source, tree.path())
+            .into_iter()
+            .map(canonical)
+            .collect();
+        assert!(dirs.contains(&canonical(project.join("copy"))), "{dirs:?}");
+        assert!(
+            !dirs.contains(&canonical(tree.path().join("other/copy"))),
+            "{dirs:?}"
+        );
+    }
+
+    /// `bhf auto` given one COBOL file scans that file's directory.
+    #[test]
+    fn a_single_scanned_file_searches_its_own_directory() {
+        let tree = tempfile::tempdir().unwrap();
+        let source = tree.path().join("prog.cob");
+        touch(&source);
+        touch(&tree.path().join("copy/REC.cpy"));
+        let canonical = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+        let dirs: Vec<PathBuf> = copybook_includes(&source, &source)
+            .into_iter()
+            .map(canonical)
+            .collect();
+        assert!(
+            dirs.contains(&canonical(tree.path().join("copy"))),
+            "{dirs:?}"
+        );
+    }
+
+    /// The walk visits at most `max_entries` entries, however large the tree.
+    #[test]
+    fn the_copybook_walk_stops_after_its_entry_budget() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..150 {
+            touch(&root.path().join(format!("d{i}/x.txt")));
+        }
+        let mut dirs = BTreeSet::new();
+        let visited = collect_cpy_dirs(root.path(), 50, &mut dirs);
+        assert!(visited <= 50, "{visited} entries visited");
+    }
 
     fn param(name: &str, kind: CobolParamKind) -> CobolParam {
         CobolParam {
