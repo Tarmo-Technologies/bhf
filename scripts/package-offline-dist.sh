@@ -378,11 +378,14 @@ run mkdir -p "$TOOL_DIR" "$PACK_ROOT/rules" "$PACK_ROOT/cve" "$PACK_ROOT/corpus"
 
 run cp "$BHF_BIN" "$TOOL_DIR/bhf"
 run cp "$DAEMON_BIN" "$TOOL_DIR/bhf-daemon"
-if [[ -f "$SHIM_DIST" ]]; then
-  run cp "$SHIM_DIST" "$TOOL_DIR/libbhf_runtrace.so"
-fi
+# libbhf_runtrace.so is the name BHF_RUNTRACE_SHIM installs point at. Ship it
+# as a copy of the cargo shim when there is one: a dist-named copy beside it
+# can lag a shim rebuild.
 if [[ -f "$SHIM_CANONICAL" ]]; then
+  run cp "$SHIM_CANONICAL" "$TOOL_DIR/libbhf_runtrace.so"
   run cp "$SHIM_CANONICAL" "$TOOL_DIR/libbhf_runtrace_shim.so"
+elif [[ -f "$SHIM_DIST" ]]; then
+  run cp "$SHIM_DIST" "$TOOL_DIR/libbhf_runtrace.so"
 fi
 run cp "$CC_INTERCEPT" "$TOOL_DIR/libbhf_cc_intercept.so"
 run cp "$SCRIPT_DIR/bhf-bug-report.sh" "$TOOL_DIR/bhf-bug-report"

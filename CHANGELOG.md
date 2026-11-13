@@ -1392,6 +1392,13 @@
   could not be deleted. The DLL is copied once into `<work-dir>/.bhf-runtime/`
   (refreshed when the toolchain's file changes) and each harness dir links to
   that copy.
+- With both `libbhf_runtrace_shim.so` (the cargo shim) and its dist-named copy
+  `libbhf_runtrace.so` beside the bhf binary, bhf preloads the cargo shim
+  whatever the files' modified times say. A stale copy written after the shim
+  (by `cp`, an archive extract or `rsync`) used to win and ran old
+  interposers, which could report a released resource as leaked. The offline
+  packager ships `libbhf_runtrace.so` as a copy of the cargo shim when there
+  is one, so `BHF_RUNTRACE_SHIM` installs get the current shim too.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

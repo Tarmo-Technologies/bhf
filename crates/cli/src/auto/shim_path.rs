@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Find libbhf_runtrace.so on disk so the auto attempt loop
+//! Find the runtrace shim on disk so the auto attempt loop
 //! can LD_PRELOAD it. Search order:
 //!
 //!   1. $BHF_RUNTRACE_SHIM (explicit override)
-//!   2. Sibling of std::env::current_exe() — same target dir as
-//!      cli's build.rs copied it to.
-//!   3. Cargo's native sibling cdylib name from direct shim builds.
+//!   2. Cargo's cdylib `libbhf_runtrace_shim.so`, a sibling of
+//!      std::env::current_exe().
+//!   3. The dist-named copy `libbhf_runtrace.so` beside it, when the cdylib
+//!      is not there (the copy is made from the cdylib, so it is never newer
+//!      in content).
 //!   4. A sibling `bhf_runtrace_shim-*` dist archive directory.
 //!   5. None — the shim isn't on disk; caller falls back to
 //!      audit-disabled mode with a one-line warning.
@@ -304,36 +306,18 @@ fn copy_shim(
 fn locate_next_to_exe(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
     // `libbhf_runtrace.so` is the dist-named copy cli's build.rs makes from
-    // the canonical cargo cdylib `libbhf_runtrace_shim.so`. Prefer the copy to
-    // preserve packaging intent — BUT cli's build.rs can lag the shim by one build
-    // within a single `cargo build` (its rerun-if-changed fingerprint is decided
-    // before the shim rebuilds in the same invocation), leaving the copy stale.
-    // Loading a stale shim silently runs old instrumentation, so when the
-    // canonical artifact is strictly newer than the copy, use the fresh one.
+    // the canonical cargo cdylib `libbhf_runtrace_shim.so`, so with both
+    // present the cdylib is the current shim: the copy can lag a shim rebuild
+    // (build.rs makes it only when it reruns), and a copy written after the
+    // cdylib (`cp`, an archive extract, `rsync`) can still hold an older shim
+    // whatever its mtime says. Loading a stale shim silently runs old
+    // instrumentation. The copy is used only when it is the only one.
     let dist = dir.join("libbhf_runtrace.so");
     let shim = dir.join("libbhf_runtrace_shim.so");
     match (dist.is_file(), shim.is_file()) {
-        (true, true) => Some(if shim_is_strictly_newer(&shim, &dist) {
-            shim
-        } else {
-            dist
-        }),
+        (_, true) => Some(shim),
         (true, false) => Some(dist),
-        (false, true) => Some(shim),
         (false, false) => locate_in_sibling_dist_dir(dir),
-    }
-}
-
-/// Whether `shim`'s mtime is strictly newer than `dist`'s. Conservative: any
-/// metadata error answers `false`, so an unreadable mtime keeps the dist-name
-/// preference rather than risking a spurious switch.
-fn shim_is_strictly_newer(shim: &Path, dist: &Path) -> bool {
-    match (
-        shim.metadata().and_then(|m| m.modified()),
-        dist.metadata().and_then(|m| m.modified()),
-    ) {
-        (Ok(shim_mtime), Ok(dist_mtime)) => shim_mtime > dist_mtime,
-        _ => false,
     }
 }
 
@@ -598,19 +582,32 @@ mod tests {
             .unwrap();
     }
 
+    /// The copy is made from the cargo cdylib, so with both present the cdylib
+    /// is current whatever the mtimes say: a copy written after it (by `cp`,
+    /// an archive extract, `rsync`) can still hold an older shim.
     #[test]
-    fn locate_next_to_exe_prefers_dist_name_when_not_older() {
+    fn locate_next_to_exe_prefers_the_cargo_shim_whatever_the_mtimes() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("bhf");
         let dist_shim = dir.path().join("libbhf_runtrace.so");
         let cargo_shim = dir.path().join("libbhf_runtrace_shim.so");
         std::fs::write(&exe, "").unwrap();
-        std::fs::write(&dist_shim, "").unwrap();
-        std::fs::write(&cargo_shim, "").unwrap();
-        // Dist copy at least as new as the cargo artifact -> dist preference holds.
+        std::fs::write(&dist_shim, "old shim").unwrap();
+        std::fs::write(&cargo_shim, "current shim").unwrap();
         let now = std::time::SystemTime::now();
         set_mtime(&cargo_shim, now - std::time::Duration::from_secs(10));
         set_mtime(&dist_shim, now);
+
+        assert_eq!(locate_next_to_exe(&exe), Some(cargo_shim));
+    }
+
+    #[test]
+    fn locate_next_to_exe_uses_the_dist_name_when_it_is_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("bhf");
+        let dist_shim = dir.path().join("libbhf_runtrace.so");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(&dist_shim, "shim").unwrap();
 
         assert_eq!(locate_next_to_exe(&exe), Some(dist_shim));
     }
