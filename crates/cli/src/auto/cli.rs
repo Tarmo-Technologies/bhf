@@ -5530,7 +5530,15 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
     for repair in repairs {
         match repair {
             HeaderPlaceholder { .. } | ConfigHeaderSynth { .. } => headers += 1,
-            HeaderForward { .. } | AddIncludeDir { .. } | IncludeTypeHeader { .. } => incdirs += 1,
+            // A type placeholder resolved to its real header found a header;
+            // it synthesized nothing.
+            HeaderForward { .. }
+            | AddIncludeDir { .. }
+            | IncludeTypeHeader { .. }
+            | TypePlaceholder {
+                resolved_header: Some(_),
+                ..
+            } => incdirs += 1,
             TypePlaceholder { .. } | TypeAlias { .. } | ConfigTypeAlias { .. } => types += 1,
             MacroDefine { .. } | ConfigGuardDefine { .. } | IncludeStdHeader { .. } => macros += 1,
             DeclareFunction { .. } => declarations += 1,
@@ -7092,6 +7100,29 @@ mod tests {
     #[test]
     fn summarize_repairs_is_none_when_no_repairs_applied() {
         assert_eq!(summarize_repairs(&[]), None);
+    }
+
+    /// A type placeholder resolved to its real header is a header the build
+    /// found, not a type bhf synthesized.
+    #[test]
+    fn summarize_repairs_counts_a_resolved_type_as_a_header() {
+        use crate::auto::repair::Repair;
+        let resolved = Repair::TypePlaceholder {
+            type_name: "cerr".into(),
+            resolved_header: Some("<iostream>".into()),
+        };
+        assert_eq!(
+            summarize_repairs(&[resolved]).as_deref(),
+            Some("resolved 1 header dir")
+        );
+        let unresolved = Repair::TypePlaceholder {
+            type_name: "widget_t".into(),
+            resolved_header: None,
+        };
+        assert_eq!(
+            summarize_repairs(&[unresolved]).as_deref(),
+            Some("synthesized 1 type")
+        );
     }
 
     #[test]

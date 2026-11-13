@@ -1399,6 +1399,12 @@
   interposers, which could report a released resource as leaked. The offline
   packager ships `libbhf_runtrace.so` as a copy of the cargo shim when there
   is one, so `BHF_RUNTRACE_SHIM` installs get the current shim too.
+- A type that a build repair resolved to its real header (`cerr` with
+  `<iostream>` included) is no longer reported as a stubbed build-config
+  macro: `missing-deps.txt`/`missing-deps.json`, the console's dependency
+  count and `run.md`'s "Synthesised build-config macros" leave it out. It
+  stays listed under `run.json` `targets[].real_headers_included`, and the
+  `-v` repair summary counts it as a resolved header, not a synthesized type.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

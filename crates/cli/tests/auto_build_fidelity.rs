@@ -186,4 +186,28 @@ fn a_cpp_target_missing_only_a_standard_header_keeps_full_fidelity() {
             && !run_md.contains("## Fabricated build context"),
         "{run_md}"
     );
+    // A real header is not a dependency the build stubbed: neither the
+    // requirements file, nor run.md's build-config macros, nor the console's
+    // dependency count lists it.
+    let missing = std::fs::read_to_string(work.join("auto/missing-deps.txt")).unwrap_or_default();
+    assert!(
+        !missing.lines().any(|line| line.contains("cerr")),
+        "{missing}"
+    );
+    let mut lines = run_md.lines();
+    while let Some(line) = lines.next() {
+        if line.contains("Synthesised build-config macros") {
+            let section: Vec<&str> = lines
+                .by_ref()
+                .take_while(|line| !line.starts_with('#'))
+                .collect();
+            assert!(
+                !section.iter().any(|line| line.contains("cerr")),
+                "{run_md}"
+            );
+        }
+    }
+    assert!(!stderr.contains("cerr ->"), "{stderr}");
+    let manifest = std::fs::read_to_string(work.join("auto/missing-deps.json")).unwrap_or_default();
+    assert!(!manifest.contains("cerr"), "{manifest}");
 }

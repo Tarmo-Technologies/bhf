@@ -2802,15 +2802,12 @@ fn aggregate_repairs(
             // still linked and executed, so this is not a synthesized dependency
             // or a stub inventory entry.
             Repair::DeclareFunction { .. } => {}
-            // A real header included for the type is a build adjustment, like a
-            // force-included standard header for a standard symbol.
+            // A real header included for the type: listed under the target's
+            // real_headers_included; not a dependency, and nothing was stubbed.
             Repair::TypePlaceholder {
-                type_name,
-                resolved_header: Some(header),
-            } => macros
-                .entry(format!("{type_name} -> {header} (real header included)"))
-                .or_default()
-                .push(id.to_owned()),
+                resolved_header: Some(_),
+                ..
+            } => {}
             Repair::TypePlaceholder { type_name, .. } => {
                 // A clang recovery-artifact placeholder (`type`/`expression`) is not
                 // a real missing type the maintainer must ship — never report it as a
@@ -3485,6 +3482,49 @@ mod tests {
             "{:?}",
             annotated.sanitizers.reason
         );
+    }
+
+    /// A type placeholder resolved to its real header is listed under the
+    /// target's real headers, not as a build-config macro the build stubbed;
+    /// an unresolved one is a synthesized type.
+    #[test]
+    fn a_resolved_type_placeholder_is_not_a_dependency() {
+        let mut buckets: [BTreeMap<String, Vec<String>>; 7] = Default::default();
+        let [headers, types, declared, blind, ada_units, ada_symbols, macros] = &mut buckets;
+        let resolved = [Repair::TypePlaceholder {
+            type_name: "cerr".into(),
+            resolved_header: Some("<iostream>".into()),
+        }];
+        aggregate_repairs(
+            &resolved,
+            "H-X",
+            headers,
+            types,
+            declared,
+            blind,
+            ada_units,
+            ada_symbols,
+            macros,
+        );
+        assert!(macros.is_empty(), "{macros:?}");
+        assert!(types.is_empty(), "{types:?}");
+        let unresolved = [Repair::TypePlaceholder {
+            type_name: "widget_t".into(),
+            resolved_header: None,
+        }];
+        aggregate_repairs(
+            &unresolved,
+            "H-X",
+            headers,
+            types,
+            declared,
+            blind,
+            ada_units,
+            ada_symbols,
+            macros,
+        );
+        assert!(types.contains_key("widget_t"), "{types:?}");
+        assert!(macros.is_empty(), "{macros:?}");
     }
     use crate::auto::candidate::{Candidate, Lang};
     use crate::auto::dep_manifest::DepKind;
