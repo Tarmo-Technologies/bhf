@@ -5,6 +5,62 @@
 ## Unreleased
 
 ### Fixed
+- A C or C++ capsule of a target that needed a synthesized stub or
+  forwarding header rebuilds where the scanned tree is gone: the stubs and
+  repair headers bhf wrote name the headers they need by absolute path, and
+  the capsule now ships those headers and rewrites each such `#include`
+  relative to the capsule. Every shipped file and the manifest are checked for
+  the work dir and the scanned tree; a capsule that still names them is
+  reported `⚠ not portable: <file> names <path>` instead of ✓
+  (`manifest.json` `portable`, `portability`), and the manifest's `sink`
+  names the file as the capsule ships it. Packaging builds and replays the
+  capsule from a copy outside the work dir, and in place where that copy
+  cannot run what was built in it (a temp dir mounted noexec).
+- `bhf capsule` and `bhf verify-poc` no longer take any crash of the
+  finding's sanitizer class for the finding: a C or C++ capsule records the
+  finding's identity (`finding_identity`: rule, kind, check, sink, site) and
+  compares the rebuilt PoC's report with it as `bhf replay` does. A
+  minimized input that crashes another way is not shipped (the recorded one
+  is, or the capsule says what the rebuilt PoC showed instead), and
+  verify-poc reports `MISMATCH` naming the differing field. A replay without
+  a sanitizer report passes with its site not compared; a capsule packaged
+  before this release is compared by class, with a note, and one of a finding
+  that recorded no sanitizer report says that is why. Capsule replays use
+  the fuzz loop's UBSan options, so the first report halts the run with its
+  stack and check name.
+- The C++ dialect ladder's choice reaches the build recipe: the build's
+  output log no longer changes the dialect cache key, and the recipe records
+  the standard the successful build used, so the capsule and the coverage
+  replay of a legacy C++ target rebuild with its `-std` instead of the
+  default one.
+- `bhf build` records the build recipe (`coverage-build-recipe.json`) of a
+  C/C++ harness it built, as `bhf auto` does: the `AUTO_EXTRA_SOURCES`,
+  `AUTO_EXTRA_INCLUDES` and `AUTO_EXTRA_LDFLAGS` it took from the
+  environment, the `CXX_STD`/`C_STD` standard, the `[toolchain]` flags and the
+  compiler family. A capsule applies every recorded field, so a harness built
+  with them packages and verifies without them set.
+- `bhf verify-poc` on a capsule whose own rebuild failed when it was packaged
+  says so, with the build's error (manifest `build_error`) and this run's,
+  instead of blaming fork-server state, the faked environment or timing; a
+  capsule that rebuilds where verify-poc runs but whose input does not crash
+  is not blamed on the build.
+- `bhf explain` offers `bhf env-capsule` first for a crash that depended on
+  the environment the runtrace shim faked, or says why it does not apply,
+  and flags the capsule, `replay.py`, cartography and direct commands as
+  replaying without that environment.
+- A finding whose harness is gone from the work dir is no longer offered its
+  `replay.py`, which looks the harness up in the same dirs: the refusal says
+  to pass a harness binary to `bhf replay --harness`, or to regenerate the
+  harness (`bhf auto`, or `bhf generate-harness --id <id> --output
+  <work>/harnesses` and then `bhf build`). `replay.py` is offered only when a
+  harness it runs exists, a relative `fixture_path` resolved in the finding's
+  work dir as `replay.py` resolves it, whatever the current directory.
+- Oracle findings (`classification: oracle_hit`) are counted as runtime
+  findings by capsule, cartography and env-capsule sweeps and refused with
+  the oracle reason.
+- The direct harness command a refusal or `bhf explain` prints for a
+  cross-built harness runs it under the emulator recorded beside it
+  (`bhf_runner.json`), with the sanitizer options of an emulated replay.
 - The explicit buffer-length dimension (`BHF_BUFFER_LEN_DIMENSION=1`) is
   recorded only for a harness it gave a buffer a length: the source stamp,
   `arg-layout.json` and `generation-metadata.json` `buffer_len_dimension`,
@@ -893,6 +949,15 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- `coverage-build-recipe.json` is schema 2: it adds `extra_compile_flags`,
+  `extra_ldflags`, `compat_flags`, `toolchain`, `compiler_family` and
+  `recorded_by`. Schema 1 recipes are still read by the coverage replay and
+  by `bhf capsule`.
+- The capsule manifest adds `finding_identity`, `identity_comparison`
+  (`verdict: none` with a `reason` for a finding without a sanitizer report),
+  `build_error`, `portable`, `portability` and `other_crash`, and its `sink`
+  names the file as the capsule ships it (relative to the scanned tree or the
+  work dir when it does not ship), not the absolute host path.
 - The C/C++ harness input format is now version 4: a call with several
   buffers, a count named as above, a pointer-typedef buffer or a parameter
   named like a harness local decodes differently from format 3. Regenerate

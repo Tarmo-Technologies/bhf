@@ -204,10 +204,12 @@ stages at `bhf_work/build/<id>/main` works as well as the one next to
 `main.c` / `main.cpp`. `bhf capsule` and `bhf verify-poc` package C and C++
 findings whatever the harness id; the language comes from the harness's
 `generation-metadata.json`. A capsule rebuilds the harness from what the
-harness directory records, and `bhf build` records no build recipe: a harness
-built with `AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES`, `AUTO_EXTRA_LDFLAGS`
-or `CXX_STD`/`C_STD` set can fail to rebuild in its capsule, while a harness
-`bhf auto` built carries its recipe:
+harness directory records: `bhf build` writes the build recipe
+(`coverage-build-recipe.json`) after a successful build, with the
+`AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES` and `AUTO_EXTRA_LDFLAGS` values,
+the `CXX_STD`/`C_STD` standard and the `[toolchain]` flags it was built with,
+as `bhf auto` does for its builds, so the capsule rebuilds with them without
+them set:
 
 ```sh
 bhf capsule --work-dir bhf_work --finding-id <finding-id>

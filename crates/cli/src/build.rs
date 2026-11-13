@@ -1288,6 +1288,13 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
                     stage_sanitizer_runtime(&harness_dir, path.as_deref());
                     stage_sanitizer_runtime(&build_dir, path.as_deref());
                 }
+                // A foreign build (or one run under an emulator) is not
+                // rebuilt for this host from its recipe.
+                record_build_recipe(
+                    &work_dir,
+                    &harness_dir,
+                    foreign.is_none() && runner.is_none(),
+                );
             } else {
                 bhfeprintln!(
                     "make reported success but did not produce expected harness binary '{}'",
@@ -1317,6 +1324,43 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
             Some(2)
         }
     }
+}
+
+/// Record what this build took from the environment beside the harness
+/// (`coverage-build-recipe.json`), as `bhf auto` does for its builds:
+/// `AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES`, `AUTO_EXTRA_LDFLAGS`, the
+/// `CXX_STD`/`C_STD` standard and the `[toolchain]` flags reach `make` that
+/// way, not through the Makefile, so `bhf capsule` reads them from here.
+fn record_build_recipe(work_dir: &Path, harness_dir: &Path, native: bool) {
+    let cpp = harness_dir.join("main.cpp").is_file();
+    let standard = std::env::var(if cpp { "CXX_STD" } else { "C_STD" })
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let extra_sources: Vec<PathBuf> = std::env::var("AUTO_EXTRA_SOURCES")
+        .ok()
+        .map(|value| {
+            recipe_words(&value)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let compilers = crate::toolchain::effective_compilers();
+    let compiler = if cpp { compilers.cxx } else { compilers.cc };
+    crate::auto::coverage_replay::persist_build_recipe(
+        harness_dir,
+        &crate::auto::coverage_replay::RecipeBuild {
+            work_dir,
+            extra_sources: &extra_sources,
+            extra_includes: &[],
+            standard,
+            native,
+            cpp,
+            compiler_family: crate::toolchain::compiler_family(&compiler, cpp),
+            recorded_by: "build",
+        },
+    );
 }
 
 const C_FAMILY_BUILD_LAYOUT_HINT: &str = "hint: bhf build takes the work directory that holds \

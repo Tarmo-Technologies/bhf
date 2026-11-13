@@ -496,6 +496,27 @@ fn replace_path(text: &str, from: &str, to: &str) -> String {
     }
 }
 
+/// The first of `protected` that `text` names as a whole path (or a path
+/// under it), as the path-like token it is named by.
+pub(crate) fn named_protected_path(text: &str, protected: &[PathBuf]) -> Option<String> {
+    protected.iter().find_map(|path| {
+        let path = path.to_string_lossy();
+        let doubled = path.replace('\\', "\\\\");
+        // A Windows path as JSON or C text writes it, with doubled
+        // backslashes, too.
+        let named = [path.as_ref(), doubled.as_str()]
+            .into_iter()
+            .find_map(|spelling| {
+                let at = find_path(text, spelling)?;
+                // The protected path whole (a drive's `C:` included), then the
+                // rest of the path-like token it starts.
+                let end = at + spelling.len();
+                Some(format!("{}{}", &text[at..end], path_at(text, end)))
+            });
+        named
+    })
+}
+
 /// The path-like token at `at` in `text`, for a message.
 fn path_at(text: &str, at: usize) -> String {
     text[at..]

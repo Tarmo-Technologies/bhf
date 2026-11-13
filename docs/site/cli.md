@@ -622,8 +622,15 @@ and explain it — all offline and deterministic (no LLM):
   with, the dependencies an offline rebuild needs, and the crash input. What a
   capsule holds and how it rebuilds is its lane's, one per harness language
   (see the table below). The input is the finding's `min_testcase.bin` when it
-  reproduces, else its `testcase.bin`; it ships as `input/testcase.bin`, and
-  the output and `manifest.json` (`input_source`) say which it is. Every path
+  reproduces the finding's crash, else its `testcase.bin`; it ships as
+  `input/testcase.bin`, and the output and `manifest.json` (`input_source`)
+  say which it is. For a C or C++ finding "reproduces" means the rebuilt PoC
+  shows the crash the finding recorded, compared field by field as
+  `bhf replay` compares it (rule, kind, then sink or site; manifest
+  `finding_identity`): a minimized input that crashes another way does not
+  ship, and when no input shows the finding's crash the capsule says what
+  the rebuilt PoC showed instead (`reproduced: false`,
+  `reproduced_other_crash: true`, `other_crash`). Every path
   the harness's build and launch files name is relocated into the capsule:
   `build.sh` renders those files into `build/` with the capsule's own location
   and the programs it finds on the host, builds there, and writes `./poc`, so
@@ -638,9 +645,20 @@ and explain it — all offline and deterministic (no LLM):
   For a C or C++ harness the headers that ship are the ones the compiler's
   `-M` lists for the build (when that fails, every header under the include
   roots ships, plus the project headers the sources' `#include` lines reach,
-  also through `..`), and the build settings are the Makefile plus the
-  language standard and extra sources/include dirs recorded in
-  `harnesses/<id>/coverage-build-recipe.json`. The compiler is `$CC`/`$CXX`,
+  also through `..`), and the build settings are the Makefile plus what the
+  build took from the environment, recorded in
+  `<harness dir>/coverage-build-recipe.json` by `bhf auto` and by `bhf build`:
+  the language standard (`CXX_STD`/`C_STD` or the dialect ladder's), the
+  extra sources and include dirs, the `AUTO_EXTRA_INCLUDES` and
+  `AUTO_EXTRA_LDFLAGS` words, the `[toolchain]` flags, the work dir's
+  compatibility flags and the compiler family. The stubs and forwarding
+  headers bhf synthesized name the headers they need by absolute path; the
+  capsule ships those headers and rewrites each such `#include` relative to
+  the stub. A capsule is portable when no file it ships and no manifest field
+  names the work dir or the scanned tree (the manifest's `sink` names the file
+  as the capsule ships it); otherwise the summary says `⚠ not portable:
+  <file> names <path>` and the manifest records `portable: false` and the
+  `portability` problems. The compiler is `$CC`/`$CXX`,
   else the family that built the harness binary (a harness bhf built with gcc
   rebuilds with gcc), and `build.sh` asks the compiler that runs it which
   family it is and passes that family's sanitizer flags, as the harness
@@ -650,9 +668,13 @@ and explain it — all offline and deterministic (no LLM):
   libstdc++ headers and library, else (a libc++ host) to `-stdlib=libc++` or
   an installed libc++ header dir; `build.sh` probes for them on the host that
   runs it. A rebuild that fails is reported by the compiler's first `error:`
-  line (or MSVC's `error C2065:` / `error LNK2019:`). The capsule is built and
-  replayed in a scratch dir, then moved into place, so a refused or failed
-  finding leaves nothing behind.
+  line (or MSVC's `error C2065:` / `error LNK2019:`). The capsule is staged in a
+  scratch dir and moved into place only when complete, so a refused or failed
+  finding leaves nothing behind; it is built and replayed from a copy outside
+  the work dir, so the build reaches nothing beside the capsule. Where that
+  copy cannot run what was built in it (a temp dir mounted noexec: the PoC, or
+  a build script the build runs, `Permission denied`), it is built and
+  replayed in place.
 
   A C or C++ capsule also ships `build.ps1`, its Windows build, which needs no
   POSIX shell (`powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1`,
@@ -686,7 +708,19 @@ and explain it — all offline and deterministic (no LLM):
   overrides it. On Windows it rebuilds a C or C++ capsule with `build.ps1`
   and checks the programs `requires_windows` lists, so no POSIX shell is
   needed. A path that does not exist is reported as such, with the
-  `bhf capsule` command that writes it.
+  `bhf capsule` command that writes it. A C or C++ capsule's replay is
+  compared with the finding's identity the way `bhf replay` compares it:
+  `PASS` names the compared fields, and another crash, of the same sanitizer
+  class or not, is `MISMATCH` with each differing field (exit 1). A rebuilt
+  PoC that dies by a signal without a sanitizer report passes with its site
+  not compared, and a capsule packaged before it recorded the finding's
+  identity is compared by sanitizer class, with a note saying so. A capsule
+  of a finding that recorded no sanitizer report has no identity to compare;
+  its manifest says why (`identity_comparison` `verdict: none`, `reason`) and
+  verify-poc prints that reason. A capsule whose own rebuild failed when it
+  was packaged (manifest `rebuilt: false`, `build_error`) is reported as such
+  when its rebuild fails here too, with both errors; one that rebuilds here
+  but whose input does not crash says that instead.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
   reproduces deterministically. It works on the built harness of a native lane
@@ -813,15 +847,29 @@ id prefix, else the driver file the dir holds), and the harness is looked up in
 by hand with `generate-harness --id <name>`, `build` and `fuzz` works too.
 `capsule` and `verify-poc` take every language below; `env-capsule` the native
 ones; `cartography` C and C++ (it maps AddressSanitizer reports). A finding a
-command does not take (an oracle hit, a missing harness or input, a harness its
-lane cannot rebuild offline) is refused with its own reason and, when there is
-one, a command that does reproduce it (`python3 <finding>/replay.py`, or the
-built harness run on the input with the sanitizer options `bhf replay` uses,
-leak detection included for a leak finding). `bhf explain` applies the same
-first check:
+command does not take (an oracle hit, `classification: oracle_hit`; a missing
+harness or input; a harness its lane cannot rebuild offline) is refused with
+its own reason and, when there is one, a command that does reproduce it
+(`python3 <finding>/replay.py` when a harness it runs exists, or the built
+harness run on the input with the sanitizer options `bhf replay` uses, leak
+detection included for a leak finding, under the emulator recorded beside a
+cross-built harness). A finding whose harness is gone from the work dir is
+told to pass a binary of the harness to `bhf replay --harness`, or to get the
+harness back first: `bhf auto` on the tree generates and builds it again, or
+`bhf generate-harness <source> --target <function> --id <id> --output
+<work>/harnesses` and then `bhf build <work> --harness <id>` (`bhf build`
+alone has no harness dir to build from). `replay.py` counts as available when
+the harness it would run exists: its recorded `fixture_path`, a relative one
+resolved in the finding's work dir (not the current directory), or a built
+`main` in the harness dirs. `bhf explain` applies the same first check:
 it offers `bhf capsule`/`bhf verify-poc` only for findings whose lane and
 harness layout capsule takes, and `bhf cartography` for AddressSanitizer
-crashes it can map. What capsule checks while it packages (dependencies in the
+crashes it can map. For a crash that depended on the environment the
+runtrace shim faked (the shim was armed and the finding's pass served a fake
+world or injected variables; a variable read from the real environment does
+not count)
+it offers `bhf env-capsule` first, or says why it does not apply, and flags
+every other command as replaying without the faked environment. What capsule checks while it packages (dependencies in the
 local cargo, module or NuGet cache, the size of the tree it ships, paths it
 cannot relocate) can still refuse a finding explain offered; capsule then says
 why.

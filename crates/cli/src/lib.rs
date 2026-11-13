@@ -239,7 +239,7 @@ enum Command {
     Replay(replay::ReplayArgs),
     /// Package a crash from a harness in any language bhf generates into a portable, self-verifying PoC capsule (input + harness + sources + recorded build + stubs + vendored dependencies); a harness that cannot rebuild offline is refused with the reason
     Capsule(capsule::CapsuleArgs),
-    /// Rebuild a PoC capsule offline and assert the recorded crash reproduces (only the lane's toolchain, as the manifest lists it, + a shell needed; on Windows a C or C++ capsule rebuilds with its build.ps1 and cl, clang-cl or clang, no POSIX shell)
+    /// Rebuild a PoC capsule offline and assert the recorded crash reproduces, compared as bhf replay compares it (only the lane's toolchain, as the manifest lists it, + a shell needed; on Windows a C or C++ capsule rebuilds with its build.ps1 and cl, clang-cl or clang, no POSIX shell)
     VerifyPoc(capsule::VerifyPocArgs),
     /// Record + replay the shim-served faked environment so an environment-driven crash of a native harness (C, C++, Ada, Rust, COBOL, Fortran) reproduces deterministically
     EnvCapsule(env_capsule::EnvCapsuleArgs),

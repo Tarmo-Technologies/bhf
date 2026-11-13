@@ -874,8 +874,12 @@ bhf cartography --work-dir bhf_work --finding-id <ID>  # which input bytes steer
 
 A C capsule rebuilds with `clang` (or `$CC`), a C++ one with `clang++` (or
 `$CXX`), from the harness driver, the target sources and the headers they
-include in their original layout, the repair stubs, and the language standard
-and extra sources bhf recorded for the build. `python3
+include in their original layout, the repair stubs (their absolute
+`#include`s made relative to the capsule), and what `bhf auto` or `bhf build`
+recorded for the build: the language standard, the extra sources, the
+`AUTO_EXTRA_*` and `[toolchain]` flags and the compatibility flags.
+`bhf verify-poc` compares the replay with the finding's rule, kind and sink
+or site, as `bhf replay` does. `python3
 bhf_work/results/findings/<ID>/replay.py` replays a finding against the work
 dir's own harness binary. See [CLI](cli.md) for the full behavior.
 

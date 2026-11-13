@@ -171,18 +171,27 @@ fn explain_suggests_only_reproduce_commands_that_apply() {
         br#"{"schema_version":1,"language":"ada"}"#,
     )
     .unwrap();
+    let reproduce = || {
+        let explain = bhf()
+            .arg("explain")
+            .arg("--work-dir")
+            .arg(&work)
+            .output()
+            .expect("run bhf explain");
+        let text = String::from_utf8_lossy(&explain.stdout).into_owned();
+        text.split("REPRODUCE OFFLINE")
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing REPRODUCE OFFLINE:\n{text}"))
+            .to_owned()
+    };
 
-    let explain = bhf()
-        .arg("explain")
-        .arg("--work-dir")
-        .arg(&work)
-        .output()
-        .expect("run bhf explain");
-    let text = String::from_utf8_lossy(&explain.stdout);
-    let reproduce = text
-        .split("REPRODUCE OFFLINE")
-        .nth(1)
-        .unwrap_or_else(|| panic!("missing REPRODUCE OFFLINE:\n{text}"));
+    // No harness was built, so replay.py would have nothing to run.
+    let unbuilt = reproduce();
+    assert!(!unbuilt.contains("bhf capsule --work-dir"), "{unbuilt}");
+    assert!(!unbuilt.contains("replay.py"), "{unbuilt}");
+
+    std::fs::write(harness.join("main"), b"\x7fELF").unwrap();
+    let reproduce = reproduce();
     assert!(!reproduce.contains("bhf capsule --work-dir"), "{reproduce}");
     assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
     assert!(reproduce.contains("Ada"), "says why: {reproduce}");
@@ -193,4 +202,72 @@ fn explain_suggests_only_reproduce_commands_that_apply() {
         )),
         "a working alternative: {reproduce}"
     );
+}
+
+/// replay.py runs the harness a relative `fixture_path` names in the work dir
+/// that holds the finding, so explain offers it (or not) the same way from any
+/// current directory.
+#[test]
+fn explain_offers_replay_py_by_the_work_dir_not_the_current_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let id = "F-0001-0000aaaa";
+    let harness_id = "H-A0003-0000ABCD";
+    let finding_dir = work.join("results/findings").join(id);
+    std::fs::create_dir_all(&finding_dir).unwrap();
+    std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+    std::fs::write(finding_dir.join("replay.py"), b"print('replay')\n").unwrap();
+    let harness = work.join("harnesses").join(harness_id);
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(
+        harness.join("generation-metadata.json"),
+        br#"{"schema_version":1,"language":"ada"}"#,
+    )
+    .unwrap();
+    // The harness binary lives only where the relative fixture_path names it
+    // from the work dir; `root/elsewhere/main` is what it names from `root`.
+    std::fs::create_dir_all(work.join("custom")).unwrap();
+    std::fs::write(work.join("custom/main"), b"\x7fELF").unwrap();
+    std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+    std::fs::write(root.path().join("elsewhere/main"), b"\x7fELF").unwrap();
+    let replay_lines = |fixture: &str, cwd: &Path| {
+        std::fs::write(
+            finding_dir.join("finding.json"),
+            serde_json::json!({"id": id, "classification": "unhandled",
+                               "harness_id": harness_id, "fixture_path": fixture})
+            .to_string(),
+        )
+        .unwrap();
+        let explain = bhf()
+            .current_dir(cwd)
+            .arg("explain")
+            .arg("--work-dir")
+            .arg(&work)
+            .output()
+            .expect("run bhf explain");
+        let text = String::from_utf8_lossy(&explain.stdout).into_owned();
+        let reproduce = text
+            .split("REPRODUCE OFFLINE")
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing REPRODUCE OFFLINE:\n{text}"))
+            .to_owned();
+        reproduce
+            .lines()
+            .filter(|line| line.contains("replay.py"))
+            .count()
+    };
+    for cwd in [root.path(), work.as_path(), Path::new("/")] {
+        assert_eq!(
+            replay_lines("custom/main", cwd),
+            1,
+            "from {}",
+            cwd.display()
+        );
+        assert_eq!(
+            replay_lines("elsewhere/main", cwd),
+            0,
+            "from {}",
+            cwd.display()
+        );
+    }
 }

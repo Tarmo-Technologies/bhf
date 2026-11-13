@@ -430,8 +430,11 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
 /// out to be packaged (the check capsule runs before it plans; what planning
 /// checks, such as dependencies in the local cache, it says when it refuses),
 /// otherwise why not and a command that does reproduce it; plus the finding's
-/// `replay.py` and, for an AddressSanitizer crash cartography can map,
-/// `bhf cartography`.
+/// `replay.py` when it finds a harness to run and, for an AddressSanitizer
+/// crash cartography can map, `bhf cartography`. A crash that depended on the
+/// environment the runtrace shim faked is offered `bhf env-capsule` first
+/// (or told why it does not apply), and every other command is flagged as
+/// replaying without that environment.
 fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     use crate::repro_lane::{self, FindingRecord, Tool};
     let record = FindingRecord {
@@ -442,14 +445,37 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     // One shell word each: a work dir may hold a space or `&`
     // (`C:\Users\a b\work`, `R&D files/`).
     let work = repro_lane::sh_word(&work_dir.to_string_lossy());
+    let id = repro_lane::sh_word(&f.id);
     let capsule = work_dir.join("capsules").join(format!("capsule_{}", f.id));
     let replay = f.dir.join("replay.py");
     let mut lines = Vec::new();
+    let environment_driven = environment_driven(f);
+    const CAVEAT: &str = "(replays without the faked environment; may not reproduce)";
+    let caveat = if environment_driven {
+        format!("   {CAVEAT}")
+    } else {
+        String::new()
+    };
+    if environment_driven {
+        match repro_lane::assess(work_dir, &record, Tool::EnvCapsule) {
+            Ok(_) => lines.push(format!(
+                "bhf env-capsule --work-dir {work} --finding-id {id}   # replays the faked \
+                 environment the crash depended on"
+            )),
+            Err(refusal) => {
+                let reason = format!(
+                    "the crash depended on the environment the runtrace shim faked, but bhf \
+                     env-capsule is not available for it: {}",
+                    refusal.reason(Tool::EnvCapsule)
+                );
+                push_wrapped(&mut lines, &reason);
+            }
+        }
+    }
     match repro_lane::assess(work_dir, &record, Tool::Capsule) {
         Ok(_) => {
             lines.push(format!(
-                "bhf capsule --work-dir {work} --finding-id {}",
-                f.id
+                "bhf capsule --work-dir {work} --finding-id {id}{caveat}"
             ));
             lines.push(format!(
                 "bhf verify-poc {}",
@@ -464,11 +490,11 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                     .to_owned(),
             );
             lines.push("  tree too large to ship, and says which)".to_owned());
-            if replay.is_file() {
+            if replay.is_file() && repro_lane::replay_py_finds_harness(work_dir, &record) {
                 // Windows' Python installer provides `python`, not `python3`.
                 let python = if cfg!(windows) { "python" } else { "python3" };
                 lines.push(format!(
-                    "{python} {}",
+                    "{python} {}{caveat}",
                     repro_lane::sh_word(&replay.to_string_lossy())
                 ));
             }
@@ -478,17 +504,11 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                 "bhf capsule is not available for this finding: {}",
                 refusal.reason(Tool::Capsule)
             );
-            for (index, line) in wrap(&reason, 74).into_iter().enumerate() {
-                lines.push(if index == 0 {
-                    line
-                } else {
-                    format!("  {line}")
-                });
-            }
+            push_wrapped(&mut lines, &reason);
             match repro_lane::alternative(work_dir, &record, &refusal) {
                 Some(command) => {
                     lines.push("Reproduce it with:".to_owned());
-                    lines.push(format!("  {command}"));
+                    lines.push(format!("  {command}{caveat}"));
                 }
                 None => lines.push("No offline reproducer is available.".to_owned()),
             }
@@ -518,11 +538,50 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     let asan = str_at(&f.raw, "/exception/sanitizer") == Some("asan");
     if asan && repro_lane::assess(work_dir, &record, Tool::Cartography).is_ok() {
         lines.push(format!(
-            "bhf cartography --work-dir {work} --finding-id {}   # which input bytes steer the access",
-            f.id
+            "bhf cartography --work-dir {work} --finding-id {id}   # which input bytes steer \
+             the access{}",
+            if environment_driven {
+                format!(" {CAVEAT}")
+            } else {
+                String::new()
+            }
         ));
     }
     lines
+}
+
+/// `text` wrapped to the section's width, continuation lines indented.
+fn push_wrapped(lines: &mut Vec<String>, text: &str) {
+    for (index, line) in wrap(text, 74).into_iter().enumerate() {
+        lines.push(if index == 0 {
+            line
+        } else {
+            format!("  {line}")
+        });
+    }
+}
+
+/// Whether the crash depended on the environment the runtrace shim faked:
+/// the shim was armed and the pass that found it served a fake world (`rng`
+/// or `fuzz_driven`; the empty pass and the observing pass-through serve
+/// none) or injected environment variables. The runtrace says nothing more:
+/// the shim logs the lookups a target makes of the real environment and
+/// fakes none of them, and it does not log its own fake files.
+fn environment_driven(f: &Finding) -> bool {
+    let mode = f.raw.get("runtime_mode");
+    let field = |key: &str| mode.and_then(|mode| mode.get(key));
+    if field("shim_armed").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    use crate::auto::pass::Pass;
+    let faking_pass = field("pass")
+        .and_then(Value::as_str)
+        .and_then(Pass::from_str)
+        .is_some_and(|pass| matches!(pass, Pass::Rng | Pass::FuzzDriven));
+    let injected = field("env_injected")
+        .and_then(Value::as_object)
+        .is_some_and(|env| !env.is_empty());
+    faking_pass || injected
 }
 
 /// The HARNESS ARGUMENTS section: the value the harness decoded for each
@@ -2364,6 +2423,112 @@ mod tests {
         ] {
             assert!(reproduce.contains(&command), "{command}\n{reproduce}");
         }
+    }
+
+    /// A crash found while the runtrace shim served a faked world is offered
+    /// `bhf env-capsule` first, and the commands that replay without that
+    /// world say so; each path stays one shell word.
+    #[test]
+    fn reproduce_offline_puts_env_capsule_first_for_an_environment_driven_crash() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work dir");
+        let finding_dir = work.join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+        std::fs::write(finding_dir.join("replay.py"), b"print('replay')\n").unwrap();
+        let harness = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            b"main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        std::fs::write(harness.join("main"), b"\x7fELF").unwrap();
+        let mut finding = frameless_finding(&finding_dir);
+        finding.raw["exception"] = serde_json::json!({
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "AddressSanitizer: heap-buffer-overflow",
+            "stack": []
+        });
+        finding.raw["runtime_mode"] =
+            serde_json::json!({"pass": "rng", "shim_armed": true, "env_injected": {}});
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let lines: Vec<&str> = reproduce
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let quoted = crate::repro_lane::sh_word(&work.to_string_lossy());
+        assert!(quoted.starts_with('\''), "{quoted}");
+        assert!(
+            lines[0].starts_with(&format!(
+                "bhf env-capsule --work-dir {quoted} --finding-id F-0001-0a0b0c0d"
+            )),
+            "{reproduce}"
+        );
+        let caveat = "(replays without the faked environment; may not reproduce)";
+        // Windows' Python installer provides `python`, not `python3`.
+        let python = if cfg!(windows) { "python " } else { "python3 " };
+        for command in [
+            "bhf capsule --work-dir",
+            python,
+            "bhf cartography --work-dir",
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(command))
+                .unwrap_or_else(|| panic!("no {command} line in:\n{reproduce}"));
+            assert!(line.ends_with(caveat), "{line}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    .starts_with(&format!("bhf capsule --work-dir {quoted} --finding-id"))),
+            "{reproduce}"
+        );
+
+        // The empty pass serves nothing: no env-capsule, no caveat.
+        finding.raw["runtime_mode"] =
+            serde_json::json!({"pass": "empty", "shim_armed": true, "env_injected": {}});
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
+        assert!(!reproduce.contains(caveat), "{reproduce}");
+        // A variable the target read from the real environment is no faked
+        // value: the shim logs every lookup and fakes none.
+        std::fs::write(
+            finding_dir.join("runtrace.jsonl"),
+            "{\"e\":\"getenv\",\"n\":\"HOME\",\"r\":1}\n{\"e\":\"getenv\",\"n\":\"LANG\",\"r\":1}\n",
+        )
+        .unwrap();
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(!reproduce.contains("bhf env-capsule"), "{reproduce}");
+        assert!(!reproduce.contains(caveat), "{reproduce}");
+        std::fs::remove_file(finding_dir.join("runtrace.jsonl")).unwrap();
+
+        // An injected variable makes it environment-driven; with no built
+        // harness env-capsule says why it does not apply.
+        finding.raw["runtime_mode"] = serde_json::json!(
+            {"pass": "empty", "shim_armed": true, "env_injected": {"WIDGET_HOME": "/x"}}
+        );
+        std::fs::remove_file(harness.join("main")).unwrap();
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let words = reproduce.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("env-capsule is not available for it")
+                && words.contains("has no built executable"),
+            "{reproduce}"
+        );
+        assert!(
+            !reproduce.contains(python),
+            "no harness for replay.py: {reproduce}"
+        );
     }
 
     /// REPRODUCE OFFLINE offers capsule and verify-poc for a finding of every

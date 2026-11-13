@@ -450,6 +450,10 @@ mod linux {
             guide.contains("`bhf minimize` takes it as `--harness`"),
             "custom-harness.md says bhf minimize takes the harness as --harness"
         );
+        assert!(
+            !guide.contains("records no build recipe"),
+            "custom-harness.md still says bhf build records no build recipe"
+        );
         let c_cpp = flat("c-cpp.md");
         assert!(
             !c_cpp.contains("but does not add it itself"),
@@ -823,5 +827,176 @@ mod linux {
         let suffix = list("w-suffix", "Table::store");
         assert!(suffix.contains("1 ranked target(s)"), "{suffix}");
         assert!(suffix.contains("widgets::Table::store"), "{suffix}");
+    }
+
+    /// The library of [`write_library`] with `table.cpp` needing what only
+    /// the build supplies: a define and a force-included config header.
+    fn write_library_needing_build_inputs(root: &Path) -> PathBuf {
+        let lib = write_library(root);
+        fs::write(
+            lib.join("include/widgets/config.h"),
+            "#pragma once\n#define WIDGETS_SLOT_SIZE 8\n",
+        )
+        .unwrap();
+        fs::write(
+            lib.join("src/table.cpp"),
+            "#include \"table.h\"\n#include <cstring>\n\
+             #ifndef WIDGETS_LEGACY\n#error WIDGETS_LEGACY comes from the build\n#endif\n\
+             namespace widgets {\n\
+             int Table::store(const unsigned char *data, size_t size) {\n\
+             \x20   if (data[0] != '!') return 0;\n\
+             \x20   char *slot = new char[WIDGETS_SLOT_SIZE];\n\
+             \x20   std::memcpy(slot, data, size);\n\
+             \x20   int first = slot[0];\n\
+             \x20   delete[] slot;\n\
+             \x20   return first;\n\
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        lib
+    }
+
+    /// Package `finding` and verify the capsule from a clean copy with the
+    /// library and the work dir moved away.
+    fn capsule_round_trip(work: &Path, lib: &Path, finding: &str) {
+        let packaged = bhf(
+            &args(&[
+                &"capsule",
+                &"--work-dir",
+                &work,
+                &"--finding-id",
+                &finding,
+                &"--verbose",
+            ]),
+            &[],
+            Duration::from_secs(600),
+        );
+        let packaged_text = text(&packaged);
+        assert!(
+            packaged.status.success()
+                && packaged_text.contains(&format!("capsule_{finding}  (✓)"))
+                && packaged_text.contains("1 verified to reproduce"),
+            "{packaged_text}"
+        );
+        let capsule = work.join("capsules").join(format!("capsule_{finding}"));
+        let clean = tempfile::tempdir().unwrap();
+        let copy = clean.path().join("capsule");
+        let copied = Command::new("cp")
+            .arg("-r")
+            .arg(&capsule)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let hidden = [lib.to_path_buf(), work.to_path_buf()];
+        for dir in &hidden {
+            fs::rename(dir, dir.with_extension("hidden")).unwrap();
+        }
+        let verified = bhf(
+            &args(&[&"verify-poc", &copy]),
+            &[],
+            Duration::from_secs(600),
+        );
+        for dir in &hidden {
+            fs::rename(dir.with_extension("hidden"), dir).unwrap();
+        }
+        let verified_text = text(&verified);
+        assert!(
+            verified.status.success() && verified_text.contains("verify-poc: PASS"),
+            "{verified_text}"
+        );
+    }
+
+    /// A harness `bhf build` built with `AUTO_EXTRA_SOURCES` and
+    /// `AUTO_EXTRA_INCLUDES` set records them in its build recipe, so its
+    /// finding packages into a capsule that rebuilds offline without them in
+    /// the environment; so does one regenerated with `--extra-source`.
+    #[test]
+    fn a_harness_built_with_extra_build_inputs_packages_into_a_verified_capsule() {
+        if !cpp_toolchain() {
+            eprintln!("skipping custom-harness capsule flow: clang++ or make unavailable");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let lib = write_library_needing_build_inputs(root.path());
+        let work = root.path().join("bhf_work");
+        let harnesses = work.join("harnesses");
+        let codec = lib.join("src/codec.cpp");
+        let table = lib.join("src/table.cpp");
+        let config = lib.join("include/widgets/config.h");
+        let id = "H-WIDGET-CAPSULE";
+        let generate = |extra_source: Option<&Path>| {
+            let mut command = args(&[
+                &"generate-harness",
+                &codec,
+                &"--target",
+                &"Codec::decode",
+                &"--id",
+                &id,
+                &"--output",
+                &harnesses,
+                &"--extra-include",
+                &lib.join("include"),
+            ]);
+            if let Some(source) = extra_source {
+                command.push("--extra-source".into());
+                command.push(source.into());
+            }
+            let output = bhf(&command, &[], Duration::from_secs(60));
+            assert!(output.status.success(), "{}", text(&output));
+        };
+        generate(None);
+        let includes = format!("-DWIDGETS_LEGACY=1 -include {}", config.display());
+        let built = bhf(
+            &args(&[&"build", &work, &"--harness", &id]),
+            &[
+                ("AUTO_EXTRA_SOURCES", table.clone().into_os_string()),
+                ("AUTO_EXTRA_INCLUDES", includes.clone().into()),
+            ],
+            Duration::from_secs(300),
+        );
+        assert!(built.status.success(), "build failed: {}", text(&built));
+        let recipe: serde_json::Value = serde_json::from_slice(
+            &fs::read(harnesses.join(id).join("coverage-build-recipe.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recipe["schema_version"], 2, "{recipe}");
+        assert_eq!(recipe["recorded_by"], "build", "{recipe}");
+        assert_eq!(
+            recipe["extra_sources"][0],
+            table.display().to_string(),
+            "{recipe}"
+        );
+        assert_eq!(
+            recipe["extra_compile_flags"],
+            serde_json::json!([
+                "-DWIDGETS_LEGACY=1",
+                "-include",
+                config.display().to_string()
+            ]),
+            "{recipe}"
+        );
+
+        let seed = root.path().join("crash.bin");
+        fs::write(&seed, CRASHING_SEED).unwrap();
+        let finding_dir = fuzz_to_finding(&work, id, &seed);
+        let finding = finding_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        capsule_round_trip(&work, &lib, &finding);
+
+        // Regenerated with --extra-source, the sibling is in the Makefile and
+        // only the compile flags come from the environment.
+        generate(Some(&table));
+        let rebuilt = bhf(
+            &args(&[&"build", &work, &"--harness", &id]),
+            &[("AUTO_EXTRA_INCLUDES", includes.into())],
+            Duration::from_secs(300),
+        );
+        assert!(rebuilt.status.success(), "build failed: {}", text(&rebuilt));
+        capsule_round_trip(&work, &lib, &finding);
     }
 }

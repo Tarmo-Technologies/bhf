@@ -50,6 +50,12 @@ const WINDOWS_BUILD_COMMAND: &str = "powershell -NoProfile -ExecutionPolicy Bypa
 // ── `bhf capsule` ───────────────────────────────────────────────────────
 
 /// `bhf capsule` — package reproducible crashes into portable PoC capsules.
+///
+/// A capsule is checked when it is packaged: it reproduces only when its
+/// rebuilt PoC shows the finding's crash (the minimized input ships only
+/// then), and it is portable only when no file it ships, and no manifest
+/// field, names the work dir or the scanned tree; otherwise the summary says
+/// `⚠ not portable: <file> names <path>`.
 #[derive(Debug, clap::Args)]
 pub struct CapsuleArgs {
     /// Work directory of a prior `auto` run to read findings + harnesses from.
@@ -76,6 +82,12 @@ pub struct CapsuleArgs {
 }
 
 /// `bhf verify-poc` — rebuild a capsule offline and assert the crash reproduces.
+///
+/// A C or C++ capsule's replay is compared with the finding's crash field by
+/// field, as `bhf replay` compares it (rule, kind, then sink or site): another
+/// crash of the same sanitizer class is a MISMATCH naming the field that
+/// differs. A capsule packaged before it recorded the finding's identity is
+/// compared by sanitizer class, and says so.
 ///
 /// It needs the programs the capsule's manifest lists under `requires` (the
 /// lane's compiler or interpreter, each overridable by its variable, such as
@@ -155,10 +167,18 @@ pub fn run(args: CapsuleArgs) -> i32 {
                 if report.reproduced {
                     reproduced += 1;
                 }
-                let mark = if report.reproduced {
-                    "✓".to_owned()
-                } else {
-                    format!("⚠ not reproduced: {}", report.not_reproduced_reason)
+                let mark = match (report.reproduced, report.portability.first()) {
+                    (true, None) => "✓".to_owned(),
+                    // It reproduces here, but a rebuild elsewhere needs what
+                    // the named file points at.
+                    (true, Some(first)) => format!(
+                        "⚠ not portable: {first}{}",
+                        match report.portability.len() {
+                            1 => String::new(),
+                            n => format!(" (and {} more)", n - 1),
+                        }
+                    ),
+                    (false, _) => format!("⚠ not reproduced: {}", report.not_reproduced_reason),
                 };
                 println!(
                     "  {} {}  ({})",
@@ -169,6 +189,9 @@ pub fn run(args: CapsuleArgs) -> i32 {
                 println!("      input: {}", report.input_note);
                 if args.verbose {
                     println!("      signature: {}", report.signature);
+                    if let Some(compared) = &report.compared {
+                        println!("      compared: {compared}");
+                    }
                 }
                 for warning in &report.warnings {
                     bhfeprintln!("  {} warning: {warning}", report.finding_id);
@@ -257,9 +280,13 @@ struct CapsuleReport {
     capsule_path: PathBuf,
     reproduced: bool,
     signature: String,
+    /// How the reproduced crash compared with the finding's identity.
+    compared: Option<String>,
     /// Which input shipped, e.g. `min_testcase.bin (minimized, 5 bytes)`.
     input_note: String,
     not_reproduced_reason: String,
+    /// `<file> names <path>`: what keeps the capsule from rebuilding elsewhere.
+    portability: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -274,6 +301,38 @@ struct Verification {
     signature: String,
     /// The input protocol the rebuilt PoC was replayed with, and why.
     protocol: Option<(HarnessProtocol, String)>,
+    /// How the reproducing crash compared with the finding's identity, when
+    /// the capsule records one.
+    identity: Option<IdentityCheck>,
+    /// The first replay that crashed, but not with the finding's crash.
+    mismatch: Option<Mismatch>,
+    /// The rebuilt PoC could not be started at all (permission denied).
+    unrunnable: bool,
+    /// The rebuild failed because it was denied running a program
+    /// (`Permission denied`, as on a mount without exec permission).
+    exec_denied: bool,
+}
+
+/// How a reproduced crash compared with the finding's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityCheck {
+    /// `match`, or `unverified` when where the crash happened could not be
+    /// compared.
+    verdict: &'static str,
+    /// The compared fields (`rule BHF-201; kind heap-buffer-overflow; ...`),
+    /// or what was not compared.
+    line: String,
+}
+
+/// A replay that crashed with another crash than the finding's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mismatch {
+    input: String,
+    signature: String,
+    /// The differing fields, comma-separated (`kind,site`).
+    fields: String,
+    /// One line per differing field (`kind: recorded ..., replayed ...`).
+    differences: Vec<String>,
 }
 
 fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<CapsuleReport> {
@@ -320,9 +379,15 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
         std::fs::write(cap.join(WINDOWS_BUILD_SCRIPT), &windows.script)?;
     }
 
-    // Verify by construction: build + replay in place, capture the signature.
-    // The minimized input ships when it reproduces; otherwise the recorded one.
-    let verification = verify_capsule(cap, f.lane, &inputs);
+    // The crash the finding recorded, in the capsule's own paths: a replay
+    // reproduces the finding only when it shows that crash, at that place.
+    let paths = PathMap::new(&plan, &f.work_dir);
+    let identity = f
+        .lane
+        .finding_identity(&f.raw, &|path: &str| paths.shipped(path));
+    // Verify by construction: build + replay, capture the signature. The
+    // minimized input ships when it reproduces; otherwise the recorded one.
+    let verification = verify_packaged(cap, f, &inputs, identity.as_ref());
     // Leave the capsule pristine (no compiled binary with a machine-specific path).
     remove_build_outputs(cap, &plan.build_outputs);
     let chosen = verification
@@ -354,22 +419,18 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     // The crash the finding recorded, when the lane can name it: a replay
     // that shows another one reproduces a crash, but not this finding's.
     let finding_signature = f.lane.finding_signature(&f.raw);
-    let other = other_crash(
-        finding_signature.as_deref(),
-        verification.reproduced_with.is_some(),
-        &verification.signature,
-    );
+    // Compared field by field when the capsule records the finding's
+    // identity; else by the signature class.
+    let other = match &identity {
+        Some(_) => None,
+        None => other_crash(
+            finding_signature.as_deref(),
+            verification.reproduced_with.is_some(),
+            &verification.signature,
+        ),
+    };
     let reproduced = verification.reproduced_with.is_some() && other.is_none();
     let format_note = crate::generate_harness::finding_format_note(&f.raw, &f.harness_dir);
-    write_manifest(
-        cap,
-        f,
-        &plan,
-        &verification,
-        &source,
-        format_note.as_deref(),
-        finding_signature.as_deref(),
-    )?;
     std::fs::write(
         cap.join("README.md"),
         readme(
@@ -379,6 +440,41 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
             &verification,
             finding_signature.as_deref(),
         ),
+    )?;
+    let mut manifest = manifest_value(
+        f,
+        &plan,
+        &verification,
+        &source,
+        format_note.as_deref(),
+        finding_signature.as_deref(),
+        identity.as_ref(),
+        &paths,
+    );
+    // Portable means a rebuild elsewhere reaches nothing on this host: no
+    // shipped file and no manifest field names the work dir or the tree.
+    let mut portability = plan.portability.problems.clone();
+    if !plan.portability.protected.is_empty() {
+        portability.extend(files_naming(cap, &plan.portability.protected));
+    }
+    let host: Vec<PathBuf> = plan
+        .portability
+        .protected
+        .iter()
+        .cloned()
+        .chain(paths.host_dirs())
+        .collect();
+    if let Some(named) = value_naming(&manifest, &host) {
+        portability.push(format!("manifest.json names {named}"));
+    }
+    portability.dedup();
+    manifest["portable"] = json!(portability.is_empty());
+    if !portability.is_empty() {
+        manifest["portability"] = json!(portability);
+    }
+    std::fs::write(
+        cap.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
     )?;
 
     let final_dir = out_root.join(format!("capsule_{}", f.finding_id));
@@ -402,14 +498,25 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let not_reproduced_reason = match &verification.build_error {
         Some(error) if !verification.built => format!("the rebuild failed: {error}"),
         _ if !verification.built => "the rebuild failed".to_owned(),
-        _ => other
-            .unwrap_or_else(|| "the rebuilt PoC did not crash on the finding's input".to_owned()),
+        _ => match (&verification.mismatch, &identity) {
+            (Some(mismatch), Some(identity)) if verification.reproduced_with.is_none() => {
+                format!(
+                    "the rebuilt PoC shows {}, the finding recorded {}",
+                    describe_mismatch(mismatch),
+                    describe_identity(identity, finding_signature.as_deref())
+                )
+            }
+            _ => other.unwrap_or_else(|| {
+                "the rebuilt PoC did not crash on the finding's input".to_owned()
+            }),
+        },
     };
     Ok(CapsuleReport {
         finding_id: f.finding_id.clone(),
         capsule_path: final_dir,
         reproduced,
         signature: verification.signature,
+        compared: verification.identity.map(|check| check.line),
         input_note: format!(
             "{source} ({}, {size} bytes) as {SHIPPED_INPUT}",
             if minimized {
@@ -419,8 +526,202 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
             }
         ),
         not_reproduced_reason,
+        portability,
         warnings: plan.warnings.into_iter().chain(format_note).collect(),
     })
+}
+
+/// Where the files a capsule ships came from, so a path the finding records
+/// is written as the capsule ships it.
+struct PathMap {
+    /// Original (normalized) path and capsule path of every shipped file.
+    shipped: Vec<(PathBuf, String)>,
+    work_dir: PathBuf,
+    source_root: Option<PathBuf>,
+}
+
+impl PathMap {
+    fn new(plan: &repro_lane::CapsulePlan, work_dir: &Path) -> Self {
+        let absolute = |path: &Path| {
+            repro_lane::normalize(&std::path::absolute(path).unwrap_or_else(|_| path.into()))
+        };
+        let shipped = plan
+            .files
+            .iter()
+            .map(|file| (absolute(&file.from), file.to.clone()))
+            .chain(
+                plan.portability
+                    .shipped_paths
+                    .iter()
+                    .map(|(from, to)| (absolute(from), to.clone())),
+            )
+            .collect();
+        let work_dir = absolute(work_dir);
+        Self {
+            shipped,
+            source_root: repro_lane::recorded_source_root(&work_dir),
+            work_dir,
+        }
+    }
+
+    /// The capsule path of the file the capsule ships for `path`.
+    fn shipped(&self, path: &str) -> Option<String> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return None;
+        }
+        let path = repro_lane::normalize(path);
+        self.shipped
+            .iter()
+            .find(|(from, _)| *from == path)
+            .map(|(_, to)| to.clone())
+    }
+
+    /// `path` as a manifest records it: the capsule path of the file it
+    /// ships, else relative to the scanned tree, else to the work dir. A
+    /// recorded value that only embeds a path gets the same treatment for each
+    /// path in it.
+    fn portable(&self, path: &str) -> String {
+        if let Some(shipped) = self.shipped(path) {
+            return shipped;
+        }
+        let normalized = repro_lane::normalize(Path::new(path));
+        if let Some(rel) = self
+            .source_root
+            .iter()
+            .chain(std::iter::once(&self.work_dir))
+            .find_map(|root| normalized.strip_prefix(root).ok())
+            .filter(|_| Path::new(path).is_absolute())
+        {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+        // A recorded value that only embeds a path (`Lua finding: /tree/x.lua`).
+        let mut text = path.to_owned();
+        for (from, to) in &self.shipped {
+            text = text.replace(&*from.to_string_lossy(), to);
+        }
+        for root in self
+            .source_root
+            .iter()
+            .chain(std::iter::once(&self.work_dir))
+        {
+            let root = root.to_string_lossy();
+            for separator in ['/', '\\'] {
+                text = text.replace(&format!("{root}{separator}"), "");
+            }
+        }
+        text
+    }
+
+    /// The host dirs a manifest must not name: the work dir and the tree.
+    fn host_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        std::iter::once(self.work_dir.clone()).chain(self.source_root.iter().cloned())
+    }
+}
+
+/// `<file> names <path>` for each text file under `cap` (but its inputs and
+/// manifest) that names one of `protected`.
+fn files_naming(cap: &Path, protected: &[PathBuf]) -> Vec<String> {
+    const MAX_SCANNED: u64 = 1024 * 1024;
+    let mut out = Vec::new();
+    let mut stack = vec![cap.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                if path != cap.join("input") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path == cap.join("manifest.json")
+                || std::fs::metadata(&path).map_or(true, |meta| meta.len() > MAX_SCANNED)
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if bytes.contains(&0) {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            if let Some(named) = repro_lane::relocate::named_protected_path(text, protected) {
+                let rel = path
+                    .strip_prefix(cap)
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                out.push(format!("{rel} names {named}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The first string in `value` that names one of `protected`, as
+/// `<field> names <path>` would say it (`sink.file`).
+fn value_naming(value: &Value, protected: &[PathBuf]) -> Option<String> {
+    fn walk(value: &Value, at: &str, protected: &[PathBuf]) -> Option<String> {
+        match value {
+            Value::String(text) => repro_lane::relocate::named_protected_path(text, protected)
+                .map(|named| format!("{named} (in {at})")),
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(index, item)| walk(item, &format!("{at}[{index}]"), protected)),
+            Value::Object(map) => map.iter().find_map(|(key, item)| {
+                let at = if at.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                walk(item, &at, protected)
+            }),
+            _ => None,
+        }
+    }
+    walk(value, "", protected)
+}
+
+/// The finding's identity as one phrase: its signature, kind and where.
+fn describe_identity(identity: &Value, signature: Option<&str>) -> String {
+    let text = |key: &str| identity.get(key).and_then(Value::as_str);
+    let mut parts = Vec::new();
+    if let Some(kind) = text("check").or_else(|| text("kind")) {
+        parts.push(kind.to_owned());
+    }
+    match (text("sink_function"), text("site")) {
+        (Some(sink), Some(site)) => parts.push(format!("in {sink} at {site}")),
+        (Some(sink), None) => parts.push(format!("in {sink}")),
+        (None, Some(site)) => parts.push(format!("at {site}")),
+        (None, None) => {}
+    }
+    match (signature, parts.is_empty()) {
+        (Some(signature), true) => signature.to_owned(),
+        (Some(signature), false) => format!("{signature} ({})", parts.join(" ")),
+        (None, false) => parts.join(" "),
+        (None, true) => text("rule_id").unwrap_or("its crash").to_owned(),
+    }
+}
+
+/// A mismatching replay as one phrase: its signature and what differs.
+fn describe_mismatch(mismatch: &Mismatch) -> String {
+    if mismatch.differences.is_empty() {
+        mismatch.signature.clone()
+    } else {
+        format!(
+            "{} ({})",
+            mismatch.signature,
+            mismatch.differences.join("; ")
+        )
+    }
 }
 
 /// Why a replay that crashed does not reproduce the finding, when the lane
@@ -442,10 +743,18 @@ fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
 }
 
 /// Build the capsule in place, then replay each input in turn; the first that
-/// crashes is the one the capsule reproduces with. The rebuilt PoC is replayed
-/// with the protocol the shared detector reads off it (the lane's own when the
-/// detector finds nothing that says).
-fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verification {
+/// crashes with the finding's crash is the one the capsule reproduces with.
+/// With the finding's `identity` (its rule, kind and sink or site, in capsule
+/// paths) a crash is compared field by field, as `bhf replay` compares it, and
+/// one that differs is not the finding's; without it, any crash is. The
+/// rebuilt PoC is replayed with the protocol the shared detector reads off it
+/// (the lane's own when the detector finds nothing that says).
+fn verify_capsule(
+    cap: &Path,
+    lane: &dyn Lane,
+    inputs: &[String],
+    identity: Option<&Value>,
+) -> Verification {
     let (mut build, script, poc) = build_command(cap);
     let built = |cap: &Path| cap.join(poc).is_file();
     match crate::command_output::output_with_timeout(&mut build, BUILD_TIMEOUT) {
@@ -460,6 +769,7 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
                         (!out.status.success() || !built(cap))
                             .then(|| format!("{script} produced no {poc}"))
                     }),
+                exec_denied: [&stderr, &stdout].iter().any(|text| denied_execution(text)),
                 ..Verification::default()
             };
         }
@@ -471,34 +781,147 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
         }
     }
     let (protocol, basis) = replay_protocol(cap, lane);
+    let record = identity.and_then(|identity| identity.get("record"));
+    let mut mismatch = None;
+    let mut unrunnable = false;
     for input in inputs {
         // A replay that ran out its wall clock did not show the crash.
-        let Ok(replay) = repro_lane::replay_poc(cap, input, protocol, REPLAY_TIMEOUT)
-            .map_err(|_| ())
-            .and_then(|replay| {
-                if replay.timed_out {
-                    Err(())
-                } else {
-                    Ok(replay)
-                }
-            })
-        else {
+        let replay = match repro_lane::replay_poc(cap, input, protocol, REPLAY_TIMEOUT) {
+            Ok(replay) if !replay.timed_out => replay,
+            Ok(_) => continue,
+            Err(error) => {
+                unrunnable |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                continue;
+            }
+        };
+        let Some(signature) = lane.crash_signature(&replay) else {
             continue;
         };
-        if let Some(signature) = lane.crash_signature(&replay) {
-            return Verification {
-                built: true,
-                build_error: None,
-                reproduced_with: Some(input.clone()),
-                signature,
-                protocol: Some((protocol, basis)),
-            };
-        }
+        let check = match record {
+            None => None,
+            Some(record) => match identity_check(record, &replay.stderr) {
+                Ok(check) => Some(check),
+                Err((fields, differences)) => {
+                    mismatch.get_or_insert(Mismatch {
+                        input: input.clone(),
+                        signature,
+                        fields,
+                        differences,
+                    });
+                    continue;
+                }
+            },
+        };
+        return Verification {
+            built: true,
+            build_error: None,
+            reproduced_with: Some(input.clone()),
+            signature,
+            protocol: Some((protocol, basis)),
+            identity: check,
+            mismatch,
+            unrunnable: false,
+            exec_denied: false,
+        };
     }
     Verification {
         built: true,
         protocol: Some((protocol, basis)),
+        mismatch,
+        unrunnable,
         ..Verification::default()
+    }
+}
+
+/// Why a capsule of a lane that compares identities has none to compare
+/// (manifest `identity_comparison.reason`).
+const NO_IDENTITY_REASON: &str = "the finding recorded no sanitizer report to compare field by \
+     field, so only the crash class was compared";
+
+/// The packaging-time verification of the staged capsule `cap`. The build
+/// runs in a copy outside the work dir, so it reaches nothing beside the
+/// capsule that it does not ship; where that copy cannot run what was built
+/// in it (a temp dir mounted noexec: the PoC, or a build script or
+/// proc-macro the build runs), it runs in place.
+fn verify_packaged(
+    cap: &Path,
+    f: &FindingRef,
+    inputs: &[String],
+    identity: Option<&Value>,
+) -> Verification {
+    match verify_elsewhere(cap, f, inputs, identity) {
+        Some(verification) if !verification.unrunnable && !verification.exec_denied => verification,
+        _ => verify_capsule(cap, f.lane, inputs, identity),
+    }
+}
+
+/// Whether a build's output says it was denied running a program: the
+/// shell's `Permission denied` or a toolchain's `os error 13` (EACCES).
+fn denied_execution(output: &str) -> bool {
+    output.contains("Permission denied") || output.contains("os error 13")
+}
+
+/// [`verify_capsule`] on a copy of the staged capsule in a scratch dir
+/// outside the work dir and the scanned tree; `None` when the copy cannot be
+/// made.
+fn verify_elsewhere(
+    cap: &Path,
+    f: &FindingRef,
+    inputs: &[String],
+    identity: Option<&Value>,
+) -> Option<Verification> {
+    let scratch = tempfile::Builder::new()
+        .prefix("bhf-capsule-verify-")
+        .tempdir()
+        .ok()?;
+    let copy = scratch.path().join(format!("capsule_{}", f.finding_id));
+    copy_tree(cap, &copy).ok()?;
+    Some(verify_capsule(&copy, f.lane, inputs, identity))
+}
+
+/// Copy the tree under `from` to `to`, file modes included.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// How a replay's crash compares with the finding's identity `record`: how
+/// it matched, or the differing fields and one line per difference. A replay
+/// that printed no sanitizer report (a bare fatal signal) is taken for the
+/// finding's crash, with where it happened not compared.
+fn identity_check(record: &Value, stderr: &str) -> Result<IdentityCheck, (String, Vec<String>)> {
+    let Some(report) = corpus::sanitizer::parse_sanitizer_report(stderr) else {
+        return Ok(IdentityCheck {
+            verdict: "unverified",
+            line: "site not compared: the rebuilt PoC printed no sanitizer report".to_owned(),
+        });
+    };
+    let comparison = crate::crash_identity::compare(record, &report);
+    match comparison.verdict() {
+        crate::crash_identity::Verdict::Match => Ok(IdentityCheck {
+            verdict: "match",
+            line: comparison.compared_line(),
+        }),
+        crate::crash_identity::Verdict::Unverified => Ok(IdentityCheck {
+            verdict: "unverified",
+            line: format!(
+                "{} not compared ({})",
+                comparison.not_compared_fields(),
+                comparison.compared_line()
+            ),
+        }),
+        crate::crash_identity::Verdict::Mismatch => {
+            Err((comparison.differing_fields(), comparison.difference_lines()))
+        }
     }
 }
 
@@ -622,16 +1045,27 @@ fn remove_build_outputs(cap: &Path, outputs: &[&str]) {
     }
 }
 
-fn write_manifest(
-    cap: &Path,
+#[allow(clippy::too_many_arguments)]
+fn manifest_value(
     f: &FindingRef,
     plan: &repro_lane::CapsulePlan,
     verification: &Verification,
     input_source: &str,
     format_note: Option<&str>,
     finding_signature: Option<&str>,
-) -> anyhow::Result<()> {
-    let sink = f.raw.pointer("/actionability/sink").cloned();
+    identity: Option<&Value>,
+    paths: &PathMap,
+) -> Value {
+    // The sink names the file in the capsule's terms, not this host's.
+    let mut sink = f.raw.pointer("/actionability/sink").cloned();
+    if let Some(file) = sink
+        .as_mut()
+        .and_then(|sink| sink.get_mut("file"))
+        .filter(|file| file.is_string())
+    {
+        let portable = paths.portable(file.as_str().unwrap_or_default());
+        *file = json!(portable);
+    }
     let cwe = f.raw.pointer("/actionability/cwe").cloned();
     // The main program the rebuild needs, as older capsules recorded it.
     let main_tool = plan.requires.first();
@@ -640,7 +1074,7 @@ fn write_manifest(
         .as_ref()
         .map(|(protocol, _)| *protocol)
         .unwrap_or_else(|| f.lane.protocol());
-    let manifest = json!({
+    let mut manifest = json!({
         "schema": "bhf.capsule/v1",
         "bhf_version": env!("BHF_VERSION_FULL"),
         "finding_id": f.finding_id,
@@ -665,10 +1099,12 @@ fn write_manifest(
         "protocol_basis": verification.protocol.as_ref().map(|(_, basis)| basis),
         "run": run_line(protocol, SHIPPED_INPUT),
         "rebuilt": verification.built,
+        // Why the rebuild failed when it was packaged, so verify-poc says so
+        // instead of guessing at the crash.
+        "build_error": verification.build_error,
         "expected_signature": verification.signature,
         "reproduced": verification.reproduced_with.is_some(),
     });
-    let mut manifest = manifest;
     // The Windows build: no POSIX shell, its own compilers.
     if let Some(windows) = &plan.windows {
         manifest["build_windows"] = json!(WINDOWS_BUILD_COMMAND);
@@ -693,24 +1129,49 @@ fn write_manifest(
     }
     if let Some(recorded) = finding_signature {
         manifest["finding_signature"] = json!(recorded);
-        // The rebuilt PoC crashed, but not with the finding's crash: it does
-        // not reproduce this finding.
-        if other_crash(
-            Some(recorded),
+    }
+    // The finding's crash as verify-poc compares it: rule, kind, check, sink
+    // and site, in the capsule's paths.
+    if let Some(identity) = identity {
+        manifest["finding_identity"] = identity.clone();
+        if let Some(check) = &verification.identity {
+            manifest["identity_comparison"] = json!({
+                "verdict": check.verdict,
+                "compared": check.line,
+            });
+        }
+    } else if f.lane.compares_identity() {
+        // A lane that compares identities, on a finding that has none to
+        // compare: say so, so verify-poc does not take the capsule for one
+        // packaged before identities were recorded.
+        manifest["identity_comparison"] = json!({
+            "verdict": "none",
+            "reason": NO_IDENTITY_REASON,
+        });
+    }
+    // The rebuilt PoC crashed, but not with the finding's crash: it does not
+    // reproduce this finding.
+    let other_class = identity.is_none()
+        && other_crash(
+            finding_signature,
             verification.reproduced_with.is_some(),
             &verification.signature,
         )
-        .is_some()
-        {
-            manifest["reproduced"] = json!(false);
-            manifest["reproduced_other_crash"] = json!(true);
-        }
+        .is_some();
+    if other_class {
+        manifest["reproduced"] = json!(false);
+        manifest["reproduced_other_crash"] = json!(true);
     }
-    std::fs::write(
-        cap.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    Ok(())
+    if let (Some(mismatch), None) = (&verification.mismatch, &verification.reproduced_with) {
+        manifest["reproduced_other_crash"] = json!(true);
+        manifest["other_crash"] = json!({
+            "input": mismatch.input,
+            "signature": mismatch.signature,
+            "differs": mismatch.fields,
+            "differences": mismatch.differences,
+        });
+    }
+    manifest
 }
 
 fn readme(
@@ -830,20 +1291,31 @@ fn readme(
         id = f.finding_id,
         language = f.lane.name(),
         summary = plan.build_summary,
-        signature = match finding_signature.filter(|recorded| {
-            other_crash(
-                Some(recorded),
-                verification.reproduced_with.is_some(),
-                &verification.signature,
-            )
-            .is_some()
-        }) {
-            Some(recorded) => format!(
+        signature = match (
+            finding_signature,
+            &verification.mismatch,
+            &verification.reproduced_with,
+        ) {
+            (Some(recorded), Some(mismatch), None) => format!(
                 "`{recorded}` (what the finding recorded; the rebuilt PoC showed `{}` when \
                  it was packaged)",
-                verification.signature
+                describe_mismatch(mismatch)
             ),
-            None => format!("`{}`", verification.signature),
+            _ => match finding_signature.filter(|recorded| {
+                other_crash(
+                    Some(recorded),
+                    verification.reproduced_with.is_some(),
+                    &verification.signature,
+                )
+                .is_some()
+            }) {
+                Some(recorded) => format!(
+                    "`{recorded}` (what the finding recorded; the rebuilt PoC showed `{}` \
+                     when it was packaged)",
+                    verification.signature
+                ),
+                None => format!("`{}`", verification.signature),
+            },
         },
     )
 }
@@ -922,8 +1394,13 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         .unwrap_or("input/testcase.bin")
         .to_owned();
 
+    // The finding's crash as the capsule recorded it, compared field by field;
+    // a capsule packaged before it was recorded is compared by class.
+    let identity = manifest
+        .get("finding_identity")
+        .filter(|identity| identity.get("record").is_some());
     // Rebuild in place (or a temp copy — for a tar it's already scratch).
-    let verification = verify_capsule(&root, lane, std::slice::from_ref(&input));
+    let verification = verify_capsule(&root, lane, std::slice::from_ref(&input), identity);
     remove_build_outputs(
         &root,
         &[
@@ -933,6 +1410,29 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         .concat(),
     );
     let reproduced = verification.reproduced_with.is_some();
+    let finding = manifest
+        .get("finding_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    if let (false, Some(mismatch), Some(identity)) = (reproduced, &verification.mismatch, identity)
+    {
+        // It crashed, but not with the finding's crash.
+        println!(
+            "verify-poc: MISMATCH — {} (finding {finding}): {} differs",
+            mismatch.signature, mismatch.fields
+        );
+        println!(
+            "  expected: {}",
+            describe_identity(
+                identity,
+                (!expected.is_empty()).then_some(expected.as_str())
+            )
+        );
+        for difference in &mismatch.differences {
+            println!("  differs:  {difference}");
+        }
+        return 1;
+    }
     let observed = verification.signature;
 
     if !reproduced {
@@ -948,10 +1448,6 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                 .get("reproduced_other_crash")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-        let finding = manifest
-            .get("finding_id")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
         if packaged_reproducing {
             println!("verify-poc: FAIL — the capsule did not rebuild+crash as expected");
             println!("  finding:  {finding}");
@@ -961,6 +1457,51 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                     println!("  observed: the rebuild failed: {error}");
                 }
                 _ => println!("  observed: <no crash>"),
+            }
+        } else if manifest.get("rebuilt").and_then(Value::as_bool) == Some(false) {
+            // The capsule never ran: its own rebuild failed when it was
+            // packaged, so the crash was never replayed. Whether the build is
+            // still what fails is this run's to say.
+            let packaged_error = manifest
+                .get("build_error")
+                .and_then(Value::as_str)
+                .filter(|error| !error.is_empty())
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default();
+            if verification.built {
+                println!(
+                    "verify-poc: NOT REPRODUCIBLE — the capsule rebuilds here, but its input \
+                     did not crash"
+                );
+                println!("  finding:  {finding}");
+                println!(
+                    "  packaged: the crash was never replayed; the rebuild failed \
+                     then{packaged_error}"
+                );
+                println!(
+                    "  note:     package the finding again where its harness builds to \
+                     record whether its capsule reproduces it; `bhf explain --finding-id \
+                     {finding}` shows what the fuzzing run depended on"
+                );
+            } else {
+                println!(
+                    "verify-poc: NOT REPRODUCIBLE — the capsule's rebuild failed when it was \
+                     packaged{packaged_error}"
+                );
+                println!("  finding:  {finding}");
+                if let Some(error) = &verification.build_error {
+                    println!("  observed: the rebuild fails here too: {error}");
+                }
+                println!(
+                    "  fix:      the build, not the crash: run `{}` here to see the error, \
+                     fix what the harness build needs (for example the flags its build \
+                     recipe records), then package the finding again",
+                    if uses_windows_build(&root) {
+                        WINDOWS_BUILD_COMMAND
+                    } else {
+                        "sh build.sh"
+                    }
+                );
             }
         } else {
             println!(
@@ -978,18 +1519,44 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         }
         return 1;
     }
-    // Signature match is best-effort: if the manifest recorded one, require the class
-    // to agree; otherwise any sanitizer crash counts.
-    let matched = expected.is_empty() || signature_matches(&expected, &observed);
+    // With the finding's identity the replay was compared field by field;
+    // otherwise, when the manifest recorded a signature, its class must agree
+    // (any sanitizer crash counts when it recorded none).
+    let matched =
+        identity.is_some() || expected.is_empty() || signature_matches(&expected, &observed);
     println!(
-        "verify-poc: {} — {} (finding {})",
+        "verify-poc: {} — {} (finding {finding})",
         if matched { "PASS" } else { "MISMATCH" },
         observed,
-        manifest
-            .get("finding_id")
-            .and_then(Value::as_str)
-            .unwrap_or("?"),
     );
+    match &verification.identity {
+        Some(check) if check.verdict == "match" => println!("  compared: {}", check.line),
+        Some(check) => println!("  note:     {}", check.line),
+        None if lane.compares_identity() && matched => {
+            let comparison = manifest.get("identity_comparison");
+            let verdict = comparison
+                .and_then(|comparison| comparison.get("verdict"))
+                .and_then(Value::as_str);
+            if verdict == Some("none") {
+                let reason = comparison
+                    .and_then(|comparison| comparison.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(NO_IDENTITY_REASON);
+                println!("  note:     {reason}");
+            } else {
+                println!(
+                    "  note:     this capsule records no finding identity (packaged by an \
+                     older bhf), so only the sanitizer class was compared"
+                );
+            }
+        }
+        None => {}
+    }
+    if let Some(problems) = manifest.get("portability").and_then(Value::as_array) {
+        if let Some(first) = problems.first().and_then(Value::as_str) {
+            println!("  note:     not portable when packaged: {first}");
+        }
+    }
     if !matched {
         println!("  expected: {expected}");
         let packaged = manifest
@@ -1267,6 +1834,270 @@ build.ps1: C:\\VS\\cl.exe exited with 2 at step link_1
         );
         assert_eq!(other_crash(None, true, "ada:CONSTRAINT_ERROR"), None);
         assert_eq!(other_crash(Some("ada:PROGRAM_ERROR"), false, ""), None);
+    }
+
+    fn plan_shipping(files: &[(&str, &str)]) -> repro_lane::CapsulePlan {
+        repro_lane::CapsulePlan {
+            files: files
+                .iter()
+                .map(|(from, to)| repro_lane::CapsuleFile {
+                    from: PathBuf::from(from),
+                    to: (*to).to_owned(),
+                })
+                .collect(),
+            generated: Vec::new(),
+            build_script: String::new(),
+            build_summary: String::new(),
+            build_facts: json!({}),
+            requires: Vec::new(),
+            layout: Vec::new(),
+            build_outputs: Vec::new(),
+            warnings: Vec::new(),
+            windows: None,
+            portability: repro_lane::PlanPortability {
+                shipped_paths: vec![(
+                    PathBuf::from("/w/harnesses/H-X1/repairs/auto_stubs.cpp"),
+                    "stubs/auto_stubs.cpp".to_owned(),
+                )],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A path the finding records is written in the manifest as the capsule
+    /// ships the file, else relative to the scanned tree or the work dir; a
+    /// path neither holds stays as it is.
+    #[test]
+    fn a_manifest_names_recorded_paths_in_capsule_terms() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("w");
+        let tree = temp.path().join("tree");
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::write(
+            work.join("auto/run.json"),
+            json!({ "source_root": tree }).to_string(),
+        )
+        .unwrap();
+        let reader = tree.join("src").join("reader.cpp");
+        let mut plan = plan_shipping(&[(&text(&reader), "sources/src/reader.cpp")]);
+        let stub = work.join("harnesses/H-X1/repairs/auto_stubs.cpp");
+        plan.portability.shipped_paths = vec![(stub.clone(), "stubs/auto_stubs.cpp".to_owned())];
+        let paths = PathMap::new(&plan, &work);
+        assert_eq!(
+            paths.portable(&text(&tree.join("src").join(".").join("reader.cpp"))),
+            "sources/src/reader.cpp"
+        );
+        assert_eq!(paths.portable(&text(&stub)), "stubs/auto_stubs.cpp");
+        assert_eq!(
+            paths.portable(&text(&tree.join("lib").join("other.c"))),
+            "lib/other.c"
+        );
+        assert_eq!(
+            paths.portable(&text(&work.join("harnesses").join("H-X1").join("main.cpp"))),
+            "harnesses/H-X1/main.cpp"
+        );
+        assert_eq!(
+            paths.portable("/usr/include/string.h"),
+            "/usr/include/string.h"
+        );
+        assert_eq!(paths.portable("reader.cpp"), "reader.cpp");
+        // A recorded value that embeds a path, as a runtime's report line does.
+        assert_eq!(
+            paths.portable(&format!(
+                "Lua finding: {}/lib/record_parser.lua",
+                tree.display()
+            )),
+            "Lua finding: lib/record_parser.lua"
+        );
+        assert_eq!(
+            paths.portable(&format!("finding at {}:3", reader.display())),
+            "finding at sources/src/reader.cpp:3"
+        );
+
+        // A manifest field that still names the work dir or the tree is found.
+        let host: Vec<PathBuf> = paths.host_dirs().collect();
+        let manifest = json!({
+            "finding_id": "F-0001-0000aaaa",
+            "sink": {"file": "sources/src/reader.cpp"},
+            "requires": [{"program": "/usr/bin/clang++"}],
+        });
+        assert_eq!(value_naming(&manifest, &host), None);
+        let leaky = json!({ "sink": { "file": reader } });
+        assert_eq!(
+            value_naming(&leaky, &host),
+            Some(format!("{} (in sink.file)", reader.display()))
+        );
+    }
+
+    /// Every shipped text file is checked for the dirs a rebuild elsewhere
+    /// cannot reach; the inputs and the manifest are not shipped text.
+    #[test]
+    fn shipped_files_naming_a_host_dir_are_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let cap = temp.path();
+        std::fs::create_dir_all(cap.join("stubs")).unwrap();
+        std::fs::create_dir_all(cap.join("input")).unwrap();
+        std::fs::write(
+            cap.join("stubs/auto_stubs.c"),
+            "#include \"/tree/inc/vendor.h\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cap.join("stubs/ok.c"),
+            "#include \"../sources/inc/vendor.h\"\n",
+        )
+        .unwrap();
+        std::fs::write(cap.join("input/testcase.bin"), "/tree/inc").unwrap();
+        std::fs::write(cap.join("manifest.json"), "\"/tree\"").unwrap();
+        assert_eq!(
+            files_naming(cap, &[PathBuf::from("/tree")]),
+            ["stubs/auto_stubs.c names /tree/inc/vendor.h"]
+        );
+        // A path that only starts with the dir's name is another dir.
+        std::fs::write(cap.join("stubs/auto_stubs.c"), "/treehouse/x.h\n").unwrap();
+        assert!(files_naming(cap, &[PathBuf::from("/tree")]).is_empty());
+    }
+
+    /// A replay's crash compared with the finding's identity: the same crash
+    /// matches; another check differs, naming the field; a replay without a
+    /// sanitizer report is taken, its site not compared.
+    #[test]
+    fn a_replay_is_compared_with_the_finding_identity() {
+        let record = json!({
+            "rule_id": "BHF-201",
+            "exception": {
+                "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                "sanitizer": "asan",
+                "stack": [{"function": "parse_record", "file": "sources/parse.c", "line": 7}]
+            }
+        });
+        let asan = |kind: &str, line: u32| {
+            format!(
+                "==1==ERROR: AddressSanitizer: {kind} on address 0x602000000014 at pc 0x1 bp 0x2 sp 0x3\n\
+                 WRITE of size 8 at 0x602000000014 thread T0\n\
+                 \x20   #0 0x1 in __asan_memcpy\n\
+                 \x20   #1 0x2 in parse_record /c/sources/parse.c:{line}:5\n\
+                 \x20   #2 0x3 in main /c/harness/main.c:90:3\n\
+                 SUMMARY: AddressSanitizer: {kind} /c/sources/parse.c:{line}:5 in parse_record\n"
+            )
+        };
+        let same = identity_check(&record, &asan("heap-buffer-overflow", 7)).unwrap();
+        assert_eq!(same.verdict, "match");
+        assert!(same.line.contains("sink parse_record"), "{}", same.line);
+        let (fields, differences) = identity_check(&record, &asan("SEGV", 3)).unwrap_err();
+        assert!(fields.contains("kind"), "{fields}");
+        assert!(
+            differences
+                .iter()
+                .any(|line| line.starts_with("kind: recorded heap-buffer-overflow")),
+            "{differences:?}"
+        );
+        let bare = identity_check(&record, "Segmentation fault\n").unwrap();
+        assert_eq!(bare.verdict, "unverified");
+        assert!(bare.line.contains("site not compared"), "{}", bare.line);
+    }
+
+    /// The capsule-time verification runs in a copy away from where the
+    /// capsule is staged: a build that reaches a file beside the capsule
+    /// (here, one next to its dir) does not verify.
+    #[cfg(unix)]
+    #[test]
+    fn a_capsule_is_verified_away_from_where_it_is_staged() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("work/capsules");
+        let cap = out.join(".capsule_F-1.stage");
+        std::fs::create_dir_all(cap.join("input")).unwrap();
+        std::fs::write(cap.join("input/testcase.bin"), b"x").unwrap();
+        std::fs::write(out.join("beside.txt"), b"x").unwrap();
+        // A PoC that reports a sanitizer crash, written only when the file
+        // beside the capsule is reachable.
+        std::fs::write(
+            cap.join("build.sh"),
+            "#!/bin/sh\nset -e\ncd \"$(dirname \"$0\")\"\ntest -f ../beside.txt\n\
+             printf '#!/bin/sh\\necho \"==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\" >&2\\nexit 1\\n' > poc\n\
+             chmod +x poc\n",
+        )
+        .unwrap();
+        let finding = FindingRef {
+            finding_id: "F-1".to_owned(),
+            finding_dir: temp.path().join("work/results/findings/F-1"),
+            harness_id: "H-C0001".to_owned(),
+            harness_dir: temp.path().join("work/harnesses/H-C0001"),
+            work_dir: temp.path().join("work"),
+            lane: &repro_lane::C_LANE,
+            inputs: Vec::new(),
+            raw: json!({}),
+        };
+        let inputs = vec!["input/testcase.bin".to_owned()];
+        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None).unwrap();
+        assert!(!elsewhere.built, "{elsewhere:?}");
+        assert!(
+            !cap.join("poc").exists(),
+            "the copy's build leaves the staged capsule as packaged"
+        );
+        // In place, the same build reaches the file and the PoC reproduces.
+        let in_place = verify_capsule(&cap, &repro_lane::C_LANE, &inputs, None);
+        assert!(in_place.reproduced_with.is_some(), "{in_place:?}");
+    }
+
+    /// A build that cannot run a program it built in the scratch copy (a
+    /// temp dir mounted noexec: `Permission denied`) says nothing about the
+    /// capsule, so packaging verifies it in place instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_denied_execution_in_the_scratch_copy_is_verified_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("work/capsules");
+        let cap = out.join(".capsule_F-1.stage");
+        std::fs::create_dir_all(cap.join("input")).unwrap();
+        std::fs::write(cap.join("input/testcase.bin"), b"x").unwrap();
+        std::fs::write(out.join("beside.txt"), b"x").unwrap();
+        // Away from the staged capsule the build fails the way a build
+        // script or proc-macro does on a noexec mount; in place it builds a
+        // PoC that reports a sanitizer crash.
+        std::fs::write(
+            cap.join("build.sh"),
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n\
+             if ! test -f ../beside.txt; then\n\
+             echo 'error: could not execute process `build/tool` (never executed)' >&2\n\
+             echo 'Caused by: Permission denied (os error 13)' >&2\n\
+             exit 101\nfi\n\
+             printf '#!/bin/sh\\necho \"==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\" >&2\\nexit 1\\n' > poc\n\
+             chmod +x poc\n",
+        )
+        .unwrap();
+        let finding = FindingRef {
+            finding_id: "F-1".to_owned(),
+            finding_dir: temp.path().join("work/results/findings/F-1"),
+            harness_id: "H-C0001".to_owned(),
+            harness_dir: temp.path().join("work/harnesses/H-C0001"),
+            work_dir: temp.path().join("work"),
+            lane: &repro_lane::C_LANE,
+            inputs: Vec::new(),
+            raw: json!({}),
+        };
+        let inputs = vec!["input/testcase.bin".to_owned()];
+        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None).unwrap();
+        assert!(!elsewhere.built, "{elsewhere:?}");
+        let verified = verify_packaged(&cap, &finding, &inputs, None);
+        assert!(verified.reproduced_with.is_some(), "{verified:?}");
+
+        // A build that fails for any other reason fails where it was copied
+        // to, and is reported as it failed there.
+        std::fs::write(
+            cap.join("build.sh"),
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n\
+             test -f ../beside.txt || { echo 'cc: error: no input files' >&2; exit 1; }\n\
+             printf '#!/bin/sh\\nexit 1\\n' > poc\nchmod +x poc\n",
+        )
+        .unwrap();
+        let verified = verify_packaged(&cap, &finding, &inputs, None);
+        assert!(!verified.built, "{verified:?}");
+        assert_eq!(
+            verified.build_error.as_deref(),
+            Some("cc: error: no input files")
+        );
     }
 
     #[test]

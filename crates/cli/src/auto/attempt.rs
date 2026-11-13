@@ -3223,6 +3223,7 @@ fn run_attempt(
         // Round 0 always builds outright, so a target that compiles as-is never
         // pays for a check it did not need.
         let round = if distrust_semantic_check { 0 } else { retry };
+        let mut built_standard = None;
         match try_build(
             candidate,
             &harness_dir,
@@ -3236,6 +3237,7 @@ fn run_attempt(
             options.project.as_deref(),
             &options.ada_toolchain,
             round,
+            &mut built_standard,
         ) {
             BuildOutcome::Success => {
                 // Record the emulator this harness runs under beside it (or
@@ -3255,24 +3257,36 @@ fn run_attempt(
                     crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
                 ) {
                     let is_cpp = candidate.lang == crate::auto::candidate::Lang::Cpp;
-                    let explicit_standard = is_cpp
-                        .then(|| std::env::var("BHF_CXX_STD").ok())
-                        .flatten()
-                        .map(|value| value.trim().to_owned())
-                        .filter(|value| !value.is_empty());
-                    let cached_standard = std::fs::read_to_string(cxx_dialect_cache_path(
-                        work_dir,
-                        &candidate.harness_id,
-                    ))
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty());
+                    // The standard the successful build used, as the build
+                    // reported it: re-reading the dialect cache here could
+                    // look up a key the build's own log has changed since.
+                    let compiler_family =
+                        if std::fs::read_to_string(c_compiler_cache_path(work_dir))
+                            .is_ok_and(|cached| cached.trim() == "gcc")
+                        {
+                            Some(harness_gen::compiler_family::CompilerFamily::Gcc)
+                        } else {
+                            let compilers = crate::toolchain::effective_compilers();
+                            let compiler = match &cross_compiler {
+                                Some(cross) if is_cpp => cross.cxx.clone(),
+                                Some(cross) => cross.cc.clone(),
+                                None if is_cpp => compilers.cxx,
+                                None => compilers.cc,
+                            };
+                            crate::toolchain::compiler_family(&compiler, is_cpp)
+                        };
                     crate::auto::coverage_replay::persist_build_recipe(
                         &harness_dir,
-                        &extra_sources,
-                        &extra_includes,
-                        explicit_standard.or(cached_standard),
-                        cross_compiler.is_none(),
+                        &crate::auto::coverage_replay::RecipeBuild {
+                            work_dir,
+                            extra_sources: &extra_sources,
+                            extra_includes: &extra_includes,
+                            standard: built_standard.clone(),
+                            native: cross_compiler.is_none(),
+                            cpp: is_cpp,
+                            compiler_family,
+                            recorded_by: "auto",
+                        },
                     );
                 }
                 // Drive a cascade of fuzz passes against the freshly
@@ -6083,6 +6097,7 @@ fn try_build(
     project_override: Option<&Path>,
     ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
+    built_standard: &mut Option<String>,
 ) -> BuildOutcome {
     use crate::auto::candidate::Lang;
     let work_dir = dir
@@ -6102,6 +6117,7 @@ fn try_build(
             cross_compiler,
             sanitizers,
             round,
+            built_standard,
         ),
         Lang::Ada => try_build_ada(
             work_dir,
@@ -6292,6 +6308,10 @@ fn try_build(
     }
 }
 
+/// Build a C/C++ harness. On success `built_standard` holds the language
+/// standard the build that succeeded used (`None`: the Makefile's default),
+/// which the build recipe records.
+#[allow(clippy::too_many_arguments)]
 fn try_build_c(
     work_dir: &Path,
     harness_id: &str,
@@ -6300,6 +6320,7 @@ fn try_build_c(
     cross_compiler: Option<&crate::build::CFamilyCompilerOverride>,
     sanitizers: &multicore_fuzz::SanitizerSelection,
     round: usize,
+    built_standard: &mut Option<String>,
 ) -> BuildOutcome {
     use multicore_fuzz::SanitizerSelection;
     // `auto --sanitizers` arms an explicit `-fsanitize=` set for the native build.
@@ -6397,6 +6418,7 @@ fn try_build_c(
         chosen_std.as_deref(),
     );
     if build_succeeded(&output) {
+        *built_standard = chosen_std.clone();
         return BuildOutcome::Success;
     }
     let mut raw_output = combined_build_output(&output);
@@ -6434,6 +6456,7 @@ fn try_build_c(
             chosen_std.as_deref(),
         );
         if build_succeeded(&compat_output) {
+            *built_standard = chosen_std.clone();
             return BuildOutcome::Success;
         }
         let compat_raw = combined_build_output(&compat_output);
@@ -6464,6 +6487,7 @@ fn try_build_c(
             None,
         );
         if build_succeeded(&compat_output) {
+            *built_standard = None;
             return BuildOutcome::Success;
         }
         let compat_raw = combined_build_output(&compat_output);
@@ -6505,6 +6529,7 @@ fn try_build_c(
             None,
         );
         if build_succeeded(&output) {
+            *built_standard = None;
             return BuildOutcome::Success;
         }
         raw_output = combined_build_output(&output);
@@ -6562,6 +6587,7 @@ fn try_build_c(
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&cache_path, std);
+                *built_standard = Some(std.to_owned());
                 return BuildOutcome::Success;
             }
             let raw = combined_build_output(&out);
@@ -6613,6 +6639,7 @@ fn try_build_c(
                 "bhf auto: {harness_id}: clang rejected this target and gcc \
                  accepted it; using gcc for the rest of the run"
             );
+            *built_standard = chosen_std.clone();
             return BuildOutcome::Success;
         }
     }
@@ -6680,10 +6707,12 @@ fn cxx_dialect_cache_path(work_dir: &Path, harness_id: &str) -> PathBuf {
     }
     let repairs = harness_dir.join("repairs");
     if let Ok(entries) = std::fs::read_dir(&repairs) {
+        // Only the build's inputs: the output log of a failed build (written
+        // after the ladder caches its rung) would make the next lookup miss.
         let mut files = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.is_file())
+            .filter(|path| path.is_file() && !path.extension().is_some_and(|ext| ext == "log"))
             .collect::<Vec<_>>();
         files.sort();
         for file in files {
@@ -6858,6 +6887,18 @@ mod cxx_dialect_output_tests {
         assert_ne!(
             before, after,
             "a repair-induced include graph change must invalidate the dialect choice"
+        );
+        // The build's own output log is not an input: writing it after the
+        // ladder cached its rung must not hide that rung from the next lookup.
+        fs::write(
+            first.join("repairs").join(super::C_BUILD_OUTPUT_LOG),
+            "error: ISO C++17 does not allow dynamic exception specifications\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cxx_dialect_cache_path(temp.path(), "H-X1"),
+            after,
+            "the build log must not change the dialect cache key"
         );
     }
 }

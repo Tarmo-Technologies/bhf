@@ -210,6 +210,7 @@ impl Lane for GoLane {
             build_outputs: vec!["poc", "build"],
             warnings: relocated.warnings,
             windows: None,
+            portability: Default::default(),
         })
     }
 

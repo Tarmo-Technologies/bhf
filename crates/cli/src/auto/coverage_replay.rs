@@ -28,10 +28,17 @@ const EXPERT_ORACLE_FILE: &str = "expert-oracle.json";
 const EXPERT_HARNESS_ENV: &str = "BHF_EXPERT_HARNESS";
 const EXPERT_COVERAGE_ENV: &str = "BHF_EXPERT_COVERED_LINES";
 
+/// The build recipe's current schema. Version 2 added what reaches `make`
+/// through the environment besides the recovered sources and include dirs
+/// (`AUTO_EXTRA_INCLUDES`/`AUTO_EXTRA_LDFLAGS`, the `[toolchain]` flags, the
+/// compatibility flags and the compiler family); version 1 recipes still read.
+pub(crate) const BUILD_RECIPE_SCHEMA: u32 = 2;
+
 /// The exact recovered inputs that made the primary C/C++ harness link. Repair
 /// sources and include roots otherwise live only in the attempt loop's memory;
 /// invoking a naked `make cov` later silently drops them and either fails or,
-/// worse, measures a smaller/stub-different program.
+/// worse, measures a smaller/stub-different program. `bhf capsule` rebuilds a
+/// harness from the same record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CoverageBuildRecipe {
     schema_version: u32,
@@ -43,25 +50,122 @@ struct CoverageBuildRecipe {
     /// built through it (the MSVC lane). `bhf capsule` rebuilds with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     msvc_compiler: Option<String>,
+    /// `AUTO_EXTRA_INCLUDES` as the build got it from the environment
+    /// (`-include <header>`, `-D`, `-U`, `-I<dir>`, `-f...`), one word each.
+    #[serde(default)]
+    extra_compile_flags: Vec<String>,
+    /// `AUTO_EXTRA_LDFLAGS` as the build got it from the environment.
+    #[serde(default)]
+    extra_ldflags: Vec<String>,
+    /// The work dir's compatibility flags the Makefile took, per compiler
+    /// family (`-fcommon` for C).
+    #[serde(default)]
+    compat_flags: CompatFlags,
+    /// The `[toolchain]` flags the Makefile took, by make variable
+    /// (`BHF_TOOLCHAIN_CFLAGS`, ...), one word each.
+    #[serde(default)]
+    toolchain: std::collections::BTreeMap<String, Vec<String>>,
+    /// The family of the compiler that built it (`clang`, `gcc`, `msvc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compiler_family: Option<String>,
+    /// Which command recorded it (`auto`, `build`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded_by: Option<String>,
+}
+
+/// Compatibility flags per compiler family.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompatFlags {
+    #[serde(default)]
+    pub(crate) clang: Vec<String>,
+    #[serde(default)]
+    pub(crate) gcc: Vec<String>,
+}
+
+/// What a successful C/C++ harness build used beyond its Makefile and the
+/// environment the recipe reads itself.
+pub(crate) struct RecipeBuild<'a> {
+    /// The work dir whose compatibility fragments the Makefile includes.
+    pub(crate) work_dir: &'a Path,
+    pub(crate) extra_sources: &'a [PathBuf],
+    pub(crate) extra_includes: &'a [PathBuf],
+    /// The language standard the build used (`None`: the Makefile's default).
+    pub(crate) standard: Option<String>,
+    /// Built for this host (not with a cross compiler).
+    pub(crate) native: bool,
+    pub(crate) cpp: bool,
+    pub(crate) compiler_family: Option<harness_gen::compiler_family::CompilerFamily>,
+    /// `auto` or `build`.
+    pub(crate) recorded_by: &'static str,
+}
+
+/// The words of an environment value as a make recipe reads them.
+fn env_words(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| crate::generate_harness::split_compile_command(&value))
+        .unwrap_or_default()
+}
+
+/// The compatibility flags the work dir's fragments give a harness Makefile:
+/// `C_COMPAT_FLAGS` from `c_compat.mk` for C (any compiler).
+pub(crate) fn work_dir_compat_flags(work_dir: &Path, cpp: bool) -> CompatFlags {
+    let read = |file: &str, variable: &str| -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(work_dir.join(file)) else {
+            return Vec::new();
+        };
+        // The last assignment wins, as in make.
+        text.lines()
+            .rev()
+            .find_map(|line| {
+                let rest = line.strip_prefix(variable)?.trim_start();
+                let rest = rest
+                    .strip_prefix(":=")
+                    .or_else(|| rest.strip_prefix("?="))
+                    .or_else(|| rest.strip_prefix('='))?;
+                Some(crate::generate_harness::split_compile_command(rest))
+            })
+            .unwrap_or_default()
+    };
+    if cpp {
+        CompatFlags::default()
+    } else {
+        let flags = read("c_compat.mk", "C_COMPAT_FLAGS");
+        CompatFlags {
+            clang: flags.clone(),
+            gcc: flags,
+        }
+    }
 }
 
 /// Checkpoint the successful build closure while the repair loop still owns it.
 /// Coverage replay consumes this recipe through the same make/build-context path
 /// as the primary build, changing only the instrumentation lane to `cov`.
-pub(crate) fn persist_build_recipe(
-    harness_dir: &Path,
-    extra_sources: &[PathBuf],
-    extra_includes: &[PathBuf],
-    standard: Option<String>,
-    native: bool,
-) {
+pub(crate) fn persist_build_recipe(harness_dir: &Path, build: &RecipeBuild) {
+    let toolchain = std::env::vars()
+        .filter(|(name, _)| name.starts_with("BHF_TOOLCHAIN_"))
+        .map(|(name, _)| {
+            let words = env_words(&name);
+            (name, words)
+        })
+        .filter(|(_, words)| !words.is_empty())
+        .collect();
     let recipe = CoverageBuildRecipe {
-        schema_version: 1,
-        native,
-        extra_sources: extra_sources.to_vec(),
-        extra_includes: extra_includes.to_vec(),
-        standard,
+        schema_version: BUILD_RECIPE_SCHEMA,
+        native: build.native,
+        extra_sources: build.extra_sources.to_vec(),
+        extra_includes: build.extra_includes.to_vec(),
+        standard: build.standard.clone(),
         msvc_compiler: crate::msvc_cc::routed_compiler(),
+        extra_compile_flags: env_words("AUTO_EXTRA_INCLUDES"),
+        extra_ldflags: env_words("AUTO_EXTRA_LDFLAGS"),
+        compat_flags: work_dir_compat_flags(build.work_dir, build.cpp),
+        toolchain,
+        compiler_family: build
+            .compiler_family
+            .map(|family| family.make_value().to_owned()),
+        recorded_by: Some(build.recorded_by.to_owned()),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&recipe) {
         let _ = crate::auto::report::atomic_write(&harness_dir.join(BUILD_RECIPE_FILE), &bytes);
@@ -75,7 +179,7 @@ pub(crate) fn clear_build_recipe(harness_dir: &Path) {
 fn read_build_recipe(harness_dir: &Path) -> Option<CoverageBuildRecipe> {
     let bytes = std::fs::read(harness_dir.join(BUILD_RECIPE_FILE)).ok()?;
     let recipe: CoverageBuildRecipe = serde_json::from_slice(&bytes).ok()?;
-    (recipe.schema_version == 1 && recipe.native).then_some(recipe)
+    ((1..=BUILD_RECIPE_SCHEMA).contains(&recipe.schema_version) && recipe.native).then_some(recipe)
 }
 
 fn write_coverage_diagnostic(hdir: &Path, message: &str) {
@@ -1333,22 +1437,86 @@ end_of_record\n";
 
         persist_build_recipe(
             &harness,
-            &sources,
-            &includes,
-            Some("gnu11".to_owned()),
-            true,
+            &RecipeBuild {
+                work_dir: root.path(),
+                extra_sources: &sources,
+                extra_includes: &includes,
+                standard: Some("gnu11".to_owned()),
+                native: true,
+                cpp: false,
+                compiler_family: Some(harness_gen::compiler_family::CompilerFamily::Clang),
+                recorded_by: "auto",
+            },
         );
         let recipe = read_build_recipe(&harness).expect("native recipe");
 
+        assert_eq!(recipe.schema_version, BUILD_RECIPE_SCHEMA);
         assert_eq!(recipe.extra_sources, sources);
         assert_eq!(recipe.extra_includes, includes);
         assert_eq!(recipe.standard.as_deref(), Some("gnu11"));
+        assert_eq!(recipe.compiler_family.as_deref(), Some("clang"));
+        assert_eq!(recipe.recorded_by.as_deref(), Some("auto"));
+    }
+
+    /// A recipe an earlier bhf wrote (schema 1, without the fields schema 2
+    /// added) still drives the coverage build.
+    #[test]
+    fn a_schema_1_recipe_still_reads() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(BUILD_RECIPE_FILE),
+            r#"{"schema_version":1,"native":true,"extra_sources":["/p/stub.c"],
+                "extra_includes":[],"standard":"gnu89"}"#,
+        )
+        .unwrap();
+        let recipe = read_build_recipe(root.path()).expect("a v1 recipe reads");
+        assert_eq!(recipe.extra_sources, [PathBuf::from("/p/stub.c")]);
+        assert_eq!(recipe.standard.as_deref(), Some("gnu89"));
+        assert!(recipe.extra_compile_flags.is_empty());
+        assert_eq!(recipe.compat_flags, CompatFlags::default());
+        std::fs::write(
+            root.path().join(BUILD_RECIPE_FILE),
+            r#"{"schema_version":3,"native":true,"extra_sources":[],"extra_includes":[],
+                "standard":null}"#,
+        )
+        .unwrap();
+        assert!(
+            read_build_recipe(root.path()).is_none(),
+            "a newer schema is not guessed at"
+        );
+    }
+
+    /// The work dir's `c_compat.mk` is recorded for a C build, for every
+    /// compiler family.
+    #[test]
+    fn the_recipe_records_the_c_compatibility_flags() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("c_compat.mk"),
+            "C_COMPAT_FLAGS := -fcommon\n",
+        )
+        .unwrap();
+        let flags = work_dir_compat_flags(root.path(), false);
+        assert_eq!(flags.clang, ["-fcommon"]);
+        assert_eq!(flags.gcc, ["-fcommon"]);
     }
 
     #[test]
     fn cross_build_recipe_is_not_replayed_as_host_coverage() {
         let root = tempfile::tempdir().unwrap();
-        persist_build_recipe(root.path(), &[], &[], None, false);
+        persist_build_recipe(
+            root.path(),
+            &RecipeBuild {
+                work_dir: root.path(),
+                extra_sources: &[],
+                extra_includes: &[],
+                standard: None,
+                native: false,
+                cpp: false,
+                compiler_family: None,
+                recorded_by: "auto",
+            },
+        );
         assert!(read_build_recipe(root.path()).is_none());
     }
 

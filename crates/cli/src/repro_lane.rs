@@ -154,10 +154,12 @@ impl Refusal {
             Refusal::Unreadable { path } => {
                 format!("{} is missing or is not valid JSON", path.display())
             }
-            Refusal::NotACrash { classification } if classification == "oracle" => format!(
-                "it is an oracle finding (a behavioral check fired, not a sanitizer crash); \
+            Refusal::NotACrash { classification } if is_oracle_classification(classification) => {
+                format!(
+                    "it is an oracle finding (a behavioral check fired, not a sanitizer crash); \
                  {command} works from a sanitizer crash"
-            ),
+                )
+            }
             Refusal::NotACrash { classification } if classification.is_empty() => format!(
                 "finding.json records no classification; {command} works from a runtime \
                  sanitizer crash (`unhandled`)"
@@ -243,6 +245,12 @@ impl Refusal {
             ),
         }
     }
+}
+
+/// Whether a finding's `classification` is a behavioral oracle's: what bhf
+/// records (`oracle_hit`) or its short spelling (`oracle`).
+pub(crate) fn is_oracle_classification(classification: &str) -> bool {
+    matches!(classification, "oracle" | "oracle_hit")
 }
 
 fn article(name: &str) -> &'static str {
@@ -331,10 +339,11 @@ pub(crate) fn select(work_dir: &Path, only: Option<&str>, tool: Tool) -> anyhow:
         }
     } else {
         records.retain(|record| {
-            matches!(
-                record.raw.get("classification").and_then(Value::as_str),
-                Some("unhandled" | "oracle")
-            )
+            record
+                .raw
+                .get("classification")
+                .and_then(Value::as_str)
+                .is_some_and(|class| class == "unhandled" || is_oracle_classification(class))
         });
     }
     records.sort_by(|a, b| a.id.cmp(&b.id));
@@ -597,8 +606,12 @@ fn read_prefix(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// A command that reproduces a refused finding without the refusing tool:
-/// the finding's `replay.py`, else the built harness on the crash input with
-/// sanitizer options. `None` when nothing could reproduce it.
+/// the finding's `replay.py` when a harness it runs exists, else the built
+/// harness on the crash input with sanitizer options (under its recorded
+/// emulator). A finding whose harness is gone from the work dir is told to
+/// replay a harness binary it has, or to regenerate the harness first (no
+/// harness dir is left for `bhf build` to build). `None` when nothing could
+/// reproduce it.
 pub(crate) fn alternative(
     work_dir: &Path,
     finding: &FindingRecord,
@@ -610,17 +623,33 @@ pub(crate) fn alternative(
     ) {
         return None;
     }
+    let harness_id = finding
+        .raw
+        .get("harness_id")
+        .and_then(Value::as_str)
+        .filter(|id| corpus::layout::is_valid_finding_id(id));
+    // replay.py looks the harness up where this lookup did: it would not
+    // find it either. Nor would `bhf build`, which builds a harness dir.
+    if let Refusal::HarnessNotFound { harness_id, .. } = refusal {
+        let work = sh_word(&work_dir.to_string_lossy());
+        let id = sh_word(harness_id);
+        return Some(format!(
+            "bhf replay --finding {} --harness <harness binary>, given a binary of the \
+             harness; or get the harness back first: bhf auto <source tree> --work-dir \
+             {work} generates and builds it again, or bhf generate-harness <source> \
+             --target <function> --id {id} --output {} and then bhf build {work} \
+             --harness {id}",
+            sh_word(&finding.dir.to_string_lossy()),
+            sh_word(&work_dir.join("harnesses").to_string_lossy()),
+        ));
+    }
     let replay = finding.dir.join("replay.py");
-    if replay.is_file() {
+    if replay.is_file() && replay_py_finds_harness(work_dir, finding) {
         // Windows' Python installer provides `python`, not `python3`.
         let python = if cfg!(windows) { "python" } else { "python3" };
         return Some(format!("{python} {}", sh_word(&replay.to_string_lossy())));
     }
-    let harness_id = finding.raw.get("harness_id").and_then(Value::as_str)?;
-    if !corpus::layout::is_valid_finding_id(harness_id) {
-        return None;
-    }
-    let binary = native_harness_binary(work_dir, harness_id)?;
+    let binary = native_harness_binary(work_dir, harness_id?)?;
     let input = crash_inputs(&finding.dir).pop()?;
     // An Ada harness reads its input from stdin and reports through its event
     // log; the shared detector says which protocol the binary speaks.
@@ -631,7 +660,7 @@ pub(crate) fn alternative(
         return Some(format!(
             "cat {} | BHF_EVENTS_PATH=\"$(mktemp)\" {}",
             sh_word(&input.to_string_lossy()),
-            sh_word(&binary.to_string_lossy())
+            runner_words(&binary).join(" ")
         ));
     }
     Some(direct_harness_command(
@@ -641,19 +670,64 @@ pub(crate) fn alternative(
     ))
 }
 
+/// Whether the finding's `replay.py` finds a harness to run, as its own
+/// lookup goes: the `fixture_path` it recorded, resolved in the work dir that
+/// holds the finding (a relative one never against the current directory),
+/// then `main` (`main.exe`, the AFL++ build) in one of the dirs it searches,
+/// then a `fixture_path` into another work dir.
+pub(crate) fn replay_py_finds_harness(work_dir: &Path, finding: &FindingRecord) -> bool {
+    let harness_id = finding
+        .raw
+        .get("harness_id")
+        .and_then(Value::as_str)
+        .filter(|id| corpus::layout::is_valid_finding_id(id));
+    let fixture = finding
+        .raw
+        .get("fixture_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    corpus::finding::fixture_path_candidates(&finding.dir, fixture)
+        .iter()
+        .any(|path| path.is_file())
+        || harness_id.is_some_and(|id| {
+            harness_dir_candidates(work_dir, id).iter().any(|dir| {
+                ["main", "main_afl", "main.exe", "main_afl.exe"]
+                    .iter()
+                    .any(|leaf| dir.join(leaf).is_file())
+            })
+        })
+        || corpus::finding::fixture_path_fallback(&finding.dir, fixture)
+            .is_some_and(|path| path.is_file())
+}
+
 /// The built harness run on one input with the sanitizer options `bhf replay`
 /// gives it ([`crate::fuzz::sanitizer_child_env`]): the first report halts the
 /// run, UBSan prints its stack and check name, and a leak finding (`leak`)
 /// keeps leak detection on. Your own `ASAN_OPTIONS`/`UBSAN_OPTIONS` are merged
-/// first, as replay merges them, so the command reproduces like a replay.
+/// first, as replay merges them, so the command reproduces like a replay. A
+/// harness built for another platform runs under the emulator recorded beside
+/// it (`bhf_runner.json`), with the options of an emulated replay.
 pub(crate) fn direct_harness_command(binary: &Path, input: &Path, leak: bool) -> String {
-    let mut words: Vec<String> = crate::fuzz::sanitizer_child_env(leak)
+    let emulated = crate::gate_evidence::recorded_runner(binary).is_some();
+    let mut words: Vec<String> = crate::fuzz::sanitizer_child_env_for(leak, emulated)
         .into_iter()
         .map(|(key, value)| format!("{key}={}", sh_word(&value)))
         .collect();
-    words.push(sh_word(&binary.to_string_lossy()));
+    words.extend(runner_words(binary));
     words.push(sh_word(&input.to_string_lossy()));
     words.join(" ")
+}
+
+/// `binary` as shell words, behind the emulator recorded beside it when there
+/// is one (`qemu-aarch64 -L <sysroot> <binary>`).
+fn runner_words(binary: &Path) -> Vec<String> {
+    let mut words = Vec::new();
+    if let Some(runner) = crate::gate_evidence::recorded_runner(binary) {
+        words.push(sh_word(&runner.program.to_string_lossy()));
+        words.extend(runner.args.iter().map(|arg| sh_word(arg)));
+    }
+    words.push(sh_word(&binary.to_string_lossy()));
+    words
 }
 
 // ── harness lookup and language ─────────────────────────────────────────────
@@ -1095,6 +1169,24 @@ pub(crate) struct CapsulePlan {
     pub(crate) warnings: Vec<String>,
     /// The Windows build a C or C++ capsule also ships (`build.ps1`).
     pub(crate) windows: Option<WindowsBuild>,
+    /// What capsule checks the shipped files against before it calls the
+    /// capsule portable.
+    pub(crate) portability: PlanPortability,
+}
+
+/// How a lane's shipped files relate to the host they were packaged on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlanPortability {
+    /// Original files the lane ships with content it rewrote, and their
+    /// capsule paths (the rest are [`CapsulePlan::files`]).
+    pub(crate) shipped_paths: Vec<(PathBuf, String)>,
+    /// Dirs no shipped file may name: what a rebuild elsewhere cannot reach
+    /// (the work dir, the scanned tree, the dirs the capsule copied from).
+    /// Empty: the lane checks its own files ([`relocate`]).
+    pub(crate) protected: Vec<PathBuf>,
+    /// `<file> names <path>`: what the lane found a shipped file still
+    /// depends on.
+    pub(crate) problems: Vec<String>,
 }
 
 /// A capsule's Windows build: `build.ps1`, which needs no POSIX shell, and the
@@ -1178,6 +1270,23 @@ pub(crate) trait Lane: Sync {
     /// capsule whose replay shows another one says so.
     fn finding_signature(&self, _finding: &Value) -> Option<String> {
         None
+    }
+    /// The crash the finding recorded as `bhf replay` compares it (rule,
+    /// kind, check, sink or site), with its source paths as the capsule ships
+    /// them (`capsule_path` maps an original path), when this lane's crashes
+    /// are sanitizer reports compared field by field. `None` keeps the
+    /// comparison by [`Lane::finding_signature`].
+    fn finding_identity(
+        &self,
+        _finding: &Value,
+        _capsule_path: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Value> {
+        None
+    }
+    /// Whether this lane's capsules record [`Lane::finding_identity`] (an
+    /// older capsule of the lane without one is compared by class).
+    fn compares_identity(&self) -> bool {
+        false
     }
     /// The built harness executable that perturbation analysis and
     /// environment capture replay.
@@ -1313,6 +1422,10 @@ pub(crate) fn report_signature(stderr: &str, status: &ExitStatus) -> Option<Stri
 pub(crate) fn configure_offline_replay(command: &mut Command) {
     command
         .env("ASAN_OPTIONS", "abort_on_error=1:handle_abort=1")
+        // UBSan reports the way the fuzz loop records them (the first report
+        // halts the run, with its stack and check name), so the replay's
+        // report can be compared with the finding's field by field.
+        .env("UBSAN_OPTIONS", crate::fuzz::ubsan_child_options())
         .env("DEBUGINFOD_URLS", "")
         // A replay runs one input; it must not wait for the fuzz loop's frames.
         .env_remove("BHF_FRAMED")
@@ -1552,7 +1665,17 @@ impl Lane for CFamilyLane {
         if let Some(glue) = self.glue {
             c_glue::adjust_model(glue, harness, &mut model)?;
         }
-        self.plan_from_model(&model)
+        let mut plan = self.plan_from_model(&model)?;
+        // A COBOL or Fortran translation names its source in comments and
+        // messages, which a rebuild never reads.
+        if self.glue.is_none() {
+            let protected = &mut plan.portability.protected;
+            protected.push(harness.work_dir.clone());
+            protected.extend(recorded_source_root(&harness.work_dir));
+        } else {
+            plan.portability.protected.clear();
+        }
+        Ok(plan)
     }
 
     fn crash_signature(&self, replay: &ReplayOutput) -> Option<String> {
@@ -1564,12 +1687,169 @@ impl Lane for CFamilyLane {
         sanitizer_signature(&replay.stderr, &replay.status)
     }
 
+    fn finding_signature(&self, finding: &Value) -> Option<String> {
+        if self.glue.is_some() {
+            return None;
+        }
+        // The sanitizer's first line, which the replay's signature is read off.
+        let message = finding.pointer("/exception/message")?.as_str()?;
+        recorded_sanitizer(finding)?;
+        sanitizer_signature(message, &failed_status()?)
+            .filter(|signature| signature != "signal:crash")
+    }
+
+    fn finding_identity(
+        &self,
+        finding: &Value,
+        capsule_path: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Value> {
+        if self.glue.is_some() {
+            return None;
+        }
+        sanitizer_finding_identity(finding, capsule_path)
+    }
+
+    fn compares_identity(&self) -> bool {
+        self.glue.is_none()
+    }
+
     fn tool_gap(&self, tool: Tool) -> Option<&'static str> {
         match tool {
             Tool::Cartography if self.glue.is_some() => Some(CARTOGRAPHY_GAP),
             _ => None,
         }
     }
+}
+
+/// The sanitizer a finding's report came from (`asan`, `ubsan`, ...), when it
+/// was a sanitizer report (not a bare fatal signal).
+fn recorded_sanitizer(finding: &Value) -> Option<&str> {
+    finding
+        .pointer("/exception/sanitizer")
+        .and_then(Value::as_str)
+        .filter(|sanitizer| {
+            matches!(
+                sanitizer.to_ascii_lowercase().as_str(),
+                "asan" | "ubsan" | "lsan" | "msan" | "tsan"
+            )
+        })
+}
+
+/// An exit status that is not success, for reading a signature off a
+/// recorded message.
+fn failed_status() -> Option<ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        Some(ExitStatus::from_raw(1 << 8))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        Some(ExitStatus::from_raw(1))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The kind a recorded `exception.name` names (`ASAN_HEAP_BUFFER_OVERFLOW` is
+/// `heap-buffer-overflow`), as [`crate::crash_identity`] reads it.
+fn exception_kind(name: &str) -> String {
+    let kind = ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name);
+    kind.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// A `file:line[:col]` position at the start of a UBSan-style message
+/// (`x.c:5:9: runtime error: ...`).
+fn message_site(message: &str) -> Option<(String, u64, Option<u64>)> {
+    let (prefix, _) = message.split_once("runtime error:")?;
+    let parts: Vec<&str> = prefix.trim().trim_end_matches(':').split(':').collect();
+    let line_at = parts
+        .iter()
+        .position(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))?;
+    if line_at == 0 {
+        return None;
+    }
+    Some((
+        parts[..line_at].join(":"),
+        parts[line_at].parse().ok()?,
+        parts.get(line_at + 1).and_then(|col| col.parse().ok()),
+    ))
+}
+
+/// The identity of a sanitizer finding in capsule terms: `rule_id`, `kind`,
+/// `check`, `sink_function` and `site` for the manifest, and `record`, the
+/// finding reduced to what [`crate::crash_identity::compare`] reads, with each
+/// source path mapped by `capsule_path` (a path it does not ship stays as
+/// recorded). `None` for a finding without a sanitizer report.
+pub(crate) fn sanitizer_finding_identity(
+    finding: &Value,
+    capsule_path: &dyn Fn(&str) -> Option<String>,
+) -> Option<Value> {
+    let sanitizer = recorded_sanitizer(finding)?;
+    let rule_id = finding.get("rule_id").and_then(Value::as_str);
+    let exception = finding.get("exception")?;
+    let text = |key: &str| exception.get(key).and_then(Value::as_str);
+    let name = text("name");
+    if rule_id.is_none() && name.is_none() {
+        return None;
+    }
+    let map = |file: &str| capsule_path(file).unwrap_or_else(|| file.to_owned());
+    let site = exception
+        .get("location")
+        .and_then(|location| {
+            Some((
+                location.get("file")?.as_str()?.to_owned(),
+                location.get("line")?.as_u64()?,
+                location.get("column").and_then(Value::as_u64),
+            ))
+        })
+        .or_else(|| text("message").and_then(message_site))
+        .map(|(file, line, column)| (map(&file), line, column));
+    let sink = actionability::sink_for_finding(finding).filter(|sink| !sink.function.is_empty());
+    let mut record_exception = serde_json::Map::new();
+    record_exception.insert("sanitizer".to_owned(), json!(sanitizer));
+    for key in ["name", "check", "signal"] {
+        if let Some(value) = text(key) {
+            record_exception.insert(key.to_owned(), json!(value));
+        }
+    }
+    if let Some((file, line, column)) = &site {
+        record_exception.insert(
+            "location".to_owned(),
+            json!({"file": file, "line": line, "column": column}),
+        );
+    }
+    if let Some(sink) = &sink {
+        record_exception.insert(
+            "stack".to_owned(),
+            json!([{
+                "function": sink.function,
+                "file": sink.file.as_deref().map(map),
+                "line": sink.line,
+            }]),
+        );
+    }
+    let mut record = json!({ "exception": record_exception });
+    if let Some(rule_id) = rule_id {
+        record["rule_id"] = json!(rule_id);
+    }
+    Some(json!({
+        "rule_id": rule_id,
+        "kind": name.map(exception_kind),
+        "check": text("check"),
+        "sink_function": sink.as_ref().map(|sink| sink.function.clone()),
+        "site": site.as_ref().map(|(file, line, column)| match column {
+            Some(column) => format!("{file}:{line}:{column}"),
+            None => format!("{file}:{line}"),
+        }),
+        "record": record,
+    }))
 }
 
 /// The C/C++ compiler a capsule rebuilds with and the flag family it speaks.
@@ -1638,10 +1918,38 @@ struct RecordedRecipe {
     /// built through it.
     #[serde(default)]
     msvc_compiler: Option<String>,
+    /// Since schema 2: `AUTO_EXTRA_INCLUDES` as the build took it from the
+    /// environment, one word each.
+    #[serde(default)]
+    extra_compile_flags: Vec<String>,
+    /// Since schema 2: `AUTO_EXTRA_LDFLAGS`, one word each.
+    #[serde(default)]
+    extra_ldflags: Vec<String>,
+    /// Since schema 2: the work dir's compatibility flags the build took, per
+    /// compiler family.
+    #[serde(default)]
+    compat_flags: Option<crate::auto::coverage_replay::CompatFlags>,
+    /// Since schema 2: the `[toolchain]` flags the build took, by make
+    /// variable (`BHF_TOOLCHAIN_CFLAGS`, ...).
+    #[serde(default)]
+    toolchain: std::collections::BTreeMap<String, Vec<String>>,
+    /// Since schema 2: the family of the compiler that built it.
+    #[serde(default)]
+    compiler_family: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+impl RecordedRecipe {
+    /// The words of one recorded `[toolchain]` make variable.
+    fn toolchain_words(&self, variable: &str) -> &[String] {
+        self.toolchain
+            .get(variable)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
 }
 
 /// The compiler family the harness Makefile last built with, as its toolchain
@@ -1656,7 +1964,9 @@ fn recorded_compiler_family(harness_dir: &Path) -> Option<CompilerFamily> {
 fn read_recorded_recipe(harness_dir: &Path) -> Option<RecordedRecipe> {
     let bytes = std::fs::read(harness_dir.join(BUILD_RECIPE_FILE)).ok()?;
     let recipe: RecordedRecipe = serde_json::from_slice(&bytes).ok()?;
-    (recipe.schema_version == 1).then_some(recipe)
+    (1..=crate::auto::coverage_replay::BUILD_RECIPE_SCHEMA)
+        .contains(&recipe.schema_version)
+        .then_some(recipe)
 }
 
 /// One compiler argument, with any path it names kept apart so it can be
@@ -1726,6 +2036,25 @@ fn parse_args(tokens: &[String], base: &Path) -> Vec<Arg> {
     args
 }
 
+/// Link flags, with a prebuilt object or archive named by path kept as a
+/// file the capsule ships.
+fn link_args(tokens: &[String], base: &Path) -> Vec<Arg> {
+    parse_args(tokens, base)
+        .into_iter()
+        .map(|arg| match arg {
+            Arg::Text(text) if !text.starts_with('-') => {
+                let path = absolute(&text, base);
+                if path.is_file() {
+                    Arg::File(path)
+                } else {
+                    Arg::Text(text)
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
 fn absolute(raw: &str, base: &Path) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -1775,6 +2104,13 @@ pub(crate) struct BuildModel {
     standard: Option<String>,
     compat_flags: Vec<String>,
     link_flags: Vec<Arg>,
+    /// The recorded `[toolchain]` target and language compile flags.
+    toolchain_flags: Vec<Arg>,
+    /// The recorded `[toolchain]` preprocessor flags (defines, include dirs),
+    /// which the Makefile puts after `AUTO_EXTRA_INCLUDES`.
+    toolchain_cppflags: Vec<Arg>,
+    /// The recorded `AUTO_EXTRA_LDFLAGS` and `[toolchain]` link flags.
+    extra_link_flags: Vec<Arg>,
     recorded_recipe: bool,
     pub(crate) compiler: CapsuleCompiler,
     /// The compiler build.ps1 rebuilds with by default.
@@ -1902,6 +2238,8 @@ impl CFamilyLane {
             }
             extra_sources.push(source);
         }
+        // `AUTO_EXTRA_INCLUDES` as make got it: the force-included repair
+        // headers, the operator's own flags, then the recovered include dirs.
         let mut extra_includes = Vec::new();
         for name in [
             crate::auto::repair::AUTO_CPP_INCLUDES_FILE,
@@ -1913,30 +2251,54 @@ impl CFamilyLane {
             }
         }
         if let Some(recipe) = &recipe {
+            extra_includes.extend(parse_args(&recipe.extra_compile_flags, &harness_dir));
             for dir in &recipe.extra_includes {
                 let dir = absolute(&dir.to_string_lossy(), &harness_dir);
                 extra_includes.push(Arg::Split("-iquote", dir.clone()));
                 extra_includes.push(Arg::Split("-idirafter", dir));
             }
         }
-        let compat_flags = if self.standard_leads {
-            Vec::new()
-        } else {
-            read_compat_flags(&harness_dir)
+        let compat_flags = match recipe
+            .as_ref()
+            .and_then(|recipe| recipe.compat_flags.as_ref())
+        {
+            // C's compatibility flags are the same for every compiler.
+            Some(recorded) if !self.standard_leads => recorded.clang.clone(),
+            Some(_) => Vec::new(),
+            None if self.standard_leads => Vec::new(),
+            None => read_compat_flags(&harness_dir),
         };
-        let mut link_flags = Vec::new();
-        for arg in parse_args(&facts.link_flags, &harness_dir) {
-            // A prebuilt object or archive named by path ships with the capsule.
-            match arg {
-                Arg::Text(text) if !text.starts_with('-') => {
-                    let path = absolute(&text, &harness_dir);
-                    link_flags.push(if path.is_file() {
-                        Arg::File(path)
-                    } else {
-                        Arg::Text(text)
-                    });
-                }
-                other => link_flags.push(other),
+        let link_flags = link_args(&facts.link_flags, &harness_dir);
+        // The `[toolchain]` flags the Makefile appends to bhf's own: the
+        // target flags and the language's flags, then the preprocessor flags.
+        let language_flags = if self.standard_leads {
+            crate::toolchain::ENV_CXXFLAGS
+        } else {
+            crate::toolchain::ENV_CFLAGS
+        };
+        let mut toolchain_flags = Vec::new();
+        let mut toolchain_cppflags = Vec::new();
+        let mut extra_link_flags = Vec::new();
+        if let Some(recipe) = &recipe {
+            for variable in [crate::toolchain::ENV_TARGET_FLAGS, language_flags] {
+                toolchain_flags.extend(parse_args(recipe.toolchain_words(variable), &harness_dir));
+            }
+            // The preprocessor words of every lane, then those the
+            // language's own flags carried (`cflags`' or `cxxflags'`).
+            let language_cppflags = if self.standard_leads {
+                crate::toolchain::ENV_CXX_CPPFLAGS
+            } else {
+                crate::toolchain::ENV_C_CPPFLAGS
+            };
+            for variable in [crate::toolchain::ENV_CPPFLAGS, language_cppflags] {
+                toolchain_cppflags
+                    .extend(parse_args(recipe.toolchain_words(variable), &harness_dir));
+            }
+            extra_link_flags.extend(link_args(&recipe.extra_ldflags, &harness_dir));
+            // The link flags, then the library operands (`-L`, `-l`,
+            // archives, objects), as the Makefile's link takes them.
+            for variable in [crate::toolchain::ENV_LDFLAGS, crate::toolchain::ENV_LIBS] {
+                extra_link_flags.extend(link_args(recipe.toolchain_words(variable), &harness_dir));
             }
         }
         Ok(BuildModel {
@@ -1949,7 +2311,13 @@ impl CFamilyLane {
                 .filter(|standard| !standard.trim().is_empty())
                 .or(facts.default_standard),
             recorded_recipe: recipe.is_some(),
-            compiler: self.capsule_compiler(&harness_dir),
+            compiler: self.capsule_compiler(
+                &harness_dir,
+                recipe
+                    .as_ref()
+                    .and_then(|recipe| recipe.compiler_family.as_deref())
+                    .and_then(CompilerFamily::from_make_value),
+            ),
             windows_compiler: self.windows_compiler(&harness_dir, recipe.as_ref()),
             driver_source: facts
                 .driver_source
@@ -1962,6 +2330,9 @@ impl CFamilyLane {
             extra_includes,
             compat_flags,
             link_flags,
+            toolchain_flags,
+            toolchain_cppflags,
+            extra_link_flags,
             rebuilt_objects: Vec::new(),
             prelude: String::new(),
             extra_link: Vec::new(),
@@ -1974,8 +2345,12 @@ impl CFamilyLane {
 
     /// The compiler the capsule rebuilds with: `$CC`/`$CXX` when set, else the
     /// family that built the harness binary (a gcc-built harness rebuilds with
-    /// gcc), else the lane's default.
-    fn capsule_compiler(&self, harness_dir: &Path) -> CapsuleCompiler {
+    /// gcc), else the family its build recipe records, else the lane's default.
+    fn capsule_compiler(
+        &self,
+        harness_dir: &Path,
+        recorded: Option<CompilerFamily>,
+    ) -> CapsuleCompiler {
         let toolchain = self.tools[0];
         let cxx = self.probe_language == "c++";
         if let Some(command) = env_value(toolchain.env_var) {
@@ -1995,21 +2370,23 @@ impl CFamilyLane {
         }
         let built = [harness_dir.join("main"), harness_dir.join("obj/main")]
             .iter()
-            .find_map(|binary| binary_compiler_family(binary));
+            .find_map(|binary| binary_compiler_family(binary))
+            .map(|family| (family, "harness binary"))
+            .or_else(|| recorded.map(|family| (family, "build recipe")));
         match built {
-            Some(CompilerFamily::Gcc) => CapsuleCompiler {
+            Some((CompilerFamily::Gcc, source)) => CapsuleCompiler {
                 command: if cxx { "g++" } else { "gcc" }.to_owned(),
                 family: CompilerFamily::Gcc,
-                source: "harness binary",
+                source,
             },
-            Some(CompilerFamily::Clang) => CapsuleCompiler {
+            Some((CompilerFamily::Clang, source)) => CapsuleCompiler {
                 command: toolchain.default.to_owned(),
                 family: CompilerFamily::Clang,
-                source: "harness binary",
+                source,
             },
             // The probe reads ELF notes only, so it never names cl; a harness
             // it cannot attribute rebuilds with the lane's default.
-            Some(CompilerFamily::Msvc) | None => CapsuleCompiler {
+            Some((CompilerFamily::Msvc, _)) | None => CapsuleCompiler {
                 command: toolchain.default.to_owned(),
                 family: CompilerFamily::Clang,
                 source: "default",
@@ -2117,6 +2494,7 @@ impl CFamilyLane {
         args.extend(model.compat_flags.iter().cloned());
         args.extend(FEATURE_TEST_FLAGS.iter().map(|f| (*f).to_owned()));
         args.extend(model.compile_db_flags.iter().flat_map(|a| a.render(map)));
+        args.extend(model.toolchain_flags.iter().flat_map(|a| a.render(map)));
         if !self.standard_leads {
             if let Some(standard) = &model.standard {
                 args.push(format!("-std={standard}"));
@@ -2124,6 +2502,7 @@ impl CFamilyLane {
         }
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
         args.extend(model.extra_includes.iter().flat_map(|a| a.render(map)));
+        args.extend(model.toolchain_cppflags.iter().flat_map(|a| a.render(map)));
         args.extend(no_fortify_flags());
         args
     }
@@ -2141,6 +2520,8 @@ impl CFamilyLane {
         args.extend(unit.flags.iter().flat_map(|a| a.render(map)));
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
         args.extend(model.extra_includes.iter().flat_map(|a| a.render(map)));
+        args.extend(model.toolchain_flags.iter().flat_map(|a| a.render(map)));
+        args.extend(model.toolchain_cppflags.iter().flat_map(|a| a.render(map)));
         args.extend(no_fortify_flags());
         args
     }
@@ -2193,15 +2574,27 @@ impl CFamilyLane {
         files.extend(model.units.iter().map(|u| u.source.clone()));
         files.extend(model.rebuilt_objects.iter().map(|o| o.source.clone()));
         files.extend(model.extra_files.iter().cloned());
-        for arg in model.extra_includes.iter().chain(&model.compile_db_flags) {
+        for arg in model
+            .extra_includes
+            .iter()
+            .chain(&model.compile_db_flags)
+            .chain(&model.toolchain_flags)
+            .chain(&model.toolchain_cppflags)
+        {
             if let Arg::Split("-include" | "-imacros", path) = arg {
                 files.insert(path.clone());
             }
         }
-        files.extend(model.link_flags.iter().filter_map(|a| match a {
-            Arg::File(path) => Some(path.clone()),
-            _ => None,
-        }));
+        files.extend(
+            model
+                .link_flags
+                .iter()
+                .chain(&model.extra_link_flags)
+                .filter_map(|a| match a {
+                    Arg::File(path) => Some(path.clone()),
+                    _ => None,
+                }),
+        );
         let main_inputs: Vec<PathBuf> = std::iter::once(model.driver.clone())
             .chain(model.target_sources.iter().cloned())
             .chain(model.extra_sources.iter().cloned())
@@ -2226,11 +2619,22 @@ impl CFamilyLane {
             }
         }
 
+        // The repair files bhf wrote name the headers they forward to or stub
+        //    for by absolute path; each such header ships too.
+        let repairs = model.harness_dir.join("repairs");
+        let named: Vec<PathBuf> = files
+            .iter()
+            .filter(|path| path.starts_with(&repairs))
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .flat_map(|text| absolute_quoted_includes(&text))
+            .filter(|path| path.is_file() && !is_system(path))
+            .collect();
+        files.extend(named);
+
         // 2. Where each file goes. The harness dir, its repairs and the C
         //    runtime have fixed homes; every other file keeps its path relative
         //    to the deepest dir holding all of them (and every project include
         //    root), so `#include "sub/x.h"` and `"../x.h"` still resolve.
-        let repairs = model.harness_dir.join("repairs");
         let runtime_dirs: Vec<PathBuf> = model
             .includes
             .iter()
@@ -2256,6 +2660,8 @@ impl CFamilyLane {
             .iter()
             .chain(&model.extra_includes)
             .chain(&model.compile_db_flags)
+            .chain(&model.toolchain_flags)
+            .chain(&model.toolchain_cppflags)
             .chain(model.units.iter().flat_map(|u| &u.flags))
             .filter_map(Arg::include_dir)
             .filter(|dir| dir.is_dir() && !is_system(dir) && !fixed(dir))
@@ -2285,6 +2691,8 @@ impl CFamilyLane {
                 .iter()
                 .chain(&model.extra_includes)
                 .chain(&model.compile_db_flags)
+                .chain(&model.toolchain_flags)
+                .chain(&model.toolchain_cppflags)
                 .chain(model.units.iter().flat_map(|u| &u.flags))
                 .filter_map(Arg::include_dir)
                 .filter(|dir| dir.is_dir() && !is_system(dir))
@@ -2313,8 +2721,9 @@ impl CFamilyLane {
             .iter()
             .filter_map(|path| path.parent())
             .chain(project_roots.iter().map(PathBuf::as_path));
-        if let Some(root) = common_ancestor(anchors) {
-            mounts.push((root, "sources".to_owned()));
+        let sources_root = common_ancestor(anchors);
+        if let Some(root) = &sources_root {
+            mounts.push((root.clone(), "sources".to_owned()));
         }
         // Longest prefix wins: `repairs/` inside the harness dir, a harness dir
         // inside the project tree.
@@ -2367,6 +2776,56 @@ impl CFamilyLane {
                 None => warnings.push(format!("{} has no place in the capsule", path.display())),
             }
         }
+        // The repair files ship with every absolute `#include "..."` of a
+        // shipped file made relative to their own place in the capsule.
+        let shipped: BTreeSet<String> = copies.iter().map(|copy| copy.to.clone()).collect();
+        let place_shipped = |path: &Path| -> Option<String> {
+            let to = place(&normalize(path)).or_else(|| {
+                let real = path.canonicalize().ok()?;
+                mounts.iter().find_map(|(dir, name)| {
+                    let rel = real.strip_prefix(dir.canonicalize().ok()?).ok()?;
+                    Some(format!(
+                        "{name}/{}",
+                        rel.to_string_lossy().replace('\\', "/")
+                    ))
+                })
+            })?;
+            shipped.contains(&to).then_some(to)
+        };
+        let mut portability = PlanPortability::default();
+        let mut rewritten: std::collections::BTreeMap<String, String> = Default::default();
+        let mut kept = Vec::with_capacity(copies.len());
+        for copy in copies {
+            let text = copy
+                .from
+                .starts_with(&repairs)
+                .then(|| std::fs::read_to_string(&copy.from).ok())
+                .flatten();
+            let Some(text) = text else {
+                kept.push(copy);
+                continue;
+            };
+            let (relocated, unplaced) =
+                relocate_includes(&text, &copy.to, &place_shipped, &is_system);
+            portability.problems.extend(
+                unplaced
+                    .into_iter()
+                    .map(|path| format!("{} names {path}", copy.to)),
+            );
+            if relocated == text {
+                kept.push(copy);
+            } else {
+                portability
+                    .shipped_paths
+                    .push((copy.from.clone(), copy.to.clone()));
+                rewritten.insert(copy.to, relocated);
+            }
+        }
+        let mut copies = kept;
+        portability.protected.extend(sources_root.iter().cloned());
+        portability.protected.push(model.harness_dir.clone());
+        portability.protected.extend(runtime_dirs.iter().cloned());
+
         // bhf's driver ships with the runtime headers: build.ps1 links it
         // beside the harness, as the Makefile does.
         let driver_place = match (&model.driver_source, self.glue) {
@@ -2452,6 +2911,7 @@ impl CFamilyLane {
         let link: Vec<String> = model
             .link_flags
             .iter()
+            .chain(&model.extra_link_flags)
             .flat_map(|a| a.render(&capsule_path))
             .collect();
         let link_words = shell_words(&link);
@@ -2476,6 +2936,8 @@ impl CFamilyLane {
         let mut generated: Vec<GeneratedFile> = model
             .generated_sources
             .iter()
+            .map(|(to, text)| (to, text))
+            .chain(&rewritten)
             .map(|(to, text)| GeneratedFile {
                 to: to.clone(),
                 bytes: text.clone().into_bytes(),
@@ -2483,16 +2945,18 @@ impl CFamilyLane {
             })
             .collect();
         let windows = match &driver_place {
-            Some(driver) => match self.windows_build(model, &capsule_path, &copies, driver) {
-                Ok((build, stubs)) => {
-                    generated.extend(stubs);
-                    Some(build)
+            Some(driver) => {
+                match self.windows_build(model, &capsule_path, &copies, &rewritten, driver) {
+                    Ok((build, stubs)) => {
+                        generated.extend(stubs);
+                        Some(build)
+                    }
+                    Err(error) => {
+                        warnings.push(format!("no build.ps1 (Windows rebuild): {error}"));
+                        None
+                    }
                 }
-                Err(error) => {
-                    warnings.push(format!("no build.ps1 (Windows rebuild): {error}"));
-                    None
-                }
-            },
+            }
             None => {
                 if cfg!(windows) && self.glue.is_none() {
                     warnings.push(
@@ -2509,7 +2973,10 @@ impl CFamilyLane {
             format!("harness/{}", self.driver),
             "the fuzz driver (decodes the input, calls the target)".to_owned(),
         )];
-        let has = |prefix: &str| copies.iter().any(|c| c.to.starts_with(prefix));
+        let has = |prefix: &str| {
+            copies.iter().any(|c| c.to.starts_with(prefix))
+                || rewritten.keys().any(|to| to.starts_with(prefix))
+        };
         if has("sources/") {
             layout.push((
                 "sources/".to_owned(),
@@ -2553,6 +3020,10 @@ impl CFamilyLane {
         facts.insert("compiler_source".to_owned(), json!(model.compiler.source));
         facts.insert("standard".to_owned(), json!(model.standard));
         facts.insert("recorded_recipe".to_owned(), json!(model.recorded_recipe));
+        facts.insert(
+            "toolchain_flags".to_owned(),
+            json!(model.toolchain_flags.len() + model.toolchain_cppflags.len()),
+        );
         facts.insert("extra_sources".to_owned(), json!(model.extra_sources.len()));
         facts.insert("translation_units".to_owned(), json!(model.units.len()));
         facts.insert("include_closure".to_owned(), json!(closure));
@@ -2581,6 +3052,7 @@ impl CFamilyLane {
             build_outputs: [&["poc", "obj"][..], WINDOWS_BUILD_OUTPUTS].concat(),
             warnings,
             windows,
+            portability,
         })
     }
 
@@ -2593,6 +3065,7 @@ impl CFamilyLane {
         model: &BuildModel,
         capsule_path: &dyn Fn(&Path) -> String,
         copies: &[CapsuleFile],
+        rewritten: &std::collections::BTreeMap<String, String>,
         driver: &str,
     ) -> Result<(WindowsBuild, Vec<GeneratedFile>), String> {
         use windows::{Dialect, DialectBuild, Step};
@@ -2630,7 +3103,13 @@ impl CFamilyLane {
             args.extend(objects);
             args.extend(model.extra_sources.iter().map(|p| capsule_path(p)));
             args.push(driver_object);
-            args.extend(model.link_flags.iter().flat_map(|a| a.render(capsule_path)));
+            args.extend(
+                model
+                    .link_flags
+                    .iter()
+                    .chain(&model.extra_link_flags)
+                    .flat_map(|a| a.render(capsule_path)),
+            );
             // The linker's own spelling of `--gc-sections`, which link.exe and
             // lld-link take from clang and from cl alike.
             args.push("-Wl,/OPT:REF".to_owned());
@@ -2656,11 +3135,18 @@ impl CFamilyLane {
                 if weak.contains_key(arg) || !has_extension(Path::new(arg), SOURCE_EXTENSIONS) {
                     continue;
                 }
-                let Some(copy) = copies.iter().find(|copy| copy.to == *arg) else {
-                    continue;
-                };
-                let Ok(text) = std::fs::read_to_string(&copy.from) else {
-                    continue;
+                // A stub's shipped text: as rewritten for the capsule, else as copied.
+                let text = match rewritten.get(arg) {
+                    Some(text) => text.clone(),
+                    None => {
+                        let Some(copy) = copies.iter().find(|copy| copy.to == *arg) else {
+                            continue;
+                        };
+                        let Ok(text) = std::fs::read_to_string(&copy.from) else {
+                            continue;
+                        };
+                        text
+                    }
                 };
                 if !text.contains("__attribute__((weak))") {
                     continue;
@@ -3184,6 +3670,75 @@ fn include_directives(text: &str) -> Vec<(&str, bool)> {
             (!name.is_empty()).then_some((name, quoted))
         })
         .collect()
+}
+
+/// The absolute names of the quoted `#include`/`#import` lines of `text`, as
+/// bhf's repair files write them (`\\` and `\"` escaped).
+fn absolute_quoted_includes(text: &str) -> Vec<PathBuf> {
+    include_directives(text)
+        .into_iter()
+        .filter(|(_, quoted)| *quoted)
+        .filter_map(|(name, _)| absolute_include_name(name))
+        .collect()
+}
+
+/// An include name as the path it names, when it is absolute. A Windows
+/// verbatim prefix (`\\?\`, from a canonicalized path) is dropped.
+fn absolute_include_name(name: &str) -> Option<PathBuf> {
+    let unescaped = name.replace("\\\\", "\\");
+    let unescaped = unescaped.strip_prefix(r"\\?\").unwrap_or(&unescaped);
+    let path = Path::new(unescaped);
+    let windows_drive = unescaped.len() > 2
+        && unescaped.as_bytes()[0].is_ascii_alphabetic()
+        && unescaped.as_bytes()[1] == b':'
+        && matches!(unescaped.as_bytes()[2], b'/' | b'\\');
+    (path.is_absolute() || unescaped.starts_with('/') || windows_drive).then(|| normalize(path))
+}
+
+/// `text` (the file shipped at capsule path `at`) with each quoted
+/// `#include`/`#import` of an absolute path rewritten to the path of that
+/// file relative to `at`'s dir, for every file `place` says the capsule ships
+/// (and where); plus the absolute names it could not place (system files are
+/// left as they are).
+fn relocate_includes(
+    text: &str,
+    at: &str,
+    place: &dyn Fn(&Path) -> Option<String>,
+    is_system: &dyn Fn(&Path) -> bool,
+) -> (String, Vec<String>) {
+    let depth = at.split('/').count().saturating_sub(1);
+    let mut out = String::with_capacity(text.len());
+    let mut unplaced = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let rewritten = (|| {
+            let (name, quoted) = include_directives(line).into_iter().next()?;
+            if !quoted {
+                return None;
+            }
+            let path = absolute_include_name(name)?;
+            if is_system(&path) {
+                return None;
+            }
+            match place(&path) {
+                Some(to) => {
+                    let relative = format!("{}{to}", "../".repeat(depth));
+                    let start = line.find(&format!("\"{name}\""))? + 1;
+                    Some(format!(
+                        "{}{}{}",
+                        &line[..start],
+                        relative,
+                        &line[start + name.len()..]
+                    ))
+                }
+                None => {
+                    unplaced.push(path.display().to_string());
+                    None
+                }
+            }
+        })();
+        out.push_str(rewritten.as_deref().unwrap_or(line));
+    }
+    (out, unplaced)
 }
 
 /// The `build.sh` lines that recover the C++ standard library when
@@ -3765,12 +4320,17 @@ mod tests {
         let fdir = work.join("results/findings/F-1");
         write(&fdir.join("testcase.bin"), "x");
 
+        // `oracle_hit` is what a behavioral oracle records.
         let oracle = finding(
             &fdir,
-            json!({"id": "F-1", "classification": "oracle", "harness_id": "H-C0001"}),
+            json!({"id": "F-1", "classification": "oracle_hit", "harness_id": "H-C0001"}),
         );
         let refusal = assess(work, &oracle, Tool::Capsule).err().unwrap();
-        assert!(refusal.reason(Tool::Capsule).contains("oracle finding"));
+        assert!(
+            refusal.reason(Tool::Capsule).contains("oracle finding"),
+            "{}",
+            refusal.reason(Tool::Capsule)
+        );
 
         let missing = finding(
             &fdir,
@@ -3867,6 +4427,27 @@ mod tests {
         let none = select(work, None, Tool::Capsule).unwrap();
         assert_eq!(none.considered, 0);
 
+        // A sweep counts an oracle hit as a runtime finding and says why the
+        // tool does not take it.
+        let fdir = work.join("results/findings/F-2");
+        write(&fdir.join("testcase.bin"), "x");
+        write(
+            &fdir.join("finding.json"),
+            &json!({"id": "F-2", "classification": "oracle_hit", "harness_id": "H-C0001"})
+                .to_string(),
+        );
+        let sweep = select(work, None, Tool::Capsule).unwrap();
+        assert_eq!(sweep.considered, 1);
+        assert_eq!(sweep.refused.len(), 1);
+        assert!(
+            sweep.refused[0]
+                .refusal
+                .reason(Tool::Capsule)
+                .contains("oracle finding"),
+            "{}",
+            sweep.refused[0].refusal.reason(Tool::Capsule)
+        );
+
         // A work dir whose runs recorded nothing has no findings dir at all.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -3921,6 +4502,168 @@ mod tests {
             assert!(command.contains("report_error_type=1"), "{command}");
             assert_eq!(command.contains("detect_leaks=1"), leaks, "{command}");
         }
+    }
+
+    /// A finding whose harness is gone from the work dir gets no replay.py
+    /// suggestion (it looks the harness up in the same dirs) but the way to
+    /// get a harness back; replay.py is suggested once a harness it finds exists.
+    #[test]
+    fn a_missing_harness_is_not_answered_with_replay_py() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let fdir = work.join("results/findings/F-1");
+        write(&fdir.join("testcase.bin"), "x");
+        write(&fdir.join("replay.py"), "print('replay')\n");
+        let record = finding(
+            &fdir,
+            json!({"id": "F-1", "classification": "unhandled", "harness_id": "H-C0001"}),
+        );
+        let refusal = assess(work, &record, Tool::Capsule).err().unwrap();
+        assert!(
+            matches!(refusal, Refusal::HarnessNotFound { .. }),
+            "{refusal:?}"
+        );
+        let hint = alternative(work, &record, &refusal).expect("a hint");
+        assert!(!hint.contains("replay.py"), "{hint}");
+        // `bhf build` alone has no harness dir to build from: the hint
+        // regenerates the harness first, or replays a binary the reader has.
+        let quoted = sh_word(&work.to_string_lossy());
+        assert!(
+            !hint.starts_with("bhf build") && !hint.contains("after rebuilding"),
+            "{hint}"
+        );
+        for command in [
+            format!("bhf auto <source tree> --work-dir {quoted}"),
+            format!(
+                "bhf generate-harness <source> --target <function> --id H-C0001 --output {}",
+                sh_word(&work.join("harnesses").to_string_lossy())
+            ),
+            format!("bhf build {quoted} --harness H-C0001"),
+            format!(
+                "bhf replay --finding {} --harness <harness binary>",
+                sh_word(&fdir.to_string_lossy())
+            ),
+        ] {
+            assert!(hint.contains(&command), "{command}\n{hint}");
+        }
+        let regenerate = hint.find("bhf generate-harness").unwrap();
+        let build = hint.find("bhf build").unwrap();
+        assert!(regenerate < build, "generate before build: {hint}");
+
+        // A harness dir with a built harness: replay.py finds it.
+        let harness = work.join("harnesses/H-C0001");
+        write(&harness.join("main"), "\x7fELF");
+        let refusal = Refusal::IncompleteHarness {
+            harness_id: "H-C0001".to_owned(),
+            language: "c".to_owned(),
+            harness_dir: harness.clone(),
+            problem: "it has no Makefile".to_owned(),
+        };
+        let command = alternative(work, &record, &refusal).expect("a command");
+        assert!(command.contains("replay.py"), "{command}");
+        // Without a built harness replay.py would find nothing to run.
+        std::fs::remove_file(harness.join("main")).unwrap();
+        let none = alternative(work, &record, &refusal);
+        assert!(
+            none.as_deref()
+                .is_none_or(|text| !text.contains("replay.py")),
+            "{none:?}"
+        );
+    }
+
+    /// replay.py finds the harness a relative `fixture_path` names in the work
+    /// dir that holds the finding, never in the current directory, and one an
+    /// absolute `fixture_path` names in another work dir only when this work
+    /// dir's harness dirs hold none; the check follows it.
+    #[test]
+    fn the_replay_py_check_resolves_a_fixture_path_as_replay_py_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let fdir = work.join("results/findings/F-1");
+        write(&fdir.join("testcase.bin"), "x");
+        let record = |fixture: &str| {
+            finding(
+                &fdir,
+                json!({"id": "F-1", "classification": "unhandled",
+                       "harness_id": "H-C0001", "fixture_path": fixture}),
+            )
+        };
+        // Relative: under the work dir, wherever bhf runs from.
+        write(&work.join("custom/main"), "\x7fELF");
+        assert!(replay_py_finds_harness(&work, &record("custom/main")));
+        // A relative path that exists only beside the current directory is
+        // not what replay.py runs.
+        let cwd_only = std::env::current_dir()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .expect("a file in the current directory");
+        assert!(!work.join(&cwd_only).exists());
+        assert!(!replay_py_finds_harness(&work, &record(&cwd_only)));
+        // Absolute, in another work dir: its harness when this one has none.
+        let other = temp.path().join("other/harnesses/H-C0001/main");
+        write(&other, "\x7fELF");
+        assert!(replay_py_finds_harness(
+            &work,
+            &record(&other.to_string_lossy())
+        ));
+        // ... mapped into this work dir by its `harnesses/<id>/main` tail first.
+        std::fs::remove_file(&other).unwrap();
+        assert!(!replay_py_finds_harness(
+            &work,
+            &record(&other.to_string_lossy())
+        ));
+        write(&work.join("harnesses/H-C0001/main"), "\x7fELF");
+        assert!(replay_py_finds_harness(
+            &work,
+            &record(&other.to_string_lossy())
+        ));
+    }
+
+    /// A harness built for another platform runs under the emulator recorded
+    /// beside it (`bhf_runner.json`); the direct command a refusal prints
+    /// starts it that way, with the sanitizer options of an emulated replay.
+    #[test]
+    fn the_direct_harness_command_runs_a_cross_harness_under_its_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let harness = work.join("harnesses").join("H-C0001");
+        let binary = harness.join("main");
+        write(&binary, "\x7fELF");
+        write(
+            &harness.join(crate::gate_evidence::RUNNER_FILE),
+            r#"{"schema":"bhf.harness_runner.v1","program":"qemu-aarch64","args":["-L","/usr/aarch64-linux-gnu"]}"#,
+        );
+        let fdir = work.join("results/findings/F-1");
+        let input = fdir.join("testcase.bin");
+        write(&input, "x");
+        let refusal = Refusal::IncompleteHarness {
+            harness_id: "H-C0001".to_owned(),
+            language: "c".to_owned(),
+            harness_dir: harness.clone(),
+            problem: "it has no Makefile".to_owned(),
+        };
+        let raw = json!({"id": "F-1", "classification": "unhandled", "harness_id": "H-C0001"});
+        let command = alternative(work, &finding(&fdir, raw), &refusal).unwrap();
+        let options: Vec<String> = crate::fuzz::sanitizer_child_env_for(false, true)
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", sh_word(&value)))
+            .collect();
+        let program = command
+            .strip_prefix(&format!("{} ", options.join(" ")))
+            .unwrap_or_else(|| panic!("the emulated replay's options lead: {command}"));
+        assert_eq!(
+            program,
+            format!(
+                "qemu-aarch64 -L /usr/aarch64-linux-gnu {} {}",
+                sh_word(&binary.to_string_lossy()),
+                sh_word(&input.to_string_lossy())
+            )
+        );
+        assert!(command.contains("abort_on_error=0"), "{command}");
     }
 
     /// A harness Makefile in bhf's shape whose driver includes a header
@@ -4294,6 +5037,194 @@ mod tests {
             .leading_flags(Some("gnu89"), &[])
             .iter()
             .any(|f| f.starts_with("-std=")));
+    }
+
+    /// A schema-2 recipe also records what reached make through the
+    /// environment: the operator's `AUTO_EXTRA_INCLUDES` and
+    /// `AUTO_EXTRA_LDFLAGS`, the `[toolchain]` flags, the compatibility flags
+    /// and the compiler family. build.sh applies each, in the Makefile's order,
+    /// and ships the header a `-include` names.
+    #[test]
+    fn capsule_plan_applies_every_field_of_a_schema_2_recipe() {
+        let temp = tempfile::tempdir().unwrap();
+        let forced = temp.path().join("proj/src/inc/forced.h");
+        write(&forced, "#define FORCED 1\n");
+        let harness = sample_harness(
+            temp.path(),
+            Some(json!({
+                "schema_version": 2,
+                "native": true,
+                "extra_sources": [temp.path().join("proj/extra/helper.c")],
+                "extra_includes": [],
+                "standard": "gnu99",
+                "extra_compile_flags": ["-DWIDGET_MODE=2", "-include", forced],
+                "extra_ldflags": ["-lm"],
+                "compat_flags": {"clang": ["-fcommon"], "gcc": ["-fcommon"]},
+                "toolchain": {
+                    "BHF_TOOLCHAIN_CFLAGS": ["-fno-strict-aliasing"],
+                    "BHF_TOOLCHAIN_CPPFLAGS": ["-DFROM_TOOLCHAIN=1"],
+                    "BHF_TOOLCHAIN_C_CPPFLAGS": ["-DFROM_CFLAGS=1"],
+                    "BHF_TOOLCHAIN_LDFLAGS": ["-lpthread"],
+                    "BHF_TOOLCHAIN_LIBS": ["-lrt"],
+                },
+                "compiler_family": "gcc",
+            })),
+        );
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
+        let script = &plan.build_script;
+        let link = &script.replace("\\\n", " ");
+        let link = link
+            .lines()
+            .find(|line| line.contains("-o poc"))
+            .unwrap_or_else(|| panic!("no link line in:\n{script}"));
+        for flag in [
+            "-DWIDGET_MODE=2",
+            "-include sources/src/inc/forced.h",
+            "-fno-strict-aliasing",
+            "-DFROM_TOOLCHAIN=1",
+            "-DFROM_CFLAGS=1",
+            " -fcommon ",
+            "-std=gnu99",
+            "sources/extra/helper.c",
+        ] {
+            assert!(link.contains(flag), "{flag} missing from:\n{script}");
+        }
+        // The Makefile's order: the toolchain's C flags before the standard,
+        // its preprocessor flags after the includes; the link flags last.
+        let at = |needle: &str| link.find(needle).unwrap();
+        assert!(at("-fno-strict-aliasing") < at("-std=gnu99"), "{link}");
+        assert!(at("-iquote sources/src") < at("-DWIDGET_MODE=2"), "{link}");
+        assert!(at("-DWIDGET_MODE=2") < at("-DFROM_TOOLCHAIN=1"), "{link}");
+        assert!(at("-DFROM_TOOLCHAIN=1") < at("-DFROM_CFLAGS=1"), "{link}");
+        assert!(
+            at("$GC_LDFLAGS") < at("-lm")
+                && at("-lm") < at("-lpthread")
+                && at("-lpthread") < at("-lrt"),
+            "{link}"
+        );
+        let shipped: Vec<&str> = plan.files.iter().map(|f| f.to.as_str()).collect();
+        assert!(shipped.contains(&"sources/src/inc/forced.h"), "{shipped:?}");
+        assert_eq!(plan.build_facts["recorded_recipe"], true);
+        if std::env::var_os("CC").is_none() {
+            assert_eq!(plan.build_facts["compiler_family"], "gcc");
+            assert_eq!(plan.build_facts["compiler_source"], "build recipe");
+        }
+        // The Windows build takes the same flags.
+        if let Some(windows) = &plan.windows {
+            for flag in ["-DWIDGET_MODE=2", "-DFROM_TOOLCHAIN=1", "-lpthread"] {
+                assert!(windows.script.contains(flag), "{flag}:\n{}", windows.script);
+            }
+        }
+    }
+
+    /// A repair file's absolute `#include` of a file the capsule ships becomes
+    /// relative to the repair file's own place in the capsule; one the
+    /// capsule cannot place is reported, and a system header is left alone.
+    #[test]
+    fn absolute_includes_are_made_relative_to_the_including_file() {
+        let place = |path: &Path| -> Option<String> {
+            path.strip_prefix("/tree/src")
+                .ok()
+                .map(|rel| format!("sources/{}", rel.to_string_lossy().replace('\\', "/")))
+        };
+        let system = |path: &Path| path.starts_with("/usr/include");
+        let text = "#include <stdlib.h>\n#include \"auto_types.h\"\n\
+                    #include \"/tree/src/include/vendor.h\"\n\
+                      #  import \"/tree/src/widget.h\" // forwarded\n\
+                    #include \"/elsewhere/missing.h\"\n\
+                    #include \"/usr/include/stdio.h\"\nint copy_at(int);\n";
+        let (rewritten, unplaced) =
+            relocate_includes(text, "stubs/auto_stubs.cpp", &place, &system);
+        assert_eq!(
+            rewritten,
+            "#include <stdlib.h>\n#include \"auto_types.h\"\n\
+             #include \"../sources/include/vendor.h\"\n\
+               #  import \"../sources/widget.h\" // forwarded\n\
+             #include \"/elsewhere/missing.h\"\n\
+             #include \"/usr/include/stdio.h\"\nint copy_at(int);\n"
+        );
+        let unplaced: Vec<String> = unplaced
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect();
+        assert_eq!(unplaced, ["/elsewhere/missing.h"]);
+        // A forwarding header two dirs down climbs out of both.
+        let (nested, _) = relocate_includes(
+            "#include \"/tree/src/include/vendor.h\"\n",
+            "stubs/auto_includes/vendor/api.h",
+            &place,
+            &system,
+        );
+        assert_eq!(nested, "#include \"../../../sources/include/vendor.h\"\n");
+        // The escaping bhf's repair writer uses for a Windows path.
+        assert_eq!(
+            absolute_include_name("C:\\\\src\\\\inc\\\\x.h"),
+            Some(normalize(Path::new("C:\\src\\inc\\x.h")))
+        );
+        assert_eq!(absolute_include_name("auto_types.h"), None);
+    }
+
+    /// A C or C++ finding's identity is what `bhf replay` compares, with the
+    /// paths the capsule ships the files under; a finding with no sanitizer
+    /// report has none.
+    #[test]
+    fn a_sanitizer_findings_identity_names_capsule_paths() {
+        let raw = json!({
+            "rule_id": "BHF-205",
+            "exception": {
+                "name": "UBSAN_SIGNED_INTEGER_OVERFLOW",
+                "sanitizer": "ubsan",
+                "check": "signed-integer-overflow",
+                "message": "/tree/src/score.cpp:6:47: runtime error: signed integer overflow",
+                "stack": [
+                    {"function": "score_record(char const*, unsigned long)",
+                     "file": "/tree/src/score.cpp", "line": 6},
+                    {"function": "bhf_run_one", "file": "/w/harnesses/H-X1/main.cpp", "line": 90}
+                ]
+            }
+        });
+        let map = |path: &str| {
+            path.strip_prefix("/tree/src/")
+                .map(|rel| format!("sources/{rel}"))
+        };
+        let identity = sanitizer_finding_identity(&raw, &map).unwrap();
+        assert_eq!(identity["rule_id"], "BHF-205");
+        assert_eq!(identity["kind"], "signed-integer-overflow");
+        assert_eq!(identity["check"], "signed-integer-overflow");
+        assert_eq!(identity["sink_function"], "score_record");
+        assert_eq!(identity["site"], "sources/score.cpp:6:47");
+        let record = &identity["record"];
+        assert_eq!(record["exception"]["location"]["file"], "sources/score.cpp");
+        assert_eq!(record["exception"]["stack"][0]["file"], "sources/score.cpp");
+        assert_eq!(
+            CPP_LANE.finding_signature(&raw).as_deref(),
+            Some("UndefinedBehaviorSanitizer:runtime-error")
+        );
+        // A replay of the rebuilt PoC at the capsule's own path matches it;
+        // another check in the same function does not.
+        let replayed = corpus::parse_sanitizer_report(
+            "/c/sources/score.cpp:6:47: runtime error: signed integer overflow: 2147483583 + 65\n\
+             \x20   #0 0x1 in score_record(char const*, unsigned long) /c/sources/score.cpp:6:47\n\
+             SUMMARY: UndefinedBehaviorSanitizer: signed-integer-overflow /c/sources/score.cpp:6:47\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::crash_identity::compare(record, &replayed).verdict(),
+            crate::crash_identity::Verdict::Match
+        );
+        let other = corpus::parse_sanitizer_report(
+            "/c/sources/score.cpp:3:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             \x20   #0 0x1 in score_record(char const*, unsigned long) /c/sources/score.cpp:3:5\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /c/sources/score.cpp:3:5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::crash_identity::compare(record, &other).verdict(),
+            crate::crash_identity::Verdict::Mismatch
+        );
+        let fatal = json!({"rule_id": "BHF-210", "exception": {"name": "FATAL_SIGNAL"}});
+        assert!(sanitizer_finding_identity(&fatal, &map).is_none());
+        assert!(c_glue::COBOL_LANE.finding_identity(&raw, &map).is_none());
     }
 
     #[test]

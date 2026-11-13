@@ -214,8 +214,8 @@ fn names_absolute(text: &str, path: &str) -> bool {
     })
 }
 
-/// The files under `dir` (but its manifest, which records where the finding
-/// came from) whose text names one of `paths`.
+/// The files under `dir`, its manifest included (which names the finding's
+/// files as the capsule ships them), whose text names one of `paths`.
 fn files_naming(dir: &Path, paths: &[&Path]) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -224,9 +224,6 @@ fn files_naming(dir: &Path, paths: &[&Path]) -> Vec<String> {
             let path = entry.path();
             if entry.file_type().unwrap().is_dir() {
                 stack.push(path);
-                continue;
-            }
-            if path == dir.join("manifest.json") {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {

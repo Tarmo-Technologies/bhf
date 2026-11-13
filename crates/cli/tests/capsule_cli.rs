@@ -72,7 +72,11 @@ fn build_capsule(work: &Path, tar: bool) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Verify a capsule from a PRISTINE location — no bhf work dir nearby.
+/// Verify a capsule from a PRISTINE location — no bhf work dir nearby. The
+/// work dir the capsule came from (`<work>/capsules/capsule_<id>`) and the
+/// tree it scanned (its `auto/run.json` `source_root`) are moved away while
+/// verify-poc runs, so nothing the capsule did not ship can be reached, and
+/// put back afterwards for the tests that reuse them.
 fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
     let scratch =
         std::env::temp_dir().join(format!("bhf-cap-scratch-{tag}-{}", std::process::id()));
@@ -88,11 +92,33 @@ fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
         .map(|s| s.success())
         .unwrap_or(false);
     assert!(ok, "failed to stage capsule copy");
-    let out = bhf()
-        .arg("verify-poc")
-        .arg(&dest)
-        .output()
-        .expect("run bhf verify-poc");
+    let work = capsule_src
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "capsules"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let tree = work
+        .as_ref()
+        .and_then(|work| std::fs::read(work.join("auto/run.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|run| run["source_root"].as_str().map(std::path::PathBuf::from))
+        .filter(|tree| tree.is_dir());
+    let hidden: Vec<(std::path::PathBuf, std::path::PathBuf)> = tree
+        .into_iter()
+        .chain(work)
+        .map(|dir| {
+            let moved = dir.with_extension("hidden-for-verify");
+            (dir, moved)
+        })
+        .collect();
+    for (dir, moved) in &hidden {
+        std::fs::rename(dir, moved).unwrap();
+    }
+    let out = bhf().arg("verify-poc").arg(&dest).output();
+    for (dir, moved) in hidden.iter().rev() {
+        std::fs::rename(moved, dir).unwrap();
+    }
+    let out = out.expect("run bhf verify-poc");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let pass = out.status.success() && stdout.contains("PASS");
     let _ = std::fs::remove_dir_all(&scratch);
@@ -599,14 +625,25 @@ fn a_refused_finding_exits_non_zero_with_its_reason() {
             && stderr.contains("Ada"),
         "the refusal must name the finding, its harness and its language:\n{stderr}"
     );
+    // replay.py would find no harness to run: it is not offered.
     assert!(
-        stderr.contains("replay.py"),
-        "the refusal must offer a working alternative:\n{stderr}"
+        !stderr.contains("replay.py"),
+        "replay.py cannot run a harness that was never built:\n{stderr}"
     );
     assert!(
         !work.join("capsules").exists(),
         "a refused run must not leave an output dir behind"
     );
+    // With a built harness replay.py runs it: it is offered.
+    std::fs::write(work.join("harnesses/H-A0003-0000ABCD/main"), b"\x7fELF").unwrap();
+    let refused = capsule_for(&work, "F-0001-0000aaaa");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("replay.py"),
+        "the refusal must offer a working alternative:\n{stderr}"
+    );
+    std::fs::remove_file(work.join("harnesses/H-A0003-0000ABCD/main")).unwrap();
 
     let typo = capsule_for(&work, "F-0001-0000aaab");
     let stderr = String::from_utf8_lossy(&typo.stderr);
@@ -761,6 +798,26 @@ fn capsule_applies_the_recorded_build_recipe() {
     assert!(build.contains("helper.c"), "{build}");
     let (pass, verify) = verify_from_scratch(&cap, "recipe");
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+    // The finding recorded no sanitizer report: the capsule says why it has no
+    // identity to compare, and verify-poc does not call it an older capsule.
+    let manifest_path = cap.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["identity_comparison"]["verdict"], "none",
+        "{manifest}"
+    );
+    assert!(!verify.contains("older bhf"), "{verify}");
+    assert!(verify.contains("recorded no sanitizer report"), "{verify}");
+    // A capsule packaged before the field existed is noted as such.
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("identity_comparison");
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let (pass, verify) = verify_from_scratch(&cap, "recipe-older");
+    assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+    assert!(verify.contains("older bhf"), "{verify}");
 
     // A run over every finding packages what it can, names what it skipped,
     // and succeeds.
@@ -1361,5 +1418,570 @@ fn a_capsule_verifies_through_a_path_relative_to_the_current_dir() {
     assert!(
         !cap.join("poc").exists(),
         "verify-poc leaves the capsule as it found it"
+    );
+}
+
+/// `bhf auto` on `files` (written under `<root>/src`) for `language`, with a
+/// seconds-scale budget; the work dir.
+#[cfg(unix)]
+fn auto_tree(root: &Path, files: &[(&str, &str)], language: &str) -> (std::path::PathBuf, String) {
+    let tree = root.join("src");
+    for (name, text) in files {
+        let path = tree.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let work = root.join("work");
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", language, "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "6", "--no-discovery-cache"])
+        .output()
+        .expect("run bhf auto");
+    (work, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The crash finding whose `exception.name` contains `name`.
+#[cfg(unix)]
+fn finding_named(work: &Path, name: &str) -> Option<(String, std::path::PathBuf)> {
+    findings(work).into_iter().find_map(|(id, dir, raw)| {
+        let named = raw["exception"]["name"]
+            .as_str()
+            .is_some_and(|recorded| recorded.contains(name));
+        (raw["classification"] == "unhandled" && named && dir.join("testcase.bin").is_file())
+            .then_some((id, dir))
+    })
+}
+
+/// The files under `dir` whose text has an `#include "/..."` of an absolute
+/// path.
+#[cfg(unix)]
+fn absolute_includes_under(dir: &Path) -> Vec<String> {
+    files_under(dir)
+        .into_iter()
+        .filter(|rel| {
+            std::fs::read_to_string(dir.join(rel)).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("#include \"/") || line.starts_with("#import \"/")
+                })
+            })
+        })
+        .collect()
+}
+
+/// A C++ target calling a function its header declares and nothing defines:
+/// bhf stubs it in `repairs/auto_stubs.cpp`, which includes the header by
+/// its absolute path.
+#[cfg(unix)]
+const VENDOR_HPP: &str = "\
+#pragma once
+namespace vendor { int lookup(int key); }
+";
+
+#[cfg(unix)]
+const LOOKUP_CPP: &str = "\
+#include \"include/vendor.h\"
+#include <cstdlib>
+#include <cstring>
+int parse_record(const char *data, unsigned long len) {
+    int key = vendor::lookup(static_cast<int>(len));
+    char *buf = static_cast<char *>(std::malloc(4));
+    std::memcpy(buf, data, len);
+    int r = buf[0] + key;
+    std::free(buf);
+    return r;
+}
+";
+
+/// A capsule of a stub-dependent C++ target ships the stub with the header's
+/// include relative to the capsule, so it rebuilds and reproduces with the
+/// scanned tree and the work dir gone, and its manifest names neither.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn a_cpp_capsule_with_a_header_backed_stub_rebuilds_without_the_tree() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(
+        root.path(),
+        &[("include/vendor.h", VENDOR_HPP), ("parse.cpp", LOOKUP_CPP)],
+        "cpp",
+    );
+    let (id, _) = crash_finding(&work, |h| h.starts_with("H-X"))
+        .unwrap_or_else(|| panic!("auto produced no C++ crash finding: {stderr}"));
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains(&format!("capsule_{id}  (✓)")),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    assert!(
+        cap.join("stubs/auto_stubs.cpp").is_file(),
+        "{:?}",
+        files_under(&cap)
+    );
+    let absolute = absolute_includes_under(&cap.join("stubs"));
+    assert!(
+        absolute.is_empty(),
+        "stubs keep absolute includes: {absolute:?}"
+    );
+    let stub = std::fs::read_to_string(cap.join("stubs/auto_stubs.cpp")).unwrap();
+    assert!(
+        stub.contains("#include \"../sources/include/vendor.h\""),
+        "{stub}"
+    );
+    let manifest = std::fs::read_to_string(cap.join("manifest.json")).unwrap();
+    for host in [root.path().join("src"), work.clone()] {
+        assert!(
+            !manifest.contains(&host.display().to_string()),
+            "the manifest names {}:\n{manifest}",
+            host.display()
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(manifest["portable"], true, "{manifest}");
+    let (pass, verify) = verify_from_scratch(&cap, "cpp-stub");
+    assert!(
+        pass,
+        "verify-poc should PASS without the tree; got:\n{verify}"
+    );
+}
+
+/// The C counterpart: a C header declares the function, and the stub that
+/// defines it includes that header.
+#[cfg(unix)]
+const VENDOR_H: &str = "\
+#pragma once
+int vendor_lookup(int key);
+";
+
+#[cfg(unix)]
+const LOOKUP_C: &str = "\
+#include \"include/vendor.h\"
+#include <stdlib.h>
+#include <string.h>
+int parse_record(const char *data, unsigned int len) {
+    int key = vendor_lookup((int)len);
+    char *buf = malloc(4);
+    if (!buf) return 0;
+    memcpy(buf, data, len);
+    int r = buf[0] + key;
+    free(buf);
+    return r;
+}
+";
+
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn a_c_capsule_with_a_header_backed_stub_rebuilds_without_the_tree() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(
+        root.path(),
+        &[("include/vendor.h", VENDOR_H), ("parse.c", LOOKUP_C)],
+        "c",
+    );
+    let (id, _) = crash_finding(&work, |h| h.starts_with("H-C"))
+        .unwrap_or_else(|| panic!("auto produced no C crash finding: {stderr}"));
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains(&format!("capsule_{id}  (✓)")),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let stub = std::fs::read_to_string(cap.join("stubs/auto_stubs.c")).unwrap();
+    assert!(stub.contains("vendor_lookup"), "{stub}");
+    let absolute = absolute_includes_under(&cap.join("stubs"));
+    assert!(
+        absolute.is_empty(),
+        "stubs keep absolute includes: {absolute:?}"
+    );
+    let (pass, verify) = verify_from_scratch(&cap, "c-stub");
+    assert!(
+        pass,
+        "verify-poc should PASS without the tree; got:\n{verify}"
+    );
+}
+
+/// Overflows a signed int on any non-empty input, and falls off the end of
+/// the function on an empty one.
+#[cfg(unix)]
+const SCORE_CPP: &str = "\
+#include <climits>
+#include <cstddef>
+int score_record(const char *data, std::size_t len) {
+    if (len > 0) {
+        int total = INT_MAX - 64;
+        for (std::size_t i = 0; i < len; i++) total += data[i];
+        return total;
+    }
+}
+";
+
+/// verify-poc compares the crash field by field: a capsule of the overflow
+/// finding fed the input that reaches the other check reports a MISMATCH
+/// naming what differs, and fails.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn verify_poc_reports_another_check_in_the_same_harness_as_a_mismatch() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(root.path(), &[("score.cpp", SCORE_CPP)], "cpp");
+    let (id, _) = finding_named(&work, "SIGNED_INTEGER_OVERFLOW")
+        .unwrap_or_else(|| panic!("auto recorded no signed-overflow finding: {stderr}"));
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["finding_identity"]["kind"], "signed-integer-overflow",
+        "{manifest}"
+    );
+    // The same capsule, with the empty input that reaches the missing return.
+    let scratch = tempfile::tempdir().unwrap();
+    let copy = scratch.path().join("cap");
+    assert!(Command::new("cp")
+        .arg("-r")
+        .arg(&cap)
+        .arg(&copy)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(copy.join("input/testcase.bin"), b"").unwrap();
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&copy)
+        .output()
+        .expect("run bhf verify-poc");
+    let out = String::from_utf8_lossy(&verified.stdout);
+    assert_eq!(verified.status.code(), Some(1), "{out}");
+    assert!(out.contains("verify-poc: MISMATCH"), "{out}");
+    assert!(!out.contains("PASS"), "{out}");
+    assert!(
+        out.contains("differs:  kind: recorded signed-integer-overflow")
+            || out.contains("differs:  site:"),
+        "the differing field is named:\n{out}"
+    );
+}
+
+/// Overflows a heap buffer on inputs longer than four bytes, and dereferences
+/// NULL on a three-byte input that starts with `Q`.
+#[cfg(unix)]
+const PARSE_OR_FAULT_C: &str = "\
+#include <stdlib.h>
+#include <string.h>
+int parse_record(const char *data, unsigned int len) {
+    if (len == 3 && data[0] == 'Q') {
+        volatile char *p = (char *)0;
+        return *p;
+    }
+    char *buf = malloc(4);
+    if (!buf) return 0;
+    memcpy(buf, data, len);
+    int r = len ? buf[0] : 0;
+    free(buf);
+    return r;
+}
+";
+
+/// A minimized input that crashes another way (a SEGV for a heap-overflow
+/// finding) is not shipped as the finding's reproducer: the capsule ships the
+/// recorded input, which reproduces the heap overflow.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn a_minimized_input_with_another_crash_is_not_shipped() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(root.path(), &[("parse.c", PARSE_OR_FAULT_C)], "c");
+    let (id, finding_dir) = finding_named(&work, "HEAP_BUFFER_OVERFLOW")
+        .unwrap_or_else(|| panic!("auto recorded no heap-overflow finding: {stderr}"));
+    std::fs::write(finding_dir.join("min_testcase.bin"), b"Qxy").unwrap();
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        !(stdout.contains("(✓)") && manifest["expected_signature"] == "AddressSanitizer:SEGV"),
+        "a SEGV must never pass for the heap overflow:\n{stdout}\n{manifest}"
+    );
+    assert!(packaged.status.success(), "{stdout}");
+    assert!(stdout.contains(&format!("capsule_{id}  (✓)")), "{stdout}");
+    assert_eq!(manifest["input_source"], "testcase.bin", "{manifest}");
+    assert_eq!(
+        manifest["expected_signature"], "AddressSanitizer:heap-buffer-overflow",
+        "{manifest}"
+    );
+    assert_eq!(
+        std::fs::read(cap.join("input/testcase.bin")).unwrap(),
+        std::fs::read(finding_dir.join("testcase.bin")).unwrap()
+    );
+}
+
+/// Valid only before C++17: a dynamic exception specification and `register`.
+#[cfg(unix)]
+const LEGACY_CPP: &str = "\
+#include <cstdlib>
+#include <cstring>
+int parse_record(const char *data, unsigned long len) throw(int) {
+    register int first = 0;
+    char *buf = static_cast<char *>(std::malloc(4));
+    std::memcpy(buf, data, len);
+    first = buf[0];
+    std::free(buf);
+    return first;
+}
+";
+
+/// The language standard the dialect ladder built a legacy C++ target with
+/// is recorded in its build recipe, so the capsule and the coverage replay
+/// rebuild it with the same `-std`.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn a_legacy_dialect_cpp_target_records_its_standard_for_the_capsule() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(root.path(), &[("legacy.cpp", LEGACY_CPP)], "cpp");
+    let (id, finding_dir) = crash_finding(&work, |h| h.starts_with("H-X"))
+        .unwrap_or_else(|| panic!("auto produced no C++ crash finding: {stderr}"));
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+    let harness = work
+        .join("harnesses")
+        .join(raw["harness_id"].as_str().unwrap());
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(harness.join("coverage-build-recipe.json")).unwrap())
+            .unwrap();
+    assert_eq!(recipe["standard"], "gnu++14", "{recipe}");
+    assert!(
+        !harness.join("coverage-replay-diagnostic.txt").exists(),
+        "the coverage build must use the recorded standard: {}",
+        std::fs::read_to_string(harness.join("coverage-replay-diagnostic.txt")).unwrap_or_default()
+    );
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains(&format!("capsule_{id}  (✓)")),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let build = std::fs::read_to_string(cap.join("build.sh")).unwrap();
+    assert!(build.contains("-std=gnu++14"), "{build}");
+    let (pass, verify) = verify_from_scratch(&cap, "legacy-cpp");
+    assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+}
+
+/// A capsule whose rebuild failed when it was packaged says so, with the
+/// build's error, and verify-poc blames the build, not the crash's
+/// circumstances.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn verify_poc_names_the_rebuild_failure_of_a_capsule_that_never_built() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("proj");
+    let work = root.path().join("work");
+    let harness_id = "H-C0001-0000B00B";
+    let harness = work.join("harnesses").join(harness_id);
+    std::fs::create_dir_all(src.join("extra")).unwrap();
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(src.join("legacy.c"), LEGACY_TARGET_C).unwrap();
+    std::fs::write(src.join("extra/helper.c"), HELPER_C).unwrap();
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+    std::fs::write(
+        harness.join("Makefile"),
+        c_harness_makefile(&runtime, &src, &src.join("legacy.c")),
+    )
+    .unwrap();
+    std::fs::write(harness.join("main.c"), DRIVER_C).unwrap();
+    std::fs::write(
+        harness.join("generation-metadata.json"),
+        br#"{"schema_version":1,"language":"c"}"#,
+    )
+    .unwrap();
+    let id = "F-0009-0000abcd";
+    write_crash_finding(&work, id, harness_id, b"0123456789abcdef");
+    // A compiler that lists dependencies and answers the family probe, but
+    // fails every real compile.
+    let cc = root.path().join("cc-breaks");
+    write_script(
+        &cc,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in -M|-E|-dM|-print-resource-dir|--version) exec clang \"$@\" ;; esac\ndone\necho 'cc-breaks: error: the toolchain refused to compile' >&2\nexit 1\n",
+    );
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--finding-id", id])
+        .env("CC", &cc)
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        stdout.contains("not reproduced: the rebuild failed"),
+        "{stdout}"
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["rebuilt"], false, "{manifest}");
+    assert!(
+        manifest["build_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("the toolchain refused to compile")),
+        "{manifest}"
+    );
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&cap)
+        .env("CC", &cc)
+        .output()
+        .expect("run bhf verify-poc");
+    let out = String::from_utf8_lossy(&verified.stdout);
+    assert_eq!(verified.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("the capsule's rebuild failed when it was packaged")
+            && out.contains("the toolchain refused to compile"),
+        "{out}"
+    );
+    // This run's rebuild failed too, and says how.
+    assert!(
+        out.contains("observed: the rebuild fails here too: cc-breaks: error: the toolchain refused to compile"),
+        "{out}"
+    );
+    assert!(!out.contains("fork-server"), "{out}");
+}
+
+/// In-bounds for the 4-byte record, out of bounds past it.
+#[cfg(unix)]
+const SHORT_RECORD_C: &str = "\
+#include <stdlib.h>
+#include <string.h>
+int parse_record(const char *data, unsigned int len) {
+    char *buf = malloc(4);
+    if (!buf) return 0;
+    memcpy(buf, data, len);
+    int r = len ? buf[0] : 0;
+    free(buf);
+    return r;
+}
+";
+
+/// A capsule whose rebuild failed when it was packaged, but that rebuilds
+/// where verify-poc runs: an input that then does not crash is not blamed on
+/// the build, which works.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn verify_poc_does_not_blame_a_packaging_build_failure_once_the_capsule_builds() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("proj");
+    let work = root.path().join("work");
+    let harness_id = "H-C0001-0000B00C";
+    let harness = work.join("harnesses").join(harness_id);
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(src.join("parse.c"), SHORT_RECORD_C).unwrap();
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+    std::fs::write(
+        harness.join("Makefile"),
+        c_harness_makefile(&runtime, &src, &src.join("parse.c")),
+    )
+    .unwrap();
+    std::fs::write(harness.join("main.c"), DRIVER_C).unwrap();
+    std::fs::write(
+        harness.join("generation-metadata.json"),
+        br#"{"schema_version":1,"language":"c"}"#,
+    )
+    .unwrap();
+    let id = "F-0009-0000abce";
+    write_crash_finding(&work, id, harness_id, b"0123456789abcdef");
+    let cc = root.path().join("cc-breaks");
+    write_script(
+        &cc,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in -M|-E|-dM|-print-resource-dir|--version) exec clang \"$@\" ;; esac\ndone\necho 'cc-breaks: error: the toolchain refused to compile' >&2\nexit 1\n",
+    );
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--finding-id", id])
+        .env("CC", &cc)
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        stdout.contains("not reproduced: the rebuild failed"),
+        "{stdout}"
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["rebuilt"], false, "{manifest}");
+    // Here the rebuild works (a compiler that compiles), and this input
+    // stays inside the record.
+    std::fs::write(cap.join("input/testcase.bin"), b"ab").unwrap();
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&cap)
+        .env("CC", "clang")
+        .output()
+        .expect("run bhf verify-poc");
+    let out = String::from_utf8_lossy(&verified.stdout);
+    assert_eq!(verified.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("NOT REPRODUCIBLE — the capsule rebuilds here, but its input did not crash"),
+        "{out}"
+    );
+    assert!(
+        out.contains("the toolchain refused to compile"),
+        "names the packaging failure: {out}"
+    );
+    assert!(!out.contains("sh build.sh"), "the build works: {out}");
+    assert!(
+        !out.contains("NOT REPRODUCIBLE — the capsule's rebuild failed"),
+        "{out}"
     );
 }
