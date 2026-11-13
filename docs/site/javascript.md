@@ -121,8 +121,21 @@ command-injection detector as the JavaScript lane.
 bhf auto path/to/ts-src --languages typescript   # needs node + esbuild
 ```
 
-Requirements: Node.js and `esbuild` (`npm i -g esbuild`); absent either, the lane
-skips cleanly. `.d.ts` declaration files (no runtime code) are not fuzzed.
+Requirements: Node.js and `esbuild` (`npm i -g esbuild`, or the project's own
+`node_modules/.bin/esbuild`). bhf looks for esbuild on `PATH`, then in
+`node_modules/.bin` of the target's directory and of each directory above it up
+to and including the directory `bhf auto` scans, the nearest first. It never
+looks above that directory: a `node_modules` there belongs to no scanned
+project, and in a directory other users can write, such as `/tmp`, anyone could
+plant the esbuild bhf would run. A single scanned file has no project directory,
+so only `PATH` is searched. The run-start toolchain check resolves esbuild the
+same way for each TypeScript target, so a project's own esbuild satisfies it.
+bhf never runs `npx` to find esbuild: since npm 7 that looks the package up in
+the registry. Absent either tool the lane skips cleanly, and the target's
+outcome is `missing_toolchain` (the reason names the tool; the next steps ask
+for the install). `bhf auto --resume` tries such a target again, so installing
+the tool and resuming fuzzes it. `.d.ts` declaration files (no runtime code) are
+not fuzzed.
 
 ## Validation (campaign)
 

@@ -147,3 +147,101 @@ fn a_sweep_with_nothing_blocked_writes_no_histogram() {
         "a clean sweep should not leave an empty blockers.json; stderr=\n{stderr}"
     );
 }
+
+/// A TypeScript target on a host with Node.js but without esbuild is blocked
+/// by a missing toolchain, and is reported as one. bhf used to fall back to
+/// `npx --no-install esbuild`, which on npm 7+ looks the package up in the
+/// registry and refuses to install it; the target was then filed under
+/// `unsupported_params` with npm's refusal as its cause, and the next steps
+/// offered `--force`, which cannot install a transpiler. bhf must never start
+/// `npx` at all: a stand-in records any call.
+#[cfg(unix)]
+#[test]
+fn a_typescript_target_without_esbuild_is_blocked_by_a_missing_toolchain() {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(node) = which::which("node") else {
+        eprintln!("skipping: node unavailable");
+        return;
+    };
+    let root = tmpdir("ts-no-esbuild");
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("parser.ts"),
+        "export function parseRecord(data: Uint8Array): number {\n  \
+         return data.length > 0 ? data[0] : 0;\n}\n",
+    )
+    .unwrap();
+    // node and a recording npx first, then every inherited dir that holds no
+    // esbuild.
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&node, bin.join("node")).unwrap();
+    let npx_calls = root.join("npx-calls");
+    fs::write(
+        bin.join("npx"),
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n",
+            npx_calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("npx"), fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&inherited).filter(|dir| !dir.join("esbuild").exists())),
+    )
+    .unwrap();
+    let work = root.join("work");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .current_dir(&root)
+        .args(["auto", "--work-dir", work.to_str().unwrap()])
+        .args([
+            "--languages",
+            "typescript",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+        ])
+        .args(["--per-target-time", "1", "--no-discovery-cache"])
+        .arg(&src)
+        .env("PATH", &path)
+        .output()
+        .expect("run bhf auto");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        !npx_calls.exists(),
+        "bhf must not run npx: {:?}\n{stderr}",
+        fs::read_to_string(&npx_calls).unwrap_or_default()
+    );
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    let outcome = &run["targets"][0]["outcome"];
+    assert_eq!(
+        outcome["outcome"], "missing_toolchain",
+        "{outcome}\n{stderr}"
+    );
+    assert!(
+        outcome["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("esbuild")),
+        "the reason names the missing tool: {outcome}"
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("auto/blockers.json")).unwrap()).unwrap();
+    assert_eq!(rows[0]["category"], "missing_toolchain", "{rows}");
+    assert_eq!(rows[0]["language"], "typescript", "{rows}");
+    assert!(
+        stderr.contains("Install missing toolchains"),
+        "the next steps name the install: {stderr}"
+    );
+    assert!(
+        !stderr.contains("a parameter couldn't be driven"),
+        "a missing toolchain is not an undrivable parameter: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

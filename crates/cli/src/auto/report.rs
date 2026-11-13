@@ -108,6 +108,12 @@ struct Summary {
     /// own outcome). 0 (omitted) when none was.
     #[serde(skip_serializing_if = "is_zero")]
     unsafe_build_path: usize,
+    /// Targets whose lane's toolchain is not installed (outcome
+    /// `missing_toolchain`: no `node` for JavaScript, no esbuild for
+    /// TypeScript; counted in `unsupported_params` before it had its own
+    /// outcome). 0 (omitted) when none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    missing_toolchain: usize,
     unrecoverable_link: usize,
     unrecoverable_runtime: usize,
     /// M22: targets discovered + statically analyzed but not fuzzed (legacy
@@ -1221,6 +1227,9 @@ pub fn write_reports_with_output_limit(
             Outcome::UnsafeBuildPath { .. } => {
                 summary.unsafe_build_path += 1;
             }
+            Outcome::MissingToolchain { .. } => {
+                summary.missing_toolchain += 1;
+            }
             Outcome::UnrecoverableLink { missing, .. } => {
                 summary.unrecoverable_link += 1;
                 for m in missing {
@@ -2225,6 +2234,7 @@ fn missing_language_package(outcome: &Outcome) -> Option<String> {
     let reason = match outcome {
         Outcome::UnsupportedParams { reason } => reason.as_str(),
         Outcome::UnsafeBuildPath { .. }
+        | Outcome::MissingToolchain { .. }
         | Outcome::FailedBuild { .. }
         | Outcome::BuiltAndFuzzed { .. }
         | Outcome::BuiltNotEntered { .. }
@@ -2256,6 +2266,7 @@ fn add_checkpoint_result(
         | Outcome::UnrecoverableRuntime { repairs, .. } => repairs,
         Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
+        | Outcome::MissingToolchain { .. }
         | Outcome::ReportOnly { .. } => &[],
     };
     // An interpreted target that could not load because a package is not
@@ -2514,7 +2525,8 @@ fn add_checkpoint_result(
         }
         Outcome::Built { .. }
         | Outcome::UnsupportedParams { .. }
-        | Outcome::UnsafeBuildPath { .. } => {}
+        | Outcome::UnsafeBuildPath { .. }
+        | Outcome::MissingToolchain { .. } => {}
     }
 }
 
@@ -3050,6 +3062,13 @@ fn render_md(r: &RunJson<'_>) -> String {
             s,
             "Refused (a path or flag cannot be quoted safely): {}",
             r.summary.unsafe_build_path
+        );
+    }
+    if r.summary.missing_toolchain > 0 {
+        let _ = writeln!(
+            s,
+            "Skipped (toolchain not installed): {}",
+            r.summary.missing_toolchain
         );
     }
     let _ = writeln!(s, "Unrecoverable link: {}", r.summary.unrecoverable_link);

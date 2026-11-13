@@ -1782,7 +1782,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // Kept for the end-of-run triage.
     let _tp = std::time::Instant::now();
     crate::auto::discovery::bhfprof("auto:start_to_preflight", _tstart);
-    let preflight = crate::auto::preflight::run(&candidates);
+    let preflight = crate::auto::preflight::run(&candidates, Some(&path));
     crate::auto::discovery::bhfprof("auto:preflight", _tp);
     bhfeprint!("{}", preflight.render());
 
@@ -2356,6 +2356,17 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 return true;
             }
             match crate::auto::report::load_resumed_result(&work, &c.harness_id) {
+                // A missing toolchain is a fact about the host, not the target:
+                // it may be installed by now, so the target is tried again
+                // (unforced; forcing cannot stand in for a toolchain).
+                Some((prior, _))
+                    if matches!(
+                        prior.outcome,
+                        crate::auto::attempt::Outcome::MissingToolchain { .. }
+                    ) =>
+                {
+                    true
+                }
                 Some((prior, prior_forced)) => {
                     let prior_fuzzed = reached_fuzz(&prior.outcome);
                     if (prior_state_incompatible && !prior_fuzzed)
@@ -3345,6 +3356,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                     )
                 })
                 .count(),
+            skipped_missing_toolchain: missing_toolchain_by_lane(&results),
             report_only: summary.report_only,
             findings: summary.findings,
             preflight: &preflight,
@@ -3720,6 +3732,28 @@ fn candidate_progress_prefix(
         ),
         None => format!("{candidate} {harness_id} {name}"),
     }
+}
+
+/// The targets whose lane's toolchain is not installed, counted per lane (its
+/// toolchain-check name), in the check's lane order.
+fn missing_toolchain_by_lane(
+    results: &[crate::auto::attempt::AttemptResult],
+) -> Vec<(&'static str, usize)> {
+    let mut lanes: Vec<(&'static str, usize)> = Vec::new();
+    for result in results {
+        if !matches!(
+            result.outcome,
+            crate::auto::attempt::Outcome::MissingToolchain { .. }
+        ) {
+            continue;
+        }
+        let lane = crate::auto::preflight::lane_name(result.candidate.lang);
+        match lanes.iter_mut().find(|(name, _)| *name == lane) {
+            Some((_, count)) => *count += 1,
+            None => lanes.push((lane, 1)),
+        }
+    }
+    lanes
 }
 
 /// Whether an outcome means the target actually reached the fuzz phase. The one
@@ -4392,7 +4426,7 @@ impl AutoSummary {
                     coverage_edges = coverage_edges
                         .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
                 }
-                UnsafeBuildPath { .. } => skipped += 1,
+                UnsafeBuildPath { .. } | MissingToolchain { .. } => skipped += 1,
                 UnsupportedParams { reason } => {
                     skipped += 1;
                     // An interpreted target that could not LOAD because a package
@@ -5211,6 +5245,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         UnsupportedParams { .. } => "skipped: could not auto-harness",
         // Not a missing feature: a path or flag no quoting makes safe.
         UnsafeBuildPath { .. } => "refused: a path or flag cannot be quoted safely",
+        // Not a missing feature: the lane's toolchain is not installed here.
+        MissingToolchain { .. } => "skipped: toolchain not installed",
         UnrecoverableLink { .. } => "unrecoverable_link",
         UnrecoverableRuntime { .. } => "unrecoverable_runtime",
         // M22: discovered + statically analyzed, not fuzzed.
@@ -5263,7 +5299,9 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
                 lines.push(format!("last error: {}", build_error_brief(err)));
             }
         }
-        UnsupportedParams { reason } | UnsafeBuildPath { reason } => lines.push(reason.clone()),
+        UnsupportedParams { reason } | UnsafeBuildPath { reason } | MissingToolchain { reason } => {
+            lines.push(reason.clone())
+        }
         UnrecoverableLink { missing, .. } => {
             if !missing.is_empty() {
                 lines.push(format!("missing libraries: {}", missing.join(", ")));

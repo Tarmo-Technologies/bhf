@@ -146,6 +146,13 @@
 - `bhf report --backfill` no longer tells you to pass `--harness`, which
   `bhf report` does not have, when a finding's harness is gone; it says to
   restore or rebuild the harness and run the backfill again.
+- TypeScript: esbuild is found on `PATH` or in a `node_modules/.bin` of the
+  scanned tree (the target's directory up to the directory `bhf auto` scans,
+  never above it), never through `npx`. Since npm 7,
+  `npx --no-install esbuild` looks the package up in the registry and refuses
+  to install it, so on a host without esbuild bhf reached the network and
+  reported npm's refusal as the target's cause. The run-start toolchain check
+  finds a project's own esbuild the same way.
 - The generated C and C++ harness Makefiles no longer recompile bhf's driver
   object each time `bhf auto` reruns `make` in the same harness directory with
   another `C_STD`/`CXX_STD` (a dialect ladder rung), other `CFLAGS`/`CXXFLAGS`
@@ -1437,6 +1444,16 @@
 - Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
   len)` pair as a C string now reports a heap overflow, as it does under
   libFuzzer.
+- A JavaScript or TypeScript target whose lane's toolchain is not installed
+  (no `node`, or no esbuild for TypeScript) has its own outcome,
+  `missing_toolchain`, in `run.json` (and `summary.missing_toolchain`, the
+  terminal label, the blocker histogram and `bhf introspect`), instead of
+  `unsupported_params`. The next steps ask for the install instead of offering
+  `--force`, and such a target is not filed in the bug report. `--resume`
+  tries such a target again, so installing the tool and resuming fuzzes it.
+  Tooling that grouped these targets under `unsupported_params` should also
+  read the new outcome. The TypeScript capsule round trip test skips without
+  esbuild.
 - The nightly integration workflow runs 12 hash shards and a shard of its own
   for `build_recovery_scenarios` instead of 6 shards, so each shard is expected
   to finish in about 25 minutes, inside its 40-minute timeout. An AFL++ test

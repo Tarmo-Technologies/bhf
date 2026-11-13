@@ -336,6 +336,7 @@ fn blocker_kind(outcome: &str) -> &'static str {
         "failed_build" => "build_blocked",
         "unsupported_params" => "unsupported_params",
         "unsafe_build_path" => "unsafe_build_path",
+        "missing_toolchain" => "missing_toolchain",
         "unrecoverable_link" => "link_blocked",
         "unrecoverable_runtime" => "runtime_blocked",
         "not_seen_in_prior_run" => "not_run",
@@ -362,6 +363,11 @@ fn recommendation_for(blocker_kind: &str, candidate: &Candidate) -> String {
         "unsafe_build_path" => {
             "Refused because a source path, include dir or compile flag holds a character that \
              cannot be quoted safely in a build recipe; rename or move that path."
+                .to_owned()
+        }
+        "missing_toolchain" => {
+            "Skipped previously because the lane's toolchain is not installed (the reason names \
+             the tool); install it and rerun."
                 .to_owned()
         }
         "link_blocked" => {

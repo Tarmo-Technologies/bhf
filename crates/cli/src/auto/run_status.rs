@@ -71,7 +71,7 @@ pub fn outcome_bucket(outcome: &crate::auto::attempt::Outcome) -> &'static str {
         FailedBuild { .. } => "failed-build",
         UnrecoverableLink { .. } => "link",
         UnrecoverableRuntime { .. } => "runtime",
-        UnsupportedParams { .. } | UnsafeBuildPath { .. } => "skipped",
+        UnsupportedParams { .. } | UnsafeBuildPath { .. } | MissingToolchain { .. } => "skipped",
         ReportOnly { .. } => "report-only",
     }
 }

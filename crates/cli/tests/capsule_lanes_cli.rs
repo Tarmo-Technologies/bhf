@@ -347,6 +347,8 @@ fn javascript_finding_round_trips() {
 )]
 fn typescript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
+    // The TypeScript lane transpiles with esbuild, which Node.js does not ship.
+    skip_unless!(runs("esbuild", &["--version"]), "esbuild not installed");
     let run = Run::new(&[(
         "parser.ts",
         "export function parseRecord(data: Uint8Array): number {\n  \

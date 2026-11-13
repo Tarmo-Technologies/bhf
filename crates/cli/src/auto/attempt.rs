@@ -802,6 +802,14 @@ pub enum Outcome {
     UnsafeBuildPath {
         reason: String,
     },
+    /// The target's lane cannot build anything on this host because its
+    /// toolchain is not installed (no `node` for JavaScript, no esbuild for
+    /// TypeScript); the reason names the tool. An environment problem with one
+    /// remedy, installing it; `--force` cannot help. Before it had its own
+    /// outcome such a target was recorded as `unsupported_params`.
+    MissingToolchain {
+        reason: String,
+    },
     UnrecoverableLink {
         repairs: Vec<Repair>,
         missing: Vec<String>,
@@ -981,6 +989,16 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::MissingToolchain { reason } => AttemptTrace {
+                terminal_stage: "toolchain".to_owned(),
+                fallback_chain: vec!["missing_toolchain".to_owned()],
+                reason_category: Some("missing_toolchain".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::UnrecoverableLink { repairs, missing } => AttemptTrace {
                 terminal_stage: "link".to_owned(),
                 fallback_chain: vec!["build_repair".to_owned(), "link_unrecoverable".to_owned()],
@@ -1063,6 +1081,7 @@ impl Outcome {
             | Outcome::UnrecoverableRuntime { repairs, .. } => repairs.as_slice(),
             Outcome::UnsupportedParams { .. }
             | Outcome::UnsafeBuildPath { .. }
+            | Outcome::MissingToolchain { .. }
             | Outcome::ReportOnly { .. } => return None,
         };
         repairs.iter().find_map(|r| match r {
@@ -1871,6 +1890,30 @@ mod sequence_fallback_tests {
         assert!(matches!(other, Outcome::UnsupportedParams { .. }));
     }
 
+    /// A lane whose toolchain is not installed is its own outcome, with its
+    /// own trace category, and carries no repairs.
+    #[test]
+    fn a_missing_toolchain_has_its_own_outcome() {
+        let reason = "no TypeScript transpiler found (install esbuild)".to_owned();
+        let outcome = Outcome::MissingToolchain {
+            reason: reason.clone(),
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "missing_toolchain");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&back, Outcome::MissingToolchain { reason: kept } if *kept == reason),
+            "{back:?}"
+        );
+        let trace = outcome.attempt_trace();
+        assert_eq!(trace.terminal_stage, "toolchain");
+        assert_eq!(trace.reason_category.as_deref(), Some("missing_toolchain"));
+        assert_eq!(trace.fallback_chain, ["missing_toolchain"]);
+        assert!(!trace.repairs_attempted);
+        assert_eq!(outcome.platform_stub(), None);
+    }
+
     #[test]
     fn unsupported_trace_is_structured_and_never_implies_missing_repairs() {
         let outcome = Outcome::UnsupportedParams {
@@ -2645,6 +2688,13 @@ fn run_attempt(
                     harness_dir,
                 });
             }
+            crate::auto::js_build::JsBuildResult::MissingToolchain(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::MissingToolchain { reason },
+                    harness_dir,
+                });
+            }
             crate::auto::js_build::JsBuildResult::Failed(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2663,12 +2713,24 @@ fn run_attempt(
     // esbuild, then drive it with the same Node framed driver as the JS lane.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Ts) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
-        match crate::auto::js_build::build_ts_harness(candidate, work_dir, &candidate.harness_id) {
+        match crate::auto::js_build::build_ts_harness(
+            candidate,
+            work_dir,
+            &candidate.harness_id,
+            options.source_root.as_deref(),
+        ) {
             crate::auto::js_build::JsBuildResult::Built => {}
             crate::auto::js_build::JsBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
                     outcome: Outcome::UnsupportedParams { reason },
+                    harness_dir,
+                });
+            }
+            crate::auto::js_build::JsBuildResult::MissingToolchain(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::MissingToolchain { reason },
                     harness_dir,
                 });
             }

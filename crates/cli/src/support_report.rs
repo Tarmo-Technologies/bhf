@@ -734,6 +734,7 @@ fn ingest_outcome(evidence: &mut Evidence, lang: &str, outcome: &Value) {
         tag,
         "unsupported_params"
             | "unsafe_build_path"
+            | "missing_toolchain"
             | "report_only"
             | "unrecoverable_link"
             | "unrecoverable_runtime"

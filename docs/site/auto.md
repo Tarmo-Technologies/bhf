@@ -87,7 +87,7 @@ their own interpreters with in-process edge coverage.
 | `--discovery-cache <PATH>` | `<work>/discovery-cache.json` | Put the default-on cache at an explicit path, useful when work directories change or the cache belongs on a known volume |
 | `--fresh-discovery` | off | Force a fresh discovery this run (ignore any cache), then overwrite the cache with the new result |
 | `--no-discovery-cache` | off | Disable the discovery cache entirely (never read or write it) |
-| `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results |
+| `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results. A target whose lane's toolchain was missing (`missing_toolchain`) is always tried again, since the tool may have been installed since |
 | `--reuse-discovery` | — | Deprecated no-op (caching is now the default); accepted for back-compat |
 | `--sanitizers <asan,ubsan,msan,tsan,lsan \| none>` | none | Arm the named matrix for native C/C++ builds (the other lanes own their instrumentation). `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
@@ -861,7 +861,11 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
   `unsafe_build_path` in `run.json`) is a target refused because a source path,
   include dir or compile flag holds a character no quoting makes safe in a
   build recipe (`$`, `#`, a backtick, a shell operator): an environment problem,
-  fixed by renaming or moving the path, not a bhf gap.
+  fixed by renaming or moving the path, not a bhf gap. A JavaScript or
+  TypeScript target whose lane's toolchain is not installed (no `node`, no
+  esbuild) has the outcome `missing_toolchain` (`summary.missing_toolchain`,
+  terminal label "skipped: toolchain not installed"): install the tool the
+  reason names; it is not filed in the bug report and `--force` cannot help.
   A non-zero `issue_count` is **informational**: it counts candidates bhf could
   not fully drive, not a run failure. `--debug` also sets `RUST_BACKTRACE` and
   keeps going past a file that would otherwise crash bhf itself, enriching the

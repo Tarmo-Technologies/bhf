@@ -3208,6 +3208,10 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         | Outcome::ReportOnly { .. } => {
             // Any of these is fine - the dispatch reached the Ada path.
         }
+        // Only the JavaScript and TypeScript lanes report a missing toolchain.
+        Outcome::MissingToolchain { reason } => {
+            panic!("an Ada candidate was routed to a script lane: {reason}")
+        }
     }
 }
 

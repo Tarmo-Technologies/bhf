@@ -20,6 +20,10 @@ pub struct TriageInputs<'a> {
     /// character no quoting can make safe in a build recipe. The remedy is to
     /// move or rename the path, not `--force`.
     pub skipped_unsafe_path: usize,
+    /// Of `skipped`, those whose lane's toolchain is not installed (no `node`,
+    /// no esbuild), counted per lane (its [`crate::auto::preflight`] name). The
+    /// remedy is to install it, not `--force`.
+    pub skipped_missing_toolchain: Vec<(&'static str, usize)>,
     pub report_only: usize,
     /// Of `failed_build`, the C++ targets (the C++ dialect ladder applies).
     pub failed_build_cpp: usize,
@@ -120,11 +124,35 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         ));
     }
 
-    // 3c. Skipped (a parameter couldn't be driven) — what --force is actually for.
+    // 3c. Skipped because the lane's toolchain is not installed. The install
+    // action above names the toolchain of each lane the run-start check found
+    // missing; the targets of a lane it did not name (a tool on PATH that did
+    // not answer, say) get this action instead.
+    let skipped_missing_toolchain: usize = inputs
+        .skipped_missing_toolchain
+        .iter()
+        .map(|(_, count)| count)
+        .sum();
+    let unnamed: usize = inputs
+        .skipped_missing_toolchain
+        .iter()
+        .filter(|(lane, _)| !inputs.preflight.missing_lanes().any(|l| l.lang == *lane))
+        .map(|(_, count)| count)
+        .sum();
+    if unnamed > 0 {
+        actions.push(format!(
+            "{unnamed} target(s) were skipped because their lane's toolchain is not installed \
+             (each reason in run.json names the tool). Install it and re-run; --force cannot \
+             help.",
+        ));
+    }
+
+    // 3d. Skipped (a parameter couldn't be driven) — what --force is actually for.
     let undrivable = inputs
         .skipped
         .saturating_sub(inputs.skipped_missing_package)
-        .saturating_sub(inputs.skipped_unsafe_path);
+        .saturating_sub(inputs.skipped_unsafe_path)
+        .saturating_sub(skipped_missing_toolchain);
     if undrivable > 0 {
         actions.push(format!(
             "{undrivable} target(s) were skipped (a parameter couldn't be driven — opaque handle, callback, unknown type). Attempt them anyway with --force.",
@@ -262,6 +290,7 @@ mod tests {
             skipped: 0,
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 2,
             preflight: &healthy(),
@@ -280,6 +309,7 @@ mod tests {
             skipped: 2,
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -305,6 +335,7 @@ mod tests {
             skipped: 0,
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -348,6 +379,7 @@ mod tests {
             skipped: 4,
             skipped_missing_package: 4,
             skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -380,6 +412,7 @@ mod tests {
             skipped: 7,
             skipped_missing_package: 5,
             skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -406,6 +439,7 @@ mod tests {
             skipped: 3,
             skipped_missing_package: 0,
             skipped_unsafe_path: 2,
+            skipped_missing_toolchain: Vec::new(),
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -423,6 +457,67 @@ mod tests {
             text.contains("1 target(s) were skipped (a parameter couldn't be driven"),
             "the force action counts only the undrivable skip:\n{text}"
         );
+    }
+
+    /// A target skipped because its lane's toolchain is not installed asks for
+    /// the install, never `--force`: once in the install action when the run's
+    /// toolchain check named the lane, and in its own action when it did not,
+    /// even when it named another lane.
+    #[test]
+    fn a_missing_toolchain_asks_for_the_install_not_force() {
+        let missing_ts = PreflightReport {
+            lanes: vec![crate::auto::preflight::LaneStatus {
+                lang: "TypeScript",
+                targets: 2,
+                missing: vec!["esbuild"],
+                install_hint: "install Node.js + esbuild (`npm i -g esbuild`)",
+                unsupported: None,
+            }],
+        };
+        // The check named another lane's tool but not this lane's (its tool
+        // was on PATH but did not answer, say): these targets still need
+        // their own action, not silence.
+        let missing_ada = PreflightReport {
+            lanes: vec![crate::auto::preflight::LaneStatus {
+                lang: "Ada",
+                targets: 1,
+                missing: vec!["gnat"],
+                install_hint: "install GNAT and GPRbuild",
+                unsupported: None,
+            }],
+        };
+        let healthy = healthy();
+        for (preflight, own_action) in
+            [(&missing_ts, false), (&healthy, true), (&missing_ada, true)]
+        {
+            let inputs = TriageInputs {
+                built_and_fuzzed: 0,
+                failed_build: 0,
+                failed_build_cpp: 0,
+                failed_build_ada: 0,
+                skipped: 2,
+                skipped_missing_package: 0,
+                skipped_unsafe_path: 0,
+                skipped_missing_toolchain: vec![("TypeScript", 2)],
+                report_only: 0,
+                findings: 0,
+                preflight,
+                custom_build: None,
+            };
+            let text = render_triage(&inputs);
+            assert!(!text.contains("anyway with --force"), "{text}");
+            assert!(!text.contains("a parameter couldn't be driven"), "{text}");
+            assert_eq!(
+                text.contains("TypeScript — install Node.js"),
+                !own_action,
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("2 target(s) were skipped because their lane's toolchain"),
+                own_action,
+                "{text}"
+            );
+        }
     }
 
     #[test]

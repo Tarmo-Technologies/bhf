@@ -6,6 +6,7 @@
 //! pass. Also feeds the end-of-run triage.
 
 use crate::auto::candidate::{Candidate, Lang};
+use std::path::Path;
 
 /// One language lane's toolchain status.
 pub struct LaneStatus {
@@ -83,13 +84,31 @@ fn have(tool: &str) -> bool {
     }
 }
 
-/// `Some(display)` when a required tool group is satisfied by any alternative; `None`
-/// (i.e. missing) reports the FIRST alternative as the canonical name to install.
-fn missing_group<'a>(alternatives: &[&'a str]) -> Option<&'a str> {
-    if alternatives.iter().any(|t| have(t)) {
+/// `Some(display)` when a required tool group is satisfied by any alternative
+/// (`found`); `None` (i.e. missing) reports the FIRST alternative as the
+/// canonical name to install.
+fn missing_group_with<'a>(
+    alternatives: &[&'a str],
+    mut found: impl FnMut(&str) -> bool,
+) -> Option<&'a str> {
+    if alternatives.iter().any(|t| found(t)) {
         None
     } else {
         alternatives.first().copied()
+    }
+}
+
+/// Whether a lane's `tool` is installed for every one of its `targets`.
+/// esbuild is resolved as the TypeScript lane resolves it for each target
+/// (PATH, else the project's own `node_modules/.bin` inside the scan root), so
+/// the check does not ask for an install a project's own esbuild makes
+/// unneeded, nor pass a lane some of whose targets have none.
+fn lane_has(tool: &str, targets: &[&Candidate], scan_root: Option<&Path>) -> bool {
+    match tool {
+        "esbuild" => targets.iter().all(|candidate| {
+            crate::auto::js_build::locate_esbuild(&candidate.source_path, scan_root).is_some()
+        }),
+        _ => have(tool),
     }
 }
 
@@ -277,11 +296,13 @@ const LANES: [Lang; 16] = [
 ];
 
 /// Build the preflight report from the discovered candidates (one lane per language
-/// that actually has targets).
-pub fn run(candidates: &[Candidate]) -> PreflightReport {
+/// that actually has targets). `scan_root` is the tree `bhf auto` scans, where
+/// a lane may find a project's own tool.
+pub fn run(candidates: &[Candidate], scan_root: Option<&Path>) -> PreflightReport {
     let mut lanes = Vec::new();
     for lang in LANES {
-        let targets = candidates.iter().filter(|c| c.lang == lang).count();
+        let lane_targets: Vec<&Candidate> = candidates.iter().filter(|c| c.lang == lang).collect();
+        let targets = lane_targets.len();
         if targets == 0 {
             continue;
         }
@@ -292,7 +313,12 @@ pub fn run(candidates: &[Candidate]) -> PreflightReport {
         let missing: Vec<&'static str> = if unsupported.is_some() {
             Vec::new()
         } else {
-            groups.iter().filter_map(|g| missing_group(g)).collect()
+            groups
+                .iter()
+                .filter_map(|g| {
+                    missing_group_with(g, |tool| lane_has(tool, &lane_targets, scan_root))
+                })
+                .collect()
         };
         lanes.push(LaneStatus {
             lang: name,
@@ -318,14 +344,14 @@ mod tests {
         // process-global, so both must hold the same lock or they race.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            missing_group(&["definitely-not-a-real-tool-xyz"]),
+            missing_group_with(&["definitely-not-a-real-tool-xyz"], have),
             Some("definitely-not-a-real-tool-xyz")
         );
         // A program every host has on PATH.
         let present = if cfg!(windows) { "cmd" } else { "sh" };
-        assert_eq!(missing_group(&[present]), None);
+        assert_eq!(missing_group_with(&[present], have), None);
         // Any alternative present satisfies the group.
-        assert_eq!(missing_group(&["nope-xyz", present]), None);
+        assert_eq!(missing_group_with(&["nope-xyz", present], have), None);
     }
 
     #[test]
