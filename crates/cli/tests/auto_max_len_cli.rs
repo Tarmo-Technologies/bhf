@@ -80,14 +80,22 @@ fn auto_max_len_auto_grows_seedlessly_and_fixed_cap_bounds() {
     write_fixture(&src);
 
     // 1) --max-len auto (the default): seedless, the adaptive ceiling grows past 4096
-    //    and the >= 8000-byte crash is found.
+    //    and the >= 6000-byte crash is found. The run is bounded by executions
+    //    (`--iterations` per pass), not by the wall clock: the mutator's random
+    //    stream is seeded, so every host reaches the same inputs, a loaded one
+    //    only later. The wall budget is a backstop, and the target stops at its
+    //    first finding.
     let work_auto = tmp.join("work_auto");
     let out = Command::new(&bin)
         .args([
             "auto",
             src.to_str().unwrap(),
             "--per-target-time",
-            "30",
+            "900",
+            "--iterations",
+            "8000",
+            "--per-target-finding-count",
+            "1",
             "--max-targets",
             "1",
             "--work-dir",

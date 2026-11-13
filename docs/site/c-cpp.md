@@ -65,8 +65,21 @@ subtractions, gcc (native or cross-prefixed, `.exe` included) gets
 `trace-pc,trace-cmp` and statically linked sanitizer runtimes. Setting
 `CFLAGS`/`CXXFLAGS` still replaces bhf's flags entirely; use `--cflags` /
 `--cxxflags` (`toolchain.cflags`) to APPEND flags and keep coverage and ASan.
-Every object depends on a toolchain stamp, so changing the compiler or its flags
-in the same harness directory rebuilds instead of linking stale objects. A
+The `main` binaries depend on a toolchain stamp (`bhf_toolchain.stamp`), and
+the MemorySanitizer, ThreadSanitizer, coverage and differential lanes on a lane
+stamp of their own (`bhf_lanes.stamp`), so changing a compiler or its flags in
+the same harness directory relinks instead of linking stale objects, and
+building a lane leaves the `main` stamp alone. bhf's driver objects depend on a
+stamp of the compilers and flags they are built with (`bhf_driver.stamp`): a
+dialect ladder rung (`C_STD`/`CXX_STD`), a repair round or a compatibility flag
+relinks the harness with the same driver object, and a new compiler, target,
+toolchain define or include dir, or driver flag rebuilds it. A lane links
+`bhf_driver.o` itself when its driver compile would be the same command as the
+main driver's: its compiler is `CC` (`CXX` for C++) and no toolchain target,
+toolchain flags for the driver, or toolchain defines and include dirs apply
+(`--target`, `--cflags`, `--define`, `--toolchain-include`), none of which a
+lane's driver compile takes. Otherwise it links a driver object built by its
+own compiler. A
 compile database's compiler is only the Makefile's default `CC`/`CXX`; it never
 overrides the compiler bhf or the operator selects. `--sanitizers` keeps the
 selected compiler when it can build the requested sanitizers and otherwise

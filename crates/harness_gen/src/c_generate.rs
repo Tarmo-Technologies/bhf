@@ -6532,6 +6532,191 @@ mod tests {
         fs::remove_dir_all(&out).ok();
     }
 
+    /// A stand-in compiler, written as `dir/name`, that creates the file it is
+    /// asked to write (`-o <file>`) and appends a line to `$BHF_OUTPUT_LOG`:
+    /// that file's name, then each driver object it was given to link, so a
+    /// test can count what make rebuilt and see what each binary linked.
+    #[cfg(unix)]
+    fn output_recording_compiler(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let compiler = dir.join(name);
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nout=\nprev=\ndrivers=\nfor arg in \"$@\"; do\n  \
+             if [ \"$prev\" = -o ]; then out=$arg; else case $arg in bhf_driver*.o) \
+             drivers=\"$drivers $arg\";; esac; fi\n  prev=$arg\ndone\n\
+             [ -n \"$out\" ] || exit 0\nprintf '%s%s\\n' \"$out\" \"$drivers\" >> \"$BHF_OUTPUT_LOG\"\n\
+             : > \"$out\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler
+    }
+
+    /// The C dialect ladder, a repair round and the sanitizer lanes rerun
+    /// `make` in one harness directory with a different `C_STD`, `CFLAGS` or
+    /// `C_COMPAT_FLAGS`. The driver takes none of those, so it is compiled
+    /// once and reused while the binaries relink. A lane whose compiler is
+    /// $(CC) links that same driver object; a lane with its own compiler gets
+    /// its own driver object, also compiled once. A new compiler, new driver
+    /// flags or a new toolchain define still rebuild the driver, and a lane
+    /// build leaves the `main` stamp alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_dialect_or_flag_change_relinks_without_recompiling_the_driver() {
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_driver_reuse");
+        let mut args = direct_args("parse_record", out.clone());
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let first = output_recording_compiler(&out, "first-cc");
+        let second = output_recording_compiler(&out, "second-cc");
+        let log = out.join("outputs.log");
+        let make = |goal: &str, cc: &Path, lanes: &Path, extra: &[&str]| {
+            let mut command = Command::new("make");
+            command
+                .arg("-C")
+                .arg(&out)
+                .arg(goal)
+                .arg(format!("CC={}", cc.display()));
+            for lane in ["MSAN_CC", "TSAN_CC", "COV_CC", "DIFF_CC"] {
+                command.arg(format!("{lane}={}", lanes.display()));
+            }
+            let output = command
+                .arg("BHF_CC_FAMILY=clang")
+                .args(extra)
+                .env("BHF_OUTPUT_LOG", &log)
+                .output()
+                .expect("run make");
+            assert!(output.status.success(), "make {goal} {extra:?}: {output:?}");
+        };
+        let lines = || fs::read_to_string(&log).unwrap_or_default();
+        let built = |file: &str| {
+            lines()
+                .lines()
+                .filter(|line| line.split(' ').next() == Some(file))
+                .count()
+        };
+        let last_link = |binary: &str| {
+            lines()
+                .lines()
+                .rev()
+                .find(|line| line.split(' ').next() == Some(binary))
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+        let goals = ["main", "msan", "tsan", "cov", "diff"];
+        let lane_drivers = [
+            ("main_msan", "bhf_driver_msan.o"),
+            ("main_tsan", "bhf_driver_tsan.o"),
+            ("main_cov", "bhf_driver_cov.o"),
+            ("main_diff", "bhf_driver_diff.o"),
+        ];
+        let rungs: [&[&str]; 5] = [
+            &[],
+            &["C_STD=gnu99"],
+            &["C_STD=gnu89"],
+            &["CFLAGS=-O0 -g"],
+            &["C_COMPAT_FLAGS=-fcommon"],
+        ];
+
+        // One compiler for every lane: the driver is compiled once, and every
+        // binary relinks per change with that one object.
+        for extra in rungs {
+            for goal in goals {
+                make(goal, &first, &first, extra);
+            }
+        }
+        assert_eq!(built("bhf_driver.o"), 1, "driver rebuilt:\n{}", lines());
+        assert_eq!(
+            built("main"),
+            5,
+            "main must relink per change:\n{}",
+            lines()
+        );
+        for (binary, own) in lane_drivers {
+            assert_eq!(built(own), 0, "{own} is the same compile:\n{}", lines());
+            assert_eq!(built(binary), 5, "{binary} must relink:\n{}", lines());
+            assert_eq!(last_link(binary), format!("{binary} bhf_driver.o"));
+        }
+
+        // A new $(CC) rebuilds the driver; the lanes keep their compiler, so
+        // each now links a driver object of its own, compiled once.
+        for extra in rungs {
+            for goal in goals {
+                make(goal, &second, &first, extra);
+            }
+        }
+        assert_eq!(
+            built("bhf_driver.o"),
+            2,
+            "a new compiler rebuilds it:\n{}",
+            lines()
+        );
+        assert_eq!(last_link("main"), "main bhf_driver.o");
+        for (binary, own) in lane_drivers {
+            assert_eq!(built(own), 1, "{own} rebuilt:\n{}", lines());
+            assert_eq!(last_link(binary), format!("{binary} {own}"));
+        }
+
+        // New driver flags rebuild every driver object.
+        for goal in goals {
+            make(goal, &second, &first, &["BHF_DRIVER_CFLAGS=-O2 -g"]);
+        }
+        assert_eq!(built("bhf_driver.o"), 3, "{}", lines());
+        for (_, own) in lane_drivers {
+            assert_eq!(built(own), 2, "{own}:\n{}", lines());
+        }
+
+        // A lane build leaves the `main` stamp alone: `main` is built with one
+        // dialect, and the lanes built later with another rewrite only their
+        // own stamp.
+        make("main", &second, &first, &["C_STD=gnu99"]);
+        let main_stamp = fs::read_to_string(out.join("bhf_toolchain.stamp")).unwrap();
+        for goal in ["msan", "tsan", "cov", "diff"] {
+            make(goal, &second, &first, &["C_STD=gnu89"]);
+        }
+        assert_eq!(
+            fs::read_to_string(out.join("bhf_toolchain.stamp")).unwrap(),
+            main_stamp,
+            "a lane build must not rewrite the main stamp"
+        );
+        let lanes_stamp = fs::read_to_string(out.join("bhf_lanes.stamp")).unwrap();
+        assert!(lanes_stamp.contains("gnu89"), "{lanes_stamp}");
+
+        // A toolchain define (`--define`, `--toolchain-include`) is part of the
+        // driver's compile, so a new one rebuilds the driver and an unchanged
+        // one reuses it. A lane's own driver
+        // compile takes no define, so with one a lane links its own driver object,
+        // not bhf_driver.o.
+        make("main", &first, &first, &[]);
+        let drivers = built("bhf_driver.o");
+        let define = |value: &str| format!("BHF_TOOLCHAIN_CPPFLAGS=-DWIDGET_MODE={value}");
+        make("main", &first, &first, &[&define("1")]);
+        assert_eq!(built("bhf_driver.o"), drivers + 1, "{}", lines());
+        make("main", &first, &first, &[&define("1")]);
+        assert_eq!(built("bhf_driver.o"), drivers + 1, "{}", lines());
+        make("main", &first, &first, &[&define("2")]);
+        assert_eq!(built("bhf_driver.o"), drivers + 2, "{}", lines());
+        for goal in ["msan", "tsan", "cov", "diff"] {
+            make(goal, &first, &first, &[&define("2")]);
+        }
+        for (binary, own) in lane_drivers {
+            assert_eq!(last_link(binary), format!("{binary} {own}"), "{}", lines());
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// A stand-in compiler that answers `-dumpmachine` with `machine` and
     /// accepts anything else, written as `dir/name`.
     #[cfg(unix)]

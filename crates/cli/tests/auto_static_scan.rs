@@ -35,14 +35,27 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
     .expect("copy fixture");
 
     let work_dir = srcroot.join("bhf_work");
+    // The join under test needs a fuzz crash at weak.c:9 whatever the host's
+    // load, found by fuzzing. The seed is 60 'A' bytes, which the harness reads
+    // as a length-prefixed string of 58 that `buf[64]` holds, so only an input
+    // the fuzzer grew or mutated from it overflows the buffer. The run is
+    // bounded by executions (`--iterations` per pass), not by the wall clock:
+    // the mutator's random stream is seeded, so a loaded host reaches the same
+    // inputs, only later. The wall budget is a backstop, and the target stops
+    // at its first finding.
+    let near_miss = [b'A'; 60];
+    let seed = tmp.path().join("near-miss.bin");
+    std::fs::write(&seed, near_miss).expect("write seed");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("auto")
         .arg("--static")
         .arg(&srcroot)
         .arg("--work-dir")
         .arg(&work_dir)
-        .arg("--per-target-time")
-        .arg("1")
+        .args(["--per-target-time", "300", "--iterations", "2000"])
+        .args(["--per-target-finding-count", "1"])
+        .arg("--seed-file")
+        .arg(&seed)
         .output()
         .expect("spawn bhf auto --static");
 
@@ -165,6 +178,11 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
     // report is written, so the crash's representative gets a small reproducer.
     let crash_id = crash["id"].as_str().expect("crash finding id");
     let crash_dir = findings_dir.join(crash_id);
+    assert_ne!(
+        std::fs::read(crash_dir.join("testcase.bin")).expect("read the crash's testcase"),
+        near_miss,
+        "the crash must be an input the fuzzer made, not the seed"
+    );
     assert!(
         crash_dir.join("min_testcase.bin").is_file(),
         "auto must minimize the crash representative: {}",

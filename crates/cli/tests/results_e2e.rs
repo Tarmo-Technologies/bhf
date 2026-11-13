@@ -20,6 +20,10 @@ fn bhf(cwd: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// 60 bytes: the harness reads them as a length-prefixed string of 58, which
+/// `buf[64]` holds.
+const NEAR_MISS_SEED: [u8; 60] = [b'A'; 60];
+
 #[test]
 fn one_results_dir_for_every_producer() {
     if which::which("clang").is_err() || which::which("make").is_err() {
@@ -38,10 +42,29 @@ fn one_results_dir_for_every_producer() {
     let db = tmp.path().join("advisories.json");
     std::fs::write(&db, r#"{"vulnerabilities":[{"id":"CVE-2026-TEST","severity":"high","summary":"t","package":{"ecosystem":"npm","name":"example"},"affected_versions":["2.4.2"],"fixed_versions":["2.4.3"]}]}"#).unwrap();
 
-    // Defaults everywhere: cwd = tmp so bhf_work resolves to tmp/bhf_work.
+    // cwd = tmp so bhf_work resolves to tmp/bhf_work. The fuzz finding must
+    // come from fuzzing: the seed's string fits weak.c's `buf[64]`, so only an
+    // input the fuzzer grew or mutated from it overflows the buffer. The run is
+    // bounded by executions (`--iterations` per pass), not by the wall clock:
+    // the mutator's random stream is seeded, so a loaded host reaches the same
+    // inputs, only later. The wall budget is a backstop, and the target stops
+    // at its first finding.
+    std::fs::write(tmp.path().join("near-miss.bin"), NEAR_MISS_SEED).unwrap();
     let auto = bhf(
         tmp.path(),
-        &["auto", "--static", "src", "--per-target-time", "1"],
+        &[
+            "auto",
+            "--static",
+            "src",
+            "--per-target-time",
+            "300",
+            "--iterations",
+            "2000",
+            "--per-target-finding-count",
+            "1",
+            "--seed-file",
+            "near-miss.bin",
+        ],
     );
     assert!(
         matches!(auto.status.code(), Some(0..=2)),
@@ -103,6 +126,19 @@ fn one_results_dir_for_every_producer() {
     for role in ["finding", "testcase", "sanitizer_log", "replay_script"] {
         assert!(roles.contains(&role), "{role} missing: {roles:?}");
     }
+    let testcase = fuzz
+        .evidence
+        .as_ref()
+        .unwrap()
+        .files
+        .iter()
+        .find(|f| f.role == "testcase")
+        .map(|f| std::fs::read(results.join(&f.path)).unwrap())
+        .unwrap();
+    assert_ne!(
+        testcase, NEAR_MISS_SEED,
+        "the fuzz finding must be an input the fuzzer made, not the seed"
+    );
     assert!(!tmp.path().join("bhf_work/FINDINGS.md").exists());
     for f in [
         "findings.csv",

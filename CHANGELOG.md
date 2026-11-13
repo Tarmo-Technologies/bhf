@@ -146,6 +146,15 @@
 - `bhf report --backfill` no longer tells you to pass `--harness`, which
   `bhf report` does not have, when a finding's harness is gone; it says to
   restore or rebuild the harness and run the backfill again.
+- The generated C and C++ harness Makefiles no longer recompile bhf's driver
+  object each time `bhf auto` reruns `make` in the same harness directory with
+  another `C_STD`/`CXX_STD` (a dialect ladder rung), other `CFLAGS`/`CXXFLAGS`
+  (a repair round) or a compatibility flag, and no longer compile a copy of it
+  for each sanitizer, coverage and differential lane that uses the same
+  compiler. The driver objects depend on a stamp of their own compiler and
+  flags (`bhf_driver.stamp`), the binaries on the toolchain stamp, so a new
+  compiler or flag still rebuilds and relinks what it changes. A target that
+  goes through the dialect ladder or repair rounds builds much faster.
 - Windows: cartography, provenance, the capability profiler and coverage
   replay no longer run a harness through `timeout`, which on Windows is the
   console pause command and ran nothing: cartography mapped no finding and no
@@ -1428,6 +1437,17 @@
 - Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
   len)` pair as a C string now reports a heap overflow, as it does under
   libFuzzer.
+- The nightly integration workflow runs 12 hash shards and a shard of its own
+  for `build_recovery_scenarios` instead of 6 shards, so each shard is expected
+  to finish in about 25 minutes, inside its 40-minute timeout. An AFL++ test
+  that assumed AFL++ was installed runs against stand-in `afl-fuzz` and
+  `afl-clang-fast` scripts instead, so it passes on runners without AFL++.
+  Three integration tests that needed the fuzzer to reach a crash within a
+  wall-clock budget (one second, or 30 seconds) reach it on a loaded runner
+  too: each is bounded by executions (`--iterations`) instead of wall time,
+  which the seeded mutator makes deterministic. The static/fuzz join and
+  results tests start from a seed that just fits their target's buffer and
+  check that the crash is an input the fuzzer made from it.
 - A target's repairs (`run.json` `targets[].outcome.repairs`, the harness's
   `result.json`) can name a new kind, `compiler_compat` (`clang`, `gcc`,
   `reason`): the compatibility flags its C++ build took.

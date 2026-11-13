@@ -1924,8 +1924,30 @@ fn a_lane_build_leaves_the_main_toolchain_stamp_alone() {
     }
 }
 
+/// A PATH that starts with stand-in `afl-fuzz` and `afl-clang-fast` scripts in
+/// `dir`, so the AFL++ lane is selected whether or not AFL++ is installed.
+/// Each stand-in fails if it is ever run.
+#[cfg(unix)]
+fn path_with_stand_in_afl(dir: &Path) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    for tool in ["afl-fuzz", "afl-clang-fast"] {
+        let path = dir.join(tool);
+        std::fs::write(&path, "#!/bin/sh\necho \"stand-in $0 ran\" >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap()
+}
+
 /// `--engine afl++` without the builtin engine: a failed `make afl` leaves the
-/// target unfuzzed and says so, instead of "builtin results kept".
+/// target unfuzzed and says so, instead of "builtin results kept". AFL++ need
+/// not be installed: stand-ins pass the run's toolchain check, and `make afl`
+/// fails on `AFLPP_CC` before either stand-in could run. (AFL++ is Unix-only.)
+#[cfg(unix)]
 #[test]
 fn a_failed_afl_build_without_the_builtin_engine_says_the_target_was_not_fuzzed() {
     if !have("clang") || !have("make") {
@@ -1942,6 +1964,7 @@ fn a_failed_afl_build_without_the_builtin_engine_says_the_target_was_not_fuzzed(
         .env_remove("CC")
         .env_remove("CXX")
         .env("AFLPP_CC", "bhf-no-such-afl-compiler")
+        .env("PATH", path_with_stand_in_afl(&tmp.path().join("afl-bin")))
         .output()
         .unwrap();
     let out = text(&output);
@@ -1955,6 +1978,7 @@ fn a_failed_afl_build_without_the_builtin_engine_says_the_target_was_not_fuzzed(
         out.contains("Source files: 0 fuzzed / 1 with targets"),
         "{out}"
     );
+    assert!(!out.contains("stand-in"), "no AFL++ tool may run: {out}");
     let target = target_with_outcome(&work, &["built"])
         .unwrap_or_else(|| panic!("the target is built, not fuzzed:\n{out}"));
     assert_eq!(target["lanes"]["afl"]["built"], false, "{target}");
