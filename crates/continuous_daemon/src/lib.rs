@@ -1629,7 +1629,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait\n",
+                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
                 pid_file.display()
             ),
         )
@@ -1701,7 +1701,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait\n",
+                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
                 pid_file.display()
             ),
         )
