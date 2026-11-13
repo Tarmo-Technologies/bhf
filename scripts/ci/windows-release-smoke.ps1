@@ -250,9 +250,13 @@ if ($crash) {
     $ErrorActionPreference = "Continue"
     $crashOutput = & .\standalone.exe $crash.FullName 2>&1 | ForEach-Object { "$_" } | Out-String
     $ErrorActionPreference = "Stop"
+    # The crash run is expected to exit non-zero (ASan aborts). Clear its exit
+    # code so the step does not inherit it as the script's result.
+    $global:LASTEXITCODE = 0
     if ($crashOutput -notmatch "ERROR: AddressSanitizer") {
         throw "The sequence template's own driver did not let ASan report the finding: $crashOutput"
     }
 }
 Pop-Location
 $env:Path = $savedPath
+exit 0
