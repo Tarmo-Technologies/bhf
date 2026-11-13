@@ -213,7 +213,14 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
                 let out_b = run_harness(harness_b, input_path, timeout);
                 if let Some(div) = compare_outputs(&out_a, &out_b) {
                     divergences += 1;
-                    write_finding(&mut ids, &input_bytes, harness_a, harness_b, &div)?;
+                    write_finding(
+                        &mut ids,
+                        &input_bytes,
+                        input_path,
+                        harness_a,
+                        harness_b,
+                        &div,
+                    )?;
                 }
             }
             RunMode::Metamorphic { harness, transform } => {
@@ -227,6 +234,7 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
                     write_metamorphic_finding(
                         &mut ids,
                         &input_bytes,
+                        input_path,
                         &transformed_bytes,
                         harness,
                         *transform,
@@ -337,6 +345,7 @@ pub(crate) fn truncate_preview(bytes: &[u8], max: usize) -> String {
 fn write_finding(
     ids: &mut corpus::layout::FamilyAllocator,
     input_bytes: &[u8],
+    input_path: &Path,
     harness_a: &Path,
     harness_b: &Path,
     div: &Divergence,
@@ -383,6 +392,11 @@ fn write_finding(
             "finding": "finding.json",
         },
     });
+    // The operator's input file, run as it is.
+    crate::fuzz_lineage::insert(
+        &mut record,
+        &crate::fuzz_lineage::of_operator_input(input_bytes, Some(input_path)),
+    );
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     fs::write(
         finding_dir.join("finding.json"),
@@ -394,6 +408,7 @@ fn write_finding(
 fn write_metamorphic_finding(
     ids: &mut corpus::layout::FamilyAllocator,
     input_bytes: &[u8],
+    input_path: &Path,
     transformed_bytes: &[u8],
     harness: &Path,
     transform: MetamorphicTransform,
@@ -447,6 +462,11 @@ fn write_metamorphic_finding(
             "finding": "finding.json",
         },
     });
+    // `testcase.bin` is the operator's input file, run as it is.
+    crate::fuzz_lineage::insert(
+        &mut record,
+        &crate::fuzz_lineage::of_operator_input(input_bytes, Some(input_path)),
+    );
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     fs::write(
         finding_dir.join("finding.json"),
@@ -530,6 +550,8 @@ fn oracle_hit_json(hit: &OracleHit) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{compare_outputs, truncate_preview, HarnessOutput};
+    #[cfg(unix)]
+    use super::{fs, run_inner, sha256_hex, DifferentialArgs, MetamorphicTransform, Path, PathBuf};
 
     fn harness_output(stdout: &[u8], exit_code: i32) -> HarnessOutput {
         HarnessOutput {
@@ -576,5 +598,73 @@ mod tests {
     fn truncate_preview_produces_lossy_for_binary_input() {
         let preview = truncate_preview(&[0xFF, 0xFE, b'a'], 4096);
         assert!(preview.contains('a'));
+    }
+
+    /// `bhf differential` runs the operator's input files as they are: a
+    /// divergence's testcase is a user seed, 0 generations down, named by the
+    /// file it was read from, in both modes.
+    #[test]
+    #[cfg(unix)]
+    fn a_divergence_names_the_input_file_it_replayed_as_a_user_seed() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let inputs = root.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        let input = inputs.join("one.bin");
+        fs::write(&input, b"hello").unwrap();
+        let script = |name: &str, body: &str| {
+            let path = root.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let same = script("same", "#!/bin/sh\ncat \"$1\"\n");
+        let other = script("other", "#!/bin/sh\necho other\n");
+        let lines = script("lines", "#!/bin/sh\nwc -l < \"$1\"\n");
+        let lineage = |work: &Path| -> serde_json::Value {
+            let findings = corpus::layout::findings_dir(work);
+            let dir = fs::read_dir(&findings)
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap()
+                .path();
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+            record["lineage"].clone()
+        };
+        let args = |work: PathBuf| DifferentialArgs {
+            harness_a: None,
+            harness_b: None,
+            harness: None,
+            metamorphic_transform: None,
+            inputs: inputs.clone(),
+            work_dir: work,
+            out: None,
+            timeout_secs: 5,
+        };
+        let named = std::path::absolute(&input).unwrap().display().to_string();
+
+        let work = root.join("work-diff");
+        let mut differential = args(work.clone());
+        differential.harness_a = Some(same.clone());
+        differential.harness_b = Some(other);
+        assert_eq!(run_inner(differential).unwrap(), 1);
+        let found = lineage(&work);
+        assert_eq!(found["origin"], "user_seed", "{found}");
+        assert_eq!(found["root_path"], named.as_str());
+        assert_eq!(found["root_sha256"], sha256_hex(b"hello"));
+        assert_eq!(found["depth"], 0);
+
+        let work = root.join("work-meta");
+        let mut metamorphic = args(work.clone());
+        metamorphic.harness = Some(lines);
+        metamorphic.metamorphic_transform = Some(MetamorphicTransform::AppendNewline);
+        assert_eq!(run_inner(metamorphic).unwrap(), 1);
+        let found = lineage(&work);
+        assert_eq!(found["origin"], "user_seed", "{found}");
+        assert_eq!(found["root_path"], named.as_str());
+        assert_eq!(found["depth"], 0);
     }
 }

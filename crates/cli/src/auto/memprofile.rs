@@ -212,9 +212,13 @@ fn write_mem_finding(
     let excess_mb = sample.peak_kb.saturating_sub(baseline_kb) / 1024;
     // One issue per harness (rule + harness), stable 64-hex cluster key.
     let cluster_key_full = hex(&Sha256::digest(format!("BHF-558:{harness_id}").as_bytes()));
-    // Persist the reproducer so `auto` can minimize / attest it.
+    // Persist the reproducer so `auto` can minimize / attest it. It is the
+    // queue entry itself, so its lineage is that entry's.
     let repro = dir.join("testcase.bin");
     let _ = std::fs::copy(&sample.input, &repro);
+    let lineage = crate::fuzz_lineage::ReplayedQueue::open(work, harness_id)
+        .entry(&sample.input)
+        .lineage;
     let mut record = json!({
         "id": id,
         "rule_id": "BHF-558",
@@ -238,6 +242,7 @@ fn write_mem_finding(
         "analysis": { "engine": "bhf.dynamic.memprofile.replay" },
         "actionability": { "cwe": ["CWE-400"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    crate::fuzz_lineage::insert(&mut record, &lineage);
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
@@ -322,5 +327,45 @@ mod tests {
             "profile replay exceeded its wall-clock timeout: {:?}",
             started.elapsed()
         );
+    }
+
+    /// The memory finding's testcase is the queue entry it profiled, and its
+    /// lineage is that entry's, from the record beside the queue.
+    #[test]
+    fn a_memory_finding_carries_the_lineage_of_the_queue_entry_it_profiled() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let queue = work.join("corpus").join("H-C0001").join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        let input = queue.join("child.bin");
+        std::fs::write(&input, b"CHILD").unwrap();
+        crate::fuzz_lineage::record_child_of_user_seed(
+            work,
+            "H-C0001",
+            b"SEED",
+            b"CHILD",
+            "/seeds/seed.bin",
+        );
+        let worst = Sample {
+            input,
+            input_len: 5,
+            peak_kb: 400 * 1024,
+        };
+        assert!(write_mem_finding(
+            work,
+            "F-MEM-0000",
+            "H-C0001",
+            &worst,
+            4 * 1024
+        ));
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.join("results/findings/F-MEM-0000/finding.json")).unwrap(),
+        )
+        .unwrap();
+        let lineage = &record["lineage"];
+        assert_eq!(lineage["origin"], "user_seed", "{record}");
+        assert_eq!(lineage["root_path"], "/seeds/seed.bin");
+        assert_eq!(lineage["depth"], 1);
+        assert_eq!(lineage["parent_sha256"], hex(&Sha256::digest(b"SEED")));
     }
 }

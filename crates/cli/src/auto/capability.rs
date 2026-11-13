@@ -466,6 +466,13 @@ fn write_capability_finding(
             "confidence": if tainted { "high" } else { "medium" }
         },
     });
+    crate::fuzz_lineage::insert(
+        &mut record,
+        &corpus::lineage::FindingLineage::unknown(
+            "the capability profile folds the operands the whole corpus reached into one \
+             finding, so no single queue entry is its input",
+        ),
+    );
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
@@ -973,5 +980,38 @@ mod tests {
         let fix = actionability::select_fix_location(&raw, None).expect("a fix location");
         assert_eq!(fix.line, Some(4), "SARIF startLine must be the call site");
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A capability is the operand set the whole corpus reached, not one
+    /// input's, so its lineage is unknown and the reason says why.
+    #[test]
+    fn a_capability_finding_says_why_its_lineage_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        let hdir = work.join("harnesses").join("H-C0001");
+        std::fs::create_dir_all(&hdir).unwrap();
+        let cap = Capability {
+            kind: "process-exec",
+            operand: "/bin/sh -c id".into(),
+            tainted: false,
+        };
+        assert!(write_capability_finding(
+            &work,
+            "F-CAP-0000",
+            &hdir,
+            "H-C0001",
+            "process-exec",
+            &[&cap],
+            &[],
+        ));
+        let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();
+        let lineage = &raw["lineage"];
+        assert_eq!(lineage["origin"], "unknown", "{raw}");
+        let reason = lineage["reason"].as_str().unwrap();
+        assert!(reason.contains("whole corpus"), "{reason}");
+        assert!(
+            lineage.get("depth").is_none(),
+            "nothing is guessed: {lineage}"
+        );
     }
 }

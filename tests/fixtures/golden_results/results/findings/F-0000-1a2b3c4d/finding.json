@@ -123,6 +123,13 @@
   ],
   "harness_id": "H-C-parse",
   "id": "F-0000-1a2b3c4d",
+  "lineage": {
+    "depth": 2,
+    "origin": "mined_seed",
+    "parent_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "root_path": "/src/demo/tests/data/header.bin",
+    "root_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
   "rule_id": "BHF-201",
   "sanitizer_second_opinion": {
     "check": "object-size",

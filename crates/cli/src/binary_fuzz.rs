@@ -309,6 +309,9 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     } else {
         seeds
     };
+    // What each seed is, in order, for the lineage of a finding the
+    // seed-replay engine saves: it runs them as they are.
+    let lineages = seed_lineages(&args, &seeds);
     let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
@@ -382,7 +385,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
 
     let mut finding_ids = Vec::new();
     let mut executions = 0usize;
-    for seed in seeds.iter().cycle().take(args.iterations.min(seeds.len())) {
+    for (seed, lineage) in seeds
+        .iter()
+        .zip(&lineages)
+        .cycle()
+        .take(args.iterations.min(seeds.len()))
+    {
         executions += 1;
         // #55: prepare a fresh fixture directory and run the setup hook before the
         // target, so filesystem/process state does not leak across testcases.
@@ -469,9 +477,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                         fs::write(dir.join("testcase.bin"), seed).with_context(|| {
                             format!("write {}", dir.join("testcase.bin").display())
                         })?;
-                        let finding = render_postcondition_finding(
+                        let mut finding = render_postcondition_finding(
                             &id, &args, seed, &env, &signature, &detail, &run,
                         )?;
+                        crate::fuzz_lineage::insert(&mut finding, lineage);
                         fs::write(
                             dir.join("finding.json"),
                             serde_json::to_vec_pretty(&finding)?,
@@ -492,6 +501,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, &args, seed, &env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
+            crate::fuzz_lineage::insert(&mut finding, lineage);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -524,7 +534,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), input)
                 .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-            let finding = render_semantic_finding(
+            let mut finding = render_semantic_finding(
                 &id,
                 &args,
                 input,
@@ -533,6 +543,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 &signature,
                 oracles.as_ref(),
             )?;
+            crate::fuzz_lineage::insert(&mut finding, &lineage_of_seed(&seeds, &lineages, input));
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -665,6 +676,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                     &representative,
                     observation,
                 )?;
+                // The replayed input is the first seed.
+                corpus::lineage::record_in_finding(
+                    &dir,
+                    &lineage_of_seed(&seeds, &lineages, &representative),
+                )
+                .with_context(|| format!("record the lineage of {id}"))?;
                 finding_ids.push(id);
             }
             let mut provenance = outcome.run_provenance;
@@ -910,6 +927,20 @@ fn parse_duration_secs(value: &str) -> Option<u64> {
         .map(|n| n.saturating_mul(mult))
 }
 
+/// The lineage of a crash AFL++ QEMU mode found: unknown, since AFL++
+/// schedules its own queue and bhf does not see what the input was mutated
+/// from. Nothing is guessed; the reason names the crash file.
+fn afl_qemu_lineage(crash: &Path) -> corpus::lineage::FindingLineage {
+    let name = crash
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    corpus::lineage::FindingLineage::unknown(format!(
+        "found by AFL++ QEMU mode, which schedules its own queue; bhf does not see which \
+         input this one was mutated from (AFL++ crash file {name})"
+    ))
+}
+
 /// Drive AFL++ in QEMU mode (`afl-fuzz -Q`) against a binary-only target: qemu's
 /// DBT injects edge coverage so a foreign-arch / no-source binary gets
 /// coverage-guided mutation. Harvest `out/default/crashes/` and confirm+record
@@ -1031,6 +1062,7 @@ fn run_afl_qemu(
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, args, &input, env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
+            crate::fuzz_lineage::insert(&mut finding, &afl_qemu_lineage(&crash));
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -2024,6 +2056,46 @@ fn render_postcondition_finding(
             "replay": format!("bhf replay --harness {} {}", args.binary.display(), id)
         }
     }))
+}
+
+/// The lineage of each of `seeds` (as [`run_inner`] collects them), for the
+/// seed-replay engine, which runs them as they are: the operator's
+/// `--seed-input`s, then `--seed-file`s named by their path, each 0
+/// generations down; or, when given none, the empty input bhf made itself.
+fn seed_lineages(args: &BinaryFuzzArgs, seeds: &[Vec<u8>]) -> Vec<corpus::lineage::FindingLineage> {
+    if args.seed_inputs.is_empty() && args.seed_files.is_empty() {
+        return seeds
+            .iter()
+            .map(|seed| crate::fuzz_lineage::of_generated_input(seed))
+            .collect();
+    }
+    let paths = args
+        .seed_inputs
+        .iter()
+        .map(|_| None)
+        .chain(args.seed_files.iter().map(|path| Some(path.as_path())));
+    seeds
+        .iter()
+        .zip(paths)
+        .map(|(seed, path)| crate::fuzz_lineage::of_operator_input(seed, path))
+        .collect()
+}
+
+/// The lineage of `input`, one of the run's `seeds`: the first seed with its
+/// bytes.
+fn lineage_of_seed(
+    seeds: &[Vec<u8>],
+    lineages: &[corpus::lineage::FindingLineage],
+    input: &[u8],
+) -> corpus::lineage::FindingLineage {
+    seeds
+        .iter()
+        .zip(lineages)
+        .find(|(seed, _)| seed.as_slice() == input)
+        .map(|(_, lineage)| lineage.clone())
+        .unwrap_or_else(|| {
+            corpus::lineage::FindingLineage::unknown("the input is not one of the run's seeds")
+        })
 }
 
 fn collect_seeds(seed_inputs: &[String], seed_files: &[PathBuf]) -> anyhow::Result<Vec<Vec<u8>>> {

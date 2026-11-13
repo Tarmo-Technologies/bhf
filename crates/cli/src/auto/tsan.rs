@@ -18,8 +18,8 @@
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -139,7 +139,8 @@ fn replay_one(
     let Ok(inputs) = std::fs::read_dir(&queue) else {
         return TsanReplay::default();
     };
-    let mut sites: BTreeSet<(String, u64)> = BTreeSet::new();
+    // Each site, with the first queue entry that showed it.
+    let mut sites: BTreeMap<(String, u64), PathBuf> = BTreeMap::new();
     let mut replayed = 0usize;
     let mut consecutive_mapping_failures = 0usize;
     let mut unmeasured = 0usize;
@@ -193,7 +194,7 @@ fn replay_one(
                 consecutive_mapping_failures = 0;
                 match classify_race(&stderr, hdir) {
                     RaceAttribution::Target(file, line_no) => {
-                        sites.insert((file, line_no));
+                        sites.entry((file, line_no)).or_insert_with(|| path.clone());
                         break;
                     }
                     // Retry first: a report can come back unsymbolized once and
@@ -247,11 +248,15 @@ fn replay_one(
     }
 
     let mut written = 0usize;
-    for (file, line) in sites {
-        let id = format!("F-TSAN-{:04}", *index);
-        *index += 1;
-        if write_tsan_finding(work_dir, &id, harness_id, &file, line) {
-            written += 1;
+    if !sites.is_empty() {
+        let queue = crate::fuzz_lineage::ReplayedQueue::open(work_dir, harness_id);
+        for ((file, line), input) in sites {
+            let id = format!("F-TSAN-{:04}", *index);
+            *index += 1;
+            let shown_by = queue.entry(&input);
+            if write_tsan_finding(work_dir, &id, harness_id, &file, line, &shown_by) {
+                written += 1;
+            }
         }
     }
     TsanReplay {
@@ -360,7 +365,14 @@ fn is_noise_frame(file: &str, hdir: &str) -> bool {
 
 /// Persist one TSan finding as a runtime crash (`classification: unhandled`) so the
 /// confirmation join + attestation treat it like any other fuzz-found defect.
-fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line: u64) -> bool {
+fn write_tsan_finding(
+    work: &Path,
+    id: &str,
+    harness_id: &str,
+    file: &str,
+    line: u64,
+    shown_by: &crate::fuzz_lineage::ReplayedEntry,
+) -> bool {
     let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
@@ -372,6 +384,8 @@ fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
     // One issue per distinct data-race site (rule + file:line), as a stable 64-hex
     // cluster key so the report collapses repeat inputs into one row.
     let cluster_key_full = hex(&Sha256::digest(format!("BHF-556:{file}:{line}").as_bytes()));
+    let mut evidence = vec![json!({ "key": "source", "value": format!("{file}:{line}") })];
+    evidence.extend(shown_by.evidence());
     let mut record = json!({
         "id": id,
         "rule_id": "BHF-556",
@@ -385,10 +399,11 @@ fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
             "message": "data race (TSan corpus replay)",
             "stack": [ { "function": "", "file": file, "line": line } ],
         },
-        "oracle": { "evidence": [ { "key": "source", "value": format!("{file}:{line}") } ] },
+        "oracle": { "evidence": evidence },
         "analysis": { "engine": "bhf.dynamic.tsan.replay" },
         "actionability": { "cwe": ["CWE-362"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    crate::fuzz_lineage::insert(&mut record, &shown_by.lineage);
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
@@ -707,5 +722,89 @@ WARNING: ThreadSanitizer: data race (pid=1)\n\
         assert!(!is_tsan_mapping_failure(
             "target process exited with code 2"
         ));
+    }
+
+    /// A TSan finding carries the lineage of the queue entry that showed the
+    /// race; an entry with no record beside the queue is a corpus root, and
+    /// the reason says why nothing earlier is known.
+    #[test]
+    #[cfg(unix)]
+    fn a_tsan_finding_carries_the_lineage_of_the_queue_entry_that_showed_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let hdir = work.join("harnesses").join("H-C0001");
+        let queue = work.join("corpus").join("H-C0001").join("queue");
+        std::fs::create_dir_all(&hdir).unwrap();
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("racy.bin"), b"RACY").unwrap();
+        std::fs::write(hdir.join("Makefile"), "tsan:\n\tchmod +x main_tsan\n").unwrap();
+        let bin = hdir.join("main_tsan");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             printf '%s\\n' 'WARNING: ThreadSanitizer: data race' >&2\n\
+             printf '%s\\n' '    #0 worker /project/race.c:12:7 (main_tsan+0x1)' >&2\n\
+             exit 86\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(run_tsan_replay(work).findings, 1);
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.join("results/findings/F-TSAN-0000/finding.json")).unwrap(),
+        )
+        .unwrap();
+        let lineage = &record["lineage"];
+        let racy = hex(&Sha256::digest(b"RACY"));
+        assert_eq!(lineage["origin"], "corpus", "{record}");
+        assert_eq!(lineage["root_sha256"], racy.as_str());
+        assert_eq!(lineage["depth"], 0);
+        assert!(
+            lineage["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no lineage record")),
+            "{record}"
+        );
+        assert!(
+            record["oracle"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["key"] == "input_sha256" && e["value"] == racy.as_str()),
+            "{record}"
+        );
+    }
+
+    /// A queue entry that cannot be read back names no sha256: the finding
+    /// carries no `input_sha256` evidence, and its lineage says why.
+    #[test]
+    fn a_finding_whose_entry_cannot_be_read_back_names_no_input_sha256() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let queue = crate::fuzz_lineage::ReplayedQueue::open(work, "H-C0001");
+        let shown_by = queue.entry(&work.join("corpus/H-C0001/queue/gone.bin"));
+        assert!(write_tsan_finding(
+            work,
+            "F-TSAN-0009",
+            "H-C0001",
+            "/proj/src/site.c",
+            8,
+            &shown_by
+        ));
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.join("results/findings/F-TSAN-0009/finding.json")).unwrap(),
+        )
+        .unwrap();
+        let evidence = record["oracle"]["evidence"].as_array().unwrap();
+        assert_eq!(
+            evidence,
+            &vec![serde_json::json!({"key": "source", "value": "/proj/src/site.c:8"})],
+            "{record}"
+        );
+        assert_eq!(record["lineage"]["origin"], "unknown", "{record}");
+        assert!(record["lineage"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("gone.bin")));
     }
 }

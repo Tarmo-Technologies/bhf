@@ -204,12 +204,17 @@ pub(crate) fn remove_stale(work_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The manifest in this work dir, or `None` when it has none (or it does not
+/// parse).
+pub(crate) fn read(work_dir: &Path) -> Option<SeedManifest> {
+    let bytes = std::fs::read(manifest_path(work_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// The `run.json` summary of the manifest this run wrote, or `None` when the
 /// work dir has none (a run from before the manifest existed).
 pub(crate) fn summary(work_dir: &Path) -> Option<SeedSummary> {
-    let bytes = std::fs::read(manifest_path(work_dir)).ok()?;
-    let manifest: SeedManifest = serde_json::from_slice(&bytes).ok()?;
-    Some(manifest.summary())
+    Some(read(work_dir)?.summary())
 }
 
 #[cfg(test)]

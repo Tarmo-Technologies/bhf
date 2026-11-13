@@ -590,6 +590,7 @@ configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracl
 │       └── runtrace.jsonl                      # per-target shim events
 ├── build/<harness-id>/
 ├── corpus/<harness-id>/queue/                  # persisted coverage-minimal corpus (#401)
+├── corpus/<harness-id>/lineage.jsonl           # what each queue entry was mutated from
 ├── findings/F-0001-…/
 └── fuzz_runs/<harness-id>-latest.json
 ```
@@ -756,6 +757,81 @@ seed. `bhf fuzz` does the same for its `--seed-file` and `--seed-input`
 seeds, once per campaign however many workers it runs; the seeds it is
 handed otherwise (its built-in seeds, a shared queue's inputs) are not
 prefixed.
+
+### Seed lineage
+
+The built-in engine records what each input it keeps was mutated from, so a
+finding can name the seed it grew out of. `corpus/<harness-id>/lineage.jsonl`
+sits beside the queue, one JSON line per entry, keyed by the `sha256` of the
+entry's bytes: `parent`, the entry its mutation started from (and `donor`,
+the entry a splice took its second part from), or for a root its `origin`:
+`seed` (with `source` and `path` when `auto/seeds.json` or the `bhf fuzz`
+command line names it, and `layout_prefix` and `seed_sha256` for a seed given
+behind its layout prefix), `corpus` (a reseeded queue entry with no line of
+its own: saved before lineage was kept, or dropped by the record cap below;
+an entry by its bytes, whatever its file is named, such as a crash input
+named by its signature or a file the multi-worker merge renamed
+`worker-N-<name>`) or `generated` (no seed: the empty or built-in start inputs, or an input a
+structured or `--grammar` generator or the random-byte fallback built). An
+input the run was handed as a seed is a root again, whatever made it before.
+A later pass or `--resume` that reseeds from the queue continues the chains
+it finds there. Each worker of a multi-worker `bhf fuzz` starts from the
+campaign's `lineage.jsonl` and `auto/seeds.json`; the shared queue's entries
+and the files the campaign writes for its workers (a seed's layout-prefixed
+variant, a programmatic seed) are bhf's copies, not seeds given to the
+worker, so a worker's finding names the seed they came from, never the copy.
+The campaign merges each worker's lines into its own.
+
+The first line recorded for an input's bytes stays: the same bytes reached
+again, by another mutation, pass or worker, keep it. The chain a finding
+reports is therefore one real derivation of those bytes, not necessarily
+the one this run took. Every writer (a pass, and the merge of a multi-worker
+campaign) reads the whole file, up to 524288 lines, and writes back at most
+twice the queue's entry limit (`BHF_MAX_CORPUS_ENTRIES` when set) or twice
+the files the queue holds, whichever is more, and never more than 524288
+lines. The merge takes the union of the workers' queues, so the shared
+queue can hold more files than the limit, and each of them keeps its line.
+First come the lines its pool's entries need (for the merge, the shared
+queue's), they and their ancestors, then, for a pass over the cap, those
+its queue's entries need, then the rest in sha256 order. An entry whose line was dropped is reported as having no lineage
+record, saved before lineage was kept or dropped by the record cap.
+
+When a finding is saved, its input's chain is followed back to the root
+through each entry's `parent` (a splice's donor is named, not followed) and
+written into `finding.json` as `lineage`: `origin` (`mined_seed`,
+`user_seed`, `seed`, `corpus`, `generated` or `unknown`), `root_sha256` (a
+seed's own, as `auto/seeds.json` lists it), `root_path`, `layout_prefix`,
+`depth` (mutation generations from the root; `0` when the input is the root
+itself), `parent_sha256`, `donor_sha256` and, when the lineage stops short
+of a seed or is unknown, `reason`. The lineage is `unknown`, with a reason,
+when the chain names an entry with no record (a corpus saved before lineage
+was kept, or one the record cap dropped), loops, or runs past 100000
+generations, and for a crash AFL++ found, through `bhf fuzz --engine afl++`
+or `bhf binary-fuzz --engine afl-qemu`: AFL++ schedules its own queue, so
+bhf does not see what that input was mutated from (the AFL++ crash file name
+is in the reason). bhf does not guess. A harness run one input per process
+(a `-fsanitize=fuzzer` binary) still gets its lineage: bhf's own engine
+picks every input it runs. The lineage is of `testcase.bin`, the input the
+fuzzer saved; minimization does not change it.
+
+Lanes that replay inputs bhf already knows record their lineage too. The
+corpus replays (the MSan and TSan replays, the memory profile and the
+`--differential` post-pass) look up the queue entry they ran in
+`lineage.jsonl`, as a pass does; an entry with no line there is a `corpus`
+root. An MSan or TSan finding saves no testcase, so its lineage is that of
+the queue entry that first showed the site, which its oracle evidence names
+by `input_sha256` (left out, with the reason in the lineage, when the entry
+could not be read back), and `bhf explain` prints that lineage under the
+entry's sha256. The capability profile folds what the whole corpus
+reached into one finding, so its lineage is `unknown` and the reason says
+so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
+the operator's inputs as they are: `user_seed`, depth `0`, with the file's
+path (`generated` for the empty input `bhf binary-fuzz` runs when it is given
+no seed). Findings saved before lineage was kept, and those of lanes that
+keep none (the target-transport and protocol-session lanes, `bhf
+relational`, the JVM sink oracle and the campaign-wide collector view, which
+observe a whole run rather than one input, and extensions), have no
+`lineage`.
 
 A work directory written by an earlier release can hold corpus entries in
 which every byte that was not valid UTF-8 was replaced by `EF BF BD`. In a work

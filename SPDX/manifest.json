@@ -1703,6 +1703,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz_lineage.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/gate_evidence.rs",
       "license": "Apache-2.0"
     },
@@ -2723,6 +2727,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/seed_lineage.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/session_fuzz_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2896,6 +2904,10 @@
     },
     {
       "path": "crates/corpus/src/line_remap.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/src/lineage.rs",
       "license": "Apache-2.0"
     },
     {

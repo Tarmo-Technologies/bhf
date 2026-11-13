@@ -774,7 +774,23 @@ and explain it — all offline and deterministic (no LLM):
     `testcase.bin`, named with its size, and whether it, or its
     `testcase.bin` (the crashing input as found, before minimizing), is one
     of bhf's built-in starting inputs (empty, `A`, `AAAAAAAA`) or a
-    byte-identical copy of a seed listed in `auto/seeds.json`;
+    byte-identical copy of a seed listed in `auto/seeds.json`; and one `Lineage
+    (testcase.bin):` line from `finding.json` `lineage` (see
+    [Seed lineage](auto.md#seed-lineage)): `descends from mined seed
+    tests/data/x.bin (sha256 4f1b6e0c2a9d…) after 7 mutation generations`
+    (or user seed, a start input no seed list names, a queue entry with no
+    lineage record,
+    an input bhf generated (no seed): a built-in start input, or one a
+    generator built mid-run), `is ... itself, unmutated` when the saved input
+    is that seed (`is an input bhf generated (no seed) ..., unmutated` when
+    bhf built it), and `unknown (<reason>)` when bhf does not know, such as
+    for an AFL++ crash or a finding saved before lineage was kept. It
+    names the input the fuzzer saved, before minimization; a root is the
+    start of that input's mutation chain, not a claim that the seed alone
+    explains the crash. A finding that saves no testcase but records a
+    lineage (the MSan and TSan corpus replays) gets the same line, headed
+    `Lineage (input sha256 <first 12 hex digits>…):` for the queue entry
+    it ran, with that entry's full sha256 in the section heading;
   - comparison evidence for that input: each input span that reached a
     comparison of the target, with its offset, the operand, what it was
     compared with, whether they were equal, the comparison (`cmp`, `switch`,

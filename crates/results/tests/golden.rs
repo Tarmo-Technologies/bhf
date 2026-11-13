@@ -63,7 +63,10 @@ fn build(work: &Path) {
             "build": {"binary": {"sha256": "2222222222222222222222222222222222222222222222222222222222222222", "build_id": "abcdef01"}},
             "sanitizer_second_opinion": {"check": "object-size", "used": "asan",
                                          "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
-                                         "replaced_cluster_key": "0bj5123e0bj5123e"}
+                                         "replaced_cluster_key": "0bj5123e0bj5123e"},
+            "lineage": {"origin": "mined_seed", "root_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+                        "root_path": "/src/demo/tests/data/header.bin", "depth": 2,
+                        "parent_sha256": "4444444444444444444444444444444444444444444444444444444444444444"}
         }),
     );
     put(&f.join("F-0000-1a2b3c4d/testcase.bin"), b"AAAA");

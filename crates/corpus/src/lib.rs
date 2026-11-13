@@ -7,6 +7,7 @@ pub mod decoded_args;
 pub mod finding;
 pub mod layout;
 pub mod line_remap;
+pub mod lineage;
 pub mod manager;
 pub mod sanitizer;
 pub mod sanitizer_options;

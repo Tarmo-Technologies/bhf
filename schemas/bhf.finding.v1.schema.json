@@ -126,6 +126,21 @@
         }
       }
     },
+    "lineage": {
+      "description": "What the finding's input descends from in the fuzz queue, resolved when the finding was saved (see the lineage definition in bhf.findings.v1). Absent in findings saved before it was kept and from lanes that keep none.",
+      "type": "object",
+      "required": ["origin"],
+      "properties": {
+        "origin": { "enum": ["mined_seed", "user_seed", "seed", "corpus", "generated", "unknown"] },
+        "root_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "root_path": { "type": "string" },
+        "layout_prefix": { "type": "integer", "minimum": 1 },
+        "depth": { "type": "integer", "minimum": 0 },
+        "parent_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "donor_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "reason": { "type": "string" }
+      }
+    },
     "decoded_args": {
       "description": "The arguments the harness decoded from the input and passed to the target (and the receiver object of a method), when traced.",
       "type": "array",

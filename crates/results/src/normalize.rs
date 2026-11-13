@@ -6,8 +6,9 @@ use crate::confirmation::{self, ConfirmationInput};
 use crate::model::{
     AccessParameter, AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence,
     Confirmation, ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding,
-    Fingerprint, Frame, FuzzBlock, InputToState, InputToStateSearch, Kind, Location, MemoryAccess,
-    PatchHint, Reproduce, RuleRef, SanitizerSecondOpinion, ScaBlock, StaticBlock, TraceStep,
+    Fingerprint, Frame, FuzzBlock, InputToState, InputToStateSearch, Kind, Lineage, Location,
+    MemoryAccess, PatchHint, Reproduce, RuleRef, SanitizerSecondOpinion, ScaBlock, StaticBlock,
+    TraceStep,
 };
 use crate::severity;
 use serde_json::Value;
@@ -303,6 +304,9 @@ pub fn from_finding_report(
             input_to_state_search: input_to_state_search(raw),
             arguments: raw.get("decoded_args").and_then(arguments),
             sanitizer_second_opinion: sanitizer_second_opinion(raw),
+            lineage: raw
+                .get("lineage")
+                .and_then(|lineage| seed_lineage(lineage, ctx.source_root)),
         }),
         static_: (kind == Kind::Static).then(|| StaticBlock {
             engine: str_at(raw, &["analysis", "engine"]).or_else(|| Some("bhf-static".to_owned())),
@@ -479,6 +483,42 @@ fn input_to_state(gates: &Value, root: Option<&Path>) -> Option<Vec<InputToState
             })
             .collect(),
     )
+}
+
+/// `finding.json` `lineage` origins the contract names.
+const LINEAGE_ORIGINS: [&str; 6] = [
+    "mined_seed",
+    "user_seed",
+    "seed",
+    "corpus",
+    "generated",
+    "unknown",
+];
+
+/// `finding.json` `lineage`, its seed path relative to the source root. An
+/// origin the contract does not name drops the whole block, and a digest
+/// that is not a lowercase sha256 is left out, rather than passed on.
+fn seed_lineage(raw: &Value, root: Option<&Path>) -> Option<Lineage> {
+    let origin =
+        str_at(raw, &["origin"]).filter(|origin| LINEAGE_ORIGINS.contains(&origin.as_str()))?;
+    let sha256 = |key: &str| {
+        str_at(raw, &[key]).filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    };
+    Some(Lineage {
+        origin,
+        root_sha256: sha256("root_sha256"),
+        root_path: str_at(raw, &["root_path"]).map(|path| strip_root(&path, root)),
+        layout_prefix: raw.get("layout_prefix").and_then(Value::as_u64),
+        depth: raw.get("depth").and_then(Value::as_u64),
+        parent_sha256: sha256("parent_sha256"),
+        donor_sha256: sha256("donor_sha256"),
+        reason: str_at(raw, &["reason"]),
+    })
 }
 
 /// The harness's decoded arguments (`finding.json` `decoded_args`). A scalar
@@ -2176,6 +2216,55 @@ mod tests {
         }
         let back: crate::model::FuzzBlock = serde_json::from_value(old).unwrap();
         assert!(back.input_to_state_status.is_none());
+    }
+
+    #[test]
+    fn the_seed_lineage_is_carried_with_its_seed_path_under_the_root() {
+        let (root, parent) = ("ab".repeat(32), "cd".repeat(32));
+        let mut raw = asan_record();
+        raw["lineage"] = json!({"origin": "mined_seed", "root_sha256": root,
+            "root_path": "/work/proj/tests/data/x.bin", "depth": 7, "parent_sha256": parent});
+        let lineage = normalize(raw, Some("/work/proj"))
+            .fuzz
+            .unwrap()
+            .lineage
+            .expect("the lineage");
+        assert_eq!(lineage.origin, "mined_seed");
+        assert_eq!(lineage.root_sha256.as_deref(), Some(root.as_str()));
+        assert_eq!(lineage.root_path.as_deref(), Some("tests/data/x.bin"));
+        assert_eq!(lineage.depth, Some(7));
+        assert_eq!(lineage.parent_sha256.as_deref(), Some(parent.as_str()));
+        assert_eq!(
+            (lineage.donor_sha256, lineage.layout_prefix, lineage.reason),
+            (None, None, None)
+        );
+
+        // Unknown lineage keeps its reason and claims nothing else.
+        let mut raw = asan_record();
+        raw["lineage"] = json!({"origin": "unknown", "reason": "found by AFL++"});
+        let lineage = normalize(raw, None).fuzz.unwrap().lineage.unwrap();
+        assert_eq!(lineage.origin, "unknown");
+        assert_eq!(lineage.reason.as_deref(), Some("found by AFL++"));
+        assert_eq!((lineage.depth, lineage.root_sha256), (None, None));
+
+        // An origin the contract does not name, or a malformed digest, is not
+        // passed on as if it were known.
+        let mut raw = asan_record();
+        raw["lineage"] = json!({"origin": "guessed", "depth": 1});
+        assert!(normalize(raw, None).fuzz.unwrap().lineage.is_none());
+        let mut raw = asan_record();
+        raw["lineage"] = json!({"origin": "generated", "root_sha256": "XYZ", "depth": 0});
+        let lineage = normalize(raw, None).fuzz.unwrap().lineage.unwrap();
+        assert_eq!((lineage.root_sha256, lineage.depth), (None, Some(0)));
+
+        // A finding saved before lineage was kept has none, and a document
+        // written before the field existed still reads.
+        let fuzz = normalize(asan_record(), None).fuzz.unwrap();
+        assert!(fuzz.lineage.is_none());
+        let mut old = serde_json::to_value(&fuzz).unwrap();
+        old.as_object_mut().unwrap().remove("lineage").unwrap();
+        let back: crate::model::FuzzBlock = serde_json::from_value(old).unwrap();
+        assert!(back.lineage.is_none());
     }
 
     #[test]

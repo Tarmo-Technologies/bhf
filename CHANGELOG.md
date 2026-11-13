@@ -1640,6 +1640,28 @@
   both forms.
 
 ### Added
+- Seed lineage: the built-in engine records what each input it keeps was
+  mutated from (`corpus/<harness-id>/lineage.jsonl`, one line per queue
+  entry, beside the queue), and each finding's `finding.json` gains
+  `lineage`: whether its input descends from a mined seed, a user seed, a
+  queue entry with no record or an input bhf generated, that seed's sha256 and
+  path, how many mutation generations down it is, and its immediate parent.
+  Later passes, `--resume` and multi-worker campaigns keep the chain (each
+  worker starts from the campaign's records and names the seeds it was
+  given, not bhf's copies of them); the file is trimmed to twice the queue's
+  entry limit or twice the files the queue holds, whichever is more (a
+  multi-worker merge can leave the shared queue holding more than the
+  limit), keeping what the queue needs first. A queue entry with no record
+  is a `corpus` root whatever its file is named. A corpus saved without the
+  file still loads, and what it cannot say is `unknown` with a reason, as is
+  the lineage of a crash AFL++ found (`bhf fuzz --engine afl++`, `bhf
+  binary-fuzz --engine afl-qemu`), whose queue bhf does not track. The
+  corpus replays (MSan, TSan, the memory profile, `--differential`) record
+  the lineage of the queue entry they ran, and `bhf binary-fuzz`'s
+  seed-replay engine and `bhf differential` name the operator's input as a
+  user seed. `bhf explain` prints it as one line, also for an MSan or TSan
+  finding, which saves no testcase and names its input by sha256, and
+  `bhf.findings.v1` carries it as the optional `fuzz.lineage`.
 - Windows: a WinAFL engine, `--engine winafl` on `bhf fuzz` and `bhf auto`
   (native Windows only; refused on other hosts before anything is built).
   WinAFL fuzzes `main_winafl.exe`, the harness's sources built without

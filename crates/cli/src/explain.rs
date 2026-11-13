@@ -489,11 +489,39 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         for line in hexdump(bytes, 6) {
             let _ = writeln!(s, "  {line}");
         }
-        for note in input_origin(work_dir, &f.dir, name, bytes) {
+        for note in input_origin(work_dir, &f.dir, name, bytes)
+            .into_iter()
+            .chain([lineage_line(&f.raw, "testcase.bin")])
+        {
             for (index, line) in wrap(&note, 74).into_iter().enumerate() {
                 let indent = if index == 0 { "  " } else { "    " };
                 let _ = writeln!(s, "{indent}{line}");
             }
+        }
+    } else if f.raw.get("lineage").is_some_and(Value::is_object) {
+        // A lane that saves no testcase (the MSan and TSan replays) names
+        // the input it ran by sha256 and records that input's lineage.
+        let sha = recorded_input_sha256(&f.raw);
+        let (saved, subject) = match sha {
+            Some(sha) => (
+                format!("not saved with this finding; sha256 {sha}"),
+                format!(
+                    "input sha256 {}…",
+                    sha.chars().take(LINEAGE_SHA_SHOWN).collect::<String>()
+                ),
+            ),
+            None => (
+                "not saved with this finding".to_owned(),
+                "the input it ran".to_owned(),
+            ),
+        };
+        let _ = writeln!(s, "\nTHE INPUT THAT TRIGGERS IT  ({saved})");
+        for (index, line) in wrap(&lineage_line(&f.raw, &subject), 74)
+            .into_iter()
+            .enumerate()
+        {
+            let indent = if index == 0 { "  " } else { "    " };
+            let _ = writeln!(s, "{indent}{line}");
         }
     }
 
@@ -1612,6 +1640,84 @@ impl StartingInput {
             path: terminal_safe(seed.get("path").and_then(Value::as_str).unwrap_or("?")),
         })
     }
+}
+
+/// Hex digits of a lineage digest shown.
+const LINEAGE_SHA_SHOWN: usize = 12;
+
+/// The sha256 a finding that saves no testcase names its input by (the
+/// `input_sha256` oracle evidence).
+fn recorded_input_sha256(raw: &Value) -> Option<&str> {
+    raw.pointer("/oracle/evidence")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("key").and_then(Value::as_str) == Some("input_sha256"))?
+        .get("value")?
+        .as_str()
+        .filter(|sha| !sha.is_empty() && sha.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// What the input `subject` names (`testcase.bin`, the input the fuzzer
+/// saved, before any minimization, or the input a lane that saves none ran)
+/// descends from, from `finding.json` `lineage`: the root and how many
+/// mutation generations down, or why that is unknown.
+fn lineage_line(raw: &Value, subject: &str) -> String {
+    let label = format!("Lineage ({subject}):");
+    let Some(lineage) = raw.get("lineage").filter(|lineage| lineage.is_object()) else {
+        return format!(
+            "{label} unknown (this finding records none: it was saved before lineage was \
+             kept, or by a lane that keeps none)."
+        );
+    };
+    let text = |key: &str| {
+        lineage
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    };
+    let reason = text("reason");
+    let unknown = || {
+        format!(
+            "{label} unknown ({}).",
+            reason.unwrap_or("no reason recorded")
+        )
+    };
+    let Some(depth) = lineage.get("depth").and_then(Value::as_u64) else {
+        return unknown();
+    };
+    let mut root = match (text("origin"), text("root_path")) {
+        (Some("mined_seed"), Some(path)) => format!("mined seed {path}"),
+        (Some("mined_seed"), None) => "a mined seed".to_owned(),
+        (Some("user_seed"), Some(path)) => format!("user seed {path}"),
+        (Some("user_seed"), None) => "a user seed given on the command line".to_owned(),
+        (Some("seed"), _) => "a start input no seed list names".to_owned(),
+        (Some("corpus"), _) => "a queue entry with no lineage record".to_owned(),
+        // Not only a start input: a structured or grammar generator, or the
+        // random-byte fallback, builds one mid-run.
+        (Some("generated"), _) => "an input bhf generated (no seed)".to_owned(),
+        _ => return unknown(),
+    };
+    if let Some(sha) = text("root_sha256") {
+        let shown: String = sha.chars().take(LINEAGE_SHA_SHOWN).collect();
+        root.push_str(&format!(" (sha256 {shown}…)"));
+    }
+    if let Some(prefix) = lineage.get("layout_prefix").and_then(Value::as_u64) {
+        root.push_str(&format!(" behind {prefix} zero bytes"));
+    }
+    let mut line = match depth {
+        0 if text("origin") == Some("generated") => format!("{label} is {root}, unmutated"),
+        0 => format!("{label} is {root} itself, unmutated"),
+        1 => format!("{label} descends from {root} after 1 mutation generation"),
+        n => format!("{label} descends from {root} after {n} mutation generations"),
+    };
+    if text("origin") == Some("corpus") {
+        line.push_str(&format!(
+            "; lineage before it unknown ({})",
+            reason.unwrap_or("its ancestry was not recorded")
+        ));
+    }
+    line.push('.');
+    line
 }
 
 /// Comparison evidence for a finding's input, and the environment the
@@ -3856,6 +3962,157 @@ mod tests {
         let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(!words.contains("built-in starting inputs"), "{out}");
         assert!(!words.contains("byte-identical"), "{out}");
+    }
+
+    /// One line names what the input descends from and how many mutation
+    /// generations down, says when it is that seed itself, and says why when
+    /// the lineage is unknown, guessing nothing.
+    #[test]
+    fn the_lineage_line_names_the_root_or_why_it_is_unknown() {
+        let work = tempfile::tempdir().unwrap();
+        let sha = "ab".repeat(32);
+        let line = |lineage: Option<serde_json::Value>| {
+            let mut raw = base_raw();
+            if let Some(lineage) = lineage {
+                raw["lineage"] = lineage;
+            }
+            let finding = finding_in(work.path(), raw);
+            std::fs::write(finding.dir.join("testcase.bin"), b"XY").unwrap();
+            let out = explain_one(work.path(), &finding, &[], false);
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let lineage = |origin: &str, path: Option<&str>, depth: u64| {
+            let mut value =
+                serde_json::json!({"origin": origin, "root_sha256": sha, "depth": depth});
+            if let Some(path) = path {
+                value["root_path"] = serde_json::json!(path);
+            }
+            value
+        };
+        let cases = [
+            (
+                lineage("mined_seed", Some("tests/data/x.bin"), 7),
+                "Lineage (testcase.bin): descends from mined seed tests/data/x.bin (sha256 \
+                 abababababab…) after 7 mutation generations.",
+            ),
+            (
+                lineage("user_seed", Some("/seeds/one.bin"), 1),
+                "Lineage (testcase.bin): descends from user seed /seeds/one.bin (sha256 \
+                 abababababab…) after 1 mutation generation.",
+            ),
+            (
+                lineage("user_seed", Some("/seeds/one.bin"), 0),
+                "Lineage (testcase.bin): is user seed /seeds/one.bin (sha256 abababababab…) \
+                 itself, unmutated.",
+            ),
+            (
+                lineage("generated", None, 3),
+                "Lineage (testcase.bin): descends from an input bhf generated (no seed) \
+                 (sha256 abababababab…) after 3 mutation generations.",
+            ),
+            // A generated input need not be a start input: a structured or
+            // grammar generator builds them mid-run.
+            (
+                lineage("generated", None, 0),
+                "Lineage (testcase.bin): is an input bhf generated (no seed) (sha256 \
+                 abababababab…), unmutated.",
+            ),
+            (
+                lineage("seed", None, 2),
+                "Lineage (testcase.bin): descends from a start input no seed list names \
+                 (sha256 abababababab…) after 2 mutation generations.",
+            ),
+        ];
+        for (value, expected) in cases {
+            let words = line(Some(value.clone()));
+            assert!(words.contains(expected), "{value}\n{words}");
+            assert!(!words.contains("generated start input"), "{value}\n{words}");
+        }
+        let mut prefixed = lineage("mined_seed", Some("tests/data/x.bin"), 4);
+        prefixed["layout_prefix"] = serde_json::json!(8);
+        assert!(line(Some(prefixed)).contains(
+            "descends from mined seed tests/data/x.bin (sha256 abababababab…) behind 8 \
+                 zero bytes after 4 mutation generations."
+        ));
+        let mut corpus = lineage("corpus", None, 2);
+        corpus["reason"] = serde_json::json!("its ancestry was not recorded");
+        assert!(line(Some(corpus)).contains(
+            "Lineage (testcase.bin): descends from a queue entry with no lineage record (sha256 \
+             abababababab…) after 2 mutation generations; lineage before it unknown (its \
+             ancestry was not recorded)."
+        ));
+        let words = line(Some(
+            serde_json::json!({"origin": "unknown", "reason": "found by AFL++"}),
+        ));
+        assert!(
+            words.contains("Lineage (testcase.bin): unknown (found by AFL++)."),
+            "{words}"
+        );
+        assert!(!words.contains("descends"), "{words}");
+        let words = line(None);
+        assert!(
+            words.contains("Lineage (testcase.bin): unknown (this finding records none"),
+            "{words}"
+        );
+    }
+
+    /// A finding that saves no testcase (the MSan and TSan replays) still
+    /// prints the lineage it recorded, naming the input by its sha256; with
+    /// neither a testcase nor a lineage there is nothing to print.
+    #[test]
+    fn a_finding_with_no_saved_input_prints_the_lineage_of_the_input_it_ran() {
+        let work = tempfile::tempdir().unwrap();
+        let entry = "cd".repeat(32);
+        let mut raw = base_raw();
+        raw["oracle"] = serde_json::json!({"evidence": [
+            {"key": "source", "value": "/proj/src/uninit.c:8"},
+            {"key": "input_sha256", "value": entry},
+        ]});
+        raw["lineage"] = serde_json::json!({
+            "origin": "user_seed", "root_path": "/seeds/seed.bin",
+            "root_sha256": "ab".repeat(32), "depth": 1,
+        });
+        let words = |raw: serde_json::Value| {
+            let out = explain_one(work.path(), &finding_in(work.path(), raw), &[], false);
+            out.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let text = words(raw.clone());
+        assert!(
+            text.contains(&format!(
+                "THE INPUT THAT TRIGGERS IT (not saved with this finding; sha256 {entry})"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Lineage (input sha256 cdcdcdcdcdcd…): descends from user seed \
+                 /seeds/seed.bin (sha256 abababababab…) after 1 mutation generation."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Lineage (testcase.bin)"), "{text}");
+
+        // An input it could not name: the lineage says why.
+        let mut unnamed = raw.clone();
+        unnamed["oracle"]["evidence"] =
+            serde_json::json!([{"key": "source", "value": "/proj/src/uninit.c:8"}]);
+        unnamed["lineage"] = serde_json::json!({
+            "origin": "unknown", "reason": "the queue entry /q/x.bin could not be read again",
+        });
+        let text = words(unnamed);
+        assert!(
+            text.contains(
+                "Lineage (the input it ran): unknown (the queue entry /q/x.bin could not be \
+                 read again)."
+            ),
+            "{text}"
+        );
+
+        let mut bare = raw;
+        bare.as_object_mut().unwrap().remove("lineage");
+        let text = words(bare);
+        assert!(!text.contains("Lineage"), "{text}");
+        assert!(!text.contains("THE INPUT THAT TRIGGERS IT"), "{text}");
     }
 
     /// The environment section names where its events come from, and says

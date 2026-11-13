@@ -474,6 +474,11 @@ pub struct FuzzBlock {
     /// after the first v1 release, like `access`.
     #[serde(default)]
     pub sanitizer_second_opinion: Option<SanitizerSecondOpinion>,
+    /// What the finding's input descends from in the fuzz queue (`lineage` in
+    /// `finding.json`). `null` when the finding records none. Added after the
+    /// first v1 release, like `arguments`.
+    #[serde(default)]
+    pub lineage: Option<Lineage>,
 }
 
 /// The re-run that decides whether a UBSan object-size finding carries ASan's
@@ -488,6 +493,32 @@ pub struct SanitizerSecondOpinion {
     pub used: String,
     /// What the re-run showed, or why it did not run.
     pub reason: String,
+}
+
+/// What a fuzz finding's input descends from: the queue entries its
+/// mutations started from, back to a root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lineage {
+    /// `mined_seed`, `user_seed`, `seed` (a start input no seed list names),
+    /// `corpus` (a reseeded entry whose own ancestry was not recorded),
+    /// `generated` (no seed) or `unknown`.
+    pub origin: String,
+    /// The root's sha256: a seed's own, as `auto/seeds.json` lists it.
+    pub root_sha256: Option<String>,
+    /// The seed file the root was read from, relative to the source root
+    /// when under it.
+    pub root_path: Option<String>,
+    /// The root entry was the seed behind this many zero bytes.
+    pub layout_prefix: Option<u64>,
+    /// Mutation generations from the root; `0` when the input is the root.
+    pub depth: Option<u64>,
+    /// The queue entry the input's last mutation started from.
+    pub parent_sha256: Option<String>,
+    /// The entry a splice took its second part from.
+    pub donor_sha256: Option<String>,
+    /// Why the lineage is unknown, or stops short of a seed.
+    pub reason: Option<String>,
 }
 
 /// How far a capture's search for operands computed from input bytes got.

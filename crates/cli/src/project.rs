@@ -653,6 +653,7 @@ fn plan_to_fuzz_args(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files,
+        campaign_seed_files: Vec::new(),
         qemu_user: None,
         qemu_args: Vec::new(),
         seed_bytes: Vec::new(),

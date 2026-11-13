@@ -83,6 +83,44 @@ impl MutationKind {
         Self::OpSequence,
         Self::CmpLogSplice,
     ];
+
+    /// Whether an input of this kind is an edit of the base it was given. The
+    /// generators (the structured shapes and `--grammar` derivations) build
+    /// theirs from the dictionary or grammar alone, so it descends from no
+    /// queue entry.
+    pub fn derives_from_base(self) -> bool {
+        match self {
+            Self::BitFlip
+            | Self::ByteFlip
+            | Self::Arithmetic
+            | Self::Interesting
+            | Self::Splice
+            | Self::DictionaryInsert
+            | Self::TypedValue
+            | Self::OpSequence
+            | Self::CmpLogSplice => true,
+            Self::StructuredRecord
+            | Self::StructuredJson
+            | Self::StructuredXml
+            | Self::StructuredKeyValue
+            | Self::StructuredUrlEncoded
+            | Self::StructuredMultipart
+            | Self::StructuredCsv
+            | Self::StructuredHttp
+            | Self::StructuredIni
+            | Self::StructuredToml
+            | Self::StructuredYaml
+            | Self::StructuredChunked
+            | Self::StructuredRecursive
+            | Self::StructuredGrammar => false,
+        }
+    }
+
+    /// Whether an input of this kind also takes bytes from the peer (a second
+    /// parent): only a splice does.
+    pub fn uses_peer(self) -> bool {
+        matches!(self, Self::Splice)
+    }
 }
 
 /// How many extra times `CmpLogSplice` is entered into the per-mutation
@@ -2483,6 +2521,59 @@ mod tests {
 
         assert_eq!(result.kind, MutationKind::Interesting);
         assert_ne!(result.bytes, vec![0]);
+    }
+
+    /// What an input was made from decides what it descends from: the
+    /// generators build theirs from the dictionary or a grammar and never read
+    /// the base, every other kind edits the base, and only a splice also reads
+    /// the peer. Each kind runs twice from the same RNG state with one of the
+    /// two changed.
+    #[test]
+    fn only_generators_ignore_the_base_and_only_splice_reads_the_peer() {
+        let dictionary = Dictionary::from_tokens([&b"key"[..], &b"value"[..], &b"\x89PNG"[..]]);
+        let grammar = crate::grammar::Grammar::from_rules(
+            &[(
+                "START".to_owned(),
+                vec!["<{START}>".to_owned(), "x".to_owned()],
+            )],
+            None,
+        )
+        .unwrap();
+        let made = |kind: MutationKind, base: &[u8], peer: &[u8]| {
+            let input = MutationInput::new(base, &dictionary)
+                .with_peer(peer)
+                .with_grammar(&grammar);
+            suite()
+                .try_mutate_with_kind(&input, kind, &mut MutationRng::new(11))
+                .map(|result| result.bytes)
+        };
+        let (base, other_base) = (&b"aaaaaaaaaaaaaaaa"[..], &b"zzzzzzzzzzzzzzzz"[..]);
+        let (peer, other_peer) = (&b"PPPPPPPPPPPPPPPP"[..], &b"QQQQQQQQQQQQQQQQ"[..]);
+        let mut compared = 0;
+        for kind in MutationKind::ALL {
+            let first = made(kind, base, peer);
+            let Some(bytes) = first.clone() else {
+                // Needs evidence this test does not give it (typed spans, an
+                // op-sequence layout, cmplog operands).
+                assert!(kind.derives_from_base(), "{kind:?} generates");
+                continue;
+            };
+            compared += 1;
+            let rebased = made(kind, other_base, peer);
+            if kind.derives_from_base() {
+                assert_ne!(rebased, first, "{kind:?} edits the base");
+            } else {
+                assert_eq!(rebased, first, "{kind:?} must not read the base");
+                assert!(!bytes.is_empty(), "{kind:?}");
+            }
+            let repeered = made(kind, base, other_peer);
+            if kind.uses_peer() {
+                assert_ne!(repeered, first, "{kind:?} reads the peer");
+            } else {
+                assert_eq!(repeered, first, "{kind:?} must not read the peer");
+            }
+        }
+        assert!(compared >= 18, "most kinds ran: {compared}");
     }
 
     #[test]

@@ -65,6 +65,13 @@ pub struct MulticoreConfig {
     /// Every worker tree must hold it once mirrored, or the campaign fails
     /// before that worker starts.
     pub harness_executable: Option<PathBuf>,
+    /// Records the campaign's seed lineage keeps: the cap each worker's pass
+    /// trims its own to ([`corpus::lineage::record_cap`] of the queue's entry
+    /// limit). The merge of the workers' records trims to it too, or to twice
+    /// the shared queue's files when that is more (the shared queue takes
+    /// the union of the workers' queues), keeping first what the shared
+    /// queue's entries need.
+    pub lineage_record_cap: usize,
 }
 
 /// Each worker's stderr, captured inside its own work dir.
@@ -321,6 +328,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         mirror_harness_layout(config, &worker_dir)?;
         let findings_before = count_findings(&worker_dir);
         copy_shared_queue_to_worker(&shared_queue, &worker_dir, &config.harness_id)?;
+        mirror_campaign_records(&config.work_dir, &worker_dir, &config.harness_id)?;
         // A file, not a pipe: nothing drains a pipe while the workers run, so a
         // worker writing more than the pipe buffer would block until killed.
         let stderr_log = worker_dir.join(WORKER_STDERR_LOG);
@@ -355,8 +363,10 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
             cmd.arg("--time")
                 .arg(format!("{}s", config.time_budget.as_secs()));
         }
+        // The shared queue's entries are the campaign's, not seeds given to
+        // the worker: it names their lineage from the campaign's records.
         for seed_file in &shared_seed_files {
-            cmd.arg("--seed-file").arg(seed_file);
+            cmd.arg("--campaign-seed-file").arg(seed_file);
         }
         for arg in &config.extra_worker_args {
             cmd.arg(arg);
@@ -428,6 +438,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         &per_worker,
         shared_seed_files.len(),
         &shared_queue,
+        config.lineage_record_cap,
     )?;
     let sync_manifest_path = config
         .work_dir
@@ -493,17 +504,58 @@ fn copy_shared_queue_to_worker(
     Ok(())
 }
 
+/// The campaign's own records a worker starts from, work-dir-relative: its
+/// seed lineage beside the queue, so what a worker reseeds from the shared
+/// queue keeps its chain, and the seed list `bhf auto` wrote, so a worker's
+/// lineage names a listed seed's source and path.
+fn campaign_records(harness_id: &str) -> [PathBuf; 2] {
+    [
+        Path::new("corpus")
+            .join(harness_id)
+            .join(corpus::lineage::LINEAGE_FILE),
+        Path::new("auto").join("seeds.json"),
+    ]
+}
+
+/// Give a worker tree the parent's copy of each of [`campaign_records`] and
+/// drop its copy of one the parent lacks, so a worker never reads a record
+/// an earlier campaign left in its tree.
+fn mirror_campaign_records(
+    work_dir: &Path,
+    worker_dir: &Path,
+    harness_id: &str,
+) -> Result<(), MulticoreError> {
+    for rel in campaign_records(harness_id) {
+        let src = work_dir.join(&rel);
+        let dst = worker_dir.join(&rel);
+        if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dst)?;
+        } else {
+            remove_path(&dst)?;
+        }
+    }
+    Ok(())
+}
+
 fn sync_worker_corpora(
     work_dir: &Path,
     harness_id: &str,
     per_worker: &[WorkerReport],
     seed_inputs_loaded: usize,
     shared_queue: &Path,
+    lineage_record_cap: usize,
 ) -> Result<CorpusSyncReport, MulticoreError> {
     std::fs::create_dir_all(shared_queue)?;
     let mut seen = HashSet::<Vec<u8>>::new();
+    // What the shared queue holds once merged, by sha256: the lineage the
+    // merge keeps first.
+    let mut queued = Vec::new();
     for seed_file in queue_seed_files(shared_queue)? {
         if let Ok(bytes) = std::fs::read(seed_file) {
+            queued.push(corpus::lineage::digest(&bytes));
             seen.insert(bytes);
         }
     }
@@ -533,10 +585,18 @@ fn sync_worker_corpora(
                     name.to_string_lossy()
                 ));
             }
-            std::fs::write(destination, bytes)?;
+            std::fs::write(destination, &bytes)?;
+            queued.push(corpus::lineage::digest(&bytes));
             imported_inputs += 1;
         }
     }
+    merge_worker_lineage(
+        work_dir,
+        harness_id,
+        per_worker,
+        &queued,
+        lineage_record_cap,
+    );
 
     Ok(CorpusSyncReport {
         shared_queue: work_dir.join("corpus").join(harness_id).join("queue"),
@@ -544,6 +604,42 @@ fn sync_worker_corpora(
         imported_inputs,
         duplicate_inputs,
     })
+}
+
+/// Merge each worker's seed lineage (`corpus/<harness>/lineage.jsonl`, see
+/// [`corpus::lineage`]) into the campaign's own, so the queue entries just
+/// imported keep what they descend from. A record the campaign already holds
+/// stays. Every record is read, and at most `cap`, or twice the shared
+/// queue's files when that is more (within the hard cap), are written back,
+/// those the shared queue's entries (`queued`, by sha256) need first, as a
+/// pass does with its pool. Best-effort, like the lineage itself: an
+/// unreadable worker index adds nothing, and the merge never fails the
+/// campaign.
+fn merge_worker_lineage(
+    work_dir: &Path,
+    harness_id: &str,
+    per_worker: &[WorkerReport],
+    queued: &[corpus::lineage::Digest],
+    cap: usize,
+) {
+    use corpus::lineage::{index_path, record_cap, LineageIndex, MAX_LINEAGE_RECORDS};
+    // Each worker's queue holds up to the entry limit, so the shared queue,
+    // their union, can hold more than `cap` records cover.
+    let cap = cap.max(record_cap(queued.len()));
+    let path = index_path(work_dir, harness_id);
+    let Ok(mut index) = LineageIndex::load(&path, MAX_LINEAGE_RECORDS) else {
+        return;
+    };
+    let before = index.len();
+    for worker in per_worker {
+        let worker_index = index_path(&worker.work_dir, harness_id);
+        if let Ok(records) = LineageIndex::load(&worker_index, MAX_LINEAGE_RECORDS) {
+            index.absorb(records);
+        }
+    }
+    if index.len() > before || index.len() > cap {
+        let _ = index.save(&path, queued, cap);
+    }
 }
 
 fn write_campaign_artifacts(
@@ -1163,6 +1259,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
 
         let summary = run_multicore(&config).expect("staggered campaign completes");
@@ -1204,6 +1301,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("campaign completes");
         let seen = std::fs::read_to_string(summary.per_worker[0].work_dir.join("defer")).unwrap();
@@ -1224,6 +1322,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         assert!(matches!(
             run_multicore(&config),
@@ -1246,6 +1345,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         assert!(matches!(
             run_multicore(&config),
@@ -1269,6 +1369,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         assert!(matches!(
             run_multicore(&config),
@@ -1533,6 +1634,7 @@ mod tests {
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("run ok");
         assert_eq!(summary.workers_started, 2);
@@ -1584,6 +1686,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
 
         let summary = run_multicore(&config).expect("run ok");
@@ -1609,6 +1712,306 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
         assert_eq!(manifest["harness_id"], "H-SYNC");
         assert_eq!(manifest["workers_started"], 2);
         assert_eq!(manifest["sync"]["imported_inputs"], 2);
+    }
+
+    /// The lineage each worker recorded beside its queue is merged into the
+    /// campaign's own, beside the queue the worker's entries were merged
+    /// into; a record the campaign already held stays as it was.
+    #[cfg(unix)]
+    #[test]
+    fn run_multicore_merges_worker_lineage_beside_the_shared_queue() {
+        use corpus::lineage::{digest, hex, index_path, Entry, LineageIndex, Origin};
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        std::fs::create_dir_all(work.join("build").join("H-LIN")).unwrap();
+        let mut held = LineageIndex::new();
+        held.insert(digest(b"held"), Entry::Root(Origin::Generated));
+        held.insert(digest(b"worker-0"), Entry::Root(Origin::Corpus));
+        held.save(&index_path(&work, "H-LIN"), &[], 16).unwrap();
+
+        // Worker N keeps `worker-N`, mutated from `seed`, and `seed` itself.
+        let line =
+            |bytes: &[u8], rest: &str| format!("{{\"sha256\":\"{}\",{rest}}}", hex(&digest(bytes)));
+        let seed = line(
+            b"seed",
+            "\"origin\":\"seed\",\"source\":\"user\",\"path\":\"/s/seed.bin\"",
+        );
+        let child = |n: u8| {
+            line(
+                format!("worker-{n}").as_bytes(),
+                &format!("\"parent\":\"{}\"", hex(&digest(b"seed"))),
+            )
+        };
+        let script = work.join("fake-bhf.sh");
+        executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nset -eu\nworker_dir=\"$2\"\n\
+                 mkdir -p \"$worker_dir/corpus/H-LIN/queue\"\n\
+                 printf \"worker-%s\" \"$BHF_WORKER_ID\" > \"$worker_dir/corpus/H-LIN/queue/worker-$BHF_WORKER_ID.bin\"\n\
+                 if [ \"$BHF_WORKER_ID\" = 0 ]; then line='{}'; else line='{}'; fi\n\
+                 printf '%s\\n%s\\n' '{seed}' \"$line\" > \"$worker_dir/corpus/H-LIN/lineage.jsonl\"\n",
+                child(0),
+                child(1)
+            ),
+        );
+        let config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-LIN".to_owned(),
+            workers: WorkerCount::Fixed(2),
+            per_worker_iterations: Some(1),
+            time_budget: Duration::ZERO,
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+            harness_dirs: Vec::new(),
+            harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
+        };
+        let summary = run_multicore(&config).expect("run ok");
+        assert_eq!(summary.workers_completed, 2);
+
+        let merged = LineageIndex::load(&index_path(&work, "H-LIN"), 16).unwrap();
+        assert_eq!(merged.len(), 4, "held, worker-0 (held), seed, worker-1");
+        assert_eq!(
+            merged.get(&digest(b"held")),
+            Some(&Entry::Root(Origin::Generated))
+        );
+        assert_eq!(
+            merged.get(&digest(b"worker-0")),
+            Some(&Entry::Root(Origin::Corpus)),
+            "the campaign's own record stays"
+        );
+        let lineage = merged.resolve(&digest(b"worker-1"));
+        assert_eq!(lineage.root_path.as_deref(), Some("/s/seed.bin"));
+        assert_eq!(lineage.depth, Some(1));
+    }
+
+    /// A worker starts from the campaign's lineage and seed list, so what
+    /// it reseeds from the shared queue keeps its chain and a listed seed
+    /// its source; it is handed the shared queue's entries as campaign
+    /// seeds, not as seeds given to `bhf fuzz`. A worker tree whose parent
+    /// has neither file loses the copy an earlier campaign left there.
+    #[cfg(unix)]
+    #[test]
+    fn workers_start_from_the_campaign_lineage_and_take_the_queue_as_campaign_seeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        std::fs::create_dir_all(work.join("build").join("H-CPY")).unwrap();
+        let queue = work.join("corpus/H-CPY/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("entry.bin"), b"entry").unwrap();
+        let lineage = work
+            .join("corpus/H-CPY")
+            .join(corpus::lineage::LINEAGE_FILE);
+        std::fs::write(&lineage, b"{\"campaign\":1}\n").unwrap();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::write(work.join("auto/seeds.json"), b"{\"seeds\":[]}").unwrap();
+        // What an earlier campaign left in worker 0's tree.
+        let stale = work.join("worker-H-CPY-0/corpus/H-CPY");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(corpus::lineage::LINEAGE_FILE), b"stale").unwrap();
+
+        let script = work.join("fake-bhf.sh");
+        executable_script(
+            &script,
+            "#!/bin/sh\nset -eu\nworker_dir=\"$2\"\n\
+             printf '%s\\n' \"$@\" > \"$worker_dir/argv.txt\"\n\
+             cp \"$worker_dir/corpus/H-CPY/lineage.jsonl\" \"$worker_dir/seen-lineage\" 2>/dev/null || true\n\
+             cp \"$worker_dir/auto/seeds.json\" \"$worker_dir/seen-seeds\" 2>/dev/null || true\n",
+        );
+        let mut config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-CPY".to_owned(),
+            workers: WorkerCount::Fixed(2),
+            per_worker_iterations: Some(1),
+            time_budget: Duration::ZERO,
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+            harness_dirs: Vec::new(),
+            harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
+        };
+        run_multicore(&config).expect("run ok");
+        for worker in 0..2 {
+            let dir = work.join(format!("worker-H-CPY-{worker}"));
+            assert_eq!(
+                std::fs::read(dir.join("seen-lineage")).unwrap(),
+                b"{\"campaign\":1}\n"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("seen-seeds")).unwrap(),
+                b"{\"seeds\":[]}"
+            );
+            let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            let entry = queue.join("entry.bin").display().to_string();
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--campaign-seed-file" && pair[1] == entry),
+                "{argv:?}"
+            );
+            assert!(!argv.contains(&"--seed-file"), "{argv:?}");
+        }
+
+        // The parent drops both: the workers lose their copies.
+        std::fs::remove_file(&lineage).unwrap();
+        std::fs::remove_file(work.join("auto/seeds.json")).unwrap();
+        config.workers = WorkerCount::Fixed(1);
+        run_multicore(&config).expect("run ok");
+        let dir = work.join("worker-H-CPY-0");
+        assert!(!dir.join("corpus/H-CPY/lineage.jsonl").exists());
+        assert!(!dir.join("auto/seeds.json").exists());
+    }
+
+    /// The merge writes no more records than a pass may keep, and the ones
+    /// it keeps first are those the shared queue's entries need.
+    #[cfg(unix)]
+    #[test]
+    fn the_merge_trims_to_the_record_cap_keeping_what_the_shared_queue_needs() {
+        use corpus::lineage::{digest, hex, index_path, Entry, LineageIndex, Origin};
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        std::fs::create_dir_all(work.join("build").join("H-CAP")).unwrap();
+        let mut held = LineageIndex::new();
+        for n in 0..10 {
+            held.insert(
+                digest(format!("old-{n}").as_bytes()),
+                Entry::Root(Origin::Generated),
+            );
+        }
+        held.save(&index_path(&work, "H-CAP"), &[], 64).unwrap();
+
+        let line =
+            |bytes: &[u8], rest: &str| format!("{{\"sha256\":\"{}\",{rest}}}", hex(&digest(bytes)));
+        let seed = line(
+            b"seed",
+            "\"origin\":\"seed\",\"source\":\"user\",\"path\":\"/s/seed.bin\"",
+        );
+        let child = |n: u8| {
+            line(
+                format!("worker-{n}").as_bytes(),
+                &format!("\"parent\":\"{}\"", hex(&digest(b"seed"))),
+            )
+        };
+        let script = work.join("fake-bhf.sh");
+        executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nset -eu\nworker_dir=\"$2\"\n\
+                 mkdir -p \"$worker_dir/corpus/H-CAP/queue\"\n\
+                 printf \"worker-%s\" \"$BHF_WORKER_ID\" > \"$worker_dir/corpus/H-CAP/queue/worker-$BHF_WORKER_ID.bin\"\n\
+                 if [ \"$BHF_WORKER_ID\" = 0 ]; then line='{}'; else line='{}'; fi\n\
+                 cat \"$worker_dir/corpus/H-CAP/lineage.jsonl\" > \"$worker_dir/lines\"\n\
+                 printf '%s\\n%s\\n' '{seed}' \"$line\" >> \"$worker_dir/lines\"\n\
+                 mv \"$worker_dir/lines\" \"$worker_dir/corpus/H-CAP/lineage.jsonl\"\n",
+                child(0),
+                child(1)
+            ),
+        );
+        let config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-CAP".to_owned(),
+            workers: WorkerCount::Fixed(2),
+            per_worker_iterations: Some(1),
+            time_budget: Duration::ZERO,
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+            harness_dirs: Vec::new(),
+            harness_executable: None,
+            lineage_record_cap: 4,
+        };
+        run_multicore(&config).expect("run ok");
+
+        let path = index_path(&work, "H-CAP");
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, 4, "trimmed to the cap");
+        let merged = LineageIndex::load(&path, 64).unwrap();
+        for worker in [b"worker-0", b"worker-1"] {
+            let lineage = merged.resolve(&digest(worker));
+            assert_eq!(lineage.root_path.as_deref(), Some("/s/seed.bin"));
+            assert_eq!(lineage.depth, Some(1));
+        }
+    }
+
+    /// Three workers that each fill a queue limited to 2 entries merge 6
+    /// entries into the shared queue, more than the cap of 4 can record:
+    /// the merge keeps up to twice the shared queue's files instead, so
+    /// every entry keeps its chain.
+    #[cfg(unix)]
+    #[test]
+    fn the_merge_keeps_a_record_for_every_shared_queue_entry_three_workers_fill() {
+        use corpus::lineage::{digest, hex, index_path, Entry, LineageIndex, Origin};
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        std::fs::create_dir_all(work.join("build").join("H-FULL")).unwrap();
+        let mut held = LineageIndex::new();
+        for n in 0..10 {
+            held.insert(
+                digest(format!("old-{n}").as_bytes()),
+                Entry::Root(Origin::Generated),
+            );
+        }
+        held.save(&index_path(&work, "H-FULL"), &[], 64).unwrap();
+
+        let seed = hex(&digest(b"seed"));
+        let script = work.join("fake-bhf.sh");
+        executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nset -eu\nworker_dir=\"$2\"\nq=\"$worker_dir/corpus/H-FULL/queue\"\n\
+                 mkdir -p \"$q\"\nout=\"$worker_dir/lines\"\n\
+                 printf '{{\"sha256\":\"%s\",\"origin\":\"seed\",\"source\":\"user\",\"path\":\"/s/seed.bin\"}}\\n' {seed} > \"$out\"\n\
+                 for k in a b; do\n\
+                   entry=\"w$BHF_WORKER_ID-$k\"; printf '%s' \"$entry\" > \"$q/$entry.bin\"\n\
+                   sha=$(sha256sum \"$q/$entry.bin\" | cut -c1-64)\n\
+                   printf '{{\"sha256\":\"%s\",\"parent\":\"%s\"}}\\n' \"$sha\" {seed} >> \"$out\"\n\
+                 done\n\
+                 mv \"$out\" \"$worker_dir/corpus/H-FULL/lineage.jsonl\"\n"
+            ),
+        );
+        let config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-FULL".to_owned(),
+            workers: WorkerCount::Fixed(3),
+            per_worker_iterations: Some(1),
+            time_budget: Duration::ZERO,
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+            harness_dirs: Vec::new(),
+            harness_executable: None,
+            lineage_record_cap: 4,
+        };
+        run_multicore(&config).expect("run ok");
+
+        let queue = work.join("corpus/H-FULL/queue");
+        assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 6);
+        let path = index_path(&work, "H-FULL");
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, 12, "twice the shared queue's 6 files");
+        let merged = LineageIndex::load(&path, 64).unwrap();
+        for worker in 0..3 {
+            for k in ["a", "b"] {
+                let entry = format!("w{worker}-{k}");
+                let lineage = merged.resolve(&digest(entry.as_bytes()));
+                assert_eq!(
+                    lineage.root_path.as_deref(),
+                    Some("/s/seed.bin"),
+                    "{entry}: {lineage:?}"
+                );
+                assert_eq!(lineage.depth, Some(1));
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1645,6 +2048,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("campaign runs");
         assert_eq!(
@@ -1680,6 +2084,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: vec![PathBuf::from("harnesses/H-AUTO")],
             harness_executable: Some(PathBuf::from("harnesses/H-AUTO/main")),
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("campaign runs");
         assert_eq!(summary.workers_completed, 2, "{:?}", summary.per_worker);
@@ -1716,6 +2121,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: vec![PathBuf::from("harnesses/H-REBUILT")],
             harness_executable: Some(PathBuf::from("harnesses/H-REBUILT/main")),
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         assert_eq!(run_multicore(&config).unwrap().workers_completed, 0);
         executable_script(&harness.join("main"), "#!/bin/sh\n# v2 rebuilt\nexit 0\n");
@@ -1757,6 +2163,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
                 Path::new("generated_harnesses").join(id),
             ],
             harness_executable: Some(PathBuf::from(executable)),
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         }
     }
 
@@ -1863,6 +2270,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: vec![PathBuf::from("build/../../outside")],
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let error = run_multicore(&config).unwrap_err();
         assert!(
@@ -1939,6 +2347,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).unwrap();
         assert_eq!(summary.workers_completed, 2, "{:?}", summary.per_worker);
@@ -1973,6 +2382,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: None,
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("campaign runs");
         assert_eq!(summary.workers_completed, 0);
@@ -2014,6 +2424,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: Some(Duration::from_secs(2)),
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
         let summary = run_multicore(&config).expect("campaign runs");
         assert_eq!(summary.workers_completed, 1, "{:?}", summary.per_worker);
@@ -2045,6 +2456,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
             kill_grace: Some(Duration::from_millis(300)),
             harness_dirs: Vec::new(),
             harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
         };
 
         let start = std::time::Instant::now();

@@ -144,6 +144,48 @@ class SchemaFilesTest(unittest.TestCase):
         bad["findings"][0]["fuzz"]["sanitizer_second_opinion"] = {**opinion, "replaced_cluster_key": "c0ffee"}
         self.assertNotEqual(_errors(findings, bad), [])
 
+    def test_seed_lineage_validates_in_both_documents_and_is_optional(self):
+        lineage = {
+            "origin": "mined_seed",
+            "root_sha256": "ab" * 32,
+            "root_path": "tests/data/x.bin",
+            "layout_prefix": None,
+            "depth": 7,
+            "parent_sha256": "cd" * 32,
+            "donor_sha256": None,
+            "reason": None,
+        }
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["lineage"] = lineage
+        self.assertEqual(_errors(findings, doc), [])
+        unknown = {**lineage, "origin": "unknown", "root_sha256": None, "root_path": None,
+                   "depth": None, "parent_sha256": None, "reason": "found by AFL++"}
+        doc["findings"][0]["fuzz"]["lineage"] = unknown
+        self.assertEqual(_errors(findings, doc), [])
+        for bad in ({**lineage, "origin": "guessed"}, {**lineage, "root_sha256": "XYZ"},
+                    {**lineage, "depth": -1}, {k: v for k, v in lineage.items() if k != "reason"}):
+            doc["findings"][0]["fuzz"]["lineage"] = bad
+            self.assertNotEqual(_errors(findings, doc), [], bad)
+        # A document written before the key existed still validates.
+        del doc["findings"][0]["fuzz"]["lineage"]
+        self.assertEqual(_errors(findings, doc), [])
+
+        envelope = _validator("bhf.finding.v1.schema.json")
+        record = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "lineage": {"origin": "user_seed", "root_sha256": "ab" * 32,
+                        "root_path": "/seeds/x.bin", "depth": 0},
+        }
+        self.assertEqual(_errors(envelope, record), [])
+        record["lineage"] = {"origin": "unknown", "reason": "found by AFL++"}
+        self.assertEqual(_errors(envelope, record), [])
+        record["lineage"] = {"origin": "guessed"}
+        self.assertNotEqual(_errors(envelope, record), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

@@ -63,6 +63,7 @@ mod fake_corba;
 mod fatal_signal;
 mod finding_arg;
 mod fuzz;
+mod fuzz_lineage;
 mod gate_evidence;
 mod generate_harness;
 mod git_diff;

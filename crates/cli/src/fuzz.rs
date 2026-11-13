@@ -376,6 +376,14 @@ pub struct FuzzArgs {
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
+    /// A seed file a multi-worker campaign hands its worker itself: an entry
+    /// of the shared queue, or seed bytes the campaign wrote to a file (a
+    /// seed's layout-prefixed variant, a programmatic seed). Read like
+    /// `--seed-file`, but not a seed given to `bhf fuzz`, so its lineage
+    /// names what it was made from, not this copy. Internal.
+    #[arg(long = "campaign-seed-file", hide = true)]
+    pub campaign_seed_files: Vec<PathBuf>,
+
     /// qemu-user executable to run a cross-built harness under. Default: the
     /// emulator recorded beside the harness (`bhf_runner.json`, written by a
     /// cross build); a harness built for another architecture with neither is
@@ -680,6 +688,22 @@ pub(crate) fn read_seed_file_prefix(path: &Path, cap: usize) -> std::io::Result<
     let mut bytes = Vec::with_capacity((len.min(cap as u64)) as usize);
     file.take(cap as u64).read_to_end(&mut bytes)?;
     Ok((bytes, len))
+}
+
+/// A `--seed-file`'s bytes, up to `max_len` (at least 1), saying when the
+/// file was longer.
+fn read_seed_file_within(seed_file: &Path, max_len: usize) -> Result<Vec<u8>, String> {
+    let (bytes, original_len) = read_seed_file_prefix(seed_file, max_len.max(1))
+        .map_err(|error| format!("read seed file '{}': {error}", seed_file.display()))?;
+    if original_len > bytes.len() as u64 {
+        bhfeprintln!(
+            "bhf: seed '{}' is {original_len} bytes; using its first {} bytes \
+             to honor --max-len",
+            seed_file.display(),
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
 /// Bound both the count and aggregate bytes of initial seeds. This is applied at
@@ -1163,6 +1187,9 @@ struct PreparedFuzzRun {
     harness_path: PathBuf,
     runner: replay_min::HarnessRunner,
     seeds: Vec<Vec<u8>>,
+    /// sha256 (and path, for a file) of each seed this `bhf fuzz` was given
+    /// (`--seed-input`, `--seed-file`), which its lineage names as user seeds.
+    operator_seeds: Vec<(corpus::lineage::Digest, Option<String>)>,
     iterations: usize,
     time: Option<Duration>,
     /// Stop the in-process loop once this many distinct findings are emitted
@@ -1657,6 +1684,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        campaign_seed_files: Vec::new(),
         qemu_user: None,
         qemu_args: Vec::new(),
         seed_bytes: seeds,
@@ -1900,6 +1928,7 @@ fn afl_programmatic_args(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        campaign_seed_files: Vec::new(),
         qemu_user: None,
         qemu_args: Vec::new(),
         seed_bytes: seeds,
@@ -2019,6 +2048,9 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         kill_grace: None,
         harness_dirs,
         harness_executable,
+        // The cap each worker's pass trims its lineage to, so the merge
+        // keeps no more.
+        lineage_record_cap: corpus::lineage::record_cap(corpus_limits(args.max_len.max(1)).entries),
     };
 
     match multicore_fuzz::run_multicore(&config) {
@@ -2377,7 +2409,9 @@ fn merge_outcome(work_dir: &Path, merge: &multicore_fuzz::MergeReport) -> i32 {
 /// Workers receive their seeds through argv, which cannot carry arbitrary bytes
 /// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected). Write the
 /// programmatic seed bytes to content-named files under the campaign dir and
-/// hand them over as `--seed-file`, which every worker reads byte for byte.
+/// hand them over as `--campaign-seed-file`, which every worker reads byte for
+/// byte and does not take for a seed given to it: these files are bhf's
+/// copies, and the lineage names the seed each was made from.
 fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     if args.seed_bytes.is_empty() {
@@ -2394,17 +2428,17 @@ fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
         let path = dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
         fs::write(&path, &bytes)
             .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
-        args.seed_files.push(path);
+        args.campaign_seed_files.push(path);
     }
     Ok(())
 }
 
-/// Hand a multi-worker campaign's seeds to its workers as seed files: the
-/// prefixed variants of the seeds given to `bhf fuzz` (see
-/// [`layout_prefixed_seeds`]), made once here, and every programmatic seed
-/// ([`materialize_seed_bytes`]). The workers are told the variants are made,
-/// so none prefixes the seeds it is handed, the programmatic and shared-queue
-/// ones included.
+/// Hand a multi-worker campaign's seeds to its workers as files: the seeds
+/// given to `bhf fuzz` as they were given, and as campaign seed files the
+/// prefixed variants of those seeds (see [`layout_prefixed_seeds`]), made
+/// once here, and every programmatic seed ([`materialize_seed_bytes`]). The
+/// workers are told the variants are made, so none prefixes the seeds it is
+/// handed, the programmatic and shared-queue ones included.
 fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> {
     if !args.seeds_layout_prefixed {
         if let Some(prefix) = layout_seed_prefix(harness, &args.work_dir, &args.harness) {
@@ -2450,6 +2484,10 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     }
     for seed_file in &args.seed_files {
         out.push("--seed-file".to_owned());
+        out.push(seed_file.display().to_string());
+    }
+    for seed_file in &args.campaign_seed_files {
+        out.push("--campaign-seed-file".to_owned());
         out.push(seed_file.display().to_string());
     }
     if args.seeds_layout_prefixed {
@@ -2573,22 +2611,23 @@ fn prepare_with_runner(
             args.sandbox_strict,
         )?,
     };
+    let mut operator_seeds: Vec<(corpus::lineage::Digest, Option<String>)> = args
+        .seed_inputs
+        .iter()
+        .map(|seed| (corpus::lineage::digest(seed.as_bytes()), None))
+        .collect();
     let mut seeds = args
         .seed_inputs
         .into_iter()
         .map(String::into_bytes)
         .collect::<Vec<_>>();
     for seed_file in args.seed_files {
-        let (bytes, original_len) = read_seed_file_prefix(&seed_file, args.max_len.max(1))
-            .map_err(|error| format!("read seed file '{}': {error}", seed_file.display()))?;
-        if original_len > bytes.len() as u64 {
-            bhfeprintln!(
-                "bhf: seed '{}' is {original_len} bytes; using its first {} bytes \
-                 to honor --max-len",
-                seed_file.display(),
-                bytes.len()
-            );
-        }
+        let bytes = read_seed_file_within(&seed_file, args.max_len)?;
+        let named = std::path::absolute(&seed_file).unwrap_or_else(|_| seed_file.clone());
+        operator_seeds.push((
+            corpus::lineage::digest(&bytes),
+            Some(named.display().to_string()),
+        ));
         seeds.push(bytes);
     }
     // A `--seed-file`/`--seed-input` seed is a sample of the target's input
@@ -2603,6 +2642,11 @@ fn prepare_with_runner(
         }
     }
     seeds.extend(args.seed_bytes);
+    // The campaign's own copies: not seeds given to this `bhf fuzz`, so not
+    // `operator_seeds`, and not prefixed again.
+    for seed_file in &args.campaign_seed_files {
+        seeds.push(read_seed_file_within(seed_file, args.max_len)?);
+    }
     let mut symbolic_sources = Vec::new();
     let mut symbolic_source_bytes = 0usize;
     let symbolic_source_limit = max_symbolic_source_bytes();
@@ -2727,6 +2771,7 @@ fn prepare_with_runner(
         harness_path,
         runner,
         seeds,
+        operator_seeds,
         iterations,
         time: args.time,
         stop_after_findings: args.stop_after_findings,
@@ -3514,6 +3559,19 @@ fn run_builtin_with_progress(
         .map(PoolEntry::seed)
         .collect();
     let mut pool_bytes: usize = pool.iter().map(|entry| entry.bytes.len()).sum();
+    // What each pool entry descends from, kept beside the queue.
+    let mut lineage = crate::fuzz_lineage::QueueLineage::start(
+        &prepared.work_dir,
+        &prepared.harness_id,
+        &prepared.operator_seeds,
+        layout_seed_prefix(
+            &prepared.harness_path,
+            &prepared.work_dir,
+            &prepared.harness_id,
+        ),
+        pool.iter().map(|entry| entry.bytes.as_slice()),
+        corpus::lineage::record_cap(corpus_limits.entries),
+    );
     // `fuzz --grammar` sets prepared.grammar_file directly; `auto --grammar` publishes
     // the path via BHF_GRAMMAR (inherited by multicore workers), so fall back to it.
     let grammar_path = prepared.grammar_file.clone().or_else(|| {
@@ -3725,6 +3783,7 @@ fn run_builtin_with_progress(
             break;
         }
 
+        let mut parents = crate::fuzz_lineage::InputParents::Queued(iteration);
         let input = if iteration < initial_seed_count {
             pool[iteration].bytes.clone()
         } else {
@@ -3759,7 +3818,7 @@ fn run_builtin_with_progress(
                     }
                 }
             }
-            mutate_from_pool(
+            let (bytes, made_from) = mutate_from_pool(
                 &pool,
                 base_index,
                 &dictionary,
@@ -3768,7 +3827,9 @@ fn run_builtin_with_progress(
                 mutator_config(prepared.structured_inputs, effective_max_len),
                 sequence_geometry,
                 &mut rng,
-            )
+            );
+            parents = made_from;
+            bytes
         };
         // RedQueen colorization can execute up to 65 probes before the main
         // input. Slow interpreted targets used to multiply a one-second pass
@@ -4066,6 +4127,8 @@ fn run_builtin_with_progress(
                     let id = emitter
                         .emit(&input, testcase, handler_index)
                         .map_err(|error| format!("emit finding: {error}"))?;
+                    let descent = lineage.of(&input, parents);
+                    crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
                     finding_ids.push(id.0);
                 } else {
                     note_duplicate_of_existing(
@@ -4158,6 +4221,8 @@ fn run_builtin_with_progress(
                     if let Some(opinion) = &opinion {
                         opinion.record(&prepared.work_dir, &id.0, &key);
                     }
+                    let descent = lineage.of(&input, parents);
+                    crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
                     sanitizer_dedup.consumed(key);
                     record_finding_arguments(
                         &prepared.work_dir,
@@ -4200,6 +4265,8 @@ fn run_builtin_with_progress(
             let id = emitter
                 .emit_oracle_hit(&input, &hit)
                 .map_err(|error| format!("emit oracle finding: {error}"))?;
+            let descent = lineage.of(&input, parents);
+            crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
             finding_ids.push(id.0);
         }
 
@@ -4236,6 +4303,7 @@ fn run_builtin_with_progress(
             }) {
                 lane.retained_inputs = lane.retained_inputs.saturating_add(1);
             }
+            lineage.retain(&input, parents);
             pool_bytes = pool_bytes.saturating_add(input.len());
             pool.push(PoolEntry {
                 bytes: input,
@@ -4301,6 +4369,8 @@ fn run_builtin_with_progress(
         let id = emitter
             .emit_oracle_hit(&confirmed.input, &hit)
             .map_err(|error| format!("emit oracle finding: {error}"))?;
+        let descent = lineage.of_bytes(&confirmed.input);
+        crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
         finding_ids.push(id.0);
     }
     if confirmed_sinks_total > max_sink_taint_findings {
@@ -4380,6 +4450,7 @@ fn run_builtin_with_progress(
             0
         }
     };
+    lineage.persist();
     if let (Some(harness_dir), Some(lanes)) = (prepared.harness_path.parent(), portfolio_feedback) {
         let payload = serde_json::json!({
             "schema_version": 1,
@@ -5229,6 +5300,14 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             if let Some(opinion) = &opinion {
                 opinion.record(&prepared.work_dir, &id.0, &key);
             }
+            crate::fuzz_lineage::record(
+                &prepared.work_dir,
+                &id.0,
+                &corpus::lineage::FindingLineage::unknown(format!(
+                    "found by AFL++, which schedules its own queue; bhf does not see which \
+                     input this one was mutated from (AFL++ crash file {name})"
+                )),
+            );
             record_finding_arguments(
                 &prepared.work_dir,
                 &id.0,
@@ -6340,15 +6419,16 @@ fn mutate_from_pool(
     config: MutatorConfig,
     sequence: Option<SequenceGeometry>,
     rng: &mut MutationRng,
-) -> Vec<u8> {
+) -> (Vec<u8>, crate::fuzz_lineage::InputParents) {
     let suite = MutatorSuite::new(config);
     let full_base = pool
         .get(base_index)
         .map(PoolEntry::mutation_base)
         .unwrap_or(&[]);
     let base = &full_base[..full_base.len().min(config.max_len)];
+    let peer_index = (base_index + 1) % pool.len().max(1);
     let full_peer = pool
-        .get((base_index + 1) % pool.len().max(1))
+        .get(peer_index)
         .map(PoolEntry::mutation_base)
         .unwrap_or(&[]);
     let peer = &full_peer[..full_peer.len().min(config.max_len)];
@@ -6372,17 +6452,22 @@ fn mutate_from_pool(
         mutation_input = mutation_input.with_operation_sequence(layout);
     }
 
-    let bytes = suite
-        .mutate(&mutation_input, rng)
-        .map(|result| result.bytes)
-        .unwrap_or_else(|| vec![rng.next_u8()]);
+    let (bytes, kind) = match suite.mutate(&mutation_input, rng) {
+        Some(result) => (result.bytes, Some(result.kind)),
+        None => (vec![rng.next_u8()], None),
+    };
     // AdaFuzz.Input.Load_From_Stdin exits the harness loop on empty input,
     // which leaves no event log behind and breaks first-run dogfooding when
     // no --seed-input is supplied. Guarantee at least one byte every time.
     if bytes.is_empty() {
-        vec![rng.next_u8()]
+        (
+            vec![rng.next_u8()],
+            crate::fuzz_lineage::InputParents::Generated,
+        )
     } else {
-        bytes
+        let parents =
+            crate::fuzz_lineage::InputParents::from_mutation(base_index, peer_index, kind);
+        (bytes, parents)
     }
 }
 
@@ -10992,13 +11077,18 @@ exit 0
         assert!(args.seed_bytes.is_empty());
 
         let passthrough = worker_passthrough_args(&args);
+        // bhf's copy, so not a seed given to the worker (`--seed-file`).
         let files: Vec<&String> = passthrough
             .windows(2)
-            .filter(|pair| pair[0] == "--seed-file")
+            .filter(|pair| pair[0] == "--campaign-seed-file")
             .map(|pair| &pair[1])
             .collect();
         assert_eq!(files.len(), 1, "{passthrough:?}");
         assert_eq!(fs::read(files[0]).unwrap(), seed);
+        assert!(
+            !passthrough.iter().any(|a| a == "--seed-file"),
+            "{passthrough:?}"
+        );
         assert!(
             !passthrough.iter().any(|a| a == "--seed-input"),
             "raw bytes never travel as a UTF-8 --seed-input: {passthrough:?}"
@@ -12267,6 +12357,69 @@ exit 0
         assert_eq!(count(b"\0\0\0\0\0\0\0\0QUEUED"), 0, "{seeds:?}");
     }
 
+    /// Of a worker's seeds only the ones given to `bhf fuzz` are the
+    /// operator's. The prefixed variants and programmatic seeds the campaign
+    /// wrote to files, and the shared queue's entries, are copies bhf handed
+    /// over: the lineage names the seed they were made from, or their own
+    /// record, never the copy.
+    #[test]
+    #[cfg(unix)]
+    fn a_worker_names_only_the_seeds_given_to_bhf_fuzz_as_the_operators() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-OPERATOR", "#!/bin/sh\nexit 0\n");
+        write_scalars_first_layout(&harness);
+        let seed_file = root.join("magic.bin");
+        fs::write(&seed_file, b"MAGC").unwrap();
+        let queued = work_dir.join("corpus/H-OPERATOR/queue/entry.bin");
+        fs::create_dir_all(queued.parent().unwrap()).unwrap();
+        fs::write(&queued, b"ENTRY").unwrap();
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        args.work_dir = work_dir.clone();
+        args.harness = "H-OPERATOR".to_owned();
+        args.seed_files = vec![seed_file.clone()];
+        args.seed_bytes = vec![b"QUEUED".to_vec()];
+        worker_seed_files(&mut args, &harness).unwrap();
+        let work = work_dir.display().to_string();
+        let queued_arg = queued.display().to_string();
+        // What the campaign adds for each shared-queue entry.
+        let mut argv = vec![
+            "fuzz",
+            work.as_str(),
+            "--harness",
+            "H-OPERATOR",
+            "--campaign-seed-file",
+            queued_arg.as_str(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        argv.extend(worker_passthrough_args(&args));
+        let worker = Wrap::try_parse_from(&argv).unwrap().inner;
+        let prepared = prepare(worker).unwrap();
+        for seed in [&b"MAGC"[..], b"\0\0\0\0\0\0\0\0MAGC", b"QUEUED", b"ENTRY"] {
+            assert!(
+                prepared.seeds.iter().any(|s| s.as_slice() == seed),
+                "{seed:?} in {:?}",
+                prepared.seeds
+            );
+        }
+        let named = std::path::absolute(&seed_file)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(
+            prepared.operator_seeds,
+            vec![(corpus::lineage::digest(b"MAGC"), Some(named))]
+        );
+    }
+
     #[test]
     fn prefixed_seed_variants_are_added_once() {
         let seeds = vec![b"MZ".to_vec(), b"".to_vec()];
@@ -12655,6 +12808,7 @@ exit 0
             no_fork_server: false,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
+            campaign_seed_files: Vec::new(),
             qemu_user: None,
             qemu_args: Vec::new(),
             seed_bytes: Vec::new(),

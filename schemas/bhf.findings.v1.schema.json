@@ -224,6 +224,23 @@
         "after_call_value": { "$ref": "#/$defs/nullable_string" }
       }
     },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "lineage": {
+      "description": "A fuzz finding's seed lineage: the root its input descends from and how many mutation generations down it is. origin is mined_seed or user_seed (a seed auto/seeds.json or the bhf fuzz command line names), seed (a start input no seed list names), corpus (a reseeded queue entry whose own ancestry was not recorded), generated (no seed: an empty or built-in start input, or one a generator built) or unknown (reason says why; nothing is guessed).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "root_sha256", "root_path", "layout_prefix", "depth", "parent_sha256", "donor_sha256", "reason"],
+      "properties": {
+        "origin": { "enum": ["mined_seed", "user_seed", "seed", "corpus", "generated", "unknown"] },
+        "root_sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "root_path": { "$ref": "#/$defs/nullable_string" },
+        "layout_prefix": { "type": ["integer", "null"], "minimum": 1 },
+        "depth": { "type": ["integer", "null"], "minimum": 0 },
+        "parent_sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "donor_sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "reason": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
     "location": {
       "type": "object",
       "additionalProperties": false,
@@ -480,6 +497,10 @@
                       }
                     }
                   ]
+                },
+                "lineage": {
+                  "description": "What the finding's input descends from in the fuzz queue (finding.json lineage); null when the finding records none. Added after the first v1 release, so documents written before it omit the key.",
+                  "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/lineage" }]
                 }
               }
             }
