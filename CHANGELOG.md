@@ -5,6 +5,13 @@
 ## Unreleased
 
 ### Fixed
+- A build lane (`make cov`, `make afl`) is reported only for the attempt that
+  built the harness: a target that `--resume` re-runs and that inherits a
+  sibling's build verdict builds nothing, and no longer reports a lane an
+  interrupted attempt recorded in its dir. Each lane in `lanes.json` and
+  `run.json` `targets[].lanes` carries `recorded_at` (additive), and
+  `summary.txt` and `run.md` say when a lane of a reloaded target was
+  recorded by an earlier run.
 - **Command injection through a quoted define in a compile database
   (CWE-78).** A `compile_commands.json` flag such as `-DNAME="a;cmd;"` passed
   the build-input check, which allows one balanced pair of double quotes in a

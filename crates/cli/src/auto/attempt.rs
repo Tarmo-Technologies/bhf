@@ -1524,6 +1524,10 @@ fn attempt_unclassified(
         Some(outcome) => {
             let harness_dir = crate::auto::layout::harness_dir(work_dir, &candidate.harness_id);
             std::fs::create_dir_all(&harness_dir)?;
+            // Nothing is built for this target, so it has no build lanes: any
+            // record in its dir is an earlier attempt's (an interrupted run a
+            // `--resume` continues), not this one's.
+            crate::auto::lanes::clear(&harness_dir);
             AttemptResult {
                 candidate: candidate.clone(),
                 outcome,

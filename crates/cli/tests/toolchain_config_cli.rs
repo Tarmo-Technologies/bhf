@@ -1291,6 +1291,72 @@ fn bhf_build_keeps_cxx_only_toolchain_flags_off_the_c_driver() {
     assert!(main.contains("-include iostream"), "{main}");
 }
 
+/// The header dirs and defines of `toolchain.cflags` (`-isystem <dir>`, the
+/// way a bare-metal toolchain names its headers) are split out of the C flags
+/// for every lane, and bhf's driver object takes them as well: the driver
+/// compile is a C compile of the same target, and used to be built without
+/// them.
+#[test]
+fn bhf_build_gives_the_driver_the_header_dirs_and_defines_of_the_c_flags() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let sys = tmp.path().join("board-sys");
+    std::fs::create_dir_all(&sys).unwrap();
+    std::fs::write(sys.join("board.h"), "#define BOARD_SLOTS 4\n").unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("widget.c"),
+        "#include <stddef.h>\n#include <board.h>\n\
+         int parse_record(const unsigned char *data, size_t size) {\n\
+         \x20   return size ? data[0] % BOARD_SLOTS : WIDGET_MODE;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let generated = bhf()
+        .arg("generate-harness")
+        .arg(src.join("widget.c"))
+        .args(["--target", "parse_record", "--id", "H-DRVSYS"])
+        .arg("--output")
+        .arg(work.join("harnesses"))
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+    let isystem = format!("-isystem {}", sys.display());
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-DRVSYS", "--cc", "clang"])
+        .arg("--cflags")
+        .arg(format!("{isystem} -DWIDGET_MODE=2 -O1"))
+        .env_remove("CC")
+        .env_remove("CFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    let driver = out
+        .lines()
+        .find(|line| line.contains("-o bhf_driver.o"))
+        .unwrap_or_else(|| panic!("no driver compile in:\n{out}"));
+    assert!(
+        driver.contains(&isystem) && driver.contains("-DWIDGET_MODE=2"),
+        "{driver}"
+    );
+    let main = out
+        .lines()
+        .find(|line| line.contains(" main.c") && line.contains("-o main"))
+        .unwrap_or_else(|| panic!("no main.c compile in:\n{out}"));
+    assert!(
+        main.contains(&isystem) && main.contains("-DWIDGET_MODE=2"),
+        "{main}"
+    );
+}
+
 /// `[toolchain]` values reach `make` through the environment, where `#`
 /// starts no comment: a define and a C flag carrying one build, and the
 /// compiler receives them whole (the string macro keeps its quotes).

@@ -6,6 +6,11 @@
 //! lane is recorded in the harness dir (`lanes.json`), so `run.json`
 //! (`targets[].lanes`), `summary.txt` and `run.md` say what it cost instead of
 //! staying silent.
+//!
+//! The record belongs to the attempt that built the harness: an attempt
+//! starts it afresh, and so does a target that inherits a sibling's verdict
+//! without building. Each entry says when it was recorded, so a lane of a
+//! target `--resume` reloaded from an earlier run is reported as that run's.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,6 +32,10 @@ pub(crate) struct LaneStatus {
     /// `make main_cov failed: <first error line>`; absent when it built.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// When the lane's build was recorded (RFC 3339, UTC), set by [`record`].
+    /// Absent in a record written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<String>,
 }
 
 impl LaneStatus {
@@ -34,6 +43,7 @@ impl LaneStatus {
         Self {
             built: true,
             reason: None,
+            recorded_at: None,
         }
     }
 
@@ -46,6 +56,23 @@ impl LaneStatus {
                 Some(line) => format!("make {binary} failed: {line}"),
                 None => format!("make {binary} failed"),
             }),
+            recorded_at: None,
+        }
+    }
+
+    /// Whether this lane was recorded before `run_started_at` (an RFC 3339
+    /// time), by an earlier run: a record with no time is one too.
+    fn recorded_before(&self, run_started_at: &str) -> bool {
+        let Ok(started) = chrono::DateTime::parse_from_rfc3339(run_started_at) else {
+            return false;
+        };
+        match self
+            .recorded_at
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+        {
+            Some(Ok(recorded)) => recorded < started,
+            _ => true,
         }
     }
 }
@@ -72,8 +99,10 @@ pub(crate) fn first_error_line(output: &str) -> Option<String> {
     Some(line)
 }
 
-/// Record `status` for `lane` in `harness_dir`, keeping the other lanes'.
-pub(crate) fn record(harness_dir: &Path, lane: &str, status: LaneStatus) {
+/// Record `status` for `lane` in `harness_dir`, keeping the other lanes',
+/// stamped with the time it is recorded.
+pub(crate) fn record(harness_dir: &Path, lane: &str, mut status: LaneStatus) {
+    status.recorded_at = Some(chrono::Utc::now().to_rfc3339());
     let mut lanes = read(harness_dir);
     lanes.insert(lane.to_owned(), status);
     if let Ok(bytes) = serde_json::to_vec_pretty(&lanes) {
@@ -96,18 +125,30 @@ pub(crate) fn read(harness_dir: &Path) -> BTreeMap<String, LaneStatus> {
 }
 
 /// What each lane that did not build cost, one line per lane:
-/// `line coverage unavailable: make main_cov failed: <first error>`.
-pub(crate) fn unavailable(lanes: &BTreeMap<String, LaneStatus>) -> Vec<String> {
+/// `line coverage unavailable: make main_cov failed: <first error>`. A lane
+/// recorded before `run_started_at` (the current run's start, RFC 3339) says
+/// it was recorded by an earlier run, and when.
+pub(crate) fn unavailable(
+    lanes: &BTreeMap<String, LaneStatus>,
+    run_started_at: &str,
+) -> Vec<String> {
     lanes
         .iter()
         .filter(|(_, status)| !status.built)
         .map(|(lane, status)| {
             let what = match lane.as_str() {
-                COVERAGE => "line coverage unavailable",
-                AFL => "AFL++ fuzzing unavailable",
-                other => return format!("{other} lane unavailable: {}", reason(status)),
+                COVERAGE => "line coverage unavailable".to_owned(),
+                AFL => "AFL++ fuzzing unavailable".to_owned(),
+                other => format!("{other} lane unavailable"),
             };
-            format!("{what}: {}", reason(status))
+            let earlier = if !status.recorded_before(run_started_at) {
+                String::new()
+            } else if let Some(at) = &status.recorded_at {
+                format!(" (recorded by an earlier run at {at})")
+            } else {
+                " (recorded by an earlier run)".to_owned()
+            };
+            format!("{what}: {}{earlier}", reason(status))
         })
         .collect()
 }
@@ -153,8 +194,9 @@ mod tests {
         record(dir.path(), AFL, LaneStatus::built());
         let lanes = read(dir.path());
         assert_eq!(lanes.len(), 2);
+        assert!(lanes.values().all(|lane| lane.recorded_at.is_some()));
         assert_eq!(
-            unavailable(&lanes),
+            unavailable(&lanes, RUN_START),
             vec![
                 "line coverage unavailable: make main_cov failed: x.c:3:1: error: unknown type \
                  name 'widget_t'"
@@ -163,7 +205,7 @@ mod tests {
         );
         // A later successful build clears the loss.
         record(dir.path(), COVERAGE, LaneStatus::built());
-        assert!(unavailable(&read(dir.path())).is_empty());
+        assert!(unavailable(&read(dir.path()), RUN_START).is_empty());
         // A new attempt starts from nothing: an earlier run's AFL++ failure is
         // not reported as this run's.
         record(
@@ -173,5 +215,57 @@ mod tests {
         );
         clear(dir.path());
         assert!(read(dir.path()).is_empty());
+    }
+
+    /// A time before every lane these tests record.
+    const RUN_START: &str = "2000-01-01T00:00:00+00:00";
+
+    /// A lane recorded before the current run started (a target `--resume`
+    /// reloaded) is reported as an earlier run's, with when it was recorded;
+    /// one this run recorded is not.
+    #[test]
+    fn a_lane_recorded_by_an_earlier_run_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        record(
+            dir.path(),
+            COVERAGE,
+            LaneStatus::failed("main_cov", "x.c:3:1: error: planted"),
+        );
+        let lanes = read(dir.path());
+        let recorded = lanes[COVERAGE].recorded_at.clone().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&recorded).is_ok(),
+            "{recorded}"
+        );
+        let this_run = unavailable(&lanes, RUN_START);
+        assert_eq!(
+            this_run,
+            vec!["line coverage unavailable: make main_cov failed: x.c:3:1: error: planted"]
+        );
+        let later = "2999-01-01T00:00:00+00:00";
+        assert_eq!(
+            unavailable(&lanes, later),
+            vec![format!(
+                "line coverage unavailable: make main_cov failed: x.c:3:1: error: planted \
+                 (recorded by an earlier run at {recorded})"
+            )]
+        );
+        // A record written before lanes carried a time is an earlier run's.
+        let mut untimed = lanes.clone();
+        untimed.get_mut(COVERAGE).unwrap().recorded_at = None;
+        assert_eq!(
+            unavailable(&untimed, RUN_START),
+            vec![
+                "line coverage unavailable: make main_cov failed: x.c:3:1: error: planted \
+                 (recorded by an earlier run)"
+            ]
+        );
+        // The time is in run.json's lanes, and an older record still reads.
+        let json = serde_json::to_value(&lanes).unwrap();
+        assert_eq!(json[COVERAGE]["recorded_at"], recorded);
+        let old: BTreeMap<String, LaneStatus> =
+            serde_json::from_str(r#"{"cov":{"built":false,"reason":"make main_cov failed"}}"#)
+                .unwrap();
+        assert_eq!(old[COVERAGE].recorded_at, None);
     }
 }

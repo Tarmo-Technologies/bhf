@@ -3131,6 +3131,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         &work,
         args.mode,
         run_start.elapsed(),
+        &started_at,
         &results,
         resumed,
         discovered_total,
@@ -4138,6 +4139,9 @@ impl AutoSummary {
         work: &Path,
         mode: actionability::RunMode,
         duration: std::time::Duration,
+        // When this run started (RFC 3339): a build lane recorded before it
+        // belongs to a target reloaded from an earlier run.
+        started_at: &str,
         results: &[crate::auto::attempt::AttemptResult],
         resumed: usize,
         discovered_total: usize,
@@ -4183,9 +4187,10 @@ impl AutoSummary {
         for r in results {
             files_with_targets.insert(r.candidate.source_path.as_path());
             if is_built(&r.outcome) {
-                for line in
-                    crate::auto::lanes::unavailable(&crate::auto::lanes::read(&r.harness_dir))
-                {
+                for line in crate::auto::lanes::unavailable(
+                    &crate::auto::lanes::read(&r.harness_dir),
+                    started_at,
+                ) {
                     lost_lanes.push(format!(
                         "{} {}: {line}",
                         r.candidate.harness_id, r.candidate.name
@@ -7010,6 +7015,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             &results,
             0,
             0,
@@ -7064,6 +7070,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             &results,
             0,
             0,
@@ -7130,6 +7137,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             std::slice::from_ref(&result),
             0,
             0,

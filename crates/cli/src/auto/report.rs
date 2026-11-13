@@ -3095,7 +3095,7 @@ fn render_md(r: &RunJson<'_>) -> String {
         let _ = writeln!(s);
         let _ = writeln!(s, "## Build lanes that did not build");
         for t in &r.targets {
-            for line in crate::auto::lanes::unavailable(&t.lanes) {
+            for line in crate::auto::lanes::unavailable(&t.lanes, &r.started_at) {
                 let _ = writeln!(s, "  - {} {} — {line}", t.harness_id, t.name);
             }
         }
