@@ -466,6 +466,14 @@ jobs:
           cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The end-to-end tests build harnesses with clang (on the image) and GNU
+      # make, which the image lacks; without make on PATH they skip.
+      - name: Install GNU make
+        shell: pwsh
+        run: |
+          choco install make --version=4.4.1 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
       # paths, capsules, explain, cartography and provenance, plus every

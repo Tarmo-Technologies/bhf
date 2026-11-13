@@ -34,6 +34,10 @@
   bhf's own driver broken. The build now fails with the linker's error. A
   definition in the scanned tree is still linked, and off Windows names like
   `_write` and `_read` (a newlib port's syscall hooks) are stubbed as before.
+- Windows CI: the spaced, ampersand and apostrophe path tests run there; they
+  looked for the `bhf` binary without its `.exe` and skipped. The Windows job
+  installs GNU make before its integration suites, whose end-to-end tests
+  (Visual Studio import among them) skipped without it.
 - Windows release smoke: each step that checks for a fixture's planted bug
   (the Visual Studio solution's clang and cl lanes, the C++ clang and cl
   lanes) starts from an input that reaches it, so a slow runner, where a lane

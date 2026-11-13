@@ -130,6 +130,21 @@ class WorkflowContractTests(unittest.TestCase):
         for suite in named:
             self.assertTrue((ROOT / "crates/cli/tests" / f"{suite}.rs").is_file(), suite)
 
+    def test_windows_integration_suites_have_make(self):
+        # Their end-to-end tests skip when GNU make is not on PATH, and the
+        # runner image has none: it is installed before they run.
+        steps = re.findall(r"(?m)^      - name: (.+)$", self.jobs["windows-build"])
+        self.assertLess(
+            steps.index("Install GNU make"),
+            steps.index("Test the Windows integration suites"),
+        )
+        install = self.windows_step("Install GNU make").splitlines()
+        commands = [index for index, line in enumerate(install) if line.strip().startswith("choco install make ")]
+        self.assertEqual(len(commands), 1)
+        # Pinned, as every action of the workflow is.
+        self.assertRegex(install[commands[0]], r"--version=\d+(\.\d+)+\b")
+        self.assertEqual(install[commands[0] + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+
     def test_windows_integration_suites_run_before_the_release_build(self):
         steps = re.findall(r"(?m)^      - name: (.+)$", self.jobs["windows-build"])
         self.assertLess(
