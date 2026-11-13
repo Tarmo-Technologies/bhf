@@ -861,29 +861,15 @@ pub fn sanitizer_options_key(s: Sanitizer) -> &'static str {
 /// `fuzz_exercised`, which is the one result bhf exists to produce.
 const REQUIRED_SANITIZER_OPTIONS: &str = "abort_on_error=1:halt_on_error=1:detect_leaks=1";
 
-/// UBSan keys bhf requires on top of [`REQUIRED_SANITIZER_OPTIONS`]: the stack
-/// of each report (`print_stacktrace=1`) and the failed check's name on its
-/// `SUMMARY:` line (`report_error_type=1`). Without them a UBSan report is one
-/// `file:line:col: runtime error:` line: no function for the sink and no check
-/// name to tell one defect from another.
-pub const UBSAN_REPORT_OPTIONS: &str = "print_stacktrace=1:report_error_type=1";
-
-/// Merge an operator-provided `<SAN>_OPTIONS` (from the inherited environment)
-/// with the keys bhf requires (#435). bhf's keys go LAST so they win on
-/// conflict — an operator cannot accidentally disable `abort_on_error`, which is
-/// what makes a sanitizer report a saved finding — while every other operator
-/// key is preserved. This is how an operator tames the RTOS / partial-build
-/// false-positive storm: export e.g.
-/// `ASAN_OPTIONS=verify_asan_link_order=0:detect_container_overflow=0:detect_odr_violation=0:allocator_may_return_null=1:suppressions=$PWD/asan.supp`
-/// (and `LSAN_OPTIONS=suppressions=$PWD/lsan.supp`) and bhf keeps it. Each
-/// sanitizer is merged independently, so per-sanitizer suppressions files land in
-/// the right place (an LSan suppressions file never leaks into `ASAN_OPTIONS`).
-pub fn merge_sanitizer_options(inherited: Option<&str>, required: &str) -> String {
-    match inherited.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(prefix) => format!("{prefix}:{required}"),
-        None => required.to_owned(),
-    }
-}
+/// UBSan keys bhf requires on top of [`REQUIRED_SANITIZER_OPTIONS`] (the
+/// stack of each report and the failed check's name), and the merge of an
+/// operator-provided `<SAN>_OPTIONS` with the keys bhf requires (#435): the
+/// inherited value is kept verbatim and bhf's keys go LAST, so they win on
+/// conflict (an operator cannot accidentally disable `abort_on_error`, which
+/// is what makes a sanitizer report a saved finding) while every other
+/// operator key, such as a suppressions file, is preserved. One definition,
+/// shared with replay, minimization and each finding's `replay.py`.
+pub use corpus::sanitizer_options::{merge as merge_sanitizer_options, UBSAN_REPORT_OPTIONS};
 
 /// Sanitizer composition envs (#296): produce a per-worker env vector that points
 /// each worker at one of ASan / MSan / UBSan / TSan / LSan via

@@ -2270,7 +2270,13 @@ fn ensure_repro_py(
         string_at(raw, &["paths", "testcase"]).unwrap_or_else(|| "testcase.bin".to_owned());
     let fixture_path = string_at(raw, &["fixture_path"]).unwrap_or_default();
     let harness_id = string_at(raw, &["harness_id"]).unwrap_or_default();
-    let (asan_defaults, asan_required) = asan_options_for(raw);
+    // The keys fuzz and replay give their children, so the reproducer runs
+    // the harness the way they do.
+    let leak = corpus::sanitizer_options::is_leak_record(raw);
+    let asan_required = corpus::sanitizer_options::asan_required(leak, false);
+    let asan_required_emulated = corpus::sanitizer_options::asan_required(leak, true);
+    let ubsan_required = corpus::sanitizer_options::ubsan_required(false);
+    let ubsan_required_emulated = corpus::sanitizer_options::ubsan_required(true);
     let extra_env = raw
         .pointer("/runtime_mode/env_injected")
         .and_then(Value::as_object)
@@ -2291,12 +2297,10 @@ fn ensure_repro_py(
         fixture_path: &fixture_path,
         harness_id: &harness_id,
         runner: &runner,
-        asan_defaults,
-        asan_required,
-        // The same UBSan report shape a fuzz child produces: it halts on the
-        // first report, with its stack and the failed check's name on the
-        // SUMMARY line.
-        ubsan_required: UBSAN_REQUIRED_OPTIONS,
+        asan_required: &asan_required,
+        asan_required_emulated: &asan_required_emulated,
+        ubsan_required: &ubsan_required,
+        ubsan_required_emulated: &ubsan_required_emulated,
         extra_env: &extra_env,
         header_lines: &header_lines,
     });
@@ -2490,29 +2494,6 @@ fn recorded_runner_argv(finding_dir: &Path, fixture_path: &str, harness_id: &str
         .unwrap_or_default()
 }
 
-/// The `UBSAN_OPTIONS` keys the reproducer always sets, after the
-/// operator's: the fuzz child's report shape, halting on the first report.
-const UBSAN_REQUIRED_OPTIONS: &str = "print_stacktrace=1:report_error_type=1:halt_on_error=1";
-
-/// The reproducer's `ASAN_OPTIONS` for `raw`: the defaults the operator's own
-/// value may override (leak detection off for a finding that is not a leak),
-/// and the keys bhf always sets after it, so they win (a report halts the
-/// run, and a leak finding keeps leak detection on).
-fn asan_options_for(raw: &Value) -> (&'static str, &'static str) {
-    let sanitizer = string_at(raw, &["exception", "sanitizer"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let message = string_at(raw, &["exception", "message"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let is_leak = sanitizer == "lsan" || message.contains("leak");
-    if is_leak {
-        ("", "abort_on_error=1:halt_on_error=1:detect_leaks=1")
-    } else {
-        ("detect_leaks=0", "abort_on_error=1:halt_on_error=1")
-    }
-}
-
 /// Compact `file:line (function)` reference to the sink for the reproducer header.
 fn sink_header_line(sink: &actionability::Sink) -> String {
     match (&sink.file, sink.line) {
@@ -2531,12 +2512,14 @@ struct ReproScript<'a> {
     /// The emulator the harness runs under (`[program, args...]`), empty for
     /// a native harness.
     runner: &'a [String],
-    /// `ASAN_OPTIONS` keys set only when the operator's value has none.
-    asan_defaults: &'a str,
     /// `ASAN_OPTIONS` keys set after the operator's value, so they win.
     asan_required: &'a str,
+    /// [`Self::asan_required`] for a harness run under a runner.
+    asan_required_emulated: &'a str,
     /// `UBSAN_OPTIONS` keys set after the operator's value, so they win.
     ubsan_required: &'a str,
+    /// [`Self::ubsan_required`] for a harness run under a runner.
+    ubsan_required_emulated: &'a str,
     extra_env: &'a serde_json::Map<String, Value>,
     header_lines: &'a [String],
 }
@@ -2550,9 +2533,10 @@ impl Default for ReproScript<'_> {
             fixture_path: "",
             harness_id: "",
             runner: &[],
-            asan_defaults: "",
             asan_required: "",
+            asan_required_emulated: "",
             ubsan_required: "",
+            ubsan_required_emulated: "",
             extra_env: NO_ENV.get_or_init(serde_json::Map::new),
             header_lines: &[],
         }
@@ -2573,9 +2557,10 @@ fn render_repro_py(spec: &ReproScript<'_>) -> String {
         fixture_path,
         harness_id,
         runner,
-        asan_defaults,
         asan_required,
+        asan_required_emulated,
         ubsan_required,
+        ubsan_required_emulated,
         extra_env,
         header_lines,
     } = *spec;
@@ -2606,9 +2591,11 @@ __HEADER__
 # copied work dir runs its own harness), then harness_id under
 # <work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/. Pass a path to
 # override. The harness runs on the recorded testcase with the sanitizer env and
-# its output + exit status are printed. bhf's sanitizer keys are added after any
-# ASAN_OPTIONS / UBSAN_OPTIONS you set, so a report still halts the run. The
-# script exits with the harness's exit status (128 + the signal for a signal).
+# its output + exit status are printed. bhf's sanitizer keys (the ones fuzz and
+# replay use) are added after any ASAN_OPTIONS / UBSAN_OPTIONS you set, which is
+# passed through unchanged; a sanitizer takes a key's last value, so a report
+# still halts the run. The script exits with the harness's exit status (128 +
+# the signal for a signal).
 #
 # A harness built for another target runs under the emulator recorded beside it
 # (bhf_runner.json, embedded below as RUNNER). Set BHF_REPLAY_RUNNER to the
@@ -2627,45 +2614,27 @@ HERE = Path(__file__).resolve().parent
 TESTCASE = HERE / __TESTCASE__
 FIXTURE_PATH = __FIXTURE__
 HARNESS_ID = __HARNESS_ID__
-ASAN_OPTIONS_DEFAULT = __ASAN_DEFAULT__
 ASAN_OPTIONS_REQUIRED = __ASAN__
-UBSAN_OPTIONS_DEFAULT = ""
+ASAN_OPTIONS_REQUIRED_EMULATED = __ASAN_EMULATED__
 UBSAN_OPTIONS_REQUIRED = __UBSAN__
+UBSAN_OPTIONS_REQUIRED_EMULATED = __UBSAN_EMULATED__
 EXTRA_ENV = __EXTRA_ENV__
 RUNNER = __RUNNER__
 RUNNER_FILE = "bhf_runner.json"
 
 
-def parse_options(text):
-    # Sanitizer options are colon-separated key=value pairs.
-    options = {}
-    for item in (text or "").split(":"):
-        key, sep, value = item.partition("=")
-        if key.strip() and sep:
-            options[key.strip()] = value
-    return options
-
-
-def merged_options(inherited, defaults, required):
-    # bhf's defaults, then the inherited value, then bhf's required keys: the
-    # operator's value overrides a default, never a required key.
-    options = parse_options(defaults)
-    for source in (inherited, required):
-        for key, value in parse_options(source).items():
-            options.pop(key, None)
-            options[key] = value
-    return ":".join("%s=%s" % item for item in options.items())
+def merged_options(inherited, required):
+    # Sanitizers take a key's last value, so bhf's keys go after the inherited
+    # value and win, and the inherited text is passed through unchanged (a
+    # quoted value or a drive path with a ':' in it stays whole).
+    inherited = (inherited or "").strip()
+    return inherited + ":" + required if inherited else required
 
 
 # Under an emulator (qemu-user) a guest abort makes the emulator dump its own
-# address space, which takes minutes. A harness run under a runner gets
-# abort_on_error=0 after bhf's required keys (a sanitizer report still exits
-# non-zero) and runs with core dumps off.
-EMULATED_OPTIONS = "abort_on_error=0"
-
-
-def required_options(required, emulated):
-    return merged_options(required, "", EMULATED_OPTIONS) if emulated else required
+# address space, which takes minutes. A harness run under a runner gets the
+# _EMULATED keys (abort_on_error=0: a sanitizer report still exits non-zero)
+# and runs with core dumps off.
 
 
 def no_core_dumps():
@@ -2878,12 +2847,12 @@ def main():
     emulated = bool(runner)
     env = dict(os.environ)
     env["ASAN_OPTIONS"] = merged_options(
-        env.get("ASAN_OPTIONS"), ASAN_OPTIONS_DEFAULT,
-        required_options(ASAN_OPTIONS_REQUIRED, emulated),
+        env.get("ASAN_OPTIONS"),
+        ASAN_OPTIONS_REQUIRED_EMULATED if emulated else ASAN_OPTIONS_REQUIRED,
     )
     env["UBSAN_OPTIONS"] = merged_options(
-        env.get("UBSAN_OPTIONS"), UBSAN_OPTIONS_DEFAULT,
-        required_options(UBSAN_OPTIONS_REQUIRED, emulated),
+        env.get("UBSAN_OPTIONS"),
+        UBSAN_OPTIONS_REQUIRED_EMULATED if emulated else UBSAN_OPTIONS_REQUIRED,
     )
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
@@ -2935,8 +2904,9 @@ if __name__ == "__main__":
         .replace("__TESTCASE__", &py_str(testcase_name))
         .replace("__FIXTURE__", &py_str(fixture_path))
         .replace("__HARNESS_ID__", &py_str(harness_id))
-        .replace("__ASAN_DEFAULT__", &py_str(asan_defaults))
+        .replace("__ASAN_EMULATED__", &py_str(asan_required_emulated))
         .replace("__ASAN__", &py_str(asan_required))
+        .replace("__UBSAN_EMULATED__", &py_str(ubsan_required_emulated))
         .replace("__UBSAN__", &py_str(ubsan_required))
         .replace("__EXTRA_ENV__", &extra_env_py)
         .replace(
@@ -4593,25 +4563,50 @@ mod tests {
         );
     }
 
+    /// The reproducer's required sanitizer keys are the ones fuzz and
+    /// replay give their children, symbolization included; leak detection is
+    /// never turned off.
     #[test]
     fn repro_py_reports_ubsan_stacks_and_check_names_like_the_fuzz_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let raw = json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"});
-        let record =
-            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
-        super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
-        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
-        assert!(
-            script.contains(
-                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
-            ),
-            "{script}"
+        use corpus::sanitizer_options::{asan_required, ubsan_required};
+        let py = |value: &str| serde_json::to_string(value).unwrap();
+        let script_for = |raw: &Value| {
+            let dir = tempfile::tempdir().unwrap();
+            let record =
+                actionability::backfill_actionability(actionability::RunMode::Reporting, raw, None);
+            super::ensure_repro_py(dir.path(), raw, &record).unwrap();
+            std::fs::read_to_string(dir.path().join("replay.py")).unwrap()
+        };
+        let script = script_for(
+            &json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"}),
         );
+        for (name, value) in [
+            ("UBSAN_OPTIONS_REQUIRED", ubsan_required(false)),
+            ("UBSAN_OPTIONS_REQUIRED_EMULATED", ubsan_required(true)),
+            ("ASAN_OPTIONS_REQUIRED", asan_required(false, false)),
+            ("ASAN_OPTIONS_REQUIRED_EMULATED", asan_required(false, true)),
+        ] {
+            let line = format!("\n{name} = {}\n", py(&value));
+            assert!(script.contains(&line), "{line}\n{script}");
+        }
+        assert!(!script.contains("detect_leaks=0"), "{script}");
+        let leak = script_for(
+            &json!({"id": "F-0002-bbbbbbbb", "harness_id": "H-C0001", "rule_id": "BHF-208"}),
+        );
+        for (name, value) in [
+            ("ASAN_OPTIONS_REQUIRED", asan_required(true, false)),
+            ("ASAN_OPTIONS_REQUIRED_EMULATED", asan_required(true, true)),
+        ] {
+            assert!(value.ends_with("detect_leaks=1"), "{value}");
+            let line = format!("\n{name} = {}\n", py(&value));
+            assert!(leak.contains(&line), "{line}\n{leak}");
+        }
     }
 
-    /// The reproducer keeps the operator's sanitizer options but adds bhf's
-    /// required keys after them, so they win: UBSan halts on its first report
-    /// with its stack, ASan halts, and a leak finding keeps leak detection.
+    /// The reproducer passes the inherited sanitizer options through as they
+    /// are and adds bhf's required keys after them, so they win (a
+    /// sanitizer takes a key's last value): a quoted value or a drive path
+    /// with a `:` in it is not cut apart.
     #[test]
     fn repro_py_merges_inherited_sanitizer_options_with_bhf_keys_winning() {
         let dir = tempfile::tempdir().unwrap();
@@ -4619,17 +4614,6 @@ mod tests {
         let record =
             actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
         super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
-        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
-        assert!(
-            script.contains(
-                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
-            ),
-            "{script}"
-        );
-        assert!(
-            script.contains("ASAN_OPTIONS_REQUIRED = \"abort_on_error=1:halt_on_error=1\""),
-            "{script}"
-        );
         let Some(python) = python3() else {
             eprintln!("skipping the merge run: python3 unavailable");
             return;
@@ -4639,10 +4623,13 @@ mod tests {
              spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
              replay = importlib.util.module_from_spec(spec)\n\
              spec.loader.exec_module(replay)\n\
+             req = replay.UBSAN_OPTIONS_REQUIRED\n\
              print(json.dumps([\n\
-               replay.merged_options('suppressions=/dev/null:halt_on_error=0', '', replay.UBSAN_OPTIONS_REQUIRED),\n\
-               replay.merged_options(None, replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
-               replay.merged_options('detect_leaks=1', replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
+               req,\n\
+               replay.merged_options(\"suppressions='/d/sup:dir/u.supp'\", req),\n\
+               replay.merged_options('suppressions=C:\\\\s\\\\u.supp', req),\n\
+               replay.merged_options(None, req),\n\
+               replay.merged_options('  ', req),\n\
              ]))\n",
             script = dir.path().join("replay.py").display().to_string(),
         );
@@ -4656,14 +4643,63 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let merged: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        let required = &merged[0];
         assert_eq!(
-            merged[0],
-            "suppressions=/dev/null:print_stacktrace=1:report_error_type=1:halt_on_error=1"
+            merged[1],
+            format!("suppressions='/d/sup:dir/u.supp':{required}")
         );
-        assert_eq!(merged[1], "detect_leaks=0:abort_on_error=1:halt_on_error=1");
+        assert_eq!(merged[2], format!("suppressions=C:\\s\\u.supp:{required}"));
+        assert_eq!(&merged[3], required);
+        assert_eq!(&merged[4], required);
+    }
+
+    /// An inherited value with a quoted `:` reaches the harness unchanged,
+    /// followed by bhf's required keys.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_passes_a_quoted_inherited_option_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let harness = harness_dir.join("main");
+        std::fs::write(
+            &harness,
+            "#!/bin/sh\nprintf '%s' \"$UBSAN_OPTIONS\" > \"$(dirname \"$0\")/ubsan.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-201"});
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let inherited = format!("suppressions='{}/sup:dir/u.supp'", tmp.path().display());
+        let output = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .env("UBSAN_OPTIONS", &inherited)
+            .env_remove("BHF_REPLAY_RUNNER")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let seen = std::fs::read_to_string(harness_dir.join("ubsan.txt")).unwrap();
         assert_eq!(
-            merged[2], "detect_leaks=1:abort_on_error=1:halt_on_error=1",
-            "the operator's value beats bhf's default, not its required keys"
+            seen,
+            format!(
+                "{inherited}:{}",
+                corpus::sanitizer_options::ubsan_required(false)
+            )
         );
     }
 
@@ -4936,6 +4972,13 @@ mod tests {
             "{emulated:?}"
         );
         assert_eq!(emulated["core"], "0", "{emulated:?}");
+        for key in ["asan", "ubsan"] {
+            assert_eq!(
+                last(&emulated[key], "symbolize").as_deref(),
+                Some("1"),
+                "{emulated:?}"
+            );
+        }
         // A runner named by BHF_REPLAY_RUNNER is an emulator too.
         let named = seen(Some(&emulator.display().to_string()));
         assert_eq!(
@@ -4956,6 +4999,13 @@ mod tests {
             Some("1"),
             "{native:?}"
         );
+        for key in ["asan", "ubsan"] {
+            assert_eq!(
+                last(&native[key], "symbolize").as_deref(),
+                Some("1"),
+                "{native:?}"
+            );
+        }
         if native["core"] == "0" {
             eprintln!("note: core dumps could not be turned on; the core check is vacuous");
         }
@@ -4985,7 +5035,6 @@ mod tests {
         let script = super::render_repro_py(&super::ReproScript {
             testcase_name: "testcase.bin",
             harness_id: "h1",
-            asan_defaults: "detect_leaks=0",
             ubsan_required: "print_stacktrace=1",
             extra_env: &extra_env,
             ..Default::default()
@@ -5106,7 +5155,6 @@ mod tests {
         let script = super::render_repro_py(&super::ReproScript {
             testcase_name: "testcase.bin",
             harness_id: "h1",
-            asan_defaults: "detect_leaks=0",
             ubsan_required: "print_stacktrace=1",
             extra_env: &extra_env,
             ..Default::default()

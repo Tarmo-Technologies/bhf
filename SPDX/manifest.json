@@ -2911,6 +2911,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/src/sanitizer_options.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/src/signature.rs",
       "license": "Apache-2.0"
     },

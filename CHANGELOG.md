@@ -162,6 +162,14 @@
   only inside the prototype, a tag was a type of its own, distinct from the
   one the harness body declares, and newer compilers (GCC 14, recent clang)
   rejected the call as passing an incompatible pointer.
+- A finding's `replay.py` runs the harness with the sanitizer options fuzz
+  and `bhf replay` use, from one shared definition: `symbolize=1` and, for
+  UBSan, `abort_on_error=1`, which it lacked, and no `detect_leaks=0` for a
+  finding that is not a leak. Its leak test is the one replay uses.
+- `replay.py` passes an inherited `ASAN_OPTIONS` or `UBSAN_OPTIONS` through
+  unchanged and adds bhf's keys after it. It split the value on every `:`,
+  which cut a quoted suppressions path or a `C:\` drive path apart, so UBSan
+  stopped with `unterminated string` and nothing was reported.
 - Windows: the generated Makefiles no longer pass `-Wl,--gc-sections` to an
   MSVC-style linker, which ignored it with a warning (lld-link's `ignoring
   unknown argument '--gc-sections'`, link.exe's LNK4044). Each lane's link

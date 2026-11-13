@@ -644,15 +644,7 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 /// Whether the finding records a leak, which only reproduces with leak
 /// detection on.
 pub(crate) fn is_leak_finding(raw: &Value) -> bool {
-    let text = |pointer: &str| {
-        raw.pointer(pointer)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    };
-    text("/rule_id") == "bhf-208"
-        || text("/exception/sanitizer") == "lsan"
-        || text("/exception/name").contains("memory_leak")
+    corpus::sanitizer_options::is_leak_record(raw)
 }
 
 /// The environment of a C/C++ replay: the fuzz child's sanitizer options and,

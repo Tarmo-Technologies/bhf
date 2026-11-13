@@ -9,6 +9,7 @@ pub mod layout;
 pub mod line_remap;
 pub mod manager;
 pub mod sanitizer;
+pub mod sanitizer_options;
 pub mod signature;
 
 pub use classify::{

@@ -5791,7 +5791,35 @@ pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
 /// which takes minutes, so an emulated child gets `abort_on_error=0`: the
 /// sanitizer exits non-zero after its report, which classifies it.
 pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
-    let mut env = native_sanitizer_child_env(leak);
+    sanitizer_child_env_with(
+        std::env::var("ASAN_OPTIONS").ok().as_deref(),
+        std::env::var("UBSAN_OPTIONS").ok().as_deref(),
+        leak,
+        emulated,
+    )
+}
+
+/// [`sanitizer_child_env_for`] with the inherited `asan` and `ubsan` values:
+/// each kept as it is, followed by the required keys
+/// ([`corpus::sanitizer_options`], which each finding's `replay.py` embeds
+/// too).
+fn sanitizer_child_env_with(
+    asan: Option<&str>,
+    ubsan: Option<&str>,
+    leak: bool,
+    emulated: bool,
+) -> Vec<(String, String)> {
+    use corpus::sanitizer_options::{asan_required, merge, ubsan_required};
+    let mut env = vec![
+        (
+            "ASAN_OPTIONS".to_owned(),
+            merge(asan, &asan_required(leak, false)),
+        ),
+        (
+            "UBSAN_OPTIONS".to_owned(),
+            merge(ubsan, &ubsan_required(false)),
+        ),
+    ];
     if emulated {
         no_abort_on_error(&mut env);
     }
@@ -5808,39 +5836,16 @@ pub(crate) fn no_abort_on_error(env: &mut [(String, String)]) {
     }
 }
 
-fn native_sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
-    // `symbolize=1`: the location a replay compares must not be erased by an
-    // inherited `symbolize=0`.
-    let asan_required = if leak {
-        "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=1"
-    } else {
-        "abort_on_error=1:halt_on_error=1:symbolize=1"
-    };
-    vec![
-        (
-            "ASAN_OPTIONS".to_owned(),
-            multicore_fuzz::merge_sanitizer_options(
-                std::env::var("ASAN_OPTIONS").ok().as_deref(),
-                asan_required,
-            ),
-        ),
-        ("UBSAN_OPTIONS".to_owned(), ubsan_child_options()),
-    ]
-}
-
 /// The `UBSAN_OPTIONS` of every child that must report UBSan findings the way
 /// the fuzz loop does — builtin fuzz children, minimization and `bhf replay`:
 /// the first report halts the run as a crash (`abort_on_error=1`,
 /// `halt_on_error=1`) and carries its stack and check name
-/// ([`multicore_fuzz::UBSAN_REPORT_OPTIONS`]). The operator's inherited
-/// `UBSAN_OPTIONS` is merged first; bhf's keys go last and win.
+/// ([`corpus::sanitizer_options::ubsan_required`]). The operator's inherited
+/// `UBSAN_OPTIONS` is kept first; bhf's keys go last and win.
 pub(crate) fn ubsan_child_options() -> String {
-    multicore_fuzz::merge_sanitizer_options(
+    corpus::sanitizer_options::merge(
         std::env::var("UBSAN_OPTIONS").ok().as_deref(),
-        &format!(
-            "abort_on_error=1:halt_on_error=1:symbolize=1:{}",
-            multicore_fuzz::UBSAN_REPORT_OPTIONS
-        ),
+        &corpus::sanitizer_options::ubsan_required(false),
     )
 }
 
@@ -9026,6 +9031,54 @@ mod fuzz_child_env_tests {
         let hits: Vec<_> = env.iter().filter(|(k, _)| k == "UBSAN_OPTIONS").collect();
         assert_eq!(hits.len(), 1, "no duplicate UBSAN_OPTIONS");
         assert_eq!(hits[0].1, "print_stacktrace=1", "explicit value preserved");
+    }
+
+    /// A reproducing child gets the shared required keys after the inherited
+    /// value, which is kept as it was.
+    #[test]
+    fn the_child_env_is_the_shared_required_keys_after_the_inherited_value() {
+        use corpus::sanitizer_options::{asan_required, ubsan_required};
+        let env = super::sanitizer_child_env_with(
+            Some("verbosity=0:symbolize=0"),
+            Some("suppressions=/dev/null"),
+            false,
+            false,
+        );
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "ASAN_OPTIONS".to_owned(),
+                    format!("verbosity=0:symbolize=0:{}", asan_required(false, false))
+                ),
+                (
+                    "UBSAN_OPTIONS".to_owned(),
+                    format!("suppressions=/dev/null:{}", ubsan_required(false))
+                ),
+            ]
+        );
+        assert_eq!(
+            env,
+            [
+                (
+                    "ASAN_OPTIONS".to_owned(),
+                    "verbosity=0:symbolize=0:abort_on_error=1:halt_on_error=1:symbolize=1"
+                        .to_owned()
+                ),
+                (
+                    "UBSAN_OPTIONS".to_owned(),
+                    "suppressions=/dev/null:abort_on_error=1:halt_on_error=1:symbolize=1:\
+                     print_stacktrace=1:report_error_type=1"
+                        .to_owned()
+                ),
+            ]
+        );
+        let leak = super::sanitizer_child_env_with(None, None, true, false);
+        assert_eq!(leak[0].1, asan_required(true, false));
+        assert_eq!(
+            leak[0].1,
+            "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=1"
+        );
     }
 }
 

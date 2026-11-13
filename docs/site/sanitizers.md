@@ -54,16 +54,17 @@ win (you cannot accidentally disable `abort_on_error`, which is what turns a
 sanitizer report into a saved finding; a child run under qemu-user gets
 `abort_on_error=0` instead, see below). `UBSAN_OPTIONS` also always gets
 `print_stacktrace=1` and `report_error_type=1`, during fuzzing, minimization,
-`bhf replay` and in the generated `replay.py`. The `replay.py` reproducer
-merges the same way (`ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1`,
-`UBSAN_OPTIONS` also `halt_on_error=1`, so an inherited value cannot turn a
-report into a clean exit) and exits with the harness's status, 128 plus the
-signal for a harness killed by one. Minimization, `bhf replay` and
-`bhf report --backfill` run C/C++ harnesses with the same `ASAN_OPTIONS` and
-`UBSAN_OPTIONS` as a fuzz child (a leak finding also gets `detect_leaks=1`;
-leak detection is never turned off). Fuzz children, minimization, `bhf replay`
-and `bhf report --backfill` also get `symbolize=1` after an inherited value,
-so an inherited `symbolize=0` cannot erase the frames a replay compares.
+`bhf replay` and in the generated `replay.py`. Minimization, `bhf replay`,
+`bhf report --backfill` and the `replay.py` reproducer run C/C++ harnesses
+with the same `ASAN_OPTIONS` and `UBSAN_OPTIONS` keys as a fuzz child
+(`abort_on_error=1:halt_on_error=1:symbolize=1`, so an inherited value cannot
+turn a report into a clean exit; a leak finding also gets `detect_leaks=1`,
+and leak detection is never turned off: nothing sets `detect_leaks=0`).
+`symbolize=1` goes after an inherited value, so an inherited `symbolize=0`
+cannot erase the frames a replay compares. The inherited value itself is
+passed through as it is, a quoted value or a drive path with a `:` in it
+included, and bhf's keys follow it. `replay.py` exits with the harness's
+status, 128 plus the signal for a harness killed by one.
 UBSan then prints the stack of
 each report and names the failed check (`missing-return`,
 `invalid-shift-exponent`, ...) on its `SUMMARY:` line. Each sanitizer is merged independently, so
