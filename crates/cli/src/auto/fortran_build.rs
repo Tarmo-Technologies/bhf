@@ -365,7 +365,7 @@ fn abi_symbol(name: &str, module: Option<&str>) -> String {
 /// self-contained `__sanitizer_cov_trace_pc` hook feeding the shared edge map
 /// (gfortran emits trace-pc, which the bhf Linux driver — trace-pc-guard —
 /// does not otherwise provide).
-fn glue_source(
+pub(crate) fn glue_source(
     entry: &str,
     args: &[FortranArg],
     result: FortranResult,
@@ -552,6 +552,7 @@ fn glue_source(
     format!(
         "/* SPDX-License-Identifier: Apache-2.0 */\n\
          /* bhf Fortran glue: drives {entry} from fuzzer bytes. */\n\
+         /* {marker}: LLVMFuzzerTestOneInput below is bhf's, not the project's. */\n\
          #include <stdint.h>\n\
          #include <stdlib.h>\n\
          #include <string.h>\n\
@@ -595,7 +596,8 @@ fn glue_source(
          \x20   {entry}({call});\n\
          {frees}\
          \x20   return 0;\n\
-         }}\n"
+         }}\n",
+        marker = crate::replay::GENERATED_ENTRY_MARKER,
     )
 }
 

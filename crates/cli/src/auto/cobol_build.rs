@@ -269,7 +269,7 @@ fn materialized_path_param_index(params: &[CobolParam]) -> Option<usize> {
 }
 
 /// The `LLVMFuzzerTestOneInput` glue that drives every `USING` operand.
-fn multi_param_glue(entry: &str, params: &[CobolParam]) -> String {
+pub(crate) fn multi_param_glue(entry: &str, params: &[CobolParam]) -> String {
     // A path plus a separate output buffer is a read-file protocol, not a path
     // parser. An expert harness materializes the fuzz bytes as a real file and
     // passes its stable path; feeding arbitrary bytes as the filename exercises
@@ -347,6 +347,7 @@ fn multi_param_glue(entry: &str, params: &[CobolParam]) -> String {
     format!(
         "/* SPDX-License-Identifier: Apache-2.0 */\n\
          /* bhf COBOL glue: drives {entry}({n} operand(s)) from fuzzer bytes. */\n\
+         /* {marker}: LLVMFuzzerTestOneInput below is bhf's, not the project's. */\n\
          #include <stdint.h>\n\
          #include <stdlib.h>\n\
          #include <string.h>\n\
@@ -381,6 +382,7 @@ fn multi_param_glue(entry: &str, params: &[CobolParam]) -> String {
          }}\n",
         n = params.len(),
         cleanup = cleanup,
+        marker = crate::replay::GENERATED_ENTRY_MARKER,
     )
 }
 

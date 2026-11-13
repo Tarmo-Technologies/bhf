@@ -3597,6 +3597,32 @@ fn run_builtin_with_progress(
     }
     let protocol = detection.protocol;
     let c_libfuzzer_harness = protocol == HarnessProtocol::LibFuzzerSingleInput;
+    // `LLVMFuzzerTestOneInput` (and the other hooks a fuzz target defines) is
+    // driver code only in a harness bhf generated around a target of its own,
+    // or that a lane's glue defines around the project's routine (the Fortran
+    // and COBOL lanes, built on the passthrough driver path); in a hand-built
+    // libFuzzer binary, or bhf's driver around a project's fuzz entry, a crash
+    // or leak in it is the project's.
+    let bhf_entry = {
+        let mut dirs = crate::replay::harness_source_dirs(
+            None,
+            &serde_json::Value::Null,
+            &prepared.harness_path,
+            Some(&detection),
+        );
+        dirs.extend(crate::auto::layout::harness_dir_candidates(
+            &prepared.work_dir,
+            &prepared.harness_id,
+        ));
+        (harness_format_for(
+            &prepared.harness_path,
+            &prepared.work_dir,
+            &prepared.harness_id,
+        )
+        .is_some()
+            && !crate::replay::is_passthrough_harness(&dirs))
+            || crate::replay::has_generated_entry(&dirs)
+    };
     // #416: crash inputs (this run's, plus any recorded by an earlier pass) are
     // excluded from the persisted corpus so a crashing input is never left in the
     // clean coverage queue. Seeded from the durable findings dir for cross-pass
@@ -4056,12 +4082,14 @@ fn run_builtin_with_progress(
             // harness would have freed — left dangling only because an exit()/abort()-
             // only target terminated before the harness free(). bhf manufactured
             // it, so SUPPRESS it (don't emit/count a phantom CWE-401).
-            if corpus::cluster::is_harness_scaffolding_leak(report) {
+            if corpus::cluster::is_harness_scaffolding_leak(report, bhf_entry) {
                 scaffolding_leak_drops += 1;
             }
             // (#388) A crash entirely in libFuzzer/sanitizer/allocator driver
             // glue with no target frame is a harness fault, not a target bug.
-            else if c_libfuzzer_harness && corpus::cluster::is_driver_glue_crash(report) {
+            else if c_libfuzzer_harness
+                && corpus::cluster::is_driver_glue_crash(report, bhf_entry)
+            {
                 driver_glue_drops += 1;
             } else if let Some(key) = sanitizer_dedup.first_sighting(report) {
                 // First sighting of this cluster (#389 dedups the rest). For a
@@ -11227,6 +11255,170 @@ exit 0
             summary.findings.len(),
             0,
             "a crash with no target frame (driver glue) must not be reported"
+        );
+    }
+
+    /// A libFuzzer harness bhf did not generate (no generation metadata):
+    /// its `LLVMFuzzerTestOneInput` is the project's fuzz target, so a crash
+    /// in its body is a finding, not driver glue.
+    #[test]
+    #[cfg(unix)]
+    fn a_crash_in_an_external_libfuzzer_entry_is_reported() {
+        let script = "#!/bin/sh\n\
+             >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000031 at pc 0x1 bp 0x2 sp 0x3'\n\
+             >&2 echo 'WRITE of size 1 at 0x602000000031 thread T0'\n\
+             >&2 echo '    #0 0x1 in LLVMFuzzerTestOneInput /src/f.c:9:5'\n\
+             >&2 echo '    #1 0x2 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) /fuzzer/d.cpp:3'\n\
+             >&2 echo 'SUMMARY: AddressSanitizer: heap-buffer-overflow /src/f.c:9:5 in LLVMFuzzerTestOneInput'\n\
+             exit 1\n";
+        let findings = |generated: bool| {
+            let root = tmpdir();
+            let work_dir = root.join("bhf_work");
+            let harness = write_c_libfuzzer_harness(&work_dir, "H-ENTRY", script);
+            if generated {
+                // bhf generated this harness around a target of its own, so
+                // its LLVMFuzzerTestOneInput is bhf's driver code.
+                fs::write(
+                    harness.parent().unwrap().join("generation-metadata.json"),
+                    r#"{"schema_version":1,"language":"c","target_function":"parse_record"}"#,
+                )
+                .unwrap();
+            }
+            run_one_target_programmatic(
+                &work_dir,
+                "H-ENTRY",
+                vec![b"seed".to_vec()],
+                8,
+                None,
+                None,
+                0,
+                &[],
+                actionability::RunMode::Reporting,
+                None, // cmplog_log
+                &[],
+                None,
+            )
+            .unwrap()
+            .findings
+            .len()
+        };
+        assert_eq!(
+            findings(false),
+            1,
+            "a crash in the project's own fuzz entry is a finding"
+        );
+        assert_eq!(
+            findings(true),
+            0,
+            "a crash in bhf's own entry with no target frame is driver glue"
+        );
+    }
+
+    /// Findings of a run whose harness is bhf's passthrough driver (no
+    /// generation metadata, as the Fortran and COBOL lanes build it) and which
+    /// reports a leak allocated in `LLVMFuzzerTestOneInput`, in `entry_file`
+    /// (`None`: a frame that names no source file), with `glue` written beside
+    /// the driver.
+    #[cfg(unix)]
+    fn glue_entry_leak_findings(glue: Option<(&str, String)>, entry_file: Option<&str>) -> usize {
+        let entry = match entry_file {
+            Some(file) => format!("LLVMFuzzerTestOneInput {file}:12:3"),
+            None => "LLVMFuzzerTestOneInput (/w/build/H-GLUE/main+0x1234)".to_owned(),
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             >&2 echo '==1==ERROR: LeakSanitizer: detected memory leaks'\n\
+             >&2 echo ''\n\
+             >&2 echo 'Direct leak of 16 byte(s) in 1 object(s) allocated from:'\n\
+             >&2 echo '    #0 0x1 in malloc'\n\
+             >&2 echo '    #1 0x2 in {entry}'\n\
+             >&2 echo '    #2 0x3 in bhf_run_one_bytes /rt/bhf_driver.c:88:5'\n\
+             >&2 echo '    #3 0x4 in main /rt/bhf_driver.c:120:5'\n\
+             >&2 echo ''\n\
+             >&2 echo 'SUMMARY: AddressSanitizer: 16 byte(s) leaked in 1 allocation(s).'\n\
+             exit 23\n"
+        );
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-GLUE", &script);
+        let dir = harness.parent().unwrap();
+        fs::write(
+            dir.join("main.c"),
+            "/* bhf driver for a passthrough libFuzzer entrypoint. */\n",
+        )
+        .unwrap();
+        if let Some((name, source)) = glue {
+            fs::write(dir.join(name), source).unwrap();
+        }
+        run_one_target_programmatic(
+            &work_dir,
+            "H-GLUE",
+            vec![b"seed".to_vec()],
+            8,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None, // cmplog_log
+            &[],
+            None,
+        )
+        .unwrap()
+        .findings
+        .len()
+    }
+
+    /// The Fortran lane calls the routine through an `LLVMFuzzerTestOneInput`
+    /// glue of bhf's own. A leak of a buffer that glue allocated (a Fortran
+    /// `STOP` ended the process before the glue's free) is bhf's, not the
+    /// target's, whether the report names the glue file or the glue says so.
+    #[test]
+    #[cfg(unix)]
+    fn a_leak_in_the_fortran_glue_entry_is_not_a_finding() {
+        let glue = crate::auto::fortran_build::glue_source(
+            "scan_",
+            &[],
+            crate::auto::fortran::FortranResult::NonChar,
+            false,
+        );
+        assert_eq!(
+            glue_entry_leak_findings(None, Some("/w/harnesses/H-GLUE/fortran_glue.c")),
+            0,
+            "a leak in the glue file is bhf's"
+        );
+        assert_eq!(
+            glue_entry_leak_findings(Some(("fortran_glue.c", glue)), None),
+            0,
+            "the glue records that bhf generated the entry"
+        );
+        assert_eq!(
+            glue_entry_leak_findings(None, Some("/src/fuzz/f.c")),
+            1,
+            "a project's own fuzz entry still reports its leak"
+        );
+    }
+
+    /// The COBOL lane's `LLVMFuzzerTestOneInput` glue is bhf's too (a COBOL
+    /// program that exits before the glue's free leaves its buffer).
+    #[test]
+    #[cfg(unix)]
+    fn a_leak_in_the_cobol_glue_entry_is_not_a_finding() {
+        let glue = crate::auto::cobol_build::multi_param_glue("BLOCKS", &[]);
+        assert_eq!(
+            glue_entry_leak_findings(None, Some("/w/harnesses/H-GLUE/cobol_glue.c")),
+            0,
+            "a leak in the glue file is bhf's"
+        );
+        assert_eq!(
+            glue_entry_leak_findings(Some(("cobol_glue.c", glue)), None),
+            0,
+            "the glue records that bhf generated the entry"
+        );
+        assert_eq!(
+            glue_entry_leak_findings(None, Some("/src/fuzz/f.c")),
+            1,
+            "a project's own fuzz entry still reports its leak"
         );
     }
 

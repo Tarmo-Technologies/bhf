@@ -443,12 +443,17 @@ mod linux {
             "the pitfall points at the compiler contract"
         );
         assert!(
-            !guide.contains("`bhf minimize` from the finding"),
-            "custom-harness.md still says bhf minimize finds the harness from the finding"
+            !guide.contains("`bhf minimize` takes it as `--harness`")
+                && !guide.contains("`bhf minimize` needs `--harness`"),
+            "custom-harness.md still says bhf minimize needs --harness"
         );
         assert!(
-            guide.contains("`bhf minimize` takes it as `--harness`"),
-            "custom-harness.md says bhf minimize takes the harness as --harness"
+            guide.contains("`--harness` is optional for `bhf replay` and `bhf minimize`"),
+            "custom-harness.md says --harness is optional for replay and minimize"
+        );
+        assert!(
+            !guide.contains("add `-U_FORTIFY_SOURCE` to `AUTO_EXTRA_INCLUDES`"),
+            "custom-harness.md still tells you to turn fortify off yourself"
         );
         assert!(
             !guide.contains("records no build recipe"),
@@ -458,6 +463,10 @@ mod linux {
         assert!(
             !cli.contains("the history and `results/` are left as they were"),
             "cli.md still says an unverified replay leaves results/ as it was"
+        );
+        assert!(
+            !cli.contains("`bhf minimize` asks for `--harness`"),
+            "cli.md still says bhf minimize needs --harness"
         );
         let c_cpp = flat("c-cpp.md");
         assert!(

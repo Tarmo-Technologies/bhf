@@ -441,11 +441,11 @@
   accepts; a unit test now checks the help text against the config key lists.
 - The custom-harness guide no longer says only clang works: `CC`/`CXX` may
   name gcc or a cross gcc, as the C/C++ compiler contract describes, with a
-  note on distribution gcc's default `_FORTIFY_SOURCE`. It now says
-  `bhf minimize` needs `--harness`, and that a capsule of a harness built by
-  `bhf build` with `AUTO_EXTRA_*` or `CXX_STD`/`C_STD` set can fail to
-  rebuild. The C/C++ page says `bhf auto` adds the C++ compatibility flag for
-  extra class qualification itself (`cxx_compat.mk`).
+  note on distribution gcc's default `_FORTIFY_SOURCE`. It now says that a
+  capsule of a harness built by `bhf build` with `AUTO_EXTRA_*` or
+  `CXX_STD`/`C_STD` set can fail to rebuild. The C/C++ page says `bhf auto`
+  adds the C++ compatibility flag for extra class qualification itself
+  (`cxx_compat.mk`).
 - Comparison evidence searches inputs longer than 32 bytes for operands
   computed from input bytes (folded range checks such as `width - 1 > 31`):
   first the bytes the harness decodes its scalar parameters from
@@ -537,6 +537,21 @@
   Each worker's JSON summary is kept in `worker-<id>-N/worker-stdout.json`,
   and the duplicate marker a merge leaves in a worker dir names the finding it
   duplicates.
+- A crash or leak in the body of a project's own `LLVMFuzzerTestOneInput` (a
+  hand-built `-fsanitize=fuzzer` binary, or bhf's driver around a project's
+  fuzz entry) is reported. It was dropped as libFuzzer driver glue or harness
+  scaffolding; only a harness bhf generated around a target of its own has
+  that function as driver code. The Fortran and COBOL lanes' glue, which
+  defines its own `LLVMFuzzerTestOneInput` on the passthrough driver path,
+  now says bhf generated it, and a fuzz entry in a glue file bhf writes
+  (`fortran_glue.c`, `cobol_glue.c`, `bhf_libfuzzer.c`) is bhf's code, so a
+  leak of the glue's buffer when a Fortran `STOP` or a COBOL exit ends the
+  run first is still not reported as the target's.
+- The custom-harness and CLI guides say `--harness` is optional for
+  `bhf minimize` as it is for `bhf replay`, and the custom-harness pitfall on
+  a distribution gcc's `_FORTIFY_SOURCE` says every sanitized build already
+  turns it off after your flags, instead of telling you to add
+  `-U_FORTIFY_SOURCE` yourself.
 - `bhf auto --no-seed-mining` (or `seed-mining = false`) says on the console
   that tree seed mining is disabled, as the mined and explicit-seed cases
   already said what seeded the run. The seed list's documentation no longer

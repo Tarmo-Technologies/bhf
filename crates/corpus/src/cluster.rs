@@ -111,6 +111,36 @@ const DRIVER_PREFIXES: &[&str] = &[
     "__sanitizer",
 ];
 
+/// The libFuzzer hooks a fuzz target defines itself. They are driver or
+/// harness code only in a harness bhf generated around a target of its own;
+/// in a project's fuzz target (a hand-built `-fsanitize=fuzzer` binary, or
+/// bhf's driver around the project's entry) they are the target.
+const FUZZ_TARGET_HOOKS: &[&str] = &[
+    "LLVMFuzzerTestOneInput",
+    "LLVMFuzzerInitialize",
+    "LLVMFuzzerCustomMutator",
+    "LLVMFuzzerCustomCrossOver",
+];
+
+fn is_fuzz_target_hook(function: &str) -> bool {
+    FUZZ_TARGET_HOOKS.contains(&function)
+}
+
+/// The glue files bhf writes into a harness dir that define a fuzz target's
+/// hooks themselves: the Fortran and COBOL lanes' `LLVMFuzzerTestOneInput`
+/// around the project's routine, and the libFuzzer shim that forwards to
+/// bhf's entry.
+const BHF_GLUE_FILES: &[&str] = &["fortran_glue.c", "cobol_glue.c", "bhf_libfuzzer.c"];
+
+/// Whether `frame` is in one of [`BHF_GLUE_FILES`]: a hook there is bhf's
+/// code, whatever else is known about the harness.
+fn in_bhf_glue(frame: &StackFrame) -> bool {
+    frame.file.as_deref().is_some_and(|file| {
+        let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+        BHF_GLUE_FILES.contains(&name)
+    })
+}
+
 /// libc / C++ allocator-runtime frames. On their own (with no target frame
 /// and a driver frame present) these signal allocator-glue corruption rather
 /// than a target double-free, which always carries the target caller above.
@@ -258,8 +288,11 @@ fn is_rust_std_allocator_noise(lower_name: &str) -> bool {
 /// reported as a target CWE-401 (#49).
 ///
 /// Conservative, like [`is_driver_glue_crash`]: requires a POSITIVE harness frame
-/// and bails the instant any real target/library frame resolves.
-pub fn is_harness_scaffolding_leak(report: &SanitizerReport) -> bool {
+/// and bails the instant any real target/library frame resolves. An
+/// `LLVMFuzzerTestOneInput` frame is harness scaffolding only when `bhf_entry`
+/// (bhf generated that function) or when it is in a glue file bhf writes
+/// ([`BHF_GLUE_FILES`]); otherwise it is the project's fuzz target.
+pub fn is_harness_scaffolding_leak(report: &SanitizerReport, bhf_entry: bool) -> bool {
     if report.sanitizer != Some(Sanitizer::LeakSanitizer) {
         return false;
     }
@@ -276,6 +309,10 @@ pub fn is_harness_scaffolding_leak(report: &SanitizerReport) -> bool {
             continue;
         }
         let lower = no_args.to_ascii_lowercase();
+        if is_fuzz_target_hook(&no_args) && !bhf_entry && !in_bhf_glue(frame) {
+            // The project's own fuzz target: a real leak.
+            return false;
+        }
         if lower.starts_with("bhf_")
             || lower.starts_with("bhf_")
             || lower.starts_with("rust_runtime::")
@@ -469,7 +506,15 @@ pub fn sanitizer_site(report: &SanitizerReport, normalized_frames: &[String]) ->
 /// or allocator-runtime, and (b) at least one frame is an unambiguous libFuzzer
 /// or sanitizer *driver* frame. A crash with only `module+offset` frames (no
 /// driver frame) is left for replay-verification to judge.
-pub fn is_driver_glue_crash(report: &SanitizerReport) -> bool {
+///
+/// The hooks a fuzz target defines (`LLVMFuzzerTestOneInput`,
+/// `LLVMFuzzerInitialize`, `LLVMFuzzerCustomMutator`,
+/// `LLVMFuzzerCustomCrossOver`) are driver frames only when `bhf_entry` (bhf
+/// generated them) or in a glue file bhf writes ([`BHF_GLUE_FILES`]);
+/// otherwise they are target frames. The runtime's own
+/// entry points (`LLVMFuzzerRunDriver`, `LLVMFuzzerMutate`, `fuzzer::*`) are
+/// driver frames either way.
+pub fn is_driver_glue_crash(report: &SanitizerReport, bhf_entry: bool) -> bool {
     let mut saw_driver = false;
     for frame in &report.stack {
         let stripped = strip_toolchain_decoration(frame.function.as_str());
@@ -477,6 +522,10 @@ pub fn is_driver_glue_crash(report: &SanitizerReport) -> bool {
         if trimmed.is_empty() {
             // Unsymbolized (module+offset) frame — neither confirms nor denies.
             continue;
+        }
+        if is_fuzz_target_hook(&strip_cpp_args(trimmed)) && !bhf_entry && !in_bhf_glue(frame) {
+            // The project's own fuzz target: a real crash.
+            return false;
         }
         if DRIVER_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
             saw_driver = true;
@@ -930,7 +979,7 @@ mod tests {
         // harness scaffolding (unfreed because an exit()-only target died first) is
         // suppressed, not reported as a target CWE-401.
         let report = sample_leak_report(vec!["malloc", "bhf_c_string", "bhf_run_one"]);
-        assert!(is_harness_scaffolding_leak(&report));
+        assert!(is_harness_scaffolding_leak(&report, true));
     }
 
     #[test]
@@ -949,7 +998,7 @@ mod tests {
             "bhf_run_one_bytes",
             "main",
         ]);
-        assert!(is_harness_scaffolding_leak(&report));
+        assert!(is_harness_scaffolding_leak(&report, true));
     }
 
     #[test]
@@ -965,14 +1014,14 @@ mod tests {
             "<alloc::alloc::Global as core::alloc::Allocator>::shrink",
             "<alloc::raw_vec::RawVecInner>::shrink_unchecked",
         ]);
-        assert!(is_harness_scaffolding_leak(&report));
+        assert!(is_harness_scaffolding_leak(&report, true));
     }
 
     #[test]
     fn harness_scaffolding_leak_false_with_a_target_frame() {
         // #49 guard: a leak WITH a real target frame is genuine — never suppressed.
         let report = sample_leak_report(vec!["malloc", "bhf_c_string", "toml_parse_table"]);
-        assert!(!is_harness_scaffolding_leak(&report));
+        assert!(!is_harness_scaffolding_leak(&report, true));
     }
 
     #[test]
@@ -980,7 +1029,7 @@ mod tests {
         // Only LSan leaks are in scope; an ASan overflow with bhf_ frames is handled
         // by the harness-cleanup-artifact verdict path, not suppressed here.
         let report = sample_sanitizer_report(vec!["bhf_c_string", "bhf_run_one"]);
-        assert!(!is_harness_scaffolding_leak(&report));
+        assert!(!is_harness_scaffolding_leak(&report, true));
     }
 
     #[test]
@@ -1114,14 +1163,99 @@ mod tests {
             "free",
             "fuzzer::RunOneTest",
         ]);
-        assert!(is_driver_glue_crash(&report));
+        assert!(is_driver_glue_crash(&report, true));
     }
 
     #[test]
     fn is_driver_glue_crash_false_when_target_frame_present() {
         let report =
             sample_sanitizer_report(vec!["cJSON_GetObjectItem", "free", "fuzzer::RunOneTest"]);
-        assert!(!is_driver_glue_crash(&report));
+        assert!(!is_driver_glue_crash(&report, true));
+    }
+
+    /// `LLVMFuzzerTestOneInput` is driver code only in a harness bhf
+    /// generated around a target of its own; in a project's own fuzz target
+    /// (a hand-built libFuzzer binary, or bhf's driver around it) its body is
+    /// the target.
+    #[test]
+    fn a_crash_in_a_projects_own_fuzz_entry_is_not_driver_glue() {
+        let mut report = sample_sanitizer_report(vec![
+            "LLVMFuzzerTestOneInput",
+            "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)",
+            "fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long)",
+            "main",
+        ]);
+        report.stack[0].file = Some("/src/fuzz/f.c".to_owned());
+        report.stack[0].line = Some(9);
+        assert!(!is_driver_glue_crash(&report, false));
+        assert!(is_driver_glue_crash(&report, true));
+        // The runtime's own entry points stay driver frames either way.
+        let runtime = sample_sanitizer_report(vec![
+            "__asan::Allocator::Deallocate",
+            "LLVMFuzzerRunDriver",
+            "fuzzer::RunOneTest",
+        ]);
+        assert!(is_driver_glue_crash(&runtime, false));
+        let allocator = sample_sanitizer_report(vec![
+            "__asan::Allocator::Deallocate",
+            "free",
+            "fuzzer::RunOneTest",
+        ]);
+        assert!(is_driver_glue_crash(&allocator, false));
+        assert!(is_driver_glue_crash(&allocator, true));
+    }
+
+    #[test]
+    fn a_leak_in_a_projects_own_fuzz_entry_is_not_scaffolding() {
+        let report = sample_leak_report(vec!["malloc", "LLVMFuzzerTestOneInput"]);
+        assert!(!is_harness_scaffolding_leak(&report, false));
+        assert!(is_harness_scaffolding_leak(&report, true));
+    }
+
+    /// The fuzz entry in a glue file bhf writes into a harness dir (the
+    /// Fortran and COBOL lanes' glue, the libFuzzer shim) is bhf's code even
+    /// where nothing else says bhf generated the entry, such as a harness
+    /// built before the glue carried a marker.
+    #[test]
+    fn a_fuzz_entry_in_bhf_glue_is_harness_code() {
+        let leak = |file: &str| {
+            let mut report = sample_leak_report(vec![
+                "malloc",
+                "LLVMFuzzerTestOneInput",
+                "bhf_run_one_bytes",
+                "main",
+            ]);
+            report.stack[1].file = Some(file.to_owned());
+            report.stack[1].line = Some(42);
+            report
+        };
+        for glue in [
+            "/w/harnesses/H-F/fortran_glue.c",
+            "/w/harnesses/H-C/cobol_glue.c",
+            "bhf_libfuzzer.c",
+            "C:\\w\\harnesses\\H-C\\cobol_glue.c",
+        ] {
+            assert!(is_harness_scaffolding_leak(&leak(glue), false), "{glue}");
+        }
+        assert!(!is_harness_scaffolding_leak(
+            &leak("/src/fuzz/fortran_glue_test.c"),
+            false
+        ));
+        assert!(!is_harness_scaffolding_leak(&leak("/src/fuzz/f.c"), false));
+
+        let crash = |file: &str| {
+            let mut report = sample_sanitizer_report(vec![
+                "LLVMFuzzerTestOneInput",
+                "fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long)",
+            ]);
+            report.stack[0].file = Some(file.to_owned());
+            report
+        };
+        assert!(is_driver_glue_crash(
+            &crash("/w/auto/H-R/bhf_libfuzzer.c"),
+            false
+        ));
+        assert!(!is_driver_glue_crash(&crash("/src/fuzz/f.c"), false));
     }
 
     #[test]
@@ -1129,7 +1263,7 @@ mod tests {
         // module+offset frames with no recognizable driver frame: leave the
         // verdict to replay-verification rather than silently dropping it.
         let report = sample_sanitizer_report(vec!["(/opt/build/main+0x12ab)"]);
-        assert!(!is_driver_glue_crash(&report));
+        assert!(!is_driver_glue_crash(&report, true));
     }
 
     fn handler_event(name: &str, file: &str, line: u32, last_breadcrumb: u32) -> HandlerEvent {

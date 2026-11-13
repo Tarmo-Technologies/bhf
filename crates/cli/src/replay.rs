@@ -917,6 +917,26 @@ pub(crate) fn is_passthrough_harness(dirs: &[PathBuf]) -> bool {
     })
 }
 
+/// What the glue a lane writes around a project routine says about the
+/// `LLVMFuzzerTestOneInput` it defines (the Fortran and COBOL lanes build that
+/// glue on the passthrough driver path, with no generation metadata): bhf
+/// generated this entry, so its frames are harness code, not the target's.
+pub(crate) const GENERATED_ENTRY_MARKER: &str = "bhf generated this fuzz entry";
+
+/// The glue files a lane writes beside its driver that define the fuzz entry.
+const GENERATED_ENTRY_GLUE: &[&str] = &["fortran_glue.c", "cobol_glue.c"];
+
+/// Whether the harness in one of `dirs` drives the project through a fuzz
+/// entry bhf generated: a lane's glue carrying [`GENERATED_ENTRY_MARKER`].
+pub(crate) fn has_generated_entry(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| {
+        GENERATED_ENTRY_GLUE.iter().any(|name| {
+            std::fs::read_to_string(dir.join(name))
+                .is_ok_and(|source| source.contains(GENERATED_ENTRY_MARKER))
+        })
+    })
+}
+
 /// The dirs a harness's sources and metadata may be in: beside the binary,
 /// beside the driver source `detection` found, and the harness dirs of the
 /// finding's work dir.

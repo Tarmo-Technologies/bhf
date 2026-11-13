@@ -16,8 +16,8 @@ triage tools. This page describes three routes:
 All commands below use one work directory, `bhf_work`. Generate harnesses
 into `bhf_work/harnesses/<id>/`, the layout `bhf auto` uses. `bhf build`,
 `bhf fuzz`, `bhf explain` and `bhf capsule` find a harness there from the work
-directory and its id, and `bhf replay` from the finding; `bhf minimize` takes it
-as `--harness` (see [Triage](#triage)).
+directory and its id, and `bhf replay` and `bhf minimize` from the finding (see
+[Triage](#triage)).
 
 ## 1. Write an `LLVMFuzzerTestOneInput` entry point
 
@@ -197,9 +197,9 @@ bhf explain --work-dir bhf_work --finding-id <finding-id>
 python3 bhf_work/results/findings/<finding-id>/replay.py
 ```
 
-`--harness` is optional for `bhf replay`: without it, replay runs the
-finding's own harness, resolved in the work directory from its `fixture_path`
-and `harness_id`. `bhf minimize` needs `--harness`. The binary `bhf build`
+`--harness` is optional for `bhf replay` and `bhf minimize`: without it, each
+runs the finding's own harness, resolved in the work directory from its
+`fixture_path` and `harness_id`. The binary `bhf build`
 stages at `bhf_work/build/<id>/main` works as well as the one next to
 `main.c` / `main.cpp`. `bhf capsule` and `bhf verify-poc` package C and C++
 findings whatever the harness id; the language comes from the harness's
@@ -252,9 +252,9 @@ from a harness directory bhf generated.
   cross-prefixed gcc work too, because the Makefile picks its flags from the
   compiler that runs (see the compiler contract in [C and C++](c-cpp.md)).
   With gcc the harness gets `trace-pc,trace-cmp` coverage and statically
-  linked sanitizer runtimes. A distribution gcc that defines
-  `_FORTIFY_SOURCE` by default can stop in a glibc fortify check before
-  AddressSanitizer reports; add `-U_FORTIFY_SOURCE` to `AUTO_EXTRA_INCLUDES`
-  when that happens.
+  linked sanitizer runtimes. Every sanitized build turns glibc's
+  `_FORTIFY_SOURCE` off after your flags (see [auto](auto.md)), so a fortify
+  check in a distribution gcc cannot stop an overflow before
+  AddressSanitizer reports it.
 - `bhf build` takes the work directory, not the `--output` directory.
 - Regenerating a harness overwrites edits to `main.cpp` and `dictionary.txt`.

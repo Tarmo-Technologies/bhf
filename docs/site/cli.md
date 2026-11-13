@@ -50,8 +50,8 @@ The replay and minimize lines show the Ada layout. A C or C++ harness replays
 from the `build/<id>/main` that `bhf build` stages or from
 `bhf_work/harnesses/<id>/main` (`main.exe` on Windows, as every harness
 binary there is named: `main_cov.exe`, `main_afl.exe`, ...); without
-`--harness`, `bhf replay` resolves the finding's harness in its work dir, and
-`bhf minimize` asks for `--harness`.
+`--harness`, `bhf replay` and `bhf minimize` resolve the finding's harness in
+its work dir.
 `bhf minimize` first runs the testcase and compares its crash with the finding
 the way `bhf replay` does, with the environment `bhf replay` gives the harness
 (the finding's recorded runtime mode and injected variables too), as does
