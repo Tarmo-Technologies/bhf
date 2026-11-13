@@ -31,12 +31,12 @@ pub struct DecodeArgsArgs {
 
     /// A finding (directory, or id under --work-dir): its harness and, unless
     /// TESTCASE is given, its testcase.bin.
-    #[arg(long, value_name = "ID_OR_DIR")]
+    #[arg(long, value_name = "ID_OR_DIR", visible_alias = "finding-id")]
     pub finding: Option<PathBuf>,
 
-    /// The harness: its binary, or its directory (with `arg-layout.json` and,
-    /// when built, `main`). Default with --finding: the harness the finding
-    /// records.
+    /// The harness: its binary, its directory (with `arg-layout.json` and,
+    /// when built, `main`), or its id under --work-dir. Default with
+    /// --finding: the harness the finding records.
     #[arg(long, value_name = "PATH", required_unless_present = "finding")]
     pub harness: Option<PathBuf>,
 
@@ -141,6 +141,8 @@ struct Inputs {
     binary: Option<PathBuf>,
     /// The directory holding `arg-layout.json`, when one was found.
     layout_dir: Option<PathBuf>,
+    /// The directories searched for the binary and `arg-layout.json`.
+    searched_dirs: Vec<PathBuf>,
     qemu_user: Option<PathBuf>,
     qemu_args: Vec<String>,
 }
@@ -167,19 +169,48 @@ fn inputs(args: &DecodeArgsArgs) -> Result<Inputs, String> {
         (None, None) => return Err("pass a TESTCASE or --finding".to_owned()),
     };
     let (binary, mut layout_dirs) = match &args.harness {
-        Some(path) if path.is_dir() => {
-            let binary = [
-                crate::auto::layout::harness_exe(path, "main"),
-                path.join("main.exe"),
-            ]
-            .into_iter()
-            .find(|candidate| candidate.is_file());
-            (binary, vec![path.clone()])
-        }
-        Some(path) => (
-            path.is_file().then(|| path.clone()),
+        Some(path) if path.is_dir() => (
+            harness_binary_in(std::slice::from_ref(path)),
+            vec![path.clone()],
+        ),
+        // A bare relative file name is made absolute, so running it never
+        // searches PATH for a program of that name.
+        Some(path) if path.is_file() => (
+            Some(std::path::absolute(path).unwrap_or_else(|_| Path::new(".").join(path))),
             path.parent().map(Path::to_path_buf).into_iter().collect(),
         ),
+        // One plain path component naming no file or dir: a harness id under
+        // the work dir.
+        Some(path) if is_harness_id(path) => {
+            let id = path.to_string_lossy();
+            let mut dirs = vec![
+                crate::auto::layout::harness_dir(&args.work_dir, &id),
+                args.work_dir.join("build").join(&*id),
+            ];
+            for dir in crate::auto::layout::harness_dir_candidates(&args.work_dir, &id) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+            let found: Vec<PathBuf> = dirs.iter().filter(|dir| dir.is_dir()).cloned().collect();
+            if found.is_empty() {
+                return Err(no_such_harness(path, &args.work_dir, &dirs));
+            }
+            (harness_binary_in(&found), found)
+        }
+        // A binary path that is not built (a work dir copied without its
+        // binaries) still decodes from the layout beside it.
+        Some(path)
+            if path.parent().is_some_and(|dir| {
+                dir.join(harness_gen::arg_layout::ARG_LAYOUT_FILE).is_file()
+            }) =>
+        {
+            (
+                None,
+                path.parent().map(Path::to_path_buf).into_iter().collect(),
+            )
+        }
+        Some(path) => return Err(no_such_harness(path, &args.work_dir, &[])),
         None => {
             let dir = finding_dir
                 .as_ref()
@@ -206,17 +237,65 @@ fn inputs(args: &DecodeArgsArgs) -> Result<Inputs, String> {
         ));
     }
     let layout_dir = layout_dirs
-        .into_iter()
-        .find(|dir| dir.join(harness_gen::arg_layout::ARG_LAYOUT_FILE).is_file());
+        .iter()
+        .find(|dir| dir.join(harness_gen::arg_layout::ARG_LAYOUT_FILE).is_file())
+        .cloned();
     Ok(Inputs {
         finding_dir,
         finding,
         testcase,
         binary,
         layout_dir,
+        searched_dirs: layout_dirs,
         qemu_user: args.qemu_user.clone(),
         qemu_args: args.qemu_args.clone(),
     })
+}
+
+/// The first built harness binary in `dirs`: `main` under the platform's
+/// spelling (`crate::auto::layout::harness_exe`), then `main.exe`.
+fn harness_binary_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .flat_map(|dir| {
+            [
+                crate::auto::layout::harness_exe(dir, "main"),
+                dir.join("main.exe"),
+            ]
+        })
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether `--harness <path>` reads as a harness id: one plain path
+/// component, no separator.
+fn is_harness_id(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !path.to_string_lossy().contains(['/', '\\'])
+}
+
+/// The error for a `--harness` that names nothing: no file, no dir, and no
+/// harness of that id under the work dir.
+fn no_such_harness(path: &Path, work_dir: &Path, looked_in: &[PathBuf]) -> String {
+    let id = if looked_in.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", and no harness `{}` under {} (looked in {})",
+            path.display(),
+            work_dir.display(),
+            looked_in
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "--harness {}: no such file or directory{id}",
+        path.display()
+    )
 }
 
 fn decode(args: &DecodeArgsArgs) -> Result<Report, String> {
@@ -288,30 +367,54 @@ fn decode(args: &DecodeArgsArgs) -> Result<Report, String> {
                     report.arguments = traced;
                     return Ok(report);
                 }
-                Err(reason) => report.notes.push(format!(
-                    "the harness was not traced ({reason}); decoded from the layout instead"
-                )),
+                Err(reason) => report.notes.push(if layout.is_some() {
+                    format!(
+                        "the harness was not traced ({reason}); decoded from the layout instead"
+                    )
+                } else {
+                    format!("the harness was not traced ({reason})")
+                }),
             },
-            None => report
+            None if layout.is_some() => report
                 .notes
                 .push("no built harness binary was found; decoded from the layout".to_owned()),
+            None => {}
         }
     }
     let Some(layout) = layout else {
+        let searched = || {
+            inputs
+                .searched_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         return Err(match &inputs.binary {
             Some(_) if args.static_only => {
                 "--static needs the harness's arg-layout.json, and none was found; regenerate the \
                  harness with this bhf"
                     .to_owned()
             }
-            _ => format!(
-                "cannot decode {}: no traceable harness binary and no arg-layout.json{}",
+            Some(_) => format!(
+                "cannot decode {}: no traceable harness binary and no arg-layout.json in {}{}",
                 inputs.testcase.display(),
+                searched(),
                 report
                     .notes
                     .first()
                     .map(|note| format!(" ({note})"))
                     .unwrap_or_default()
+            ),
+            None => format!(
+                "cannot decode {}: no harness binary in {} and no arg-layout.json in {}",
+                inputs.testcase.display(),
+                inputs
+                    .searched_dirs
+                    .first()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_else(|| "the harness dir".to_owned()),
+                searched()
             ),
         });
     };
@@ -610,9 +713,139 @@ mod tests {
         .err()
         .unwrap();
         assert!(
-            error.contains("no traceable harness binary and no arg-layout.json"),
+            error.contains(&format!(
+                "no harness binary in {} and no arg-layout.json in",
+                dir.path().display()
+            )),
             "{error}"
         );
+        assert!(!error.contains("decoded from the layout"), "{error}");
+    }
+
+    /// The flag every other finding command spells `--finding-id` is
+    /// accepted here too.
+    #[test]
+    fn finding_id_is_an_alias_of_finding() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: DecodeArgsArgs,
+        }
+        let cli = Cli::try_parse_from(["x", "--finding-id", "F-1"]).unwrap();
+        assert_eq!(cli.args.finding.as_deref(), Some(Path::new("F-1")));
+    }
+
+    fn write_static_layout(dir: &Path) {
+        let mut index = layout_param("bit_index", "cursor", "scalar");
+        index.primitive = Some("bhf_i32".to_owned());
+        index.width = Some(4);
+        index.value_kind = Some("u32".to_owned());
+        ArgLayout::new("c", "direct", vec![LayoutStep::Param(index)])
+            .write(dir)
+            .unwrap();
+    }
+
+    fn decode_with_harness(
+        work: &Path,
+        harness: &str,
+        testcase: PathBuf,
+    ) -> Result<Report, String> {
+        decode(&DecodeArgsArgs {
+            testcase: Some(testcase),
+            finding: None,
+            harness: Some(PathBuf::from(harness)),
+            work_dir: work.to_path_buf(),
+            static_only: false,
+            json: false,
+            qemu_user: None,
+            qemu_args: Vec::new(),
+        })
+    }
+
+    /// A `--harness` that names no file or dir but a harness id is looked up
+    /// under the work dir.
+    #[test]
+    fn a_harness_id_resolves_under_the_work_dir() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses/H-X");
+        std::fs::create_dir_all(&harness).unwrap();
+        write_static_layout(&harness);
+        let testcase = work.path().join("t.bin");
+        std::fs::write(&testcase, b"\x2a\x00\x00\x00").unwrap();
+        let report = decode_with_harness(work.path(), "H-X", testcase).unwrap();
+        assert_eq!(report.source, Source::ArgLayout);
+        let names: Vec<&str> = report.arguments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["bit_index"]);
+        assert_eq!(report.arguments[0].value.as_deref(), Some("42"));
+    }
+
+    /// A `--harness` that names nothing says so, instead of saying it decoded
+    /// from a layout it never found.
+    #[test]
+    fn an_unknown_harness_says_it_does_not_exist() {
+        let work = tempfile::tempdir().unwrap();
+        let testcase = work.path().join("t.bin");
+        std::fs::write(&testcase, b"x").unwrap();
+        let error = decode_with_harness(work.path(), "H-NOPE", testcase)
+            .err()
+            .unwrap();
+        assert!(error.contains("no such file or directory"), "{error}");
+        assert!(
+            error.contains(&work.path().display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains("decoded from the layout"), "{error}");
+    }
+
+    /// A bare file name given as `--harness` is the file in the current
+    /// directory, never a program of that name on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_harness_file_name_runs_the_file_in_the_current_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = temp.path().join("path-tracer-ran");
+        let script = |name: &str, extra: &str| {
+            format!(
+                "#!/bin/sh\n# {} BHF_FRAMED\n{extra}echo 'BHF_ARG {{\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"{name}\",\"type\":\"int\",\"span\":[0,1],\"value\":\"7\"}}' >&2\n",
+                corpus::decoded_args::TRACE_ARGS_ENV
+            )
+        };
+        for (path, body) in [
+            (cwd.join("tracer"), script("local", "")),
+            (
+                bin.join("tracer"),
+                script("from_path", &format!("touch '{}'\n", marker.display())),
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let testcase = temp.path().join("t.bin");
+        std::fs::write(&testcase, b"x").unwrap();
+        let saved_dir = std::env::current_dir().unwrap();
+        let saved_path = std::env::var_os("PATH");
+        let mut path = vec![bin.clone()];
+        path.extend(std::env::split_paths(
+            &saved_path.clone().unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+        std::env::set_current_dir(&cwd).unwrap();
+        let report = decode_with_harness(temp.path(), "tracer", testcase);
+        std::env::set_current_dir(saved_dir).unwrap();
+        match saved_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let report = report.unwrap();
+        assert!(!marker.exists(), "the PATH program ran: {:?}", report.notes);
+        assert_eq!(report.source, Source::HarnessTrace, "{:?}", report.notes);
+        assert_eq!(report.arguments[0].name, "local");
     }
 
     /// A finding recorded against another input format than the layout gets

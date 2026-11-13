@@ -1405,6 +1405,14 @@
   count and `run.md`'s "Synthesised build-config macros" leave it out. It
   stays listed under `run.json` `targets[].real_headers_included`, and the
   `-v` repair summary counts it as a resolved header, not a synthesized type.
+- `bhf decode-args` accepts `--finding-id` (as `bhf capsule`, `explain` and
+  `cartography` spell it) next to `--finding`, and a `--harness` that is a
+  harness id is looked up under `--work-dir` (`harnesses/<id>`, then
+  `build/<id>`). A `--harness` that names nothing says so ("no such file or
+  directory, and no harness ... under <work>"), instead of claiming it decoded
+  from a layout it never found; without a layout or binary the error names the
+  dirs it searched. A bare file name given as `--harness` runs the file in the
+  current directory, never a program of that name on `PATH`.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

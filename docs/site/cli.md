@@ -868,11 +868,13 @@ and explain it — all offline and deterministic (no LLM):
   `finding.json`, or a finding of another classification, such as a static
   scan row) exits 1 with the reason; without `--finding-id`, a work dir with
   nothing to explain exits 0.
-- `bhf decode-args [TESTCASE] [--finding <id>] [--harness <bin-or-dir>]` —
+- `bhf decode-args [TESTCASE] [--finding <id>|--finding-id <id>] [--harness <bin|dir|id>]` —
   the value each C/C++ harness parameter receives from a testcase: from the
   harness's own argument trace (`BHF_TRACE_ARGS=1`) when its binary runs, else
   (or with `--static`) from its `arg-layout.json`, naming each parameter that
-  cannot be decoded statically and why. `--json` prints a
+  cannot be decoded statically and why. A `--harness` id is looked up under
+  `--work-dir` (`harnesses/<id>`, then `build/<id>`); a `--harness` that names
+  nothing is an error saying so. `--json` prints a
   `bhf.decode-args.v1` document. See the
   [C/C++ guide](c-cpp.md#decoding-a-testcase-without-running-it).
 - `bhf cartography` — map which input bytes control which sink operand
