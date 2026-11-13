@@ -64,7 +64,7 @@
             "additionalProperties": false,
             "required": ["kind", "name"],
             "properties": {
-              "kind": { "enum": ["macro", "header", "type"] },
+              "kind": { "enum": ["macro", "header", "type", "include_dir"] },
               "name": { "type": "string", "minLength": 1 },
               "value": { "$ref": "#/$defs/nullable_string" }
             }

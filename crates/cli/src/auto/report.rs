@@ -518,9 +518,10 @@ fn is_build_context_refusal(reason: &str) -> bool {
 }
 
 /// force-fuzz Phase 2, persisted: findings from a forced-and-stub-heavy target
-/// carry `forced: true` + the caveat on disk, so every renderer (and importer)
-/// floors them the same way instead of only the in-memory CSV path. The note is
-/// the single shared [`confidence_model::FORCED_STUB_NOTE`].
+/// carry `forced: true` + the caveat on disk, and their
+/// `actionability.confidence` is floored to `low`, so every renderer (and
+/// importer) floors them the same way instead of only the in-memory CSV path.
+/// The note is the single shared [`confidence_model::FORCED_STUB_NOTE`].
 ///
 /// `forced` is a fact fixed at the finding's birth (it was produced by a forced,
 /// stub-heavy build). A later non-forced run never clears it: this pass only ever
@@ -560,10 +561,16 @@ fn annotate_forced_findings(
                 serde_json::json!(confidence_model::FORCED_STUB_NOTE),
             );
         }
+        let floored = crate::auto::build_fidelity::floor_actionability_confidence(&mut raw);
         if raw == before {
             continue;
         }
-        corpus::finding::append_history(&mut raw, "auto", &["forced", "forced_note"]);
+        let fields: &[&str] = if floored {
+            &["forced", "forced_note", "actionability.confidence"]
+        } else {
+            &["forced", "forced_note"]
+        };
+        corpus::finding::append_history(&mut raw, "auto", fields);
         match serde_json::to_vec_pretty(&raw) {
             Ok(serialized) => {
                 if let Err(error) = atomic_write(&path, &serialized) {
@@ -3470,6 +3477,7 @@ mod tests {
                 serde_json::to_vec_pretty(&serde_json::json!({
                     "id": id,
                     "harness_id": harness,
+                    "actionability": {"verdict": "likely_reachable", "confidence": "high"},
                 }))
                 .unwrap(),
             )
@@ -3490,6 +3498,12 @@ mod tests {
             forced_record["forced_note"],
             confidence_model::FORCED_STUB_NOTE
         );
+        // Floored as findings.json floors it.
+        assert_eq!(forced_record["actionability"]["confidence"], "low");
+        assert_eq!(
+            forced_record["actionability"]["verdict"], "likely_reachable",
+            "only the confidence is floored"
+        );
         let history = forced_record["history"].as_array().expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["command"], "auto");
@@ -3498,6 +3512,7 @@ mod tests {
         let unforced_record = read("F-0002");
         assert!(unforced_record.get("forced").is_none());
         assert!(unforced_record.get("history").is_none());
+        assert_eq!(unforced_record["actionability"]["confidence"], "high");
     }
 
     #[test]
@@ -3976,20 +3991,24 @@ mod tests {
         for (id, harness) in [("F-0000-fab0cafe", "H-FAB"), ("F-0001-0e0ac70c", "H-EXACT")] {
             let dir = work.join("results").join("findings").join(id);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("finding.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "id": id,
-                    "harness_id": harness,
-                    "rule_id": "BHF-201",
-                    "classification": "unhandled",
-                    "build": {"binary": {"sha256": "ab".repeat(32)}},
-                    "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
-                                  "message": "heap-buffer-overflow WRITE of size 1"},
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+            let mut raw = serde_json::json!({
+                "id": id,
+                "harness_id": harness,
+                "rule_id": "BHF-201",
+                "classification": "unhandled",
+                "build": {"binary": {"sha256": "ab".repeat(32)}},
+                "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+                              "message": "heap-buffer-overflow WRITE of size 1"},
+            });
+            // The record a fuzz finding is born with: medium confidence.
+            let mut record = actionability::backfill_actionability(
+                actionability::RunMode::Reporting,
+                &raw,
+                None,
+            );
+            record.confidence = actionability::ActionabilityConfidence::Medium;
+            raw["actionability"] = serde_json::to_value(&record).unwrap();
+            std::fs::write(dir.join("finding.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
         }
         let fab_dir = work.join("harnesses").join("H-FAB");
         std::fs::create_dir_all(fab_dir.join("repairs")).unwrap();
@@ -4094,8 +4113,12 @@ mod tests {
             "ab".repeat(32),
             "kept"
         );
+        // finding.json says the confidence every report says (findings.json
+        // below), not the one the finding was born with.
+        assert_eq!(fabricated["actionability"]["confidence"], "low");
         let exact = read("results/findings/F-0001-0e0ac70c/finding.json");
         assert!(exact["build"].get("fidelity").is_none(), "{exact}");
+        assert_eq!(exact["actionability"]["confidence"], "medium");
 
         let run = read("auto/run.json");
         assert_eq!(run["summary"]["fabricated_build_context"], 1, "{run}");
@@ -4127,6 +4150,10 @@ mod tests {
         };
         let fabricated = normalized("F-0000-fab0cafe");
         assert_eq!(fabricated["confidence"]["level"], "low");
+        // A low-confidence sanitizer crash is a crash lead, not a confirmed
+        // sanitizer crash (finding-report-fields.md); the build-context twin
+        // with its real context keeps `sanitizer_crash`.
+        assert_eq!(fabricated["confirmation"]["level"], "crash_lead");
         assert_eq!(
             fabricated["reproduce"]["build"]["fidelity"]["level"],
             "reduced"
@@ -4136,6 +4163,8 @@ mod tests {
             exact["reproduce"]["build"].get("fidelity").is_none(),
             "{exact}"
         );
+        assert_eq!(exact["confidence"]["level"], "medium");
+        assert_eq!(exact["confirmation"]["level"], "sanitizer_crash");
         assert!(
             !exact["fidelity"]["caveats"]
                 .to_string()

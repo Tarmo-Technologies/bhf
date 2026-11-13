@@ -43,6 +43,11 @@ pub enum Repair {
     HeaderForward {
         virtual_path: String,
         source_path: PathBuf,
+        /// The header lies outside the scanned tree (see
+        /// [`crate::auto::decl_index::DeclarationIndex::is_borrowed_include_dir`]),
+        /// which reduces the build's fidelity.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        outside_scanned_tree: bool,
     },
     /// A missing autoconf/cmake `config.h` for a project that ships only a
     /// `config.h.in`: write a minimal config.h (HAVE_CONFIG_H + standard feature
@@ -57,6 +62,12 @@ pub enum Repair {
     /// whose headers live in sibling `modules/*/fsw/inc` dirs.
     AddIncludeDir {
         dir: PathBuf,
+        /// The dir lies outside the scanned tree, in the rest of the project a
+        /// subdir run reads headers from (see
+        /// [`crate::auto::decl_index::DeclarationIndex::is_borrowed_include_dir`]),
+        /// which reduces the build's fidelity.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        outside_scanned_tree: bool,
     },
     /// Force-include the unique surviving project header that defines a type
     /// whose original include edge was lost with a damaged private header.
@@ -257,7 +268,7 @@ impl RepairManifest {
                 key == format!("forward-h:{virtual_path}")
             }
             Repair::ConfigHeaderSynth { virtual_path } => key == format!("config-h:{virtual_path}"),
-            Repair::AddIncludeDir { dir } => dir.display().to_string() == key,
+            Repair::AddIncludeDir { dir, .. } => dir.display().to_string() == key,
             Repair::IncludeTypeHeader { type_name, .. } => {
                 key == format!("type-header:{type_name}")
             }
@@ -1416,6 +1427,7 @@ pub fn apply_repair_with_source(
         Repair::HeaderForward {
             virtual_path,
             source_path,
+            ..
         } => {
             let p = confined_join(&includes_dir, virtual_path)?;
             if let Some(parent) = p.parent() {
@@ -1450,7 +1462,7 @@ pub fn apply_repair_with_source(
                 resolved_header: None,
             })
         }
-        Repair::AddIncludeDir { dir } => {
+        Repair::AddIncludeDir { dir, .. } => {
             // Parent-relative missing includes can require a synthetic child search
             // directory so `-I child` plus `../header.h` reaches an exact recovered
             // sibling. This only creates the planned directory; source files remain
@@ -3026,7 +3038,11 @@ pub(crate) fn plan_repair_forced_with_source_policy(
             // index) over an empty placeholder, which only defers the failure to
             // a cascade of "unknown type" errors.
             if let Some(dir) = decl_index.include_root_for(path) {
-                Some(Repair::AddIncludeDir { dir })
+                let outside_scanned_tree = decl_index.is_borrowed_include_dir(&dir);
+                Some(Repair::AddIncludeDir {
+                    dir,
+                    outside_scanned_tree,
+                })
             } else if c_stub_gen::is_config_header(path) {
                 // A project that ships only `config.h.in` (autoconf/cmake): an
                 // empty placeholder leaves `#ifdef HAVE_CONFIG_H`-guarded code
@@ -3050,9 +3066,11 @@ pub(crate) fn plan_repair_forced_with_source_policy(
                     header_path: Some(path.clone()),
                 })
             } else if let Some(source_path) = decl_index.unique_header_for(path) {
+                let outside_scanned_tree = decl_index.is_borrowed_include_dir(&source_path);
                 Some(Repair::HeaderForward {
                     virtual_path: path.clone(),
                     source_path,
+                    outside_scanned_tree,
                 })
             } else {
                 Some(Repair::HeaderPlaceholder {
@@ -5478,6 +5496,61 @@ mod tests {
         );
     }
 
+    /// A missing header found only in another project of the same checkout
+    /// (outside the scanned tree) still resolves to its real dir or file, and
+    /// the repair says it came from outside the scanned tree; one from the
+    /// scanned tree does not.
+    #[test]
+    fn a_header_from_outside_the_scanned_tree_is_marked_on_its_repair() {
+        let root = tmpdir();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let scan = root.join("app tree");
+        let sibling = root.join("other project/tableinc");
+        fs::create_dir_all(scan.join("inc")).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("table.h"), "#define TABLE_ROWS 4\n").unwrap();
+        fs::write(sibling.join("cells.h"), "#define CELL_WIDTH 2\n").unwrap();
+        fs::write(scan.join("inc/local.h"), "#define LOCAL 1\n").unwrap();
+        let idx = crate::auto::decl_index::DeclarationIndex::build_indexed(&scan, &root).unwrap();
+        let plan = |path: &str| {
+            plan_repair(
+                &BuildErrorKind::MissingHeader {
+                    path: path.to_owned(),
+                },
+                &idx,
+            )
+        };
+        assert!(
+            matches!(&plan("table.h"),
+                Some(Repair::AddIncludeDir { dir, outside_scanned_tree: true }) if dir == &sibling),
+            "{:?}",
+            plan("table.h")
+        );
+        assert!(
+            matches!(
+                &plan("layout/cells.h"),
+                Some(Repair::HeaderForward {
+                    outside_scanned_tree: true,
+                    ..
+                })
+            ),
+            "{:?}",
+            plan("layout/cells.h")
+        );
+        assert!(
+            matches!(
+                &plan("local.h"),
+                Some(Repair::AddIncludeDir {
+                    outside_scanned_tree: false,
+                    ..
+                })
+            ),
+            "{:?}",
+            plan("local.h")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn missing_installed_layout_header_forwards_to_unique_real_header() {
         let root = tmpdir();
@@ -5495,7 +5568,7 @@ mod tests {
         )
         .expect("unique in-tree basename should be forwarded");
         assert!(
-            matches!(&repair, Repair::HeaderForward { virtual_path, source_path }
+            matches!(&repair, Repair::HeaderForward { virtual_path, source_path, outside_scanned_tree: false }
                 if virtual_path == "yajl/yajl_common.h" && source_path == &real),
             "got: {repair:?}"
         );

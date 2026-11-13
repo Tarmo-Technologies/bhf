@@ -347,7 +347,10 @@ pub struct BuildFidelity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FabricatedInput {
-    /// `macro`, `header` or `type`.
+    /// `macro`, `header` or `type`; or `include_dir`, a dir of real headers
+    /// found by file name outside the scanned tree (in the rest of the
+    /// project a subdir run reads headers from), which may be another
+    /// project's.
     pub kind: String,
     pub name: String,
     /// The value given to a macro (`0`, empty), or the type a placeholder
@@ -360,7 +363,8 @@ impl BuildFidelity {
     /// At most this many fabricated inputs are named in a caveat.
     const NAMED: usize = 6;
 
-    /// The fabricated inputs as `macro NAME=VALUE`, `header NAME`, `type NAME`.
+    /// The fabricated inputs as `macro NAME=VALUE`, `header NAME`, `type NAME`,
+    /// `headers from DIR (outside the scanned tree)`.
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = self
             .fabricated
@@ -370,6 +374,9 @@ impl BuildFidelity {
                 |input| match (input.kind.as_str(), input.value.as_deref()) {
                     ("macro", Some(value)) if !value.is_empty() => {
                         format!("macro {}={value}", input.name)
+                    }
+                    ("include_dir", _) => {
+                        format!("headers from {} (outside the scanned tree)", input.name)
                     }
                     (kind, _) => format!("{kind} {}", input.name),
                 },

@@ -219,9 +219,16 @@ a macro value or a type undefined, the repair loop writes a placeholder
 (an empty header, `#define NAME 0`, `typedef void *T`) so the target
 compiles. Code compiled against a placeholder can take paths the real build
 never does, so such a finding may be false or need an input the real build
-rejects. Each one says so: its `finding.json` has `build.fidelity`
-(`{level: "reduced", context, fabricated: [{kind, name, value}]}`), its
-normalized record is low confidence with a caveat in INDEX.md, findings.csv's
+rejects. The same holds for a header found by its file name outside the
+scanned tree: a subdir run of a checkout reads headers from the whole
+checkout, so in a monorepo the header can be another project's, with that
+project's definitions. A header from the scanned tree wins over such a one,
+and a dir named with `--extra-include` is never counted. Each such finding
+says so: its `finding.json` has `build.fidelity`
+(`{level: "reduced", context, fabricated: [{kind, name, value}]}`, `kind`
+`macro`, `header`, `type` or `include_dir`) and an `actionability.confidence`
+of `low`, its normalized record is low confidence with a caveat in INDEX.md,
+findings.csv's
 `build_fidelity` column and `bhf explain`, and `run.json` lists the target's
 `build_fidelity` and counts the targets in `summary.fabricated_build_context`.
 The console summary and `run.md` list them too. Supply the real context (a

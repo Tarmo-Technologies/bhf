@@ -46,6 +46,20 @@ pub(crate) fn for_target(repairs: &[Repair], harness_dir: &Path) -> Option<Build
             | Repair::ConfigHeaderSynth { virtual_path } => {
                 push("header", virtual_path, None);
             }
+            // A real header, but found by its file name outside the scanned
+            // tree: another project's definitions, perhaps.
+            Repair::AddIncludeDir {
+                dir,
+                outside_scanned_tree: true,
+            } => push("include_dir", &dir.display().to_string(), None),
+            Repair::HeaderForward {
+                source_path,
+                outside_scanned_tree: true,
+                ..
+            } => {
+                let dir = source_path.parent().unwrap_or(source_path);
+                push("include_dir", &dir.display().to_string(), None);
+            }
             // A real header included for the type is no fabrication.
             Repair::TypePlaceholder {
                 resolved_header: Some(_),
@@ -144,9 +158,24 @@ pub(crate) fn incomplete_context_headers(fidelity: &BuildFidelity) -> Vec<&str> 
         .collect()
 }
 
+/// Floor a `finding.json`'s `actionability.confidence` to `low`, the level
+/// every report (findings.json, findings.csv, INDEX.md, explain) gives a
+/// finding from a build with fabricated inputs or a forced stub build. `true`
+/// when the value changed.
+pub(crate) fn floor_actionability_confidence(raw: &mut serde_json::Value) -> bool {
+    match raw.pointer_mut("/actionability/confidence") {
+        Some(confidence) if confidence != "low" => {
+            *confidence = serde_json::Value::from("low");
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Stamp `build.fidelity` onto every `finding.json` produced by a harness in
-/// `by_harness`. Like the forced floor, the record is a fact of the build the
-/// finding came from: a later run only ever adds it.
+/// `by_harness`, and floor its `actionability.confidence` when the build
+/// fabricated an input. Like the forced floor, the record is a fact of the
+/// build the finding came from: a later run only ever adds it.
 pub(crate) fn annotate_findings(work_dir: &Path, by_harness: &BTreeMap<String, BuildFidelity>) {
     if by_harness.is_empty() {
         return;
@@ -186,10 +215,16 @@ pub(crate) fn annotate_findings(work_dir: &Path, by_harness: &BTreeMap<String, B
         if let Some(build) = build.as_object_mut() {
             build.insert("fidelity".to_owned(), value);
         }
+        let floored = !fidelity.fabricated.is_empty() && floor_actionability_confidence(&mut raw);
         if raw == before {
             continue;
         }
-        corpus::finding::append_history(&mut raw, "auto", &["build.fidelity"]);
+        let fields: &[&str] = if floored {
+            &["build.fidelity", "actionability.confidence"]
+        } else {
+            &["build.fidelity"]
+        };
+        corpus::finding::append_history(&mut raw, "auto", fields);
         if let Ok(serialized) = serde_json::to_vec_pretty(&raw) {
             if let Err(error) = crate::auto::report::atomic_write(&path, &serialized) {
                 bhfeprintln!(
@@ -204,6 +239,7 @@ pub(crate) fn annotate_findings(work_dir: &Path, by_harness: &BTreeMap<String, B
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn fabricated_inputs_are_named_with_the_values_written() {
@@ -280,6 +316,56 @@ mod tests {
         );
         assert_eq!(incomplete_context_headers(&fidelity), vec!["tables.h"]);
         assert!(for_target(&[Repair::StubBlind { symbol: "x".into() }], temp.path()).is_none());
+    }
+
+    /// A header dir or forwarded header taken from outside the scanned tree
+    /// (another project of a monorepo, found by file name) reduces the build's
+    /// fidelity: its definitions may not be the ones this project builds with.
+    /// One from the scanned tree does not.
+    #[test]
+    fn headers_from_outside_the_scanned_tree_reduce_fidelity() {
+        let temp = tempfile::tempdir().unwrap();
+        let borrowed = [
+            Repair::AddIncludeDir {
+                dir: PathBuf::from("/src/mono/other project/tableinc"),
+                outside_scanned_tree: true,
+            },
+            Repair::HeaderForward {
+                virtual_path: "layout/cells.h".to_owned(),
+                source_path: PathBuf::from("/src/mono/other project/cells.h"),
+                outside_scanned_tree: true,
+            },
+            Repair::AddIncludeDir {
+                dir: PathBuf::from("/src/mono/app tree/inc"),
+                outside_scanned_tree: false,
+            },
+        ];
+        let fidelity = for_target(&borrowed, temp.path()).expect("reduced");
+        assert_eq!(fidelity.level, "reduced");
+        let named: Vec<(&str, &str)> = fidelity
+            .fabricated
+            .iter()
+            .map(|input| (input.kind.as_str(), input.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("include_dir", "/src/mono/other project/tableinc"),
+                ("include_dir", "/src/mono/other project"),
+            ]
+        );
+        assert!(
+            fidelity.caveat().contains(
+                "headers from /src/mono/other project/tableinc (outside the scanned tree)"
+            ),
+            "{}",
+            fidelity.caveat()
+        );
+        let in_tree = [Repair::AddIncludeDir {
+            dir: PathBuf::from("/src/mono/app tree/inc"),
+            outside_scanned_tree: false,
+        }];
+        assert!(for_target(&in_tree, temp.path()).is_none());
     }
 
     /// A type the repair resolved by including its real header (`cerr` from

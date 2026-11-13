@@ -4502,7 +4502,7 @@ fn repair_key(repair: &Repair) -> String {
         Repair::HeaderPlaceholder { virtual_path } => virtual_path.clone(),
         Repair::HeaderForward { virtual_path, .. } => format!("forward-h:{virtual_path}"),
         Repair::ConfigHeaderSynth { virtual_path } => format!("config-h:{virtual_path}"),
-        Repair::AddIncludeDir { dir } => dir.display().to_string(),
+        Repair::AddIncludeDir { dir, .. } => dir.display().to_string(),
         Repair::IncludeTypeHeader { type_name, .. } => format!("type-header:{type_name}"),
         Repair::TypePlaceholder { type_name, .. } => type_name.clone(),
         Repair::TypeAlias { type_name, .. } => type_name.clone(),

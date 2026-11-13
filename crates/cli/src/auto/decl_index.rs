@@ -167,6 +167,45 @@ pub struct DeclarationIndex {
     /// `#include` is still paired. Held behind `Arc` so the per-target harness path
     /// clones the handle, not the vector.
     pub c_tree_lifecycle: std::sync::Arc<Vec<harness_gen::c_generate::CHandleLifecycle>>,
+    /// `(scanned tree, project root)` when the header index reaches past the
+    /// scanned tree to the project root (a subdir run): a header found there
+    /// but outside the scanned tree may belong to another project of the same
+    /// checkout. `None` when the two are the same dir.
+    widened_header_root: Option<(PathBuf, PathBuf)>,
+    /// Header search roots the operator named (`--extra-include`): headers
+    /// from them are the operator's choice, never borrowed.
+    operator_header_roots: Vec<PathBuf>,
+    /// Roots holding files recovered from the checkout's history, each laid
+    /// out like the checkout (repo-relative paths): a header there is judged by
+    /// where it lived in the checkout.
+    vcs_recovery_roots: Vec<PathBuf>,
+}
+
+/// `path` and `root` in one spelling: `/` separators and no `\\?\` verbatim
+/// prefix, since the header index spells a dir with `/` and a canonicalized
+/// root can carry the prefix.
+fn plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text
+        .strip_prefix("//?/UNC/")
+        .map(|rest| format!("//{rest}"))
+        .or_else(|| text.strip_prefix("//?/").map(str::to_owned))
+        .unwrap_or(text);
+    PathBuf::from(text)
+}
+
+/// Whether `path` is `root` or lies under it, compared in one spelling
+/// ([`plain_path`]).
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    plain_path(path).starts_with(plain_path(root))
+}
+
+/// `path` relative to `root` when it lies under it ([`plain_path`] spelling).
+fn path_relative_to(path: &Path, root: &Path) -> Option<PathBuf> {
+    plain_path(path)
+        .strip_prefix(plain_path(root))
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// The directory the cross-tree index should be built from when harnessing
@@ -207,6 +246,7 @@ impl DeclarationIndex {
         if header_root != parse_root {
             idx.extend_header_paths(header_root)?;
             idx.extend_ada_unit_paths(header_root)?;
+            idx.widened_header_root = Some((parse_root.to_path_buf(), header_root.to_path_buf()));
         }
         // Drop Ada units that live only in GPR scenario-excluded dirs (libkeccak's
         // SIMD `src/x86_64/AVX2`): the default build never compiles them, so the
@@ -290,8 +330,35 @@ impl DeclarationIndex {
     pub fn add_header_search_roots(&mut self, roots: &[PathBuf]) -> std::io::Result<()> {
         for root in roots {
             self.extend_header_paths(root)?;
+            if !self.operator_header_roots.contains(root) {
+                self.operator_header_roots.push(root.clone());
+            }
         }
         Ok(())
+    }
+
+    /// Whether a header dir (or header) resolved from this index lies outside
+    /// the scanned tree, in the wider project the header index reaches on a
+    /// subdir run, and not under an `--extra-include` root. Such a header was
+    /// chosen by its file name alone: in a monorepo it can be another
+    /// project's, whose definitions this project never builds with.
+    pub fn is_borrowed_include_dir(&self, dir: &Path) -> bool {
+        let Some((scanned, project)) = &self.widened_header_root else {
+            return false;
+        };
+        // A recovered file lived at the same repo-relative path in the checkout.
+        let recovered = self
+            .vcs_recovery_roots
+            .iter()
+            .find_map(|root| path_relative_to(dir, root))
+            .map(|relative| project.join(relative));
+        let dir = recovered.as_deref().unwrap_or(dir);
+        path_is_within(dir, project)
+            && !path_is_within(dir, scanned)
+            && !self
+                .operator_header_roots
+                .iter()
+                .any(|root| path_is_within(dir, root))
     }
 
     /// Fold the `.c`/`.cpp` DEFINITION sources from additional roots — `auto
@@ -392,6 +459,9 @@ impl DeclarationIndex {
     /// visible to the real-source repair indexes. Only files in the recovery
     /// root are parsed, so the surviving tree is not duplicated.
     pub fn add_vcs_recovery_root(&mut self, root: &Path) -> std::io::Result<()> {
+        if !self.vcs_recovery_roots.iter().any(|known| known == root) {
+            self.vcs_recovery_roots.push(root.to_path_buf());
+        }
         let recovered = Self::build_parsed(root)?;
         merge_vec_map(&mut self.c, recovered.c);
         merge_vec_map(&mut self.cpp, recovered.cpp);
@@ -985,8 +1055,10 @@ impl DeclarationIndex {
                     .map(PathBuf::from)
             })
             .collect();
-        // Prefer the shortest root (the canonical include dir over a deep copy).
-        roots.sort_by_key(|root| root.as_os_str().len());
+        // Prefer a root in the scanned tree over one borrowed from the rest of
+        // the project, then the shortest root (the canonical include dir over
+        // a deep copy).
+        roots.sort_by_key(|root| (self.is_borrowed_include_dir(root), root.as_os_str().len()));
         if let Some(root) = roots.into_iter().next() {
             return Some(root);
         }
@@ -2937,6 +3009,106 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
             !struct_names.contains(&"tcb"),
             "struct with a pointer field must be dropped: {struct_names:?}"
         );
+    }
+
+    /// A subdir run reads headers from the whole project, so a header can come
+    /// from a directory outside the scanned tree (another project of the same
+    /// checkout). Such a dir is reported as borrowed, an in-tree one with the
+    /// same header wins over it, and a dir the operator named with
+    /// `--extra-include` is not borrowed.
+    #[test]
+    fn include_dirs_outside_the_scanned_tree_are_borrowed() {
+        let root = tmpdir();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let scan = root.join("app tree");
+        let sibling = root.join("other project/tableinc");
+        let vendor = root.join("vendor/include");
+        for dir in [&scan, &sibling, &vendor] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            scan.join("main.c"),
+            "int parse(const char *p) { return p[0]; }\n",
+        )
+        .unwrap();
+        fs::write(sibling.join("table.h"), "#define TABLE_ROWS 4\n").unwrap();
+        fs::write(vendor.join("vendor.h"), "#define VENDOR_ID 1\n").unwrap();
+
+        let mut idx = DeclarationIndex::build_indexed(&scan, &root).unwrap();
+        let dir = idx
+            .include_root_for("table.h")
+            .expect("found in the project");
+        assert_eq!(dir, sibling);
+        assert!(idx.is_borrowed_include_dir(&dir), "{}", dir.display());
+        let vendor_dir = idx.include_root_for("vendor.h").unwrap();
+        assert!(idx.is_borrowed_include_dir(&vendor_dir));
+        idx.add_header_search_roots(std::slice::from_ref(&vendor))
+            .unwrap();
+        assert!(
+            !idx.is_borrowed_include_dir(&vendor_dir),
+            "an --extra-include dir is the operator's"
+        );
+
+        // The scanned tree's own copy of the header wins, even from a deeper
+        // dir than the sibling's.
+        let own = scan.join("src/include/tables/current");
+        fs::create_dir_all(&own).unwrap();
+        fs::write(own.join("table.h"), "#define TABLE_ROWS 8\n").unwrap();
+        let idx = DeclarationIndex::build_indexed(&scan, &root).unwrap();
+        let dir = idx.include_root_for("table.h").unwrap();
+        assert_eq!(dir, own);
+        assert!(!idx.is_borrowed_include_dir(&dir));
+
+        // A whole-project run borrows nothing.
+        let idx = DeclarationIndex::build_indexed(&root, &root).unwrap();
+        assert!(!idx.is_borrowed_include_dir(&sibling));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A header recovered from the checkout's history (deleted from the work
+    /// tree but tracked) is judged by where it lived in the checkout, not by
+    /// where bhf put it: a recovered header of the scanned tree is the tree's
+    /// own, wherever the work dir is, and one of another project is borrowed.
+    #[test]
+    fn recovered_headers_are_judged_by_their_place_in_the_checkout() {
+        let root = tmpdir();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let scan = root.join("app");
+        fs::create_dir_all(&scan).unwrap();
+        fs::write(scan.join("parse.c"), "int parse(int x) { return x; }\n").unwrap();
+        let outside = tmpdir();
+        for recovery in [
+            root.join("bhf_work/vcs_recovery"),
+            outside.join("vcs_recovery"),
+        ] {
+            fs::create_dir_all(recovery.join("app/inc")).unwrap();
+            fs::create_dir_all(recovery.join("other project/inc")).unwrap();
+            fs::write(recovery.join("app/inc/limits_cfg.h"), "#define LIMIT 4\n").unwrap();
+            fs::write(
+                recovery.join("other project/inc/peer.h"),
+                "#define PEER 1\n",
+            )
+            .unwrap();
+            let mut idx = DeclarationIndex::build_indexed(&scan, &root).unwrap();
+            idx.add_vcs_recovery_root(&recovery).unwrap();
+            let own = idx
+                .include_root_for("limits_cfg.h")
+                .expect("recovered header");
+            assert_eq!(own, recovery.join("app/inc"));
+            assert!(
+                !idx.is_borrowed_include_dir(&own),
+                "the scanned tree's own recovered header: {}",
+                own.display()
+            );
+            let peer = idx.include_root_for("peer.h").expect("recovered header");
+            assert!(
+                idx.is_borrowed_include_dir(&peer),
+                "another project's recovered header: {}",
+                peer.display()
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

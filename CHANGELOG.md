@@ -5,6 +5,18 @@
 ## Unreleased
 
 ### Fixed
+- A finding from a build with fabricated inputs, or from a forced stub build,
+  now has `actionability.confidence` `low` in its `finding.json`, the level
+  findings.json, findings.csv, INDEX.md and `bhf explain` already gave it; it
+  read `medium` or `high` there. Such a sanitizer crash's
+  `confirmation.level` is accordingly `crash_lead` (a low-confidence crash),
+  not `sanitizer_crash`, in findings.json, findings.csv and INDEX.md.
+- A subdir run reads headers from the whole checkout. A header found there
+  by its file name outside the scanned tree, which in a monorepo can be
+  another project's, now reduces the build's fidelity (`build.fidelity`
+  entry of kind `include_dir`, low confidence, a caveat in every report),
+  and a copy of the header in the scanned tree wins over it. A dir named
+  with `--extra-include` is not counted.
 - Windows: cartography, provenance, the capability profiler and coverage
   replay no longer run a harness through `timeout`, which on Windows is the
   console pause command and ran nothing: cartography mapped no finding and no
