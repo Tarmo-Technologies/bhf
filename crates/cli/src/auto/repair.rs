@@ -233,6 +233,15 @@ pub enum Repair {
     /// method calls (`GetLength`/`GetAt`), so such targets degrade to a report-only
     /// static scan instead (the graceful path).
     Win32Pack,
+    /// The C++ target builds with a compiler compatibility flag from the work
+    /// dir's `cxx_compat.mk`, in each compiler family's spelling, for a
+    /// construct only MSVC accepts by default (`reason`). Applying it is a
+    /// no-op: the build adds the fragment itself; this records that it did.
+    CompilerCompat {
+        clang: Vec<String>,
+        gcc: Vec<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -274,6 +283,7 @@ impl RepairManifest {
             Repair::PlatformStub { platform } => key == format!("platform-stub:{platform}"),
             Repair::ForcedSyntheticParams { .. } => key == "forced-synthetic-params",
             Repair::Win32Pack => key == "win32-pack",
+            Repair::CompilerCompat { .. } => key == "compiler-compat",
         })
     }
 }
@@ -2062,9 +2072,10 @@ pub fn apply_repair_with_source(
                 resolved_header: None,
             })
         }
-        Repair::ForcedSyntheticParams { .. } => {
-            // Label-only marker: the lane's own generator already emitted the
-            // synthesized value into the harness source. Nothing to apply here.
+        Repair::ForcedSyntheticParams { .. } | Repair::CompilerCompat { .. } => {
+            // Label-only markers: the lane's own generator already emitted the
+            // synthesized value into the harness source, and the build takes
+            // the compatibility fragment itself. Nothing to apply here.
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],

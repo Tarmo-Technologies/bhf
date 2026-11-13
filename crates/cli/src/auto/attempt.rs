@@ -3288,6 +3288,20 @@ fn run_attempt(
                             recorded_by: "auto",
                         },
                     );
+                    // The work dir's C++ compatibility fragment reached this
+                    // build: say so where the target's repairs are recorded.
+                    let compat =
+                        crate::auto::coverage_replay::work_dir_compat_flags(work_dir, true);
+                    if is_cpp
+                        && !(compat.clang.is_empty() && compat.gcc.is_empty())
+                        && !manifest.already_attempted("compiler-compat")
+                    {
+                        manifest.repairs.push(Repair::CompilerCompat {
+                            clang: compat.clang,
+                            gcc: compat.gcc,
+                            reason: CXX_COMPAT_REASON.to_owned(),
+                        });
+                    }
                 }
                 // Drive a cascade of fuzz passes against the freshly
                 // built harness. Three tiny seeds + 1024 iterations is
@@ -4459,6 +4473,7 @@ fn repair_key(repair: &Repair) -> String {
         Repair::PlatformStub { platform } => format!("platform-stub:{platform}"),
         Repair::ForcedSyntheticParams { .. } => "forced-synthetic-params".to_owned(),
         Repair::Win32Pack => "win32-pack".to_owned(),
+        Repair::CompilerCompat { .. } => "compiler-compat".to_owned(),
     }
 }
 
@@ -4597,6 +4612,7 @@ fn repair_replaces_candidate_target(repair: &Repair, candidate: &Candidate) -> b
         | Repair::StubGprImport { .. }
         | Repair::PlatformStub { .. }
         | Repair::ForcedSyntheticParams { .. }
+        | Repair::CompilerCompat { .. }
         | Repair::Win32Pack => false,
     }
 }
@@ -6456,6 +6472,7 @@ fn try_build_c(
             chosen_std.as_deref(),
         );
         if build_succeeded(&compat_output) {
+            announce_cxx_compat(harness_id);
             *built_standard = chosen_std.clone();
             return BuildOutcome::Success;
         }
@@ -6463,6 +6480,7 @@ fn try_build_c(
         let compat_errors = build_classifier::classify(&compat_raw);
         if !output_has_extra_qualification(&compat_errors) {
             // The class is gone; whatever remains is the next thing to repair.
+            announce_cxx_compat(harness_id);
             raw_output = compat_raw;
             persist_c_build_output(work_dir, harness_id, &raw_output);
             errors = compat_errors;
@@ -6672,6 +6690,18 @@ const CXX_COMPAT_EXTRA_QUALIFICATION: &str =
     "# Written by bhf auto: members declared with their own class's qualification.\n\
 CXX_COMPAT_FLAGS_CLANG := -fms-extensions\n\
 CXX_COMPAT_FLAGS_GCC := -fpermissive\n";
+
+/// Why bhf adds [`CXX_COMPAT_EXTRA_QUALIFICATION`]'s flags, as the run says it.
+const CXX_COMPAT_REASON: &str = "a member declared with an extra class qualification";
+
+/// Say that a target builds with the C++ compatibility flags, once, when the
+/// build adopts them.
+fn announce_cxx_compat(harness_id: &str) {
+    bhfeprintln!(
+        "bhf auto: {harness_id}: building with -fms-extensions (clang) / -fpermissive (gcc) \
+         for {CXX_COMPAT_REASON}"
+    );
+}
 
 /// Whether a classified build failure includes an extra member qualification.
 fn output_has_extra_qualification(errors: &[BuildErrorKind]) -> bool {

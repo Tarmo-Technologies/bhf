@@ -5365,7 +5365,8 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
         mut ada,
         mut incdirs,
         mut platforms,
-    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        mut compat,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     for repair in repairs {
         match repair {
             HeaderPlaceholder { .. } | ConfigHeaderSynth { .. } => headers += 1,
@@ -5381,6 +5382,7 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
             | OverrideAdaBodyStub { .. }
             | StubGprImport { .. } => ada += 1,
             PlatformStub { .. } | Win32Pack | ForcedSyntheticParams { .. } => platforms += 1,
+            CompilerCompat { .. } => compat += 1,
         }
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -5420,6 +5422,9 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
             "stub-isolated {platforms} platform{}",
             plural(platforms)
         ));
+    }
+    if compat > 0 {
+        parts.push("added a compiler compatibility flag".to_owned());
     }
     Some(parts.join(", "))
 }

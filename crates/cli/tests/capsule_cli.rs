@@ -1985,3 +1985,161 @@ fn verify_poc_does_not_blame_a_packaging_build_failure_once_the_capsule_builds()
         "{out}"
     );
 }
+
+/// Uses `std::cerr` without including `<iostream>`: the compile database
+/// force-includes it.
+#[cfg(unix)]
+const NEEDS_IOSTREAM_CPP: &str = "\
+#include <cstdlib>
+#include <cstring>
+int parse_record(const char *data, unsigned long len) {
+    if (len == 0) {
+        std::cerr << \"empty record\\n\";
+        return 0;
+    }
+    char *buf = static_cast<char *>(std::malloc(4));
+    std::memcpy(buf, data, len);
+    int r = buf[0];
+    std::free(buf);
+    return r;
+}
+";
+
+/// A compile database's `-include iostream` names a system header the
+/// compiler finds itself: the capsule keeps it as written instead of
+/// pointing it at a file next to the harness, and rebuilds.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn a_forced_system_header_from_the_compile_database_stays_a_bare_name() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("src");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(
+        tree.join("compile_commands.json"),
+        serde_json::json!([{
+            "directory": tree,
+            "file": tree.join("widget.cpp"),
+            "arguments": ["clang++", "-include", "iostream", "-c", "widget.cpp", "-o", "widget.o"],
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let (work, stderr) = auto_tree(root.path(), &[("widget.cpp", NEEDS_IOSTREAM_CPP)], "cpp");
+    let (id, _) = crash_finding(&work, |h| h.starts_with("H-X"))
+        .unwrap_or_else(|| panic!("auto produced no C++ crash finding: {stderr}"));
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let build = std::fs::read_to_string(cap.join("build.sh")).unwrap();
+    assert!(build.contains("-include iostream "), "{build}");
+    assert!(!build.contains("/iostream"), "{build}");
+    let (pass, verify) = verify_from_scratch(&cap, "forced-system-header");
+    assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+}
+
+/// Declares a member with its own class's qualification, which only MSVC
+/// takes by default: clang needs `-fms-extensions`, gcc `-fpermissive`.
+#[cfg(unix)]
+const QUALIFIED_MEMBER_H: &str = "\
+#pragma once
+#include <cstddef>
+class Widget {
+public:
+    int Widget::copy_at(const char *data, std::size_t len);
+};
+";
+
+#[cfg(unix)]
+const QUALIFIED_MEMBER_CPP: &str = "\
+#include \"widget.h\"
+#include <cstdlib>
+#include <cstring>
+int Widget::copy_at(const char *data, std::size_t len) {
+    char *buf = static_cast<char *>(std::malloc(4));
+    std::memcpy(buf, data, len);
+    int r = len ? buf[0] : 0;
+    std::free(buf);
+    return r;
+}
+";
+
+/// The compatibility flag `bhf auto` adds for a member declared with an extra
+/// qualification is announced, recorded as a repair and in the build recipe,
+/// and applied by the capsule, which rebuilds and reproduces from a clean copy.
+// The build.sh round trip of a Linux toolchain; build.ps1 has its own.
+#[cfg(unix)]
+#[test]
+fn the_cpp_compatibility_flag_is_recorded_and_reaches_the_capsule() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (work, stderr) = auto_tree(
+        root.path(),
+        &[
+            ("widget.h", QUALIFIED_MEMBER_H),
+            ("widget.cpp", QUALIFIED_MEMBER_CPP),
+        ],
+        "cpp",
+    );
+    let (id, finding_dir) = crash_finding(&work, |h| h.starts_with("H-X"))
+        .unwrap_or_else(|| panic!("auto produced no C++ crash finding: {stderr}"));
+    assert!(
+        stderr.contains("building with -fms-extensions (clang) / -fpermissive (gcc)"),
+        "the flag is announced:\n{stderr}"
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+    let harness_id = raw["harness_id"].as_str().unwrap();
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    let target = run["targets"]
+        .as_array()
+        .and_then(|targets| targets.iter().find(|t| t["harness_id"] == harness_id))
+        .unwrap_or_else(|| panic!("no run.json target for {harness_id}: {run}"));
+    assert!(
+        target["outcome"]["repairs"]
+            .as_array()
+            .is_some_and(|repairs| repairs.iter().any(|repair| {
+                repair["kind"] == "compiler_compat" && repair["clang"][0] == "-fms-extensions"
+            })),
+        "{target}"
+    );
+    let recipe: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            work.join("harnesses")
+                .join(harness_id)
+                .join("coverage-build-recipe.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recipe["compat_flags"]["clang"][0], "-fms-extensions",
+        "{recipe}"
+    );
+    assert_eq!(recipe["compat_flags"]["gcc"][0], "-fpermissive", "{recipe}");
+    let packaged = capsule_for(&work, &id);
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains(&format!("capsule_{id}  (✓)")),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let build = std::fs::read_to_string(cap.join("build.sh")).unwrap();
+    assert!(build.contains("COMPAT=\"-fms-extensions\""), "{build}");
+    let (pass, verify) = verify_from_scratch(&cap, "cxx-compat");
+    assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+}

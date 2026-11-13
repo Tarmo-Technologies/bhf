@@ -651,7 +651,14 @@ and explain it — all offline and deterministic (no LLM):
   the language standard (`CXX_STD`/`C_STD` or the dialect ladder's), the
   extra sources and include dirs, the `AUTO_EXTRA_INCLUDES` and
   `AUTO_EXTRA_LDFLAGS` words, the `[toolchain]` flags, the work dir's
-  compatibility flags and the compiler family. The stubs and forwarding
+  compatibility flags (`-fcommon` for C; for C++ clang's `-fms-extensions`
+  and gcc's `-fpermissive`, which `build.sh` picks by the family of the
+  compiler that runs it, and `build.ps1` spells `/permissive` for cl and
+  clang-cl) and the compiler family. A forced include that names
+  no file next to the build (`-include iostream`, from a compile database,
+  `AUTO_EXTRA_INCLUDES` or the toolchain flags) is a header the compiler finds
+  on its own search path, and `build.sh` passes it as written. The stubs and
+  forwarding
   headers bhf synthesized name the headers they need by absolute path; the
   capsule ships those headers and rewrites each such `#include` relative to
   the stub. A capsule is portable when no file it ships and no manifest field

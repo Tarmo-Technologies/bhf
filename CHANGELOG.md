@@ -5,6 +5,19 @@
 ## Unreleased
 
 ### Fixed
+- A forced include that names no file next to the build (`-include
+  iostream` from a compile database, `AUTO_EXTRA_INCLUDES` or the toolchain
+  flags) reaches a capsule's `build.sh` as written, instead of as a missing
+  file beside the harness, so the capsule rebuilds; only a forced include
+  that is a file ships.
+- The C++ compatibility flag `bhf auto` adds for a member declared with an
+  extra class qualification (`-fms-extensions` for clang, `-fpermissive` for
+  gcc, from the work dir's `cxx_compat.mk`) is announced, recorded among the
+  target's repairs (`compiler_compat` in `run.json` and `result.json`) and in
+  its build recipe (`compat_flags`), and applied by its capsule: `build.sh`
+  passes the spelling of the compiler family that runs it, and `build.ps1`
+  each dialect's (clang's `-fms-extensions`; for cl and clang-cl the
+  permissive mode, `/permissive`).
 - A C or C++ capsule of a target that needed a synthesized stub or
   forwarding header rebuilds where the scanned tree is gone: the stubs and
   repair headers bhf wrote name the headers they need by absolute path, and
@@ -949,6 +962,9 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- A target's repairs (`run.json` `targets[].outcome.repairs`, the harness's
+  `result.json`) can name a new kind, `compiler_compat` (`clang`, `gcc`,
+  `reason`): the compatibility flags its C++ build took.
 - `coverage-build-recipe.json` is schema 2: it adds `extra_compile_flags`,
   `extra_ldflags`, `compat_flags`, `toolchain`, `compiler_family` and
   `recorded_by`. Schema 1 recipes are still read by the coverage replay and

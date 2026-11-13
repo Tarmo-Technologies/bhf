@@ -2375,6 +2375,8 @@ fn add_checkpoint_result(
             // (#5's rule for codegen errors). The finding-level forced caveat and the
             // blocker histogram already carry it.
             | Repair::ForcedSyntheticParams { .. }
+            // A compiler compatibility flag is a build adjustment bhf made.
+            | Repair::CompilerCompat { .. }
             | Repair::Win32Pack => {}
         }
     }
@@ -2855,6 +2857,8 @@ fn aggregate_repairs(
             // Reduced-fidelity label for a forced Go/C# parameter or receiver;
             // surfaced per-finding as the forced caveat, not as a dependency.
             Repair::ForcedSyntheticParams { .. } => {}
+            // A compiler flag bhf added to the build, not a dependency.
+            Repair::CompilerCompat { .. } => {}
         }
     }
 }

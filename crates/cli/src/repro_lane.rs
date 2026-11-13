@@ -1598,6 +1598,9 @@ fn no_fortify_flags() -> impl Iterator<Item = String> {
 /// A build.sh word that expands to the sanitizer flags of the compiler that
 /// runs the script (`$SANITIZE`), which the script picks by asking it.
 const SANITIZE_WORD: &str = "\u{1}SANITIZE";
+/// A build.sh word that expands to the compatibility flags of the compiler
+/// that runs the script (`$COMPAT`), when the families spell them differently.
+const COMPAT_WORD: &str = "\u{1}COMPAT";
 /// The Makefile's `SECTION_FLAGS`: without them (and the matching linker
 /// garbage collection) an isolated target inherits undefined references from
 /// every unused function in its translation unit.
@@ -2008,7 +2011,10 @@ impl Arg {
 }
 
 /// Classify compiler tokens, resolving relative paths against `base` (the
-/// directory make runs the recipe in).
+/// directory make runs the recipe in). A forced include (`-include`,
+/// `-imacros`) is a path only when it is absolute or names a file under
+/// `base`; otherwise (`-include iostream`) the compiler finds it on its own
+/// search path, so both words stay as written.
 fn parse_args(tokens: &[String], base: &Path) -> Vec<Arg> {
     let mut args = Vec::new();
     let mut index = 0;
@@ -2020,7 +2026,16 @@ fn parse_args(tokens: &[String], base: &Path) -> Vec<Arg> {
             .find(|flag| token.starts_with(**flag));
         match path_flag {
             Some(flag) if token == flag && index + 1 < tokens.len() => {
-                args.push(Arg::Split(flag, absolute(&tokens[index + 1], base)));
+                let operand = &tokens[index + 1];
+                let searched = FILE_FLAGS.contains(flag)
+                    && !is_rooted(operand)
+                    && !base.join(operand).is_file();
+                if searched {
+                    args.push(Arg::Text(token.clone()));
+                    args.push(Arg::Text(operand.clone()));
+                } else {
+                    args.push(Arg::Split(flag, absolute(operand, base)));
+                }
                 index += 2;
                 continue;
             }
@@ -2053,6 +2068,13 @@ fn link_args(tokens: &[String], base: &Path) -> Vec<Arg> {
             other => other,
         })
         .collect()
+}
+
+/// Whether `raw` names a place in the file system rather than a name to
+/// search for: an absolute path, or one rooted at a drive's root (`/x.h` on
+/// Windows).
+fn is_rooted(raw: &str) -> bool {
+    Path::new(raw).is_absolute() || raw.starts_with('/') || raw.starts_with('\\')
 }
 
 fn absolute(raw: &str, base: &Path) -> PathBuf {
@@ -2102,7 +2124,8 @@ pub(crate) struct BuildModel {
     includes: Vec<Arg>,
     extra_includes: Vec<Arg>,
     standard: Option<String>,
-    compat_flags: Vec<String>,
+    /// The work dir's compatibility flags the build took, per family.
+    compat: crate::auto::coverage_replay::CompatFlags,
     link_flags: Vec<Arg>,
     /// The recorded `[toolchain]` target and language compile flags.
     toolchain_flags: Vec<Arg>,
@@ -2258,15 +2281,23 @@ impl CFamilyLane {
                 extra_includes.push(Arg::Split("-idirafter", dir));
             }
         }
-        let compat_flags = match recipe
+        // What the recipe recorded, else what the work dir's fragments give
+        // the Makefile (`c_compat.mk`, `cxx_compat.mk`).
+        let compat = match recipe
             .as_ref()
-            .and_then(|recipe| recipe.compat_flags.as_ref())
+            .and_then(|recipe| recipe.compat_flags.clone())
         {
-            // C's compatibility flags are the same for every compiler.
-            Some(recorded) if !self.standard_leads => recorded.clang.clone(),
-            Some(_) => Vec::new(),
-            None if self.standard_leads => Vec::new(),
-            None => read_compat_flags(&harness_dir),
+            Some(recorded) => recorded,
+            None => harness_dir
+                .parent()
+                .and_then(Path::parent)
+                .map(|work_dir| {
+                    crate::auto::coverage_replay::work_dir_compat_flags(
+                        work_dir,
+                        self.standard_leads,
+                    )
+                })
+                .unwrap_or_default(),
         };
         let link_flags = link_args(&facts.link_flags, &harness_dir);
         // The `[toolchain]` flags the Makefile appends to bhf's own: the
@@ -2328,7 +2359,7 @@ impl CFamilyLane {
             extra_sources,
             units,
             extra_includes,
-            compat_flags,
+            compat,
             link_flags,
             toolchain_flags,
             toolchain_cppflags,
@@ -2484,14 +2515,17 @@ impl CFamilyLane {
     }
 
     /// The full argument list (no output, no inputs) of the `main` compile.
+    /// `compat` stands for the compatibility flags (the family's own for a
+    /// scan, [`COMPAT_WORD`] for build.sh when the families differ).
     fn main_args(
         &self,
         model: &BuildModel,
         sanitize: &[String],
+        compat: &[String],
         map: &dyn Fn(&Path) -> String,
     ) -> Vec<String> {
         let mut args = self.leading_flags(model.standard.as_deref(), sanitize);
-        args.extend(model.compat_flags.iter().cloned());
+        args.extend(compat.iter().cloned());
         args.extend(FEATURE_TEST_FLAGS.iter().map(|f| (*f).to_owned()));
         args.extend(model.compile_db_flags.iter().flat_map(|a| a.render(map)));
         args.extend(model.toolchain_flags.iter().flat_map(|a| a.render(map)));
@@ -2513,10 +2547,11 @@ impl CFamilyLane {
         model: &BuildModel,
         unit: &Unit,
         sanitize: &[String],
+        compat: &[String],
         map: &dyn Fn(&Path) -> String,
     ) -> Vec<String> {
         let mut args = self.leading_flags(model.standard.as_deref(), sanitize);
-        args.extend(model.compat_flags.iter().cloned());
+        args.extend(compat.iter().cloned());
         args.extend(unit.flags.iter().flat_map(|a| a.render(map)));
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
         args.extend(model.extra_includes.iter().flat_map(|a| a.render(map)));
@@ -2580,9 +2615,13 @@ impl CFamilyLane {
             .chain(&model.compile_db_flags)
             .chain(&model.toolchain_flags)
             .chain(&model.toolchain_cppflags)
+            .chain(model.units.iter().flat_map(|unit| &unit.flags))
         {
+            // Only a forced include that is a file ships.
             if let Arg::Split("-include" | "-imacros", path) = arg {
-                files.insert(path.clone());
+                if path.is_file() {
+                    files.insert(path.clone());
+                }
             }
         }
         files.extend(
@@ -2600,13 +2639,14 @@ impl CFamilyLane {
             .chain(model.extra_sources.iter().cloned())
             .filter(|path| has_extension(path, SOURCE_EXTENSIONS))
             .collect();
+        let scan_compat = model.compat.for_family(family).to_vec();
         let mut scans = vec![(
-            self.main_args(model, &scan_sanitize, &original),
+            self.main_args(model, &scan_sanitize, &scan_compat, &original),
             main_inputs,
         )];
         for unit in &model.units {
             scans.push((
-                self.unit_args(model, unit, &scan_sanitize, &original),
+                self.unit_args(model, unit, &scan_sanitize, &scan_compat, &original),
                 vec![unit.source.clone()],
             ));
         }
@@ -2851,6 +2891,7 @@ impl CFamilyLane {
              {compiler_var}=\"${{{compiler_var}:-{}}}\"\n\
              {}\
              {}\
+             {}\
              case \"$(uname -s)\" in\n\
              \x20 Darwin) GC_LDFLAGS=-Wl,-dead_strip ;;\n\
              \x20 *) GC_LDFLAGS=-Wl,--gc-sections ;;\n\
@@ -2859,6 +2900,7 @@ impl CFamilyLane {
             sh_double_quoted(compiler),
             compiler_runner(compiler_var),
             self.sanitize_selection(family),
+            compat_selection(&model.compat),
         );
         let (stdlib_cflags, stdlib_ldflags) = if self.recovers_cpp_stdlib {
             script.push_str(&cpp_stdlib_fallback(compiler_var));
@@ -2887,9 +2929,10 @@ impl CFamilyLane {
                 .collect(),
         ));
         let sanitize = [SANITIZE_WORD.to_owned()];
+        let compat = compat_words(&model.compat);
         for (index, unit) in model.units.iter().enumerate() {
             let object = format!("obj/unit_{index}.o");
-            let args = shell_words(&self.unit_args(model, unit, &sanitize, &capsule_path));
+            let args = shell_words(&self.unit_args(model, unit, &sanitize, &compat, &capsule_path));
             script.push_str(&format!(
                 "cc_run {args}{stdlib_cflags} \\\n\x20 -c {} -o {object}\n",
                 sh_word(&capsule_path(&unit.source))
@@ -2918,7 +2961,7 @@ impl CFamilyLane {
         let extra_link = model.extra_link.join(" ");
         script.push_str(&format!(
             "cc_run {}{stdlib_cflags} \\\n\x20 -o poc {} $GC_LDFLAGS{stdlib_ldflags}{}{}\n",
-            shell_words(&self.main_args(model, &sanitize, &capsule_path)),
+            shell_words(&self.main_args(model, &sanitize, &compat, &capsule_path)),
             shell_words(&inputs),
             if link_words.is_empty() {
                 String::new()
@@ -3020,6 +3063,9 @@ impl CFamilyLane {
         facts.insert("compiler_source".to_owned(), json!(model.compiler.source));
         facts.insert("standard".to_owned(), json!(model.standard));
         facts.insert("recorded_recipe".to_owned(), json!(model.recorded_recipe));
+        if !(model.compat.clang.is_empty() && model.compat.gcc.is_empty()) {
+            facts.insert("compat_flags".to_owned(), json!(model.compat));
+        }
         facts.insert(
             "toolchain_flags".to_owned(),
             json!(model.toolchain_flags.len() + model.toolchain_cppflags.len()),
@@ -3075,47 +3121,60 @@ impl CFamilyLane {
             .unwrap_or_else(|| "x64".to_owned());
         // The GCC-style command lines: bhf's driver, each per-TU object, then
         // the harness compiled and linked with them (the Makefile's `main`).
-        let commands = |sanitize: &[String], ext: &str| -> Vec<(String, Vec<String>)> {
-            let words = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
-            let driver_object = format!("obj/bhf_driver.{ext}");
-            let mut driver_args = if cxx { words(&["-x", "c"]) } else { Vec::new() };
-            driver_args.extend(words(OPT_FLAGS));
-            driver_args.extend(words(FEATURE_TEST_FLAGS));
-            driver_args.extend(words(&["-c", driver, "-o", &driver_object]));
-            let mut commands = vec![("bhf_driver".to_owned(), driver_args)];
-            let mut objects = Vec::new();
-            for (index, unit) in model.units.iter().enumerate() {
-                let object = format!("obj/unit_{index}.{ext}");
-                let mut args = self.unit_args(model, unit, sanitize, capsule_path);
-                args.extend([
-                    "-c".to_owned(),
-                    capsule_path(&unit.source),
-                    "-o".to_owned(),
-                    object.clone(),
-                ]);
-                commands.push((format!("unit_{index}"), args));
-                objects.push(object);
-            }
-            let mut args = self.main_args(model, sanitize, capsule_path);
-            args.extend(words(&["-DBHF_EXTERNAL_DRIVER", "-o", "poc.exe"]));
-            args.push(capsule_path(&model.driver));
-            args.extend(model.target_sources.iter().map(|p| capsule_path(p)));
-            args.extend(objects);
-            args.extend(model.extra_sources.iter().map(|p| capsule_path(p)));
-            args.push(driver_object);
-            args.extend(
-                model
-                    .link_flags
-                    .iter()
-                    .chain(&model.extra_link_flags)
-                    .flat_map(|a| a.render(capsule_path)),
-            );
-            // The linker's own spelling of `--gc-sections`, which link.exe and
-            // lld-link take from clang and from cl alike.
-            args.push("-Wl,/OPT:REF".to_owned());
-            commands.push(("link".to_owned(), args));
-            commands
-        };
+        // The compatibility flags in each dialect's spelling: clang's own,
+        // and for cl (and clang-cl) the permissive mode gcc's `-fpermissive`
+        // names (`/permissive`, which the front end passes through); cl has no
+        // spelling of the others.
+        let cl_compat: Vec<String> = model
+            .compat
+            .gcc
+            .iter()
+            .filter(|flag| *flag == "-fpermissive")
+            .map(|_| "/permissive".to_owned())
+            .collect();
+        let commands =
+            |sanitize: &[String], compat: &[String], ext: &str| -> Vec<(String, Vec<String>)> {
+                let words =
+                    |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+                let driver_object = format!("obj/bhf_driver.{ext}");
+                let mut driver_args = if cxx { words(&["-x", "c"]) } else { Vec::new() };
+                driver_args.extend(words(OPT_FLAGS));
+                driver_args.extend(words(FEATURE_TEST_FLAGS));
+                driver_args.extend(words(&["-c", driver, "-o", &driver_object]));
+                let mut commands = vec![("bhf_driver".to_owned(), driver_args)];
+                let mut objects = Vec::new();
+                for (index, unit) in model.units.iter().enumerate() {
+                    let object = format!("obj/unit_{index}.{ext}");
+                    let mut args = self.unit_args(model, unit, sanitize, compat, capsule_path);
+                    args.extend([
+                        "-c".to_owned(),
+                        capsule_path(&unit.source),
+                        "-o".to_owned(),
+                        object.clone(),
+                    ]);
+                    commands.push((format!("unit_{index}"), args));
+                    objects.push(object);
+                }
+                let mut args = self.main_args(model, sanitize, compat, capsule_path);
+                args.extend(words(&["-DBHF_EXTERNAL_DRIVER", "-o", "poc.exe"]));
+                args.push(capsule_path(&model.driver));
+                args.extend(model.target_sources.iter().map(|p| capsule_path(p)));
+                args.extend(objects);
+                args.extend(model.extra_sources.iter().map(|p| capsule_path(p)));
+                args.push(driver_object);
+                args.extend(
+                    model
+                        .link_flags
+                        .iter()
+                        .chain(&model.extra_link_flags)
+                        .flat_map(|a| a.render(capsule_path)),
+                );
+                // The linker's own spelling of `--gc-sections`, which link.exe and
+                // lld-link take from clang and from cl alike.
+                args.push("-Wl,/OPT:REF".to_owned());
+                commands.push(("link".to_owned(), args));
+                commands
+            };
         let mut clang_sanitize = self.sanitize_flags(CompilerFamily::Clang);
         clang_sanitize.push(CompilerFamily::Clang.coverage_flag().to_owned());
         let msvc_sanitize = vec![
@@ -3124,7 +3183,7 @@ impl CFamilyLane {
         ];
         // cl has no weak symbols: bhf's weak repair stubs compile from MSVC
         // copies, as the bhf-cl front end compiles them.
-        let msvc_commands = commands(&msvc_sanitize, "obj");
+        let msvc_commands = commands(&msvc_sanitize, &cl_compat, "obj");
         let mut weak = std::collections::BTreeMap::new();
         let mut stubs = Vec::new();
         for (_, args) in &msvc_commands {
@@ -3169,9 +3228,11 @@ impl CFamilyLane {
         let mut builds = Vec::new();
         for dialect in Dialect::ALL {
             let build = match dialect.backend() {
-                Some(backend) => windows::cl_build(&msvc_commands, backend, &weak)?,
+                Some(backend) => windows::cl_build(&msvc_commands, backend, &weak, &|path| {
+                    copies.iter().any(|copy| copy.to == path) || rewritten.contains_key(path)
+                })?,
                 None => DialectBuild {
-                    steps: commands(&clang_sanitize, "o")
+                    steps: commands(&clang_sanitize, &model.compat.clang, "o")
                         .into_iter()
                         .map(|(name, args)| Step { name, args })
                         .collect(),
@@ -3342,29 +3403,31 @@ fn is_provenance_stub(path: &Path) -> bool {
         .is_some_and(|stem| stem == PROVENANCE_STUBS)
 }
 
-/// `C_COMPAT_FLAGS` from the work dir's `c_compat.mk`, which every C harness
-/// Makefile includes as `../../c_compat.mk` (written when legacy tentative
-/// definitions need `-fcommon`).
-fn read_compat_flags(harness_dir: &Path) -> Vec<String> {
-    let Some(work_dir) = harness_dir.parent().and_then(Path::parent) else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(work_dir.join("c_compat.mk")) else {
-        return Vec::new();
-    };
-    // The last assignment wins, as in make.
-    text.lines()
-        .rev()
-        .find_map(|line| {
-            let rest = line.strip_prefix("C_COMPAT_FLAGS")?;
-            let rest = rest.trim_start();
-            let rest = rest
-                .strip_prefix(":=")
-                .or_else(|| rest.strip_prefix("?="))
-                .or_else(|| rest.strip_prefix('='))?;
-            Some(crate::generate_harness::split_compile_command(rest))
-        })
-        .unwrap_or_default()
+/// The compatibility flags as build.sh words: the flags themselves when every
+/// compiler family takes the same ones (C's `-fcommon`), else [`COMPAT_WORD`],
+/// which [`compat_selection`] sets for the compiler that runs the script.
+fn compat_words(compat: &crate::auto::coverage_replay::CompatFlags) -> Vec<String> {
+    if compat.clang == compat.gcc {
+        compat.clang.clone()
+    } else {
+        vec![COMPAT_WORD.to_owned()]
+    }
+}
+
+/// The build.sh line that sets `$COMPAT` to the compatibility flags of the
+/// compiler family that runs the script (`$CC_FAMILY`, which the sanitizer
+/// selection set), when the families spell them differently.
+fn compat_selection(compat: &crate::auto::coverage_replay::CompatFlags) -> String {
+    if compat.clang == compat.gcc {
+        return String::new();
+    }
+    format!(
+        "# The compatibility flags the harness build took, in the spelling of the\n\
+         # compiler that runs.\n\
+         if [ \"$CC_FAMILY\" = gcc ]; then COMPAT=\"{}\"; else COMPAT=\"{}\"; fi\n",
+        sh_double_quoted(&compat.gcc.join(" ")),
+        sh_double_quoted(&compat.clang.join(" ")),
+    )
 }
 
 /// The `main`-variant per-translation-unit rules of a harness:
@@ -3952,6 +4015,8 @@ fn shell_words(words: &[String]) -> String {
         .map(|word| {
             if word == SANITIZE_WORD {
                 "$SANITIZE".to_owned()
+            } else if word == COMPAT_WORD {
+                "$COMPAT".to_owned()
             } else {
                 sh_word(word)
             }
@@ -4122,6 +4187,43 @@ mod tests {
                 Arg::Text("-DX=1".to_owned()),
                 Arg::Text("-isysroot".to_owned()),
                 Arg::Text("/sdk".to_owned()),
+            ]
+        );
+    }
+
+    /// A forced include that names no file next to the recipe (`-include
+    /// iostream`) is a header the compiler finds on its own search path: it
+    /// keeps its name, while a header that exists there is mapped.
+    #[test]
+    fn a_forced_include_that_is_no_file_keeps_its_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = normalize(temp.path());
+        write(&base.join("local.h"), "#define LOCAL 1\n");
+        // An absolute path is a path even when nothing is there (yet).
+        let elsewhere = base.join("elsewhere").join("x.h");
+        let elsewhere_text = elsewhere.to_string_lossy().into_owned();
+        let tokens: Vec<String> = [
+            "-include",
+            "iostream",
+            "-include",
+            "local.h",
+            "-imacros",
+            "config.h",
+            "-include",
+            &elsewhere_text,
+        ]
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+        assert_eq!(
+            parse_args(&tokens, &base),
+            vec![
+                Arg::Text("-include".to_owned()),
+                Arg::Text("iostream".to_owned()),
+                Arg::Split("-include", base.join("local.h")),
+                Arg::Text("-imacros".to_owned()),
+                Arg::Text("config.h".to_owned()),
+                Arg::Split("-include", elsewhere.clone()),
             ]
         );
     }
@@ -4928,6 +5030,16 @@ mod tests {
         assert!(windows.script.contains("$Compiler = $env:CXX"));
     }
 
+    /// The whole link command of build.sh, its continuation lines joined.
+    fn link_command(script: &str) -> String {
+        script
+            .replace("\\\n", " ")
+            .lines()
+            .find(|line| line.contains("-o poc"))
+            .unwrap_or_else(|| panic!("no link line in:\n{script}"))
+            .to_owned()
+    }
+
     #[cfg(unix)]
     fn compile_line(script: &str) -> &str {
         script
@@ -5427,8 +5539,8 @@ mod tests {
             C_LANE.sanitize_flags(CompilerFamily::Gcc),
         ] {
             for args in [
-                C_LANE.main_args(&model, &sanitize, &original),
-                C_LANE.unit_args(&model, &model.units[0], &sanitize, &original),
+                C_LANE.main_args(&model, &sanitize, &[], &original),
+                C_LANE.unit_args(&model, &model.units[0], &sanitize, &[], &original),
             ] {
                 let tail = args.len() - SANITIZED_NO_FORTIFY.len();
                 assert_eq!(&args[tail..], SANITIZED_NO_FORTIFY, "{args:?}");
@@ -5491,6 +5603,134 @@ mod tests {
         assert!(!cpp_gcc
             .iter()
             .any(|flag| flag.contains("user-defined-literal")));
+    }
+
+    /// A C++ harness in bhf's layout whose target needs the work dir's
+    /// compatibility fragment (`cxx_compat.mk`).
+    fn compat_harness(root: &Path) -> PathBuf {
+        let src = root.join("proj");
+        write(
+            &src.join("widget.cpp"),
+            "int copy_at(int v) { return v; }\n",
+        );
+        let runtime = root.join("c_runtime");
+        write(&runtime.join("bhf_decode.h"), "/* decode */\n");
+        write(&runtime.join("bhf_driver.c"), "int bhf_driver_marker;\n");
+        let harness = root.join("work/harnesses/H-X0001-00000001");
+        write(&harness.join("main.cpp"), "int main() { return 0; }\n");
+        write(
+            &harness.join("Makefile"),
+            &format!(
+                "BHF_DRIVER_SOURCE ?= {runtime}/bhf_driver.c\n\
+                 INCLUDES = -I . -I {runtime}\n\
+                 main: main.cpp\n\
+                 \t$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ main.cpp \"{src}/widget.cpp\" $(AUTO_EXTRA_SOURCES)\n",
+                runtime = harness_gen::build_safety::make_path(&runtime),
+                src = harness_gen::build_safety::make_path(&src)
+            ),
+        );
+        harness
+    }
+
+    /// A C++ capsule applies the compatibility flag the build took from the
+    /// work dir's `cxx_compat.mk` (or its recipe), in the spelling of the
+    /// compiler that runs build.sh: `-fms-extensions` for clang,
+    /// `-fpermissive` for gcc.
+    #[test]
+    fn a_cpp_capsule_applies_the_compatibility_flag_of_its_compiler() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = compat_harness(temp.path());
+        let plan = CPP_LANE.plan_capsule(&context(&harness)).unwrap();
+        assert!(
+            !plan.build_script.contains("COMPAT"),
+            "no compatibility flag without the fragment:\n{}",
+            plan.build_script
+        );
+        write(
+            &temp
+                .path()
+                .join("work")
+                .join(crate::auto::attempt::CXX_COMPAT_FILE),
+            "CXX_COMPAT_FLAGS_CLANG := -fms-extensions\nCXX_COMPAT_FLAGS_GCC := -fpermissive\n",
+        );
+        let plan = CPP_LANE.plan_capsule(&context(&harness)).unwrap();
+        let script = &plan.build_script;
+        assert!(link_command(script).contains(" $COMPAT "), "{script}");
+        assert_eq!(
+            plan.build_facts["compat_flags"]["clang"][0],
+            "-fms-extensions"
+        );
+        assert_eq!(plan.build_facts["compat_flags"]["gcc"][0], "-fpermissive");
+        // build.sh picks the spelling by asking the compiler that runs it.
+        #[cfg(unix)]
+        {
+            let fake = |name: &str, macro_name: &str| {
+                let path = temp.path().join(name);
+                executable(
+                    &path,
+                    &format!("#!/bin/sh\necho '#define {macro_name} 1'\n"),
+                );
+                path
+            };
+            let gcc = fake("fake-gxx", "__GNUC__");
+            let clang = fake("fake-clangxx", "__clang__");
+            let selection = script
+                .find("case \"$( (echo")
+                .map(|at| &script[at..])
+                .and_then(|rest| rest.find("case \"$(uname").map(|end| &rest[..end]))
+                .unwrap_or_else(|| panic!("no family selection in:\n{script}"));
+            let selected = |cxx: &Path| {
+                let out = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "set -e\n{}{selection}echo \"$COMPAT\"\n",
+                        compiler_runner("CXX")
+                    ))
+                    .env("CXX", cxx)
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_owned()
+            };
+            assert_eq!(selected(&gcc), "-fpermissive");
+            assert_eq!(selected(&clang), "-fms-extensions");
+        }
+        // The Windows build passes each dialect's spelling: clang's flag, and
+        // for cl and clang-cl the permissive mode gcc's flag also names.
+        {
+            let windows = plan.windows.as_ref().expect("a build.ps1");
+            let clang = ps1_branch(&windows.script, "clang");
+            assert!(clang.contains("'-fms-extensions'"), "{clang}");
+            for dialect in ["cl", "clang-cl"] {
+                let branch = ps1_branch(&windows.script, dialect);
+                assert!(branch.contains("'/permissive'"), "{dialect}: {branch}");
+                assert!(!branch.contains("ms-extensions"), "{dialect}: {branch}");
+            }
+        }
+        // A schema-2 recipe's compatibility flags apply without the fragment.
+        std::fs::remove_file(
+            temp.path()
+                .join("work")
+                .join(crate::auto::attempt::CXX_COMPAT_FILE),
+        )
+        .unwrap();
+        write(
+            &harness.join(BUILD_RECIPE_FILE),
+            &json!({
+                "schema_version": 2,
+                "native": true,
+                "extra_sources": [],
+                "extra_includes": [],
+                "standard": null,
+                "compat_flags": {"clang": ["-fms-extensions"], "gcc": ["-fpermissive"]},
+            })
+            .to_string(),
+        );
+        let plan = CPP_LANE.plan_capsule(&context(&harness)).unwrap();
+        assert!(
+            link_command(&plan.build_script).contains(" $COMPAT "),
+            "{}",
+            plan.build_script
+        );
     }
 
     /// The family that built a harness binary is read from the producer

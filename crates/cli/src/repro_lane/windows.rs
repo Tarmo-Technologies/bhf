@@ -127,18 +127,20 @@ pub(crate) struct DialectBuild {
 /// spelling and the dir its own includes resolve from (a repair stub whose
 /// weak definitions became alternate names). cl looks a forced include
 /// (`/FI`) up from the source's dir, not the working dir as clang does, so a
-/// relative one is anchored at the capsule ([`CAPSULE_ROOT`], which build.ps1
-/// replaces with its own dir).
+/// relative one the capsule ships (`shipped`) is anchored at the capsule
+/// ([`CAPSULE_ROOT`], which build.ps1 replaces with its own dir); any other
+/// (`iostream`) is a header cl finds on its include path and stays as written.
 pub(crate) fn cl_build(
     commands: &[(String, Vec<String>)],
     backend: Backend,
     weak: &BTreeMap<String, (String, String)>,
+    shipped: &dyn Fn(&str) -> bool,
 ) -> Result<DialectBuild, String> {
     let mut build = DialectBuild::default();
     let anchor_forced_includes = |args: &mut Vec<String>| {
         let mut forced = false;
         for arg in args.iter_mut() {
-            if forced && !Path::new(arg.as_str()).is_absolute() {
+            if forced && !Path::new(arg.as_str()).is_absolute() && shipped(arg) {
                 *arg = format!("{CAPSULE_ROOT}/{arg}");
             }
             forced = arg == "/FI";
@@ -509,7 +511,7 @@ mod tests {
                     "link".to_owned(),
                     words(
                         "-O1 -g -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge \
-                         -I harness -idirafter sources -include stubs/defs.h \
+                         -I harness -idirafter sources -include stubs/defs.h -include iostream \
                          -DBHF_EXTERNAL_DRIVER -o poc.exe \
                          harness/main.c sources/main.c obj/unit_0.obj -Wl,/OPT:REF",
                     ),
@@ -517,6 +519,7 @@ mod tests {
             ],
             Backend::Cl,
             &weak,
+            &|path: &str| path == "stubs/defs.h",
         )
         .unwrap();
         assert_eq!(build.include_after, ["sources"]);
@@ -547,6 +550,16 @@ mod tests {
             rsp_word("@BHF_CAPSULE@/stubs/defs.h"),
             "\"@BHF_CAPSULE@/stubs/defs.h\""
         );
+        // A forced include the capsule does not ship is a header cl finds on
+        // its own include path: it stays as written.
+        let system = build.steps[1]
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| *arg == "/FI")
+            .map(|(at, _)| build.steps[1].args[at + 1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(system, ["@BHF_CAPSULE@/stubs/defs.h", "iostream"]);
         let link = &build.steps[3].args;
         for expected in [
             "/Fe:poc.exe",
@@ -564,6 +577,7 @@ mod tests {
             )],
             Backend::ClangCl,
             &BTreeMap::new(),
+            &|_: &str| true,
         )
         .unwrap();
         assert!(clang_cl

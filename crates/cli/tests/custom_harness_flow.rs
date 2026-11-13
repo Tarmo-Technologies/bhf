@@ -830,7 +830,8 @@ mod linux {
     }
 
     /// The library of [`write_library`] with `table.cpp` needing what only
-    /// the build supplies: a define and a force-included config header.
+    /// the build supplies: a define, a force-included config header, and
+    /// `<iostream>` for the `std::cerr` it never includes.
     fn write_library_needing_build_inputs(root: &Path) -> PathBuf {
         let lib = write_library(root);
         fs::write(
@@ -844,7 +845,10 @@ mod linux {
              #ifndef WIDGETS_LEGACY\n#error WIDGETS_LEGACY comes from the build\n#endif\n\
              namespace widgets {\n\
              int Table::store(const unsigned char *data, size_t size) {\n\
-             \x20   if (data[0] != '!') return 0;\n\
+             \x20   if (data[0] != '!') {\n\
+             \x20       std::cerr << \"not a table record\\n\";\n\
+             \x20       return 0;\n\
+             \x20   }\n\
              \x20   char *slot = new char[WIDGETS_SLOT_SIZE];\n\
              \x20   std::memcpy(slot, data, size);\n\
              \x20   int first = slot[0];\n\
@@ -909,7 +913,8 @@ mod linux {
     }
 
     /// A harness `bhf build` built with `AUTO_EXTRA_SOURCES` and
-    /// `AUTO_EXTRA_INCLUDES` set records them in its build recipe, so its
+    /// `AUTO_EXTRA_INCLUDES` set (`-include iostream` among them, a header
+    /// the compiler finds itself) records them in its build recipe, so its
     /// finding packages into a capsule that rebuilds offline without them in
     /// the environment; so does one regenerated with `--extra-source`.
     #[test]
@@ -947,7 +952,10 @@ mod linux {
             assert!(output.status.success(), "{}", text(&output));
         };
         generate(None);
-        let includes = format!("-DWIDGETS_LEGACY=1 -include {}", config.display());
+        let includes = format!(
+            "-DWIDGETS_LEGACY=1 -include {} -include iostream",
+            config.display()
+        );
         let built = bhf(
             &args(&[&"build", &work, &"--harness", &id]),
             &[
@@ -973,7 +981,9 @@ mod linux {
             serde_json::json!([
                 "-DWIDGETS_LEGACY=1",
                 "-include",
-                config.display().to_string()
+                config.display().to_string(),
+                "-include",
+                "iostream"
             ]),
             "{recipe}"
         );

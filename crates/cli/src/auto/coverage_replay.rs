@@ -82,6 +82,19 @@ pub(crate) struct CompatFlags {
     pub(crate) gcc: Vec<String>,
 }
 
+impl CompatFlags {
+    /// The flags of `family` (clang's for MSVC, whose front end drops them).
+    pub(crate) fn for_family(
+        &self,
+        family: harness_gen::compiler_family::CompilerFamily,
+    ) -> &[String] {
+        match family {
+            harness_gen::compiler_family::CompilerFamily::Gcc => &self.gcc,
+            _ => &self.clang,
+        }
+    }
+}
+
 /// What a successful C/C++ harness build used beyond its Makefile and the
 /// environment the recipe reads itself.
 pub(crate) struct RecipeBuild<'a> {
@@ -109,7 +122,9 @@ fn env_words(name: &str) -> Vec<String> {
 }
 
 /// The compatibility flags the work dir's fragments give a harness Makefile:
-/// `C_COMPAT_FLAGS` from `c_compat.mk` for C (any compiler).
+/// `C_COMPAT_FLAGS` from `c_compat.mk` for C (any compiler), and for C++ the
+/// `CXX_COMPAT_FLAGS_CLANG`/`CXX_COMPAT_FLAGS_GCC` of `cxx_compat.mk`, each
+/// compiler family's own spelling.
 pub(crate) fn work_dir_compat_flags(work_dir: &Path, cpp: bool) -> CompatFlags {
     let read = |file: &str, variable: &str| -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(work_dir.join(file)) else {
@@ -129,7 +144,11 @@ pub(crate) fn work_dir_compat_flags(work_dir: &Path, cpp: bool) -> CompatFlags {
             .unwrap_or_default()
     };
     if cpp {
-        CompatFlags::default()
+        let file = crate::auto::attempt::CXX_COMPAT_FILE;
+        CompatFlags {
+            clang: read(file, "CXX_COMPAT_FLAGS_CLANG"),
+            gcc: read(file, "CXX_COMPAT_FLAGS_GCC"),
+        }
     } else {
         let flags = read("c_compat.mk", "C_COMPAT_FLAGS");
         CompatFlags {
@@ -1499,6 +1518,19 @@ end_of_record\n";
         let flags = work_dir_compat_flags(root.path(), false);
         assert_eq!(flags.clang, ["-fcommon"]);
         assert_eq!(flags.gcc, ["-fcommon"]);
+        // A C++ build takes `cxx_compat.mk`, each compiler its own spelling.
+        assert_eq!(
+            work_dir_compat_flags(root.path(), true),
+            CompatFlags::default()
+        );
+        std::fs::write(
+            root.path().join(crate::auto::attempt::CXX_COMPAT_FILE),
+            "# note\nCXX_COMPAT_FLAGS_CLANG := -fms-extensions\nCXX_COMPAT_FLAGS_GCC := -fpermissive\n",
+        )
+        .unwrap();
+        let cpp = work_dir_compat_flags(root.path(), true);
+        assert_eq!(cpp.clang, ["-fms-extensions"]);
+        assert_eq!(cpp.gcc, ["-fpermissive"]);
     }
 
     #[test]
