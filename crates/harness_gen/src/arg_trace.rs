@@ -2318,6 +2318,25 @@ mod tests {
             "{decl}"
         );
         assert!(plan(&group, &emissions, &[]).buffer_len_dimension);
+        // The decoder's own lone copy under the dimension is exactly the
+        // slice once sliced: sized by the slice's length, copied from it.
+        let exact = {
+            let _dimension = crate::scoped_buffer_len_dimension(true);
+            crate::c_decoders::select_c_decoder_with_registry("const uint8_t *", "a", &registry)
+                .expect("decodes")
+        };
+        let mut emissions = call();
+        emissions[0] = exact;
+        slice_input_units(&mut emissions, &units, true);
+        let decl = &emissions[0].decl;
+        assert!(
+            decl.contains("_bhf_cap_a = (size_t)_bhf_slicelen_a ? (size_t)_bhf_slicelen_a : 1"),
+            "{decl}"
+        );
+        assert!(
+            decl.contains("memcpy((void *)a, _bhf_slice_a, _bhf_slicelen_a)"),
+            "{decl}"
+        );
 
         // A stream gets exactly its bytes either way, and so does a pair. The
         // stream is the decoder's own (`bhf_fmemopen`, which is a temporary

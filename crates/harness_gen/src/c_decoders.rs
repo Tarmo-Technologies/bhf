@@ -1568,18 +1568,32 @@ fn is_const_pointee(c_type: &str) -> bool {
     }
 }
 
-/// A NUL-terminated heap copy of the input for a lone read-only byte
-/// pointer `name` of type `c_type`, at least 8 bytes and zeroed past the
-/// input, freed after the call.
+/// A heap copy of the input for a lone read-only byte pointer `name` of type
+/// `c_type`, freed after the call. By default it is NUL-terminated, at least
+/// 8 bytes and zeroed past the input.
+///
+/// With the buffer-length dimension ([`crate::buffer_len_dimension_enabled`])
+/// the buffer's bytes are exactly its slice, so the copy is exactly that size
+/// (one zeroed byte when empty, so a read of byte 0 of an empty buffer is not
+/// reported), with no floor and no NUL: a read past it is a heap overflow.
 fn emit_nul_terminated_byte_copy(ctx: &mut DecodeContext<'_>, c_type: &str, name: &str) {
     let cap = format!("_bhf_cap_{name}");
-    ctx.push(format!(
-        "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
-         {c_type} {name} = ({c_type})malloc({cap}); \
-         if ({name}) {{ memset((void *){name}, 0, {cap}); \
-         if (Size) memcpy((void *){name}, Data, Size); \
-         ((char *){name})[Size] = '\\0'; }}"
-    ));
+    if crate::buffer_len_dimension_enabled() {
+        ctx.push(format!(
+            "size_t {cap} = (size_t)Size ? (size_t)Size : 1; \
+             {c_type} {name} = ({c_type})malloc({cap}); \
+             if ({name}) {{ memset((void *){name}, 0, {cap}); \
+             if (Size) memcpy((void *){name}, Data, Size); }}"
+        ));
+    } else {
+        ctx.push(format!(
+            "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
+             {c_type} {name} = ({c_type})malloc({cap}); \
+             if ({name}) {{ memset((void *){name}, 0, {cap}); \
+             if (Size) memcpy((void *){name}, Data, Size); \
+             ((char *){name})[Size] = '\\0'; }}"
+        ));
+    }
     ctx.cleanups.push(format!("free((void *){name})"));
 }
 
@@ -4942,6 +4956,45 @@ mod tests {
             "{}",
             e.decl
         );
+    }
+
+    /// With the buffer-length dimension a lone read-only byte buffer is an
+    /// exact copy of its bytes (one byte when empty): no floor, no NUL.
+    #[test]
+    fn lone_const_byte_pointer_is_an_exact_copy_with_the_length_dimension() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let e = select_c_decoder_with_registry("const unsigned char *", "source", &registry(""))
+            .expect("const byte pointer is supported");
+        assert!(
+            e.decl
+                .contains("_bhf_cap_source = (size_t)Size ? (size_t)Size : 1"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl
+                .contains("if (Size) memcpy((void *)source, Data, Size)"),
+            "{}",
+            e.decl
+        );
+        assert!(!e.decl.contains("< 8)"), "{}", e.decl);
+        assert!(!e.decl.contains("'\\0'"), "{}", e.decl);
+        assert_eq!(e.free.as_deref(), Some("free((void *)source)"));
+        // A byte pointer behind a typedef gets the same exact copy.
+        let hidden = select_c_decoder_with_registry(
+            "cbytes_t",
+            "source",
+            &registry("typedef const unsigned char *cbytes_t;"),
+        )
+        .expect("byte-pointer typedef is supported");
+        assert!(
+            hidden
+                .decl
+                .contains("_bhf_cap_source = (size_t)Size ? (size_t)Size : 1"),
+            "{}",
+            hidden.decl
+        );
+        assert!(!hidden.decl.contains("< 8)"), "{}", hidden.decl);
     }
 
     #[test]

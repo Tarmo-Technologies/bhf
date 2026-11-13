@@ -4700,6 +4700,22 @@ mod tests {
         type_model::TypeRegistry::from_defs(std::iter::once(&defs))
     }
 
+    /// With the buffer-length dimension a lone read-only byte buffer takes
+    /// a sized slice and is an exact copy of it, in C++ as in C.
+    #[test]
+    fn cpp_lone_byte_buffer_is_exact_with_the_length_dimension() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let registry = typedef_registry("");
+        let decls = cpp_param_decls(&registry, &[("p", "const uint8_t *"), ("a", "uint32_t")]);
+        let p = decls
+            .iter()
+            .find(|decl| decl.contains("const uint8_t * p ="))
+            .unwrap_or_else(|| panic!("no decl for p: {decls:#?}"));
+        assert!(p.contains("bhf_take_sized_copy"), "{p}");
+        assert!(!p.contains("< 8)"), "{p}");
+        assert!(!p.contains("'\\0'"), "{p}");
+    }
+
     #[test]
     fn cpp_buffer_pairing_resolves_typedefs_on_both_sides() {
         let registry = typedef_registry(

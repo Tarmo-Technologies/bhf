@@ -1164,6 +1164,12 @@
   heap copy of that slice. Such a buffer is now labelled `sized heap copy` and
   its length `sized copy length`; the last buffer of a call still views the
   rest of the input.
+- With `BHF_BUFFER_LEN_DIMENSION=1`, a read-only byte buffer without a length
+  partner was still copied with one byte of slack and at least 8 bytes, so a
+  read past a short buffer went unreported. It is now a heap copy of exactly
+  its bytes (one byte when empty), with no NUL terminator, in C and C++; a
+  writable buffer keeps its headroom for the callee's writes. The default
+  (dimension off) is unchanged.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

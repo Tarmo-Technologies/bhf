@@ -475,12 +475,16 @@ The remaining input has no length of its own: a buffer without a length
 parameter is as long as the input lets it be. Set
 `BHF_BUFFER_LEN_DIMENSION=1` when generating the harness (`bhf generate-harness`
 or `bhf auto`) to give it one. A buffer with no length partner then gets
-exactly its bytes in a heap copy of that size (a `const void *` view
-included, so the sanitizer sees the shorter buffer): one before the call's
-last buffer gets its slice, above, without the input-sized allocation, and
-the call's last buffer takes a sized slice too, after the cursor parameters
-and the other buffers (4 more bytes, a little-endian length clamped to the
-bytes left, then that many bytes). It is off by default: a buffer shorter
+exactly its bytes in a heap copy of that size (one byte when empty), with no
+NUL terminator and no 8-byte floor: a read-only byte pointer, a `void *` and
+a `const void *` view alike, so the sanitizer sees the shorter buffer. A
+writable byte pointer keeps its 64 KiB of headroom for the callee's writes.
+One before the call's last buffer gets its slice, above, without the
+input-sized allocation, and the call's last buffer takes a sized slice too,
+after the cursor parameters and the other buffers (4 more bytes, a
+little-endian length clamped to the bytes left, then that many bytes). An
+empty buffer's one byte is zeroed and addressable, so a read of byte 0 of an
+empty buffer is not reported. It is off by default: a buffer shorter
 than the input can make a function with an implicit length contract read
 past it, a crash the harness made. The harness records it only where it
 gave a buffer a length (`buffer_len_dimension` in `arg-layout.json` and

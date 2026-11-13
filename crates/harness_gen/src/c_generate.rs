@@ -7449,6 +7449,64 @@ mod tests {
         fs::remove_dir_all(&out).ok();
     }
 
+    /// With the buffer-length dimension, a lone read-only buffer is a heap
+    /// copy of exactly its slice: no 8-byte floor and no NUL past it, so a
+    /// read past a short slice is a heap overflow the sanitizer reports. An
+    /// empty slice is one zeroed byte.
+    #[test]
+    fn built_c_harness_with_the_length_dimension_gives_a_lone_buffer_exactly_its_bytes() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        // 4 bytes for `a`, the 4-byte slice length 1, then the slice.
+        let one_byte = [0, 0, 0, 0, 1, 0, 0, 0, 0xaa];
+        let Some(out) = build_c_harness(
+            "read_word",
+            &[("p", "const uint8_t *"), ("a", "uint32_t")],
+            "#include <stdint.h>\n#include <string.h>\n\
+             uint32_t read_word(const uint8_t *p, uint32_t a) {\n\
+             \x20   uint32_t v;\n\
+             \x20   memcpy(&v, p, 4);\n\
+             \x20   return v + a;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let path = out.join("short.bin");
+        fs::write(&path, one_byte).unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.status.success()
+                && stderr.contains("heap-buffer-overflow")
+                && stderr.contains("1-byte region"),
+            "{stderr}"
+        );
+        fs::remove_dir_all(&out).ok();
+
+        let Some(out) = build_c_harness(
+            "peek",
+            &[("p", "const uint8_t *"), ("a", "uint32_t")],
+            "#include <stdint.h>\n\
+             int peek(const uint8_t *p, uint32_t a) { return p[0] + (int)a; }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, &one_byte, Some("1"));
+        let p = traced(&args, "p", None);
+        assert_eq!(p["len"], 1, "{args:#?}");
+        assert_eq!(p["alloc_size"], 1, "{args:#?}");
+        assert_eq!(p["span"], serde_json::json!([8, 9]));
+        // An empty slice: one zeroed byte, so reading byte 0 stays quiet.
+        let args = traced_args(&out, &[0; 8], Some("1"));
+        let p = traced(&args, "p", None);
+        assert_eq!(p["len"], 0, "{args:#?}");
+        assert_eq!(p["alloc_size"], 1, "{args:#?}");
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// A call whose parameters all use the whole input captures no cursor
     /// positions, so a `-Wall -Werror` build stays clean.
     #[test]
