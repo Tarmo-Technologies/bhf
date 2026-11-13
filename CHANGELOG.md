@@ -404,6 +404,13 @@
   bhf's switches to the parent's `Default_Switches ("Ada")`, so a switch the
   sources need (`-gnateD`, `-O1`) and per-file `Switches` still apply; bhf
   prints the merged parent switches.
+- A resource-leak (BHF-306) finding from a C, C++ or other native harness is
+  reported by the new language-neutral `resource-leak` oracle (exception
+  `ORACLE_RESOURCE_LEAK`) instead of being labelled `ORACLE_RESOURCE_LEAK_ADA`;
+  an Ada harness's leak keeps `resource-leak-ada`. The runtime leak event
+  carries the harness language, and `bhf list oracles` lists both. Findings
+  recorded earlier keep their old name, so a re-run reports a C/C++ leak
+  under a new cluster key.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf

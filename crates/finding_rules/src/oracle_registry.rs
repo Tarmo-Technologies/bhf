@@ -189,6 +189,9 @@ impl BugOracle for SensitiveEnvAda {
     }
 }
 
+/// The resource-leak oracle of an Ada harness, whose event log the leaks are
+/// read from. [`ResourceLeak`] reports the same defect for every other
+/// harness.
 pub struct ResourceLeakAda;
 
 impl BugOracle for ResourceLeakAda {
@@ -214,30 +217,7 @@ impl BugOracle for ResourceLeakAda {
     }
 
     fn evaluate(&self, event: &OracleRuntimeEvent) -> Option<OracleHit> {
-        let OracleRuntimeEvent::ResourceLeak {
-            api,
-            resource,
-            evidence,
-        } = event
-        else {
-            return None;
-        };
-        if resource.trim().is_empty() {
-            return None;
-        }
-        let mut hit_evidence = vec![OracleEvidence::new("resource", resource)];
-        hit_evidence.extend(
-            evidence
-                .iter()
-                .filter(|(key, value)| !key.is_empty() && !value.is_empty())
-                .map(|(key, value)| OracleEvidence::new(key.as_str(), value.as_str())),
-        );
-        Some(OracleHit::from_oracle(
-            self,
-            api,
-            "resource opened during fuzz execution was not released",
-            hit_evidence,
-        ))
+        resource_leak_hit(self, event, true)
     }
 }
 
@@ -1239,6 +1219,67 @@ impl BugOracle for AdaRuntimeUserException {
     }
 }
 
+/// The resource-leak oracle of a C, C++ or other native harness: a file the
+/// runtrace shim saw opened and not closed before the testcase exit. The
+/// language-neutral counterpart of [`ResourceLeakAda`], same rule (BHF-306).
+pub struct ResourceLeak;
+
+impl BugOracle for ResourceLeak {
+    fn name(&self) -> &'static str {
+        "resource-leak"
+    }
+    fn rule_id(&self) -> &'static str {
+        "BHF-306"
+    }
+    fn category(&self) -> OracleCategory {
+        OracleCategory::LogicBug
+    }
+    fn dangerous_apis(&self) -> &'static [&'static str] {
+        &["open", "openat", "fopen", "fopen64"]
+    }
+    fn describe(&self) -> &'static str {
+        "Detect files a native harness opened during fuzz execution and did not release before testcase exit"
+    }
+
+    fn evaluate(&self, event: &OracleRuntimeEvent) -> Option<OracleHit> {
+        resource_leak_hit(self, event, false)
+    }
+}
+
+/// A resource-leak hit of `oracle` for `event`, when the event's harness
+/// language is Ada exactly when `ada` is set.
+fn resource_leak_hit(
+    oracle: &dyn BugOracle,
+    event: &OracleRuntimeEvent,
+    ada: bool,
+) -> Option<OracleHit> {
+    let OracleRuntimeEvent::ResourceLeak {
+        api,
+        resource,
+        language,
+        evidence,
+    } = event
+    else {
+        return None;
+    };
+    if language.eq_ignore_ascii_case("ada") != ada || resource.trim().is_empty() {
+        return None;
+    }
+    let mut hit_evidence = vec![OracleEvidence::new("resource", resource)];
+    hit_evidence.extend(
+        evidence
+            .iter()
+            .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            .map(|(key, value)| OracleEvidence::new(key.as_str(), value.as_str())),
+    );
+    Some(OracleHit::from_oracle(
+        oracle,
+        api,
+        "resource opened during fuzz execution was not released",
+        hit_evidence,
+    ))
+}
+
 pub static ORACLE_REGISTRY: &[&'static dyn BugOracle] = &[
     &PathTraversalAda,
     &SqlInjectionAda,
@@ -1246,6 +1287,7 @@ pub static ORACLE_REGISTRY: &[&'static dyn BugOracle] = &[
     &CommandInjectionAda,
     &SensitiveEnvAda,
     &ResourceLeakAda,
+    &ResourceLeak,
     &DynamicLibraryLoadRuntime,
     &FileDeletionRuntime,
     &NativeAssertionContract,
@@ -1640,6 +1682,32 @@ mod tests {
         assert_eq!(hit, None);
     }
 
+    /// A leak is named for the harness's language: the Ada oracle keeps its
+    /// name for an Ada harness, and a C or C++ harness's leak is reported by
+    /// the language-neutral oracle, so it is never labelled an Ada one.
+    #[test]
+    fn a_resource_leak_is_named_for_the_language_of_its_harness() {
+        use crate::oracle_sdk::OracleRuntimeEvent;
+
+        let leak = |language: &str| OracleRuntimeEvent::ResourceLeak {
+            api: "fopen".to_owned(),
+            resource: "fd:4 path:/srv/widget.cfg".to_owned(),
+            language: language.to_owned(),
+            evidence: vec![("fd".to_owned(), "4".to_owned())],
+        };
+        let names = |event: &OracleRuntimeEvent| -> Vec<String> {
+            ORACLE_REGISTRY
+                .iter()
+                .filter_map(|oracle| oracle.evaluate(event))
+                .map(|hit| format!("{} {}", hit.oracle_name, hit.rule_id))
+                .collect()
+        };
+        assert_eq!(names(&leak("c")), ["resource-leak BHF-306"]);
+        assert_eq!(names(&leak("cpp")), ["resource-leak BHF-306"]);
+        assert_eq!(names(&leak("")), ["resource-leak BHF-306"]);
+        assert_eq!(names(&leak("ada")), ["resource-leak-ada BHF-306"]);
+    }
+
     #[test]
     fn resource_leak_oracle_matches_runtime_resource_event() {
         use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
@@ -1648,6 +1716,7 @@ mod tests {
             .evaluate(&OracleRuntimeEvent::ResourceLeak {
                 api: "open".to_owned(),
                 resource: "fd:7 path:/tmp/acme.conf".to_owned(),
+                language: "ada".to_owned(),
                 evidence: vec![
                     ("fd".to_owned(), "7".to_owned()),
                     ("path".to_owned(), "/tmp/acme.conf".to_owned()),

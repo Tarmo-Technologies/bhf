@@ -253,6 +253,11 @@ executable-oracle path promotes them to `ada-runtime-constraint-check` BHF-102,
 `ada-runtime-storage-error` BHF-103, `ada-runtime-tasking-error` BHF-104, or
 `ada-runtime-user-exception` BHF-105 findings with handler/source evidence.
 
+The resource-leak oracle (BHF-306) is named for the harness it watched:
+`resource-leak` (exception `ORACLE_RESOURCE_LEAK`) for a C, C++ or other
+native harness, `resource-leak-ada` (`ORACLE_RESOURCE_LEAK_ADA`) for an Ada
+one.
+
 ### Runtime confirmation
 
 Static source scans emit candidate findings (for example BHF-405

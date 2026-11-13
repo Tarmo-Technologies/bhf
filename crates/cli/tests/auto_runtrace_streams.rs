@@ -267,3 +267,57 @@ fn a_sanitized_targets_printf_format_reaches_explain() {
     );
     assert!(!section.contains("touched no external resource"), "{text}");
 }
+
+/// A C target that opens a file and never closes it: the BHF-306 finding is
+/// named for the language-neutral oracle (`resource-leak`, exception
+/// `ORACLE_RESOURCE_LEAK`), not for the Ada one.
+#[test]
+fn a_c_targets_resource_leak_is_not_labelled_an_ada_one() {
+    if !tool_available("clang") || !tool_available("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let Some(bin) = bhf_with_shim() else {
+        eprintln!("skip: bhf and its runtrace shim are not built");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("proj");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    let config = tmp.path().join("widget.cfg");
+    std::fs::write(&config, "slots=4\n").unwrap();
+    std::fs::write(
+        tree.join("src/widget.h"),
+        "#include <stddef.h>\nint read_widget(const unsigned char *data, size_t len);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join("src/widget.c"),
+        format!(
+            "#include \"widget.h\"\n#include <stdio.h>\n\
+             int read_widget(const unsigned char *data, size_t len) {{\n\
+             \x20   FILE *f = fopen(\"{}\", \"r\");\n\
+             \x20   if (!f) return -1;\n\
+             \x20   return len ? fgetc(f) + data[0] : fgetc(f);\n\
+             }}\n",
+            config.display()
+        ),
+    )
+    .unwrap();
+    let output = auto(&bin, &tree, &work, "c", "4");
+    let log = log_of(&output);
+    let leaks: Vec<serde_json::Value> = findings(&work)
+        .into_iter()
+        .map(|(_, finding)| finding)
+        .filter(|finding| finding["rule_id"] == "BHF-306")
+        .collect();
+    assert!(!leaks.is_empty(), "the unclosed file is a leak:\n{log}");
+    for leak in &leaks {
+        assert_eq!(
+            leak["exception"]["name"], "ORACLE_RESOURCE_LEAK",
+            "{leak:#}"
+        );
+        assert_eq!(leak["oracle"]["name"], "resource-leak", "{leak:#}");
+    }
+}

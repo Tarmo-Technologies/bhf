@@ -296,6 +296,17 @@ pub fn oracle_hits_from_events_for_lane(
     events: &[RuntraceEvent],
     interpreted: bool,
 ) -> Vec<finding_rules::oracle_sdk::OracleHit> {
+    oracle_hits_for_harness(events, interpreted, "")
+}
+
+/// As [`oracle_hits_from_events_for_lane`], for a harness in `language`
+/// (`ada`, `c`, `cpp`, ...; empty when unknown): the resource-leak oracle is
+/// named for it, so a C or C++ harness's leak is not labelled an Ada one.
+pub fn oracle_hits_for_harness(
+    events: &[RuntraceEvent],
+    interpreted: bool,
+    language: &str,
+) -> Vec<finding_rules::oracle_sdk::OracleHit> {
     let mut hits = Vec::new();
     for event in events {
         let Some(runtime_event) = oracle_runtime_event(event) else {
@@ -307,7 +318,7 @@ pub fn oracle_hits_from_events_for_lane(
             }
         }
     }
-    for runtime_event in resource_leak_runtime_events(events, interpreted) {
+    for runtime_event in resource_leak_runtime_events(events, interpreted, language) {
         for oracle in finding_rules::oracle_registry::ORACLE_REGISTRY {
             if let Some(hit) = oracle.evaluate(&runtime_event) {
                 hits.push(hit);
@@ -910,6 +921,7 @@ pub fn is_bhf_owned_resource(path: &str) -> bool {
 fn resource_leak_runtime_events(
     events: &[RuntraceEvent],
     interpreted: bool,
+    language: &str,
 ) -> Vec<finding_rules::oracle_sdk::OracleRuntimeEvent> {
     let mut opened = BTreeMap::<i32, OpenResource>::new();
     let mut leaks = Vec::new();
@@ -940,7 +952,7 @@ fn resource_leak_runtime_events(
                         path: path.clone(),
                     },
                 ) {
-                    leaks.push(resource_leak_event(*fd, previous));
+                    leaks.push(resource_leak_event(*fd, previous, language));
                 }
             }
             RuntraceEvent::FileClosed { fd } => {
@@ -952,7 +964,7 @@ fn resource_leak_runtime_events(
     leaks.extend(
         opened
             .into_iter()
-            .map(|(fd, resource)| resource_leak_event(fd, resource)),
+            .map(|(fd, resource)| resource_leak_event(fd, resource, language)),
     );
     leaks
 }
@@ -960,10 +972,12 @@ fn resource_leak_runtime_events(
 fn resource_leak_event(
     fd: i32,
     resource: OpenResource,
+    language: &str,
 ) -> finding_rules::oracle_sdk::OracleRuntimeEvent {
     finding_rules::oracle_sdk::OracleRuntimeEvent::ResourceLeak {
         api: resource.api,
         resource: format!("fd:{fd} path:{}", resource.path),
+        language: language.to_owned(),
         evidence: vec![
             ("fd".to_owned(), fd.to_string()),
             ("path".to_owned(), resource.path),
@@ -2564,11 +2578,34 @@ mod tests {
         }]);
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].oracle_name, "resource-leak-ada");
+        // Not an Ada harness: the language-neutral oracle names the leak.
+        assert_eq!(hits[0].oracle_name, "resource-leak");
         assert_eq!(hits[0].rule_id, "BHF-306");
         assert_eq!(hits[0].api, "open");
         assert_eq!(hits[0].evidence_value("fd"), Some("7"));
         assert_eq!(hits[0].evidence_value("path"), Some("/tmp/acme.conf"));
+    }
+
+    /// The leak oracle is named for the harness the events came from: a C or
+    /// C++ harness's leak is `resource-leak` (exception
+    /// `ORACLE_RESOURCE_LEAK`), an Ada harness's keeps `resource-leak-ada`.
+    #[test]
+    fn a_leak_is_named_for_the_harness_language() {
+        let open = RuntraceEvent::FileOpened {
+            syscall: "fopen".to_owned(),
+            fd: 5,
+            path: "/srv/widget.cfg".to_owned(),
+            taint_offset: None,
+        };
+        let named = |language: &str| -> Vec<String> {
+            oracle_hits_for_harness(std::slice::from_ref(&open), false, language)
+                .into_iter()
+                .map(|hit| hit.oracle_name)
+                .collect()
+        };
+        assert_eq!(named("c"), ["resource-leak"]);
+        assert_eq!(named("cpp"), ["resource-leak"]);
+        assert_eq!(named("ada"), ["resource-leak-ada"]);
     }
 
     #[test]

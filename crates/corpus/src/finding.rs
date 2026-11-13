@@ -1986,6 +1986,51 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_leak_finding_is_named_for_the_oracle_of_its_harness() {
+        use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
+
+        let root = temp_dir("oracle-leak-names");
+        let leak = |oracle: &str| OracleHit {
+            oracle_name: oracle.to_owned(),
+            rule_id: "BHF-306".to_owned(),
+            category: "logic-bug".to_owned(),
+            api: "fopen".to_owned(),
+            message: "resource opened during fuzz execution was not released".to_owned(),
+            evidence: vec![OracleEvidence {
+                key: "resource".to_owned(),
+                value: "fd:4 path:/srv/widget.cfg".to_owned(),
+            }],
+        };
+        let exception_name = |harness: &str, language: &str, oracle: &str| {
+            let emitter = super::FindingEmitter::with_metadata(
+                root.clone(),
+                harness.to_owned(),
+                language.to_owned(),
+                format!("/tmp/{harness}/main"),
+            );
+            let id = emitter.emit_oracle_hit(b"widget", &leak(oracle)).unwrap();
+            let finding: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            finding["exception"]["name"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(
+            exception_name("H-C0001", "c", "resource-leak"),
+            "ORACLE_RESOURCE_LEAK"
+        );
+        assert_eq!(
+            exception_name("H-A0001", "ada", "resource-leak-ada"),
+            "ORACLE_RESOURCE_LEAK_ADA"
+        );
+    }
+
+    #[test]
     fn emit_oracle_hit_writes_runtime_evidence() {
         use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 

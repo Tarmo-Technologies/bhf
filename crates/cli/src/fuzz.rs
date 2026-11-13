@@ -3282,6 +3282,23 @@ fn run_builtin_with_progress(
                 || s.contains("BHF_PHP_LAUNCHER")
         })
         .unwrap_or(false);
+    // The harness's language names the resource-leak oracle (an Ada harness's
+    // leak is `resource-leak-ada`, any other's `resource-leak`).
+    let harness_language = if is_instrumented_ada_harness(&prepared.runner) {
+        "ada".to_owned()
+    } else {
+        let dirs: Vec<PathBuf> = prepared
+            .harness_path
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(crate::auto::layout::harness_dir_candidates(
+                &prepared.work_dir,
+                &prepared.harness_id,
+            ))
+            .collect();
+        crate::repro_lane::harness_language(&dirs, &prepared.harness_id).unwrap_or_default()
+    };
     let sandbox_metadata = prepared.runner.sandbox_metadata();
     let build_binary_identity = build_binary_record(&prepared.harness_path);
     let mut emitter = with_harness_format(
@@ -3920,9 +3937,10 @@ fn run_builtin_with_progress(
             }
         }
 
-        for hit in crate::auto::runtrace::oracle_hits_from_events_for_lane(
+        for hit in crate::auto::runtrace::oracle_hits_for_harness(
             &runtrace_events,
             interpreted_lane,
+            &harness_language,
         ) {
             let key = oracle_hit_dedupe_key(&hit);
             if !seen_oracle_hits.insert(key.clone()) {

@@ -44,4 +44,18 @@ mod tests {
         assert!(out.contains("logic-bug"));
         assert!(out.contains("Ada.Directories.Open"));
     }
+
+    #[test]
+    fn render_lists_the_resource_leak_oracle_of_each_language() {
+        let out = render();
+        let row = |name: &str| {
+            out.lines()
+                .find(|line| line.split_whitespace().next() == Some(name))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{out}"))
+                .to_owned()
+        };
+        assert!(row("resource-leak").contains("BHF-306"));
+        assert!(row("resource-leak").contains("fopen"));
+        assert!(row("resource-leak-ada").contains("Ada.Text_IO.Open"));
+    }
 }
