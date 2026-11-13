@@ -1314,8 +1314,8 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
                 }
                 if cfg!(windows) {
                     let path = std::env::var_os("PATH");
-                    stage_sanitizer_runtime(&harness_dir, path.as_deref());
-                    stage_sanitizer_runtime(&build_dir, path.as_deref());
+                    stage_sanitizer_runtime(&work_dir, &harness_dir, path.as_deref());
+                    stage_sanitizer_runtime(&work_dir, &build_dir, path.as_deref());
                 }
                 // A foreign build (or one run under an emulator) is not
                 // rebuilt for this host from its recipe.
@@ -2216,7 +2216,7 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
     )
     .unwrap_or_else(|error| make_spawn_failure(&error));
     if cfg!(windows) && output.status.success() {
-        stage_sanitizer_runtime(&harness_dir, std::env::var_os("PATH").as_deref());
+        stage_sanitizer_runtime(work_dir, &harness_dir, std::env::var_os("PATH").as_deref());
     }
     output
 }
@@ -2266,11 +2266,18 @@ pub(crate) fn sanitizer_runtime_dirs(path: Option<&std::ffi::OsStr>) -> Vec<Path
 
 /// Give a Windows harness its sanitizer runtime: the DLLs of the first
 /// runtime directory on PATH (the one the build used: cl's own for the MSVC
-/// lane, clang's resource directory otherwise) are linked — or copied — next
-/// to the binary, where the loader looks before PATH, so the harness starts
-/// from any shell and never picks up another toolchain's same-named DLL. The
-/// directories are also recorded in [`RUNTIME_PATH_FILE`].
-fn stage_sanitizer_runtime(harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
+/// lane, clang's resource directory otherwise) are staged next to the binary,
+/// where the loader looks before PATH, so the harness starts from any shell
+/// and never picks up another toolchain's same-named DLL. The directories are
+/// also recorded in [`RUNTIME_PATH_FILE`].
+///
+/// Each DLL is copied once into `<work_dir>/.bhf-runtime/` and the harness
+/// dir gets a hard link to that copy (or a copy of it): never a link to the
+/// toolchain's own file, which would carry its directory's ACL (read and
+/// execute only under Program Files) and leave a work dir that cannot be
+/// deleted. A sweep stages hundreds of harness dirs, so the links cost no
+/// space per dir.
+fn stage_sanitizer_runtime(work_dir: &Path, harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
     let dirs = sanitizer_runtime_dirs(path);
     let sidecar = harness_dir.join(RUNTIME_PATH_FILE);
     let Some(first) = dirs.first() else {
@@ -2285,6 +2292,12 @@ fn stage_sanitizer_runtime(harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
     let Ok(entries) = fs::read_dir(first) else {
         return;
     };
+    let cache_dir = work_dir.join(RUNTIME_CACHE_DIR);
+    // The concurrent candidates of a sweep stage into the same work-dir copy:
+    // one at a time, so each finds the copy complete and links to it.
+    let _staging = RUNTIME_STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for entry in entries.flatten() {
         let name = entry.file_name();
         let lower = name.to_string_lossy().to_ascii_lowercase();
@@ -2295,19 +2308,171 @@ fn stage_sanitizer_runtime(harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
             continue;
         }
         let source = entry.path();
+        let cache = cache_dir.join(&name);
         let target = harness_dir.join(&name);
-        let same = fs::metadata(&target)
-            .ok()
-            .zip(fs::metadata(&source).ok())
-            .is_some_and(|(a, b)| a.len() == b.len());
-        if same {
+        if refresh_runtime_copy(&source, &cache).is_err() {
+            // No work-dir copy of the current DLL: copy the toolchain's file
+            // itself (never link to it, nor to a stale copy).
+            if same_file(&target, &source) || !same_runtime_file(&target, &source) {
+                let _ = put_in_place(&target, |temp| copy_with_mtime(&source, temp));
+            }
             continue;
         }
-        let _ = fs::remove_file(&target);
-        if fs::hard_link(&source, &target).is_err() {
-            let _ = fs::copy(&source, &target);
+        // Only a link to the copy is kept: an equal length and modified time
+        // is also what a link to the toolchain's own file has.
+        if same_file(&target, &cache) {
+            continue;
         }
+        let _ = put_in_place(&target, |temp| {
+            fs::hard_link(&cache, temp).or_else(|_| copy_with_mtime(&cache, temp))
+        });
     }
+}
+
+/// Serializes [`stage_sanitizer_runtime`] within this process.
+static RUNTIME_STAGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A name beside `path` no other writer uses (this process's id and a
+/// counter), for a file written there and then renamed onto `path`.
+fn unique_partial(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.partial", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Write `path` through `write` into a [`unique_partial`] name and rename it
+/// into place, so `path` is never seen missing or half written.
+fn put_in_place(
+    path: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let partial = unique_partial(path);
+    let result = write(&partial).and_then(|()| fs::rename(&partial, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
+
+/// The work-dir directory holding bhf's copies of runtime files (the runtrace
+/// shim staging uses it too).
+const RUNTIME_CACHE_DIR: &str = ".bhf-runtime";
+
+/// Whether `copy` holds the same file as `source`, by length and modified
+/// time (a hard link, or a copy [`copy_with_mtime`] made).
+fn same_runtime_file(copy: &Path, source: &Path) -> bool {
+    let stamp = |path: &Path| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)))
+    };
+    stamp(copy).is_some_and(|copy| Some(copy) == stamp(source))
+}
+
+/// Make `cache` a copy of `source` unless it already is one. The new copy is
+/// written beside it under a name of its own and renamed into place, so a
+/// harness dir linked to the old copy keeps its bytes until it is staged
+/// again, and another bhf process staging the same work dir never sees a
+/// partial copy. An error means `cache` is not a copy of `source`.
+fn refresh_runtime_copy(source: &Path, cache: &Path) -> std::io::Result<()> {
+    if same_runtime_file(cache, source) && !same_file(cache, source) {
+        return Ok(());
+    }
+    if let Some(dir) = cache.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    match put_in_place(cache, |partial| copy_with_mtime(source, partial)) {
+        // Another process may have put the same copy in place meanwhile (the
+        // rename onto a copy a running harness has loaded fails on Windows).
+        Err(_) if same_runtime_file(cache, source) && !same_file(cache, source) => Ok(()),
+        result => result,
+    }
+}
+
+/// `fs::copy` that keeps the source's modified time (Windows' `CopyFileW`
+/// does already; elsewhere it is set after the copy).
+fn copy_with_mtime(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::copy(source, target)?;
+    let modified = fs::metadata(source)?.modified()?;
+    fs::File::options()
+        .write(true)
+        .open(target)?
+        .set_modified(modified)
+}
+
+/// Which file `path` names: its device and inode, or on Windows its volume
+/// serial number and file index. Two paths with the same identity are hard
+/// links to one file. `None` when the file cannot be read.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// `GetFileInformationByHandle`'s volume serial number and 64-bit file index
+/// (the `MetadataExt` accessors for them are not stable).
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
+    // SAFETY: `file` owns a live handle for the duration of the call, and
+    // `info` points to writable memory of the structure's size.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so it filled the structure (which was
+    // zeroed, every field being a plain integer, beforehand anyway).
+    let info = unsafe { info.assume_init() };
+    Some((
+        u64::from(info.volume_serial_number),
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
+}
+
+/// Whether `a` and `b` name the same file (hard links to it).
+fn same_file(a: &Path, b: &Path) -> bool {
+    file_identity(a).is_some_and(|id| Some(id) == file_identity(b))
 }
 
 /// Append flags to an environment value already staged on a command.
@@ -4546,7 +4711,8 @@ mod tests {
         );
         let harness = temp.path().join("harness");
         std::fs::create_dir_all(&harness).unwrap();
-        super::stage_sanitizer_runtime(&harness, Some(&path));
+        let work = temp.path().join("work");
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
         assert_eq!(
             std::fs::read_to_string(harness.join(super::RUNTIME_PATH_FILE)).unwrap(),
             format!("{}\n{}\n", msvc.display(), llvm.display())
@@ -4561,10 +4727,177 @@ mod tests {
             !harness.join("clang_rt.asan_dynamic-x86_64.dll").exists(),
             "another toolchain's runtime is not mixed in"
         );
-        super::stage_sanitizer_runtime(&harness, Some(other.as_os_str()));
+        super::stage_sanitizer_runtime(&work, &harness, Some(other.as_os_str()));
         assert!(
             !harness.join(super::RUNTIME_PATH_FILE).exists(),
             "a stale sidecar is removed"
         );
+    }
+
+    /// The runtime DLL staged beside a harness is never the toolchain's own
+    /// file: a hard link to it would carry the toolchain directory's ACL (read
+    /// and execute only under Program Files), and the work dir could not be
+    /// deleted. It is copied once into the work dir and linked from there.
+    #[test]
+    fn a_staged_runtime_is_never_the_toolchains_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        std::fs::write(&source, b"v1").unwrap();
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses/H-ONE");
+        std::fs::create_dir_all(&harness).unwrap();
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        let cache = work.join(".bhf-runtime").join(name);
+        assert_eq!(std::fs::read(&cache).unwrap(), b"v1");
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+            assert_eq!(
+                ino(&harness.join(name)),
+                ino(&cache),
+                "linked from the cache"
+            );
+            assert_ne!(ino(&harness.join(name)), ino(&source));
+        }
+        // A link to the toolchain's file would read the new bytes.
+        std::fs::write(&source, b"v2-longer").unwrap();
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v2-longer");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"v2-longer");
+    }
+
+    /// Stage the runtime into every dir of `harnesses` at once, one thread per
+    /// dir, all released together (the concurrent candidates of a sweep).
+    fn stage_concurrently(work: &Path, harnesses: &[PathBuf], path: &std::ffi::OsStr) {
+        let start = std::sync::Barrier::new(harnesses.len());
+        std::thread::scope(|scope| {
+            for harness in harnesses {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    super::stage_sanitizer_runtime(work, harness, Some(path));
+                });
+            }
+        });
+    }
+
+    /// Candidates staging the runtime into one work dir at the same time each
+    /// get the whole DLL, every one a link to the single work-dir copy, both
+    /// on a fresh work dir and when the toolchain's DLL has changed since.
+    #[test]
+    fn concurrent_stagers_each_get_the_whole_runtime_from_one_copy() {
+        const STAGERS: usize = 16;
+        const ROUNDS: usize = 6;
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let first: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut second = first.clone();
+        second.extend_from_slice(b"a newer toolchain build");
+        second[0] ^= 0xff;
+        for round in 0..ROUNDS {
+            let work = temp.path().join(format!("work-{round}"));
+            let harnesses: Vec<PathBuf> = (0..STAGERS)
+                .map(|i| work.join(format!("harnesses/H-{i}")))
+                .collect();
+            for harness in &harnesses {
+                std::fs::create_dir_all(harness).unwrap();
+            }
+            for (stage, bytes) in [("fresh", &first), ("re-staged", &second)] {
+                std::fs::write(&source, bytes).unwrap();
+                stage_concurrently(&work, &harnesses, &path);
+                let cache = work.join(".bhf-runtime").join(name);
+                assert!(
+                    std::fs::read(&cache).unwrap() == *bytes,
+                    "round {round}, {stage}: the work-dir copy is the toolchain's DLL"
+                );
+                for harness in &harnesses {
+                    let staged = harness.join(name);
+                    let read = std::fs::read(&staged).unwrap();
+                    assert!(
+                        read == *bytes,
+                        "round {round}, {stage}: {} holds {} of {} bytes",
+                        staged.display(),
+                        read.len(),
+                        bytes.len()
+                    );
+                    assert!(
+                        super::same_file(&staged, &cache),
+                        "round {round}, {stage}: {} is a link to the work-dir copy",
+                        staged.display()
+                    );
+                }
+                let leftovers: Vec<_> = std::fs::read_dir(work.join(".bhf-runtime"))
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.file_name())
+                    .filter(|file| file != name)
+                    .collect();
+                assert!(
+                    leftovers.is_empty(),
+                    "round {round}, {stage}: {leftovers:?}"
+                );
+            }
+        }
+    }
+
+    /// A harness or build dir an earlier bhf staged as a hard link to the
+    /// toolchain's own DLL has its length and modified time, and those of the
+    /// work-dir copy too: it is still relinked to that copy.
+    #[test]
+    fn a_dir_linked_to_the_toolchains_file_is_relinked_to_the_work_dir_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        std::fs::write(&source, b"v1").unwrap();
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("build/H-ONE");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::hard_link(&source, harness.join(name)).unwrap();
+        assert!(super::same_file(&harness.join(name), &source));
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        let cache = work.join(".bhf-runtime").join(name);
+        assert!(
+            !super::same_file(&harness.join(name), &source),
+            "still the toolchain's file"
+        );
+        assert!(super::same_file(&harness.join(name), &cache));
+        std::fs::write(&source, b"v1 rebuilt").unwrap();
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+    }
+
+    /// Two paths are the same file exactly when one is a hard link to the
+    /// other; an equal copy is a different file.
+    #[test]
+    fn file_identity_tells_a_link_from_a_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("a.dll");
+        std::fs::write(&original, b"bytes").unwrap();
+        let link = temp.path().join("b.dll");
+        std::fs::hard_link(&original, &link).unwrap();
+        let copy = temp.path().join("c.dll");
+        std::fs::copy(&original, &copy).unwrap();
+        assert!(super::same_file(&original, &link));
+        assert!(!super::same_file(&original, &copy));
+        assert!(!super::same_file(
+            &original,
+            &temp.path().join("missing.dll")
+        ));
     }
 }

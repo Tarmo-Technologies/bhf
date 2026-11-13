@@ -1386,6 +1386,12 @@
   built+fuzzed targets: a target that was built but not fuzzed (a failed
   `make afl` with `--engine afl++`) or that never entered the target no longer
   counts its file as fuzzed.
+- Windows: the AddressSanitizer runtime DLL staged beside each harness is no
+  longer a hard link to the toolchain's own file. A link kept the toolchain
+  directory's ACL (read and execute only under Program Files), so a work dir
+  could not be deleted. The DLL is copied once into `<work-dir>/.bhf-runtime/`
+  (refreshed when the toolchain's file changes) and each harness dir links to
+  that copy.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
