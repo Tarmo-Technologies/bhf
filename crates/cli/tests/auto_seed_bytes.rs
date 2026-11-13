@@ -271,6 +271,55 @@ fn seed_file_and_seed_dir_reach_the_corpus_byte_exact() {
         .unwrap()
         .iter()
         .all(|seed| seed["source"] == "user"));
+    assert!(manifest.get("reason").is_none(), "{manifest}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Explicit seed inputs turn tree seed mining off even when they load
+/// nothing (a missing file, an empty dir): the run says so, and seeds.json
+/// carries the reason. Mining used to run as if no seed had been given.
+#[test]
+fn explicit_seeds_that_load_nothing_keep_mining_off() {
+    if !have_clang() {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = scratch("empty-user");
+    let src = tmp.join("src");
+    write_tree(&src);
+    let empty = tmp.join("empty-seeds");
+    std::fs::create_dir_all(&empty).unwrap();
+    let work = tmp.join("work");
+
+    let out = run_auto(
+        &src,
+        &work,
+        "2",
+        &[
+            "--seed-file",
+            tmp.join("missing.bin").to_str().unwrap(),
+            "--seed-dir",
+            empty.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "bhf auto: the --seed-file/--seed-dir inputs loaded no seed; tree seed mining \
+             stays off"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("mined from the tree"), "{stderr}");
+    assert!(!queue_entries(&work).contains(&binary_seed(1)), "{stderr}");
+    let manifest = seed_manifest(&work);
+    assert_eq!(manifest["mining"], "skipped_user_seeds", "{manifest}");
+    assert!(
+        manifest["seeds"].as_array().unwrap().is_empty(),
+        "{manifest}"
+    );
+    assert!(manifest["reason"].is_string(), "{manifest}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

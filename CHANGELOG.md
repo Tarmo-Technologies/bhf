@@ -1413,6 +1413,11 @@
   from a layout it never found; without a layout or binary the error names the
   dirs it searched. A bare file name given as `--harness` runs the file in the
   current directory, never a program of that name on `PATH`.
+- An explicit `--seed-file`/`--seed-dir` (or config `seed-file`/`seed-dir`)
+  that loads no seed (a missing file, an empty dir) keeps tree seed mining
+  off, as documented; the run says so, and `auto/seeds.json` records
+  `skipped_user_seeds` with a `reason`. Mining used to run as if no seed had
+  been given.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

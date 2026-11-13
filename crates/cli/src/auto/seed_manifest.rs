@@ -34,7 +34,8 @@ pub(crate) enum SeedSource {
 pub(crate) enum SeedMining {
     /// No explicit seeds were given, so the tree's test data was searched.
     Ran,
-    /// Explicit `--seed-file` / `--seed-dir` seeds replace mining.
+    /// Explicit `--seed-file` / `--seed-dir` inputs replace mining, even when
+    /// they load no seed ([`SeedManifest::reason`] then says so).
     SkippedUserSeeds,
     /// Turned off with `--no-seed-mining` or `seed-mining = false`.
     Disabled,
@@ -81,6 +82,10 @@ pub(crate) struct SeedManifest {
     /// fixed-width parameters before its buffer (see [`LayoutVariant`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) layout_variants: Vec<LayoutVariant>,
+    /// Why mining did not run when that is not plain from `mining` (explicit
+    /// seed inputs that loaded no seed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 /// One target's prefixed seeds. Its harness decodes `layout_prefix` input
@@ -91,8 +96,8 @@ pub(crate) struct SeedManifest {
 pub(crate) struct LayoutVariant {
     pub(crate) harness_id: String,
     pub(crate) layout_prefix: usize,
-    /// sha256 of each prefixed seed the engine received, which also names
-    /// its `corpus/<harness-id>/queue/<sha256>.bin`.
+    /// sha256 of each prefixed seed the engine received; a seed that added
+    /// coverage is kept as `corpus/<harness-id>/queue/<sha256>.bin`.
     pub(crate) sha256: Vec<String>,
 }
 
@@ -124,6 +129,7 @@ impl SeedManifest {
                 })
                 .collect(),
             layout_variants: Vec::new(),
+            reason: None,
         }
     }
 

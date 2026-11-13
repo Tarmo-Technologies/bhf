@@ -871,12 +871,23 @@ fn resolve_auto_seeds(
 ) -> Vec<Vec<u8>> {
     use crate::auto::seed_manifest::{SeedManifest, SeedMining, SeedSource};
     let user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
+    // Any explicit seed input (the config's `seed-file`/`seed-dir` too) turns
+    // tree seed mining off, even one that loads nothing.
+    let explicit = !args.seed_files.is_empty() || !args.seed_dirs.is_empty();
+    let mut reason = None;
     let (mining, source, seeds) = if !user_seeds.is_empty() {
         bhfeprintln!(
             "bhf auto: {} user seed input(s) added to each target's corpus",
             user_seeds.len()
         );
         (SeedMining::SkippedUserSeeds, SeedSource::User, user_seeds)
+    } else if explicit {
+        bhfeprintln!(
+            "bhf auto: the --seed-file/--seed-dir inputs loaded no seed; tree seed mining stays \
+             off (drop them to mine the tree's test data)"
+        );
+        reason = Some("the explicit seed inputs loaded no seed".to_owned());
+        (SeedMining::SkippedUserSeeds, SeedSource::User, Vec::new())
     } else if args.no_seed_mining {
         bhfeprintln!(
             "bhf auto: tree seed mining disabled (--no-seed-mining or seed-mining = false)"
@@ -887,8 +898,8 @@ fn resolve_auto_seeds(
         // reached through random bytes spends its budget bouncing off the header
         // check, while the same harness given one real archive or document starts
         // INSIDE the format. Projects already ship those files next to their
-        // tests; bhf used to walk straight past them. Explicit `--seed-*` wins,
-        // so this can never override what an operator asked for.
+        // tests; bhf used to walk straight past them. Any explicit `--seed-*`
+        // turns this off, so it can never override what an operator asked for.
         let mined = crate::auto::recipe_mining::mine_seed_corpus(tree_root);
         let mined_seeds = if mined.is_empty() {
             Vec::new()
@@ -904,7 +915,8 @@ fn resolve_auto_seeds(
         }
         (SeedMining::Ran, SeedSource::Mined, mined_seeds)
     };
-    let manifest = SeedManifest::new(mining, &seeds, source);
+    let mut manifest = SeedManifest::new(mining, &seeds, source);
+    manifest.reason = reason;
     match crate::auto::seed_manifest::write(work, &manifest) {
         Ok(manifest_path) => {
             if !seeds.is_empty() {

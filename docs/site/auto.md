@@ -93,7 +93,7 @@ their own interpreters with in-process edge coverage.
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
 | `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++ only; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
 | `--differential <A:B>` | unset | Two-compiler differential fuzzing (C/C++), e.g. `clang:gcc`: after the normal run, rebuild each C/C++ harness under both compilers and replay the corpus through both, flagging any input whose exit/crash behavior diverges (a codegen- or UB-dependent bug) as a BHF-301 finding. Either side may be a compiler path; paths with spaces are quoted |
-| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus, used byte for byte (binary formats included); repeatable. Any explicit seed turns tree seed mining off |
+| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus, used byte for byte (binary formats included); repeatable. Any explicit seed input turns tree seed mining off, even one that loads nothing (a missing file, an empty dir) |
 | `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file, in name order); repeatable |
 | `--no-seed-mining` | off | Do not seed targets from the tree's own test-data files (see [Seeds](#seeds)). Config key: `seed-mining = false` |
 | `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; paths with spaces are quoted; repeatable |
@@ -726,6 +726,10 @@ from the tree's own test data (regular files directly inside `test/`, `tests/`,
 build/IDE artifacts (`.vcxproj`, `.sln`, `.filters`, `.user`, `.suo`, `.props`,
 `.pdb`, `.dll`, `.lib`, `.obj`, `.ilk`, `.exp`, …), files over 256 KiB, and
 stops at 64 files. Turn it off with `--no-seed-mining` or `seed-mining = false`.
+An explicit `--seed-file`/`--seed-dir` (or config `seed-file`/`seed-dir`)
+turns it off too, even when it loads no seed (a missing file, an empty dir):
+the run says so, and `seeds.json` records `skipped_user_seeds` with a
+`reason`.
 
 Seeds reach the engine byte for byte, as do the corpus entries a later pass or
 the AFL++ stage reseeds from `corpus/<harness-id>/queue/`. `auto/seeds.json`
