@@ -107,6 +107,7 @@ class WorkflowContractTests(unittest.TestCase):
         "cartography_cli",
         "explain_cli",
         "provenance_cli",
+        "winafl_engine",
     )
 
     def test_windows_runs_the_windows_integration_suites(self):

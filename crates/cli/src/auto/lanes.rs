@@ -2,7 +2,8 @@
 
 //! The extra build lanes of a C/C++ harness that are built after `main` has
 //! built and can fail on their own: the source-coverage lane (`make cov`) that
-//! line coverage is measured with, and the AFL++ lane (`make afl`). A lost
+//! line coverage is measured with, the AFL++ lane (`make afl`) and the WinAFL
+//! lane (`make winafl`). A lost
 //! lane is recorded in the harness dir (`lanes.json`), so `run.json`
 //! (`targets[].lanes`), `summary.txt` and `run.md` say what it cost instead of
 //! staying silent.
@@ -24,6 +25,8 @@ pub(crate) const LANES_FILE: &str = "lanes.json";
 pub(crate) const COVERAGE: &str = "cov";
 /// The AFL++ lane (`make afl`, `main_afl`).
 pub(crate) const AFL: &str = "afl";
+/// The WinAFL lane (`make winafl`, `main_winafl`), built for `--engine winafl`.
+pub(crate) const WINAFL: &str = "winafl";
 
 /// Whether one lane built, and why not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ pub(crate) fn unavailable(
             let what = match lane.as_str() {
                 COVERAGE => "line coverage unavailable".to_owned(),
                 AFL => "AFL++ fuzzing unavailable".to_owned(),
+                WINAFL => "WinAFL fuzzing unavailable".to_owned(),
                 other => format!("{other} lane unavailable"),
             };
             let earlier = if !status.recorded_before(run_started_at) {

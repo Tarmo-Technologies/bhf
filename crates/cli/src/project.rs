@@ -633,6 +633,13 @@ fn plan_to_fuzz_args(
         afl_path: launch.afl_path.clone(),
         // A single manifest range maps to one repeatable `--afl-inst-range`.
         afl_inst_ranges: launch.afl_inst_ranges.clone().into_iter().collect(),
+        // A project manifest has no WinAFL engine; its keys stay at their defaults.
+        winafl_path: None,
+        dynamorio_path: None,
+        winafl_instrumentation: crate::fuzz::WinaflInstrumentation::Dynamorio,
+        winafl_iterations: None,
+        winafl_coverage_modules: Vec::new(),
+        winafl_page_heap: false,
         workers: None,
         iterations: None,
         time: resolve_duration(&launch.time)?,

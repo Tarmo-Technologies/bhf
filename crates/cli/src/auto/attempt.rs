@@ -249,6 +249,9 @@ pub struct AttemptOptions {
     /// The Ada toolchain (`[toolchain.ada]`, `--ada-*`, `--probe-backend`)
     /// every Ada harness build uses.
     pub ada_toolchain: crate::toolchain::AdaBuildSettings,
+    /// `--engine winafl` settings: the WinAFL and DynamoRIO locations and the
+    /// instrumentation, iteration and coverage-module choices.
+    pub winafl: crate::fuzz::WinaflSettings,
 }
 
 /// A whole-sweep cross target and what the run prepared for it.
@@ -290,6 +293,7 @@ impl Default for AttemptOptions {
             force: false,
             cross_sweep: None,
             ada_toolchain: crate::toolchain::AdaBuildSettings::default(),
+            winafl: crate::fuzz::WinaflSettings::default(),
         }
     }
 }
@@ -1374,7 +1378,7 @@ pub(crate) fn applicable_engines(
         .copied()
         .filter(|engine| match engine {
             FuzzEngine::Builtin => true,
-            FuzzEngine::AflPlusPlus => is_c_family,
+            FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
         })
         .collect();
     if out.is_empty() {
@@ -2991,7 +2995,10 @@ fn run_attempt(
     // cross-compiled, fall back to the builtin (emulated) cascade so the target is
     // still fuzzed rather than silently left unfuzzed.
     let run_afl = target_engines.contains(&FuzzEngine::AflPlusPlus) && cross_runner.is_none();
-    let run_builtin = target_engines.contains(&FuzzEngine::Builtin) || !run_afl;
+    // WinAFL likewise runs only a native harness: DynamoRIO instruments the
+    // host process, never an emulated one.
+    let run_winafl = target_engines.contains(&FuzzEngine::Winafl) && cross_runner.is_none();
+    let run_builtin = target_engines.contains(&FuzzEngine::Builtin) || !(run_afl || run_winafl);
 
     // Resolve probe archives before generation. If one compiled under this
     // exact sanitizer contract exports the target, it must be the sole target
@@ -3774,6 +3781,110 @@ fn run_attempt(
                             }
                             Err(error) => bhfeprintln!(
                                 "bhf auto: warning: AFL run failed for {}: {error}",
+                                candidate.harness_id
+                            ),
+                        }
+                    }
+                }
+
+                // WinAFL engine stage (`auto --engine winafl`, native Windows):
+                // build `main_winafl` (the same sources without sanitizers) with
+                // the recovered extras the `main` build used, then run WinAFL for
+                // this engine's budget slice. Each crash and hang it saves is
+                // replayed through the sanitized `main`, so its findings fold into
+                // the shared pipeline. A failure is logged and skipped like AFL's.
+                if run_winafl {
+                    progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "winafl" }));
+                    let winafl_build = crate::build::try_run_c_make_winafl_build_with_extras(
+                        work_dir,
+                        &candidate.harness_id,
+                        &extra_sources,
+                        &extra_includes,
+                    );
+                    let winafl_built = winafl_build.status.success();
+                    let winafl_lane = if winafl_built {
+                        crate::auto::lanes::LaneStatus::built()
+                    } else {
+                        crate::auto::lanes::LaneStatus::failed(
+                            crate::fuzz::WINAFL_BINARY,
+                            &format!(
+                                "{}\n{}",
+                                String::from_utf8_lossy(&winafl_build.stderr),
+                                String::from_utf8_lossy(&winafl_build.stdout)
+                            ),
+                        )
+                    };
+                    if !winafl_built {
+                        bhfeprintln!(
+                            "bhf auto: warning: WinAFL skipped for {}: {}",
+                            candidate.harness_id,
+                            winafl_lane
+                                .reason
+                                .as_deref()
+                                .unwrap_or("make main_winafl failed"),
+                        );
+                    }
+                    crate::auto::lanes::record(
+                        &harness_dir,
+                        crate::auto::lanes::WINAFL,
+                        winafl_lane,
+                    );
+                    if winafl_built {
+                        let mut winafl_seeds = seeds.clone();
+                        reseed_from_corpus_queue(
+                            work_dir,
+                            &candidate.harness_id,
+                            &mut winafl_seeds,
+                            CORPUS_RESEED_CAP,
+                        );
+                        match crate::fuzz::run_winafl_programmatic(
+                            work_dir,
+                            &candidate.harness_id,
+                            winafl_seeds,
+                            Some(engine_budget),
+                            &env_injected,
+                            options.mode,
+                            options.rss_limit_mb,
+                            options.sanitizers.runtime_set(),
+                            &options.winafl,
+                        ) {
+                            Ok(summary) => {
+                                let reach_label = effective_reachability_label(
+                                    candidate.input_reachability,
+                                    ipc_channel_observed,
+                                );
+                                let reach_basis = reachability_basis_for(candidate, reach_label);
+                                for fid in &summary.findings {
+                                    let finding_path = corpus::layout::finding_dir(work_dir, fid)
+                                        .join("finding.json");
+                                    // The WinAFL target runs without the runtrace shim.
+                                    if let Err(error) = stamp_runtime_mode(
+                                        &finding_path,
+                                        crate::auto::pass::Pass::FuzzDriven,
+                                        &env_injected,
+                                        reach_label,
+                                        reach_basis,
+                                        false,
+                                    ) {
+                                        bhfeprintln!(
+                                            "bhf auto: warning: stamp {fid} runtime_mode: {error}"
+                                        );
+                                    }
+                                }
+                                pass_runs.push(PassRun {
+                                    pass: crate::auto::pass::Pass::FuzzDriven,
+                                    engine: "winafl".to_owned(),
+                                    executions: summary.executions,
+                                    target_entry_observed: summary.target_entry_observed,
+                                    coverage_edges: summary.coverage.edges,
+                                    coverage_instrumentation: summary.coverage.instrumentation(),
+                                    elapsed_secs: summary.elapsed_secs,
+                                    executions_per_sec: summary.executions_per_sec,
+                                    findings: summary.findings.clone(),
+                                });
+                            }
+                            Err(error) => bhfeprintln!(
+                                "bhf auto: warning: WinAFL run failed for {}: {error}",
                                 candidate.harness_id
                             ),
                         }

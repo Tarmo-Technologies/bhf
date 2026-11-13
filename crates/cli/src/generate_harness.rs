@@ -8180,6 +8180,7 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
     ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
     ("PROV", "$(CC)", "$(CFLAGS)", true, true),
+    ("WINAFL", "$(CC)", "$(WINAFL_CFLAGS)", true, true),
 ];
 
 const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
@@ -8187,6 +8188,7 @@ const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
+    ("WINAFL", "$(CXX)", "$(WINAFL_CXXFLAGS)", true, true),
 ];
 
 fn remove_stale_per_tu_context(output_dir: &Path, fragment_name: &str) -> Result<()> {
@@ -8252,7 +8254,13 @@ fn write_per_tu_context(
                 && *operator_lane
                 && context.source.extension().and_then(|ext| ext.to_str()) == Some("c");
             let (compiler, variant_flags) = if c_row_of_cpp {
-                ("$(CC)", "$(BHF_CONTEXT_C_FLAGS)")
+                // The WinAFL lane's C units stay uninstrumented like its C++
+                // ones; every other operator lane's take the sanitized C flags.
+                if *variant == "WINAFL" {
+                    ("$(CC)", "$(WINAFL_CFLAGS)")
+                } else {
+                    ("$(CC)", "$(BHF_CONTEXT_C_FLAGS)")
+                }
             } else {
                 (*lane_compiler, *lane_flags)
             };
@@ -20216,6 +20224,89 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The WinAFL lane (`make winafl`) builds the harness's sources without
+    /// sanitizers or SanitizerCoverage, since an AddressSanitizer binary does
+    /// not run under DynamoRIO, and links a driver object built with
+    /// -DBHF_WINAFL, which exports WinAFL's persistent entry.
+    #[test]
+    fn winafl_lane_builds_without_sanitizers_and_exports_its_entry() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-winafl-lane");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-WINAFL-C", &root);
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir =
+            generate_for_make_test(&cpp_source, "parse_record", "H-WINAFL-CPP", &cpp_root);
+        // Each binary carries the platform's executable suffix (`.exe` on Windows).
+        let exe = |stem: &str| format!("{stem}{} ", std::env::consts::EXE_SUFFIX);
+        for dir in [&c_dir, &cpp_dir] {
+            let dry_run = make_dry_run_goal(dir, "winafl", &[]);
+            let link = recipe_for(&dry_run, &exe("main_winafl"));
+            assert!(!link.contains("-fsanitize"), "{link}");
+            assert!(link.contains("-DBHF_EXTERNAL_DRIVER"), "{link}");
+            assert!(link.contains("bhf_driver_winafl.o"), "{link}");
+            let driver = recipe_for(&dry_run, "bhf_driver_winafl.o ");
+            assert!(driver.contains("-DBHF_WINAFL"), "{driver}");
+            assert!(!driver.contains("-fsanitize"), "{driver}");
+            // `main` keeps its sanitizers.
+            let main = make_dry_run_goal(dir, "main", &[]);
+            assert!(
+                recipe_for(&main, &exe("main")).contains("-fsanitize=address"),
+                "{main}"
+            );
+            // The dllexport leaves an import library and an exports file on
+            // Windows, which `clean` removes with the build.
+            let clean = make_dry_run_goal(dir, "clean", &[]);
+            for leftover in [
+                exe("main_winafl"),
+                "main_winafl.lib ".to_owned(),
+                "main_winafl.exp ".to_owned(),
+                "main_winafl.pdb ".to_owned(),
+            ] {
+                assert!(clean.contains(&leftover), "{leftover}: {clean}");
+            }
+            // `make clean` also removes the copies `--winafl-page-heap` runs
+            // left (each with bhf's marker beside it), and nothing without one.
+            let file = |name: String| {
+                let path = dir.join(name);
+                fs::write(&path, "x").unwrap();
+                path
+            };
+            let suffix = std::env::consts::EXE_SUFFIX;
+            let copy = file(format!("main_winafl-4321-0-6935c1a2{suffix}"));
+            let marker = file(format!("main_winafl-4321-0-6935c1a2{suffix}.bhf-run"));
+            let unmarked = file(format!("main_winafl-4321-1-6935c1a3{suffix}"));
+            let handmade = file(format!("main_winafl-handmade{suffix}"));
+            let status = std::process::Command::new("make")
+                .arg("-C")
+                .arg(dir)
+                .arg("clean")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(!copy.exists() && !marker.exists(), "{}", dir.display());
+            assert!(unmarked.exists() && handmade.exists(), "{}", dir.display());
+        }
+    }
+
     /// The toolchain's preprocessor words and library operands reach every
     /// lane of both Makefiles, not just `main`: a lane built with another
     /// compiler (coverage, AFL++, libFuzzer, MSan, TSan, differential) that
@@ -20246,6 +20337,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("main", "main"),
             ("prov", "main_prov"),
             ("afl", "main_afl"),
+            ("winafl", "main_winafl"),
             ("libfuzzer", "main_libfuzzer"),
             ("msan", "main_msan"),
             ("tsan", "main_tsan"),
@@ -20273,6 +20365,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         for (goal, binary) in [
             ("main", "main"),
             ("afl", "main_afl"),
+            ("winafl", "main_winafl"),
             ("libfuzzer", "main_libfuzzer"),
             ("cov", "main_cov"),
             ("diff", "main_diff"),

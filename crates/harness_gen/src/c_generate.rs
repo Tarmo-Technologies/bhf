@@ -9375,8 +9375,13 @@ mod tests {
             mk.contains("DBHF_AFL"),
             "Makefile should compile AFL build with -DBHF_AFL"
         );
+        // A name that starts with it: `WINAFL_CFLAGS` (the WinAFL lane) is not
+        // in AFL's namespace.
+        let words: Vec<&str> = mk
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
         assert!(
-            !mk.contains("AFL_CC") && !mk.contains("AFL_CFLAGS"),
+            !words.contains(&"AFL_CC") && !words.contains(&"AFL_CFLAGS"),
             "Makefile must not use the reserved AFL_ env-var prefix",
         );
         assert!(

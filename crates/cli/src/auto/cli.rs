@@ -114,14 +114,16 @@ pub struct AutoArgs {
     /// resolve against the file's directory. Without this, a `.bhf.toml` in the
     /// scanned tree root is auto-loaded — but an auto-loaded config honors only SAFE
     /// knobs (keys that EXECUTE something, `build-command`, `run-untrusted`,
-    /// `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate` and
-    /// the `[toolchain]` table, require this explicit flag). Only these flags have a
+    /// `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate`,
+    /// `winafl-path`, `dynamorio-path` and the `[toolchain]` table, require this
+    /// explicit flag). Only these flags have a
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, grammar,
     /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
     /// engine, languages, project, ada-deps, passes, force, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
-    /// msbuild-evaluate (`seed-mining = false` is --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
+    /// msbuild-evaluate, winafl-path, dynamorio-path (`seed-mining = false` is
+    /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
     /// --ldflags, --define, --toolchain-include, --sysroot, --target-triple,
     /// --runner, --runner-arg, --ada-*, --probe-backend) are keys of a
     /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
@@ -421,9 +423,47 @@ pub struct AutoArgs {
     /// `afl-clang-fast` on PATH, else it falls back to builtin with a warning).
     /// `--engine builtin,afl++` runs BOTH per target, splitting `--per-target-time`
     /// evenly across them. For a non-C/C++ target an `afl++` selection falls back
-    /// to builtin (logged, never silently skipped).
+    /// to builtin (logged, never silently skipped). `winafl` drives WinAFL on
+    /// native Windows (C/C++ targets; needs WinAFL and DynamoRIO, see
+    /// `--winafl-path` / `--dynamorio-path`; refused on other hosts): it fuzzes
+    /// a build without sanitizers and replays each saved crash and hang through
+    /// the sanitized harness.
     #[arg(long = "engine", default_value = "builtin", value_name = "LIST")]
     pub engine: String,
+
+    /// WinAFL directory for `--engine winafl` (holding `afl-fuzz.exe` and
+    /// `winafl.dll`). Default: `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on PATH.
+    #[arg(long = "winafl-path", value_name = "DIR")]
+    pub winafl_path: Option<PathBuf>,
+
+    /// DynamoRIO install root (or its `bin64`) for `--engine winafl`. Default:
+    /// `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on PATH.
+    #[arg(long = "dynamorio-path", value_name = "DIR")]
+    pub dynamorio_path: Option<PathBuf>,
+
+    /// WinAFL coverage: `dynamorio` (default) or `intel-pt`.
+    #[arg(
+        long = "winafl-instrumentation",
+        value_enum,
+        default_value_t = crate::fuzz::WinaflInstrumentation::Dynamorio
+    )]
+    pub winafl_instrumentation: crate::fuzz::WinaflInstrumentation,
+
+    /// WinAFL `-fuzz_iterations` (persistent-entry calls per process). Default 5000.
+    #[arg(long = "winafl-iterations", value_name = "N")]
+    pub winafl_iterations: Option<u32>,
+
+    /// Another module (a target DLL) for WinAFL to measure coverage in. Repeatable.
+    #[arg(long = "winafl-coverage-module", value_name = "MODULE")]
+    pub winafl_coverage_modules: Vec<String>,
+
+    /// Run the WinAFL build under full PageHeap, so heap overflows fault as
+    /// crashes: WinAFL fuzzes a copy of `main_winafl.exe` under a name only
+    /// the run uses, with an Image File Execution Options key bhf sets for that
+    /// name and removes after the run. Needs an elevated shell (refused up
+    /// front otherwise).
+    #[arg(long = "winafl-page-heap")]
+    pub winafl_page_heap: bool,
 
     /// Print an extra indented line per target explaining the outcome:
     /// why a target was skipped or failed, which repairs auto applied,
@@ -1138,6 +1178,27 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
     if args.max_corpus_mb == 0 {
         anyhow::bail!("--max-corpus-mb must be at least 1");
+    }
+    // `--engine winafl`: refused off native Windows, its tools are located and
+    // `--winafl-page-heap` is checked against the shell's rights before
+    // anything is discovered or built, so a missing WinAFL or DynamoRIO, or a
+    // shell that may not set PageHeap, fails the run at once with the error
+    // naming what to do. Like an unusable toolchain, that is exit 2.
+    let winafl = crate::fuzz::WinaflSettings {
+        winafl_path: args.winafl_path.clone(),
+        dynamorio_path: args.dynamorio_path.clone(),
+        instrumentation: args.winafl_instrumentation,
+        fuzz_iterations: args.winafl_iterations,
+        coverage_modules: args.winafl_coverage_modules.clone(),
+        page_heap: args.winafl_page_heap,
+    };
+    if crate::fuzz::parse_engine_list(&args.engine)
+        .is_ok_and(|engines| engines.contains(&crate::fuzz::FuzzEngine::Winafl))
+    {
+        if let Err(error) = crate::fuzz::check_winafl_available(&winafl) {
+            bhfeprintln!("error: {error}");
+            return Ok(2);
+        }
     }
     let work_state = crate::auto::work_state::prepare(&work, args.resume)
         .with_context(|| format!("prepare generated state under {}", work.display()))?;
@@ -2073,6 +2134,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             probe_archives: cross_probe_archives,
         }),
         ada_toolchain,
+        winafl,
     };
     // #6: the fully-ranked candidate count BEFORE any --max-targets / campaign
     // split cap, so the report can surface how many targets the cap dropped from

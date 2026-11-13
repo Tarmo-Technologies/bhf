@@ -1695,6 +1695,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/winafl.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/fuzz/winafl/page_heap.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/gate_evidence.rs",
       "license": "Apache-2.0"
     },
@@ -2756,6 +2764,10 @@
     },
     {
       "path": "crates/cli/tests/transport_fuzz_timeout_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/winafl_engine.rs",
       "license": "Apache-2.0"
     },
     {

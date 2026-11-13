@@ -215,6 +215,267 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 `bhf explain` quotes the work dir and capsule paths it prints, so a path
 with spaces (`C:\Users\a b\work`) pastes as one argument.
 
+## WinAFL engine (`--engine winafl`)
+
+[WinAFL](https://github.com/googleprojectzero/winafl) is a third engine for
+C/C++ targets on native Windows, beside the builtin engine and AFL++.
+`--engine winafl` is refused on any other host before anything is built.
+
+```powershell
+bhf.exe auto C:\path\to\source --engine winafl `
+  --winafl-path C:\tools\winafl-src\build64\bin\Release `
+  --dynamorio-path C:\tools\DynamoRIO-Windows-11.91.20763 `
+  --per-target-time 120
+# or with the builtin engine sharing each target's budget:
+bhf.exe auto C:\path\to\source --engine builtin,winafl --per-target-time 240
+```
+
+### Installing WinAFL and DynamoRIO
+
+WinAFL no longer ships prebuilt binaries, so build it with CMake against a
+DynamoRIO package. The versions bhf is validated with (Windows Server 2022, VS
+2022 Build Tools 17.14):
+
+| Tool | Version | Where |
+|------|---------|-------|
+| DynamoRIO | 11.91.20763 (weekly build `cronbuild-11.91.20763`, 2026-11-07), `DynamoRIO-Windows-11.91.20763.zip`, SHA-256 `EA3DAD4AE6E39228FE87B5D4D7BC3A53FAFDB6161EE5BA6A2E98FB64F8A7E0D4` | [DynamoRIO releases](https://github.com/DynamoRIO/dynamorio/releases/tag/cronbuild-11.91.20763) |
+| WinAFL | master `fd85f38548` (WinAFL 1.17, AFL 2.43b), built x64 with `-DINTELPT=1 -DUSE_COLOR=1` | [googleprojectzero/winafl](https://github.com/googleprojectzero/winafl) |
+
+WinAFL master calls `drmgr_register_exit_event`, which DynamoRIO's last
+release, 11.3.0, does not have: linking `winafl.dll` against 11.3.0 fails with
+LNK2019. Use a DynamoRIO weekly build of 11.90 or later with master (as above),
+or build WinAFL at `c362747159`, the commit before that change, against
+DynamoRIO 11.3.0.
+
+From a VS 2022 x64 developer prompt:
+
+```powershell
+# DynamoRIO: unpack the zip, e.g. to C:\tools\DynamoRIO-Windows-11.91.20763
+git clone https://github.com/googleprojectzero/winafl C:\tools\winafl-src
+cd C:\tools\winafl-src
+git submodule update --init --recursive    # Intel PT support (third_party)
+mkdir build64; cd build64
+cmake -G "Visual Studio 17 2022" -A x64 .. `
+  -DDynamoRIO_DIR=C:\tools\DynamoRIO-Windows-11.91.20763\cmake -DINTELPT=1 -DUSE_COLOR=1
+cmake --build . --config Release
+# -> build64\bin\Release\afl-fuzz.exe, winafl.dll, winaflpt-debug.exe
+```
+
+bhf finds them from `--winafl-path` (the directory holding `afl-fuzz.exe` and
+`winafl.dll`, or the checkout holding `build64\bin\Release`), then
+`BHF_WINAFL_PATH`, then `afl-fuzz.exe` on `PATH`; and DynamoRIO from
+`--dynamorio-path` (its install root, or its `bin64`), then
+`BHF_DYNAMORIO_PATH`, then DynamoRIO's own `DYNAMORIO_HOME`, then `drrun.exe`
+on `PATH`. In `bhf auto` a `--config` file can hold them as `winafl-path` and
+`dynamorio-path`; like the `[toolchain]` table they name programs bhf runs, so
+an auto-loaded `.bhf.toml` cannot set them. A missing tool stops the run before
+the sweep with an error naming it and how to install it (`WinAFL not found:
+...`, `WinAFL at ... has afl-fuzz.exe but no winafl.dll ...`, `DynamoRIO not
+found: ...`). An x86 harness (`--vs-arch x86`) uses DynamoRIO's `bin32` and
+needs a 32-bit WinAFL build: bhf reads the architecture of each `winafl.dll` it
+finds (in a checkout, `build32\bin\Release` for x86) and refuses one that does
+not match the harness. An ARM64 target (`--vs-arch arm64`, or the default on
+an ARM64 machine) is refused, since WinAFL fuzzes x86 and x64 harnesses. In
+`bhf auto` these checks run before the sweep, and it exits `2` when one fails,
+as for an unusable toolchain. `bhf fuzz` exits `1` for a missing or unusable
+WinAFL or DynamoRIO, a refused `--winafl-coverage-module` or an ARM64 harness,
+as for a missing `afl-fuzz`; it exits `3` on a host other than native Windows,
+for `--winafl-page-heap` in a shell that is not elevated, and for
+`--target-transport` or `--protocol-profile`.
+
+### How a target is fuzzed
+
+- **The WinAFL build.** `bhf auto` runs `make winafl`, which builds
+  `main_winafl.exe` beside `main.exe` from the same translation units, without
+  AddressSanitizer or SanitizerCoverage (`WINAFL_CFLAGS`, default `-O1 -g`;
+  `bhf build --c-engine winafl` builds it for `bhf fuzz`). Like `main.exe` it
+  is named with `$(EXEEXT)`; its export also leaves `main_winafl.lib` and
+  `main_winafl.exp`, which `make clean` removes with `main_winafl.pdb` and the
+  run copies `--winafl-page-heap` left. An extensionless
+  `main_winafl` an earlier build left is still found. WinAFL measures
+  coverage itself, with DynamoRIO.
+- **Persistent entry.** bhf's driver has an exported, never-inlined
+  `int bhf_winafl_fuzz(const char *path)` that opens, reads and closes the input
+  file and runs it, as WinAFL's persistent mode requires; `main` calls it for
+  its argument. WinAFL runs it as `-target_method`:
+
+  ```text
+  afl-fuzz.exe -i <seeds> -o <out> -D <DynamoRIO>\bin64 -w <winafl.dll> -t 2000+ -I 30000 -m <MiB|none> -d [-x dictionary.txt] --
+    -coverage_module main_winafl.exe [-coverage_module <dll>...] -target_module main_winafl.exe
+    -target_method bhf_winafl_fuzz -nargs 1 -fuzz_iterations 5000 -covtype edge -- <dir>\main_winafl.exe @@
+  ```
+
+  `-t` is `--timeout` (default 2000 ms per iteration; `+` skips seeds that time
+  out), `-I` gives the first iteration of each process its start-up time under
+  DynamoRIO (ten times `-t`, at least 30 s; without it a slow start reads as a
+  hang), `-m` is `--rss-limit-mb` plus 1024 MiB for DynamoRIO (`-m none` for
+  `0`; WinAFL caps the committed memory of drrun and the target with a job
+  object). For an x86 harness, whose 32-bit afl-fuzz computes that cap in 32
+  bits, `-m` is passed only while it is below what the process can address
+  (2 GiB, or 4 GiB when linked `/LARGEADDRESSAWARE`), and is `-m none`
+  otherwise, which bhf notes. `-fuzz_iterations` is `--winafl-iterations`, and
+  `--winafl-coverage-module` adds a DLL of the target the harness loads (a
+  name with a space or a quote is refused, since WinAFL passes it on
+  unquoted). `-d` skips AFL's deterministic stages, as AFL++ does by default;
+  on a campaign of minutes they spend the budget on the first queue entries.
+- **Seeds and dictionary.** The seeds are the ones the other engines get (mined,
+  `--seed-file`/`--seed-dir`, the corpus earlier passes grew), written byte for
+  byte; WinAFL skips an empty file and refuses one over 1 MiB, so an empty seed
+  is left out and a larger one cut to 1 MiB. AFL 2.x takes one `-x`, so the
+  harness's `dictionary.txt` and `learned_dictionary.txt` are merged into one
+  file in WinAFL's syntax, each token once (tokens over 128 bytes, WinAFL's
+  limit, are left out). WinAFL's queue is handed back to the harness's corpus
+  (`corpus/<id>/queue/`) at the end.
+- **Time budget.** WinAFL has no time limit and no graceful stop, so bhf stops
+  it at the budget, killing afl-fuzz, drrun and the target together through a
+  job object. When WinAFL stops early on its own (it aborts when it cannot stop
+  a hung target), bhf starts it again on the queue it reached for the time left,
+  up to 8 sessions. When the last session stops early, what it saved is still
+  replayed and its queue still kept, with a warning (`stopped_early` in
+  `run.json`); the run fails only when WinAFL saved nothing at all.
+- **A run stopped before its replay.** On Ctrl-C, Ctrl-Break or a closed
+  console bhf stops WinAFL and the target and ends the run without replaying
+  what WinAFL saved, printing where those inputs are and how to run one by
+  hand:
+
+  ```text
+  bhf: the WinAFL run of H-1 stopped (Ctrl-C, Ctrl-Break or a closed console) before it replayed what WinAFL saved: those inputs stay under C:\work\winafl_out\H-1, and the next `bhf fuzz --engine winafl` or `bhf auto --engine winafl` run of H-1 in this work dir replays them into findings (to run one by hand: C:\work\build\H-1\main.exe <file>)
+  ```
+
+  They stay in `<work>\winafl_out\<id>\out*\crashes` and `hangs` (a
+  run killed outright leaves them there too). The next WinAFL run of that
+  harness in the same work dir keeps such output under
+  `winafl_out\<id>\earlier\<n>` (the last 8 such runs) and replays it with its
+  own saved inputs, so it becomes findings like any other (`earlier_inputs` in
+  `run.json`). Output a run did replay is cleared by the next run. Running the
+  sanitized `main.exe` on one file prints its report, but records no finding.
+- **Coverage and statistics.** `coverage.edges` is WinAFL's own: the map bytes
+  `fuzz_bitmap` shows hit, or, before its first write (once a minute), the map
+  density in `plot_data` (every 5 s) times the 64 KiB map. The executions come
+  from `fuzzer_stats`, or are added up from `plot_data`'s rates when that is
+  fresher. `run.json` keeps them under `winafl` with the tools, the two
+  binaries, the sessions and how each saved input replayed.
+- **Findings.** The crashes and hangs WinAFL saves, and the seeds its dry run
+  found crashing, are replayed through the sanitized `main.exe`: first one
+  crash of each exception name, then the other crashes, the crashing seeds and
+  the hangs. Inputs with the same bytes are replayed once, and the replay ends
+  after half the time budget (at least 30 s, at most 10 min). Half of that is
+  kept for the hangs: while hangs wait, the crashes stop at it, and the ones
+  left over are replayed after the hangs in the time that remains. Hangs stop
+  being replayed after 8 of them time out again with no report in between
+  (WinAFL keeps up to 500, and each that still times out costs a replay
+  timeout); a hang that replays clean costs only its run and does not count,
+  so the one real hang after many load-induced ones is still replayed. An
+  input that cannot be read or replayed is a warning, and the rest are still
+  replayed. `run.json` counts the inputs left
+  out (`replay_duplicates`, `replay_skipped`, `replay_errors`); they stay
+  under `<work>\winafl_out\<id>`. An input that
+  produces a sanitizer or exception report becomes a finding through the same
+  root-cause dedupe and `results/` flow as an AFL++ crash, so `bhf replay`,
+  `bhf explain`, `bhf capsule` and `bhf verify-poc` work on it as on a builtin
+  finding. Its `finding.json` has a `discovery` block (`engine: winafl`, the
+  binary and its empty sanitizer list, `saved_as` `crash`/`hang`/
+  `crashing-seed`, WinAFL's exception name), and in `bhf auto` its fidelity
+  record says it was found by WinAFL in a build without sanitizers and
+  confirmed by the sanitized replay. A hang that replays clean, or still times
+  out, is counted (`replay_clean`, `replay_timed_out`), not reported.
+
+### AddressSanitizer and DynamoRIO
+
+An AddressSanitizer harness does not run under DynamoRIO, which is why WinAFL
+gets its own build. Measured on the validation VM (clang 23 `-fsanitize=address`,
+DynamoRIO 11.3.0 and 11.91.20763): the ASan binary hangs at start-up under
+`drrun` even with no client, while the same source without ASan runs WinAFL's
+persistent loop at 1,500 to 4,600 executions a second. And WinAFL's client
+treats every first-chance access violation as a crash, while 64-bit Windows
+ASan commits its shadow memory on demand from access violations.
+
+Without ASan, WinAFL sees a memory error only when it faults. A heap overflow
+that corrupts the heap is ended by Windows with a fail-fast
+(`STATUS_HEAP_CORRUPTION`), which WinAFL's DynamoRIO client never sees, so WinAFL
+saves the input as a hang, or the process takes the next inputs down with it;
+bhf replays hangs through `main.exe` too, which reports the overflow. The WinAFL
+build checks the process heap after every input (`HeapValidate`), so a corrupted
+heap ends that input's iteration rather than a later one's.
+`--winafl-page-heap` makes heap errors fault at once instead. Every allocation
+then ends at a guard page and a freed one is decommitted, so an overflow or a
+use after free is an access violation WinAFL saves as a crash. It needs memory
+for a page or two per allocation.
+
+PageHeap is set per image name, machine-wide, by an Image File Execution
+Options key (the one `gflags /p /enable <image> /full` writes). So that no
+other run, campaign or `--jobs` worker sees it, WinAFL fuzzes a copy of
+`main_winafl.exe` under a name only this run uses,
+`main_winafl-<pid>-<n>-<stamp>.exe` beside the build, and bhf sets the key for
+that name only and prints it:
+
+```text
+bhf: full PageHeap: WinAFL fuzzes C:\work\build\H-1\main_winafl-4321-0-6935c1a2.exe (a copy of C:\work\build\H-1\main_winafl.exe) with PageHeap set under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\main_winafl-4321-0-6935c1a2.exe until the run ends
+```
+
+The key holds a `BhfPageHeapOwner` value naming the bhf process (its id and
+start time), and the copy has a marker file beside it,
+`main_winafl-<pid>-<n>-<stamp>.exe.bhf-run`, naming the same process. When the
+run ends, bhf deletes the `GlobalFlag`, `PageHeapFlags` and owner values it
+wrote, then the key (which it created, if nothing else is in it), then the copy
+and its marker. On Ctrl-C, Ctrl-Break or a closed console it does the same from
+a console control handler: it removes the key, stops afl-fuzz, drrun and the
+target through their job object, deletes the copy and its marker once the
+target has exited (waiting up to 2 s), and starts no replay (the next run
+replays what WinAFL saved; see "A run stopped before its replay" above). A run killed
+outright (`taskkill /F`, a crash of bhf) cannot do any of that, so every WinAFL
+run first removes the keys (from an elevated shell) of owners that are no
+longer running, and the copies in that harness directory whose marker names
+such an owner; `make clean` in the harness directory removes every marked copy
+too. Until then the stale key names only that run's copy, which nothing else
+runs. bhf deletes only what its owner value or marker proves a bhf run made: a
+`main_winafl-*.exe` without a marker, or a key without the owner value, is left
+alone, and so is one whose key bhf cannot read.
+To remove one by hand, from an elevated PowerShell (bhf prints the line when it
+cannot remove a key itself):
+
+```powershell
+reg delete 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\main_winafl-<...>.exe' /f
+```
+
+Writing the key needs an elevated shell: without one, `--winafl-page-heap` is
+refused before anything is built (`bhf auto` exits `2`, `bhf fuzz` `3`). The
+`page_heap` recorded in `run.json` and in each finding's `discovery` block is
+the PageHeap the key had in effect: `true` for a run without the flag too when
+someone set PageHeap for `main_winafl.exe` outside bhf, which bhf then notes.
+A memory error that faults in neither way (an overflow into allocation padding,
+an uninitialized read) is left to the builtin and AFL++ engines, which run
+ASan.
+
+### Intel PT
+
+`--winafl-instrumentation intel-pt` runs WinAFL with `-P` (Intel Processor
+Trace) instead of DynamoRIO. It needs a WinAFL built with `-DINTELPT=1` (bhf
+checks for `winaflpt-debug.exe` beside `afl-fuzz.exe`), an Intel CPU with PT,
+and no hypervisor in between unless it passes PT through; on the KVM validation
+VM afl-fuzz stops with `Unable to start IPT Service (err=50)` and `No IPT`,
+which bhf reports with a hint to use DynamoRIO. DynamoRIO is not needed in that
+mode.
+
+### Limits
+
+- One WinAFL instance per target: `bhf fuzz --engine winafl` refuses
+  `--workers` and a sanitizer matrix.
+- No cmplog or value profile: WinAFL solves comparisons only through coverage
+  and the dictionary. Pair it with the builtin engine (`--engine builtin,winafl`)
+  for magic values.
+- Only native targets: a cross-compiled harness runs the builtin engine.
+- `--target-transport` and `--protocol-profile` run the builtin engine's own
+  loops, so `bhf fuzz` refuses them with `--engine winafl` (or `afl++`).
+- WinAFL is not installed on the GitHub Windows runners, so the end-to-end
+  tests (`crates/cli/tests/winafl_engine.rs`: `bhf auto --engine winafl` on a
+  planted heap overflow, with and without PageHeap, nonzero WinAFL coverage,
+  then `replay`, `explain`, `capsule` and `verify-poc`) are `#[ignore]`d and
+  listed as ignored there; CI runs the test's refusal checks. Run them on a
+  machine with WinAFL and DynamoRIO, from an elevated shell, with
+  `BHF_WINAFL_PATH` and `BHF_DYNAMORIO_PATH` set: `cargo test -p bhf --test
+  winafl_engine -- --ignored`. Without the tools they fail instead of passing.
+
 ## Visual Studio solutions (.sln / .vcxproj)
 
 `bhf auto` imports a Visual Studio solution by default — no flag — when the

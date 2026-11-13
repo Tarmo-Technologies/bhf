@@ -48,6 +48,7 @@ fn options(source_root: &Path) -> AttemptOptions {
     AttemptOptions {
         cross_sweep: None,
         ada_toolchain: Default::default(),
+        winafl: Default::default(),
         project: None,
         decoder_limits: Default::default(),
         force: false,

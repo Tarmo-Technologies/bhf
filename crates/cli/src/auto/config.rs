@@ -68,6 +68,10 @@ pub struct AutoConfig {
     /// `--msbuild-evaluate`: MSBuild evaluates the imported Visual Studio
     /// projects, running their property functions.
     pub msbuild_evaluate: Option<bool>,
+    /// `--winafl-path`: the WinAFL directory `--engine winafl` runs from.
+    pub winafl_path: Option<PathBuf>,
+    /// `--dynamorio-path`: the DynamoRIO install `--engine winafl` runs under.
+    pub dynamorio_path: Option<PathBuf>,
     /// The `[toolchain]` table shared with `bhf build --config`.
     pub toolchain: Option<config::ToolchainConfig>,
     /// `[cross.<guard>]` tables: the toolchain and emulator of each
@@ -112,6 +116,8 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     ("probe-build", "probe-build"),
     ("msbuild-evaluate", "msbuild-evaluate"),
+    ("winafl-path", "winafl-path"),
+    ("dynamorio-path", "dynamorio-path"),
     ("cc", "toolchain.cc"),
     ("cxx", "toolchain.cxx"),
     ("cflags", "toolchain.cflags"),
@@ -141,6 +147,8 @@ pub(crate) const EXPLICIT_CONFIG_KEYS: &[&str] = &[
     "unsafe-search-and-run-build-commands",
     "probe-build",
     "msbuild-evaluate",
+    "winafl-path",
+    "dynamorio-path",
     "[toolchain]",
 ];
 
@@ -199,6 +207,11 @@ pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
     "max-array-elems",
     "max-decl-bytes",
     "max-decode-depth",
+    // WinAFL tuning for `--engine winafl` (its tool paths have config keys).
+    "winafl-instrumentation",
+    "winafl-iterations",
+    "winafl-coverage-module",
+    "winafl-page-heap",
 ];
 
 /// Where the effective config came from, which gates the execute-y knobs.
@@ -405,6 +418,8 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         || config.unsafe_search_and_run_build_commands == Some(true)
         || config.probe_build == Some(true)
         || config.msbuild_evaluate == Some(true)
+        || config.winafl_path.is_some()
+        || config.dynamorio_path.is_some()
         || config.toolchain.as_ref().is_some_and(|t| !t.is_empty())
         || config
             .cross
@@ -429,6 +444,17 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             if config.msbuild_evaluate == Some(true) {
                 args.msbuild_evaluate = true;
             }
+            // They name programs bhf runs, like the `[toolchain]` compilers.
+            if let Some(v) = config.winafl_path {
+                if args.winafl_path.is_none() {
+                    args.winafl_path = Some(resolved(base, v));
+                }
+            }
+            if let Some(v) = config.dynamorio_path {
+                if args.dynamorio_path.is_none() {
+                    args.dynamorio_path = Some(resolved(base, v));
+                }
+            }
             if let Some(mut toolchain) = config.toolchain {
                 toolchain.resolve_relative_to(base);
                 args.config_toolchain = Some(toolchain);
@@ -444,7 +470,8 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             notes.push(format!(
                 "ignoring build-executing keys in the auto-loaded {CONFIG_FILE_NAME} \
                  (build-command / run-untrusted / unsafe-search-and-run-build-commands / \
-                 probe-build / msbuild-evaluate / [toolchain] / [cross.*]) — pass it \
+                 probe-build / msbuild-evaluate / winafl-path / dynamorio-path / [toolchain] / \
+                 [cross.*]) — pass it \
                  explicitly with --config to honor them, since they run code or programs \
                  named by the scanned tree"
             ));
@@ -806,6 +833,45 @@ mod tests {
             auto: AutoArgs,
         }
         TestCli::try_parse_from(argv).unwrap().auto
+    }
+
+    #[test]
+    fn winafl_and_dynamorio_paths_are_honored_only_from_an_explicit_config() {
+        let tree = tempfile::tempdir().unwrap();
+        let config = tree.path().join(CONFIG_FILE_NAME);
+        std::fs::write(
+            &config,
+            "winafl-path = \"tools/winafl\"\ndynamorio-path = \"tools/dr\"\n",
+        )
+        .unwrap();
+        // Auto-loaded from the scanned tree: both name programs bhf would run.
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        let notes = apply(&mut args, tree.path()).unwrap();
+        assert_eq!(args.winafl_path, None);
+        assert_eq!(args.dynamorio_path, None);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("winafl-path") && note.contains("dynamorio-path")),
+            "{notes:?}"
+        );
+        // Passed explicitly: honored, relative to the file.
+        let mut args = parse_auto_args(&["bhf", "tree", "--config", config.to_str().unwrap()]);
+        apply(&mut args, tree.path()).unwrap();
+        let base = crate::toolchain::config_base_dir(&config);
+        assert_eq!(args.winafl_path, Some(base.join("tools/winafl")));
+        assert_eq!(args.dynamorio_path, Some(base.join("tools/dr")));
+        // A flag still beats the explicit config.
+        let mut args = parse_auto_args(&[
+            "bhf",
+            "tree",
+            "--config",
+            config.to_str().unwrap(),
+            "--winafl-path",
+            "flag/winafl",
+        ]);
+        apply(&mut args, tree.path()).unwrap();
+        assert_eq!(args.winafl_path, Some(PathBuf::from("flag/winafl")));
     }
 
     #[test]

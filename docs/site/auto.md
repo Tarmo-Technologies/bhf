@@ -69,7 +69,7 @@ their own interpreters with in-process edge coverage.
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
 | `--reuse-legacy-corpus` | off | In a work dir from an earlier release (migrated from the 0.2.x layout, or run by an earlier `bhf auto`), keep reseeding its old corpus instead of moving it to `corpus-legacy/` on the first run |
-| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate`, and the whole `[toolchain]` and `[cross.<guard>]` tables) are ignored, with a note, unless the config is passed explicitly with `--config` |
+| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate`, `winafl-path`, `dynamorio-path`, and the whole `[toolchain]` and `[cross.<guard>]` tables) are ignored, with a note, unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
 | `--per-target-finding-count <N>` | unset (collect all) | Stop a target as soon as it has produced N **distinct** findings (crash signatures), or when its `--per-target-time` is spent — whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash |
@@ -151,7 +151,9 @@ each spelled like its flag:
   `force`.
 - Explicit `--config` only, because they execute something: `build-command`,
   `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`,
-  `msbuild-evaluate`, the `[toolchain]` table and the `[cross.<guard>]` tables.
+  `msbuild-evaluate`, `winafl-path` and `dynamorio-path` (the WinAFL and
+  DynamoRIO installs `--engine winafl` runs), the `[toolchain]` table and the
+  `[cross.<guard>]` tables.
 
 The other flags (target selection, `--resume`, `--dry-run`, output and
 diagnostic switches) have no key; a unit test keeps this list and the flag set

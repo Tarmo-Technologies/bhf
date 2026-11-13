@@ -204,7 +204,9 @@ pub struct BuildArgs {
     /// For C/C++ harnesses: which Makefile target to build.
     /// `libfuzzer` (default) runs `make` which produces a libFuzzer binary
     /// driven by sanitizers; `afl++` runs `make afl` which produces a
-    /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`.
+    /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`;
+    /// `winafl` runs `make winafl` which produces `main_winafl`, the build
+    /// without sanitizers `bhf fuzz --engine winafl` runs beside `main`.
     #[arg(long, value_enum, default_value = "libfuzzer")]
     pub c_engine: CEngine,
 }
@@ -263,6 +265,9 @@ pub enum CEngine {
     /// `make afl` target - AFL++ persistent-mode entrypoint.
     #[value(name = "afl++")]
     AflPlusPlus,
+    /// `make winafl` target - the uninstrumented WinAFL build (`main_winafl`,
+    /// native Windows), which `bhf fuzz --engine winafl` runs beside `main`.
+    Winafl,
 }
 
 pub fn run(args: BuildArgs) -> i32 {
@@ -1230,6 +1235,7 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
     let (make_target, built_name, staged_name) = match args.c_engine {
         CEngine::Libfuzzer => (Some("main"), "main", "main"),
         CEngine::AflPlusPlus => (Some("afl"), "main_afl", "main_afl"),
+        CEngine::Winafl => (Some("winafl"), "main_winafl", "main_winafl"),
     };
     bhfeprintln!(
         "Building C/C++ harness '{}' via make{}",
@@ -2306,6 +2312,26 @@ fn append_command_env_flags(cmd: &mut std::process::Command, key: &str, extra: &
 /// unit-testable without a toolchain.
 pub(crate) fn afl_make_target_and_artifact() -> (Option<&'static str>, &'static str) {
     (Some("afl"), "main_afl")
+}
+
+/// Build `main_winafl`, the WinAFL lane (`make winafl`: the harness's sources
+/// without sanitizers or SanitizerCoverage), for an auto-recovered C/C++
+/// harness with the same recovered extras as its `main` build.
+pub(crate) fn try_run_c_make_winafl_build_with_extras(
+    work_dir: &Path,
+    harness_id: &str,
+    extra_sources: &[PathBuf],
+    extra_includes: &[PathBuf],
+) -> std::process::Output {
+    try_run_c_make_build_with_target(
+        work_dir,
+        harness_id,
+        extra_sources,
+        extra_includes,
+        None,
+        Some("winafl"),
+        None,
+    )
 }
 
 /// Build the AFL-instrumented `main_afl` for an auto-recovered C/C++ harness,
@@ -4074,6 +4100,50 @@ mod tests {
             Some(0)
         );
         assert!(staged.is_file());
+    }
+
+    /// `bhf build --c-engine winafl` runs `make winafl` and stages the WinAFL
+    /// build in `build/<id>/` under the name `bhf fuzz --engine winafl` looks
+    /// for beside `main` (`main_winafl.exe` on Windows).
+    #[test]
+    fn c_build_for_winafl_stages_main_winafl_where_bhf_fuzz_finds_it() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping winafl staging test: make not on PATH");
+            return;
+        }
+        assert_eq!(
+            <CEngine as clap::ValueEnum>::from_str("winafl", false),
+            Ok(CEngine::Winafl)
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        let exe = crate::auto::layout::harness_exe_name;
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main:\n\tprintf main > {}\nwinafl:\n\tprintf winafl > {}\n",
+                exe("main"),
+                exe("main_winafl")
+            ),
+        )
+        .unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.c_engine = CEngine::Winafl;
+        assert_eq!(c_make_build(&args), Some(0));
+        let build_dir = work.join("build").join("H-ONE");
+        let staged = crate::auto::layout::harness_exe(&build_dir, crate::fuzz::WINAFL_BINARY);
+        assert_eq!(staged, build_dir.join(exe("main_winafl")));
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "winafl");
+        assert!(
+            !build_dir.join(exe("main")).exists() && !harness.join(exe("main")).exists(),
+            "only `make winafl` ran"
+        );
     }
 
     #[test]

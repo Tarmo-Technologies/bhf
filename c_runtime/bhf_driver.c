@@ -1114,6 +1114,48 @@ static void bhf_run_file(const char *path) {
     bhf_run_one_bytes(b, r);
     free(b);
 }
+#ifdef _WIN32
+/* WinAFL's persistent entry (`--engine winafl` runs WinAFL with
+ * `-target_method bhf_winafl_fuzz -nargs 1`): one input, by file name. WinAFL
+ * wraps this function, rewrites the file between calls and jumps back to its
+ * start each time it returns, so it opens, reads and closes the file on every
+ * call, returns normally, and is never inlined into main. The WinAFL build
+ * (`make winafl`, -DBHF_WINAFL) exports it so WinAFL finds it without symbols;
+ * every other Windows build has the same function, unexported, as its argv
+ * path. */
+#if defined(BHF_MSVC)
+#define BHF_NOINLINE __declspec(noinline)
+#else
+#define BHF_NOINLINE __attribute__((noinline))
+#endif
+#if defined(BHF_WINAFL)
+#define BHF_WINAFL_EXPORT __declspec(dllexport)
+/* The WinAFL build has no AddressSanitizer, so a heap overflow only corrupts
+ * the heap, and WinAFL's persistent loop runs the next inputs on that heap:
+ * the fault (or a hang in the allocator) then surfaces on an innocent input,
+ * and the one that did it is never saved. Checking the process heap (the CRT's
+ * malloc heap) after every input turns the corruption into
+ * STATUS_HEAP_CORRUPTION, which WinAFL saves as a crash, on the input that
+ * caused it. */
+static void bhf_winafl_check_heap(void) {
+    if (!HeapValidate(GetProcessHeap(), 0, NULL)) {
+        fprintf(stderr, "BHF_CRASH heap corruption after this input\n");
+        fflush(stderr);
+        RaiseException(0xC0000374u /* STATUS_HEAP_CORRUPTION */, EXCEPTION_NONCONTINUABLE, 0,
+                       NULL);
+    }
+}
+#else
+#define BHF_WINAFL_EXPORT
+#endif
+BHF_WINAFL_EXPORT BHF_NOINLINE int bhf_winafl_fuzz(const char *path) {
+    bhf_run_file(path);
+#if defined(BHF_WINAFL)
+    bhf_winafl_check_heap();
+#endif
+    return 0;
+}
+#endif
 static int bhf_read_n(int fd, void *buf, size_t n) {
     size_t got = 0;
     unsigned char *b = (unsigned char *)buf;
@@ -1183,6 +1225,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc < 2) return 0;
+#ifdef _WIN32
+    bhf_winafl_fuzz(argv[1]);
+#else
     bhf_run_file(argv[1]);
+#endif
     return 0;
 }

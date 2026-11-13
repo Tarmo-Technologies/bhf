@@ -950,3 +950,30 @@ fn trap_signals_are_fatal_signal_findings_that_name_the_signal() {
         );
     }
 }
+
+/// `--target-transport` and `--protocol-profile` run the builtin engine's own
+/// loops, so another `--engine` with them is refused instead of silently not
+/// running, on every host.
+#[test]
+fn a_non_builtin_engine_with_a_transport_or_protocol_profile_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    for (engine, flag, value) in [
+        ("winafl", "--target-transport", "tcp:127.0.0.1:9"),
+        ("afl++", "--target-transport", "tcp:127.0.0.1:9"),
+        ("winafl", "--protocol-profile", "profile.json"),
+        ("afl++", "--protocol-profile", "profile.json"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+            .arg("fuzz")
+            .arg(temp.path())
+            .args(["--harness", "H-NONE", "--engine", engine, flag, value])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{engine} {flag}: {stderr}");
+        assert!(
+            stderr.contains(&format!("--engine {engine} cannot run with {flag}")),
+            "{engine} {flag}: {stderr}"
+        );
+    }
+}

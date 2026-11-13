@@ -3842,7 +3842,8 @@ mod tests {
         assert!(main.contains("int LLVMFuzzerTestOneInput"));
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
-        assert!(makefile.contains(".PHONY: all afl libfuzzer cov diff syntaxcheck clean"));
+        assert!(makefile.contains(".PHONY: all afl winafl libfuzzer cov diff syntaxcheck clean"));
+        assert!(makefile.contains("winafl: main_winafl"));
         assert!(makefile.contains("AFLPP_CXX ?= afl-clang-fast++"));
         assert!(makefile.contains("afl: main_afl"));
         assert!(makefile.contains("libfuzzer: main_libfuzzer"));

@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod winafl;
+pub use winafl::{WinaflInstrumentation, WinaflSettings};
+
 /// Belt-and-suspenders kernel rails on every fuzz harness spawn.
 ///
 /// 1. On Linux, `PR_SET_PDEATHSIG(SIGKILL)` — the kernel SIGKILLs the
@@ -213,10 +216,50 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub harness: String,
 
-    /// Fuzz engine: the built-in coverage-guided engine (default), or AFL++ via
-    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH).
+    /// Fuzz engine: the built-in coverage-guided engine (default), AFL++ via
+    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH), or
+    /// WinAFL (`winafl`, native Windows only; needs WinAFL and DynamoRIO, see
+    /// `--winafl-path` and `--dynamorio-path`).
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
+
+    /// WinAFL directory for `--engine winafl`: the one holding `afl-fuzz.exe`
+    /// and `winafl.dll` (or a WinAFL checkout with `build64\bin\Release`).
+    /// Default: `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on `PATH`.
+    #[arg(long = "winafl-path", value_name = "DIR")]
+    pub winafl_path: Option<PathBuf>,
+
+    /// DynamoRIO install root (or its `bin64` directory) for `--engine winafl`.
+    /// Default: `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on
+    /// `PATH`.
+    #[arg(long = "dynamorio-path", value_name = "DIR")]
+    pub dynamorio_path: Option<PathBuf>,
+
+    /// How WinAFL collects coverage: `dynamorio` (default, `afl-fuzz -D`) or
+    /// `intel-pt` (`afl-fuzz -P`; needs an Intel CPU with Processor Trace and
+    /// a WinAFL built with `-DINTELPT=1`, and does not run in most VMs).
+    #[arg(long = "winafl-instrumentation", value_enum, default_value_t = WinaflInstrumentation::Dynamorio)]
+    pub winafl_instrumentation: WinaflInstrumentation,
+
+    /// WinAFL `-fuzz_iterations`: calls of the persistent entry before WinAFL
+    /// restarts the harness process. Default 5000.
+    #[arg(long = "winafl-iterations", value_name = "N")]
+    pub winafl_iterations: Option<u32>,
+
+    /// Another module (a DLL of the target the harness loads) for WinAFL to
+    /// measure coverage in, beside the harness executable. Repeatable.
+    #[arg(long = "winafl-coverage-module", value_name = "MODULE")]
+    pub winafl_coverage_modules: Vec<String>,
+
+    /// Run the WinAFL build under full PageHeap for the run, so a heap overflow
+    /// or use after free faults at once and WinAFL saves it as a crash (without
+    /// it Windows ends a corrupted heap with a fail-fast WinAFL records as a
+    /// hang). WinAFL fuzzes a copy of `main_winafl.exe` under a name only
+    /// this run uses, and bhf sets the PageHeap Image File Execution Options key
+    /// for that name (it prints the key) and removes key and copy when the run
+    /// ends; needs an elevated shell.
+    #[arg(long = "winafl-page-heap")]
+    pub winafl_page_heap: bool,
 
     /// AFL++ execution mode for `--engine afl++`: `native` (default, compile-time
     /// instrumentation), `qemu` (`afl-fuzz -Q`), or `frida` (`afl-fuzz -O`).
@@ -699,6 +742,8 @@ pub enum FuzzEngine {
     Builtin,
     #[value(name = "afl++")]
     AflPlusPlus,
+    /// WinAFL on native Windows (DynamoRIO or Intel PT instrumentation).
+    Winafl,
 }
 
 /// AFL++ execution mode for `--engine afl++` (issue #45). `native` uses
@@ -756,8 +801,8 @@ impl AflMode {
 /// ordered, de-duplicated `Vec<FuzzEngine>`. Order is preserved as written; the
 /// first occurrence of each engine wins. Whitespace around names is tolerated.
 /// Empty input or an unknown name is an error. Accepted names mirror the
-/// `FuzzEngine` value-enum (`builtin`, `afl++`), plus `afl`/`aflplusplus`
-/// synonyms for `afl++`.
+/// `FuzzEngine` value-enum (`builtin`, `afl++`, `winafl`), plus
+/// `afl`/`aflplusplus` synonyms for `afl++`.
 pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
     let mut out: Vec<FuzzEngine> = Vec::new();
     for tok in raw.split(',') {
@@ -768,9 +813,10 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
         let engine = match name {
             "builtin" => FuzzEngine::Builtin,
             "afl++" | "aflplusplus" | "afl" => FuzzEngine::AflPlusPlus,
+            "winafl" => FuzzEngine::Winafl,
             other => {
                 return Err(format!(
-                    "unknown fuzz engine '{other}' (expected: builtin, afl++)"
+                    "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl)"
                 ))
             }
         };
@@ -779,7 +825,7 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
         }
     }
     if out.is_empty() {
-        return Err("no fuzz engine specified (expected: builtin, afl++)".to_owned());
+        return Err("no fuzz engine specified (expected: builtin, afl++, winafl)".to_owned());
     }
     Ok(out)
 }
@@ -917,6 +963,12 @@ pub(crate) struct FuzzRunSummary {
     /// and omitted from `run.json` for a plain `native` afl++ run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) afl: Option<AflRunProvenance>,
+    /// WinAFL run provenance (`--engine winafl`): the tools, the uninstrumented
+    /// binary WinAFL fuzzed and the sanitized one its saved inputs were
+    /// replayed through, WinAFL's own statistics and the replay outcomes.
+    /// Omitted for the other engines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) winafl: Option<winafl::WinaflRunProvenance>,
     /// #57: out-of-process extension `oracle.evaluate` provenance for a
     /// `--extension` run — the negotiated protocol/capabilities, the extension's
     /// executable/config hashes, how many retained inputs were evaluated, how many
@@ -1124,6 +1176,11 @@ struct PreparedFuzzRun {
     afl_path: Option<PathBuf>,
     /// Instrumentation ranges for `--afl-mode qemu|frida`.
     afl_inst_ranges: Vec<String>,
+    /// `--engine winafl` settings (tool paths, instrumentation, iterations).
+    winafl: WinaflSettings,
+    /// The explicit `--timeout`, which becomes WinAFL's `-t`; `None` keeps
+    /// WinAFL's default per-iteration timeout.
+    winafl_timeout: Option<Duration>,
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
@@ -1252,6 +1309,12 @@ pub(crate) fn fatal_signal_pc_offset(stderr: &str, signal: &str) -> Option<u64> 
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
+    // The transport and session lanes are the builtin engine's own loops: an
+    // AFL++ or WinAFL run asked for with them would silently not happen.
+    if let Some(error) = engine_lane_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 3;
+    }
     // HDF-1b: when a target transport is requested, drive the additive
     // transport-fuzz path (a separate loop over the `target_transport` seam) and
     // leave the host libFuzzer/AFL path below untouched.
@@ -1266,6 +1329,24 @@ pub fn run(args: FuzzArgs) -> i32 {
         return crate::session_fuzz::run(args);
     }
 
+    if args.engine == FuzzEngine::Winafl {
+        if let Err(error) = winafl::host_supported().and_then(|()| {
+            winafl::check_page_heap_here(&WinaflSettings {
+                page_heap: args.winafl_page_heap,
+                ..WinaflSettings::default()
+            })
+        }) {
+            bhfeprintln!("{error}");
+            return 3;
+        }
+        if multicore_requested(&args) {
+            bhfeprintln!(
+                "--engine winafl runs one WinAFL instance; --workers and a sanitizer matrix \
+                 (several --sanitizers) are not supported with it"
+            );
+            return 3;
+        }
+    }
     if multicore_requested(&args) {
         return run_multicore_campaign(args);
     }
@@ -1288,6 +1369,7 @@ pub fn run(args: FuzzArgs) -> i32 {
     let result = match prepared.engine {
         FuzzEngine::Builtin => run_builtin(prepared),
         FuzzEngine::AflPlusPlus => run_afl_plus_plus(prepared),
+        FuzzEngine::Winafl => winafl::run(prepared),
     };
 
     match result {
@@ -1554,6 +1636,12 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         afl_mode: AflMode::Native,
         afl_path: None,
         afl_inst_ranges: Vec::new(),
+        winafl_path: None,
+        dynamorio_path: None,
+        winafl_instrumentation: WinaflInstrumentation::Dynamorio,
+        winafl_iterations: None,
+        winafl_coverage_modules: Vec::new(),
+        winafl_page_heap: false,
         workers: None,
         iterations: Some(iterations),
         time: time_budget,
@@ -1638,6 +1726,60 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         std::env::var("BHF_MAX_LEN").ok().as_deref(),
     )?;
     run_afl_plus_plus(prepared)
+}
+
+/// Refuse `--engine winafl` off native Windows, locate WinAFL and DynamoRIO for
+/// the architecture harnesses are built for (`--vs-arch`, x64 by default), and
+/// refuse `--winafl-page-heap` in a shell that is not elevated, so a run fails
+/// before its sweep with the error naming what to do.
+pub(crate) fn check_winafl_available(settings: &WinaflSettings) -> Result<(), String> {
+    winafl::check_available(settings)
+}
+
+/// The WinAFL build `make winafl` writes beside `main` (`main_winafl.exe`).
+pub(crate) const WINAFL_BINARY: &str = winafl::FUZZ_BINARY_STEM;
+
+/// Drive WinAFL against an already-built `main_winafl` for `bhf auto`'s attempt
+/// loop, returning the same [`FuzzRunSummary`] as the other engines so its
+/// findings (each saved crash or hang replayed through the sanitized `main`)
+/// fold into the shared findings pipeline. Errors (no WinAFL or DynamoRIO, no
+/// `main_winafl`, afl-fuzz failure) go to the caller, which warns and keeps the
+/// target's other results. `iterations` is unused: WinAFL runs on the time
+/// budget, which bhf enforces since WinAFL has none of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_winafl_programmatic(
+    work_dir: &Path,
+    harness_id: &str,
+    seeds: Vec<Vec<u8>>,
+    time_budget: Option<Duration>,
+    extra_env: &[(String, String)],
+    mode: actionability::RunMode,
+    rss_limit_mb: usize,
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    settings: &WinaflSettings,
+) -> Result<FuzzRunSummary, String> {
+    let largest_seed = seeds.iter().map(Vec::len).max().unwrap_or(0);
+    let max_len = resolve_max_len_spec(std::env::var("BHF_MAX_LEN").ok().as_deref(), largest_seed);
+    let mut args = afl_programmatic_args(
+        work_dir,
+        harness_id,
+        seeds,
+        time_budget,
+        extra_env,
+        mode,
+        rss_limit_mb,
+        sanitizers,
+        max_len,
+    );
+    args.engine = FuzzEngine::Winafl;
+    args.timeout = resolve_env_timeout();
+    args.winafl_path = settings.winafl_path.clone();
+    args.dynamorio_path = settings.dynamorio_path.clone();
+    args.winafl_instrumentation = settings.instrumentation;
+    args.winafl_iterations = settings.fuzz_iterations;
+    args.winafl_coverage_modules = settings.coverage_modules.clone();
+    args.winafl_page_heap = settings.page_heap;
+    winafl::run(prepare(args)?)
 }
 
 /// The prepared AFL++ run behind [`run_afl_plus_plus_programmatic`], for the
@@ -1739,6 +1881,12 @@ fn afl_programmatic_args(
         afl_mode: AflMode::Native,
         afl_path: None,
         afl_inst_ranges: Vec::new(),
+        winafl_path: None,
+        dynamorio_path: None,
+        winafl_instrumentation: WinaflInstrumentation::Dynamorio,
+        winafl_iterations: None,
+        winafl_coverage_modules: Vec::new(),
+        winafl_page_heap: false,
         workers: None,
         iterations: Some(0),
         time: time_budget,
@@ -1783,6 +1931,29 @@ fn afl_programmatic_args(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     }
+}
+
+/// Why `--engine` cannot run with `--target-transport` or
+/// `--protocol-profile`, which drive the builtin engine's transport and
+/// session lanes.
+fn engine_lane_conflict(args: &FuzzArgs) -> Option<String> {
+    if args.engine == FuzzEngine::Builtin {
+        return None;
+    }
+    let flag = if args.target_transport.is_some() {
+        "--target-transport"
+    } else if args.protocol_profile.is_some() {
+        "--protocol-profile"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "--engine {} cannot run with {flag}: {flag} drives the builtin engine's own loop, so \
+         the {} engine would not run at all; use --engine builtin with {flag}, or leave {flag} \
+         out",
+        engine_arg_name(args.engine),
+        engine_arg_name(args.engine)
+    ))
 }
 
 fn multicore_requested(args: &FuzzArgs) -> bool {
@@ -2320,6 +2491,7 @@ fn engine_arg_name(engine: FuzzEngine) -> &'static str {
     match engine {
         FuzzEngine::Builtin => "builtin",
         FuzzEngine::AflPlusPlus => "afl++",
+        FuzzEngine::Winafl => "winafl",
     }
 }
 
@@ -2378,9 +2550,6 @@ fn prepare_with_runner(
     args: FuzzArgs,
     runner: Option<replay_min::HarnessRunner>,
 ) -> Result<PreparedFuzzRun, String> {
-    match args.engine {
-        FuzzEngine::Builtin | FuzzEngine::AflPlusPlus => {}
-    }
     let iterations = args.effective_iterations();
     let sanitizers = parse_sanitizer_args(&args.sanitizers)?
         .runtime_set()
@@ -2566,6 +2735,15 @@ fn prepare_with_runner(
         afl_mode: args.afl_mode,
         afl_path: args.afl_path,
         afl_inst_ranges: args.afl_inst_ranges,
+        winafl: WinaflSettings {
+            winafl_path: args.winafl_path,
+            dynamorio_path: args.dynamorio_path,
+            instrumentation: args.winafl_instrumentation,
+            fuzz_iterations: args.winafl_iterations,
+            coverage_modules: args.winafl_coverage_modules,
+            page_heap: args.winafl_page_heap,
+        },
+        winafl_timeout: args.timeout,
         mode: args.mode,
         extra_env,
         _local_coverage_map: local_coverage_map,
@@ -4210,6 +4388,7 @@ fn run_builtin_with_progress(
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
+        winafl: None,
         extension: extension_block,
         duplicate_sanitizer_hits: sanitizer_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
@@ -4963,6 +5142,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             afl_path: prepared.afl_path.clone(),
             inst_ranges: prepared.afl_inst_ranges.clone(),
         }),
+        winafl: None,
         // The extension `oracle.evaluate` pass is a builtin-engine feature
         // (it iterates the builtin pool's retained corpus); AFL++ owns its own
         // on-disk queue, so `--extension` is not driven here.
@@ -7546,7 +7726,9 @@ pub(crate) fn find_harness_executable(
                 legacy_auto_dir.clone(),
             ],
         ),
-        FuzzEngine::Builtin => (
+        // WinAFL fuzzes `main_winafl` beside the sanitized `main`, which every
+        // saved input is replayed through and which the findings name.
+        FuzzEngine::Builtin | FuzzEngine::Winafl => (
             &["main"],
             vec![
                 build_dir.clone(),
@@ -11694,6 +11876,12 @@ exit 0
             afl_mode: AflMode::Native,
             afl_path: None,
             afl_inst_ranges: Vec::new(),
+            winafl_path: None,
+            dynamorio_path: None,
+            winafl_instrumentation: WinaflInstrumentation::Dynamorio,
+            winafl_iterations: None,
+            winafl_coverage_modules: Vec::new(),
+            winafl_page_heap: false,
             workers: None,
             iterations: Some(1),
             time: None,

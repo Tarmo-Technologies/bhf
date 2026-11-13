@@ -193,6 +193,16 @@ COV_CFLAGS ?= -O0 -g -fprofile-instr-generate -fcoverage-mapping
 # that only one compiler's output triggers still surfaces as an exit divergence.
 DIFF_CC ?= clang
 DIFF_CFLAGS ?= -O2 -g -fsanitize=address
+# WinAFL build (`--engine winafl`, native Windows): the translation units of
+# `main`, built WITHOUT AddressSanitizer or SanitizerCoverage. WinAFL measures
+# coverage itself, through DynamoRIO (or Intel PT), and an AddressSanitizer
+# binary cannot run under DynamoRIO: 64-bit Windows ASan commits its shadow
+# memory on demand from access violations, which WinAFL's DynamoRIO client
+# reports as crashes, and such a binary hangs at start-up under drrun. WinAFL
+# fuzzes this binary, and bhf replays every crash and hang it saves through the
+# sanitized `main` for the report. bhf's driver object for it is built with
+# -DBHF_WINAFL, which exports the persistent entry `bhf_winafl_fuzz`.
+WINAFL_CFLAGS ?= -O1 -g
 BHF_DRIVER_SOURCE ?= {{ bhf_driver_source }}
 BHF_DRIVER_CFLAGS ?= -O1 -g
 # bhf's driver object takes the toolchain's C flags too, so a flag that selects
@@ -219,6 +229,7 @@ CONTEXT_TSAN_OBJECTS ?=
 CONTEXT_COV_OBJECTS ?=
 CONTEXT_DIFF_OBJECTS ?=
 CONTEXT_PROV_OBJECTS ?=
+CONTEXT_WINAFL_OBJECTS ?=
 REPAIR_CONTEXT_MAIN_OBJECTS ?=
 REPAIR_CONTEXT_AFL_OBJECTS ?=
 REPAIR_CONTEXT_MSAN_OBJECTS ?=
@@ -226,15 +237,16 @@ REPAIR_CONTEXT_TSAN_OBJECTS ?=
 REPAIR_CONTEXT_COV_OBJECTS ?=
 REPAIR_CONTEXT_DIFF_OBJECTS ?=
 REPAIR_CONTEXT_PROV_OBJECTS ?=
+REPAIR_CONTEXT_WINAFL_OBJECTS ?=
 
 ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl libfuzzer msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
+.PHONY: all afl winafl libfuzzer msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
 all: main$(EXEEXT)
 # The bare goal names, for the binaries named with $(EXEEXT).
-BHF_BINARIES = main main_afl main_libfuzzer main_msan main_tsan main_cov main_diff main_prov
+BHF_BINARIES = main main_afl main_winafl main_libfuzzer main_msan main_tsan main_cov main_diff main_prov
 ifneq ($(EXEEXT),)
 .PHONY: $(BHF_BINARIES)
 $(BHF_BINARIES): %: %$(EXEEXT)
@@ -269,6 +281,9 @@ bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_
 bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
 	$(DIFF_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
+bhf_driver_winafl.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_toolchain.stamp
+	$(CC) $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(FEATURE_TEST_FLAGS) -DBHF_WINAFL -c -o $@ $(BHF_DRIVER_SOURCE)
+
 main$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
@@ -282,6 +297,11 @@ main$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $
 # target is called successful.
 syntaxcheck: main.c
 	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CFLAGS)) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.c{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
+
+winafl: main_winafl$(EXEEXT)
+
+main_winafl$(EXEEXT): main.c bhf_driver_winafl.o bhf_toolchain.stamp $(CONTEXT_WINAFL_OBJECTS) $(REPAIR_CONTEXT_WINAFL_OBJECTS)
+	$(CC) $(WINAFL_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_WINAFL_OBJECTS) $(REPAIR_CONTEXT_WINAFL_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_winafl.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 afl: main_afl$(EXEEXT)
 
@@ -340,6 +360,11 @@ prov: main_prov$(EXEEXT)
 main_prov$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS)
 	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS) $(AUTO_PROV_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
+# The copies `--winafl-page-heap` runs fuzz (`main_winafl-<pid>-<n>-<stamp>`),
+# each with bhf's marker `<copy>.bhf-run` beside it. A run deletes its own when
+# it ends, and the next run those a killed run left; `clean` removes any left.
+BHF_WINAFL_RUN_MARKERS = $(wildcard main_winafl-*.bhf-run)
+
 clean:
-	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_toolchain.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp
 	rm -rf context_objs repair_context_objs

@@ -424,6 +424,38 @@ fn binary_sanitizers(path: &Path) -> Vec<String> {
     .collect()
 }
 
+/// A finding's fidelity record, given how it was found: one WinAFL found
+/// (`discovery.engine == "winafl"`) was found by a build without sanitizers
+/// and confirmed by replaying it through the sanitized harness, which the
+/// sanitizer dimension's reason says.
+fn with_discovery_sanitizers(
+    fidelity: &actionability::Fidelity,
+    discovery: Option<&serde_json::Value>,
+) -> actionability::Fidelity {
+    let mut fidelity = fidelity.clone();
+    let found_by_winafl = discovery
+        .and_then(|discovery| discovery.get("engine"))
+        .and_then(serde_json::Value::as_str)
+        == Some("winafl");
+    if found_by_winafl {
+        let confirmation = fidelity
+            .sanitizers
+            .reason
+            .clone()
+            .unwrap_or_else(|| "no sanitizer report".to_owned());
+        let confirmed = if fidelity.sanitizers.is_gap() {
+            confirmation
+        } else {
+            format!("confirmed by a replay that {confirmation}")
+        };
+        fidelity.sanitizers.reason = Some(format!(
+            "found by WinAFL in a build without sanitizers (AddressSanitizer does not run under \
+             DynamoRIO); {confirmed}"
+        ));
+    }
+    fidelity
+}
+
 /// CC-1: write the per-finding fidelity block onto every `finding.json` on disk.
 /// A finding produced by a fuzzed target inherits that target's record (keyed by
 /// `harness_id`); a static / no-harness finding gets an all-`NotApplicable`
@@ -470,7 +502,8 @@ fn annotate_findings_with_fidelity(
             .get(harness_id)
             .copied()
             .unwrap_or(&static_record);
-        let Ok(value) = serde_json::to_value(fidelity) else {
+        let fidelity = with_discovery_sanitizers(fidelity, obj.get("discovery"));
+        let Ok(value) = serde_json::to_value(&fidelity) else {
             continue;
         };
         obj.insert("fidelity".to_owned(), value);
@@ -3414,6 +3447,43 @@ fn md_section(s: &mut String, title: &str, bag: &[Aggregated]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_winafl_finding_says_its_build_had_no_sanitizer() {
+        let mut facts = actionability::FidelityFacts::host();
+        facts.sanitizers = vec!["asan".to_owned(), "ubsan".to_owned()];
+        let fidelity = actionability::Fidelity::from_facts(&facts);
+        let winafl = serde_json::json!({ "engine": "winafl", "sanitizers": [] });
+        let annotated = with_discovery_sanitizers(&fidelity, Some(&winafl));
+        assert_eq!(annotated.sanitizers.status, fidelity.sanitizers.status);
+        assert_eq!(
+            annotated.sanitizers.reason.as_deref(),
+            Some(
+                "found by WinAFL in a build without sanitizers (AddressSanitizer does not run \
+                 under DynamoRIO); confirmed by a replay that ran under asan+ubsan"
+            )
+        );
+        // The other dimensions, and every other finding, are left alone.
+        assert_eq!(annotated.arch, fidelity.arch);
+        let builtin = serde_json::json!({ "engine": "builtin" });
+        assert_eq!(
+            with_discovery_sanitizers(&fidelity, Some(&builtin)),
+            fidelity
+        );
+        assert_eq!(with_discovery_sanitizers(&fidelity, None), fidelity);
+        // A run without sanitizers says so instead of claiming a confirmation.
+        let bare = actionability::Fidelity::from_facts(&actionability::FidelityFacts::host());
+        let annotated = with_discovery_sanitizers(&bare, Some(&winafl));
+        assert!(
+            annotated
+                .sanitizers
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with("; no sanitizer instrumentation was active")),
+            "{:?}",
+            annotated.sanitizers.reason
+        );
+    }
     use crate::auto::candidate::{Candidate, Lang};
     use crate::auto::dep_manifest::DepKind;
     use std::path::PathBuf;
