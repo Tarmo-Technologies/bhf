@@ -276,16 +276,113 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<(Option<ExitStatus>, bool)> {
+    if let Some(status) = wait_exit_within(child, timeout)? {
+        return Ok((Some(status), false));
+    }
+    kill_process_group(child);
+    Ok((child.wait().ok(), true))
+}
+
+/// Wait at most `timeout` for `child` to exit: its exit status, or `None` if
+/// it is still running. The wait blocks on the process itself (a pidfd on
+/// Linux, the process handle on Windows), so the caller wakes when the child
+/// exits rather than on the next tick of a sleep loop. A sleep tick costs
+/// every execution its length, and on a loaded machine each wakeup also waits
+/// for a CPU. Elsewhere this falls back to a short, growing poll.
+pub fn wait_exit_within(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<Option<ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    if timeout.is_zero() {
+        return Ok(None);
+    }
     let deadline = Instant::now() + timeout;
+    match block_until_exit(child, deadline) {
+        Some(_) => child.try_wait(),
+        None => poll_until_exit(child, deadline),
+    }
+}
+
+/// Milliseconds left until `deadline`, rounded up so a sub-millisecond
+/// remainder still waits, and capped at `max`.
+fn millis_until(deadline: Instant, max: u32) -> u32 {
+    let left = deadline.saturating_duration_since(Instant::now());
+    left.as_nanos().div_ceil(1_000_000).min(u128::from(max)) as u32
+}
+
+/// Block until `child` exits (`Some(true)`) or `deadline` passes
+/// (`Some(false)`); `None` when the platform offers no such wait.
+#[cfg(target_os = "linux")]
+fn block_until_exit(child: &Child, deadline: Instant) -> Option<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let pid = libc::pid_t::try_from(child.id()).ok()?;
+    // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1. The
+    // child is not reaped yet, so `pid` still names it.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: the kernel just returned this fd and nothing else owns it.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = millis_until(deadline, i32::MAX as u32) as i32;
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut pfd, 1, millis) } {
+            ready if ready > 0 => return Some(true),
+            0 if Instant::now() >= deadline => return Some(false),
+            0 => {}
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn block_until_exit(child: &Child, deadline: Instant) -> Option<bool> {
+    use std::os::windows::io::AsRawHandle;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    loop {
+        // Stay below INFINITE (u32::MAX); a longer wait loops.
+        let millis = millis_until(deadline, u32::MAX - 1);
+        // SAFETY: the handle is the live process handle `child` owns.
+        match unsafe { WaitForSingleObject(child.as_raw_handle(), millis) } {
+            WAIT_OBJECT_0 => return Some(true),
+            WAIT_TIMEOUT if Instant::now() >= deadline => return Some(false),
+            WAIT_TIMEOUT => {}
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn block_until_exit(_child: &Child, _deadline: Instant) -> Option<bool> {
+    None
+}
+
+/// The fallback wait: poll, sleeping 0.1 ms at first and at most 5 ms.
+fn poll_until_exit(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
+    let mut nap = Duration::from_micros(100);
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok((Some(status), false));
+            return Ok(Some(status));
         }
-        if Instant::now() >= deadline {
-            kill_process_group(child);
-            return Ok((child.wait().ok(), true));
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(nap.min(deadline - now));
+        nap = (nap * 2).min(Duration::from_millis(5));
     }
 }
 
@@ -344,6 +441,46 @@ pub fn feed_stdin(child: &mut Child, bytes: Vec<u8>) -> Option<JoinHandle<std::i
     }))
 }
 
+/// The blocking wait on every platform: an exited child's status comes back,
+/// and a running one is reported as running once the timeout passes.
+#[cfg(all(test, any(unix, windows)))]
+mod wait_tests {
+    use super::*;
+
+    fn shell(unix: &str, windows: &str) -> Child {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/c", windows]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", unix]);
+            command
+        };
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn an_exiting_child_is_waited_for_and_a_running_one_times_out() {
+        let mut quick = shell("exit 3", "exit 3");
+        let status = wait_exit_within(&mut quick, Duration::from_secs(10)).unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(3));
+
+        let mut slow = shell(
+            "exec sleep 30",
+            r"%SystemRoot%\System32\ping.exe -n 30 127.0.0.1 > nul",
+        );
+        let started = Instant::now();
+        let status = wait_exit_within(&mut slow, Duration::from_millis(300)).unwrap();
+        let waited = started.elapsed();
+        assert!(status.is_none(), "still running");
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+        let _ = slow.kill();
+        let _ = slow.wait();
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -373,6 +510,47 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Waiting blocks until the child exits instead of waking on a sleep tick:
+    /// the waiting thread switches out about once, however long the child runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wait_blocks_until_the_child_exits() {
+        let switches = || {
+            // SAFETY: `usage` is a valid out-pointer for the duration of the call.
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+                0
+            );
+            usage.ru_nvcsw
+        };
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 0.4"])
+            .spawn()
+            .unwrap();
+        let before = switches();
+        let (status, timed_out) = wait_with_timeout(&mut child, Duration::from_secs(10)).unwrap();
+        let woke = switches() - before;
+        assert!(!timed_out);
+        assert!(status.is_some_and(|status| status.success()));
+        assert!(woke <= 4, "a 400 ms child took {woke} wakeups to wait for");
+    }
+
+    /// A child that outlives the timeout is still killed at it.
+    #[test]
+    fn a_wait_still_times_out_a_child_that_keeps_running() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let started = Instant::now();
+        let (_, timed_out) = wait_with_timeout(&mut child, Duration::from_millis(400)).unwrap();
+        let waited = started.elapsed();
+        assert!(timed_out);
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
     }
 
     #[test]

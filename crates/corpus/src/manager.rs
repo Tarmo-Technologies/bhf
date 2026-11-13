@@ -7,6 +7,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
+/// The directory beside a harness's corpus queue (`corpus/<harness>/`) that
+/// holds inputs a fuzz pass kept for their coverage but could not re-run in a
+/// fresh process before it ended. They are not queue entries: the next pass
+/// re-runs them first and queues only those that come back clean.
+pub const UNCHECKED_DIR: &str = "unchecked";
+
+/// `corpus/<harness>/unchecked/` under `work_dir` (see [`UNCHECKED_DIR`]).
+pub fn unchecked_dir(work_dir: &std::path::Path, harness_id: &str) -> PathBuf {
+    work_dir.join("corpus").join(harness_id).join(UNCHECKED_DIR)
+}
+
 pub struct CorpusManager {
     root: PathBuf,
     retention: Option<RetentionLimits>,

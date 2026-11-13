@@ -180,6 +180,45 @@
   flags (`bhf_driver.stamp`), the binaries on the toolchain stamp, so a new
   compiler or flag still rebuilds and relinks what it changes. A target that
   goes through the dialect ladder or repair rounds builds much faster.
+- `bhf fuzz` keeps its throughput when the CPU is shared. A harness that
+  speaks the framed protocol now gets `--timeout`, but at least 10 s and never
+  more than `--time`, to send its fork-server ready byte. The fixed 2 s
+  allowance used to expire on a loaded machine, and the rest of the run then
+  started a fresh process for every input. A harness that misses even that
+  deadline gets a note on stderr. Waiting for a fresh per-input process, and
+  on Windows for the fork-server's reply, now blocks until the harness answers
+  or exits, where it used to poll with sleeps. Each sleep tick added up to
+  20 ms to every execution, and on a loaded machine each wakeup also waited
+  behind the busy threads for a CPU. On one core shared with busy processes,
+  the fork-server's execution rate now stays near its fair share of the CPU,
+  on Linux and on Windows.
+- The fork-server loop no longer waits for the fresh-process re-run of each
+  new corpus input. Those re-runs, which catch crashes only a fresh process
+  sees, run on a background thread; a crash they find is still reported. On a
+  loaded host, where a process start takes seconds, each re-run used to stall
+  the loop for that long. An input is saved in the corpus queue only once its
+  re-run comes back clean; one still unchecked at the end of a pass is counted
+  in the run summary (`fresh_reruns`), kept in `corpus/<harness>/unchecked/`
+  and re-run first by the next pass, which queues it or reports it. A
+  `--workers` campaign hands those inputs to its workers and keeps what they
+  leave unchecked out of its queue. A pass with `--time` ends inside it: the
+  loop stops issuing inputs early enough for the re-runs to finish, and a
+  re-run still going at the deadline is stopped. A crash a re-run reports is
+  no longer a mutation base, and `--per-target-finding-count` holds for those
+  crashes too. Each re-run has a working directory of its own, so a target
+  that keeps files there no longer reports a false crash when it shares them
+  with the fork-server. With two or more CPUs a re-run's process runs at a
+  lower priority; with one CPU it keeps the loop's priority, and with
+  `--deadline` it runs in the loop, so a response time is never judged while
+  the two compete for the CPU. A deadline report from a background re-run is
+  re-checked in the loop at normal priority before it becomes a finding;
+  stderr announces the finding only then, and notes an overrun the re-check
+  cleared. The empty input runs in a fresh process once per pass instead of
+  once per occurrence.
+- Windows: the ASan runtime of the clang that builds the harnesses now always
+  comes first on PATH. When it was already listed there, the Visual Studio
+  environment put MSVC's own ASan DLL ahead of it, and clang-built harnesses
+  failed to start (STATUS_ENTRYPOINT_NOT_FOUND).
 - Windows: cartography, provenance, the capability profiler and coverage
   replay no longer run a harness through `timeout`, which on Windows is the
   console pause command and ran nothing: cartography mapped no finding and no

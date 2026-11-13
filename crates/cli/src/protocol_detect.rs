@@ -247,6 +247,16 @@ pub(crate) fn detect(harness: &Path, work_dirs: &[&Path]) -> Detection {
     }
 }
 
+/// Whether `harness` is known to speak the framed fork-server protocol: bhf's
+/// drivers and launchers, or an Ada runtime that reads `BHF_FRAMED`. Such a
+/// harness that is slow to answer the handshake is starting up, not one that
+/// does not speak the protocol.
+pub(crate) fn speaks_framed(harness: &Path, detection: &Detection) -> bool {
+    detection.protocol == HarnessProtocol::BhfFramed
+        || matches!(&detection.basis, ProtocolBasis::Declared(mode) if mode == "framed")
+        || embedded_markers(harness).framed
+}
+
 /// Directories that can hold the harness's `main.c` / `main.cpp`: its own
 /// directory, then `<work>/<root>/<id>/` for every harness root of every work
 /// dir (the given ones first, then the one the harness path names).
@@ -442,6 +452,28 @@ mod tests {
         let detection = detect(&harness, &[work.path()]);
         assert_eq!(detection.protocol, HarnessProtocol::BhfFramed);
         assert_eq!(detection.basis, ProtocolBasis::EmbeddedDriver);
+    }
+
+    #[test]
+    fn drivers_and_framed_ada_runtimes_speak_the_framed_protocol() {
+        let work = tempfile::tempdir().unwrap();
+        let speaks = |dir: &str, contents: &[u8]| {
+            let harness = binary(&work.path().join(dir), contents);
+            speaks_framed(&harness, &detect(&harness, &[work.path()]))
+        };
+        assert!(speaks(
+            "build/H-DRIVER",
+            &padded(b"BHF_FRAMED\0BHF_COV_SHM\0", 8192)
+        ));
+        assert!(speaks(
+            "build/H-ADA/obj",
+            &padded(b"BHF_FRAMED\0BHF_EVENTS_PATH\0", 8192)
+        ));
+        assert!(!speaks(
+            "build/H-OLD-ADA/obj",
+            &padded(b"BHF_EVENTS_PATH\0", 8192)
+        ));
+        assert!(!speaks("build/H-PLAIN", &padded(b"plain\0", 8192)));
     }
 
     #[test]

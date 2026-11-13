@@ -284,6 +284,11 @@ pub struct CorpusSyncReport {
     pub seed_inputs_loaded: usize,
     pub imported_inputs: usize,
     pub duplicate_inputs: usize,
+    /// Inputs the workers left unchecked (kept for their coverage but not yet
+    /// re-run in a fresh process), now in the campaign's
+    /// `corpus/<harness>/unchecked/` and not in its queue.
+    #[serde(default)]
+    pub unchecked_inputs: usize,
 }
 
 /// Spawn `workers` parallel fuzz subprocesses and wait for all of
@@ -323,6 +328,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         })
         .collect();
     let dropped_duplicates = merge::drop_orphaned_duplicates(&config.work_dir, &worker_dirs)?;
+    hand_out_unchecked(&config.work_dir, &config.harness_id, &worker_dirs)?;
     for (worker_id, worker_dir) in (0..workers).zip(worker_dirs) {
         std::fs::create_dir_all(&worker_dir)?;
         mirror_harness_layout(config, &worker_dir)?;
@@ -590,6 +596,28 @@ fn sync_worker_corpora(
             imported_inputs += 1;
         }
     }
+    // What a worker kept unchecked comes back unchecked, not queued; one a
+    // worker queued as clean is settled.
+    let held = corpus::manager::unchecked_dir(work_dir, harness_id);
+    let mut unchecked_inputs = 0_usize;
+    for worker in per_worker {
+        let left = corpus::manager::unchecked_dir(&worker.work_dir, harness_id);
+        for file in files_in(&left)? {
+            let bytes = std::fs::read(&file)?;
+            let Some(name) = file.file_name() else {
+                continue;
+            };
+            let destination = held.join(name);
+            if seen.contains(&bytes) || destination.exists() {
+                std::fs::remove_file(&file)?;
+                continue;
+            }
+            std::fs::create_dir_all(&held)?;
+            move_file(&file, &destination)?;
+            unchecked_inputs += 1;
+        }
+        let _ = std::fs::remove_dir(&left);
+    }
     merge_worker_lineage(
         work_dir,
         harness_id,
@@ -603,7 +631,61 @@ fn sync_worker_corpora(
         seed_inputs_loaded,
         imported_inputs,
         duplicate_inputs,
+        unchecked_inputs,
     })
+}
+
+/// Hand the inputs the campaign holds unchecked (`corpus/<harness>/unchecked/`,
+/// see [`corpus::manager::UNCHECKED_DIR`]) to the workers in turn: each worker
+/// re-runs its share first. They leave the campaign's directory; what a worker
+/// still leaves unchecked comes back when the campaign ends.
+fn hand_out_unchecked(
+    work_dir: &Path,
+    harness_id: &str,
+    worker_dirs: &[PathBuf],
+) -> Result<(), MulticoreError> {
+    if worker_dirs.is_empty() {
+        return Ok(());
+    }
+    let held = corpus::manager::unchecked_dir(work_dir, harness_id);
+    for (index, file) in files_in(&held)?.into_iter().enumerate() {
+        let Some(name) = file.file_name() else {
+            continue;
+        };
+        let to =
+            corpus::manager::unchecked_dir(&worker_dirs[index % worker_dirs.len()], harness_id);
+        std::fs::create_dir_all(&to)?;
+        move_file(&file, &to.join(name))?;
+    }
+    let _ = std::fs::remove_dir(&held);
+    Ok(())
+}
+
+/// The files directly in `dir`, by name; none when it does not exist.
+fn files_in(dir: &Path) -> Result<Vec<PathBuf>, MulticoreError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Move `from` to `to`, by a copy and a delete where a rename cannot.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    std::fs::remove_file(from)
 }
 
 /// Merge each worker's seed lineage (`corpus/<harness>/lineage.jsonl`, see
@@ -1712,6 +1794,108 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
         assert_eq!(manifest["harness_id"], "H-SYNC");
         assert_eq!(manifest["workers_started"], 2);
         assert_eq!(manifest["sync"]["imported_inputs"], 2);
+    }
+
+    /// The inputs a campaign holds unchecked (kept for their coverage, not yet
+    /// re-run in a fresh process) go to the workers in turn, which re-run them
+    /// first. What a worker still leaves unchecked comes back to the
+    /// campaign's `unchecked/`, never into its queue, and an input a worker
+    /// queued as clean is not kept unchecked as well.
+    #[cfg(unix)]
+    #[test]
+    fn unchecked_inputs_go_to_the_workers_and_come_back_unchecked_not_queued() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempdir("unchecked");
+        std::fs::create_dir_all(work.join("build").join("H-HELD")).unwrap();
+        std::fs::create_dir_all(work.join("corpus/H-HELD/queue")).unwrap();
+        let held = corpus::manager::unchecked_dir(&work, "H-HELD");
+        std::fs::create_dir_all(&held).unwrap();
+        for name in ["held-a", "held-b", "held-c"] {
+            std::fs::write(held.join(format!("{name}.bin")), name).unwrap();
+        }
+        // Each worker notes what it was handed and leaves it unchecked (as a
+        // worker stopped at the deadline does), leaves one input of its own
+        // unchecked, queues one clean input, and worker 1 also queues
+        // "held-b" as checked clean.
+        let script = work.join("fake-bhf.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+worker_dir="$2"
+harness=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --harness) harness="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+u="$worker_dir/corpus/$harness/unchecked"
+q="$worker_dir/corpus/$harness/queue"
+mkdir -p "$u" "$q"
+ls "$u" > "$worker_dir/handed.txt"
+printf "pending-%s" "$BHF_WORKER_ID" > "$u/pending-$BHF_WORKER_ID.bin"
+printf "clean-%s" "$BHF_WORKER_ID" > "$q/clean-$BHF_WORKER_ID.bin"
+if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-HELD".to_owned(),
+            workers: WorkerCount::Fixed(2),
+            per_worker_iterations: Some(1),
+            time_budget: Duration::ZERO,
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+            harness_dirs: Vec::new(),
+            harness_executable: None,
+            lineage_record_cap: corpus::lineage::MAX_LINEAGE_RECORDS,
+        };
+
+        let summary = run_multicore(&config).expect("run ok");
+
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect();
+            names.sort();
+            names
+        };
+        let handed = |worker: u32| -> Vec<String> {
+            std::fs::read_to_string(work.join(format!("worker-H-HELD-{worker}/handed.txt")))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(handed(0), ["held-a.bin", "held-c.bin"]);
+        assert_eq!(handed(1), ["held-b.bin"]);
+        assert_eq!(
+            names(&held),
+            ["held-a", "held-c", "pending-0", "pending-1"],
+            "unchecked inputs come back to the campaign"
+        );
+        assert_eq!(
+            names(&work.join("corpus/H-HELD/queue")),
+            ["clean-0", "clean-1", "held-b"],
+            "only inputs a worker queued reach the campaign's queue"
+        );
+        for worker in 0..2 {
+            let left = corpus::manager::unchecked_dir(
+                &work.join(format!("worker-H-HELD-{worker}")),
+                "H-HELD",
+            );
+            assert!(names(&left).is_empty(), "{left:?} still holds inputs");
+        }
+        assert_eq!(summary.sync.unchecked_inputs, 4);
     }
 
     /// The lineage each worker recorded beside its queue is merged into the

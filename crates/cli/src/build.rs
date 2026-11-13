@@ -133,16 +133,46 @@ pub(crate) fn activate_windows_clang_runtime() {
         }) {
             continue;
         }
-        let already_present = std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).any(|entry| entry == runtime))
-            .unwrap_or(false);
-        if !already_present {
-            prepend_process_path("PATH", &[runtime]);
+        let path: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        if let Ok(joined) = std::env::join_paths(with_dir_first(&path, &runtime)) {
+            std::env::set_var("PATH", joined);
         }
     }
 }
 
-#[cfg(any(unix, windows))]
+/// `path` with `dir` first, moved there when it is already listed. Windows
+/// loads the first DLL of a name it finds on PATH, and the Visual Studio
+/// environment puts MSVC's own `clang_rt.asan_dynamic` DLL (another LLVM
+/// version) ahead of an entry PATH already had. A clang-built harness that
+/// loads it dies before `main` with STATUS_ENTRYPOINT_NOT_FOUND.
+#[cfg(any(windows, test))]
+fn with_dir_first(path: &[PathBuf], dir: &Path) -> Vec<PathBuf> {
+    std::iter::once(dir.to_path_buf())
+        .chain(path.iter().filter(|entry| entry.as_path() != dir).cloned())
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn the_clang_asan_runtime_goes_first_on_path_even_when_already_listed() {
+    let (msvc, runtime, tools) = (
+        PathBuf::from("vs/msvc/bin"),
+        PathBuf::from("llvm/lib/windows"),
+        PathBuf::from("tools"),
+    );
+    assert_eq!(
+        with_dir_first(&[msvc.clone(), runtime.clone(), tools.clone()], &runtime),
+        [runtime.clone(), msvc.clone(), tools]
+    );
+    assert_eq!(
+        with_dir_first(std::slice::from_ref(&msvc), &runtime),
+        [runtime, msvc]
+    );
+}
+
+#[cfg(unix)]
 fn prepend_process_path(key: &str, prefixes: &[PathBuf]) {
     let mut paths = prefixes.to_vec();
     if let Some(existing) = std::env::var_os(key) {

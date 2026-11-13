@@ -1691,6 +1691,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fresh_rerun.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz.rs",
       "license": "Apache-2.0"
     },
@@ -2571,7 +2575,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fresh_rerun_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_cpu_contention.rs",
       "license": "Apache-2.0"
     },
     {

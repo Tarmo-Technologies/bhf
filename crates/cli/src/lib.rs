@@ -62,6 +62,7 @@ mod extract_state_machines;
 mod fake_corba;
 mod fatal_signal;
 mod finding_arg;
+mod fresh_rerun;
 mod fuzz;
 mod fuzz_lineage;
 mod gate_evidence;

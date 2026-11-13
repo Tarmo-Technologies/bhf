@@ -231,6 +231,54 @@ per crashing input.
 When the persistent fork-server misses a crash that the fresh-process re-run
 catches, that run's stderr is the finding's `sanitizer.log`.
 
+The fork-server runs every input it keeps in its corpus once more in a fresh
+process, to catch crashes the warm process hides. These re-runs happen on a
+background thread, so the fuzz loop does not wait for a process start on a
+loaded host. Where a re-run runs, and at what priority, depends on the CPUs
+bhf may use (its affinity and CPU quota) and on `--deadline`:
+
+| Usable CPUs | `--deadline` | Re-runs run | Their priority |
+|---|---|---|---|
+| 2 or more | either | on a background thread | lower: nice +10 on Linux, below-normal on Windows (back to normal once the loop stops) |
+| 1 | not set | on a background thread | the loop's own |
+| 1 | set | inline, as the loop's own step | the loop's own |
+
+At a lower priority a re-run takes a CPU only when the loop leaves one idle.
+On one CPU a lowered re-run would never finish under load, so it keeps the
+loop's priority, and with `--deadline` it runs inline, so a response time is
+never judged while it competes with the loop.
+
+- **Deadline re-check.** A response-deadline (BHF-555) report from a
+  background re-run is re-checked inline, at the loop's priority, before it
+  becomes a finding, whatever the CPU count.
+- **Isolation.** Each re-run starts in an empty working directory of its own,
+  with `TMPDIR` (`TMP` and `TEMP` on Windows) pointing there, so a target that
+  keeps files in its working directory never shares them with the fork-server.
+- **Findings.** A crash a re-run finds goes through the same dedup and
+  verification and becomes a finding. The input then stops being a mutation
+  base and is never saved in the corpus queue.
+- **The queue.** An input reaches `corpus/<harness>/queue/` only once its
+  re-run has come back clean. Until then it is only a mutation base in memory.
+- **Bounds.** At most 32 re-runs (64 MiB of inputs) are outstanding; beyond
+  that the loop waits for the oldest.
+- **End of a pass.** Near the end of `--time` the loop stops issuing inputs
+  early enough for the outstanding re-runs to finish inside it; a re-run still
+  going at `--time` is stopped. A pass without `--time` waits for every
+  re-run. A pass that stopped at its finding count does not wait, and a crash
+  a re-run reports after that count is reached is kept for the next pass
+  instead of reported.
+- **Unchecked inputs.** Inputs a pass could not check are counted in
+  `fresh_reruns.unchecked` of `fuzz_runs/<harness>-latest.json` and kept in
+  `corpus/<harness>/unchecked/`, beside the queue (up to 128 of them; `bhf
+  auto` keeps `corpus/` between runs). The next fork-server pass on that work
+  dir re-runs them first: a clean one joins the queue and a crashing one is
+  reported. A `--workers` campaign hands them to its workers and collects what
+  the workers leave unchecked back there, never into its queue.
+- **Seeds.** A seed a fork-server pass never got to run is not added to the
+  queue by that pass.
+- **The empty input** always runs in a fresh process; bhf runs it once per
+  pass and reuses the result.
+
 A harness built without a sanitizer runtime (a cross build run under its
 emulator, or a native build without sanitizers) prints nothing of its
 own when a fatal signal kills it. bhf's driver then writes one line to stderr

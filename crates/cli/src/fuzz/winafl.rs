@@ -2477,6 +2477,7 @@ pub(crate) fn run_on_host(
         extension: None,
         duplicate_sanitizer_hits: dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: dedup.unreproduced_hits(),
+        fresh_reruns: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)

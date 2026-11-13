@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
+
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
 
@@ -1014,6 +1016,28 @@ pub(crate) struct FuzzRunSummary {
     /// empty.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) unreproduced_sanitizer_hits: std::collections::BTreeMap<String, usize>,
+    /// The fork-server pass's fresh-process re-runs of new corpus inputs (the
+    /// check for crashes only a fresh process sees). Omitted when none ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fresh_reruns: Option<FreshRerunSummary>,
+}
+
+/// Fresh-process re-runs of new corpus inputs during one fork-server pass.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FreshRerunSummary {
+    /// Inputs queued for a re-run, including ones carried over from the last
+    /// pass.
+    pub(crate) submitted: usize,
+    /// Re-runs that completed.
+    pub(crate) checked: usize,
+    /// Re-runs that produced a crash report the fork-server run did not.
+    pub(crate) reports: usize,
+    /// Inputs still unchecked when the pass ended. They stay in the corpus and
+    /// are saved in `unchecked_dir`; the next pass on this work dir re-runs
+    /// them first.
+    pub(crate) unchecked: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unchecked_dir: Option<PathBuf>,
 }
 
 /// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
@@ -1240,6 +1264,7 @@ struct PreparedFuzzRun {
     extension_manifest: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 struct HarnessRun {
     events: Vec<Event>,
     testcases: Vec<Testcase>,
@@ -3258,6 +3283,10 @@ struct PoolEntry {
     /// at the offset they were compared instead of every occurrence of a common
     /// byte. `None` until captured; mutation draws from it when present.
     colored: Option<Vec<u8>>,
+    /// A fresh-process re-run showed this input crashes (#416): it is a
+    /// finding, so it is neither mutated from nor saved in the queue. Kept in
+    /// place so every other entry keeps its pool index.
+    retired: bool,
 }
 
 /// Quantitative marginal feedback from one execution. Keeping the channel
@@ -3293,6 +3322,7 @@ impl PoolEntry {
             selections: 0,
             cmplog: None,
             colored: None,
+            retired: false,
         }
     }
 
@@ -3736,15 +3766,12 @@ fn run_builtin_with_progress(
     // ForkServer::spawn handshake is the backstop — it returns Err -> None for
     // anything that doesn't complete the protocol.
     let driver_harness = protocol == HarnessProtocol::BhfFramed;
+    let speaks_framed =
+        crate::protocol_detect::speaks_framed(prepared.runner.harness_path(), &detection);
+    let handshake_timeout =
+        fork_handshake_timeout(prepared.per_input_timeout, prepared.time, speaks_framed);
     let mut fork_server = if prepared.fork_server && !c_libfuzzer_harness {
-        ForkServer::spawn(
-            &prepared.runner,
-            &prepared.work_dir,
-            &prepared.extra_env,
-            prepared.rss_limit_mb,
-            prepared.per_input_timeout,
-        )
-        .ok()
+        start_fork_server(&prepared, handshake_timeout, speaks_framed)
     } else {
         None
     };
@@ -3775,12 +3802,268 @@ fn run_builtin_with_progress(
         None
     };
 
+    // The sanitizer half of the finding path: dedup, replay-verify and emit.
+    // Shared by an input's own run and by its fresh-process re-run, which may
+    // finish later, in the background (see `crate::fresh_rerun`).
+    macro_rules! emit_sanitizer_report {
+        ($input:expr, $report:expr, $stderr:expr, $lineage:expr) => {{
+            let input: &[u8] = $input;
+            let report: &corpus::SanitizerReport = $report;
+            let stderr: Option<&str> = $stderr;
+            'emit: {
+                // (#49) An LSan leak whose entire allocation stack is bhf's own
+                // decode/harness scaffolding (no target frame) is the decoder buffer the
+                // harness would have freed — left dangling only because an exit()/abort()-
+                // only target terminated before the harness free(). bhf manufactured
+                // it, so SUPPRESS it (don't emit/count a phantom CWE-401).
+                if corpus::cluster::is_harness_scaffolding_leak(report, bhf_entry) {
+                    scaffolding_leak_drops += 1;
+                }
+                // (#388) A crash entirely in libFuzzer/sanitizer/allocator driver
+                // glue with no target frame is a harness fault, not a target bug.
+                else if c_libfuzzer_harness
+                    && corpus::cluster::is_driver_glue_crash(report, bhf_entry)
+                {
+                    driver_glue_drops += 1;
+                } else if let Some(key) = sanitizer_dedup.first_sighting(report) {
+                    // First sighting of this cluster (#389 dedups the rest). For a
+                    // passthrough libFuzzer harness, replay-verify before emitting
+                    // (#388): re-run in a fresh process and drop non-reproducing
+                    // faults (allocator-state corruption across inputs). The key is
+                    // consumed only once the finding is emitted, so a first hit that
+                    // does not reproduce does not hide a later one that does.
+                    if !c_libfuzzer_harness
+                        || sanitizer_crash_reproduces(
+                            &prepared.runner,
+                            &prepared.work_dir,
+                            input,
+                            report,
+                            &prepared.extra_env,
+                            prepared.per_input_timeout,
+                            prepared.rss_limit_mb,
+                            prepared.deadline,
+                        )
+                    {
+                        // UBSan's object-size check reports an overflow ASan
+                        // would have reported first: emit ASan's report then.
+                        // Asked once per root cause: the key is consumed below.
+                        let opinion = object_size_second_opinion(
+                            &prepared.work_dir,
+                            report,
+                            &prepared.extra_env,
+                            prepared.per_input_timeout,
+                            pass_deadline,
+                            |env, timeout| {
+                                // No response deadline: the re-run asks only what
+                                // ASan reports.
+                                run_c_libfuzzer_single_input(
+                                    &prepared.runner,
+                                    &prepared.work_dir,
+                                    input,
+                                    env,
+                                    timeout,
+                                    prepared.rss_limit_mb,
+                                    None,
+                                )
+                                .map(|rerun| (rerun.sanitizer, rerun.stderr))
+                            },
+                        );
+                        let (report, stderr) = match opinion.as_ref().and_then(|o| o.asan.as_ref())
+                        {
+                            Some((view, stderr)) => (view, stderr.as_deref()),
+                            None => (report, stderr),
+                        };
+                        if opinion.as_ref().is_some_and(|o| o.asan.is_some()) {
+                            match sanitizer_dedup.first_sighting(report) {
+                                Some(view_key) => sanitizer_dedup.consumed(view_key),
+                                None => {
+                                    // That ASan report is a finding already.
+                                    sanitizer_dedup.consumed(key);
+                                    note_duplicate_of_existing(
+                                        &mut duplicates_of_existing,
+                                        existing_findings
+                                            .clusters
+                                            .get(&sanitizer_dedup.key(report)),
+                                    );
+                                    // Out of this block only: the caller still
+                                    // keeps the input out of the corpus.
+                                    break 'emit;
+                                }
+                            }
+                        }
+                        let id = emitter
+                            .emit_sanitizer_crash_with_log(input, report, stderr.map(str::as_bytes))
+                            .map_err(|error| format!("emit sanitizer finding: {error}"))?;
+                        if let Some(opinion) = &opinion {
+                            opinion.record(&prepared.work_dir, &id.0, &key);
+                        }
+                        let descent = $lineage;
+                        crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
+                        sanitizer_dedup.consumed(key);
+                        record_finding_arguments(
+                            &prepared.work_dir,
+                            &id.0,
+                            prepared.runner.harness_path(),
+                            input,
+                            TraceInput::ArgvFile,
+                            &prepared.extra_env,
+                            prepared.per_input_timeout,
+                            prepared.runner.qemu_prefix(),
+                        );
+                        finding_ids.push(id.0);
+                    } else {
+                        sanitizer_dedup.unconfirmed(key);
+                        non_reproducible += 1;
+                    }
+                } else {
+                    // A hit of a root cause pre-seeded from an on-disk finding is
+                    // reported against that finding's id.
+                    note_duplicate_of_existing(
+                        &mut duplicates_of_existing,
+                        existing_findings.clusters.get(&sanitizer_dedup.key(report)),
+                    );
+                }
+            }
+        }};
+    }
+    // #416 AC2 fresh-process re-runs of new corpus inputs, run in the
+    // background. An input reaches the saved queue only once its re-run has
+    // come back clean; one still unchecked when the pass ends is kept in
+    // `corpus/<harness>/unchecked/` instead. Inputs a previous pass left there
+    // go first: a clean one joins the queue, a crashing one is reported.
+    let mut fresh_reruns: Option<FreshReruns<FreshRerunResult>> = None;
+    let mut fresh_rerun_summary = FreshRerunSummary::default();
+    let unchecked_dir = corpus::manager::unchecked_dir(&prepared.work_dir, &prepared.harness_id);
+    let carried_over = if driver_harness && fork_server.is_some() {
+        read_unchecked_inputs(&unchecked_dir)
+    } else {
+        Vec::new()
+    };
+    // The files of the carried-over inputs not settled yet, by input.
+    let mut carried_over_files: HashMap<u64, PathBuf> = carried_over
+        .iter()
+        .map(|(path, input)| (crash_input_key(input), path.clone()))
+        .collect();
+    // Re-run results waiting to be taken in at the end of an iteration.
+    let mut arrived: Vec<crate::fresh_rerun::Checked<FreshRerunResult>> = Vec::new();
+    // Inputs this pass leaves unchecked: still running when it ended, cut
+    // short by its end, or held back once the finding cap was reached.
+    let mut unchecked_inputs: Vec<Vec<u8>> = Vec::new();
+    macro_rules! finding_cap_reached {
+        () => {
+            prepared
+                .stop_after_findings
+                .is_some_and(|cap| finding_ids.len() >= cap)
+        };
+    }
+    macro_rules! adopt_fresh_reruns {
+        ($checked:expr) => {
+            for checked in $checked {
+                let crate::fresh_rerun::Checked {
+                    input,
+                    result,
+                    placement,
+                } = checked;
+                let mut fresh = result?;
+                // A deadline report from a re-run that ran at a lower priority
+                // beside the loop may only say it waited for a CPU: confirm it
+                // with a re-run at the loop's own priority first.
+                if placement == Placement::Background
+                    && fresh
+                        .as_ref()
+                        .and_then(|run| run.sanitizer.as_ref())
+                        .is_some_and(|report| report.rule_id == RESPONSE_DEADLINE_RULE)
+                {
+                    if let Some(reruns) = fresh_reruns.as_ref() {
+                        let overrun = fresh
+                            .as_ref()
+                            .and_then(|run| run.sanitizer.as_ref())
+                            .map(|report| deadline_overrun_of(report).to_owned())
+                            .unwrap_or_default();
+                        fresh = reruns.run_inline(&input)?;
+                        if fresh.as_ref().is_some_and(|run| run.sanitizer.is_none()) {
+                            bhfeprintln!(
+                                "bhf fuzz: note: an input's background fresh-process re-run \
+                                 {overrun}, but met it when re-run at normal priority: not a \
+                                 finding"
+                            );
+                        }
+                    }
+                }
+                let Some(fresh) = fresh else {
+                    unchecked_inputs.push(input);
+                    continue;
+                };
+                let key = crash_input_key(&input);
+                match &fresh.sanitizer {
+                    None => {
+                        fresh_rerun_summary.checked += 1;
+                        if carried_over_files.contains_key(&key) {
+                            let _ = corpus
+                                .persist_coverage_corpus(&prepared.harness_id, [input.as_slice()]);
+                        }
+                    }
+                    // Held back once the run has its findings: never queued,
+                    // reported by the next pass.
+                    Some(_) if finding_cap_reached!() => {
+                        unchecked_inputs.push(input);
+                        continue;
+                    }
+                    Some(report) => {
+                        if report.rule_id == RESPONSE_DEADLINE_RULE {
+                            announce_deadline_finding(deadline_overrun_of(report));
+                        }
+                        fresh_rerun_summary.checked += 1;
+                        fresh_rerun_summary.reports += 1;
+                        emit_sanitizer_report!(
+                            &input,
+                            report,
+                            fresh.stderr.as_deref(),
+                            lineage.of_bytes(&input)
+                        );
+                        if crashing_inputs.len() < finding_dedup_limit {
+                            crashing_inputs.insert(key);
+                        }
+                        retire_from_pool(&mut pool, &input);
+                        forget_queued_input(&prepared.work_dir, &prepared.harness_id, &input);
+                    }
+                }
+                if let Some(path) = carried_over_files.remove(&key) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        };
+    }
+    if !carried_over.is_empty() {
+        let reruns =
+            fresh_reruns.get_or_insert_with(|| start_fresh_reruns(&prepared, pass_deadline));
+        for (_, input) in carried_over {
+            arrived.extend(reruns.submit(input));
+        }
+        adopt_fresh_reruns!(std::mem::take(&mut arrived));
+    }
+    // Past this share of the pass, the loop stops early enough for the
+    // outstanding re-runs to finish inside `--time`.
+    let drain_window = prepared.time.map(|budget| budget / FRESH_RERUN_DRAIN_SHARE);
+    // The empty input always runs in a fresh process (an empty frame ends the
+    // framed loop in some drivers). Run it once per pass and reuse the result.
+    let mut empty_input_run: Option<HarnessRun> = None;
     for iteration in 0..prepared.iterations {
         if prepared
             .time
             .is_some_and(|budget| start.elapsed() >= budget)
         {
             break;
+        }
+        // Near the end, stop issuing inputs once the re-runs still out need
+        // the time that is left.
+        if let (Some(deadline), Some(window), Some(reruns)) =
+            (pass_deadline, drain_window, fresh_reruns.as_ref())
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left <= window && left <= reruns.drain_estimate(prepared.per_input_timeout) {
+                break;
+            }
         }
 
         let mut parents = crate::fuzz_lineage::InputParents::Queued(iteration);
@@ -3861,7 +4144,7 @@ fn run_builtin_with_progress(
         // per-spawn process). Fork-server findings are replay-validated below so
         // an artifact of accumulated global state never escapes as a finding.
         let mut from_fork_server = false;
-        let mut run = if !input.is_empty() && fork_server.is_some() {
+        let run = if !input.is_empty() && fork_server.is_some() {
             match fork_server
                 .as_mut()
                 .expect("fork_server checked is_some")
@@ -3885,20 +4168,29 @@ fn run_builtin_with_progress(
                         protocol,
                         prepared.deadline,
                     )?;
-                    fork_server = ForkServer::spawn(
-                        &prepared.runner,
-                        &prepared.work_dir,
-                        &prepared.extra_env,
-                        prepared.rss_limit_mb,
-                        prepared.per_input_timeout,
-                    )
-                    .ok();
+                    // Never wait past the end of the pass for the new server.
+                    let left = pass_deadline
+                        .map_or(handshake_timeout, |deadline| {
+                            deadline.saturating_duration_since(Instant::now())
+                        })
+                        .min(handshake_timeout);
+                    fork_server = if left.is_zero() {
+                        None
+                    } else {
+                        start_fork_server(
+                            &prepared,
+                            left,
+                            speaks_framed && left == handshake_timeout,
+                        )
+                    };
                     forkserver_started |= fork_server.is_some();
                     run
                 }
             }
+        } else if let (true, Some(cached)) = (input.is_empty(), &empty_input_run) {
+            cached.clone()
         } else {
-            run_harness_with_protocol(
+            let run = run_harness_with_protocol(
                 &prepared.runner,
                 &prepared.work_dir,
                 &input,
@@ -3907,7 +4199,11 @@ fn run_builtin_with_progress(
                 prepared.rss_limit_mb,
                 protocol,
                 prepared.deadline,
-            )?
+            )?;
+            if input.is_empty() {
+                empty_input_run = Some(run.clone());
+            }
+            run
         };
         executions += 1;
         target_entry_observed |= run.testcases.iter().any(|testcase| testcase.target_entered);
@@ -4004,22 +4300,25 @@ fn run_builtin_with_progress(
         // monotonic), so this adds ~corpus-many extra spawns over a whole run, like
         // AFL++ calibrating each new corpus entry; the captured report flows into the
         // dedup / replay-verify emission path below exactly like a per-spawn crash.
+        // The re-run goes to a background worker (`crate::fresh_rerun`): a fresh
+        // process costs seconds on a loaded host, and waiting for it here used
+        // to stall the loop on every new corpus entry. Its report, when it
+        // arrives, takes the same finding path and retires the input from the
+        // pool. Until a clean result arrives the input is only a mutation base:
+        // the queue saved at the end of the pass leaves it out, and one still
+        // unchecked then is kept in `corpus/<harness>/unchecked/` for the next
+        // pass. Where it runs, and at what priority: `fresh_rerun_placement`.
         if from_fork_server
             && made_progress
             && driver_harness
             && run.sanitizer.is_none()
             && !input.is_empty()
         {
-            let fresh = run_c_libfuzzer_single_input(
-                &prepared.runner,
-                &prepared.work_dir,
-                &input,
-                &prepared.extra_env,
-                prepared.per_input_timeout,
-                prepared.rss_limit_mb,
-                prepared.deadline,
-            )?;
-            adopt_fresh_rerun(&mut run, fresh);
+            let reruns =
+                fresh_reruns.get_or_insert_with(|| start_fresh_reruns(&prepared, pass_deadline));
+            arrived.extend(reruns.submit(input.clone()));
+        } else if let Some(reruns) = fresh_reruns.as_mut() {
+            arrived.extend(reruns.take_checked());
         }
         // #382: this input's coverage novelty — new corpus signatures plus (on the
         // driver path) new edge coverage — is its scheduling energy, captured here
@@ -4140,113 +4439,12 @@ fn run_builtin_with_progress(
         }
 
         if let Some(report) = &run.sanitizer {
-            // (#49) An LSan leak whose entire allocation stack is bhf's own
-            // decode/harness scaffolding (no target frame) is the decoder buffer the
-            // harness would have freed — left dangling only because an exit()/abort()-
-            // only target terminated before the harness free(). bhf manufactured
-            // it, so SUPPRESS it (don't emit/count a phantom CWE-401).
-            if corpus::cluster::is_harness_scaffolding_leak(report, bhf_entry) {
-                scaffolding_leak_drops += 1;
-            }
-            // (#388) A crash entirely in libFuzzer/sanitizer/allocator driver
-            // glue with no target frame is a harness fault, not a target bug.
-            else if c_libfuzzer_harness
-                && corpus::cluster::is_driver_glue_crash(report, bhf_entry)
-            {
-                driver_glue_drops += 1;
-            } else if let Some(key) = sanitizer_dedup.first_sighting(report) {
-                // First sighting of this cluster (#389 dedups the rest). For a
-                // passthrough libFuzzer harness, replay-verify before emitting
-                // (#388): re-run in a fresh process and drop non-reproducing
-                // faults (allocator-state corruption across inputs). The key is
-                // consumed only once the finding is emitted, so a first hit that
-                // does not reproduce does not hide a later one that does.
-                if !c_libfuzzer_harness
-                    || sanitizer_crash_reproduces(
-                        &prepared.runner,
-                        &prepared.work_dir,
-                        &input,
-                        report,
-                        &prepared.extra_env,
-                        prepared.per_input_timeout,
-                        prepared.rss_limit_mb,
-                        prepared.deadline,
-                    )
-                {
-                    // UBSan's object-size check reports an overflow ASan
-                    // would have reported first: emit ASan's report then.
-                    // Asked once per root cause: the key is consumed below.
-                    let opinion = object_size_second_opinion(
-                        &prepared.work_dir,
-                        report,
-                        &prepared.extra_env,
-                        prepared.per_input_timeout,
-                        pass_deadline,
-                        |env, timeout| {
-                            // No response deadline: the re-run asks only what
-                            // ASan reports.
-                            run_c_libfuzzer_single_input(
-                                &prepared.runner,
-                                &prepared.work_dir,
-                                &input,
-                                env,
-                                timeout,
-                                prepared.rss_limit_mb,
-                                None,
-                            )
-                            .map(|rerun| (rerun.sanitizer, rerun.stderr))
-                        },
-                    );
-                    let (report, stderr) = match opinion.as_ref().and_then(|o| o.asan.as_ref()) {
-                        Some((view, stderr)) => (view, stderr.as_deref()),
-                        None => (report, run.stderr.as_deref()),
-                    };
-                    if opinion.as_ref().is_some_and(|o| o.asan.is_some()) {
-                        match sanitizer_dedup.first_sighting(report) {
-                            Some(view_key) => sanitizer_dedup.consumed(view_key),
-                            None => {
-                                // That ASan report is a finding already.
-                                sanitizer_dedup.consumed(key);
-                                note_duplicate_of_existing(
-                                    &mut duplicates_of_existing,
-                                    existing_findings.clusters.get(&sanitizer_dedup.key(report)),
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    let id = emitter
-                        .emit_sanitizer_crash_with_log(&input, report, stderr.map(str::as_bytes))
-                        .map_err(|error| format!("emit sanitizer finding: {error}"))?;
-                    if let Some(opinion) = &opinion {
-                        opinion.record(&prepared.work_dir, &id.0, &key);
-                    }
-                    let descent = lineage.of(&input, parents);
-                    crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
-                    sanitizer_dedup.consumed(key);
-                    record_finding_arguments(
-                        &prepared.work_dir,
-                        &id.0,
-                        prepared.runner.harness_path(),
-                        &input,
-                        TraceInput::ArgvFile,
-                        &prepared.extra_env,
-                        prepared.per_input_timeout,
-                        prepared.runner.qemu_prefix(),
-                    );
-                    finding_ids.push(id.0);
-                } else {
-                    sanitizer_dedup.unconfirmed(key);
-                    non_reproducible += 1;
-                }
-            } else {
-                // A hit of a root cause pre-seeded from an on-disk finding is
-                // reported against that finding's id.
-                note_duplicate_of_existing(
-                    &mut duplicates_of_existing,
-                    existing_findings.clusters.get(&sanitizer_dedup.key(report)),
-                );
-            }
+            emit_sanitizer_report!(
+                &input,
+                report,
+                run.stderr.as_deref(),
+                lineage.of(&input, parents)
+            );
         }
 
         for hit in crate::auto::runtrace::oracle_hits_for_harness(
@@ -4311,21 +4509,67 @@ fn run_builtin_with_progress(
                 selections: 0,
                 cmplog: None,
                 colored: None,
+                retired: false,
             });
         }
+
+        // The re-run results that came in during this iteration, after its own
+        // findings, so the cap below holds for them too.
+        adopt_fresh_reruns!(std::mem::take(&mut arrived));
 
         // Per-target finding cap (`auto --per-target-finding-count`): stop this
         // run the instant it has emitted the requested number of DISTINCT findings
         // (`finding_ids` is signature/cluster-deduped above) so the cascade can
         // move on. The caller passes the count REMAINING for this pass; `None`
         // (default) never breaks early.
-        if prepared
-            .stop_after_findings
-            .is_some_and(|cap| finding_ids.len() >= cap)
-        {
+        if finding_cap_reached!() {
             break;
         }
     }
+
+    // End of pass: wait for the outstanding re-runs while the pass has time
+    // left (all of them when it has no `--time`, none once it has its
+    // findings), then keep what is still unchecked for the next pass, out of
+    // the queue.
+    adopt_fresh_reruns!(std::mem::take(&mut arrived));
+    let wait = if finding_cap_reached!() {
+        Some(Duration::ZERO)
+    } else {
+        pass_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    };
+    if let Some(finished) = fresh_reruns.as_mut().map(|reruns| reruns.finish(wait)) {
+        adopt_fresh_reruns!(finished.checked);
+        unchecked_inputs.extend(finished.unchecked);
+    }
+    let mut unchecked_keys = HashSet::new();
+    unchecked_inputs.retain(|input| unchecked_keys.insert(crash_input_key(input)));
+    if let Some(reruns) = fresh_reruns.take() {
+        fresh_rerun_summary.submitted = reruns.submitted();
+        fresh_rerun_summary.unchecked = unchecked_inputs.len();
+        match save_unchecked_inputs(&unchecked_dir, &unchecked_inputs) {
+            Ok(0) => {}
+            Ok(left_out) => bhfeprintln!(
+                "bhf fuzz: {left_out} unchecked input(s) did not fit in {} (at most \
+                 {MAX_SAVED_UNCHECKED_INPUTS}) and were left out of the corpus",
+                unchecked_dir.display()
+            ),
+            Err(error) => {
+                bhfeprintln!("bhf fuzz: warning: could not save unchecked inputs: {error}");
+            }
+        }
+        if !unchecked_inputs.is_empty() {
+            fresh_rerun_summary.unchecked_dir = Some(unchecked_dir.clone());
+            bhfeprintln!(
+                "bhf fuzz: {} new corpus input(s) were not re-run in a fresh process \
+                 before the pass ended; they are kept out of the corpus queue, in {}, \
+                 for the next pass to check first",
+                unchecked_inputs.len(),
+                unchecked_dir.display()
+            );
+        }
+    }
+    // An empty unchecked dir is gone.
+    let _ = fs::remove_dir(&unchecked_dir);
 
     // #422: emit a taint-confirmed sink finding for each cross-execution-
     // confirmed fuzz-controlled sink (path-open BHF-405, process-exec BHF-431,
@@ -4438,11 +4682,30 @@ fn run_builtin_with_progress(
     // The corpus is about to hold this pass's inputs, of this harness's input
     // format, whether or not the pass found anything: record that format.
     emitter.record_corpus_format();
+    //
+    // #416 AC2: a crasher (known by a finding, or retired from the pool by a
+    // fresh re-run) and an input whose fresh re-run has not come back are
+    // left out.
+    // So is a seed a fork-server pass never ran (its time went to the
+    // re-runs, or it stopped at its findings): nothing checked it here.
+    let unrun_seeds = if forkserver_started && driver_harness {
+        executions.min(initial_seed_count)..initial_seed_count
+    } else {
+        0..0
+    };
+    let queueable = |(index, entry): &(usize, &PoolEntry)| {
+        let key = crash_input_key(&entry.bytes);
+        !entry.retired
+            && !unrun_seeds.contains(index)
+            && !crashing_inputs.contains(&key)
+            && !unchecked_keys.contains(&key)
+    };
     let corpus_persisted = match corpus.persist_coverage_corpus(
         &prepared.harness_id,
         pool.iter()
-            .map(|entry| &entry.bytes)
-            .filter(|bytes| !crashing_inputs.contains(&crash_input_key(bytes))),
+            .enumerate()
+            .filter(|entry| queueable(entry))
+            .map(|(_, entry)| &entry.bytes),
     ) {
         Ok(count) => count,
         Err(error) => {
@@ -4498,8 +4761,9 @@ fn run_builtin_with_progress(
             &emitter,
             &prepared.harness_id,
             pool.iter()
-                .map(|entry| entry.bytes.as_slice())
-                .filter(|bytes| !crashing_inputs.contains(&crash_input_key(bytes))),
+                .enumerate()
+                .filter(|entry| queueable(entry))
+                .map(|(_, entry)| entry.bytes.as_slice()),
         )
     });
 
@@ -4532,6 +4796,7 @@ fn run_builtin_with_progress(
         extension: extension_block,
         duplicate_sanitizer_hits: sanitizer_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
+        fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -4810,14 +5075,6 @@ fn replay_afl_input(
             }
         }
     }
-}
-
-/// #416: adopt a fresh-process re-run's result for an input the persistent
-/// fork-server ran without a report: the parsed report and the raw stderr it
-/// was parsed from, which becomes the finding's `sanitizer.log`.
-fn adopt_fresh_rerun(run: &mut HarnessRun, fresh: HarnessRun) {
-    run.sanitizer = fresh.sanitizer;
-    run.stderr = fresh.stderr;
 }
 
 /// Count one crash that matched an existing finding (`None`: the match was a
@@ -5368,6 +5625,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         extension: None,
         duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
+        fresh_reruns: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -5561,9 +5819,84 @@ fn collected_child_output(
     }
 }
 
+/// How often a per-spawn run samples the child's RSS when `--rss-limit-mb` is
+/// set. Without a limit the wait blocks until the child exits.
+const PER_SPAWN_RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
+/// How often a cancellable per-spawn run (a background fresh re-run) checks
+/// whether it was cancelled.
+const PER_SPAWN_CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How a per-spawn run starts and waits for its process, beyond the plain run.
+#[derive(Clone, Copy, Default)]
+struct SpawnTweaks<'a> {
+    /// Start the process at a lower priority than bhf's (nice +10 on Unix,
+    /// below-normal priority class on Windows).
+    low_priority: bool,
+    /// Kill the process and return an error once this is set.
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Once this is set, return a lowered process to normal priority where
+    /// the platform allows it (Windows; an unprivileged Unix process cannot
+    /// undo a nice).
+    restore_priority: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Say nothing when the run overruns `--deadline`: the caller decides
+    /// whether the overrun becomes a finding and says so then (a fresh re-run's
+    /// overrun may be re-checked and cleared first).
+    quiet_deadline: bool,
+}
+
+/// How much lower than bhf's own a background re-run's process runs on Unix.
+#[cfg(unix)]
+const LOWER_PRIORITY_NICE: libc::c_int = 10;
+
+/// Start `command`'s process at a lower priority than bhf's: it then takes
+/// a CPU only when the fuzz loop and the harness it drives leave one idle.
+#[cfg(unix)]
+fn lower_spawn_priority(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: nice(2) is async-signal-safe and touches only the new process.
+    unsafe {
+        command.pre_exec(|| {
+            libc::nice(LOWER_PRIORITY_NICE);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn lower_spawn_priority(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lower_spawn_priority(_command: &mut std::process::Command) {}
+
+/// Return a process [`lower_spawn_priority`] started to normal priority: on
+/// Windows, before it is killed (a starved process is slow to finish dying)
+/// and once the loop it gave way to has stopped. A Unix process cannot raise
+/// a nice value back without privilege, so there it stays lowered.
+#[cfg(windows)]
+fn restore_spawn_priority(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
+    }
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    // SAFETY: the handle is the live child's, owned by `child`.
+    unsafe {
+        SetPriorityClass(child.as_raw_handle().cast(), NORMAL_PRIORITY_CLASS);
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_spawn_priority(_child: &std::process::Child) {}
+
 /// Run `harness_path <input_path>` with a wall-clock timeout. On
 /// timeout, kill the process and return a synthetic exit status plus
 /// a marker on stderr so the caller can distinguish hang-vs-crash.
+#[allow(clippy::too_many_arguments)]
 fn run_with_timeout(
     harness_path: &Path,
     input_path: &Path,
@@ -5572,6 +5905,7 @@ fn run_with_timeout(
     scratch: &Path,
     rss_limit_mb: usize,
     qemu_prefix: Option<(&Path, &[String])>,
+    tweaks: SpawnTweaks<'_>,
 ) -> Result<std::process::Output, String> {
     // A foreign-arch harness runs under qemu-user (`qemu-aarch64 [args] harness
     // input`); the host path keeps the exact direct `harness input` invocation.
@@ -5596,6 +5930,9 @@ fn run_with_timeout(
         timeout_cmd.env(k, v);
     }
     apply_runaway_rlimits(&mut timeout_cmd);
+    if tweaks.low_priority {
+        lower_spawn_priority(&mut timeout_cmd);
+    }
     let mut child = timeout_cmd.spawn().map_err(|error| {
         format!(
             "failed to start harness '{}': {error}",
@@ -5603,13 +5940,50 @@ fn run_with_timeout(
         )
     })?;
     let stderr_reader = drain_child_stderr(child.stderr.take());
+    let mut lowered = tweaks.low_priority;
 
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait() {
+        // Block until the child exits, or until the next check is due: the
+        // deadline, the next RSS sample when a limit is set, or the next look
+        // at the cancel and priority flags when there are any.
+        let mut wait = deadline.saturating_duration_since(Instant::now());
+        if rss_limit_mb > 0 {
+            wait = wait.min(PER_SPAWN_RSS_SAMPLE_INTERVAL);
+        }
+        if tweaks.cancel.is_some() || (lowered && tweaks.restore_priority.is_some()) {
+            wait = wait.min(PER_SPAWN_CANCEL_CHECK_INTERVAL);
+        }
+        match replay_min::process::wait_exit_within(&mut child, wait) {
             Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader)),
             Ok(None) => {
+                if lowered
+                    && tweaks
+                        .restore_priority
+                        .is_some_and(|restore| restore.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    restore_spawn_priority(&child);
+                    lowered = false;
+                }
+                if tweaks
+                    .cancel
+                    .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    if lowered {
+                        restore_spawn_priority(&child);
+                    }
+                    kill_process_group(&mut child);
+                    let _ = child.wait();
+                    let _ = stderr_reader.and_then(|reader| reader.join().ok());
+                    return Err(format!(
+                        "the run of harness '{}' was cancelled",
+                        harness_path.display()
+                    ));
+                }
                 if Instant::now() >= deadline {
+                    if lowered {
+                        restore_spawn_priority(&child);
+                    }
                     kill_process_group(&mut child);
                     let status = child.wait().map_err(|error| {
                         format!(
@@ -5645,7 +6019,6 @@ fn run_with_timeout(
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
                 kill_process_group(&mut child);
@@ -5669,6 +6042,33 @@ fn run_c_libfuzzer_single_input(
     rss_limit_mb: usize,
     deadline: Option<Duration>,
 ) -> Result<HarnessRun, String> {
+    run_c_libfuzzer_single_input_in(
+        runner,
+        work_dir,
+        &ensure_harness_scratch(work_dir)?,
+        input,
+        extra_env,
+        per_input_timeout,
+        rss_limit_mb,
+        deadline,
+        SpawnTweaks::default(),
+    )
+}
+
+/// [`run_c_libfuzzer_single_input`] with the process started in `scratch`
+/// and with `tweaks`.
+#[allow(clippy::too_many_arguments)]
+fn run_c_libfuzzer_single_input_in(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    scratch: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+    deadline: Option<Duration>,
+    tweaks: SpawnTweaks<'_>,
+) -> Result<HarnessRun, String> {
     let tmp_dir = work_dir.join("fuzz_inputs");
     fs::create_dir_all(&tmp_dir)
         .map_err(|error| format!("create fuzz inputs dir '{}': {error}", tmp_dir.display()))?;
@@ -5676,7 +6076,11 @@ fn run_c_libfuzzer_single_input(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let input_path = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
+    // A sequence number too: fresh-process re-runs write inputs from a second
+    // thread, and two writes can share a clock reading.
+    static INPUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = INPUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let input_path = tmp_dir.join(format!("input-{}-{}-{seq}.bin", std::process::id(), nonce));
     fs::write(&input_path, input)
         .map_err(|error| format!("write fuzz input '{}': {error}", input_path.display()))?;
 
@@ -5690,11 +6094,15 @@ fn run_c_libfuzzer_single_input(
         &input_path,
         per_input_timeout,
         extra_env,
-        &ensure_harness_scratch(work_dir)?,
+        scratch,
         rss_limit_mb,
         runner.qemu_prefix(),
-    )?;
+        tweaks,
+    );
     let elapsed = exec_start.elapsed();
+    let output = output.inspect_err(|_| {
+        let _ = fs::remove_file(&input_path);
+    })?;
     let _ = fs::remove_file(&input_path);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5708,11 +6116,10 @@ fn run_c_libfuzzer_single_input(
     // finding is only synthesized when there is no sanitizer report to surface.
     if let Some(deadline) = deadline {
         if elapsed > deadline && corpus::parse_sanitizer_report(&stderr).is_none() {
-            bhfeprintln!(
-                "bhf: input exceeded the response deadline of {:?} (took {:?}) - recording BHF-555 finding",
-                deadline,
-                elapsed
-            );
+            let overrun = deadline_overrun(deadline, elapsed);
+            if !tweaks.quiet_deadline {
+                announce_deadline_finding(&overrun);
+            }
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
@@ -5725,11 +6132,9 @@ fn run_c_libfuzzer_single_input(
                     kind: "response-deadline-exceeded".to_owned(),
                     // A real catalog rule (CWE-400 timing/availability) so it dedups,
                     // replays, and reports like any other finding.
-                    rule_id: "BHF-555",
+                    rule_id: RESPONSE_DEADLINE_RULE,
                     stack: Vec::new(),
-                    message: format!(
-                        "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
-                    ),
+                    message: format!("harness {overrun}"),
                     ..Default::default()
                 }),
                 stderr: None,
@@ -6140,9 +6545,16 @@ fn choose_entropic_index_pool(pool: &[PoolEntry], rng: &mut MutationRng) -> usiz
     if pool.is_empty() {
         return 0;
     }
+    // A retired entry (a known crasher) is never picked while another is left.
     let weights: Vec<u64> = pool
         .iter()
-        .map(|entry| entropic_weight(entry.energy, entry.selections))
+        .map(|entry| {
+            if entry.retired {
+                0
+            } else {
+                entropic_weight(entry.energy, entry.selections)
+            }
+        })
         .collect();
     let total: u64 = weights.iter().sum();
     if total == 0 {
@@ -6156,6 +6568,15 @@ fn choose_entropic_index_pool(pool: &[PoolEntry], rng: &mut MutationRng) -> usiz
         r -= *weight;
     }
     pool.len() - 1
+}
+
+/// The pool entry a mutation of `base_index` splices from: the next one that
+/// is not retired (a known crasher), else the base itself.
+fn splice_peer(pool: &[PoolEntry], base_index: usize) -> usize {
+    (1..pool.len())
+        .map(|step| (base_index + step) % pool.len())
+        .find(|index| !pool[*index].retired)
+        .unwrap_or(base_index)
 }
 
 /// Max byte positions a colorization pass probes per base (#400). Bounds the
@@ -6426,7 +6847,7 @@ fn mutate_from_pool(
         .map(PoolEntry::mutation_base)
         .unwrap_or(&[]);
     let base = &full_base[..full_base.len().min(config.max_len)];
-    let peer_index = (base_index + 1) % pool.len().max(1);
+    let peer_index = splice_peer(pool, base_index);
     let full_peer = pool
         .get(peer_index)
         .map(PoolEntry::mutation_base)
@@ -7076,24 +7497,18 @@ fn run_harness_with_protocol(
     // forever. The C/libFuzzer lane already wall-clock-bounds its wait in
     // `run_c_libfuzzer_single_input`; this is the matching guard for the
     // event-log per-spawn lane (the #412 deadlock class).
-    let deadline = Instant::now() + per_input_timeout;
-    let exit_status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "wait for harness '{}': {error}",
-                    runner.harness_path().display()
-                ));
-            }
+    let exit_status = match replay_min::process::wait_exit_within(&mut child, per_input_timeout) {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => {
+            kill_process_group(&mut child);
+            let _ = child.wait();
+            None
+        }
+        Err(error) => {
+            return Err(format!(
+                "wait for harness '{}': {error}",
+                runner.harness_path().display()
+            ));
         }
     };
     let stderr_bytes = stderr_reader
@@ -7624,6 +8039,7 @@ fn run_traced_argv(
         &ensure_harness_scratch(work_dir)?,
         0,
         qemu_prefix,
+        SpawnTweaks::default(),
     );
     let _ = fs::remove_file(&path);
     Ok(output?.stderr)
@@ -7653,23 +8069,19 @@ fn run_traced_stdin(
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input);
     }
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader).stderr),
-            Ok(None) if Instant::now() >= deadline => {
-                kill_process_group(&mut child);
-                let status = child
-                    .wait()
-                    .map_err(|error| format!("reap '{}': {error}", harness.display()))?;
-                return Ok(collected_child_output(status, stderr_reader).stderr);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                kill_process_group(&mut child);
-                let _ = child.wait();
-                return Err(format!("poll '{}': {error}", harness.display()));
-            }
+    match replay_min::process::wait_exit_within(&mut child, timeout) {
+        Ok(Some(status)) => Ok(collected_child_output(status, stderr_reader).stderr),
+        Ok(None) => {
+            kill_process_group(&mut child);
+            let status = child
+                .wait()
+                .map_err(|error| format!("reap '{}': {error}", harness.display()))?;
+            Ok(collected_child_output(status, stderr_reader).stderr)
+        }
+        Err(error) => {
+            kill_process_group(&mut child);
+            let _ = child.wait();
+            Err(format!("poll '{}': {error}", harness.display()))
         }
     }
 }
@@ -7785,11 +8197,80 @@ enum ForkOutcome {
     Died,
 }
 
-/// Handshake timeout (ms): a conforming Ada harness writes its "ready" sync byte
-/// at startup essentially instantly; anything not speaking the framed protocol
-/// (a C/libFuzzer harness, a stale build, a test mock) never does, so spawn bails
-/// to per-spawn after this.
-const FORK_HANDSHAKE_TIMEOUT_MS: i32 = 2000;
+/// How long a harness that may not speak the framed protocol gets to write its
+/// "ready" sync byte. Anything that does not speak it (a stale build, a test
+/// mock) never does, so spawn bails to per-spawn after this short probe.
+const FORK_HANDSHAKE_PROBE: Duration = Duration::from_secs(2);
+/// The least time a harness known to speak the framed protocol gets to start.
+/// Startup can take far longer than one input (a runtime to load, static
+/// initialisers, a loaded machine), and a missed handshake drops the rest of
+/// the run to a fresh process per input.
+const FORK_STARTUP_FLOOR: Duration = Duration::from_secs(10);
+
+/// The last part of a pass (one over this share of `--time`) in which the loop
+/// stops issuing inputs once the fresh re-runs still out need the time left.
+const FRESH_RERUN_DRAIN_SHARE: u32 = 4;
+
+/// The rule of a response-deadline (`--deadline`) report.
+const RESPONSE_DEADLINE_RULE: &str = "BHF-555";
+
+/// How a run overran the response deadline, as its BHF-555 report and the
+/// stderr line put it.
+fn deadline_overrun(deadline: Duration, elapsed: Duration) -> String {
+    format!("exceeded the response deadline of {deadline:?} (took {elapsed:?})")
+}
+
+/// [`deadline_overrun`] read back from a BHF-555 report's message.
+fn deadline_overrun_of(report: &corpus::SanitizerReport) -> &str {
+    report
+        .message
+        .strip_prefix("harness ")
+        .unwrap_or(&report.message)
+}
+
+/// Say on stderr that a run's deadline overrun is being recorded as a BHF-555
+/// finding.
+fn announce_deadline_finding(overrun: &str) {
+    bhfeprintln!("bhf: input {overrun} - recording BHF-555 finding");
+}
+
+/// How long `ForkServer::spawn` waits for the ready byte: the per-input
+/// timeout, but at least [`FORK_STARTUP_FLOOR`], for a harness known to speak
+/// the framed protocol, and the short [`FORK_HANDSHAKE_PROBE`] for any other.
+/// Never longer than the pass itself.
+fn fork_handshake_timeout(
+    run_timeout: Duration,
+    pass_budget: Option<Duration>,
+    speaks_framed: bool,
+) -> Duration {
+    let wait = if speaks_framed {
+        run_timeout.max(FORK_STARTUP_FLOOR)
+    } else {
+        run_timeout.min(FORK_HANDSHAKE_PROBE)
+    };
+    pass_budget.map_or(wait, |budget| wait.min(budget))
+}
+
+#[cfg(test)]
+#[test]
+fn fork_handshake_waits_for_a_slow_start_of_a_framed_harness() {
+    let secs = Duration::from_secs;
+    // A known framed harness gets the per-input timeout, at least the floor.
+    assert_eq!(fork_handshake_timeout(secs(10), None, true), secs(10));
+    assert_eq!(fork_handshake_timeout(secs(1), None, true), secs(10));
+    assert_eq!(fork_handshake_timeout(secs(30), None, true), secs(30));
+    // Never past the pass budget.
+    assert_eq!(
+        fork_handshake_timeout(secs(10), Some(secs(4)), true),
+        secs(4)
+    );
+    // Any other harness keeps the short probe.
+    assert_eq!(fork_handshake_timeout(secs(10), None, false), secs(2));
+    assert_eq!(
+        fork_handshake_timeout(Duration::from_millis(750), None, false),
+        Duration::from_millis(750)
+    );
+}
 /// Convert a run timeout to the bounded millisecond value accepted by `poll(2)`.
 /// A zero/sub-millisecond budget still receives one millisecond so the protocol
 /// gets a chance to observe an already-readable sync byte.
@@ -7797,9 +8278,21 @@ fn fork_run_timeout_ms(timeout: Duration) -> i32 {
     timeout.as_millis().clamp(1, i32::MAX as u128) as i32
 }
 
-/// A child's stdout is readable once it writes or exits, and not while it is
-/// alive and silent, so a harness that never answers the fork-server
-/// handshake (or hangs on an input) times out instead of blocking the run.
+/// What waiting for one sync byte from the harness gave.
+#[derive(Debug, PartialEq, Eq)]
+enum SyncByte {
+    /// The byte arrived.
+    Received,
+    /// The pipe closed: the harness exited or died.
+    Closed,
+    /// Nothing arrived in time; the harness is still running.
+    TimedOut,
+}
+
+/// A child's stdout yields the sync byte once it writes, reads as closed once
+/// it exits, and times out while it is alive and silent, so a harness that
+/// never answers the fork-server handshake (or hangs on an input) times out
+/// instead of blocking the run.
 #[cfg(all(test, any(unix, windows)))]
 #[test]
 fn fork_server_pipe_wait_times_out_on_a_silent_child() {
@@ -7822,12 +8315,15 @@ fn fork_server_pipe_wait_times_out_on_a_silent_child() {
             .unwrap()
     };
 
-    let mut silent = shell("sleep 5", "ping -n 6 127.0.0.1 > nul");
+    let mut silent = shell(
+        "sleep 5",
+        r"%SystemRoot%\System32\ping.exe -n 6 127.0.0.1 > nul",
+    );
     let started = Instant::now();
-    assert!(!stdout_readable_within(
-        silent.stdout.as_ref().unwrap(),
-        200
-    ));
+    assert_eq!(
+        read_sync_byte(silent.stdout.as_mut().unwrap(), Duration::from_millis(200)),
+        SyncByte::TimedOut
+    );
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(150), "{waited:?}");
     assert!(waited < Duration::from_secs(3), "{waited:?}");
@@ -7835,20 +8331,20 @@ fn fork_server_pipe_wait_times_out_on_a_silent_child() {
     let _ = silent.wait();
 
     let mut writer = shell("echo ready", "echo ready");
-    assert!(stdout_readable_within(
-        writer.stdout.as_ref().unwrap(),
-        3_000
-    ));
+    assert_eq!(
+        read_sync_byte(writer.stdout.as_mut().unwrap(), Duration::from_secs(3)),
+        SyncByte::Received
+    );
     let _ = writer.wait();
 
-    // An exited child's pipe reads as end of file: readable, so the caller's
-    // read reports the death.
+    // An exited child's pipe reads as closed, which the caller reports as the
+    // harness's death.
     let mut exited = shell("exit 0", "exit 0");
     let _ = exited.wait();
-    assert!(stdout_readable_within(
-        exited.stdout.as_ref().unwrap(),
-        3_000
-    ));
+    assert_eq!(
+        read_sync_byte(exited.stdout.as_mut().unwrap(), Duration::from_secs(3)),
+        SyncByte::Closed
+    );
 }
 
 #[cfg(test)]
@@ -7857,6 +8353,181 @@ fn fork_server_wait_inherits_short_pass_budget() {
     assert_eq!(fork_run_timeout_ms(Duration::ZERO), 1);
     assert_eq!(fork_run_timeout_ms(Duration::from_millis(750)), 750);
     assert_eq!(fork_run_timeout_ms(Duration::from_secs(3)), 3_000);
+}
+
+/// Wait at most `timeout` for the harness's next sync byte on its stdout. The
+/// thread blocks until the harness writes or exits (`poll` on Unix, one
+/// overlapped read on Windows), so a reply wakes it at once even on a loaded
+/// machine.
+fn read_sync_byte(stdout: &mut std::process::ChildStdout, timeout: Duration) -> SyncByte {
+    use std::io::Read;
+    #[cfg(windows)]
+    if let Some(outcome) = win_pipe::read_byte_within(stdout, timeout) {
+        return outcome;
+    }
+    if !stdout_readable_within(stdout, fork_run_timeout_ms(timeout)) {
+        return SyncByte::TimedOut;
+    }
+    let mut byte = [0u8; 1];
+    match stdout.read_exact(&mut byte) {
+        Ok(()) => SyncByte::Received,
+        Err(_) => SyncByte::Closed,
+    }
+}
+
+/// One overlapped read of the harness's sync byte, waited for on an event.
+/// Rust opens its own end of a child's pipe for overlapped I/O. Polling the
+/// pipe instead wakes on every timer tick, and on a loaded machine each
+/// wakeup then waits behind the busy threads for a CPU, while a thread whose
+/// read completes is boosted and runs at once.
+#[cfg(windows)]
+mod win_pipe {
+    use super::SyncByte;
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Duration;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: usize,
+        information: usize,
+    }
+
+    const ERROR_IO_PENDING: u32 = 997;
+    const ERROR_OPERATION_ABORTED: u32 = 995;
+    const WAIT_OBJECT_0: u32 = 0;
+    const FILE_MODE_INFORMATION: u32 = 16;
+    const FILE_SYNCHRONOUS_IO: u32 = 0x10 | 0x20;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(
+            attributes: *mut c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn ReadFile(
+            file: *mut c_void,
+            buffer: *mut c_void,
+            to_read: u32,
+            read: *mut u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            file: *mut c_void,
+            overlapped: *mut Overlapped,
+            transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
+        fn CancelIoEx(file: *mut c_void, overlapped: *mut Overlapped) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationFile(
+            file: *mut c_void,
+            io_status: *mut IoStatusBlock,
+            information: *mut c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+
+    /// Whether `handle` was opened for overlapped I/O. An overlapped read on a
+    /// synchronous handle would block past the timeout.
+    fn is_overlapped(handle: *mut c_void) -> bool {
+        let mut io_status = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let mut mode = 0u32;
+        // SAFETY: valid out-pointers; FILE_MODE_INFORMATION is one ULONG.
+        let status = unsafe {
+            NtQueryInformationFile(
+                handle,
+                &mut io_status,
+                (&mut mode as *mut u32).cast(),
+                4,
+                FILE_MODE_INFORMATION,
+            )
+        };
+        status >= 0 && mode & FILE_SYNCHRONOUS_IO == 0
+    }
+
+    /// Read one byte from `stdout`, waiting at most `timeout`; `None` when the
+    /// handle is not overlapped or no event could be made.
+    pub(super) fn read_byte_within(
+        stdout: &std::process::ChildStdout,
+        timeout: Duration,
+    ) -> Option<SyncByte> {
+        let handle = stdout.as_raw_handle();
+        if !is_overlapped(handle) {
+            return None;
+        }
+        // SAFETY: a fresh unnamed manual-reset event, closed below.
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event,
+        };
+        let mut byte = 0u8;
+        let mut transferred = 0u32;
+        // SAFETY: `handle` is the live read end `stdout` owns. `byte` and
+        // `overlapped` outlive the read: unless it fails to start, it is waited
+        // for (`GetOverlappedResult` with wait set) before they go out of scope.
+        let outcome = unsafe {
+            let started = ReadFile(
+                handle,
+                (&mut byte as *mut u8).cast(),
+                1,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            );
+            if started == 0 && GetLastError() != ERROR_IO_PENDING {
+                SyncByte::Closed
+            } else {
+                if started == 0 {
+                    let millis = timeout.as_millis().clamp(1, u128::from(u32::MAX - 1)) as u32;
+                    if WaitForSingleObject(event, millis) != WAIT_OBJECT_0 {
+                        CancelIoEx(handle, &mut overlapped);
+                    }
+                }
+                if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 1) != 0 {
+                    if transferred == 1 {
+                        SyncByte::Received
+                    } else {
+                        SyncByte::Closed
+                    }
+                } else if GetLastError() == ERROR_OPERATION_ABORTED {
+                    SyncByte::TimedOut
+                } else {
+                    SyncByte::Closed
+                }
+            }
+        };
+        // SAFETY: `event` is the handle created above, no longer in use.
+        unsafe { CloseHandle(event) };
+        Some(outcome)
+    }
 }
 
 /// Block until the child's `stdout` is readable (it wrote, or it exited) or
@@ -7930,6 +8601,356 @@ fn stdout_readable_within(_stdout: &std::process::ChildStdout, _timeout_ms: i32)
     true
 }
 
+/// What one fresh-process re-run came to: `Ok(None)` when the pass ended (or
+/// gave up on it) before it finished, so the input is still unchecked.
+type FreshRerunResult = Result<Option<HarnessRun>, String>;
+
+/// Start the fresh-process re-runs for this pass (see `crate::fresh_rerun`),
+/// placed by [`fresh_rerun_placement`].
+fn start_fresh_reruns(
+    prepared: &PreparedFuzzRun,
+    pass_deadline: Option<Instant>,
+) -> FreshReruns<FreshRerunResult> {
+    let runner = prepared.runner.clone();
+    let work_dir = prepared.work_dir.clone();
+    let env = fresh_rerun_env(&prepared.extra_env);
+    let (timeout, rss_limit_mb, deadline) = (
+        prepared.per_input_timeout,
+        prepared.rss_limit_mb,
+        prepared.deadline,
+    );
+    let placement = fresh_rerun_placement(usable_cpus(), deadline.is_some());
+    FreshReruns::start(
+        move |input: &[u8], context: &RerunContext<'_>| {
+            run_fresh_rerun(
+                &runner,
+                &work_dir,
+                input,
+                &env,
+                FreshRerunLimits {
+                    timeout,
+                    rss_limit_mb,
+                    deadline,
+                    pass_deadline,
+                    lower_priority: placement.lower_priority,
+                },
+                context,
+            )
+        },
+        placement.workers,
+        crate::fresh_rerun::MAX_OUTSTANDING_INPUTS,
+        crate::fresh_rerun::MAX_OUTSTANDING_BYTES,
+    )
+}
+
+/// Where a pass's fresh re-runs run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreshRerunPlacement {
+    /// Background workers; none runs each re-run inline, as the loop's step.
+    workers: usize,
+    /// Start a background re-run's process at a lower priority.
+    lower_priority: bool,
+}
+
+/// How a pass on `cpus` usable CPUs places its fresh re-runs (#416):
+/// - Two or more CPUs: one background worker, its processes at a lower
+///   priority (nice +10; below-normal on Windows, back to normal once the
+///   loop stops). On a busy machine they take a CPU only when the loop
+///   leaves one idle.
+/// - One CPU with `--deadline`: inline, as the loop's own step. A re-run
+///   sharing the only CPU with the loop takes longer than the input does.
+/// - One CPU without a deadline: one background worker at the loop's
+///   priority. The loop keeps fuzzing while a re-run waits for its process
+///   to start; lowered, the re-run would never finish under load.
+///
+/// Whatever the placement, a deadline (BHF-555) report from a background
+/// re-run is re-checked inline, at the loop's priority, before it is a
+/// finding (see `adopt_fresh_reruns!`).
+fn fresh_rerun_placement(cpus: usize, response_deadline: bool) -> FreshRerunPlacement {
+    match (cpus > 1, response_deadline) {
+        (true, _) => FreshRerunPlacement {
+            workers: 1,
+            lower_priority: true,
+        },
+        (false, true) => FreshRerunPlacement {
+            workers: 0,
+            lower_priority: false,
+        },
+        (false, false) => FreshRerunPlacement {
+            workers: 1,
+            lower_priority: false,
+        },
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fresh_reruns_run_inline_only_on_one_cpu_with_a_response_deadline() {
+    let placement = |cpus, deadline| {
+        let placed = fresh_rerun_placement(cpus, deadline);
+        (placed.workers, placed.lower_priority)
+    };
+    assert_eq!(placement(1, true), (0, false));
+    assert_eq!(placement(1, false), (1, false));
+    assert_eq!(placement(2, false), (1, true));
+    assert_eq!(placement(8, true), (1, true));
+}
+
+/// The CPUs this process may run on: its affinity and CPU quota (a cgroup's
+/// `cpu.max` on Linux), and on Windows its affinity mask.
+fn usable_cpus() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    #[cfg(windows)]
+    if let Some(allowed) = windows_affinity_cpus() {
+        return cpus.min(allowed);
+    }
+    cpus
+}
+
+/// How many CPUs this process's affinity mask allows (Windows).
+#[cfg(windows)]
+fn windows_affinity_cpus() -> Option<usize> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetProcessAffinityMask(
+            process: *mut c_void,
+            process_mask: *mut usize,
+            system_mask: *mut usize,
+        ) -> i32;
+    }
+    let (mut process_mask, mut system_mask) = (0usize, 0usize);
+    // SAFETY: the out-pointers are valid for the call; the pseudo-handle of
+    // the current process needs no closing.
+    let ok =
+        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) };
+    (ok != 0 && process_mask != 0).then(|| process_mask.count_ones() as usize)
+}
+
+/// The bounds of one fresh re-run.
+#[derive(Clone, Copy)]
+struct FreshRerunLimits {
+    timeout: Duration,
+    rss_limit_mb: usize,
+    /// `--deadline`.
+    deadline: Option<Duration>,
+    /// When the pass ends: a re-run never runs past it.
+    pass_deadline: Option<Instant>,
+    /// Start a background re-run's process at a lower priority.
+    lower_priority: bool,
+}
+
+/// Re-run `input` in a fresh process, in a scratch directory of its own (a
+/// target can keep files in its working directory, and a background re-run
+/// runs beside the fork-server), within what is left of the pass. A re-run the
+/// end of the pass cuts short, or that the pass cancels, is `Ok(None)`.
+fn run_fresh_rerun(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    limits: FreshRerunLimits,
+    context: &RerunContext<'_>,
+) -> FreshRerunResult {
+    use std::sync::atomic::Ordering;
+    let left = limits
+        .pass_deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    let timeout = left.map_or(limits.timeout, |left| limits.timeout.min(left));
+    if timeout.is_zero() || context.cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let scratch = fresh_rerun_scratch(work_dir)?;
+    let mut env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| !SCRATCH_TEMP_VARS.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    for key in SCRATCH_TEMP_VARS {
+        env.push(((*key).to_owned(), scratch.display().to_string()));
+    }
+    let background = context.placement == Placement::Background;
+    let started = Instant::now();
+    let run = run_c_libfuzzer_single_input_in(
+        runner,
+        work_dir,
+        &scratch,
+        input,
+        &env,
+        timeout,
+        limits.rss_limit_mb,
+        limits.deadline,
+        SpawnTweaks {
+            low_priority: background && limits.lower_priority,
+            cancel: background.then_some(context.cancelled),
+            restore_priority: background.then_some(context.draining),
+            // Announced where the report is adopted, once it is a finding.
+            quiet_deadline: true,
+        },
+    );
+    let _ = fs::remove_dir_all(&scratch);
+    if context.cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let run = run?;
+    // Killed at the end of the pass rather than at its own timeout: the input
+    // was not checked.
+    if run.sanitizer.is_none() && timeout < limits.timeout && started.elapsed() >= timeout {
+        return Ok(None);
+    }
+    Ok(Some(run))
+}
+
+/// The temp-dir variables a fresh re-run points at its own scratch directory.
+const SCRATCH_TEMP_VARS: &[&str] = if cfg!(windows) {
+    &["TMP", "TEMP"]
+} else {
+    &["TMPDIR"]
+};
+
+/// A new, empty scratch directory for one fresh re-run, under `fuzz_scratch/`.
+fn fresh_rerun_scratch(work_dir: &Path) -> Result<PathBuf, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir =
+        ensure_harness_scratch(work_dir)?.join(format!(".rerun-{}-{seq}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create re-run scratch dir {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The environment of a background re-run: the run's own, without the
+/// coverage, comparison and value-profile maps and with the runtrace log sent
+/// nowhere. Those are shared with the fork-server, which reads them after each
+/// of its inputs; a re-run running at the same time would be credited to the
+/// fork-server's next input.
+fn fresh_rerun_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+    const SHARED_WITH_THE_FORK_SERVER: &[&str] = &[
+        "BHF_COV_SHM",
+        "BHF_COV_CNT_SHM",
+        "BHF_CMP_PROGRESS_SHM",
+        "BHF_CMP_SHM",
+        "BHF_VP_SHM",
+        "BHF_TARGET_ENTRY_SHM",
+        "BHF_CMPLOG",
+        "BHF_CMP_EVIDENCE",
+    ];
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    extra_env
+        .iter()
+        .filter(|(key, _)| !SHARED_WITH_THE_FORK_SERVER.contains(&key.as_str()))
+        .map(|(key, value)| {
+            if key == "BHF_RUNTRACE_LOG" {
+                (key.clone(), null_device.to_owned())
+            } else {
+                (key.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+/// The most inputs kept unchecked for one harness. Past it a pass leaves the
+/// rest out, which never queues them: nothing unchecked reaches the queue.
+const MAX_SAVED_UNCHECKED_INPUTS: usize = 4 * crate::fresh_rerun::MAX_OUTSTANDING_INPUTS;
+
+/// The file an unchecked input is kept in: named by its sha256, like a queue
+/// entry, so saving it twice keeps one copy.
+fn unchecked_input_path(dir: &Path, input: &[u8]) -> PathBuf {
+    dir.join(format!(
+        "{}.bin",
+        corpus::lineage::hex(&corpus::lineage::digest(input))
+    ))
+}
+
+/// Up to one re-run queue's worth of the inputs an earlier pass left
+/// unchecked in `dir`, with their files, by file name.
+fn read_unchecked_inputs(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "bin") && path.is_file())
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .take(crate::fresh_rerun::MAX_OUTSTANDING_INPUTS)
+        .filter_map(|path| fs::read(&path).ok().map(|bytes| (path, bytes)))
+        .collect()
+}
+
+/// Keep `inputs` in `dir` for the next pass, up to
+/// [`MAX_SAVED_UNCHECKED_INPUTS`] files in all. Returns how many did not fit.
+fn save_unchecked_inputs(dir: &Path, inputs: &[Vec<u8>]) -> std::io::Result<usize> {
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+    fs::create_dir_all(dir)?;
+    let mut held = fs::read_dir(dir)?.flatten().count();
+    let mut left_out = 0;
+    for input in inputs {
+        let path = unchecked_input_path(dir, input);
+        if path.exists() {
+            continue;
+        }
+        if held >= MAX_SAVED_UNCHECKED_INPUTS {
+            left_out += 1;
+            continue;
+        }
+        fs::write(&path, input)?;
+        held += 1;
+    }
+    Ok(left_out)
+}
+
+/// A pool entry that crashed in a fresh process is a finding, not a mutation
+/// base or a queue entry: mark every copy of `input` in the pool so.
+fn retire_from_pool(pool: &mut [PoolEntry], input: &[u8]) {
+    for entry in pool.iter_mut().filter(|entry| entry.bytes == input) {
+        entry.retired = true;
+    }
+}
+
+/// Remove `input` from the harness's saved queue, where an earlier pass (or an
+/// older bhf) may have put it before a fresh run showed that it crashes.
+fn forget_queued_input(work_dir: &Path, harness_id: &str, input: &[u8]) {
+    let queue = work_dir.join("corpus").join(harness_id).join("queue");
+    let _ = fs::remove_file(unchecked_input_path(&queue, input));
+}
+
+/// Start the run's fork-server, or `None` to run a fresh process per input. A
+/// harness known to speak the protocol that still misses the handshake says
+/// so, since every later input then pays a full process start.
+fn start_fork_server(
+    prepared: &PreparedFuzzRun,
+    handshake_timeout: Duration,
+    speaks_framed: bool,
+) -> Option<ForkServer> {
+    match ForkServer::spawn(
+        &prepared.runner,
+        &prepared.work_dir,
+        &prepared.extra_env,
+        prepared.rss_limit_mb,
+        prepared.per_input_timeout,
+        handshake_timeout,
+    ) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            if speaks_framed {
+                bhfeprintln!(
+                    "bhf: {error}; running a fresh process per input instead (slower). \
+                     A target that is slow to start needs a longer --timeout."
+                );
+            }
+            None
+        }
+    }
+}
+
 impl ForkServer {
     fn spawn(
         runner: &replay_min::HarnessRunner,
@@ -7937,6 +8958,7 @@ impl ForkServer {
         extra_env: &[(String, String)],
         rss_limit_mb: usize,
         run_timeout: Duration,
+        handshake_timeout: Duration,
     ) -> Result<Self, String> {
         let events_path = temp_event_path(work_dir)?;
         // Fresh, empty events file; we read deltas from it per input.
@@ -7981,16 +9003,18 @@ impl ForkServer {
         // No byte within the timeout means this harness does not speak the framed
         // protocol (a C/libFuzzer harness, a stale build, a test mock) -> bail so
         // the caller uses the per-spawn path.
-        use std::io::Read;
-        let mut ready = [0u8; 1];
-        let handshake_timeout_ms = FORK_HANDSHAKE_TIMEOUT_MS.min(fork_run_timeout_ms(run_timeout));
-        if !stdout_readable_within(&stdout, handshake_timeout_ms)
-            || stdout.read_exact(&mut ready).is_err()
-        {
+        let ready = read_sync_byte(&mut stdout, handshake_timeout);
+        if ready != SyncByte::Received {
             kill_process_group(&mut child);
             let _ = child.wait();
             let _ = fs::remove_file(&events_path);
-            return Err("fork-server: harness did not complete the protocol handshake".to_owned());
+            return Err(match ready {
+                SyncByte::TimedOut => {
+                    format!("fork-server: harness sent no ready byte within {handshake_timeout:?}")
+                }
+                _ => "fork-server: harness exited before completing the protocol handshake"
+                    .to_owned(),
+            });
         }
         Ok(Self {
             child,
@@ -8012,7 +9036,6 @@ impl ForkServer {
     }
 
     fn run_one(&mut self, input: &[u8]) -> ForkOutcome {
-        use std::io::Read;
         // Write the framed input, then await the harness's sync byte (sent from
         // its next Load_From_Stdin once it has flushed this input's events). A
         // broken pipe / EOF means the process died; a timeout means this input
@@ -8023,16 +9046,17 @@ impl ForkServer {
         {
             return ForkOutcome::Died;
         }
-        if !self.await_sync_within_rss_limit() {
-            // Either the input hung the process or it blew past the RSS ceiling;
-            // kill the child and isolate via the per-spawn path, which polls RSS
-            // and synthesizes the BHF-209 out-of-memory finding.
-            kill_process_group(&mut self.child);
-            return ForkOutcome::Died;
-        }
-        let mut sync = [0u8; 1];
-        if self.stdout.read_exact(&mut sync).is_err() {
-            return ForkOutcome::Died;
+        match self.await_sync_within_rss_limit() {
+            SyncByte::Received => {}
+            SyncByte::Closed => return ForkOutcome::Died,
+            SyncByte::TimedOut => {
+                // Either the input hung the process or it blew past the RSS
+                // ceiling; kill the child and isolate via the per-spawn path,
+                // which polls RSS and synthesizes the BHF-209 out-of-memory
+                // finding.
+                kill_process_group(&mut self.child);
+                return ForkOutcome::Died;
+            }
         }
         // The input may have driven RSS over the ceiling and only then sent its
         // sync byte (the harness frees nothing mid-loop); catch that too.
@@ -8046,22 +9070,21 @@ impl ForkServer {
         }
     }
 
-    /// Wait for the harness's sync byte to become readable, returning `true` once
-    /// it is. With no RSS limit this is a single bounded poll; with a limit it
-    /// polls in short slices, returning `false` if the child's RSS breaches the
-    /// ceiling (or the whole-input timeout elapses) so the caller can isolate it.
-    fn await_sync_within_rss_limit(&self) -> bool {
+    /// Wait for the harness's sync byte. With no RSS limit this is a single
+    /// bounded wait; with a limit it waits in short slices, giving up
+    /// (`TimedOut`) if the child's RSS breaches the ceiling or the whole-input
+    /// timeout elapses, so the caller can isolate it.
+    fn await_sync_within_rss_limit(&mut self) -> SyncByte {
+        let run_timeout = Duration::from_millis(self.run_timeout_ms as u64);
         if self.rss_limit_mb == 0 {
-            return stdout_readable_within(&self.stdout, self.run_timeout_ms);
+            return read_sync_byte(&mut self.stdout, run_timeout);
         }
-        const RSS_POLL_INTERVAL_MS: i32 = 25;
-        let deadline = Instant::now() + Duration::from_millis(self.run_timeout_ms as u64);
+        const RSS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+        let deadline = Instant::now() + run_timeout;
         loop {
-            if stdout_readable_within(&self.stdout, RSS_POLL_INTERVAL_MS) {
-                return true;
-            }
-            if self.rss_exceeded() || Instant::now() >= deadline {
-                return false;
+            match read_sync_byte(&mut self.stdout, RSS_POLL_INTERVAL) {
+                SyncByte::TimedOut if !self.rss_exceeded() && Instant::now() < deadline => {}
+                outcome => return outcome,
             }
         }
     }
@@ -8117,6 +9140,322 @@ impl Drop for ForkServer {
         kill_process_group(&mut self.child);
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.events_path);
+    }
+}
+
+/// Startup and per-spawn waits under CPU contention: a slow start is not a
+/// failed handshake, and waiting for a child adds no fixed polling latency.
+#[cfg(all(test, unix))]
+mod exec_wait_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bhf-exec-wait-{name}-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("main");
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A framed harness that takes longer than the old fixed 2 s to send its
+    /// ready byte (a slow start, as under CPU contention) still gets its
+    /// fork-server instead of dropping the run to a process per input.
+    #[test]
+    fn slow_starting_framed_harness_completes_the_handshake() {
+        let work = scratch_dir("slow-start");
+        let harness = script(
+            &work,
+            "#!/bin/sh\n# BHF_FRAMED\nsleep 2.5\nprintf '\\001'\nexec cat >/dev/null\n",
+        );
+        let runner = replay_min::HarnessRunner::direct(harness);
+        let run_timeout = Duration::from_secs(10);
+        let handshake = fork_handshake_timeout(run_timeout, None, true);
+        let server = ForkServer::spawn(&runner, &work, &[], 0, run_timeout, handshake);
+        assert!(
+            server.is_ok(),
+            "a slow framed start must not fail the handshake: {:?}",
+            server.err()
+        );
+        drop(server);
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// A harness that never sends its ready byte is still abandoned, at the
+    /// handshake deadline, with a message that says how long it waited.
+    #[test]
+    fn silent_harness_is_abandoned_at_the_handshake_deadline() {
+        let work = scratch_dir("silent-start");
+        let harness = script(&work, "#!/bin/sh\n# BHF_FRAMED\nexec sleep 30\n");
+        let runner = replay_min::HarnessRunner::direct(harness);
+        let started = Instant::now();
+        let error = ForkServer::spawn(
+            &runner,
+            &work,
+            &[],
+            0,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("a silent harness fails the handshake");
+        let waited = started.elapsed();
+        assert!(error.contains("no ready byte within 1s"), "{error}");
+        assert!(waited >= Duration::from_secs(1), "{waited:?}");
+        assert!(waited < Duration::from_secs(8), "{waited:?}");
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// An input that hangs the persistent harness is still given up on at the
+    /// per-input timeout, not at the more generous handshake deadline.
+    #[test]
+    fn an_input_that_hangs_the_fork_server_times_out_at_the_run_timeout() {
+        let work = scratch_dir("hung-input");
+        let harness = script(
+            &work,
+            "#!/bin/sh\n# BHF_FRAMED\nprintf '\\001'\nexec sleep 30\n",
+        );
+        let runner = replay_min::HarnessRunner::direct(harness);
+        let mut server = ForkServer::spawn(
+            &runner,
+            &work,
+            &[],
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        )
+        .expect("the harness sends its ready byte");
+        let started = Instant::now();
+        assert!(matches!(server.run_one(b"input"), ForkOutcome::Died));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(1), "{waited:?}");
+        assert!(waited < Duration::from_secs(8), "{waited:?}");
+        drop(server);
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// Voluntary context switches of the calling thread so far. A thread that
+    /// blocks until a child exits switches out about once; one that polls with
+    /// sleeps switches out on every tick, however fast the machine is.
+    #[cfg(target_os = "linux")]
+    fn voluntary_switches() -> i64 {
+        // SAFETY: `usage` is a valid out-pointer for the duration of the call.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+            0
+        );
+        usage.ru_nvcsw
+    }
+
+    /// How many more times the calling thread wakes when `run`'s child lives
+    /// 2 s longer: about none for a wait that blocks until the child exits, one
+    /// per tick for a sleep-poll. Spawning, pipes and files cost the same for
+    /// both children, so the difference isolates the wait even on a loaded
+    /// machine.
+    #[cfg(target_os = "linux")]
+    fn extra_wakeups_for_a_longer_child(run: impl Fn(&str)) -> i64 {
+        let wakeups = |secs: &str| {
+            let before = voluntary_switches();
+            run(secs);
+            voluntary_switches() - before
+        };
+        let short = wakeups("0.1");
+        let long = wakeups("2.1");
+        long - short
+    }
+
+    /// Waiting for a per-spawn harness blocks until it exits: no sleep tick
+    /// sits between the child's exit and bhf noticing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_spawn_wait_blocks_instead_of_polling() {
+        let work = scratch_dir("per-spawn-wait");
+        let scratch = ensure_harness_scratch(&work).unwrap();
+        let input = work.join("input.sh");
+        let extra = extra_wakeups_for_a_longer_child(|secs| {
+            fs::write(&input, format!("sleep {secs}\n")).unwrap();
+            let output = run_with_timeout(
+                Path::new("/bin/sh"),
+                &input,
+                Duration::from_secs(10),
+                &[],
+                &scratch,
+                0,
+                None,
+                SpawnTweaks::default(),
+            )
+            .unwrap();
+            assert!(output.status.success());
+        });
+        assert!(
+            extra <= 40,
+            "2 s more of the child cost {extra} more wakeups"
+        );
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// A background re-run's process starts at a lower priority than bhf's
+    /// own (nice +10), so it takes a CPU only when the fuzz loop leaves one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_low_priority_spawn_starts_its_process_niced() {
+        let work = scratch_dir("nice");
+        let scratch = ensure_harness_scratch(&work).unwrap();
+        let input = work.join("input.sh");
+        fs::write(&input, "nice >&2\n").unwrap();
+        let niceness = |low_priority| {
+            let output = run_with_timeout(
+                Path::new("/bin/sh"),
+                &input,
+                Duration::from_secs(10),
+                &[],
+                &scratch,
+                0,
+                None,
+                SpawnTweaks {
+                    low_priority,
+                    ..SpawnTweaks::default()
+                },
+            )
+            .unwrap();
+            let text = String::from_utf8_lossy(&output.stderr).into_owned();
+            text.trim()
+                .parse::<i32>()
+                .unwrap_or_else(|_| panic!("nice printed {text:?}"))
+        };
+        // SAFETY: getpriority reads this process's nice value.
+        let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(niceness(false), own);
+        assert_eq!(niceness(true), (own + LOWER_PRIORITY_NICE).min(19));
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// A cancelled per-spawn run stops its process at once instead of waiting
+    /// out its timeout.
+    #[test]
+    fn a_cancelled_spawn_stops_its_process() {
+        let work = scratch_dir("cancel");
+        let scratch = ensure_harness_scratch(&work).unwrap();
+        let input = work.join("input.sh");
+        fs::write(&input, "exec sleep 30\n").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            let result = run_with_timeout(
+                Path::new("/bin/sh"),
+                &input,
+                Duration::from_secs(60),
+                &[],
+                &scratch,
+                0,
+                None,
+                SpawnTweaks {
+                    cancel: Some(&cancel),
+                    ..SpawnTweaks::default()
+                },
+            );
+            let waited = started.elapsed();
+            assert!(result.is_err(), "a cancelled run is not a result");
+            assert!(waited >= Duration::from_millis(300), "{waited:?}");
+            assert!(waited < Duration::from_secs(5), "{waited:?}");
+        });
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// The same for the event-log lane's per-spawn run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn event_log_per_spawn_wait_blocks_instead_of_polling() {
+        let work = scratch_dir("event-log-wait");
+        let harness = script(&work, "#!/bin/sh\ncat >/dev/null\nsleep \"$WAIT_SECS\"\n");
+        let runner = replay_min::HarnessRunner::direct(harness);
+        let extra = extra_wakeups_for_a_longer_child(|secs| {
+            let env = [("WAIT_SECS".to_owned(), secs.to_owned())];
+            let run = run_harness(
+                &runner,
+                &work,
+                b"input",
+                &env,
+                Duration::from_secs(10),
+                0,
+                None,
+            )
+            .unwrap();
+            assert!(run.sanitizer.is_none());
+        });
+        assert!(
+            extra <= 40,
+            "2 s more of the child cost {extra} more wakeups"
+        );
+        let _ = fs::remove_dir_all(&work);
+    }
+}
+
+/// A background re-run's process starts in the below-normal priority class,
+/// and is returned to normal once the loop it gave way to has stopped.
+#[cfg(all(test, windows))]
+mod spawn_priority_windows_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_low_priority_spawn_runs_below_normal_until_restored() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work = std::env::temp_dir().join(format!("bhf-spawn-priority-{nonce}"));
+        fs::create_dir_all(&work).unwrap();
+        let scratch = ensure_harness_scratch(&work).unwrap();
+        // The script prints its own priority class after `wait_ms`.
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let class = |low_priority, restore: Option<&AtomicBool>, wait_ms: u32| {
+            let script = work.join(format!("class-{wait_ms}.ps1"));
+            fs::write(
+                &script,
+                format!(
+                    "Start-Sleep -Milliseconds {wait_ms}\r\n\
+                     [Console]::Error.WriteLine((Get-Process -Id $PID).PriorityClass)\r\n"
+                ),
+            )
+            .unwrap();
+            let output = run_with_timeout(
+                &powershell,
+                &script,
+                Duration::from_secs(60),
+                &[],
+                &scratch,
+                0,
+                None,
+                SpawnTweaks {
+                    low_priority,
+                    restore_priority: restore,
+                    ..SpawnTweaks::default()
+                },
+            )
+            .unwrap();
+            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        };
+        assert_eq!(class(false, None, 0), "Normal");
+        assert_eq!(class(true, None, 0), "BelowNormal");
+        let restore = AtomicBool::new(true);
+        assert_eq!(class(true, Some(&restore), 2000), "Normal");
+        let _ = fs::remove_dir_all(&work);
     }
 }
 
@@ -8841,7 +10180,10 @@ mod dedup_seed_tests {
 
 #[cfg(test)]
 mod entropic_tests {
-    use super::{choose_entropic_index_pool, entropic_weight, CoverageNovelty, PoolEntry};
+    use super::{
+        choose_entropic_index_pool, entropic_weight, retire_from_pool, splice_peer,
+        CoverageNovelty, PoolEntry,
+    };
     use fuzz_engine_builtin::MutationRng;
 
     #[test]
@@ -8856,6 +10198,26 @@ mod entropic_tests {
         // fresh seed eventually outweighs an over-mined one.
         assert_eq!(entropic_weight(4, 4), 1024);
         assert!(entropic_weight(0, 0) > entropic_weight(4, 9));
+    }
+
+    /// A pool entry a fresh re-run showed to crash is a finding: it is never
+    /// picked to mutate from, however much energy it had, nor spliced from.
+    #[test]
+    fn a_retired_entry_is_neither_a_base_nor_a_splice_peer() {
+        let mut pool = vec![
+            PoolEntry::seed(b"crash".to_vec()),
+            PoolEntry::seed(b"clean-1".to_vec()),
+            PoolEntry::seed(b"clean-2".to_vec()),
+        ];
+        pool[0].energy = 4096;
+        assert_eq!(splice_peer(&pool, 2), 0, "before: the next entry");
+        retire_from_pool(&mut pool, b"crash");
+        let mut rng = MutationRng::new(7);
+        for _ in 0..500 {
+            assert_ne!(choose_entropic_index_pool(&pool, &mut rng), 0);
+        }
+        assert_eq!(splice_peer(&pool, 2), 1, "the retired entry is skipped");
+        assert_eq!(splice_peer(&pool, 1), 2);
     }
 
     #[test]
@@ -9759,33 +11121,6 @@ mod auto_path_tests {
         assert!(afl_crash_is_new(&mut dedup, &missing_return_at(9)));
         assert!(!afl_crash_is_new(&mut dedup, &missing_return_at(9)));
         assert_eq!(dedup.duplicate_hits().values().sum::<usize>(), 1);
-    }
-
-    /// #416: when the fork-server missed a crash that a fresh process caught,
-    /// the fresh run's raw stderr travels with its report so the finding gets a
-    /// `sanitizer.log`.
-    #[test]
-    fn a_fresh_rerun_hands_over_its_stderr_with_its_report() {
-        let mut run = HarnessRun {
-            events: Vec::new(),
-            testcases: Vec::new(),
-            sanitizer: None,
-            stderr: None,
-            rejected: false,
-        };
-        let fresh = HarnessRun {
-            events: Vec::new(),
-            testcases: Vec::new(),
-            sanitizer: Some(sanitizer_report("BHF-201", vec!["copy_at"])),
-            stderr: Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow".to_owned()),
-            rejected: false,
-        };
-        adopt_fresh_rerun(&mut run, fresh);
-        assert!(run.sanitizer.is_some());
-        assert_eq!(
-            run.stderr.as_deref(),
-            Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow")
-        );
     }
 
     #[test]
@@ -10694,6 +12029,7 @@ exit 0
             &scratch,
             0,
             None,
+            SpawnTweaks::default(),
         );
 
         assert!(
@@ -11166,6 +12502,7 @@ exit 0
                     seed_inputs_loaded: 0,
                     imported_inputs: 0,
                     duplicate_inputs: 0,
+                    unchecked_inputs: 0,
                 },
                 per_worker,
                 dropped_duplicates: 0,
@@ -12073,6 +13410,106 @@ exit 0
             1,
             "--per-target-finding-count 1 stops the run at the first distinct finding"
         );
+    }
+
+    /// Two distinct crashes only fresh processes see, whose background re-run
+    /// results come back together while the loop runs a slow input, still
+    /// stop a one-finding run at one finding. The crasher left over is kept
+    /// for the next pass, and neither is queued.
+    #[test]
+    #[cfg(unix)]
+    fn reruns_that_report_together_do_not_overshoot_the_finding_count() {
+        let clang = std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let cpus = std::thread::available_parallelism().map_or(1, |cpus| cpus.get());
+        if !clang || cpus < 2 {
+            eprintln!("skipping: needs clang and a second CPU");
+            return;
+        }
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let dir = work_dir.join("harnesses/H-RCAP");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("target.c"),
+            "#include <stdlib.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <time.h>\n\
+             static int fresh(void) {\n\
+                 static int f = -1;\n\
+                 if (f < 0) f = getenv(\"BHF_FRAMED\") == NULL;\n\
+                 return f;\n\
+             }\n\
+             __attribute__((noinline)) int read_past(size_t n) {\n\
+                 volatile char *p = malloc(n); int r = p[n + 2]; free((void *)p); return r;\n\
+             }\n\
+             __attribute__((noinline)) int write_past(size_t n) {\n\
+                 volatile char *p = malloc(n); p[n + 3] = 1; free((void *)p); return 0;\n\
+             }\n\
+             int bhf_run_one(const uint8_t *d, size_t n) {\n\
+                 if (n >= 2 && d[0] == 'R' && d[1] == '1' && fresh()) return read_past(n);\n\
+                 if (n >= 2 && d[0] == 'R' && d[1] == '2' && fresh()) return write_past(n);\n\
+                 if (n >= 1 && d[0] == 'S' && !fresh()) {\n\
+                     struct timespec t = { 1, 500000000 };\n\
+                     nanosleep(&t, 0);\n\
+                 }\n\
+                 return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        let built = std::process::Command::new("clang")
+            .current_dir(&dir)
+            .args(["-O1", "-g", "-fsanitize=address"])
+            .args(["-fsanitize-coverage=trace-pc-guard,trace-cmp"])
+            .args(["-o", "main", "target.c"])
+            .arg(&driver)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // R1 and R2 are re-run in fresh processes while the fork-server
+        // spends 1.5 s on S; both reports are there when the loop picks
+        // its re-run results up again.
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-RCAP",
+            vec![b"R1".to_vec(), b"R2".to_vec(), b"S".to_vec()],
+            1000,
+            Some(Duration::from_secs(20)),
+            Some(1),
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.findings.len(), 1, "{:?}", summary.findings);
+        let read = |dir: &Path| -> Vec<Vec<u8>> {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| fs::read(entry.path()).ok())
+                .collect()
+        };
+        let queued = read(&work_dir.join("corpus/H-RCAP/queue"));
+        assert!(
+            !queued.iter().any(|input| input == b"R1" || input == b"R2"),
+            "a crasher was queued: {queued:?}"
+        );
+        let pending = read(&work_dir.join("corpus/H-RCAP/unchecked"));
+        assert!(
+            pending.iter().any(|input| input == b"R1" || input == b"R2"),
+            "the crasher left over is kept for the next pass: {pending:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
