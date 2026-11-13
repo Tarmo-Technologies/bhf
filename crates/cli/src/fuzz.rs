@@ -11077,6 +11077,15 @@ exit 0
         let note = libfuzzer_binary_note(&detection, &binary).expect("note");
         assert!(note.contains("without coverage guidance"), "{note}");
         assert!(note.contains("--target LLVMFuzzerTestOneInput"), "{note}");
+        // A bhf driver source in the work dir is not what this binary runs.
+        let sources = work.join("harnesses/H-LFNOTE");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("main.cpp"), "// BHF_FRAMED driver\n").unwrap();
+        let detection = crate::protocol_detect::detect(&binary, &[&work]);
+        assert!(
+            libfuzzer_binary_note(&detection, &binary).is_some(),
+            "{detection:?}"
+        );
         fs::write(&binary, binary_with(b"BHF_FRAMED\0")).unwrap();
         let detection = crate::protocol_detect::detect(&binary, &[&work]);
         assert!(libfuzzer_binary_note(&detection, &binary).is_none());

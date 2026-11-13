@@ -5,7 +5,6 @@ use event_log::{group_into_testcases, EventReader};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -691,36 +690,31 @@ pub(crate) fn signatures_for_input_with_runner(
             path: harness.clone(),
             source,
         })?;
+    // An interrupted bhf kills what the harness started, too.
+    let mut group = crate::process::guard_process_group(&child);
     let stderr = child
         .stderr
         .take()
         .map(|pipe| crate::process::drain(pipe, MAX_HARNESS_STDERR));
 
-    if let Some(mut stdin) = child.stdin.take() {
-        // A harness that exits before consuming the whole input closes the pipe,
-        // so write_all/flush return BrokenPipe — not an error here (the process
-        // ran; its exit + stderr are evaluated below). Only a genuine I/O error
-        // propagates.
-        for r in [stdin.write_all(input), stdin.flush()] {
-            if let Err(error) = r {
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    crate::process::kill_process_group(&mut child);
-                    let _ = child.wait();
-                    return Err(ReplayError::IoAt {
-                        path: harness,
-                        source: error,
-                    });
-                }
-            }
-        }
-        drop(stdin);
-    }
+    // The input is written on a thread so the timeout runs while it is: a
+    // harness that never reads an input larger than the pipe buffer would
+    // block the write. A harness that exits before reading it all is not an
+    // error (its exit and stderr are evaluated below); only a genuine I/O
+    // error is.
+    let writer = crate::process::feed_stdin(&mut child, input.to_vec());
 
-    let (status, timed_out) = crate::process::wait_with_timeout(&mut child, runner.timeout)
-        .map_err(|source| ReplayError::IoAt {
-            path: harness.clone(),
-            source,
-        })?;
+    // The wait kills whatever the harness left running, before the harness
+    // is reaped.
+    let (status, timed_out) =
+        group
+            .wait_then_kill(&mut child, runner.timeout)
+            .map_err(|source| ReplayError::IoAt {
+                path: harness.clone(),
+                source,
+            })?;
+    let written =
+        writer.and_then(|handle| crate::process::join_bounded(handle, crate::process::DRAIN_GRACE));
     let stderr = stderr
         .and_then(|handle| crate::process::join_bounded(handle, crate::process::DRAIN_GRACE))
         .unwrap_or_default();
@@ -728,6 +722,12 @@ pub(crate) fn signatures_for_input_with_runner(
         return Err(ReplayError::HarnessTimedOut {
             path: harness,
             timeout: runner.timeout,
+        });
+    }
+    if let Some(Err(source)) = written {
+        return Err(ReplayError::IoAt {
+            path: harness,
+            source,
         });
     }
     if !status.is_some_and(|status| status.success()) {
@@ -1505,6 +1505,28 @@ fn main() -> std::io::Result<()> {
             "{error:?}"
         );
         assert!(error.to_string().contains(&harness.display().to_string()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A harness that never reads its input is still killed after the
+    /// timeout when the input is larger than the pipe buffer.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_that_ignores_a_large_input_is_killed_after_the_timeout() {
+        let dir = temp_dir("timeout-large-input");
+        let harness = script(&dir, "exec sleep 30");
+        let runner =
+            HarnessRunner::direct(&harness).with_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let error = signatures_for_input_with_runner(&runner, &vec![0u8; 1 << 20]).unwrap_err();
+        assert!(
+            matches!(error, ReplayError::HarnessTimedOut { .. }),
+            "{error:?}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "{:?}",

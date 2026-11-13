@@ -894,6 +894,168 @@ fn replay_of_the_same_class_at_another_site_is_a_mismatch_naming_the_sink() {
     );
 }
 
+/// minimize first replays the testcase and compares the crash with the
+/// finding: a harness that reports another crash is refused like a replay
+/// MISMATCH, and nothing is minimized.
+#[cfg(unix)]
+#[test]
+fn minimize_refuses_a_harness_that_reports_another_crash() {
+    let root = temp_dir("minimize-other-site");
+    let work = root.join("work");
+    let recorded = work.join("harnesses/H-1/main");
+    write_crashing_harness(&recorded, &asan_report("Widget::copy_at", 12));
+    let finding = emit_finding(&work, &recorded, &asan_report("Widget::copy_at", 12));
+    let other = root.join("other/main");
+    write_crashing_harness(&other, &asan_report("Widget::other", 8));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args([
+            "minimize",
+            finding.to_str().unwrap(),
+            "--harness",
+            other.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains(
+            "sink: recorded Widget::copy_at (widget/widget.cc:12), replayed Widget::other (widget/widget.cc:8)"
+        ),
+        "{stderr}"
+    );
+    assert!(!finding.join("min_testcase.bin").exists(), "{stderr}");
+
+    // A finding that records no crash location cannot be checked against
+    // this harness: it is minimized, with a note that says so.
+    let mut record = read_finding_json(&finding);
+    let exception = record["exception"].as_object_mut().unwrap();
+    exception.insert("stack".to_owned(), serde_json::json!([]));
+    exception.remove("location");
+    record["actionability"] = serde_json::json!({});
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args([
+            "minimize",
+            finding.to_str().unwrap(),
+            "--harness",
+            other.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "note: the original testcase's crash could not be shown to be the recorded one \
+             (location not compared)"
+        ),
+        "{stderr}"
+    );
+    assert!(finding.join("min_testcase.bin").exists(), "{stderr}");
+}
+
+/// `--allow-other-crash` minimizes against the crash the harness reports (an
+/// intentional rebuild that moved the sink), with a warning naming what
+/// differs, and the finding records it.
+#[cfg(unix)]
+#[test]
+fn minimize_against_another_crash_when_asked() {
+    let root = temp_dir("minimize-allow-other");
+    let work = root.join("work");
+    let recorded = work.join("harnesses/H-1/main");
+    write_crashing_harness(&recorded, &asan_report("Widget::copy_at", 12));
+    let finding = emit_finding(&work, &recorded, &asan_report("Widget::copy_at", 12));
+    let other = root.join("other/main");
+    write_crashing_harness(&other, &asan_report("Widget::other", 8));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args([
+            "minimize",
+            finding.to_str().unwrap(),
+            "--harness",
+            other.to_str().unwrap(),
+            "--allow-other-crash",
+        ])
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("warning: the original testcase crashes")
+            && stderr.contains(
+                "sink: recorded Widget::copy_at (widget/widget.cc:12), replayed Widget::other (widget/widget.cc:8)"
+            ),
+        "{stderr}"
+    );
+    assert!(finding.join("min_testcase.bin").exists(), "{stderr}");
+    let record = read_finding_json(&finding);
+    let other_crash = record["minimization"]["other_crash"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(other_crash.contains("sink: recorded"), "{record}");
+}
+
+/// A harness whose crash depends on a variable the finding recorded as
+/// injected (`runtime_mode.env_injected`): replay sets it, and so does
+/// minimize, for the testcase and for every reduction it tries.
+#[cfg(unix)]
+#[test]
+fn minimize_runs_the_harness_with_the_recorded_environment() {
+    let root = temp_dir("minimize-env");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let recorded = asan_report("Widget::copy_at", 12);
+    let other = asan_report("Widget::other", 8);
+    fs::create_dir_all(harness.parent().unwrap()).unwrap();
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED test driver\n\
+             case \"$(cat \"$1\")\" in *input*) ;; *) exit 0;; esac\n\
+             if [ -n \"$WIDGET_HOME\" ]; then\ncat >&2 <<'REPORT'\n{recorded}REPORT\n\
+             else\ncat >&2 <<'REPORT'\n{other}REPORT\nfi\nkill -ABRT $$\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&harness);
+    let finding = emit_finding(&work, &harness, &recorded);
+    let mut record = read_finding_json(&finding);
+    record["runtime_mode"] =
+        serde_json::json!({"pass": "rng", "env_injected": {"WIDGET_HOME": "/x"}});
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let replay = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .arg("replay")
+        .arg(&finding)
+        .env_remove("WIDGET_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(replay.status.code(), Some(0), "{}", text(&replay.stderr));
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .arg("minimize")
+        .arg(&finding)
+        .env_remove("WIDGET_HOME")
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read(finding.join("min_testcase.bin")).unwrap(),
+        b"input",
+        "every reduction ran with the recorded environment: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn replay_json_and_show_output() {
@@ -947,6 +1109,32 @@ fn replay_reports_a_hang_as_a_timeout() {
     assert!(stderr.contains("timed out after 10s"), "{stderr}");
 }
 
+/// A stdin harness that never reads a testcase larger than the pipe buffer
+/// still times out instead of blocking replay on the write.
+#[cfg(unix)]
+#[test]
+fn a_stdin_replay_of_a_large_testcase_still_times_out() {
+    let root = temp_dir("timeout-stdin-large");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main_afl");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    fs::write(finding.join("testcase.bin"), vec![b'A'; 1 << 20]).unwrap();
+    fs::write(&harness, "#!/bin/sh\n# BHF_FRAMED\nexec sleep 30\n").unwrap();
+    let started = std::time::Instant::now();
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    let elapsed = started.elapsed();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("actual=<timeout>"), "{stderr}");
+    assert!(stderr.contains("timed out after 10s"), "{stderr}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "replay took {elapsed:?}"
+    );
+}
+
 /// A launcher harness whose own child never finishes: the replay timeout
 /// kills both, so replay returns soon after the timeout instead of hanging
 /// on the pipe the grandchild holds.
@@ -975,6 +1163,81 @@ fn a_replay_timeout_kills_what_the_harness_started() {
             "{name}: replay took {elapsed:?}"
         );
     }
+}
+
+/// An interrupted replay (Ctrl-C reaches bhf only: the harness runs in its
+/// own process group) kills what the harness started before bhf ends by the
+/// same signal.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_interrupted_replay_kills_what_the_harness_started() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let ended = |pid: &str| match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    };
+    let root = temp_dir("interrupted");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    let pid_file = root.join("grandchild.pid");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED\nsh -c 'echo $$ > \"{}\"; exec sleep 47'\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    let mut bhf = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args(["replay", finding.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let grandchild = loop {
+        let pid = fs::read_to_string(&pid_file).unwrap_or_default();
+        if !pid.trim().is_empty() || Instant::now() >= deadline {
+            break pid.trim().to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !grandchild.is_empty(),
+        "the harness did not start its child"
+    );
+    Command::new("kill")
+        .args(["-INT", &bhf.id().to_string()])
+        .status()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = bhf.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = bhf.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ended(&grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let gone = ended(&grandchild);
+    if !gone {
+        let _ = Command::new("kill").args(["-9", &grandchild]).status();
+    }
+    let status = status.expect("bhf replay did not end after SIGINT");
+    assert_eq!(status.signal(), Some(2), "{status:?}");
+    assert!(gone, "process {grandchild} outlived the interrupted replay");
 }
 
 /// Replay runs with the fuzz child's sanitizer options; a leak finding keeps
@@ -1265,11 +1528,23 @@ fn an_unsymbolized_replay_of_the_recorded_crash_is_unverified() {
     write_crashing_harness(&harness, &report);
     let finding = emit_finding(&work, &harness, &report);
     write_crashing_harness(&harness, UNSYMBOLIZED_REPORT);
+    let report = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args(["report", "--work-dir", work.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "{}", text(&report.stderr));
+    let before = fs::read(finding.join("finding.json")).unwrap();
 
     let output = replay_output(&[finding.to_str().unwrap()]);
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
+    // The finding is left as it was; replay.log is rewritten, and results/
+    // is rebuilt so the attestation covers it.
+    assert_eq!(fs::read(finding.join("finding.json")).unwrap(), before);
+    let log = fs::read_to_string(finding.join("replay.log")).unwrap();
+    assert!(log.contains("verdict: unverified"), "{log}");
+    assert_attestation_current(&work);
     assert_eq!(
         stderr.lines().next(),
         Some("UNVERIFIED recorded=BHF-201 actual=BHF-201 not_compared=sink"),
@@ -1296,6 +1571,33 @@ fn an_unsymbolized_replay_of_the_recorded_crash_is_unverified() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["verdict"], "unverified");
     assert_eq!(output.status.code(), Some(4));
+}
+
+/// bhf appends `symbolize=1` to an inherited `ASAN_OPTIONS`, so an inherited
+/// `symbolize=0` does not reach the harness and is not named as the cause of
+/// an unsymbolized report.
+#[cfg(unix)]
+#[test]
+fn an_inherited_symbolize_0_is_not_named_as_the_cause() {
+    let root = temp_dir("unsymbolized-inherited");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    write_crashing_harness(&harness, UNSYMBOLIZED_REPORT);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args(["replay", finding.to_str().unwrap()])
+        .env("ASAN_OPTIONS", "symbolize=0")
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    let options = fs::read_to_string(harness.parent().unwrap().join("asan-options.txt")).unwrap();
+    assert!(options.ends_with("symbolize=1"), "{options}");
+    assert!(stderr.contains("ASAN_SYMBOLIZER_PATH"), "{stderr}");
+    assert!(!stderr.contains("sets symbolize=0"), "{stderr}");
 }
 
 /// An ASan heap-buffer-overflow report printed without a symbolizer: frames
@@ -1610,6 +1912,97 @@ fn replay_never_runs_a_harness_relative_to_the_current_directory() {
         "a harness relative to the current directory ran"
     );
     assert!(stdout.contains(moved.to_str().unwrap()), "{stdout}");
+}
+
+/// A harness without bhf's marker whose input mode is declared beside it
+/// (`harness-protocol.json`, as `bhf project run` writes it) replays through
+/// that mode.
+#[cfg(unix)]
+#[test]
+fn a_finding_replays_through_the_declared_input_mode() {
+    let root = temp_dir("declared-mode");
+    let work = root.join("work");
+    let harness = work.join("build/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    fs::create_dir_all(harness.parent().unwrap()).unwrap();
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n[ -f \"$1\" ] || exit 0\ncat >&2 <<'REPORT'\n{report}REPORT\nkill -ABRT $$\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&harness);
+    fs::write(
+        harness.parent().unwrap().join("harness-protocol.json"),
+        r#"{"schema_version":1,"input_mode":"framed","source":"bhf.project.v1 manifest"}"#,
+    )
+    .unwrap();
+    let finding = emit_finding(&work, &harness, &report);
+
+    let output = replay_output(&[finding.to_str().unwrap(), "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("{}", text(&output.stderr)));
+    assert_eq!(value["verdict"], "match", "{value}");
+    assert_eq!(value["harness"]["protocol"], "bhf framed", "{value}");
+    let basis = value["harness"]["protocol_basis"].as_str().unwrap();
+    assert!(
+        basis.contains("declared in harness-protocol.json"),
+        "{basis}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// `--harness` is a path: a bare name runs the file in the current
+/// directory, never a program of that name on `PATH`.
+#[cfg(unix)]
+#[test]
+fn a_bare_harness_name_runs_the_file_in_the_current_directory() {
+    let root = temp_dir("bare-harness");
+    let here = root.join("here");
+    let harness = here.join("other_ab");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&root.join("work"), &harness, &report);
+    let on_path = root.join("on-path");
+    fs::create_dir_all(&on_path).unwrap();
+    fs::write(
+        on_path.join("other_ab"),
+        "#!/bin/sh\ntouch \"$(dirname \"$0\")/wrong\"\nexit 0\n",
+    )
+    .unwrap();
+    make_executable(&on_path.join("other_ab"));
+    let path = format!(
+        "{}:{}",
+        on_path.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |command: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cli"))
+            .args([command, finding.to_str().unwrap(), "--harness", "other_ab"])
+            .current_dir(&here)
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+    let output = run("replay");
+    let stderr = text(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}{stderr}",
+        text(&output.stdout)
+    );
+    assert!(here.join("ran").is_file(), "{stderr}");
+    assert!(!on_path.join("wrong").exists(), "{stderr}");
+    assert!(!stderr.contains("spawn other_ab"), "{stderr}");
+
+    let output = run("minimize");
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(finding.join("min_testcase.bin").is_file(), "{stderr}");
+    assert!(!on_path.join("wrong").exists(), "{stderr}");
 }
 
 /// A recorded harness sha256 is read from finding.json and may not be hex: the

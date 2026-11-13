@@ -52,6 +52,16 @@ from the `build/<id>/main` that `bhf build` stages or from
 binary there is named: `main_cov.exe`, `main_afl.exe`, ...); without
 `--harness`, `bhf replay` resolves the finding's harness in its work dir, and
 `bhf minimize` asks for `--harness`.
+`bhf minimize` first runs the testcase and compares its crash with the finding
+the way `bhf replay` does, with the environment `bhf replay` gives the harness
+(the finding's recorded runtime mode and injected variables too), as does
+every reduction it tries: another crash is refused with exit `3` and nothing
+is written, and a crash that cannot be shown to be the recorded one is
+minimized with a note (`bhf auto` names all such findings in one line).
+After an intentional rebuild whose inlining, line numbers or symbolizer moved
+the sink, `--allow-other-crash` minimizes against the crash the harness
+reports instead: it prints a warning naming what differs and records it as
+`minimization.other_crash` in `finding.json`.
 
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
@@ -473,16 +483,23 @@ MATCH
   the sanitizer printed. A fatal signal without a sanitizer report also
   compares its signal (`exception.signal`, or the signal an older record's
   message names): an abort is not reproduced by an illegal instruction
-  (`differs=signal`). A crash of the same rule elsewhere is a `MISMATCH`
-  whose `differs=` field and `differs` line name what differed. Rules and
-  kinds earlier releases gave the same report still match. A hang is reported
-  as `actual=<timeout>` after 10 s, a clean exit as `actual=<none>` with its
-  exit status.
+  (`differs=signal`). A COBOL finding is recorded as the libcob runtime error
+  its harness printed before the signal (kind `cobol-runtime-error`, site the
+  `.cob` line libcob named); replay, `bhf minimize` and `bhf report --backfill`
+  read the replayed run's libcob error the same way, so it matches the same
+  error at the same COBOL line by the same signal, and a bare signal without
+  that error is `differs=kind`. A crash of the same rule elsewhere is a
+  `MISMATCH` whose `differs=` field and `differs` line name what differed.
+  Rules and kinds earlier releases gave the same report still match. A hang
+  is reported as `actual=<timeout>` after 10 s, a clean exit as
+  `actual=<none>` with its exit status.
 - **Unverified.** A replayed report that names no function and no source
   position (an unsymbolized one) is not another site, but it is not a
   reproduction either: the verdict is `UNVERIFIED ... not_compared=sink`
-  (exit `4`), and `last_seen`, the history and `results/` are left as they
-  were. When the harness is the recorded build (its sha256 is
+  (exit `4`); `last_seen` and the history are left as they were
+  (`finding.json` does not change). Like every replay it rewrites
+  `replay.log`, and `results/` is rebuilt so the attestation covers it.
+  When the harness is the recorded build (its sha256 is
   `build.binary.sha256`), replay first symbolizes the report itself with
   `llvm-symbolizer` (or `addr2line`) from `PATH` and compares again. A finding
   that records no crash location at all (no frames, sink, site or pc, such as
@@ -490,14 +507,17 @@ MATCH
   recorded build, and so is the faulting pc offset a fatal signal records
   (`not_compared=location`, `not_compared=pc` otherwise). A `note` line names
   the cause: a fatal signal that printed no sanitizer report, a stripped
-  harness binary, a `symbolize=0` in an inherited `ASAN_OPTIONS` or
-  `UBSAN_OPTIONS`, or no symbolizer. Replay puts the LLVM toolchain `bhf auto`
+  harness binary, a `symbolize=0` in `ASAN_OPTIONS` or `UBSAN_OPTIONS` that
+  still reached the harness (bhf appends `symbolize=1` to the inherited
+  value), or no symbolizer. Replay puts the LLVM toolchain `bhf auto`
   uses on `PATH` (the RHEL 7 LLVM Toolset when the base `clang` lacks
   SanitizerCoverage); elsewhere put `llvm-symbolizer` on `PATH` or set
   `ASAN_SYMBOLIZER_PATH`.
 - **Timeout.** The harness runs in its own process group: after 10 s it is
   killed with every process it started (a launcher script's children too),
   and replay does not wait more than 2 s for output a leftover process holds.
+  An interrupted replay or minimize (Ctrl-C, `SIGTERM` or `SIGHUP`) kills
+  that group too before bhf ends by the signal.
 - **Build identity.** When the harness's sha256 differs from the finding's
   `build.binary.sha256`, the harness line says so.
 - **`--json`** prints one `bhf.replay.v1` document on stdout instead: `verdict`
@@ -509,7 +529,7 @@ MATCH
   protocol and why, sha256) and `testcase`. Exit codes are unchanged.
 - **`--show-output`** also prints the harness's raw stderr and stdout (the full
   sanitizer report).
-- **`replay.log`.** Every replay, `MATCH` or `MISMATCH`, writes
+- **`replay.log`.** Every replay, `MATCH`, `MISMATCH` or `UNVERIFIED`, writes
   `<finding>/replay.log`: the verdict, what ran, the exit status, the
   harness's raw stderr and stdout (each kept to its first 256 KiB and last
   768 KiB, with the cut marked, so a sanitizer report at the end survives)
@@ -594,13 +614,14 @@ MATCH
 - **Protocol.** `bhf fuzz`, `bhf replay` and `bhf minimize` decide how a
   harness takes its input the same way: a `harness-protocol.json` next to the
   binary (written by `bhf project run`), the `BHF_FRAMED` marker in a launcher
-  script, a bhf `main.c`/`main.cpp` beside the binary or in any harness dir of
-  the work dir, bhf's driver strings compiled into the binary (so a binary that
-  `bhf build` staged alone into `build/<id>/main` still replays; an Ada
-  harness, which also reads `BHF_FRAMED`, is told apart by the version string
-  GNAT's binder puts in every Ada main), a plain libFuzzer source, or the
-  libFuzzer runtime in the binary. The summary's harness line names the
-  protocol and why.
+  script, the libFuzzer runtime in a binary without bhf's driver (which
+  decides it before any source beside the binary), a bhf `main.c`/`main.cpp`
+  beside the binary or in any harness dir of the work dir, bhf's driver
+  strings compiled into the binary (so a binary that `bhf build` staged alone
+  into `build/<id>/main` still replays; an Ada harness, which also reads
+  `BHF_FRAMED`, is told apart by the version string GNAT's binder puts in
+  every Ada main), or a plain libFuzzer source. The summary's harness line
+  names the protocol and why.
 - **Results stay current.** A `MATCH` stamps `last_seen` in `finding.json`; when
   the work dir has a results index, replay rebuilds it so
   `results/findings.json` and `results/attestation.json` match the files on

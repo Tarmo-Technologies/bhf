@@ -8,17 +8,19 @@
 //! 1. a declared input mode in a `harness-protocol.json` sidecar next to the
 //!    binary (written by `bhf project run` from a `bhf.project.v1` target);
 //! 2. the `BHF_FRAMED` marker in a launcher script that is the harness itself;
-//! 3. a bhf `main.c` / `main.cpp` beside the binary or in any harness directory
+//! 3. the libFuzzer runtime's messages in a binary without bhf's driver
+//!    (`BHF_FRAMED`): a libFuzzer target, whatever source sits beside it;
+//! 4. a bhf `main.c` / `main.cpp` beside the binary or in any harness directory
 //!    of the work dir (`generated_harnesses/`, `harnesses/`, `auto/`, `build/`
 //!    `<id>/`);
-//! 4. strings compiled into the binary: bhf's C/C++ driver reads `BHF_FRAMED`;
+//! 5. strings compiled into the binary: bhf's C/C++ driver reads `BHF_FRAMED`;
 //!    so does the Ada runtime, which a GNAT-bound main identifies (the binder
 //!    always embeds `GNAT Version: `, and the host-file probe also reads
 //!    `BHF_EVENTS_PATH`); the libFuzzer runtime carries its own messages. The
-//!    whole file is scanned, not just a prefix, so a binary staged alone into
-//!    `build/<id>/main` is still recognised;
-//! 5. a C/C++ source without the marker (a plain libFuzzer target);
-//! 6. otherwise the Ada stdin/event-log protocol.
+//!    whole file is scanned once, not just a prefix, so a binary staged alone
+//!    into `build/<id>/main` is still recognised;
+//! 6. a C/C++ source without the marker (a plain libFuzzer target);
+//! 7. otherwise the Ada stdin/event-log protocol.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -193,6 +195,15 @@ pub(crate) fn detect(harness: &Path, work_dirs: &[&Path]) -> Detection {
             basis: ProtocolBasis::LauncherMarker,
         };
     }
+    // The libFuzzer runtime without bhf's driver is a libFuzzer target,
+    // whatever bhf source sits beside it: that source is not this binary's.
+    let markers = embedded();
+    if markers.libfuzzer && !markers.framed {
+        return Detection {
+            protocol: HarnessProtocol::LibFuzzerSingleInput,
+            basis: ProtocolBasis::LibFuzzerBinary,
+        };
+    }
     let mut plain_source = None;
     for dir in source_dirs(harness, work_dirs) {
         for name in ["main.c", "main.cpp"] {
@@ -208,7 +219,6 @@ pub(crate) fn detect(harness: &Path, work_dirs: &[&Path]) -> Detection {
             }
         }
     }
-    let markers = embedded();
     if markers.bhf_driver() {
         return Detection {
             protocol: HarnessProtocol::BhfFramed,
@@ -497,6 +507,60 @@ mod tests {
         let detection = detect(&harness, &[work.path()]);
         assert_eq!(detection.protocol, HarnessProtocol::LibFuzzerSingleInput);
         assert_eq!(detection.basis, ProtocolBasis::LibFuzzerBinary);
+    }
+
+    /// The libFuzzer runtime in a binary without bhf's driver decides the
+    /// protocol before a bhf source beside it: that source is not what was
+    /// built into this binary.
+    #[test]
+    fn a_libfuzzer_binary_beside_a_bhf_source_is_a_libfuzzer_binary() {
+        let work = tempfile::tempdir().unwrap();
+        let sources = work.path().join("harnesses/H-X");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("main.cpp"), "// BHF_FRAMED driver\n").unwrap();
+        let harness = binary(
+            &work.path().join("build/H-X"),
+            &padded(
+                b"INFO: libFuzzer ignores flags that start with '--'\0",
+                9000,
+            ),
+        );
+        let detection = detect(&harness, &[work.path()]);
+        assert_eq!(detection.protocol, HarnessProtocol::LibFuzzerSingleInput);
+        assert_eq!(detection.basis, ProtocolBasis::LibFuzzerBinary);
+        // bhf's driver linked with the libFuzzer runtime is still bhf's.
+        fs::write(
+            &harness,
+            padded(
+                b"BHF_FRAMED\0INFO: libFuzzer ignores flags that start with '--'\0",
+                9000,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            detect(&harness, &[work.path()]).protocol,
+            HarnessProtocol::BhfFramed
+        );
+    }
+
+    #[test]
+    fn a_declared_framed_mode_wins_over_a_libfuzzer_binary() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("build/H-X");
+        let harness = binary(
+            &dir,
+            &padded(
+                b"INFO: libFuzzer ignores flags that start with '--'\0",
+                9000,
+            ),
+        );
+        write_declared_input_mode(&dir, "framed", "bhf.project.v1 manifest").unwrap();
+        let detection = detect(&harness, &[work.path()]);
+        assert_eq!(detection.protocol, HarnessProtocol::BhfFramed);
+        assert_eq!(
+            detection.basis,
+            ProtocolBasis::Declared("framed".to_owned())
+        );
     }
 
     #[test]

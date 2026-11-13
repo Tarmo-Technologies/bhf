@@ -11,6 +11,12 @@
 //! and, when bhf's driver printed one, the faulting pc offset in the
 //! executable, which only the recorded build can reproduce.
 //!
+//! A COBOL harness's crash is recorded as the libcob runtime error it printed
+//! ([`crate::auto::cobol_oracle`]): its kind is `cobol-runtime-error`, its
+//! site the COBOL source line libcob named (`cobol_source`), and it is still
+//! identified by its signal. The callers give a replayed run the same
+//! attribution ([`crate::replay::CRun::report_for`]) before comparing.
+//!
 //! `bhf replay`, `bhf report --backfill` and the fuzz loop's fresh-process
 //! confirmation all compare through [`compare_with`], so a crash of the same
 //! class at another site never counts as a reproduction. The [`Verdict`] also
@@ -36,12 +42,39 @@ pub(crate) enum Outcome {
     NotComparable,
 }
 
+/// Why a field was [`Outcome::NotComparable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotCompared {
+    /// The replay names no function or source position.
+    Unlocated,
+    /// The replay printed no pc offset.
+    NoPcOffset,
+    /// A pc offset is compared in the recorded build only; whether the
+    /// harness is that build (`Some(false)`: its sha256 differs; `None`: no
+    /// recorded sha256 to check it against).
+    OtherBuild(Option<bool>),
+}
+
+impl NotCompared {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Unlocated => "the replay names no function or source position",
+            Self::NoPcOffset => "the replay printed no pc offset",
+            Self::OtherBuild(Some(_)) => "the harness's sha256 differs from the recorded build",
+            Self::OtherBuild(None) => "no build sha256 to check the harness against",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Check {
     pub(crate) field: &'static str,
     pub(crate) recorded: Option<String>,
     pub(crate) replayed: Option<String>,
     pub(crate) outcome: Outcome,
+    /// Why a [`Outcome::NotComparable`] field was not compared.
+    #[serde(skip)]
+    pub(crate) why: Option<NotCompared>,
 }
 
 impl Check {
@@ -54,9 +87,9 @@ impl Check {
             Outcome::Differs => format!("{}: recorded {recorded}, replayed {replayed}", self.field),
             Outcome::NotRecorded => format!("{} not recorded", self.field),
             Outcome::NotComparable => format!(
-                "{} not compared (recorded {recorded}; the replay names no function or source \
-                 position)",
-                self.field
+                "{} not compared (recorded {recorded}; {})",
+                self.field,
+                self.why.unwrap_or(NotCompared::Unlocated).describe()
             ),
         }
     }
@@ -311,6 +344,13 @@ fn normalize_kind(kind: &str) -> String {
     kind.trim().to_ascii_lowercase().replace('_', "-")
 }
 
+/// Whether a crash of `kind` (normalized) is reported by a fatal signal with
+/// no sanitizer report, so its signal is part of what identifies it: a bare
+/// fatal signal, and a COBOL runtime error, which the harness ends by one.
+fn reported_by_signal(kind: &str) -> bool {
+    kind == "fatal-signal" || kind == crate::auto::cobol_oracle::KIND
+}
+
 /// The kind token of a recorded `exception.name` (`ASAN_HEAP_BUFFER_OVERFLOW`,
 /// `UBSAN_MISSING_RETURN`, `FATAL_SIGNAL`), without its sanitizer prefix.
 fn kind_from_exception_name(name: &str) -> Option<String> {
@@ -349,13 +389,23 @@ fn recorded_identity(raw: &Value) -> Identity {
     let exception = raw.get("exception");
     let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
     let location = exception.and_then(|e| e.get("location"));
-    let site = location
-        .and_then(|loc| {
-            Position::new(
-                loc.get("file")?.as_str()?,
-                loc.get("line")?.as_u64()?,
-                loc.get("column").and_then(Value::as_u64),
-            )
+    // A COBOL runtime error happened at the COBOL source line libcob named.
+    let cobol_site = raw.get("cobol_source").and_then(|source| {
+        Position::new(
+            source.get("file")?.as_str()?,
+            source.get("line")?.as_u64()?,
+            None,
+        )
+    });
+    let site = cobol_site
+        .or_else(|| {
+            location.and_then(|loc| {
+                Position::new(
+                    loc.get("file")?.as_str()?,
+                    loc.get("line")?.as_u64()?,
+                    loc.get("column").and_then(Value::as_u64),
+                )
+            })
         })
         .or_else(|| {
             text(exception.and_then(|e| e.get("message")))
@@ -369,8 +419,9 @@ fn recorded_identity(raw: &Value) -> Identity {
     // signal carries, else the message an older release wrote.
     let signal = text(exception.and_then(|e| e.get("signal")))
         .or_else(|| {
-            text(exception.and_then(|e| e.get("check")))
-                .filter(|check| kind.as_deref() == Some("fatal-signal") && check.starts_with("SIG"))
+            text(exception.and_then(|e| e.get("check"))).filter(|check| {
+                kind.as_deref().is_some_and(reported_by_signal) && check.starts_with("SIG")
+            })
         })
         .or_else(|| {
             text(exception.and_then(|e| e.get("message")))
@@ -411,7 +462,7 @@ fn replayed_identity(report: &SanitizerReport) -> Identity {
             location.column.map(u64::from),
         )
     });
-    let fatal = report.sanitizer.is_none() && normalize_kind(&report.kind) == "fatal-signal";
+    let fatal = report.sanitizer.is_none() && reported_by_signal(&normalize_kind(&report.kind));
     Identity {
         rule: Some(report.rule_id.to_owned()),
         kind: Some(normalize_kind(&report.kind)),
@@ -483,6 +534,7 @@ fn check_rule(recorded: &Identity, report: &SanitizerReport) -> Check {
         recorded: recorded.rule.clone(),
         replayed,
         outcome,
+        why: None,
     }
 }
 
@@ -498,6 +550,7 @@ fn check_kind(recorded: &Identity, replayed: &Identity, report: &SanitizerReport
         recorded: recorded.kind.clone(),
         replayed: replayed.kind.clone(),
         outcome,
+        why: None,
     }
 }
 
@@ -513,6 +566,7 @@ fn check_signal(recorded: &Identity, replayed: &Identity) -> Option<Check> {
         } else {
             Outcome::Differs
         },
+        why: None,
     })
 }
 
@@ -520,21 +574,26 @@ fn check_signal(recorded: &Identity, replayed: &Identity) -> Option<Check> {
 /// the recorded build, so it is compared only when `same_binary`.
 fn check_pc(recorded: &Identity, replayed: &Identity, same_binary: Option<bool>) -> Check {
     let render = |offset: u64| format!("exe+{offset:#x}");
-    let outcome = match replayed.pc_offset {
+    let (outcome, why) = match replayed.pc_offset {
         Some(pc) if same_binary == Some(true) => {
             if Some(pc) == recorded.pc_offset {
-                Outcome::Equal
+                (Outcome::Equal, None)
             } else {
-                Outcome::Differs
+                (Outcome::Differs, None)
             }
         }
-        _ => Outcome::NotComparable,
+        None => (Outcome::NotComparable, Some(NotCompared::NoPcOffset)),
+        Some(_) => (
+            Outcome::NotComparable,
+            Some(NotCompared::OtherBuild(same_binary)),
+        ),
     };
     Check {
         field: "pc",
         recorded: recorded.pc_offset.map(render),
         replayed: replayed.pc_offset.map(render),
         outcome,
+        why,
     }
 }
 
@@ -575,6 +634,7 @@ fn check_location(
                 .map(SinkSite::render)
                 .or_else(|| replayed.site.as_ref().map(Position::render)),
             outcome,
+            why: (outcome == Outcome::NotComparable).then_some(NotCompared::Unlocated),
         });
     }
     if recorded.sink.is_none() || recorded.ubsan {
@@ -590,6 +650,7 @@ fn check_location(
             recorded: recorded.site.as_ref().map(Position::render),
             replayed: replayed.site.as_ref().map(Position::render),
             outcome,
+            why: (outcome == Outcome::NotComparable).then_some(NotCompared::Unlocated),
         });
     }
     checks
@@ -840,6 +901,13 @@ mod tests {
             .expect("sink check");
         assert_eq!(sink.outcome, Outcome::NotComparable);
         assert!(comparison.compared_line().contains("sink not compared"));
+        assert!(
+            comparison
+                .compared_line()
+                .contains("the replay names no function or source position"),
+            "{}",
+            comparison.compared_line()
+        );
         // A replay that does name another function still differs.
         let comparison = compare(&recorded, &asan(OTHER));
         assert!(!comparison.location_not_compared());
@@ -930,6 +998,21 @@ mod tests {
         let rebuilt = compare_with(&recorded, &fatal("SIGSEGV", Some(0x2a10)), Some(false));
         assert_eq!(rebuilt.verdict(), Verdict::Unverified);
         assert_eq!(rebuilt.not_compared_fields(), "pc");
+        // The compared line gives the reason the pc was not compared.
+        let line = rebuilt.compared_line();
+        assert!(
+            line.contains(
+                "pc not compared (recorded exe+0x1b3c; the harness's sha256 differs from the \
+                 recorded build)"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("names no function"), "{line}");
+        let line = compare_with(&recorded, &fatal("SIGSEGV", Some(0x2a10)), None).compared_line();
+        assert!(line.contains("no build sha256"), "{line}");
+        assert!(!line.contains("names no function"), "{line}");
+        let line = compare_with(&recorded, &fatal("SIGSEGV", None), Some(true)).compared_line();
+        assert!(line.contains("the replay printed no pc offset"), "{line}");
         // A fresh re-run (the same binary) at another pc is another crash.
         assert!(same_crash(
             &fatal("SIGSEGV", Some(0x1b3c)),
@@ -953,6 +1036,134 @@ mod tests {
         .unwrap();
         assert!(same_crash(&a, &a.clone()));
         assert!(!same_crash(&a, &b));
+    }
+
+    /// A COBOL finding as `bhf auto` records it: the harness's SIGSEGV,
+    /// attributed to the libcob runtime error it printed at `parseit.cob:11`.
+    #[cfg(unix)]
+    fn cobol_record() -> Value {
+        json!({
+            "rule_id": "BHF-210",
+            "harness_id": "H-B0002-10C8E67B",
+            "exception": {
+                "name": "COBOL_RUNTIME_ERROR",
+                "check": "SIGSEGV",
+                "signal": "SIGSEGV",
+                "message": "COBOL out-of-bounds reference-modification / subscript at \
+                            /src/cobol/parseit.cob:11: offset of 'BUF' out of bounds: 200, \
+                            maximum: 8",
+                "libcob_diagnostic": "offset of 'BUF' out of bounds: 200, maximum: 8",
+                "stack": [],
+            },
+            "cobol_source": {"file": "/src/cobol/parseit.cob", "line": 11},
+            "analysis": {"engine": "bhf.cobol.attribution"},
+        })
+    }
+
+    /// A COBOL harness run that died by `signal` after printing `stderr`.
+    #[cfg(unix)]
+    fn harness_run(signal: i32, stderr: &str) -> crate::replay::CRun {
+        use std::os::unix::process::ExitStatusExt;
+        crate::replay::CRun {
+            status: Some(std::process::ExitStatus::from_raw(signal)),
+            timed_out: false,
+            duration: std::time::Duration::ZERO,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            env: Vec::new(),
+        }
+    }
+
+    /// libcob's diagnostic for an out-of-bounds reference-modification at
+    /// `line`, as the harness prints it before it dies.
+    #[cfg(unix)]
+    fn libcob_ref_mod(line: u32) -> String {
+        format!(
+            "libcob: /src/cobol/parseit.cob:{line}: error: offset of 'BUF' out of bounds: 200, \
+             maximum: 8\n\n Last statement of PARSEIT was at line {line} of \
+             /src/cobol/parseit.cob\n\n/src/cobol/parseit.cob:{line}: attempt to reference \
+             unallocated memory (signal SIGSEGV)\n"
+        )
+    }
+
+    /// The replay of a COBOL finding gets the attribution the finding got, so
+    /// the same libcob error at the same COBOL line, by the same signal, is
+    /// the recorded crash, in any build: the COBOL line is where it happened.
+    #[cfg(unix)]
+    #[test]
+    fn a_cobol_finding_matches_the_same_runtime_error_on_replay() {
+        let recorded = cobol_record();
+        let report = harness_run(11, &libcob_ref_mod(11))
+            .report_for(&recorded)
+            .expect("a crash");
+        let comparison = compare(&recorded, &report);
+        assert_eq!(comparison.verdict(), Verdict::Match, "{comparison:?}");
+        assert_eq!(
+            comparison.compared_line(),
+            "rule BHF-210; kind cobol-runtime-error; signal SIGSEGV; site cobol/parseit.cob:11"
+        );
+        // The minimizer's predicate holds a reduction to the same COBOL line.
+        let other_line = harness_run(11, &libcob_ref_mod(20))
+            .report_for(&recorded)
+            .expect("a crash");
+        assert!(same_crash(&report, &report.clone()));
+        assert!(!same_crash(&report, &other_line));
+    }
+
+    /// The attribution keeps the comparison strict: a COBOL finding is not
+    /// reproduced by a bare SIGSEGV without libcob's diagnostic, by a libcob
+    /// error at another COBOL line, or by another signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_cobol_finding_mismatches_a_different_crash() {
+        let recorded = cobol_record();
+        let differs = |signal: i32, stderr: &str| {
+            let report = harness_run(signal, stderr)
+                .report_for(&recorded)
+                .expect("a crash");
+            let comparison = compare_with(&recorded, &report, Some(true));
+            assert_eq!(comparison.verdict(), Verdict::Mismatch, "{comparison:?}");
+            comparison.difference_lines()
+        };
+        assert_eq!(
+            differs(11, "Segmentation fault\n"),
+            ["kind: recorded cobol-runtime-error, replayed fatal-signal"]
+        );
+        assert_eq!(
+            differs(11, &libcob_ref_mod(20)),
+            ["site: recorded cobol/parseit.cob:11, replayed cobol/parseit.cob:20"]
+        );
+        assert_eq!(
+            differs(6, &libcob_ref_mod(11)),
+            ["signal: recorded SIGSEGV, replayed SIGABRT"]
+        );
+        // A call to a program the harness does not link is an artifact the
+        // attribution never records: such a crash stays a bare fatal signal.
+        assert_eq!(
+            differs(11, "libcob: error: module 'SIBLING' not found\n"),
+            ["kind: recorded cobol-runtime-error, replayed fatal-signal"]
+        );
+    }
+
+    /// Only a COBOL harness's crash is attributed, as only its findings are:
+    /// a libcob line in another harness's output leaves its fatal signal as
+    /// it was recorded.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_cobol_harness_crash_is_attributed() {
+        let recorded = json!({
+            "rule_id": "BHF-210",
+            "harness_id": "H-C0001-0A0B0C0D",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGSEGV", "stack": []},
+        });
+        let report = harness_run(11, &libcob_ref_mod(11))
+            .report_for(&recorded)
+            .expect("a crash");
+        assert_eq!(report.kind, "fatal-signal");
+        assert_eq!(
+            compare_with(&recorded, &report, Some(true)).verdict(),
+            Verdict::Match
+        );
     }
 
     #[test]

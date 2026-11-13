@@ -1215,6 +1215,54 @@
   testcase buffer, now poisons the bytes past the input under
   AddressSanitizer, so the same read is reported there (as
   `use-after-poison`).
+- `bhf replay`, `bhf minimize`, `bhf report --backfill`, `bhf decode-args` and
+  the binary-only fuzz loop write a stdin testcase on a thread, so a harness
+  that never reads an input larger than the pipe buffer is killed at the
+  timeout; the write used to block first and the run never timed out.
+- `bhf minimize` compares the original testcase's crash with the finding the
+  way `bhf replay` does before it reduces anything. A harness that reports
+  another crash is refused with exit `3` and nothing is written; it used to
+  minimize toward that other crash and record it in the finding. A crash that
+  cannot be shown to be the recorded one is minimized with a note, which
+  `bhf auto` gives once for all such findings. After an intentional rebuild,
+  `--allow-other-crash` minimizes against the crash the harness reports, with
+  a warning, and records what differs as `minimization.other_crash`.
+- A COBOL finding replays as a `MATCH`. It is recorded as the libcob runtime
+  error its harness printed before the signal, and `bhf replay`,
+  `bhf minimize` (and so the `bhf auto` minimization pass) and
+  `bhf report --backfill` now read the replayed run's libcob error the same
+  way; replay compared it with a bare fatal signal and reported
+  `MISMATCH ... differs=kind`. The same error at the same COBOL line by the
+  same signal matches; a bare signal, a libcob error at another COBOL line or
+  another signal is still a `MISMATCH`.
+- `bhf minimize` and the `bhf auto` minimization pass run the testcase and
+  every reduction with the environment `bhf replay` gives the harness,
+  including the finding's recorded runtime mode and injected variables. A
+  finding that reproduced only with them was replayed as a `MATCH` but
+  refused, or not reduced, by minimize.
+- The note under an `UNVERIFIED` replay reads the `ASAN_OPTIONS` and
+  `UBSAN_OPTIONS` the harness received, not the inherited ones. bhf appends
+  `symbolize=1` to an inherited value, so an inherited `symbolize=0` was named
+  as the cause when the real one was a missing symbolizer.
+- A replay's compared line gives the real reason a pc offset was not compared
+  (the harness is another build, there is no recorded build sha256, or the
+  replay printed no pc offset) instead of always saying the replay names no
+  function or source position.
+- The CLI reference said an `UNVERIFIED` replay leaves `results/` as it was.
+  Like every replay it rewrites `replay.log` and rebuilds `results/`, so the
+  attestation covers the log; only `finding.json` (`last_seen` and the
+  history) is left as it was.
+- `bhf replay --harness <name>` and `bhf minimize --harness <name>` run the
+  file of that name in the current directory. A name without a `/` was
+  looked up on `PATH` and failed with `No such file or directory`.
+- Ctrl-C (or `SIGTERM`, `SIGHUP`) on `bhf replay` or `bhf minimize` kills the
+  processes the harness started before bhf ends by the signal. The harness
+  runs in its own process group, which the terminal's Ctrl-C does not reach,
+  so a launcher harness's children kept running.
+- A libFuzzer (`-fsanitize=fuzzer`) binary without bhf's driver is run as a
+  libFuzzer target even when a bhf driver source sits in the work dir's
+  harness dirs for the same id; that source made it run as a bhf framed
+  harness, without the libFuzzer note.
 
 ### Changed
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`

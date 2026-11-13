@@ -366,7 +366,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// tried, and telling the user to pass `--harness`, when nothing resolves.
 fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(harness) = explicit {
-        return Ok(harness);
+        return Ok(explicit_harness(harness));
     }
     let finding_path = finding_dir.join("finding.json");
     let raw: Value = std::fs::read(&finding_path)
@@ -457,6 +457,17 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
          Pass --harness <path>.",
         finding_dir.display()
     ))
+}
+
+/// An explicit `--harness`: a path, so a relative one is resolved against the
+/// current directory, never looked up on `PATH` as a bare program name would
+/// be. Absolute, so sandbox binds and the summary's harness line name the
+/// file without ambiguity.
+pub(crate) fn explicit_harness(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::path::absolute(&path).unwrap_or_else(|_| Path::new(".").join(&path))
 }
 
 /// The harness a finding records ([`resolve_harness`] without an explicit
@@ -550,6 +561,9 @@ pub(crate) struct CRun {
     pub(crate) duration: Duration,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    /// The variables the harness was given on top of the inherited
+    /// environment.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl CRun {
@@ -562,6 +576,21 @@ impl CRun {
             crate::fatal_signal::classify(&status, &stderr)
                 .map(|_| crate::fuzz::fatal_signal_report(&status, &stderr))
         })
+    }
+
+    /// The crash this run reported, as bhf records a crash of the finding
+    /// `raw`'s harness: [`Self::report`], with the attribution `bhf auto`
+    /// gives a COBOL harness's crash
+    /// ([`crate::auto::cobol_oracle::attribute_report`]), so it compares with
+    /// the finding as it was recorded.
+    pub(crate) fn report_for(&self, raw: &Value) -> Option<corpus::SanitizerReport> {
+        let mut report = self.report()?;
+        crate::auto::cobol_oracle::attribute_report(
+            raw,
+            &mut report,
+            &String::from_utf8_lossy(&self.stderr),
+        );
+        Some(report)
     }
 
     fn exit(&self) -> ExitSummary {
@@ -616,8 +645,13 @@ pub(crate) fn is_leak_finding(raw: &Value) -> bool {
 /// The environment of a C/C++ replay: the fuzz child's sanitizer options and,
 /// for an argv-file harness (the builtin engine's lanes), the runtrace shim
 /// (native runs only), the recorded runtime mode and any env the finding
-/// recorded as injected (which wins).
-fn replay_env(parsed: &Value, runner: &HarnessRunner, input: CInput) -> Vec<(String, String)> {
+/// recorded as injected (which wins). Minimization runs the testcase and every
+/// reduction with it too, so it reproduces what `bhf replay` reproduces.
+pub(crate) fn replay_env(
+    parsed: &Value,
+    runner: &HarnessRunner,
+    input: CInput,
+) -> Vec<(String, String)> {
     let mut env = crate::fuzz::sanitizer_child_env_for(
         is_leak_finding(parsed),
         runner.qemu_prefix().is_some(),
@@ -705,7 +739,6 @@ pub(crate) fn run_c_harness(
     timeout: Duration,
     env: &[(String, String)],
 ) -> Result<CRun, String> {
-    use std::io::Write;
     use std::process::Stdio;
 
     let harness = runner.harness_path();
@@ -738,6 +771,8 @@ pub(crate) fn run_c_harness(
     let started = Instant::now();
     let mut child =
         spawn_harness(&mut cmd).map_err(|error| format!("spawn {}: {error}", harness.display()))?;
+    // An interrupted bhf kills what the harness started, too.
+    let mut group = replay_min::process::guard_process_group(&child);
     let stdout = child
         .stdout
         .take()
@@ -746,16 +781,20 @@ pub(crate) fn run_c_harness(
         .stderr
         .take()
         .map(|pipe| replay_min::process::drain(pipe, MAX_CAPTURED_OUTPUT));
-    if let (Some(bytes), Some(mut stdin)) = (bytes, child.stdin.take()) {
-        // A harness that exits before reading all of its input closes the pipe;
-        // its exit status, not the write, is the result.
-        let _ = stdin.write_all(&bytes);
-    }
-    let (status, timed_out) = replay_min::process::wait_with_timeout(&mut child, timeout)
+    // Written on a thread, so a harness that never reads an input larger than
+    // the pipe buffer cannot block the timeout below.
+    let writer = bytes.and_then(|bytes| replay_min::process::feed_stdin(&mut child, bytes));
+    // Whatever the harness left running would keep the pipes open: the wait
+    // kills its whole group, before the harness is reaped.
+    let (status, timed_out) = group
+        .wait_then_kill(&mut child, timeout)
         .map_err(|error| format!("poll {}: {error}", harness.display()))?;
     let duration = started.elapsed();
-    // Whatever the harness left running would keep the pipes open.
-    replay_min::process::kill_process_group(&mut child);
+    // A harness that exits before reading all of its input closes the pipe;
+    // its exit status, not the write, is the result.
+    if let Some(writer) = writer {
+        let _ = replay_min::process::join_bounded(writer, replay_min::process::DRAIN_GRACE);
+    }
     let join = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
         handle
             .and_then(|handle| {
@@ -769,6 +808,7 @@ pub(crate) fn run_c_harness(
         duration,
         stdout: join(stdout),
         stderr: join(stderr),
+        env: env.to_vec(),
     })
 }
 
@@ -1124,18 +1164,30 @@ fn harness_summary(raw: &Value, harness: &Path, detection: &Detection) -> Harnes
     )
 }
 
+/// The build sha256 the finding `raw` records (`build.binary.sha256`, or a
+/// binary finding's `binary.sha256`).
+fn recorded_build_sha256(raw: &Value) -> Option<&str> {
+    ["/build/binary/sha256", "/binary/sha256"]
+        .iter()
+        .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_str))
+}
+
+/// Whether `binary` is the build the finding `raw` was recorded with: its
+/// sha256 against the recorded one; `None` when either is unknown.
+pub(crate) fn recorded_build_matches(raw: &Value, binary: &Path) -> Option<bool> {
+    sha256_matches(sha256_file(binary).as_deref(), recorded_build_sha256(raw))
+}
+
+fn sha256_matches(sha256: Option<&str>, recorded: Option<&str>) -> Option<bool> {
+    sha256.zip(recorded).map(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// The binary that ran, its sha256, and whether that is the sha256 the finding
 /// recorded (`build.binary.sha256`, or a binary finding's `binary.sha256`).
 fn binary_summary(raw: &Value, path: &Path, protocol: String, basis: String) -> HarnessSummary {
     let sha256 = sha256_file(path);
-    let recorded_sha256 = ["/build/binary/sha256", "/binary/sha256"]
-        .iter()
-        .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_str))
-        .map(str::to_owned);
-    let sha256_matches = sha256
-        .as_deref()
-        .zip(recorded_sha256.as_deref())
-        .map(|(a, b)| a.eq_ignore_ascii_case(b));
+    let recorded_sha256 = recorded_build_sha256(raw).map(str::to_owned);
+    let sha256_matches = sha256_matches(sha256.as_deref(), recorded_sha256.as_deref());
     HarnessSummary {
         path: path.display().to_string(),
         protocol,
@@ -1539,12 +1591,13 @@ pub(crate) const UNSYMBOLIZED_NOTE: &str =
 
 /// Why a replayed `report` names no crash location, for the note under an
 /// UNVERIFIED verdict: a fatal signal printed no sanitizer report, the
-/// harness binary is `stripped`, an `inherited` `<SAN>_OPTIONS` value turned
-/// symbolization off, or else (most often) no symbolizer was found.
+/// harness binary is `stripped`, the `<SAN>_OPTIONS` value the harness
+/// received (`child_options`) turned symbolization off, or else (most often)
+/// no symbolizer was found.
 pub(crate) fn unlocated_report_note(
     report: &corpus::SanitizerReport,
     stripped: bool,
-    inherited: &[(&str, Option<String>)],
+    child_options: &[(&str, Option<String>)],
 ) -> String {
     if report.sanitizer.is_none() {
         let signal = report
@@ -1566,24 +1619,26 @@ pub(crate) fn unlocated_report_note(
             .find_map(|item| item.trim().strip_prefix("symbolize="))
             .is_some_and(|value| matches!(value.trim(), "0" | "false"))
     };
-    if let Some((variable, _)) = inherited
+    if let Some((variable, _)) = child_options
         .iter()
         .find(|(_, value)| value.as_deref().is_some_and(symbolize_off))
     {
         return format!(
-            "{variable} sets symbolize=0, so the report names no function or source position; \
-             remove it from {variable} and replay again"
+            "{variable} as the harness received it sets symbolize=0, so the report names no \
+             function or source position"
         );
     }
     UNSYMBOLIZED_NOTE.to_owned()
 }
 
 /// The notes under an UNVERIFIED verdict: why each location field could not
-/// be compared.
+/// be compared. `child_env` is what the harness was given on top of the
+/// inherited environment.
 fn unverified_notes(
     comparison: &crash_identity::Comparison,
     report: &corpus::SanitizerReport,
     harness: &Path,
+    child_env: &[(String, String)],
 ) -> Vec<String> {
     let mut notes = Vec::new();
     let build = match comparison.same_binary {
@@ -1609,11 +1664,20 @@ fn unverified_notes(
             )),
             "sink" | "site" => {
                 let stripped = crate::runner::elf_has_symbols(harness) == Some(false);
-                let inherited: Vec<(&str, Option<String>)> = ["ASAN_OPTIONS", "UBSAN_OPTIONS"]
+                // The value the harness got: the last one bhf set
+                // (Command::env is last-wins), else the inherited one.
+                let child_options: Vec<(&str, Option<String>)> = ["ASAN_OPTIONS", "UBSAN_OPTIONS"]
                     .into_iter()
-                    .map(|key| (key, std::env::var(key).ok()))
+                    .map(|key| {
+                        let set = child_env
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| name == key)
+                            .map(|(_, value)| value.clone());
+                        (key, set.or_else(|| std::env::var(key).ok()))
+                    })
                     .collect();
-                let note = unlocated_report_note(report, stripped, &inherited);
+                let note = unlocated_report_note(report, stripped, &child_options);
                 if !notes.contains(&note) {
                     notes.push(note);
                 }
@@ -1791,7 +1855,7 @@ pub(crate) fn replay_c(
         Ok(run) => run,
         Err(error) => return report_error(&output, finding_dir, &error),
     };
-    let mut report = run.report();
+    let mut report = run.report_for(&raw);
     let source_dirs = harness_source_dirs(
         Some(finding_dir),
         &raw,
@@ -1866,7 +1930,12 @@ pub(crate) fn replay_c(
         });
     }
     if let (crash_identity::Verdict::Unverified, Some(report)) = (verdict, &report) {
-        notes.extend(unverified_notes(&comparison, report, runner.harness_path()));
+        notes.extend(unverified_notes(
+            &comparison,
+            report,
+            runner.harness_path(),
+            &run.env,
+        ));
     }
     if let Some(note) = finding_format_note_for(&raw, runner.harness_path(), detection) {
         notes.push(note);
@@ -1954,9 +2023,10 @@ fn symbolize_and_compare(
     same_binary: Option<bool>,
 ) -> Option<(corpus::SanitizerReport, crash_identity::Comparison, String)> {
     let symbolizer = crate::offline_symbolize::find()?;
-    let text =
-        crate::offline_symbolize::symbolize_report(&String::from_utf8_lossy(stderr), &symbolizer)?;
-    let report = corpus::parse_sanitizer_report(&text)?;
+    let stderr = String::from_utf8_lossy(stderr);
+    let text = crate::offline_symbolize::symbolize_report(&stderr, &symbolizer)?;
+    let mut report = corpus::parse_sanitizer_report(&text)?;
+    crate::auto::cobol_oracle::attribute_report(raw, &mut report, &stderr);
     let comparison = crash_identity::compare_with(raw, &report, same_binary);
     (!comparison.location_not_compared()).then(|| (report, comparison, symbolizer.name()))
 }
@@ -2216,6 +2286,33 @@ mod silent_abort_tests {
             3
         );
     }
+
+    /// A stdin harness that never reads an input larger than the pipe
+    /// buffer is still killed after the timeout.
+    #[test]
+    fn a_stdin_harness_that_ignores_its_input_times_out() {
+        let root = tempdir().expect("tempdir");
+        let harness = root.path().join("sleeper.sh");
+        fs::write(&harness, "#!/bin/sh\nexec sleep 30\n").expect("harness");
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let testcase = root.path().join("testcase.bin");
+        fs::write(&testcase, vec![b'A'; 1 << 20]).expect("testcase");
+        let started = std::time::Instant::now();
+        let run = super::run_c_harness(
+            &HarnessRunner::direct(harness),
+            super::CInput::Stdin,
+            &testcase,
+            std::time::Duration::from_millis(300),
+            &[],
+        )
+        .expect("run");
+        assert!(run.timed_out);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2435,12 +2532,15 @@ mod tests {
             super::unlocated_report_note(&asan, true, &none),
             "the harness binary is stripped; replay a build with symbols"
         );
-        let inherited = [
+        let child_options = [
             ("ASAN_OPTIONS", Some("verbosity=0:symbolize=0".to_owned())),
             ("UBSAN_OPTIONS", None),
         ];
-        let note = super::unlocated_report_note(&asan, false, &inherited);
-        assert!(note.contains("ASAN_OPTIONS sets symbolize=0"), "{note}");
+        let note = super::unlocated_report_note(&asan, false, &child_options);
+        assert!(
+            note.contains("ASAN_OPTIONS as the harness received it sets symbolize=0"),
+            "{note}"
+        );
         let turned_back_on = [("ASAN_OPTIONS", Some("symbolize=0:symbolize=1".to_owned()))];
         assert_eq!(
             super::unlocated_report_note(&asan, false, &turned_back_on),
@@ -2449,6 +2549,55 @@ mod tests {
         assert_eq!(
             super::unlocated_report_note(&asan, false, &none),
             super::UNSYMBOLIZED_NOTE
+        );
+    }
+
+    /// The symbolize note reads the options the harness was given, not the
+    /// ones bhf inherited: bhf's own `symbolize=1` comes last.
+    #[test]
+    fn the_symbolize_note_reads_the_options_the_harness_received() {
+        let unsymbolized = corpus::parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x1 bp 0x2 sp 0x3\n\
+             WRITE of size 1 at 0x1 thread T0\n\
+             \x20   #0 0x4f5a2b  (/w/harnesses/H-1/main+0x4f5a2b)\n",
+        )
+        .unwrap();
+        let recorded = serde_json::json!({
+            "rule_id": "BHF-201",
+            "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "stack": [
+                {"function": "Widget::copy_at(char const*)", "file": "/src/widget/widget.cc", "line": 12},
+            ]},
+        });
+        let comparison = crate::crash_identity::compare(&recorded, &unsymbolized);
+        assert_eq!(comparison.not_compared_fields(), "sink");
+        let dir = tempfile::tempdir().unwrap();
+        let harness = dir.path().join("main");
+        std::fs::write(&harness, "#!/bin/sh\n").unwrap();
+        let env = |value: &str| vec![("ASAN_OPTIONS".to_owned(), value.to_owned())];
+
+        let notes = super::unverified_notes(
+            &comparison,
+            &unsymbolized,
+            &harness,
+            &env("verbosity=0:symbolize=0:abort_on_error=1:halt_on_error=1:symbolize=1"),
+        );
+        assert!(
+            notes.iter().any(|note| note == super::UNSYMBOLIZED_NOTE),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("sets symbolize=0")),
+            "{notes:?}"
+        );
+
+        let notes =
+            super::unverified_notes(&comparison, &unsymbolized, &harness, &env("symbolize=0"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note
+                    .contains("ASAN_OPTIONS as the harness received it sets symbolize=0")),
+            "{notes:?}"
         );
     }
 

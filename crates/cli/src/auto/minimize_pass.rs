@@ -104,10 +104,35 @@ pub(crate) fn mark_skipped(dir: &Path, reason: &str) {
     }
 }
 
+/// One line naming the findings minimized from a crash that could not be
+/// shown to be the recorded one (see `bhf minimize`), or `None` for none.
+pub(crate) fn unverified_note(ids: &[String]) -> Option<String> {
+    const NAMED: usize = 5;
+    let count = ids.len();
+    if count == 0 {
+        return None;
+    }
+    let mut named = ids[..count.min(NAMED)].join(", ");
+    if count > NAMED {
+        named.push_str(&format!(" and {} more", count - NAMED));
+    }
+    let (noun, each) = if count == 1 {
+        ("finding", "its")
+    } else {
+        ("findings", "each")
+    };
+    Some(format!(
+        "{count} minimized {noun} ({named}): the original testcase's crash could not be shown \
+         to be the recorded one; {each} minimized input reproduces the crash its harness \
+         reports. `bhf replay <finding>` shows what was not compared"
+    ))
+}
+
 /// Returns (minimized, skipped_for_budget).
 pub fn run(work_dir: &Path) -> (usize, usize) {
     let start = Instant::now();
     let (mut done, mut skipped) = (0, 0);
+    let mut unverified = Vec::new();
     for pick in representatives(work_dir) {
         let remaining = TOTAL.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -120,10 +145,18 @@ pub fn run(work_dir: &Path) -> (usize, usize) {
         };
         let deadline = Instant::now() + PER_GROUP.min(remaining);
         match crate::minimize::minimize_for_auto(&pick.dir, &harness, deadline) {
-            Ok(Some(_)) => done += 1,
+            Ok(Some(summary)) => {
+                done += 1;
+                if summary.unverified.is_some() {
+                    unverified.push(pick.id.clone());
+                }
+            }
             Ok(None) => {}
             Err(error) => bhfeprintln!("bhf: minimize {} skipped: {error:#}", pick.id),
         }
+    }
+    if let Some(note) = unverified_note(&unverified) {
+        bhfeprintln!("note: {note}");
     }
     (done, skipped)
 }
@@ -131,6 +164,29 @@ pub fn run(work_dir: &Path) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The findings minimized from a crash that could not be shown to be the
+    /// recorded one are named in one line, not one note each.
+    #[test]
+    fn unverified_minimizations_are_summed_up_in_one_line() {
+        assert_eq!(unverified_note(&[]), None);
+        let one = unverified_note(&["F-0001-aaaaaaaa".to_owned()]).unwrap();
+        assert!(
+            one.starts_with("1 minimized finding (F-0001-aaaaaaaa)"),
+            "{one}"
+        );
+        assert!(one.contains("`bhf replay <finding>`"), "{one}");
+        let ids: Vec<String> = (0..7).map(|i| format!("F-000{i}-aaaaaaaa")).collect();
+        let many = unverified_note(&ids).unwrap();
+        assert!(
+            many.starts_with(
+                "7 minimized findings (F-0000-aaaaaaaa, F-0001-aaaaaaaa, F-0002-aaaaaaaa, \
+                 F-0003-aaaaaaaa, F-0004-aaaaaaaa and 2 more)"
+            ),
+            "{many}"
+        );
+        assert_eq!(many.lines().count(), 1, "{many}");
+    }
 
     #[test]
     fn picks_one_representative_per_group_and_skips_minimized_or_static() {

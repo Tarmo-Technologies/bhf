@@ -284,7 +284,7 @@ fn backfill_log(
         Ok(run) => run,
         Err(error) => return Err(format!("replay failed: {error}")),
     };
-    let Some(report) = run.report() else {
+    let Some(report) = run.report_for(raw) else {
         return Err(format!(
             "the testcase no longer crashes harness {} ({})",
             harness.display(),

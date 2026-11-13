@@ -36,6 +36,9 @@ A COBOL subprogram — a `PROGRAM-ID` with a `LINKAGE SECTION` driven by
   `SIZE ERROR`, divide-by-zero, invalid numeric data. bhf surfaces these as
   crashes and **attributes each to the exact `.cob:line` and CWE** (out-of-bounds
   → CWE-125, zero-divide → CWE-369, size overflow → CWE-190, …).
+  `bhf replay`, `bhf minimize` and the `bhf auto` minimization pass read a
+  replayed crash's libcob error the same way, so such a finding replays as a
+  `MATCH` against the same error at the same `.cob` line and is minimized.
 
 ### Behavioral / taint oracles
 

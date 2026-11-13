@@ -11,10 +11,56 @@
 //! finding with the COBOL source location, a human message, and the mapped CWE
 //! (out-of-bounds reference-modification/subscript → CWE-125, zero divide →
 //! CWE-369, SIZE overflow → CWE-190, ...). Non-COBOL findings are left untouched.
+//!
+//! `bhf replay`, `bhf minimize` (and the auto minimize pass) and `bhf report
+//! --backfill` give a replayed crash of a COBOL harness the same attribution
+//! ([`attribute_report`]) before they compare it with the finding, so the
+//! recorded runtime error is reproduced by the same libcob error at the same
+//! COBOL line, and by nothing else.
 
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
+
+/// The `exception.name` of an attributed finding.
+pub(crate) const EXCEPTION_NAME: &str = "COBOL_RUNTIME_ERROR";
+
+/// The crash kind of an attributed finding, as [`crate::crash_identity`]
+/// reads [`EXCEPTION_NAME`].
+pub(crate) const KIND: &str = "cobol-runtime-error";
+
+/// Whether the attribution applies to the finding `raw`: one of a COBOL
+/// harness, whose ids are `H-B*` (see `Candidate::id_prefix`).
+pub(crate) fn applies_to(raw: &Value) -> bool {
+    raw.get("harness_id")
+        .and_then(Value::as_str)
+        .is_some_and(|harness_id| harness_id.starts_with("H-B"))
+}
+
+/// Give `report`, a replayed crash of the finding `raw`'s harness, the
+/// attribution [`run_cobol_attribution`] gives the finding: for a COBOL
+/// harness whose `stderr` carries libcob's diagnostic (one the attribution
+/// records, not a harness artifact), its kind becomes [`KIND`], its message
+/// the attributed one and its location the COBOL source site libcob named.
+/// Any other report is left as it is.
+pub(crate) fn attribute_report(raw: &Value, report: &mut corpus::SanitizerReport, stderr: &str) {
+    if !applies_to(raw) {
+        return;
+    }
+    let Some(diag) = first_diagnostic(stderr).filter(|diag| !is_harness_artifact(&diag.what))
+    else {
+        return;
+    };
+    report.kind = KIND.to_owned();
+    report.message = attributed_message(&diag);
+    if let Some((file, line)) = diag.source() {
+        report.location = Some(corpus::sanitizer::SourceLocation {
+            file: file.to_owned(),
+            line,
+            column: None,
+        });
+    }
+}
 
 /// Replay every COBOL (`H-B*`) crash finding to recover libcob's diagnostic and
 /// enrich the finding record. Returns the number of findings enriched.
@@ -37,14 +83,13 @@ pub fn run_cobol_attribution(work_dir: &Path) -> usize {
         let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
             continue;
         };
+        if !applies_to(&value) {
+            continue;
+        }
         let harness_id = value
             .get("harness_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // COBOL harness ids are `H-B*` (see Candidate::id_prefix).
-        if !harness_id.starts_with("H-B") {
-            continue;
-        }
         let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
         if !main_bin.is_file() {
             continue;
@@ -84,13 +129,12 @@ fn replay_capture_libcob(bin: &Path, input: &Path) -> Option<LibcobDiag> {
     crate::command_output::run_target_beside_binary(&mut command, bin);
     let out =
         crate::command_output::output_with_timeout(&mut command, Duration::from_secs(15)).ok()?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for line in stderr.lines() {
-        if let Some(diag) = parse_libcob_line(line) {
-            return Some(diag);
-        }
-    }
-    None
+    first_diagnostic(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// The first `libcob: ...: error: ...` diagnostic in a harness's stderr.
+fn first_diagnostic(stderr: &str) -> Option<LibcobDiag> {
+    stderr.lines().find_map(parse_libcob_line)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +142,28 @@ struct LibcobDiag {
     file: String,
     line: u32,
     what: String,
+}
+
+impl LibcobDiag {
+    /// The COBOL source site libcob named, when it named one.
+    fn source(&self) -> Option<(&str, u32)> {
+        (self.line > 0 && !self.file.is_empty()).then_some((self.file.as_str(), self.line))
+    }
+}
+
+/// The attributed finding's message: the mapped kind, the COBOL source site
+/// and libcob's description.
+fn attributed_message(diag: &LibcobDiag) -> String {
+    let (_, kind) = classify(&diag.what);
+    let location = match diag.source() {
+        Some((file, line)) => format!("{file}:{line}"),
+        None => diag.file.clone(),
+    };
+    if location.is_empty() {
+        format!("{kind}: {}", diag.what)
+    } else {
+        format!("{kind} at {location}: {}", diag.what)
+    }
 }
 
 /// Parse `libcob: <file>:<line>: error: <what>` (the `<file>:<line>:` part is
@@ -160,29 +226,20 @@ fn classify(what: &str) -> (&'static str, &'static str) {
 /// Rewrite the finding's exception message + CWE + source location in place.
 /// Returns true when the finding was changed.
 fn enrich(value: &mut Value, diag: &LibcobDiag) -> bool {
-    let (cwe, kind) = classify(&diag.what);
+    let (cwe, _) = classify(&diag.what);
     // Snapshot so a re-run over preserved results/ that recovers the same diagnostic
     // reports "unchanged" and the caller skips both the rewrite and the history entry.
     let before = value.clone();
     let Some(obj) = value.as_object_mut() else {
         return false;
     };
-    let location = if diag.line > 0 && !diag.file.is_empty() {
-        format!("{}:{}", diag.file, diag.line)
-    } else {
-        diag.file.clone()
-    };
-    let message = if location.is_empty() {
-        format!("{kind}: {}", diag.what)
-    } else {
-        format!("{kind} at {location}: {}", diag.what)
-    };
+    let message = attributed_message(diag);
     // Exception name + message.
     let exception = obj
         .entry("exception")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(exc) = exception.as_object_mut() {
-        exc.insert("name".to_owned(), Value::from("COBOL_RUNTIME_ERROR"));
+        exc.insert("name".to_owned(), Value::from(EXCEPTION_NAME));
         exc.insert("message".to_owned(), Value::from(message));
         exc.insert(
             "libcob_diagnostic".to_owned(),
@@ -197,10 +254,10 @@ fn enrich(value: &mut Value, diag: &LibcobDiag) -> bool {
         act.insert("cwe".to_owned(), serde_json::json!([cwe]));
     }
     // Record the COBOL source site if we recovered one.
-    if diag.line > 0 && !diag.file.is_empty() {
+    if let Some((file, line)) = diag.source() {
         obj.insert(
             "cobol_source".to_owned(),
-            serde_json::json!({ "file": diag.file, "line": diag.line }),
+            serde_json::json!({ "file": file, "line": line }),
         );
     }
     obj.insert(

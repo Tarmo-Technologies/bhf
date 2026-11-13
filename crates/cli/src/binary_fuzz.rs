@@ -1522,11 +1522,11 @@ fn run_binary_once(
         close_fd(fd);
     }
     let mut child = spawned.with_context(|| format!("spawn {}", program.display()))?;
-    if mode == BinaryInputMode::Stdin {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input);
-        }
-    }
+    // Written on a thread, so a target that never reads an input larger than
+    // the pipe buffer cannot block the deadline below.
+    let writer = (mode == BinaryInputMode::Stdin)
+        .then(|| replay_min::process::feed_stdin(&mut child, input.to_vec()))
+        .flatten();
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     loop {
@@ -1541,6 +1541,11 @@ fn run_binary_once(
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+    // A target that exits before reading all of its input closes the pipe;
+    // its exit status, not the write, is the result.
+    if let Some(writer) = writer {
+        let _ = replay_min::process::join_bounded(writer, replay_min::process::DRAIN_GRACE);
     }
     let output = child.wait_with_output()?;
     let input_path = input_file
@@ -2487,6 +2492,42 @@ mod tests {
             run.signature.starts_with("signal:11:"),
             "signature distinguishes the signal, got {}",
             run.signature
+        );
+    }
+
+    /// A stdin target that never reads an input larger than the pipe buffer
+    /// is still stopped at the time limit.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_target_that_ignores_its_input_still_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sleeper.sh");
+        fs::write(&script, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TargetInvocation {
+            binary: script,
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+        };
+        let started = Instant::now();
+        let run = run_binary_once(
+            &invocation,
+            BinaryInputMode::Stdin,
+            &vec![0u8; 1 << 20],
+            &BTreeMap::new(),
+            Duration::from_millis(300),
+            dir.path(),
+            None,
+        )
+        .expect("run the target");
+        assert!(run.timeout, "the run is a timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
         );
     }
 

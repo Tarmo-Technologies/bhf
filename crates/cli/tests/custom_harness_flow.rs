@@ -454,6 +454,11 @@ mod linux {
             !guide.contains("records no build recipe"),
             "custom-harness.md still says bhf build records no build recipe"
         );
+        let cli = flat("cli.md");
+        assert!(
+            !cli.contains("the history and `results/` are left as they were"),
+            "cli.md still says an unverified replay leaves results/ as it was"
+        );
         let c_cpp = flat("c-cpp.md");
         assert!(
             !c_cpp.contains("but does not add it itself"),
