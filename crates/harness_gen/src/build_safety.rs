@@ -42,16 +42,27 @@ const FORBIDDEN: &[char] = &[
 
 /// What double quotes do not hold literally in a Windows recipe, which may run
 /// through `sh` or `cmd`: `$` (expanded by `make`), a backtick (expanded by
-/// `sh` inside double quotes), a double quote (it ends the quoting) and `%`
-/// (`cmd` expands variables inside double quotes).
+/// `sh` inside double quotes), a double quote (it ends the quoting; a quoted
+/// define's own pair is escaped, see [`windows_quoted_define`]) and `%` (`cmd`
+/// expands variables inside double quotes).
 const WINDOWS_UNQUOTABLE: &[char] = &['$', '`', '"', '%'];
 
-/// True when `value` is safe to interpolate into a Makefile recipe.
+/// What `cmd` acts on outside its own quoting: the content of a quoted define
+/// sits between two escaped quotes (`"-DNAME=\"<content>\""`), which `cmd`
+/// reads as the end of one quoted span and the start of the next, so none of
+/// these may appear there.
+const CMD_OPERATORS: &[char] = &['&', '|', '<', '>', '^', '(', ')', '%', '!'];
+
+/// True when `value` is safe to interpolate into a Makefile recipe as it is,
+/// with the shell's own quoting rules applied to it.
+///
+/// A quoted string-macro define (`-DREVISION_ID="lib-1.2.3"`) passes, but a
+/// compile flag is never written into a recipe as it is: [`recipe_token`]
+/// quotes every flag that carries a character the shell acts on, the quoted
+/// define included, so the compiler receives its quotes and the shell never
+/// parses what is inside them.
 pub fn is_build_input_safe(value: &str) -> bool {
-    if !value
-        .chars()
-        .any(|c| c.is_control() || FORBIDDEN.contains(&c))
-    {
+    if is_bare_safe(value) {
         return true;
     }
     // A quoted string-macro define is the one common, legitimate use of double
@@ -61,52 +72,68 @@ pub fn is_build_input_safe(value: &str) -> bool {
     is_quoted_define_safe(value)
 }
 
+/// True when `value` carries no character the shell or `make` acts on, so it
+/// can be written into a recipe or a make variable without any quoting.
+fn is_bare_safe(value: &str) -> bool {
+    !value
+        .chars()
+        .any(|c| c.is_control() || FORBIDDEN.contains(&c))
+}
+
 /// A `-D<NAME>=...="<content>"` define whose ONLY metacharacters are a single
 /// balanced pair of wrapping double quotes (and spaces inside them, which the
 /// quotes protect from word-splitting). Everything outside the quotes must pass
 /// the ordinary check, and the quoted content must still be free of characters
 /// that `make`/the shell act on *before* quote parsing — `$` (make/shell
 /// expansion), a backtick (command substitution), a backslash (escape), an inner
-/// quote, or a newline — so no command injection slips through the relaxation.
+/// quote, a newline, or `#` (which starts a comment in the make variable the
+/// flag is assigned to) — and on Windows `%`, which `cmd` expands inside
+/// double quotes.
 fn is_quoted_define_safe(value: &str) -> bool {
-    if !value.starts_with("-D") {
-        return false;
+    quoted_define_content(value).is_some_and(|inside| {
+        const DANGEROUS_IN_QUOTES: &[char] = &['$', '`', '\\', '"', '#', '\n', '\r'];
+        !inside.chars().any(|c| {
+            c.is_control() || DANGEROUS_IN_QUOTES.contains(&c) || (cfg!(windows) && c == '%')
+        })
+    })
+}
+
+/// The content between the quotes of a `-D<NAME>=..."<content>"` define: one
+/// balanced pair of double quotes that closes the flag, with a plain prefix.
+fn quoted_define_content(value: &str) -> Option<&str> {
+    if !value.starts_with("-D") || value.matches('"').count() != 2 {
+        return None;
     }
-    if value.matches('"').count() != 2 {
-        return false;
-    }
-    let first = value.find('"').unwrap();
-    let last = value.rfind('"').unwrap();
-    let before = &value[..first];
-    let inside = &value[first + 1..last];
-    if !value[last + 1..].is_empty() {
-        return false; // trailing junk after the closing quote
-    }
-    if !is_build_input_safe(before) {
-        return false;
-    }
-    const DANGEROUS_IN_QUOTES: &[char] = &['$', '`', '\\', '"', '\n', '\r'];
-    !inside
-        .chars()
-        .any(|c| c.is_control() || DANGEROUS_IN_QUOTES.contains(&c))
+    let first = value.find('"')?;
+    let last = value.rfind('"')?;
+    // Nothing may follow the closing quote, and the prefix must be plain.
+    (last + 1 == value.len() && is_bare_safe(&value[..first])).then(|| &value[first + 1..last])
 }
 
 /// A token that is not safe BARE but is safe once quoted, rendered with those
 /// quotes. `None` when it is unsafe either way, or when it needs no quoting at
 /// all (the caller then emits it unchanged).
 ///
-/// `sh` treats every character inside single quotes literally, so the only shell
-/// hazard is a single quote itself. `make` expands `$` BEFORE the shell ever sees
-/// the line, so that stays forbidden, as do newlines and control characters,
-/// which no quoting can contain. A flag with an apostrophe in it (an include dir
-/// under `/home/Dana's tree/`) is double-quoted instead, when every character
-/// that needs quoting is one a path may carry ([`QUOTABLE_IN_PATH`]); see
-/// [`first_unquotable_flag_char`].
+/// `sh` treats every character inside single quotes literally, so the whole
+/// word is single-quoted, with each `'` in it written `'\''` (close the
+/// quotes, a backslash-escaped apostrophe, reopen them). `make` expands `$`
+/// BEFORE the shell ever sees the line, so it stays forbidden, as do newlines
+/// and control characters, which no quoting can contain. A `#` is quoted like
+/// any other character: `make` reads it as a comment only in the Makefile's
+/// own text, where [`unquotable_flag_char`] refuses it, not in a value it
+/// takes from the environment ([`unquotable_environment_flag_char`]).
+///
+/// A quoted string-macro define (`-DNAME="value with spaces"`) is quoted the
+/// same way: the compiler receives its double quotes, so the macro is a string
+/// literal, and the shell never parses what is inside them. Written bare, the
+/// shell would strip the quotes; written with backslash-escaped quotes, the
+/// shell would run a `;` or `|` inside them as a command.
 ///
 /// On Windows every such flag is double-quoted ([`windows_double_quoted`]):
 /// the recipe may run through `cmd`, which does not honour single quotes, and
 /// double quotes hold the shell operators and parentheses literally in both
-/// `sh` and `cmd`.
+/// `sh` and `cmd`. A quoted define's own quotes are escaped inside them
+/// ([`windows_quoted_define`]).
 ///
 /// This is what lets a legitimate CMake define through. `-DLLAMA_VERSIONS=>=3`
 /// (gpt4all) and `-D_LIBCPP_HARDENING_MODE=..._DEBUG>` (btop) are ordinary
@@ -114,17 +141,33 @@ fn is_quoted_define_safe(value: &str) -> bool {
 /// them cost every target in those projects, and quoting them is both correct and
 /// safe.
 pub fn quoted_build_input(value: &str) -> Option<String> {
-    if value.is_empty() || is_build_input_safe(value) || first_unquotable_flag_char(value).is_some()
-    {
+    if value.is_empty() || is_bare_safe(value) || first_unquotable(value, false).is_some() {
         return None;
     }
     if cfg!(windows) {
-        Some(windows_double_quoted(value))
-    } else if value.contains('\'') {
-        Some(format!("\"{value}\""))
+        Some(if value.contains('"') {
+            windows_quoted_define(value)
+        } else {
+            windows_double_quoted(value)
+        })
     } else {
-        Some(format!("'{value}'"))
+        Some(posix_single_quoted(value))
     }
+}
+
+/// `value` as one single-quoted `sh` word: every character literal, each `'`
+/// written `'\''`.
+fn posix_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// A quoted define for a Windows recipe: double-quoted whole, with its own
+/// quotes escaped (`"-DNAME=\"value\""`), which `sh` and the Windows argument
+/// parser both read back as `-DNAME="value"`. Callers have checked it with
+/// [`unquotable_flag_char`]: no backslash, and nothing in its content
+/// that `cmd` acts on ([`CMD_OPERATORS`]).
+fn windows_quoted_define(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 /// `value` in double quotes for a Windows recipe. A run of backslashes at the
@@ -137,33 +180,66 @@ fn windows_double_quoted(value: &str) -> String {
     format!("\"{value}{}\"", "\\".repeat(trailing))
 }
 
-/// The first character of a compile flag that no quoting can make safe, or
-/// `None` when the flag can be emitted bare or quoted by
-/// [`quoted_build_input`].
+/// The first character of a compile flag written into the Makefile's text (a
+/// make variable assignment such as `COMPILE_DB_FLAGS = ...`, or a recipe
+/// line) that no quoting can make safe, or `None` when the flag can be
+/// emitted bare or quoted by [`quoted_build_input`].
 ///
-/// A control character or `$` is never safe. Single quotes contain anything
-/// else except a single quote. A flag with an apostrophe is double-quoted, and
-/// inside double quotes `sh` still acts on `$`, a backtick, a backslash and a
-/// double quote, so such a flag may only carry the characters a path may
-/// ([`QUOTABLE_IN_PATH`]) beyond those safe bare. On Windows every flag that
-/// needs quoting is double-quoted, so it may carry anything but
-/// [`WINDOWS_UNQUOTABLE`]; a backslash stays, as the path separator.
-fn first_unquotable_flag_char(value: &str) -> Option<char> {
-    if is_build_input_safe(value) {
+/// A control character, `$` or `#` is never safe: `make` acts on the last two
+/// before the shell sees the line (`#` ends the variable assignment, its
+/// closing quote included). Single quotes, with `'` written `'\''`, contain
+/// anything else. On Windows every flag that needs quoting is double-quoted,
+/// so it may carry anything but [`WINDOWS_UNQUOTABLE`]; a backslash stays, as
+/// the path separator. A quoted define is the exception for a double quote:
+/// its pair is escaped inside the quoting, so it may carry no backslash, and
+/// its content nothing `cmd` acts on ([`CMD_OPERATORS`]).
+pub fn unquotable_flag_char(value: &str) -> Option<char> {
+    first_unquotable(value, true)
+}
+
+/// As [`unquotable_flag_char`], for a flag `make` takes from the environment
+/// (the `BHF_TOOLCHAIN_*` values) and expands into a recipe: `make` reads no
+/// comment in such a value, so a `#` is quoted like any other character.
+pub fn unquotable_environment_flag_char(value: &str) -> Option<char> {
+    first_unquotable(value, false)
+}
+
+/// Why no quoting makes `c` safe in a recipe (a character
+/// [`unquotable_flag_char`] or [`unquotable_environment_flag_char`]
+/// returned), for a refusal message.
+pub fn unquotable_reason(c: char) -> &'static str {
+    match c {
+        '$' => "`make` expands it",
+        '#' => "`make` reads it as a comment in the variable the flag is assigned to",
+        '%' => "`cmd` expands it inside double quotes",
+        '`' => "the shell runs a command between backticks inside double quotes",
+        '"' => "it would end the double quotes the flag is written in",
+        '\\' => "it would change the escaping of the define's own quotes",
+        c if c.is_control() => "no quoting can hold a control character",
+        _ => "`cmd` acts on it between the define's own quotes",
+    }
+}
+
+fn first_unquotable(value: &str, makefile_text: bool) -> Option<char> {
+    if is_bare_safe(value) {
         return None;
     }
-    if let Some(c) = value.chars().find(|c| c.is_control() || *c == '$') {
+    if let Some(c) = value
+        .chars()
+        .find(|c| c.is_control() || *c == '$' || (makefile_text && *c == '#'))
+    {
         return Some(c);
     }
-    if cfg!(windows) {
-        return value.chars().find(|c| WINDOWS_UNQUOTABLE.contains(c));
-    }
-    if !value.contains('\'') {
+    if !cfg!(windows) {
         return None;
     }
-    value
-        .chars()
-        .find(|c| *c == '\\' || (FORBIDDEN.contains(c) && !QUOTABLE_IN_PATH.contains(c)))
+    if let Some(content) = quoted_define_content(value) {
+        return value
+            .chars()
+            .find(|c| matches!(c, '\\' | '`' | '%'))
+            .or_else(|| content.chars().find(|c| CMD_OPERATORS.contains(c)));
+    }
+    value.chars().find(|c| WINDOWS_UNQUOTABLE.contains(c))
 }
 
 /// Whether a COMPILE FLAG may be interpolated into a recipe — bare or quoted.
@@ -174,7 +250,7 @@ fn first_unquotable_flag_char(value: &str) -> Option<char> {
 /// ([`is_build_path_usable`]): they also land in `#include "..."` lines and in
 /// make variable assignments, so a `;` or `|` in one stays refused.
 pub fn is_compile_flag_usable(value: &str) -> bool {
-    first_unquotable_flag_char(value).is_none()
+    unquotable_flag_char(value).is_none()
 }
 
 /// Render a compile flag for a recipe: unchanged when it is safe bare,
@@ -284,7 +360,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     for value in values {
-        if let Some(c) = first_unquotable_flag_char(value) {
+        if let Some(c) = unquotable_flag_char(value) {
             return Err(HarnessGenError::UnsafeBuildInput(format!(
                 "refusing to generate harness: compile flag {value:?} contains {c:?}, a \
                  shell/make metacharacter that quoting cannot contain and could inject \
@@ -600,11 +676,12 @@ mod tests {
             assert!(ensure_all_compile_flags_safe([flag]).is_err(), "{flag:?}");
         }
 
-        // On Unix a single quote ends the single quoting, so a flag carrying
-        // one and an operator is refused (Windows double-quotes it).
+        // On Unix a single quote inside the single quoting is written `'\''`,
+        // so a flag carrying one and an operator stays one literal word
+        // (Windows double-quotes it).
         if !cfg!(windows) {
-            assert!(!is_compile_flag_usable("-DX='; id; '"));
-            assert!(ensure_all_compile_flags_safe(["-DX='; id; '"]).is_err());
+            assert!(is_compile_flag_usable("-DX='; id; '"));
+            assert_eq!(recipe_token("-DX='; id; '"), r"'-DX='\''; id; '\'''");
         }
 
         // A safe-bare flag is emitted unchanged — no gratuitous quoting.
@@ -782,33 +859,231 @@ mod tests {
     }
 
     /// A compile-database flag under a directory with an apostrophe
-    /// (`-I/home/Dana's tree/include`) cannot be single-quoted, so it is
-    /// double-quoted, which holds a space, parenthesis or apostrophe literally.
+    /// (`-I/home/Dana's tree/include`) is single-quoted whole, with the
+    /// apostrophe written `'\''`.
     #[cfg(not(windows))]
     #[test]
-    fn a_flag_with_an_apostrophe_is_double_quoted() {
-        for flag in [
-            "-I/home/Dana's tree/proj/include",
-            "-I/srv/o'neil/include",
-            "-DOWNER=o'neil",
-            "-iquote/opt/Kit's (x86)/inc",
-            "-I/data/proj [old]/inc's",
+    fn a_flag_with_an_apostrophe_is_single_quoted_with_the_apostrophe_escaped() {
+        for (flag, rendered) in [
+            (
+                "-I/home/Dana's tree/proj/include",
+                r"'-I/home/Dana'\''s tree/proj/include'",
+            ),
+            ("-DOWNER=o'neil", r"'-DOWNER=o'\''neil'"),
+            ("-DX='a\"b'", r#"'-DX='\''a"b'\'''"#),
         ] {
             assert!(is_compile_flag_usable(flag), "{flag:?} must be usable");
-            assert_eq!(recipe_token(flag), format!("\"{flag}\""), "{flag:?}");
             assert!(ensure_all_compile_flags_safe([flag]).is_ok(), "{flag:?}");
+            assert_eq!(recipe_token(flag), rendered, "{flag:?}");
         }
-        // With an apostrophe, anything double quotes do not hold literally stays
-        // refused: an operator, an expansion, a backtick, a quote or a backslash.
+        // What `make` acts on before the shell sees the line stays refused.
+        for flag in ["-I/a'b/$(id)", "-DX='a#b'", "-DX='a\nb'"] {
+            assert!(!is_compile_flag_usable(flag), "{flag:?} must be refused");
+        }
+    }
+
+    /// The arguments `sh` hands a program for `words` written into a command
+    /// line, one per element.
+    #[cfg(unix)]
+    fn sh_arguments(words: &str) -> Vec<String> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '<%s>\\n' {words}"))
+            .output()
+            .expect("run sh");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Flags the recipe shell would act on, quoted defines among them.
+    #[cfg(unix)]
+    const FLAGS_THAT_NEED_QUOTING: &[&str] = &[
+        "-DNAME=\"value with spaces\"",
+        "-DREVISION_ID=\"lib-1.2.3\"",
+        "-DMSG=\"a;echo INJECTED;\"",
+        "-DMSG=\"a && echo INJECTED\"",
+        "-DMSG=\"a | echo INJECTED\"",
+        "-DMSG=\"a`echo INJECTED`\"",
+        "-DMSG=\"x' ; echo INJECTED ; '\"",
+        "-DOWNER=\"it's\"",
+        "-DX=\"a\";echo INJECTED;\"b\"",
+        "-DX='; echo INJECTED; '",
+        "-DLLAMA_VERSIONS=>=3",
+        "-I/home/Dana's tree/proj/include",
+        "-iquote/opt/Kit's (x86)/inc",
+        "-I/a'b\\c",
+    ];
+
+    /// Each flag is written as one quoted word, so the program receives
+    /// exactly the flag, a quoted define's quotes included, and nothing inside
+    /// it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_flag_reaches_the_program_as_the_one_word_it_was() {
+        for flag in FLAGS_THAT_NEED_QUOTING {
+            assert!(is_compile_flag_usable(flag), "{flag:?} must be usable");
+            assert!(ensure_all_compile_flags_safe([*flag]).is_ok(), "{flag:?}");
+            let token = recipe_token(flag);
+            assert_eq!(
+                sh_arguments(&token),
+                vec![format!("<{flag}>")],
+                "{flag:?} written as {token}"
+            );
+        }
+    }
+
+    /// The same flags assigned to a make variable, as the generated Makefiles
+    /// assign the build context's flags (`COMPILE_DB_FLAGS = ...`), and
+    /// written straight into a recipe line, as the per-translation-unit rules
+    /// write them: `make` and then `sh` hand the program each flag unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_flag_survives_a_make_variable_and_a_recipe_line() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bhf-recipe-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokens = FLAGS_THAT_NEED_QUOTING
+            .iter()
+            .map(|flag| recipe_token(flag))
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(
+            dir.join("Makefile"),
+            format!(
+                "FLAGS = {tokens}\nvariable:\n\t@printf '<%s>\\n' $(FLAGS)\n\
+                 recipe:\n\t@printf '<%s>\\n' {tokens}\n"
+            ),
+        )
+        .unwrap();
+        let expected: Vec<String> = FLAGS_THAT_NEED_QUOTING
+            .iter()
+            .map(|flag| format!("<{flag}>"))
+            .collect();
+        for goal in ["variable", "recipe"] {
+            let output = std::process::Command::new("make")
+                .args(["-s", "-f", "Makefile", goal])
+                .current_dir(&dir)
+                .output()
+                .expect("run make");
+            assert!(output.status.success(), "{goal}: {output:?}");
+            let words: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(words, expected, "{goal}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `make` ends a variable assignment at `#`, whatever quotes surround it,
+    /// so a flag carrying one would lose the rest of the line, its closing
+    /// quote included, and leave the recipe's quoting unbalanced. It is
+    /// refused, quoted define or not.
+    #[test]
+    fn a_flag_with_a_make_comment_character_is_refused() {
+        for flag in ["-DX=a#b", "-DCOLOR=\"#fff\"", "-DX='#'", "-DX=\"a #b c\""] {
+            assert!(!is_compile_flag_usable(flag), "{flag:?} must be refused");
+            let error = ensure_all_compile_flags_safe([flag])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("'#'"), "{error}");
+        }
+        assert!(!is_build_input_safe("-DCOLOR=\"#fff\""));
+    }
+
+    /// A flag `make` takes from the environment (the `[toolchain]` values) is
+    /// not parsed for comments, so it may carry `#`: rendered for the
+    /// environment, it reaches the program as the one word it was, through a
+    /// make variable and a recipe line alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_flag_carried_in_the_environment_may_hold_a_make_comment_character() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let flags = [
+            "-DWIDGET_HUE=#0f0",
+            "-DWIDGET_TAG=\"#fff\"",
+            "-DX=\"a #b c\"",
+            "-DX='#'",
+        ];
+        for flag in flags {
+            assert_eq!(unquotable_environment_flag_char(flag), None, "{flag:?}");
+            assert_eq!(unquotable_flag_char(flag), Some('#'), "{flag:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("bhf-env-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Makefile"),
+            "FROM_ENV ?=\nWORDS = $(FROM_ENV)\nshow:\n\t@printf '<%s>\\n' $(WORDS)\n",
+        )
+        .unwrap();
+        let rendered = flags.map(recipe_token).join(" ");
+        let output = std::process::Command::new("make")
+            .args(["-s", "-f", "Makefile", "show"])
+            .env("FROM_ENV", &rendered)
+            .current_dir(&dir)
+            .output()
+            .expect("run make");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success(), "{output:?}");
+        let words: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let expected: Vec<String> = flags.iter().map(|flag| format!("<{flag}>")).collect();
+        assert_eq!(words, expected, "rendered as {rendered}");
+    }
+
+    /// On Windows a quoted define is double-quoted whole with its own quotes
+    /// escaped, which `sh` and the Windows argument parser both read back as
+    /// the flag. `cmd` reads the escaped quotes as the end and the restart of
+    /// its own quoting, so what it acts on there (and a backslash, which would
+    /// change the escaping) is refused inside the define.
+    #[cfg(windows)]
+    #[test]
+    fn windows_quoted_defines_are_one_double_quoted_word() {
+        for (flag, rendered) in [
+            (
+                "-DNAME=\"value with spaces\"",
+                r#""-DNAME=\"value with spaces\"""#,
+            ),
+            (
+                "-DMSG=\"a;echo INJECTED;\"",
+                r#""-DMSG=\"a;echo INJECTED;\"""#,
+            ),
+            ("-DOWNER=\"it's\"", r#""-DOWNER=\"it's\"""#),
+        ] {
+            assert!(is_compile_flag_usable(flag), "{flag:?} must be usable");
+            assert_eq!(recipe_token(flag), rendered, "{flag:?}");
+        }
         for flag in [
-            "-DX='; id; '",
-            "-I/a'b/$(id)",
-            "-I/a'b/`id`",
-            "-DX='a\"b'",
-            "-I/a'b\\c",
-            "-DX='a|b'",
+            "-DMSG=\"a&calc\"",
+            "-DMSG=\"a|b\"",
+            "-DMSG=\"a<b\"",
+            "-DMSG=\"(x)\"",
+            "-DMSG=\"a^b\"",
+            "-DMSG=\"100%\"",
+            "-DMSG=\"a!b\"",
+            "-DMSG=\"C:\\dir\"",
+            "-DMSG=\"a\";id;\"b\"",
         ] {
             assert!(!is_compile_flag_usable(flag), "{flag:?} must be refused");
+            assert!(ensure_all_compile_flags_safe([flag]).is_err(), "{flag:?}");
         }
     }
 

@@ -474,8 +474,14 @@ cmplog, and ASan all work natively on Windows.
   (w64devkit, MSYS2) and through `cmd` otherwise, so a compile flag that needs
   quoting there (a space, parenthesis, apostrophe or shell operator, as in
   `-DBAR=(x)`) is double-quoted, which both honour. Such a flag that also holds
-  `%`, `"` or a backtick is refused, since one of the two shells acts on it
-  even inside double quotes.
+  `%`, `#`, `"` or a backtick is refused, since one of the two shells (or
+  `make`, for `#`) acts on it even inside double quotes (a `[toolchain]`
+  flag, which `make` takes from the environment, may hold `#`). The
+  exception is a quoted string-macro define (`-DNAME="value"`), which is
+  double-quoted whole with its own quotes escaped (`"-DNAME=\"value\""`), so
+  the compiler receives them; `cmd` reads those escaped quotes as the end and
+  the restart of its own quoting, so such a define is refused when it holds a
+  backslash or its value holds one of `& | < > ^ ( ) % !`.
 - A harness for a function that takes a `FILE *` gets its input through a
   temporary file deleted on close, since the Windows C runtime has no
   `fmemopen`.

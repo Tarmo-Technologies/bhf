@@ -8209,8 +8209,7 @@ fn write_per_tu_context(
     cpp: bool,
 ) -> Result<()> {
     use harness_gen::build_safety::{
-        checked_recipe_path, ensure_all_compile_flags_safe, ensure_build_path_safe,
-        quoted_build_input,
+        checked_recipe_path, ensure_all_compile_flags_safe, ensure_build_path_safe, recipe_token,
     };
     // Paths may carry spaces (double-quoted below) and flags may need quoting
     // (`-I/proj dir/include`); anything quoting cannot contain is refused.
@@ -8257,12 +8256,13 @@ fn write_per_tu_context(
             } else {
                 (*lane_compiler, *lane_flags)
             };
-            // A flag that is safe bare keeps its quoted-define escaping; one that
-            // needs quoting (a spaced include dir) is single-quoted whole.
+            // Each flag is one word, quoted whole when it needs quoting (a
+            // spaced include dir, a quoted define): the compiler receives a
+            // define's quotes, and the shell never parses what is inside them.
             let flags = context
                 .flags
                 .iter()
-                .map(|flag| quoted_build_input(flag).unwrap_or_else(|| flag.replace('"', "\\\"")))
+                .map(|flag| recipe_token(flag))
                 .collect::<Vec<_>>()
                 .join(" ");
             // C keeps its compat flags right after the section flags. The C++
@@ -13071,7 +13071,7 @@ impl CppBuildContext {
                 .is_some_and(|standard| standard.contains("++"))
         });
         // SECURITY: the `-std=` was just REMOVED from `compile_flags`, so it no longer
-        // passes through `escape_makefile_recipe_flag`; it is spliced bare into the
+        // passes through `build_safety::recipe_token`; it is spliced bare into the
         // Makefile's `CXX_STD`. It came from the scanned tree's build system, so a value
         // that is not a bare dialect name is dropped entirely rather than re-emitted.
         if let Some(standard) =
@@ -19541,6 +19541,75 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             flags: Vec::new(),
         }];
         assert!(write_c_per_tu_context(&dir, &hostile).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A compile-database row's quoted define reaches the compiler as the one
+    /// argument it was, quotes included, when make runs the per-translation-unit
+    /// rule: a shell operator inside it never runs (written with
+    /// backslash-escaped quotes, the recipe shell ran the `touch` below), and a
+    /// legitimate define stays a string literal. C and C++ rows alike.
+    #[cfg(unix)]
+    #[test]
+    fn per_tu_context_passes_a_quoted_define_to_the_compiler_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let dir = temp_dir("per-tu-quoted-define");
+        let compiler = dir.join("record-args");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$BHF_ARGV_LOG\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("Makefile"), "include build_context_objects.mk\n").unwrap();
+        let marker = dir.join("injected");
+        let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
+        let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
+        let legit = "-DNAME=\"value with spaces\"".to_owned();
+        for (source, cpp) in [
+            ("/proj/lib/widget.c", false),
+            ("/proj/lib/widget.cpp", true),
+        ] {
+            let contexts = vec![PerTuCompileContext {
+                source: PathBuf::from(source),
+                compiler: None,
+                flags: vec![hostile.clone(), piped.clone(), legit.clone()],
+            }];
+            if cpp {
+                write_cpp_per_tu_context(&dir, &contexts).unwrap();
+            } else {
+                write_c_per_tu_context(&dir, &contexts).unwrap();
+            }
+            let log = dir.join(format!("argv-{cpp}.log"));
+            let build = std::process::Command::new("make")
+                .arg("context_objs/main_0.o")
+                .arg(format!("CC={}", compiler.display()))
+                .arg(format!("CXX={}", compiler.display()))
+                .env("BHF_ARGV_LOG", &log)
+                .current_dir(&dir)
+                .output()
+                .expect("run make");
+            assert!(
+                !marker.exists(),
+                "a command inside a quoted define ran ({source}): {build:?}"
+            );
+            assert!(build.status.success(), "{source}: {build:?}");
+            let argv: Vec<String> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            for flag in [&hostile, &piped, &legit] {
+                assert!(
+                    argv.contains(flag),
+                    "{source}: {flag:?} not passed whole: {argv:#?}"
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -158,9 +158,9 @@ fn staging_dirs(shim: &Path) -> Vec<PathBuf> {
 
 /// `shim` itself when `LD_PRELOAD` can carry its path; otherwise a copy of it
 /// in the first of `dirs` whose path it can carry and that is private to this
-/// user. A copy is reused while it is current (same size and modification
-/// time as the shim) and replaced when the shim was rebuilt. `None` when no
-/// directory works.
+/// user. A copy is reused only while its bytes are the shim's, and replaced
+/// otherwise (a rebuilt shim, or a file with the same size and modification
+/// time but other contents). `None` when no directory works.
 ///
 /// `bhf auto --jobs N` workers locate the shim from their own threads, so one
 /// staging runs at a time in this process; the first makes the copy and the
@@ -181,13 +181,13 @@ fn stage_for_preload(shim: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
         if !is_preload_safe(&staged) || !private_dir(dir) {
             return None;
         }
-        if copy_is_current(&source, &staged) {
+        if copy_is_current(shim, &source, &staged) {
             return Some(staged);
         }
         match copy_shim(shim, &source, dir, &staged) {
             Ok(()) => Some(staged),
             // Another process staged the same copy meanwhile.
-            Err(_) if copy_is_current(&source, &staged) => Some(staged),
+            Err(_) if copy_is_current(shim, &source, &staged) => Some(staged),
             Err(_) => None,
         }
     })
@@ -219,23 +219,59 @@ fn private_dir(_dir: &Path) -> bool {
     false
 }
 
-/// Whether `staged` is a regular file with `source`'s size and modification
-/// time.
-fn copy_is_current(source: &std::fs::Metadata, staged: &Path) -> bool {
+/// Whether `staged` is a regular file (not a symbolic link) holding exactly
+/// `shim`'s bytes (`source` is `shim`'s metadata). The contents are compared,
+/// not the size and modification time, which anyone who can write the file
+/// can set: a staged copy is preloaded into every harness, so it is never
+/// trusted unverified.
+fn copy_is_current(shim: &Path, source: &std::fs::Metadata, staged: &Path) -> bool {
     let Ok(copy) = std::fs::symlink_metadata(staged) else {
         return false;
     };
-    copy.file_type().is_file()
-        && copy.len() == source.len()
-        && matches!(
-            (copy.modified(), source.modified()),
-            (Ok(copy), Ok(source)) if copy == source
-        )
+    copy.file_type().is_file() && copy.len() == source.len() && same_contents(shim, staged)
+}
+
+/// Whether the files `a` and `b` hold the same bytes; `false` when either
+/// cannot be read.
+fn same_contents(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut left = vec![0u8; 64 * 1024];
+    let mut right = vec![0u8; 64 * 1024];
+    loop {
+        let Ok(read) = read_full(&mut a, &mut left) else {
+            return false;
+        };
+        let Ok(other) = read_full(&mut b, &mut right) else {
+            return false;
+        };
+        if read != other || left[..read] != right[..other] {
+            return false;
+        }
+        if read == 0 {
+            return true;
+        }
+    }
+
+    /// Fill `buf` from `file` until it is full or the file ends.
+    fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..])? {
+                0 => break,
+                read => filled += read,
+            }
+        }
+        Ok(filled)
+    }
 }
 
 /// Copy `shim` to `staged` through a temporary file in `dir`, so a bhf
 /// process loading the copy never sees it half-written, and give the copy the
-/// shim's modification time.
+/// shim's modification time. The rename into `dir`, which only this user can
+/// write, replaces whatever was there.
 fn copy_shim(
     shim: &Path,
     source: &std::fs::Metadata,
@@ -402,12 +438,14 @@ mod tests {
         let stage = dir.path().join("stage");
         let first = stage_for_preload(&shim, std::slice::from_ref(&stage)).unwrap();
         assert_eq!(std::fs::read(&first).unwrap(), b"old");
-        // Same size and mtime: the copy is reused as it is.
+        // A copy with the shim's size and modification time but other bytes
+        // is never trusted: the shim's own bytes replace it.
         std::fs::write(&first, b"cpy").unwrap();
         let mtime = shim.metadata().unwrap().modified().unwrap();
         set_mtime(&first, mtime);
         let again = stage_for_preload(&shim, std::slice::from_ref(&stage)).unwrap();
-        assert_eq!(std::fs::read(&again).unwrap(), b"cpy");
+        assert_eq!(again, first);
+        assert_eq!(std::fs::read(&again).unwrap(), b"old");
         // A rebuilt shim replaces the copy.
         std::fs::write(&shim, b"newer").unwrap();
         let refreshed = stage_for_preload(&shim, std::slice::from_ref(&stage)).unwrap();

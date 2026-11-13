@@ -1972,28 +1972,6 @@ impl CppBuildContextRender {
     }
 }
 
-/// Escape a build flag for verbatim interpolation into a Makefile recipe. A flag
-/// may legitimately carry a quoted string-macro value (`-DREVISION_ID="lib-1.2.3"`,
-/// from CMake / compile_commands.json); written raw into `$(CXX) ... -DX="v" ...`,
-/// the shell strips the inner quotes and the macro expands UNQUOTED — a bare token,
-/// not a string literal — breaking compilation. Backslash-escaping the quotes makes
-/// the shell pass them through literally so the macro stays a string.
-pub(crate) fn escape_makefile_recipe_flag(flag: &str) -> String {
-    // A flag that is unsafe BARE but safe single-quoted gets the quotes. A CMake
-    // version-comparison define (`-DLLAMA_VERSIONS=>=3`, gpt4all;
-    // `-D_LIBCPP_HARDENING_MODE=..._DEBUG>`, btop) is legitimate, and its `>`
-    // would redirect if emitted bare — refusing it cost every target in those
-    // projects. `validate_*` has already rejected anything no quoting can save.
-    if let Some(quoted) = crate::build_safety::quoted_build_input(flag) {
-        return quoted;
-    }
-    if flag.contains('"') {
-        flag.replace('"', "\\\"")
-    } else {
-        flag.to_owned()
-    }
-}
-
 fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
     let mut compile_flags = Vec::new();
     let mut link_flags = Vec::new();
@@ -2014,7 +1992,7 @@ fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_DROPPED_PREFIX) {
             dropped = value.to_owned();
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_LDFLAG_PREFIX) {
-            link_flags.push(escape_makefile_recipe_flag(value));
+            link_flags.push(crate::build_safety::recipe_token(value));
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_CXX_STANDARD_PREFIX) {
             // Validated again at the emission boundary: these pseudo-flags are built from
             // tree-controlled input, and `ensure_all_compile_flags_safe` only ever saw the
@@ -2025,7 +2003,10 @@ fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_COMPILER_PREFIX) {
             compiler = Some(value.to_owned()).filter(|v| crate::build_safety::is_compiler_token(v));
         } else {
-            compile_flags.push(escape_makefile_recipe_flag(flag));
+            // Quoted whole when it needs quoting, a quoted string-macro define
+            // (`-DREVISION_ID="lib-1.2.3"`) included: the compiler receives its
+            // quotes, and the recipe shell never parses what is inside them.
+            compile_flags.push(crate::build_safety::recipe_token(flag));
         }
     }
 
@@ -5765,6 +5746,98 @@ mod tests {
         assert!(main.contains("std::tuple<std::uint32_t, std::string_view, bool> entry"));
         assert!(main.contains("parse(entry);"));
         assert!(makefile.contains("CXX_STD ?= gnu++20"));
+    }
+
+    /// A stand-in compiler that appends each argument it is given to the file
+    /// `$BHF_ARGV_LOG`, one per line, and does nothing else.
+    #[cfg(unix)]
+    fn argument_recording_compiler(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let compiler = dir.join("record-args");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$BHF_ARGV_LOG\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler
+    }
+
+    /// The build context's flags come from the scanned tree's compile
+    /// database. A quoted define whose content holds a shell operator
+    /// (`-DMSG="a;touch <file>;"`) must reach the compiler as that one
+    /// argument, quotes included: written with backslash-escaped quotes, the
+    /// recipe shell ran the `touch`. A legitimate quoted define keeps its
+    /// quotes, so the macro is a string literal.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_define_from_the_build_context_reaches_the_compiler_whole() {
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-quoted-define");
+        let marker = out.join("injected");
+        let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
+        let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
+        let legit = "-DNAME=\"value with spaces\"".to_owned();
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-QUOTED-DEFINE".to_owned(),
+            output_dir: out.clone(),
+            source_path: PathBuf::from("/tmp/x.cpp"),
+            target: cppfunction("parse_record"),
+            params: vec![CppParameter {
+                name: "size".to_owned(),
+                cpp_type: "int".to_owned(),
+            }],
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: Vec::new(),
+            target_sources: Vec::new(),
+            compile_flags: vec![hostile.clone(), piped.clone(), legit.clone()],
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        let compiler = argument_recording_compiler(&out);
+        let log = out.join("argv.log");
+        let build = Command::new("make")
+            .arg("main")
+            .arg(format!("CXX={}", compiler.display()))
+            .arg("BHF_CXX_FAMILY=clang")
+            .env("BHF_ARGV_LOG", &log)
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            !marker.exists(),
+            "a command inside a quoted define ran:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(build.status.success(), "{build:?}");
+        let argv: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for flag in [&hostile, &piped, &legit] {
+            assert!(argv.contains(flag), "{flag:?} not passed whole: {argv:#?}");
+        }
+        fs::remove_dir_all(&out).ok();
     }
 
     #[test]

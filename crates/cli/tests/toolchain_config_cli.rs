@@ -1291,6 +1291,57 @@ fn bhf_build_keeps_cxx_only_toolchain_flags_off_the_c_driver() {
     assert!(main.contains("-include iostream"), "{main}");
 }
 
+/// `[toolchain]` values reach `make` through the environment, where `#`
+/// starts no comment: a define and a C flag carrying one build, and the
+/// compiler receives them whole (the string macro keeps its quotes).
+#[test]
+fn bhf_build_passes_toolchain_values_that_hold_a_hash() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("widget.c"),
+        "#include <stddef.h>\n\
+         #ifndef WIDGET_HUE\n#error WIDGET_HUE missing\n#endif\n\
+         _Static_assert(sizeof(WIDGET_TAG) == 5, \"WIDGET_TAG is the string #fff\");\n\
+         int parse_record(const unsigned char *data, size_t size) {\n\
+         \x20   return size ? data[0] ^ WIDGET_TAG[1] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let generated = bhf()
+        .arg("generate-harness")
+        .arg(src.join("widget.c"))
+        .args(["--target", "parse_record", "--id", "H-HASH"])
+        .arg("--output")
+        .arg(work.join("harnesses"))
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-HASH", "--cc", "clang"])
+        .args(["--cflags", "-DWIDGET_HUE=#0f0"])
+        .args(["--define", "WIDGET_TAG=\"#fff\""])
+        .env_remove("CC")
+        .env_remove("CFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    let main = out
+        .lines()
+        .find(|line| line.contains(" main.c") && line.contains("-o main"))
+        .unwrap_or_else(|| panic!("no main.c compile in:\n{out}"));
+    assert!(main.contains("-DWIDGET_HUE=#0f0"), "{main}");
+}
+
 /// A vendor library outside the tree: `include/vendor.h` and
 /// `lib/libvendor.a`, built with the host compiler. Returns the vendor dir.
 fn write_vendor_library(dir: &Path) -> PathBuf {

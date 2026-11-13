@@ -5,6 +5,26 @@
 ## Unreleased
 
 ### Fixed
+- **Command injection through a quoted define in a compile database
+  (CWE-78).** A `compile_commands.json` flag such as `-DNAME="a;cmd;"` passed
+  the build-input check, which allows one balanced pair of double quotes in a
+  define, and the C++ Makefile and the per-translation-unit object rules then
+  wrote it with its quotes backslash-escaped, so the recipe shell ran what was
+  inside them on the analysing host. Every compile flag of every Makefile
+  lane is now written through one quoting routine: a flag the shell would act
+  on is single-quoted whole, an apostrophe in it written `'\''`, so a quoted
+  define reaches the compiler with its quotes and nothing inside them runs.
+  On Windows it is double-quoted with its own quotes escaped, and refused
+  when it holds a backslash or a value `cmd` would act on (`& | < > ^ ( ) %
+  !`). A legitimate quoted define (`-DNAME="value with spaces"`) is now a
+  string literal in the C lane too, where the shell used to strip its quotes.
+  A flag from the compile database or the build context that holds `#` is
+  refused, as `make` ends the variable the flag is assigned to there; the
+  `[toolchain]` flags and defines, which `make` takes from the environment,
+  may still hold one, and a refused toolchain value's message names the
+  character. A flag with an apostrophe is single-quoted the same way rather
+  than double-quoted, so it may also carry a shell operator or a double
+  quote.
 - A capsule's `build.sh` prints a missing tool's message as written: the
   message is one single-quoted word, so the Rust capsule's, which shows
   `cargo +nightly`, no longer runs cargo (and prints its help) when
@@ -383,9 +403,11 @@
 - bhf installed under a directory with a space or colon (`Program Files
   (x86)`, a user profile) loads its runtrace shim: `LD_PRELOAD` splits paths
   on those characters, so the shim is preloaded from a copy staged under the
-  work dir's `.bhf-runtime/` or `$TMPDIR/bhf-shim-<uid>-<hash>/` (refreshed
-  when the shim changes, and only in a directory no other account can
-  write); with no usable directory bhf warns once and runs without it.
+  work dir's `.bhf-runtime/` or `$TMPDIR/bhf-shim-<uid>-<hash>/` (only in a
+  directory no other account can write, and reused only while its bytes are
+  the shim's: a copy with the shim's size and modification time but other
+  contents is replaced, never preloaded); with no usable directory bhf warns
+  once and runs without it.
   The shim creates its runtrace log when it loads, and `finding.json`
   `runtime_mode.shim_armed` (and `gate_capture.shim_armed`) is true only when
   the run produced that log, not merely when `LD_PRELOAD` was set.

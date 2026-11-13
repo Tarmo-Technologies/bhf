@@ -6345,6 +6345,65 @@ mod tests {
         make_ok && clang_ok
     }
 
+    /// The build context's quoted defines reach a C harness's compiler whole:
+    /// a shell operator inside one never runs, and a legitimate one keeps its
+    /// quotes, so the macro is a string literal rather than bare tokens.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_define_from_the_build_context_reaches_the_c_compiler_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_quoted_define");
+        let marker = out.join("injected");
+        let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
+        let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
+        let legit = "-DNAME=\"value with spaces\"".to_owned();
+        let mut args = direct_args("parse_record", out.clone());
+        args.compile_flags = vec![hostile.clone(), piped.clone(), legit.clone()];
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let compiler = out.join("record-args");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$BHF_ARGV_LOG\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let log = out.join("argv.log");
+        let build = std::process::Command::new("make")
+            .arg("main")
+            .arg(format!("CC={}", compiler.display()))
+            .arg("BHF_CC_FAMILY=clang")
+            .env("BHF_ARGV_LOG", &log)
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            !marker.exists(),
+            "a command inside a quoted define ran: {build:?}"
+        );
+        assert!(build.status.success(), "{build:?}");
+        let argv: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for flag in [&hostile, &piped, &legit] {
+            assert!(argv.contains(flag), "{flag:?} not passed whole: {argv:#?}");
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// End-to-end proof of the portable libFuzzer target (#62): a generated C
     /// harness built with `make libfuzzer` is a real libFuzzer binary that drives
     /// the target through bhf's `bhf_run_one` (via the emitted `bhf_libfuzzer.c`

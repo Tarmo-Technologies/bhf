@@ -284,27 +284,36 @@ pub(crate) fn resolve(
 /// usable in a generated Makefile recipe, and the probe backend must exist.
 pub(crate) fn validate(config: &ToolchainConfig) -> Result<(), String> {
     config.validate().map_err(|error| error.to_string())?;
-    use harness_gen::build_safety::{is_build_path_usable, is_compile_flag_usable};
+    use harness_gen::build_safety::{
+        is_build_path_usable, unquotable_environment_flag_char, unquotable_reason,
+    };
+    // The flags and defines reach `make` through the environment
+    // (`BHF_TOOLCHAIN_*`), so they are checked as such: a `#` is quoted with
+    // the rest of the flag, `make` reading no comment in an environment value.
+    let refusal = |key: &str, value: &str, flag: &str| {
+        unquotable_environment_flag_char(flag).map(|c| {
+            format!(
+                "{key}: {value:?} cannot be passed through the harness Makefile: it holds \
+                 {c:?}, which no quoting makes safe in a build recipe ({})",
+                unquotable_reason(c)
+            )
+        })
+    };
     for (key, flags) in [
         ("toolchain.cflags", &config.cflags),
         ("toolchain.cxxflags", &config.cxxflags),
         ("toolchain.ldflags", &config.ldflags),
     ] {
-        if let Some(flag) = flags.iter().find(|flag| !is_compile_flag_usable(flag)) {
-            return Err(format!(
-                "{key}: {flag:?} cannot be passed through the harness Makefile \
-                 (a `$` or control character)"
-            ));
+        if let Some(error) = flags.iter().find_map(|flag| refusal(key, flag, flag)) {
+            return Err(error);
         }
     }
-    if let Some(define) = config
+    if let Some(error) = config
         .defines
         .iter()
-        .find(|define| !is_compile_flag_usable(&format!("-D{define}")))
+        .find_map(|define| refusal("toolchain.defines", define, &format!("-D{define}")))
     {
-        return Err(format!(
-            "toolchain.defines: {define:?} cannot be passed through the harness Makefile"
-        ));
+        return Err(error);
     }
     for (key, path) in config
         .include_dirs
@@ -1546,6 +1555,48 @@ mod tests {
         assert_eq!(
             probe_backend(&config),
             crate::probe_backend::ProbeBackend::MemoryBuffer
+        );
+    }
+
+    /// The toolchain values reach `make` through the environment, where `#`
+    /// starts no comment, so a flag or define carrying one is accepted and
+    /// rendered as one quoted word; a refusal names the character refused.
+    #[test]
+    fn toolchain_values_may_hold_a_hash_and_a_refusal_names_the_character() {
+        let config = ToolchainConfig {
+            cflags: vec!["-DWIDGET_HUE=#0f0".to_owned()],
+            defines: vec!["WIDGET_TAG=\"#fff\"".to_owned()],
+            ..ToolchainConfig::default()
+        };
+        validate(&config).unwrap();
+        let values: HashMap<_, _> = make_values(&config, Some(CompilerFamily::Clang))
+            .into_iter()
+            .collect();
+        let (hue, tag) = if cfg!(windows) {
+            ("\"-DWIDGET_HUE=#0f0\"", "\"-DWIDGET_TAG=\\\"#fff\\\"\"")
+        } else {
+            ("'-DWIDGET_HUE=#0f0'", "'-DWIDGET_TAG=\"#fff\"'")
+        };
+        assert_eq!(values[ENV_C_CPPFLAGS], hue);
+        assert_eq!(values[ENV_CPPFLAGS], tag);
+
+        let config = ToolchainConfig {
+            cflags: vec!["-DX=$(shell id)".to_owned()],
+            ..ToolchainConfig::default()
+        };
+        let error = validate(&config).unwrap_err();
+        assert!(
+            error.contains("toolchain.cflags") && error.contains("'$'"),
+            "{error}"
+        );
+        let config = ToolchainConfig {
+            defines: vec!["X=a\u{7}b".to_owned()],
+            ..ToolchainConfig::default()
+        };
+        let error = validate(&config).unwrap_err();
+        assert!(
+            error.contains("toolchain.defines") && error.contains("'\\u{7}'"),
+            "{error}"
         );
     }
 

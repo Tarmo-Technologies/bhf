@@ -219,6 +219,56 @@ fn compile_database_compiler_cannot_inject_into_the_harness_makefile() {
     }
 }
 
+/// V5 — a quoted string-macro define from the compile database
+/// (`-DLABEL="..."`, which CMake writes for `target_compile_definitions`) whose
+/// content holds shell operators. The define reaches the recipe as one quoted
+/// word: the compiler receives it whole, quotes included, so the macro is the
+/// string literal the source expects and nothing inside it runs. Written with
+/// backslash-escaped quotes, the recipe shell ran the `touch`.
+#[cfg(unix)]
+#[test]
+fn compile_database_quoted_define_cannot_inject_into_the_harness_recipe() {
+    if Command::new("clang++").arg("--version").output().is_err()
+        || Command::new("make").arg("--version").output().is_err()
+    {
+        eprintln!("skip: clang++/make unavailable");
+        return;
+    }
+    let s = Scenario::new("v5");
+    // The target only compiles when LABEL is a string literal.
+    std::fs::write(
+        s.root.join("parser.cpp"),
+        "#include <cstdint>\n#include <cstddef>\n#include <cstring>\n\
+         int parse_input(const uint8_t* d, size_t n){\
+         const char *label = LABEL; return n && d[0] == (uint8_t)label[0] ? (int)std::strlen(label) : 0;}\n",
+    )
+    .expect("write parser.cpp");
+    s.write_compile_db(
+        "/usr/bin/clang++",
+        &format!("-DLABEL=\"a;touch {};\"", s.marker.to_str().unwrap()),
+    );
+
+    let out = s.run();
+    s.assert_no_execution("V5 compile_commands.json quoted define");
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.work.join("auto/run.json")).expect("run.json"))
+            .expect("run.json parses");
+    let built = run["targets"].as_array().is_some_and(|targets| {
+        targets.iter().any(|target| {
+            target["name"] == "parse_input"
+                && target["outcome"]["outcome"]
+                    .as_str()
+                    .is_some_and(|outcome| outcome.starts_with("built"))
+        })
+    });
+    assert!(
+        built,
+        "parse_input must build with the define as a string literal:\n{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        serde_json::to_string_pretty(&run["targets"]).unwrap_or_default()
+    );
+}
+
 /// The fix must not cost legitimate projects their recovered build context: a
 /// well-formed dialect and compiler from the same untrusted sources are still
 /// honored, and ordinary compile flags still reach the recipe.

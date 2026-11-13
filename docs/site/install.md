@@ -309,10 +309,11 @@ If policy keeps the libraries elsewhere, set `BHF_RUNTRACE_SHIM` and
 `BHF_CC_INTERCEPT` to absolute paths. A prefix with a space or colon in it
 (`/opt/Program Files (x86)/bhf`) works too: `LD_PRELOAD` splits paths on
 those characters, so bhf preloads a copy of the runtrace shim staged under
-the run's work dir (`<work>/.bhf-runtime/`) or `$TMPDIR/bhf-shim-<uid>-<hash>/`,
-refreshed whenever the shim changes. It only uses a directory private to the
-user running bhf (owned by them, mode `0700`), so no other local user can
-plant the library it preloads. When no such directory can be used it warns
+the run's work dir (`<work>/.bhf-runtime/`) or `$TMPDIR/bhf-shim-<uid>-<hash>/`.
+It only uses a directory private to the account running bhf (owned by it, mode
+`0700`), so no other local user can plant the library it preloads, and it
+reuses a staged copy only while its bytes are the shim's; any other file there
+is replaced by a fresh copy. When no such directory can be used it warns
 once and runs without the shim. Every component archive includes an
 `INSTALL.md` with these commands and the optional daemon/user-local layout.
 

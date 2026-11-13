@@ -201,8 +201,8 @@ fn auto_builds_and_fuzzes_targets_under_paths_with_spaces() {
 
 /// A compile database's include flags name the tree's own directories, so a
 /// tree under a directory with an apostrophe (`/home/Dana's tree/...`) puts the
-/// apostrophe inside a compile flag. Single quotes cannot hold it, so the flag
-/// is double-quoted; it used to be refused, and every target with it.
+/// apostrophe inside a compile flag. The flag is single-quoted whole with the
+/// apostrophe written `'\''`; it used to be refused, and every target with it.
 #[test]
 fn auto_uses_compile_database_flags_under_an_apostrophe_directory() {
     if !tool_available("clang") || !tool_available("make") {
