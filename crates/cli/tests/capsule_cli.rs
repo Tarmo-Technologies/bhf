@@ -83,15 +83,8 @@ fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let dest = scratch.join(capsule_src.file_name().unwrap());
-    // Copy the capsule tree into the scratch area (cp -r).
-    let ok = Command::new("cp")
-        .arg("-r")
-        .arg(capsule_src)
-        .arg(&dest)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "failed to stage capsule copy");
+    // Copy the capsule tree into the scratch area.
+    copy_tree(capsule_src, &dest);
     let work = capsule_src
         .parent()
         .filter(|dir| dir.file_name().is_some_and(|name| name == "capsules"))
@@ -123,6 +116,25 @@ fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
     let pass = out.status.success() && stdout.contains("PASS");
     let _ = std::fs::remove_dir_all(&scratch);
     (pass, stdout)
+}
+
+/// Copy the directory tree `src` to `dst`, as `cp -r` would, on any host.
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap().flatten() {
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// `path` as bhf writes it into a generated Makefile: forward slashes and no
+/// `\\?\` prefix on Windows, unchanged elsewhere.
+fn make_path(path: &Path) -> String {
+    harness_gen::build_safety::make_path(path)
 }
 
 fn only_capsule(work: &Path) -> std::path::PathBuf {
@@ -186,14 +198,22 @@ fn stub_dependent_crash_capsule_ships_stubs_and_reproduces() {
     );
     let cap = only_capsule(&work);
     // The recovered stub for the undefined external must be packaged, and the
-    // provenance-poisoned copy must NOT be.
+    // provenance-poisoned copy must NOT be. On Windows the work dir may be
+    // spelled with an 8.3 short name (`C:\Users\ADMINI~1`) that the recorded
+    // build recipe does not use, and the stub then ships with the other
+    // recorded sources rather than under stubs/; either home rebuilds it.
+    let shipped = files_under(&cap);
     assert!(
-        cap.join("stubs/auto_stubs.c").is_file(),
-        "capsule must ship the stub"
+        cap.join("stubs/auto_stubs.c").is_file()
+            || (cfg!(windows)
+                && shipped
+                    .iter()
+                    .any(|f| f.starts_with("sources/") && f.ends_with("/repairs/auto_stubs.c"))),
+        "capsule must ship the stub: {shipped:?}"
     );
     assert!(
-        !cap.join("stubs/auto_stubs_prov.c").exists(),
-        "the provenance-poisoned stub is internal and must not ship"
+        !shipped.iter().any(|f| f.ends_with("auto_stubs_prov.c")),
+        "the provenance-poisoned stub is internal and must not ship: {shipped:?}"
     );
     let (pass, out) = verify_from_scratch(&cap, "stub");
     assert!(
@@ -699,9 +719,9 @@ fn c_harness_makefile(runtime: &Path, src_dir: &Path, target: &Path) -> String {
          COMPILE_DB_FLAGS = \n\
          main: main.c\n\
          \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -DBHF_EXTERNAL_DRIVER -o $@ main.c {target} $(AUTO_EXTRA_SOURCES) $(AUTO_EXTRA_LDFLAGS)\n",
-        runtime = runtime.display(),
-        src = src_dir.display(),
-        target = target.display(),
+        runtime = make_path(runtime),
+        src = make_path(src_dir),
+        target = make_path(target),
     )
 }
 
@@ -1101,8 +1121,8 @@ fn cpp_harness_makefile(src_dir: &Path, target: &Path) -> String {
          COMPILE_DB_FLAGS = \n\
          main: main.cpp\n\
          \t$(CXX) $(CXXFLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -o $@ main.cpp {target} $(AUTO_EXTRA_SOURCES) $(AUTO_EXTRA_LDFLAGS)\n",
-        src = src_dir.display(),
-        target = target.display(),
+        src = make_path(src_dir),
+        target = make_path(target),
     )
 }
 
@@ -1197,13 +1217,7 @@ fn cpp_capsule_rebuilds_where_the_compiler_misses_the_standard_headers() {
     // The shipped build.sh recovers them on its own, offline.
     let scratch = tempfile::tempdir().unwrap();
     let dest = scratch.path().join("cap");
-    assert!(Command::new("cp")
-        .arg("-r")
-        .arg(&cap)
-        .arg(&dest)
-        .status()
-        .unwrap()
-        .success());
+    copy_tree(&cap, &dest);
     let verify = bhf()
         .arg("verify-poc")
         .arg(&dest)
@@ -1276,13 +1290,7 @@ fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
     for cc in [None, Some("gcc")] {
         let scratch = tempfile::tempdir().unwrap();
         let dest = scratch.path().join("cap");
-        assert!(Command::new("cp")
-            .arg("-r")
-            .arg(&cap)
-            .arg(&dest)
-            .status()
-            .unwrap()
-            .success());
+        copy_tree(&cap, &dest);
         let mut verify = bhf();
         verify.arg("verify-poc").arg(&dest);
         match cc {
@@ -1301,6 +1309,8 @@ fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
 
 /// A launcher in front of the compiler (`CXX="ccache clang++"`) works for
 /// the capsule's include scan and for its build.sh, as it does for make.
+// The launcher is a POSIX shell script, which Windows cannot run as a program.
+#[cfg(unix)]
 #[test]
 fn a_cpp_capsule_builds_through_a_compiler_launcher() {
     if !clangxx_available() {
@@ -1355,13 +1365,7 @@ fn a_cpp_capsule_builds_through_a_compiler_launcher() {
     let cap = work.join("capsules").join(format!("capsule_{id}"));
     let scratch = tempfile::tempdir().unwrap();
     let dest = scratch.path().join("cap");
-    assert!(Command::new("cp")
-        .arg("-r")
-        .arg(&cap)
-        .arg(&dest)
-        .status()
-        .unwrap()
-        .success());
+    copy_tree(&cap, &dest);
     let verified = bhf()
         .arg("verify-poc")
         .arg(&dest)

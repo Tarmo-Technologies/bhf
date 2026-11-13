@@ -652,6 +652,11 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and does not build on native Windows"
+)]
 fn rust_finding_round_trips() {
     skip_unless!(
         runs("cargo", &["+nightly", "--version"]),
@@ -712,6 +717,11 @@ fn cargo_crate_cached(name: &str) -> bool {
 /// A Rust target depending on a crates.io package ships it vendored, and the
 /// capsule rebuilds offline from the vendored copy.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and does not build on native Windows"
+)]
 fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
     skip_unless!(
         runs("cargo", &["+nightly", "--version"]),

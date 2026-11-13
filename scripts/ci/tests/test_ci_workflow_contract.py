@@ -95,6 +95,48 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--skip", step)
         self.assertNotRegex(step, r"(?m)^\s*if:")
 
+    WINDOWS_INTEGRATION_SUITES = (
+        "auto_msbuild_import",
+        "auto_force_win32",
+        "auto_makefile_injection",
+        "auto_spaced_paths",
+        "auto_force_params",
+        "auto_peripheral_sequence",
+        "capsule_cli",
+        "capsule_lanes_cli",
+        "cartography_cli",
+        "explain_cli",
+        "provenance_cli",
+    )
+
+    def test_windows_runs_the_windows_integration_suites(self):
+        lines = self.windows_step("Test the Windows integration suites").splitlines()
+        commands = [index for index, line in enumerate(lines) if line.strip().startswith("cargo test ")]
+        self.assertEqual(len(commands), 2)
+        for index in commands:
+            self.assertIn("--locked", lines[index])
+            self.assertIn("--no-fail-fast", lines[index])
+            self.assertNotIn("--skip", lines[index])
+            self.assertEqual(lines[index + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+        others, bhf = (lines[index].split() for index in commands)
+        # Every integration test of the other crates, and the bhf suites of the
+        # native Windows paths, each named once.
+        self.assertEqual(others[others.index("--exclude") + 1], "bhf")
+        self.assertIn("--workspace", others)
+        self.assertEqual(others[others.index("--test") + 1], "'*'")
+        self.assertEqual(bhf[bhf.index("-p") + 1], "bhf")
+        named = [bhf[i + 1] for i, word in enumerate(bhf) if word == "--test"]
+        self.assertEqual(sorted(named), sorted(self.WINDOWS_INTEGRATION_SUITES))
+        for suite in named:
+            self.assertTrue((ROOT / "crates/cli/tests" / f"{suite}.rs").is_file(), suite)
+
+    def test_windows_integration_suites_run_before_the_release_build(self):
+        steps = re.findall(r"(?m)^      - name: (.+)$", self.jobs["windows-build"])
+        self.assertLess(
+            steps.index("Test the Windows integration suites"),
+            steps.index("Build Windows release artifacts"),
+        )
+
     def test_windows_clippy_fails_on_warnings(self):
         lines = self.windows_step("Clippy").splitlines()
         index = next(i for i, line in enumerate(lines) if line.strip().startswith("cargo clippy "))

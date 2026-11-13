@@ -409,15 +409,14 @@ fn replay_one(
         }
         replayed += 1;
         // Fresh process per input (argv[1]) so the profile flushes at exit.
-        let completed = crate::command_output::output_with_timeout(
+        let completed = crate::command_output::bounded_replay_output(
             replay_command(&bin).arg(path).env(
                 "LLVM_PROFILE_FILE",
                 prof_dir.join(format!("cov-{i}.profraw")),
             ),
             Duration::from_secs(15),
         )
-        .map(|output| !matches!(output.status.code(), Some(124 | 137)))
-        .unwrap_or(false);
+        .is_ok_and(|(_, cut_off)| !cut_off);
         if !completed {
             return None;
         }
@@ -1258,7 +1257,7 @@ fn replay_expert_coverage(
         }
         let normalized = input_dir.join(format!("input-{index}"));
         std::fs::write(&normalized, bytes).map_err(|error| error.to_string())?;
-        let output = crate::command_output::output_with_timeout(
+        let (_, cut_off) = crate::command_output::bounded_replay_output(
             replay_command(binary).arg(&normalized).env(
                 "LLVM_PROFILE_FILE",
                 profile_dir.join(format!("expert-{index}.profraw")),
@@ -1266,7 +1265,7 @@ fn replay_expert_coverage(
             Duration::from_secs(15),
         )
         .map_err(|error| format!("replay expert harness: {error}"))?;
-        if matches!(output.status.code(), Some(124 | 137)) {
+        if cut_off {
             return Err("expert harness timed out during corpus replay".to_owned());
         }
         replayed += 1;
@@ -1325,13 +1324,7 @@ fn sequence_control_len(hdir: &Path) -> usize {
 /// Coverage is a best-effort post-pass. Bound every replay so a target that hangs
 /// after consuming its input cannot hold the complete auto campaign open.
 fn replay_command(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
-        let mut command = Command::new("timeout");
-        command.arg("-s").arg("KILL").arg("10").arg(bin);
-        command
-    } else {
-        Command::new(bin)
-    }
+    crate::command_output::killed_after(bin, 10)
 }
 
 /// Parse an LCOV export into the covered `<file>:<line>` set plus the number of

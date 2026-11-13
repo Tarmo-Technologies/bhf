@@ -224,6 +224,10 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             });
             continue;
         }
+        if let Some(name) = msvc_missing_library(line) {
+            hits.push(BuildErrorKind::MissingSharedLib { name });
+            continue;
+        }
         if let Some(caps) = malformed_function_body().captures(line) {
             if let Ok(line_no) = caps[2].parse::<u32>() {
                 hits.push(BuildErrorKind::MalformedFunctionDecl {
@@ -661,6 +665,23 @@ fn is_known_header_function(name: &str) -> bool {
 fn ld_cannot_find_lib() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"cannot find -l([^\s:]+)").expect("regex"))
+}
+
+/// The library an MSVC-style linker could not open, as the `<name>` of the
+/// `-l<name>` that asked for it: lld-link's `could not open '<dir>/<name>.lib':
+/// no such file or directory` and link.exe's `LNK1181: cannot open input file
+/// '<name>.lib'`. Any other file it could not open (an object) is no library.
+fn msvc_missing_library(line: &str) -> Option<String> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let caps = R
+        .get_or_init(|| {
+            Regex::new(r"(?:could not open|LNK1181: cannot open input file) '([^']+)'")
+                .expect("regex")
+        })
+        .captures(line)?;
+    let file = caps[1].rsplit(['/', '\\']).next()?;
+    let name = file.strip_suffix(".lib")?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Map a libc/system symbol back to the `-l<name>` that defines it.

@@ -578,6 +578,9 @@ struct CTemplateContext {
     c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
+    /// The `struct`/`union` tags the target's prototype names, declared at
+    /// file scope before it ([`tag_declarations`]).
+    forward_tags: Vec<String>,
     params: Vec<CParamEmission>,
     return_type: String,
     return_type_present: bool,
@@ -651,6 +654,9 @@ struct CSequenceTemplateContext {
     c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
+    /// The `struct`/`union` tags the lifecycle prototypes name, declared at
+    /// file scope before them ([`tag_declarations`]).
+    forward_tags: Vec<String>,
     /// Exact public libjpeg decompressor lifecycle. `jpeg_read_header` cannot
     /// be called on a field-by-field synthesized `jpeg_decompress_struct`: the
     /// macro constructor, error manager, source manager, and ordered scanline
@@ -3333,6 +3339,12 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
             &args.c_runtime_include,
         )),
         emit_forward_declaration: !args.target_declared_in_header,
+        forward_tags: tag_declarations(
+            params
+                .iter()
+                .map(|param| param.c_type.as_str())
+                .chain([return_type.as_str()]),
+        ),
         params_decode: trace.decode,
         params_after: trace.after,
         params,
@@ -3457,6 +3469,7 @@ fn build_c_sequence_context_untraced(
                 &args.c_runtime_include,
             )),
             emit_forward_declaration: false,
+            forward_tags: Vec::new(),
             expert_jpeg_decompress,
             expert_sqlite_prepare,
             handle_type: String::new(),
@@ -3975,7 +3988,7 @@ fn build_c_sequence_context_untraced(
     };
     let op_ctrl_len = 1 + MAX_SEQUENCE_STEPS * 5 + usize::from(protocol_portfolio_lanes > 1);
 
-    Ok(CSequenceTemplateContext {
+    let mut context = CSequenceTemplateContext {
         arg_layout: crate::arg_layout::ArgLayout::new("c", "sequence", Vec::new()),
         harness_id: args.harness_id.clone(),
         target_includes: args.target_includes.clone(),
@@ -3991,6 +4004,7 @@ fn build_c_sequence_context_untraced(
             &args.c_runtime_include,
         )),
         emit_forward_declaration: !args.target_declared_in_header,
+        forward_tags: Vec::new(),
         expert_jpeg_decompress: false,
         expert_sqlite_prepare: false,
         handle_type: emit_c_type(&args.handle_type),
@@ -4019,7 +4033,65 @@ fn build_c_sequence_context_untraced(
         expert_output_drain,
         op_steps,
         end_step,
-    })
+    };
+    context.forward_tags = context.prototype_tags();
+    Ok(context)
+}
+
+impl CSequenceTemplateContext {
+    /// The `struct`/`union` tags the lifecycle prototypes the template emits
+    /// name (the handle, every step's return and parameter types, an output
+    /// drain's cleanup parameter).
+    fn prototype_tags(&self) -> Vec<String> {
+        let steps = self
+            .init_step
+            .iter()
+            .chain(&self.op_steps)
+            .chain(&self.mined_protocol_declarations)
+            .chain(&self.end_step);
+        let mut types = vec![self.handle_param_type.as_str()];
+        for step in steps {
+            types.push(step.return_type.as_str());
+            types.extend(step.params.iter().map(|param| param.c_type.as_str()));
+        }
+        if let Some(drain) = &self.expert_output_drain {
+            types.push(drain.cleanup_param_type.as_str());
+        }
+        tag_declarations(types)
+    }
+}
+
+/// The `struct` and `union` tags `types` name, as file-scope declarations
+/// (`struct widget_ctx`), each once, in the order first named.
+///
+/// A harness declares a target no header declares with its own prototype. A
+/// tag first named inside that prototype's parameter list is declared in the
+/// prototype's scope alone, a type distinct from the same tag the harness body
+/// names, so the call passes an incompatible pointer, which newer compilers
+/// reject. Declared at file scope first, both name one type; a tag a header
+/// already declared or defined is merely redeclared. (An `enum` cannot be
+/// declared without its enumerators in C, and is left out.)
+fn tag_declarations<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for ty in types {
+        let words: Vec<&str> = ty
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .collect();
+        for pair in words.windows(2) {
+            let (keyword, name) = (pair[0], pair[1]);
+            if matches!(keyword, "struct" | "union")
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && !matches!(name, "const" | "volatile" | "restrict")
+            {
+                let tag = format!("{keyword} {name}");
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+    }
+    tags
 }
 
 /// A deliberately narrow gate for the public libjpeg decompressor state
@@ -11847,6 +11919,100 @@ int main(void) {
             main.contains("(struct foo *)"),
             "the opaque pointer must be cast from a best-effort buffer:\n{main}"
         );
+    }
+
+    /// A target declared by the harness itself (no header names it) whose
+    /// parameters or return type are `struct`/`union` tags no header declares:
+    /// the tags are declared at file scope before the target's prototype, or
+    /// the prototype would declare them in its own scope, as types distinct
+    /// from the ones the harness body declares. Newer compilers reject the
+    /// call (`incompatible pointer types passing 'struct widget_ctx *' to
+    /// parameter of type 'struct widget_ctx *'`).
+    #[test]
+    fn a_target_prototype_declares_the_tags_it_names_at_file_scope() {
+        let clang_ok = std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !clang_ok {
+            eprintln!("skip: clang unavailable");
+            return;
+        }
+        let out = temp_dir("emit-force-tag-scope");
+        let mut args = direct_args("widget_feed", out.clone());
+        args.force = true;
+        args.params = vec![
+            CParameter {
+                name: "ctx".to_owned(),
+                c_type: "struct widget_ctx *".to_owned(),
+            },
+            CParameter {
+                name: "n".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.return_type = "union widget_word *".to_owned();
+        args.target.return_type = "union widget_word *".to_owned();
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        let prototype = main
+            .find("extern union widget_word * widget_feed(")
+            .unwrap_or_else(|| panic!("no prototype in:\n{main}"));
+        for tag in ["struct widget_ctx;", "union widget_word;"] {
+            assert!(
+                main.find(tag).is_some_and(|at| at < prototype),
+                "{tag} is not declared before the prototype:\n{main}"
+            );
+        }
+        let check = std::process::Command::new("clang")
+            .args([
+                "-fsyntax-only",
+                "-Werror=incompatible-pointer-types",
+                "-Werror=visibility",
+                "-I",
+            ])
+            .arg(result.main_c.parent().unwrap())
+            .arg("-I")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime"))
+            .arg(&result.main_c)
+            .output()
+            .expect("run clang");
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Every `struct`/`union` tag a prototype's types name, qualifiers,
+    /// pointers and function-pointer parameters included, once each; an
+    /// `enum` (which C cannot declare without its enumerators) and a plain
+    /// typedef name are not tags.
+    #[test]
+    fn tag_declarations_name_each_struct_and_union_tag_once() {
+        assert_eq!(
+            tag_declarations([
+                "const struct widget_ctx *",
+                "int (*)(struct widget_ctx *, union widget_word)",
+                "struct  widget_ctx**",
+                "enum widget_mode",
+                "widget_t *",
+                "size_t",
+                "volatile union widget_word *",
+                "struct widget_list *const *",
+            ]),
+            vec![
+                "struct widget_ctx",
+                "union widget_word",
+                "struct widget_list",
+            ]
+        );
+        assert!(tag_declarations(["int", "void *"]).is_empty());
     }
 
     #[test]

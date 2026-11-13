@@ -430,9 +430,11 @@ cmplog, and ASan all work natively on Windows.
 - bhf itself runs on Linux and Windows; macOS is not yet a target.
 - The **C/C++ lane** (including Visual Studio solutions) is the primary,
   most-exercised native-Windows path. Go emits a native binary and works with
-  `go` installed. Rust, Ada, COBOL, and Fortran also produce native binaries but
+  `go` installed. Ada, COBOL, and Fortran also produce native binaries but
   their Windows toolchain combinations are less exercised; validate them on a
-  representative target before relying on a campaign.
+  representative target before relying on a campaign. The Rust lane builds its
+  harness as a Unix static archive (`lib*.a`, linked with `libpthread` and
+  `libdl`) and does not build on native Windows yet; run it under WSL/Linux.
 - Java, Python, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently
   emit POSIX `main` launchers even though discovery is portable. Run those lanes
   under WSL/Linux for now; installing only the interpreter/JDK on native Windows

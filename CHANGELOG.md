@@ -5,6 +5,29 @@
 ## Unreleased
 
 ### Fixed
+- Windows: cartography, provenance, the capability profiler and coverage
+  replay no longer run a harness through `timeout`, which on Windows is the
+  console pause command and ran nothing: cartography mapped no finding and no
+  finding got a provenance label there. Each of these replays is bounded by
+  bhf itself (15 s), with coreutils `timeout` only as an extra guard where it
+  runs, so an input that loops (a byte cartography flips can do that) no
+  longer stalls `bhf cartography` on Windows or on a Unix host without
+  coreutils; a replay killed at that bound counts as unfinished: no crash
+  facts for cartography, no provenance verdict, and no capability or
+  coverage profile from a partial run.
+- Windows: bhf's coverage and comparison hooks in the harness and driver are
+  not AddressSanitizer-instrumented on Windows, where ASan calls them from its
+  interceptors before its shadow memory is set up; a harness built at `-O0`
+  or `-O2` (the differential lane) exited with an access violation before
+  `main`.
+- Windows: a library that lld-link or link.exe cannot open (`could not open
+  'x.lib'`, LNK1181) is reported as a missing library
+  (`needed_for_build.missing_libraries`), as GNU ld's `cannot find -lx` is.
+- A harness that declares its target itself (no header declares it) declares
+  the `struct`/`union` tags the prototype names at file scope first. Named
+  only inside the prototype, a tag was a type of its own, distinct from the
+  one the harness body declares, and newer compilers (GCC 14, recent clang)
+  rejected the call as passing an incompatible pointer.
 - Windows: the generated Makefiles no longer pass `-Wl,--gc-sections` to an
   MSVC-style linker, which ignored it with a warning (lld-link's `ignoring
   unknown argument '--gc-sections'`, link.exe's LNK4044). Each lane's link
@@ -1018,6 +1041,12 @@
   `build_error`, `portable`, `portability` and `other_crash`, and its `sink`
   names the file as the capsule ships it (relative to the scanned tree or the
   work dir when it does not ship), not the absolute host path.
+- The Windows CI job runs the integration suites of the native Windows paths
+  (harness lanes, Visual Studio import, quoted build inputs, spaced paths,
+  capsules, explain, cartography, provenance) and every integration test of
+  the other crates, with a 120-minute budget. Tests that hold only on Unix are
+  gated in the source; the Rust lane's capsule round trips are ignored on
+  Windows, where that lane does not build harnesses yet (documented).
 - The C/C++ harness input format is now version 4: a call with several
   buffers, a count named as above, a pointer-typedef buffer or a parameter
   named like a harness local decodes differently from format 3. Regenerate

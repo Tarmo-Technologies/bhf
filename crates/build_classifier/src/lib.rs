@@ -956,6 +956,36 @@ main.exe : fatal error LNK1120: 4 unresolved externals\r\n";
         );
     }
 
+    /// The MSVC-style linkers name a library `-l<name>` asked for as the
+    /// `<name>.lib` they could not open: lld-link (`could not open
+    /// 'x.lib': no such file or directory`) and link.exe (LNK1181).
+    #[test]
+    fn missing_shared_lib_msvc_linker_forms() {
+        for stderr in [
+            "lld-link: error: could not open 'hiredis.lib': no such file or directory\n",
+            "LINK : fatal error LNK1181: cannot open input file 'hiredis.lib'\r\n",
+            "lld-link: error: could not open 'C:/vendor/lib/hiredis.lib': no such file or directory\n",
+        ] {
+            let kinds = classify(stderr);
+            assert!(
+                kinds.iter().any(|k| matches!(
+                    k,
+                    BuildErrorKind::MissingSharedLib { name } if name == "hiredis"
+                )),
+                "{stderr:?}: got {kinds:?}"
+            );
+        }
+        // An object file that cannot be opened is no library.
+        let kinds =
+            classify("lld-link: error: could not open 'main.obj': no such file or directory\n");
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, BuildErrorKind::MissingSharedLib { .. })),
+            "got {kinds:?}"
+        );
+    }
+
     #[test]
     fn missing_type_clang_form() {
         let stderr = "main.c:5:1: error: unknown type name 'Widget'\nWidget x;\n^\n";

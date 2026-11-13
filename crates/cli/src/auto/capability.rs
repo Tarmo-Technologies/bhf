@@ -219,12 +219,13 @@ fn replay_into(
         // (run without the shim's symbolizer scoping in this post-hoc replay), which
         // would wedge the whole capability pass on the first crashing input.
         .env("ASAN_OPTIONS", "abort_on_error=0:exitcode=0:symbolize=0");
-    let completed = crate::command_output::output_with_timeout(
+    // A replay cut off at its bound (by the `timeout` wrapper, or by bhf where
+    // none runs) is not a completed profile of the input.
+    let completed = crate::command_output::bounded_replay_output(
         &mut command,
         std::time::Duration::from_secs(15),
     )
-    .map(|output| !matches!(output.status.code(), Some(124 | 137)))
-    .unwrap_or(false);
+    .is_ok_and(|(_, cut_off)| !cut_off);
     let mut events = runtrace::parse_log(&log).unwrap_or_default();
     runtrace::dedupe_in_place(&mut events);
     let _ = std::fs::remove_file(&log);
@@ -255,16 +256,13 @@ fn fold_capabilities(events: &[RuntraceEvent], input: &Path, caps: &mut BTreeSet
     }
 }
 
-/// Build the replay command, wrapping in `timeout` when available so a
-/// pathological corpus input can never wedge the profiling pass.
+/// Build the replay command, killed after 10 s
+/// ([`crate::command_output::killed_after`]) where a coreutils `timeout` runs
+/// and at the 15 s bound of [`crate::command_output::bounded_replay_output`]
+/// everywhere, so a pathological corpus input can never wedge the profiling
+/// pass.
 fn replay_command(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        cmd
-    } else {
-        Command::new(bin)
-    }
+    crate::command_output::killed_after(bin, 10)
 }
 
 /// Map a runtrace event to a security-relevant capability, or `None` for noise.

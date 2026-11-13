@@ -435,8 +435,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: windows-2022
-    # The full unit-test suite and clippy run before the release build.
-    timeout-minutes: 90
+    # The full unit-test suite, clippy and the Windows integration suites run
+    # before the release build.
+    timeout-minutes: 120
     env:
       BHF_RELEASE_VERSION: "1"
       BHF_VCS_REF: ${{ github.sha }}
@@ -463,6 +464,21 @@ jobs:
         shell: pwsh
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The integration suites of the native Windows paths: the clang and
+      # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
+      # paths, capsules, explain, cartography and provenance, plus every
+      # integration test of the other crates. A test that only holds on Unix
+      # is cfg-gated in the source. bhf's other integration suites run on
+      # Linux (build-test's smoke subset per change, all of them nightly);
+      # build_recovery builds a release bhf of its own and stays off this job.
+      - name: Test the Windows integration suites
+        shell: pwsh
+        run: |
+          cargo test --locked --workspace --exclude bhf --test '*' --no-fail-fast
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p bhf --no-fail-fast --test auto_msbuild_import --test auto_force_win32 --test auto_makefile_injection --test auto_spaced_paths --test auto_force_params --test auto_peripheral_sequence --test capsule_cli --test capsule_lanes_cli --test cartography_cli --test explain_cli --test provenance_cli
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test portable scheduler runtime reliability

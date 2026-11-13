@@ -216,6 +216,27 @@ pub(crate) fn run_target_beside_binary(command: &mut Command, binary: &std::path
     }
 }
 
+/// A command that runs `binary`, killed after `seconds` by coreutils `timeout`
+/// where that is on `PATH`. Callers run it with [`bounded_replay_output`],
+/// whose bound is the only one where no wrapper runs; the wrapper makes sure
+/// the binary itself dies (`timeout` signals the program it execs). Never on
+/// Windows: `timeout` there is the console pause command
+/// (`System32\timeout.exe`), which rejects `-s KILL` and runs nothing, so a
+/// replay through it saw no crash at all.
+pub(crate) fn killed_after(binary: &std::path::Path, seconds: u32) -> Command {
+    if cfg!(unix) && which::which("timeout").is_ok() {
+        let mut command = Command::new("timeout");
+        command
+            .arg("-s")
+            .arg("KILL")
+            .arg(seconds.to_string())
+            .arg(binary);
+        command
+    } else {
+        Command::new(binary)
+    }
+}
+
 /// Run a command to completion with INHERITED stdio (so compiler output still
 /// streams to the terminal), bounded by the same campaign clamp as
 /// [`output_with_timeout`], in its own process group so a timeout kills the
@@ -286,6 +307,22 @@ pub(crate) fn output_with_timeout_flagged(
 ) -> io::Result<(Output, bool)> {
     capture_with_timeout(command, clamp_to_campaign(timeout), max_stream_bytes())
         .map(|captured| (captured.output, captured.timed_out))
+}
+
+/// Run a [`killed_after`] command bounded by `timeout`, which should exceed
+/// the wrapper's seconds; the flag is true when the run was CUT OFF rather
+/// than finished: killed at `timeout` (the only bound on Windows, or on a Unix
+/// host without coreutils `timeout`, where the killed child's status is an
+/// ordinary failure or a signal), or by the wrapper (exit 124, or 137 for its
+/// SIGKILL). A cut-off replay saw only part of what the input does, so it
+/// stands for no crash, coverage or behaviour.
+pub(crate) fn bounded_replay_output(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<(Output, bool)> {
+    let (output, timed_out) = output_with_timeout_flagged(command, timeout)?;
+    let wrapper_killed = cfg!(unix) && matches!(output.status.code(), Some(124 | 137));
+    Ok((output, timed_out || wrapper_killed))
 }
 
 /// As [`output_with_timeout`], but the child's stdout and stderr are also
@@ -378,6 +415,68 @@ fn capture_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replay bounded by [`killed_after`] runs the binary: through coreutils
+    /// `timeout` on Unix, directly on Windows, where `timeout` is the console
+    /// pause command and ran nothing. The test binary lists its own tests.
+    #[test]
+    fn a_command_killed_after_a_timeout_runs_the_binary() {
+        let binary = std::env::current_exe().unwrap();
+        let mut command = killed_after(&binary, 30);
+        if cfg!(unix) && which::which("timeout").is_ok() {
+            assert_eq!(command.get_program(), "timeout");
+        } else {
+            assert_eq!(command.get_program(), binary.as_os_str());
+        }
+        let output = output_with_timeout(
+            command.args(["--list", "a_command_killed_after_a_timeout_runs_the_binary"]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("a_command_killed_after_a_timeout_runs_the_binary"),
+            "{output:?}"
+        );
+    }
+
+    /// A replay killed at bhf's own bound is cut off, not finished: with no
+    /// `timeout` wrapper (Windows, or a Unix host without coreutils) the
+    /// killed child's status is an ordinary failure (Windows) or a signal
+    /// (Unix), neither of which is the wrapper's 124 or 137.
+    #[test]
+    fn a_replay_killed_at_its_bound_is_cut_off() {
+        let mut sleeper = if cfg!(windows) {
+            let mut ping = Command::new("ping");
+            ping.args(["-n", "30", "127.0.0.1"]);
+            ping
+        } else {
+            let mut sleep = Command::new("sleep");
+            sleep.arg("30");
+            sleep
+        };
+        let started = Instant::now();
+        let (output, cut_off) =
+            bounded_replay_output(&mut sleeper, Duration::from_millis(500)).unwrap();
+        assert!(cut_off, "{output:?}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{output:?}");
+    }
+
+    /// Where the coreutils wrapper runs, its timeout statuses (124, and 137
+    /// for `-s KILL`) cut the replay off; any other exit is a finished run.
+    #[test]
+    #[cfg(unix)]
+    fn a_replay_the_timeout_wrapper_killed_is_cut_off() {
+        for (code, cut) in [(124, true), (137, true), (1, false), (0, false)] {
+            let (output, cut_off) = bounded_replay_output(
+                Command::new("sh").args(["-c", &format!("exit {code}")]),
+                Duration::from_secs(20),
+            )
+            .unwrap();
+            assert_eq!(cut_off, cut, "exit {code}: {output:?}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]

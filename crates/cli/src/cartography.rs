@@ -271,16 +271,20 @@ fn traced_args(bin: &Path, input: &[u8]) -> Vec<corpus::decoded_args::TracedArg>
     if std::fs::write(&scratch, input).is_err() {
         return Vec::new();
     }
-    let out = replay_command(&bin)
-        .arg(&scratch)
-        .env(
-            "ASAN_OPTIONS",
-            "abort_on_error=1:symbolize=0:detect_leaks=0",
-        )
-        .env(corpus::decoded_args::TRACE_ARGS_ENV, "1")
-        .output();
+    // A run cut off at its bound still printed the trace, which the harness
+    // writes before it calls the target.
+    let out = crate::command_output::bounded_replay_output(
+        replay_command(&bin)
+            .arg(&scratch)
+            .env(
+                "ASAN_OPTIONS",
+                "abort_on_error=1:symbolize=0:detect_leaks=0",
+            )
+            .env(corpus::decoded_args::TRACE_ARGS_ENV, "1"),
+        REPLAY_BOUND,
+    );
     let _ = std::fs::remove_file(&scratch);
-    let Ok(out) = out else {
+    let Ok((out, _)) = out else {
         return Vec::new();
     };
     let args = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&out.stderr));
@@ -394,8 +398,12 @@ fn classify_variants(
 /// `symbolize=0` is load-bearing: the coverage-instrumented `main` otherwise hangs
 /// in the ASan crash symbolizer (llvm-symbolizer, run without the shim here), and
 /// the memory-locator line we parse (`located N bytes after region`) is emitted by
-/// ASan's shadow analysis, NOT symbolization, so it survives. A `timeout` wrapper
-/// is a belt-and-suspenders guard against an input that genuinely loops.
+/// ASan's shadow analysis, NOT symbolization, so it survives.
+///
+/// An input that loops (a flipped length or count byte can do that) is killed
+/// at [`REPLAY_BOUND`] and stands for no crash: the run is bounded by bhf
+/// itself, as no `timeout` wrapper runs on Windows or on a host without
+/// coreutils.
 ///
 /// The replay runs beside the binary, so the binary and the scratch input are
 /// made absolute first: a relative `--work-dir` would otherwise resolve against
@@ -405,29 +413,36 @@ fn replay_facts(bin: &Path, input: &[u8]) -> Option<CrashFacts> {
     let dir = bin.parent()?;
     let scratch = dir.join("cart_input.bin");
     std::fs::write(&scratch, input).ok()?;
-    let out = replay_command(&bin)
-        .arg(&scratch)
-        .env(
+    let out = crate::command_output::bounded_replay_output(
+        replay_command(&bin).arg(&scratch).env(
             "ASAN_OPTIONS",
             "abort_on_error=1:symbolize=0:detect_leaks=0",
-        )
-        .output()
-        .ok()?;
+        ),
+        REPLAY_BOUND,
+    );
     let _ = std::fs::remove_file(&scratch);
+    let (out, cut_off) = out.ok()?;
+    if cut_off {
+        return None;
+    }
     let stderr = String::from_utf8_lossy(&out.stderr);
     parse_crash(&stderr)
 }
 
-/// Build the replay command, wrapping in `timeout` when it is available so a
-/// pathological input can never wedge the analysis.
+/// How long one cartography replay may run: past the 10 s of the `timeout`
+/// wrapper ([`replay_command`]) where one runs, the only bound where none
+/// does.
+const REPLAY_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Build the replay command, killed after 10 s ([`killed_after`]) where a
+/// coreutils `timeout` runs; callers run it with
+/// [`bounded_replay_output`] and [`REPLAY_BOUND`], so a pathological input
+/// can never wedge the analysis.
+///
+/// [`killed_after`]: crate::command_output::killed_after
+/// [`bounded_replay_output`]: crate::command_output::bounded_replay_output
 fn replay_command(bin: &Path) -> Command {
-    let mut cmd = if which::which("timeout").is_ok() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        cmd
-    } else {
-        Command::new(bin)
-    };
+    let mut cmd = crate::command_output::killed_after(bin, 10);
     crate::command_output::run_target_beside_binary(&mut cmd, bin);
     disable_address_randomization(&mut cmd);
     cmd

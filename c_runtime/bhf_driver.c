@@ -137,7 +137,16 @@ void __asan_on_error(void) {
  * `no_sanitize_coverage`; clang spells it `no_sanitize("coverage")`. */
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(_WIN32)
+/* On Windows AddressSanitizer's interceptors call the comparison hooks
+ * below before the program starts, while its shadow memory is still being
+ * set up, so an instrumented hook faulted there and the process died before
+ * main (a clean input exited with an access violation). They are not
+ * address-checked: they read only the bytes the compare read. */
+#define BHF_NOCOV __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOCOV __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)

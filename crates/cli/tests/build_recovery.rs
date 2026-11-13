@@ -339,6 +339,27 @@ fn skip_scenario_for_toolchain(scenario: &Scenario) -> Option<&'static str> {
     if scenario.fixture.starts_with("ada_") && which::which("gnatmake").is_err() {
         return Some("gnatmake not on PATH");
     }
+    // The miniz fixtures call POSIX APIs (<dlfcn.h>, <sys/socket.h>,
+    // <unistd.h>) so that one input reaches every runtime bucket; they do not
+    // build on Windows.
+    if cfg!(windows) && scenario.fixture.starts_with("miniz") {
+        return Some("the fixture uses POSIX-only headers");
+    }
+    // The runtime buckets (missing files, network endpoints, dlopen failures,
+    // faked environment variables) are what the LD_PRELOAD runtrace shim
+    // observes, and the shim is Linux-only.
+    let runtime = scenario.missing.iter().any(|entry| {
+        matches!(
+            entry,
+            Missing::RuntimeFile { .. }
+                | Missing::RuntimeEndpoint { .. }
+                | Missing::RuntimeDlopen { .. }
+                | Missing::EnvVar { .. }
+        )
+    });
+    if runtime && !cfg!(target_os = "linux") {
+        return Some("the runtrace shim that observes runtime buckets is Linux-only");
+    }
     None
 }
 

@@ -111,13 +111,24 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
             .is_some_and(|h| h.starts_with("42"))),
         "the 'B' of BOOM reached a comparison: {gates:?}"
     );
-    // The environment: the shim served getenv APP_MODE to this input's own replay.
-    assert!(
-        text.contains(
-            "FAKED ENVIRONMENT  (observed while replaying min_testcase.bin with the runtrace shim)"
-        ) && text.contains("APP_MODE"),
-        "missing faked-env timeline:\n{text}"
-    );
+    // The environment: the shim served getenv APP_MODE to this input's own
+    // replay. The runtrace shim is an LD_PRELOAD library, so elsewhere explain
+    // says the environment was not observed.
+    if cfg!(target_os = "linux") {
+        assert!(
+            text.contains(
+                "FAKED ENVIRONMENT  (observed while replaying min_testcase.bin with the runtrace shim)"
+            ) && text.contains("APP_MODE"),
+            "missing faked-env timeline:\n{text}"
+        );
+    } else {
+        assert!(
+            text.contains(
+                "FAKED ENVIRONMENT\n  environment not observed (runtrace shim not loaded)"
+            ),
+            "the environment must be said unobserved:\n{text}"
+        );
+    }
     // Reproduce hooks wire into the capsule feature.
     assert!(
         text.contains("bhf verify-poc"),
@@ -154,7 +165,7 @@ fn explain_suggests_only_reproduce_commands_that_apply() {
     let work = root.path().join("work");
     let id = "F-0001-0000aaaa";
     let harness_id = "H-A0003-0000ABCD";
-    let finding_dir = work.join("results/findings").join(id);
+    let finding_dir = work.join("results").join("findings").join(id);
     std::fs::create_dir_all(&finding_dir).unwrap();
     std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
     std::fs::write(finding_dir.join("replay.py"), b"print('replay')\n").unwrap();
@@ -195,11 +206,16 @@ fn explain_suggests_only_reproduce_commands_that_apply() {
     assert!(!reproduce.contains("bhf capsule --work-dir"), "{reproduce}");
     assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
     assert!(reproduce.contains("Ada"), "says why: {reproduce}");
+    // In the host shell's own spelling: PowerShell quotes the path, and the
+    // Windows interpreter is `python`.
+    let replay = finding_dir.join("replay.py");
+    let command = if cfg!(windows) {
+        format!("python '{}'", replay.display())
+    } else {
+        format!("python3 {}", replay.display())
+    };
     assert!(
-        reproduce.contains(&format!(
-            "python3 {}",
-            finding_dir.join("replay.py").display()
-        )),
+        reproduce.contains(&command),
         "a working alternative: {reproduce}"
     );
 }

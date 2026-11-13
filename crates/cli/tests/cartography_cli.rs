@@ -178,7 +178,13 @@ fn cartography_maps_the_bytes_that_set_a_cpp_segv_faulting_address() {
     );
     let card: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fdir.join("byte-control.json")).unwrap()).unwrap();
-    assert_eq!(card["crash"]["class"], "SEGV", "{card}");
+    // The crash class is the sanitizer's own word for the fault.
+    let class = if cfg!(windows) {
+        "access-violation"
+    } else {
+        "SEGV"
+    };
+    assert_eq!(card["crash"]["class"], class, "{card}");
     let classes: Vec<&str> = card["bytes"]
         .as_array()
         .unwrap()
@@ -200,6 +206,116 @@ fn cartography_maps_the_bytes_that_set_a_cpp_segv_faulting_address() {
             .iter()
             .any(|b| b.as_u64() == Some(0)),
         "{card}"
+    );
+}
+
+/// `parse_record` reads past a 16-byte heap block for any input of two bytes
+/// or more (byte 0 sets the offset), except that it spins forever when byte 1
+/// is 0xC3 and `WIDGET_SPIN` is set. The variable is set only for the
+/// cartography run, so the fuzz campaign never meets the loop.
+const SPINS_ON_A_PERTURBED_BYTE_C: &str = "\
+#include <stdlib.h>
+#include <string.h>
+int parse_record(const char *data, unsigned int len) {
+    if (len < 2) return 0;
+    if ((unsigned char)data[1] == 0xC3 && getenv(\"WIDGET_SPIN\")) {
+        volatile int spin = 1;
+        while (spin) {}
+    }
+    char *buf = malloc(16);
+    memset(buf, 0, 16);
+    unsigned idx = 16 + ((unsigned char)data[0] % 8);
+    char r = buf[idx];
+    free(buf);
+    return r;
+}
+";
+
+/// Every replay cartography runs is bounded by bhf itself, not only by a
+/// coreutils `timeout` on `PATH` (none on Windows, where `timeout` is the
+/// console pause command, and none here on Unix): flipping byte 1 of the
+/// crash input (0x3C ^ 0xFF) makes the target loop, and the analysis must
+/// still finish and map the offset byte.
+#[test]
+fn cartography_finishes_when_a_perturbed_input_loops() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let src = root.path().join("parse_record.c");
+    std::fs::write(&src, SPINS_ON_A_PERTURBED_BYTE_C).unwrap();
+    let snip = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("snippet")
+        .arg(&src)
+        .args(["--lang", "c", "--per-target-time", "6", "--work-dir"])
+        .arg(&work)
+        .env_remove("WIDGET_SPIN")
+        .output()
+        .expect("run snippet");
+    let fdir = find_finding(&work).unwrap_or_else(|| {
+        panic!(
+            "snippet produced no crash: {}",
+            String::from_utf8_lossy(&snip.stderr)
+        )
+    });
+    // A crash input whose byte 1 turns into 0xC3 under the 0xFF flip.
+    let _ = std::fs::remove_file(fdir.join("min_testcase.bin"));
+    std::fs::write(fdir.join("testcase.bin"), [0x00, 0x3C]).unwrap();
+
+    let stdout_path = root.path().join("cartography.out");
+    let stderr_path = root.path().join("cartography.err");
+    let mut carto = Command::new(env!("CARGO_BIN_EXE_bhf"));
+    carto
+        .arg("cartography")
+        .arg("--work-dir")
+        .arg(&work)
+        .env("WIDGET_SPIN", "1")
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
+    if cfg!(unix) {
+        // No `timeout` to fall back on: the replays need nothing from PATH.
+        let empty = root.path().join("empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        carto.env("PATH", &empty);
+    }
+    let mut child = carto.spawn().expect("run cartography");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "cartography did not finish in 120 s: a replay of a looping input is unbounded; \
+                 stderr:\n{}",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        status.success(),
+        "cartography must map the finding; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let card: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fdir.join("byte-control.json")).unwrap()).unwrap();
+    assert_eq!(
+        card["primitive"]["kind"], "controlled_relative_read",
+        "{card}"
+    );
+    assert!(
+        card["primitive"]["controlling_bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_u64() == Some(0)),
+        "byte 0 sets the read offset: {card}"
     );
 }
 
