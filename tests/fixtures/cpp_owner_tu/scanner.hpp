@@ -12,7 +12,7 @@ inline int scan_bytes(const unsigned char *data, std::size_t len) {
     }
     if (data[0] == 'G') {
         unsigned char window[ScannerLimit];
-        // Planted out-of-bounds read (BHF-201 / CWE-125).
+        // Planted out-of-bounds read: an array index out of bounds (BHF-220).
         return static_cast<int>(window[len]);
     }
     return static_cast<int>(len);

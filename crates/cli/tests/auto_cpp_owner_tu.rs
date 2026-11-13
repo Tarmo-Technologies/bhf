@@ -89,11 +89,27 @@ fn a_target_in_a_non_self_contained_header_builds_via_its_owner_tu() {
 
     // The planted out-of-bounds read sits behind a byte gate inside the header's
     // function, so finding it proves the header was really compiled and driven —
-    // not merely that something linked.
+    // not merely that something linked. The read indexes a fixed-size array, so
+    // UndefinedBehaviorSanitizer's array-index check reports it (and halts) before
+    // AddressSanitizer sees the access: BHF-220, array index out of bounds.
     let json = std::fs::read_to_string(work.join("results/findings.json")).unwrap_or_default();
-    assert!(
-        json.contains("BHF-201"),
-        "the out-of-bounds read in the header target must be found:\n{json}\n{combined}"
+    let findings: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+    let planted = findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|finding| {
+            finding["location"]["function"] == "scan_bytes"
+                && finding["location"]["file"]
+                    .as_str()
+                    .is_some_and(|file| file.ends_with("scanner.hpp"))
+        })
+        .unwrap_or_else(|| {
+            panic!("the out-of-bounds read in the header target must be found:\n{json}\n{combined}")
+        });
+    assert_eq!(
+        planted["rule"]["id"], "BHF-220",
+        "the planted read is an out-of-bounds array index:\n{planted}"
     );
 
     // The enumerator veto. `scan_twice` does not build here — its harness includes
