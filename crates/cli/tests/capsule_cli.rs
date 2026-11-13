@@ -1236,6 +1236,11 @@ fn cpp_capsule_rebuilds_where_the_compiler_misses_the_standard_headers() {
 /// gcc and gcc's sanitizer flags, whether or not `$CC` is set when it is
 /// packaged or verified (the compiler is read off the harness binary).
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "gcc has no sanitizer runtime on Windows, where C harnesses build with clang or \
+              cl; see docs/site/windows.md"
+)]
 fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
     if which::which("gcc").is_err() {
         eprintln!("skipping: gcc not installed");
@@ -1305,6 +1310,52 @@ fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
             String::from_utf8_lossy(&verified.stderr)
         );
     }
+}
+
+/// On native Windows a C target whose compiler is gcc is refused, naming the
+/// compiler and what to use instead: GCC has no sanitizer runtime there, and
+/// the build would fail at the link in words that read like a missing header.
+#[cfg(windows)]
+#[test]
+fn a_gcc_compiler_is_refused_for_c_on_native_windows() {
+    if which::which("gcc").is_err() {
+        eprintln!("skipping: gcc not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("parse_header.c"), OVERFLOW_C).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "2", "--no-discovery-cache"])
+        .env("CC", "gcc")
+        .output()
+        .expect("run bhf auto");
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).unwrap_or_else(|error| {
+            panic!(
+                "run.json: {error}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }),
+    )
+    .unwrap();
+    let outcome = &report["targets"][0]["outcome"];
+    assert_eq!(outcome["outcome"], "report_only", "{outcome}");
+    assert_eq!(
+        outcome["reason"],
+        "CC=gcc is GCC, which ships no AddressSanitizer or UBSan runtime on Windows, and the \
+         harness links both: build C and C++ harnesses with clang or cl (`--cc cl`) on native \
+         Windows, pass `--sanitizers none` for a crash-only gcc build, or run under WSL (see \
+         docs/site/windows.md) — discovered and statically analyzed, not fuzzed",
+        "{outcome}"
+    );
 }
 
 /// A launcher in front of the compiler (`CXX="ccache clang++"`) works for

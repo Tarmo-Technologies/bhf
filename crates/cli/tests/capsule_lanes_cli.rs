@@ -285,6 +285,10 @@ def _walk(data, depth):
 /// A Python capsule round-trips; verify-poc names the interpreter it needs
 /// when that is missing.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Python runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn python_finding_round_trips_and_names_a_missing_interpreter() {
     skip_unless!(runs("python3", &["--version"]), "python3 not installed");
     let run = Run::new(&[("record_parser.py", PYTHON_TARGET)]);
@@ -318,6 +322,10 @@ fn python_finding_round_trips_and_names_a_missing_interpreter() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn javascript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     let run = Run::new(&[(
@@ -333,6 +341,10 @@ fn javascript_finding_round_trips() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "TypeScript runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn typescript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     let run = Run::new(&[(
@@ -348,6 +360,10 @@ fn typescript_finding_round_trips() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Ruby runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn ruby_finding_round_trips() {
     skip_unless!(runs("ruby", &["--version"]), "ruby not installed");
     let run = Run::new(&[(
@@ -362,6 +378,10 @@ fn ruby_finding_round_trips() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Perl runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn perl_finding_round_trips() {
     skip_unless!(runs("perl", &["-v"]), "perl not installed");
     let run = Run::new(&[(
@@ -377,6 +397,10 @@ fn perl_finding_round_trips() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn php_finding_round_trips() {
     skip_unless!(runs("php", &["--version"]), "php not installed");
     let run = Run::new(&[(
@@ -388,6 +412,49 @@ fn php_finding_round_trips() {
         .auto("php", 6, &[])
         .expect("bhf auto must find the crash");
     run.round_trip(&id, "php");
+}
+
+/// On native Windows a lane that runs under WSL there is refused up front,
+/// whether or not its interpreter is installed: the toolchain check says so
+/// and the target is reported static-only with the reason, instead of
+/// failing in its launcher in words that read like a missing module.
+#[cfg(windows)]
+#[test]
+fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
+    let run = Run::new(&[(
+        "parser.php",
+        "<?php\nfunction parse_record(string $text): int {\n    \
+         return intdiv(1000, strlen($text));\n}\n",
+    )]);
+    let out = run
+        .bhf()
+        .arg("auto")
+        .arg(&run.src)
+        .arg("--work-dir")
+        .arg(&run.work)
+        .args(["--languages", "php", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "2", "--no-discovery-cache"])
+        .output()
+        .expect("run bhf auto");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "PHP    (1 targets): NOT ON NATIVE WINDOWS — its harness launcher is a POSIX shell \
+             script; the lane runs under WSL (see docs/site/windows.md)"
+        ),
+        "{stderr}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.work.join("auto/run.json")).unwrap()).unwrap();
+    let outcome = &report["targets"][0]["outcome"];
+    assert_eq!(outcome["outcome"], "report_only", "{outcome}");
+    assert_eq!(
+        outcome["reason"],
+        "the PHP lane does not run on native Windows (its harness launcher is a POSIX shell \
+         script); run it under WSL (see docs/site/windows.md) — discovered and statically \
+         analyzed, not fuzzed",
+        "{outcome}"
+    );
 }
 
 // Builds a PATH of symlinks into /usr/bin.
@@ -776,6 +843,10 @@ fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn java_finding_round_trips() {
     skip_unless!(
         runs("javac", &["-version"]) && runs("java", &["-version"]),
@@ -966,6 +1037,11 @@ fn cobol_finding_round_trips() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Fortran runs under WSL on Windows (MinGW-w64's GCC has no AddressSanitizer \
+              runtime); see docs/site/windows.md"
+)]
 fn fortran_finding_round_trips_from_source() {
     skip_unless!(
         runs("gfortran", &["--version"]) && runs("clang", &["--version"]),
@@ -997,6 +1073,10 @@ fn fortran_finding_round_trips_from_source() {
 /// SharpFuzz.Common.dll and the launcher) from the SharpFuzz command-line
 /// tool's own copy of the assembly.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn csharp_harness_round_trips() {
     skip_unless!(
         runs("dotnet", &["--version"]),
@@ -1038,6 +1118,10 @@ fn csharp_harness_round_trips() {
 /// packed by the test into a local feed dir, which fills a package cache of
 /// the test's own without the network.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn csharp_finding_with_a_cached_package_round_trips_vendored() {
     skip_unless!(
         runs("dotnet", &["--version"]),

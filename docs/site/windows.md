@@ -429,16 +429,29 @@ cmplog, and ASan all work natively on Windows.
 
 - bhf itself runs on Linux and Windows; macOS is not yet a target.
 - The **C/C++ lane** (including Visual Studio solutions) is the primary,
-  most-exercised native-Windows path. Go emits a native binary and works with
-  `go` installed. Ada, COBOL, and Fortran also produce native binaries but
-  their Windows toolchain combinations are less exercised; validate them on a
-  representative target before relying on a campaign. The Rust lane builds its
-  harness as a Unix static archive (`lib*.a`, linked with `libpthread` and
-  `libdl`) and does not build on native Windows yet; run it under WSL/Linux.
+  most-exercised native-Windows path. It builds with clang or cl: GCC
+  (MinGW-w64's, Cygwin's, MSYS2's) ships no AddressSanitizer or UBSan runtime
+  on Windows, and the harness links both, so a C or C++ target whose `CC` or
+  `CXX` is gcc is refused there, naming the compiler, and reported static-only
+  (discovered and statically analyzed, not fuzzed), unless `--sanitizers none`
+  asks for a crash-only build without them. Go emits a native binary
+  and works with `go` installed; a Go capsule rebuilds through `build.sh`, so
+  `bhf verify-poc` needs a POSIX `sh` on `PATH` (Git for Windows' will do).
+  Ada and COBOL also produce native binaries but their Windows toolchain
+  combinations are less exercised; validate them on a representative target
+  before relying on a campaign. The Rust lane builds its harness as a Unix
+  static archive (`lib*.a`, linked with `libpthread` and `libdl`) and does not
+  build on native Windows yet; run it under WSL/Linux. The Fortran lane's
+  crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC, the
+  Windows gfortran, ships no sanitizer runtime; run it under WSL/Linux.
 - Java, Python, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently
   emit POSIX `main` launchers even though discovery is portable. Run those lanes
   under WSL/Linux for now; installing only the interpreter/JDK on native Windows
-  is not sufficient. A missing toolchain still skips cleanly.
+  is not sufficient.
+- On native Windows `bhf auto` refuses the lanes that run under WSL (those
+  above, Rust and Fortran) whatever is installed: its toolchain check marks
+  each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are
+  reported static-only with that reason, pointing at WSL.
 - The persistent fork-server + coverage-guided engine run on Windows the same as
   on Linux (shared-memory coverage via Win32 file mapping).
 - The LD_PRELOAD runtrace shim is Linux-only (an empty stub on Windows), so the

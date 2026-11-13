@@ -1441,6 +1441,22 @@ pub fn attempt(
     )
 }
 
+/// `candidate` discovered and statically analyzed but not fuzzed, for `reason`.
+fn report_only_attempt(
+    candidate: &Candidate,
+    work_dir: &Path,
+    reason: String,
+) -> Result<AttemptResult> {
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, &candidate.harness_id);
+    std::fs::create_dir_all(&harness_dir)?;
+    let outcome = crate::auto::report_only::emit_report_only(candidate, reason, work_dir);
+    Ok(AttemptResult {
+        candidate: candidate.clone(),
+        outcome,
+        harness_dir,
+    })
+}
+
 pub fn attempt_with_progress(
     candidate: &Candidate,
     work_dir: &Path,
@@ -1460,6 +1476,13 @@ fn attempt_unclassified(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
+    // A lane that does not run on native Windows (it runs under WSL there) is
+    // refused up front with that reason, rather than failing later in its build
+    // or its launcher in words that read like a missing module or a compile
+    // error.
+    if let Some(reason) = crate::auto::preflight::native_windows_refusal(candidate.lang) {
+        return report_only_attempt(candidate, work_dir, reason);
+    }
     if !options.run_untrusted
         && matches!(
             candidate.lang,
@@ -2922,6 +2945,29 @@ fn run_attempt(
         }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
+    // GCC has no sanitizer runtime on Windows, so a native C or C++ build with
+    // it fails at the link (`cannot read spec file 'libsanitizer.spec'`), which
+    // the build classifier would read as a missing header. Refuse it, naming
+    // the compiler, unless the operator asked for no sanitizers.
+    if cfg!(windows)
+        && candidate_is_c_family
+        && cross_compiler.is_none()
+        && !matches!(options.sanitizers, multicore_fuzz::SanitizerSelection::None)
+    {
+        let cxx = matches!(candidate.lang, crate::auto::candidate::Lang::Cpp);
+        let compilers = crate::toolchain::effective_compilers();
+        let (env_var, compiler) = if cxx {
+            ("CXX", &compilers.cxx)
+        } else {
+            ("CC", &compilers.cc)
+        };
+        if crate::toolchain::compiler_family(compiler, cxx)
+            == Some(harness_gen::compiler_family::CompilerFamily::Gcc)
+        {
+            let reason = crate::auto::preflight::windows_gcc_refusal(env_var, compiler);
+            return report_only_attempt(candidate, work_dir, reason);
+        }
+    }
     let cross_runner = match &strategy {
         ForeignStrategy::Cross(target) => Some(cross_harness_wrapper(target)),
         // An Ada harness built for a target this host cannot run goes through
@@ -6643,6 +6689,8 @@ fn try_build_c(
         && cross_compiler.is_none()
         && matches!(sanitizers, SanitizerSelection::Default)
         && !c_compiler_cache_path(work_dir).exists()
+        // GCC links no sanitizer runtime on Windows: it cannot build this.
+        && !cfg!(windows)
         && which::which("gcc").is_ok()
     {
         let alternate = gcc_fallback_override();
