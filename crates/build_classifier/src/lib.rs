@@ -943,6 +943,32 @@ main.exe : fatal error LNK1120: 4 unresolved externals\r\n";
         );
     }
 
+    /// gcc's driver names a spec file it cannot read (a sanitizer's, when the
+    /// runtime is not installed: MinGW's gcc has none) in the words of a
+    /// missing header. It is not one, and placeholder headers cannot repair it.
+    #[test]
+    fn an_unreadable_spec_file_is_not_a_missing_header() {
+        let stderr = "gcc: fatal error: cannot read spec file 'libsanitizer.spec': No such \
+                      file or directory\ncompilation terminated.\n\
+                      make: *** [Makefile:258: main] Error 1\n";
+        let kinds = classify(stderr);
+        assert_eq!(
+            kinds,
+            vec![BuildErrorKind::Other {
+                tail: "gcc: fatal error: cannot read spec file 'libsanitizer.spec': No such \
+                       file or directory"
+                    .to_owned()
+            }]
+        );
+        // A real one still is.
+        assert_eq!(
+            classify("x.c:1:10: fatal error: widget.h: No such file or directory\n"),
+            vec![BuildErrorKind::MissingHeader {
+                path: "widget.h".to_owned()
+            }]
+        );
+    }
+
     #[test]
     fn missing_shared_lib_ld_form() {
         let stderr = "/usr/bin/ld: cannot find -lhiredis: No such file or directory\n";

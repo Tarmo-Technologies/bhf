@@ -303,6 +303,12 @@ impl Relocator {
         }
         script.push_str(
             "here=$(pwd -P)\n\
+             # An MSYS shell (Git for Windows, MSYS2, Cygwin) names the dir /c/...,\n\
+             # which the native Windows programs that read the rendered files\n\
+             # cannot open: render them with C:/... instead.\n\
+             case \"$(uname -s 2>/dev/null)\" in\n\
+             \x20 MINGW*|MSYS*|CYGWIN*) if command -v cygpath >/dev/null 2>&1; then here=$(cygpath -m \"$here\"); fi ;;\n\
+             esac\n\
              sed_escape() { printf '%s\\n' \"$1\" | sed -e 's/[\\\\|&]/\\\\&/g'; }\n\
              SED_HERE=$(sed_escape \"$here\")\n",
         );
@@ -823,6 +829,91 @@ mod tests {
         );
         assert!(rendered.contains("exec \"/usr/bin/env\""), "{rendered}");
         assert!(!rendered.contains("@BHF_"), "{rendered}");
+    }
+
+    /// Under an MSYS shell (Git for Windows' sh, where `uname -s` says
+    /// MINGW64_NT) the capsule's dir is `/c/...`, which a native Windows
+    /// program reading a rendered file (go's go.mod `replace`) cannot open:
+    /// build.sh renders the `C:/...` spelling cygpath gives it.
+    #[cfg(unix)]
+    #[test]
+    fn an_msys_shell_renders_the_capsule_path_as_windows_spells_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let tree = temp.path().join("tree");
+        let harness = work.join("harnesses/H-P0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            harness.join("go.mod"),
+            format!("replace example.com/widget => \"{}\"\n", tree.display()),
+        )
+        .unwrap();
+        let r = relocator(&work, &tree);
+        let relocated = r.relocate().unwrap();
+        assert_eq!(relocated.templates, vec!["harness/go.mod"]);
+        let template = String::from_utf8(relocated.generated[0].bytes.clone()).unwrap();
+        let cap = temp.path().join("cap");
+        std::fs::create_dir_all(cap.join("harness")).unwrap();
+        std::fs::write(cap.join("harness/go.mod"), &template).unwrap();
+        // An MSYS host: uname names it, cygpath maps /c/... to C:/...
+        let bin = temp.path().join("msys-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, body) in [
+            ("uname", "#!/bin/sh\necho MINGW64_NT-10.0-20348\n"),
+            (
+                "cygpath",
+                "#!/bin/sh\n[ \"$1\" = -m ] && echo \"C:/msys$2\"\n",
+            ),
+        ] {
+            std::fs::write(bin.join(name), body).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let script = r.render_script(&relocated);
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{script}"))
+            .current_dir(&cap)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rendered = std::fs::read_to_string(cap.join("build/harness/go.mod")).unwrap();
+        let here = cap.canonicalize().unwrap();
+        assert_eq!(
+            rendered,
+            format!(
+                "replace example.com/widget => \"C:/msys{}/sources\"\n",
+                here.display()
+            )
+        );
+        // Elsewhere the dir is rendered as the shell names it.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{script}"))
+            .current_dir(&cap)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let rendered = std::fs::read_to_string(cap.join("build/harness/go.mod")).unwrap();
+        assert_eq!(
+            rendered,
+            format!(
+                "replace example.com/widget => \"{}/sources\"\n",
+                here.display()
+            )
+        );
     }
 
     /// A text file that ships as is but names the work dir or the scanned

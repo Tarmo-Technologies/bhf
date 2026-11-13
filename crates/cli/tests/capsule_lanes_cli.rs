@@ -511,10 +511,7 @@ fn go_finding_with_a_cached_module_dependency_round_trips_vendored() {
     let empty_cache = run.root().join("empty-modcache");
     std::fs::create_dir_all(&empty_cache).unwrap();
     run.env = vec![
-        (
-            "GOPROXY".into(),
-            format!("file://{}", proxy.display()).into(),
-        ),
+        ("GOPROXY".into(), file_url(&proxy).into()),
         ("GOMODCACHE".into(), cache.clone().into()),
         ("GOSUMDB".into(), "off".into()),
         ("GOTOOLCHAIN".into(), "local".into()),
@@ -557,6 +554,17 @@ impl Drop for WritableOnDrop {
             .arg("u+w")
             .arg(&self.0)
             .status();
+    }
+}
+
+/// The `file://` URL of the absolute path `path`: `file:///C:/dir` for a
+/// Windows path, whose drive would otherwise read as the URL's host.
+fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
     }
 }
 

@@ -52,15 +52,19 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             continue;
         }
         if let Some(caps) = missing_header().captures(line) {
-            hits.push(BuildErrorKind::MissingHeader {
-                path: caps
-                    .get(1)
-                    .or_else(|| caps.get(2))
-                    .expect("missing-header regex has a path capture")
-                    .as_str()
-                    .to_owned(),
-            });
-            continue;
+            let path = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .expect("missing-header regex has a path capture")
+                .as_str();
+            // gcc's driver reports a spec file it cannot read (a sanitizer
+            // runtime's) in the same words; no header repair can supply it.
+            if !path.starts_with("cannot read spec file") {
+                hits.push(BuildErrorKind::MissingHeader {
+                    path: path.to_owned(),
+                });
+                continue;
+            }
         }
         if let Some(caps) = incomplete_type().captures(line) {
             // A forward-declared-but-undefined type (pimpl idiom): "incomplete
