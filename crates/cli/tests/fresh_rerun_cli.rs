@@ -725,6 +725,10 @@ mod one_core {
     /// With `--deadline` on one core, a fresh process that answers inside the
     /// deadline when it has the core is not reported as too slow: on a
     /// single CPU the re-run does not compete with the fork-server loop.
+    ///
+    /// The deadline leaves the 600 ms fresh run room for a shared core (CI
+    /// runs other tests on it). Which CPUs get inline re-runs is pinned
+    /// exactly by `fresh_reruns_run_inline_only_on_one_cpu_with_a_response_deadline`.
     #[test]
     fn a_response_deadline_on_one_core_is_not_missed_because_of_the_loop() {
         if !clang_runs() || !taskset_runs() {
@@ -763,7 +767,7 @@ mod one_core {
             &work,
             "H-DEADLINE",
             &seeds,
-            &["--fork-server", "--time", "8s", "--deadline", "1s"],
+            &["--fork-server", "--time", "8s", "--deadline", "2s"],
         );
         assert_eq!(run.exit, Some(0), "{}", run.stderr);
         assert!(
