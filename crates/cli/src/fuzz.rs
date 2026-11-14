@@ -5885,8 +5885,18 @@ fn restore_spawn_priority(child: &std::process::Child) {
     }
     const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
     // SAFETY: the handle is the live child's, owned by `child`.
-    unsafe {
-        SetPriorityClass(child.as_raw_handle().cast(), NORMAL_PRIORITY_CLASS);
+    let restored = unsafe { SetPriorityClass(child.as_raw_handle().cast(), NORMAL_PRIORITY_CLASS) };
+    if restored == 0 {
+        // A re-run left below normal only finishes later; say why, once per
+        // process, rather than fail the run.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let error = std::io::Error::last_os_error();
+        WARNED.call_once(|| {
+            bhfeprintln!(
+                "bhf fuzz: warning: could not return a background re-run (pid {}) to normal priority: {error}",
+                child.id()
+            );
+        });
     }
 }
 
