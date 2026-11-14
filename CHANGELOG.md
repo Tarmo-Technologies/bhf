@@ -5,6 +5,15 @@
 ## Unreleased
 
 ### Fixed
+- Ada: a build that recovered a missing unit could fail to bind with
+  `"<unit>" must be recompiled` and `no object specified`. A repair round's
+  semantic check (`-gnatc`) compiles into the same object directories as the
+  full build and leaves an ALI without code beside the object an earlier full
+  build made. GNAT time stamps have one-second resolution, so when both were
+  written in the same second the next full build took the pair for a compiled
+  unit. The full build now passes `-s` to gprbuild, which recompiles a unit
+  whose last compile had other switches, and still skips units nothing
+  changed.
 - Windows: every harness binary is now named with `.exe` (`main.exe`,
   `main_cov.exe`, `main_afl.exe`, the Go lane's `main.exe`). The default
   clang lane wrote an extensionless `main`, which cmd ("is not recognized as

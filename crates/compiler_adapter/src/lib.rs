@@ -150,7 +150,10 @@ mod tests {
             args[2].starts_with("-j") && args[2][2..].parse::<usize>().is_ok(),
             "the build must ask for parallel compilation: {args:?}"
         );
-        assert_eq!(args.len(), 3, "a full build carries nothing else: {args:?}");
+        // `-s`: a unit a check last compiled (with `-gnatc`, no code) is
+        // compiled again, whatever its time stamps say.
+        assert_eq!(args[3], "-s", "{args:?}");
+        assert_eq!(args.len(), 4, "a full build carries nothing else: {args:?}");
     }
 
     #[test]
