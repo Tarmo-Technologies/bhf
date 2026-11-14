@@ -9431,16 +9431,19 @@ mod spawn_priority_windows_tests {
         let work = std::env::temp_dir().join(format!("bhf-spawn-priority-{nonce}"));
         fs::create_dir_all(&work).unwrap();
         let scratch = ensure_harness_scratch(&work).unwrap();
-        // The script prints its own priority class after `wait_ms`.
+        // The script prints its own priority class `samples` times, 250 ms
+        // apart.
         let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-        let class = |low_priority, restore: Option<&AtomicBool>, wait_ms: u32| {
-            let script = work.join(format!("class-{wait_ms}.ps1"));
+        let classes = |low_priority, restore: Option<&AtomicBool>, samples: u32| {
+            let script = work.join(format!("class-{samples}.ps1"));
             fs::write(
                 &script,
                 format!(
-                    "Start-Sleep -Milliseconds {wait_ms}\r\n\
-                     [Console]::Error.WriteLine((Get-Process -Id $PID).PriorityClass)\r\n"
+                    "for ($i = 0; $i -lt {samples}; $i++) {{\r\n\
+                     if ($i -gt 0) {{ Start-Sleep -Milliseconds 250 }}\r\n\
+                     [Console]::Error.WriteLine((Get-Process -Id $PID).PriorityClass)\r\n\
+                     }}\r\n"
                 ),
             )
             .unwrap();
@@ -9459,12 +9462,24 @@ mod spawn_priority_windows_tests {
                 },
             )
             .unwrap();
-            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
         };
-        assert_eq!(class(false, None, 0), "Normal");
-        assert_eq!(class(true, None, 0), "BelowNormal");
+        assert_eq!(classes(false, None, 1), ["Normal"]);
+        assert_eq!(classes(true, None, 1), ["BelowNormal"]);
+        // Raised as soon as the loop that it gave way to has stopped (here,
+        // from the start): within the 5 s the script samples, whatever the
+        // load on the host, and it stays raised.
         let restore = AtomicBool::new(true);
-        assert_eq!(class(true, Some(&restore), 2000), "Normal");
+        let seen = classes(true, Some(&restore), 20);
+        let raised = seen.iter().position(|class| class == "Normal");
+        assert!(
+            raised.is_some_and(|at| seen[at..].iter().all(|class| class == "Normal")),
+            "the re-run was not returned to normal priority: {seen:?}"
+        );
         let _ = fs::remove_dir_all(&work);
     }
 }
