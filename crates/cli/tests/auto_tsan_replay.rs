@@ -4,15 +4,47 @@
 // `make tsan` variant, replays its corpus through it, and writes a BHF-556 data-race
 // finding whose faulting frame lands in a TARGET source (not the bhf driver /
 // system libs). Uses a real racy fixture — two unsynchronized writes to a shared
-// global across a spawned thread, the canonical always-detected TSan race — compiled
-// as a separate target source so the race frame passes the target-frame filter.
-// Skips cleanly when clang lacks a working ThreadSanitizer (the GNAT-less rule).
+// global across a spawned thread, ordered in time so TSan reports them on every
+// run (see `RACE_C`) — compiled as a separate target source so the race frame
+// passes the target-frame filter. Skips cleanly when clang lacks a working
+// ThreadSanitizer (the GNAT-less rule).
 
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cli::auto::tsan::run_tsan_replay;
+
+/// The racy target: two writes to one global, from two threads, with no
+/// happens-before between them.
+///
+/// The writes are ORDERED IN TIME by TSan's own test-only barrier, which TSan
+/// does not treat as synchronization. Without it the fixture missed its race on
+/// about one run in twenty (26 of 500 bare runs on an idle host, exit 0 and no
+/// stderr; 84 of 300 when the two writes were released at once). TSan checks
+/// and updates an address's shadow cells without an atomic step, so two threads
+/// that write a never-touched address at the same instant can each find it
+/// empty and neither reports. Either fixed order is reported every time.
+/// TSan's own race tests order their accesses the same way.
+const RACE_C: &str = "#include <pthread.h>\n\
+     void __tsan_testonly_barrier_init(unsigned long long *barrier, unsigned count);\n\
+     void __tsan_testonly_barrier_wait(unsigned long long *barrier);\n\
+     static unsigned long long g_order;\n\
+     static int g_shared;\n\
+     static void *worker(void *arg) {\n\
+         (void)arg;\n\
+         g_shared = 1;\n\
+         __tsan_testonly_barrier_wait(&g_order);\n\
+         return 0;\n\
+     }\n\
+     void run_race(void) {\n\
+         pthread_t t;\n\
+         __tsan_testonly_barrier_init(&g_order, 2);\n\
+         pthread_create(&t, 0, worker, 0);\n\
+         __tsan_testonly_barrier_wait(&g_order);\n\
+         g_shared = 2;\n\
+         pthread_join(t, 0);\n\
+     }\n";
 
 fn clang_has_tsan() -> bool {
     let probe = std::env::temp_dir().join(format!("bhf-tsan-probe-{}", std::process::id()));
@@ -26,13 +58,9 @@ fn clang_has_tsan() -> bool {
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(
-                    b"#include <pthread.h>\nstatic int x;\nstatic void *w(void *p){(void)p;x=1;return 0;}\nint main(void){pthread_t t;pthread_create(&t,0,w,0);x=2;pthread_join(t,0);return 0;}",
-                )?;
+            child.stdin.take().unwrap().write_all(
+                format!("{RACE_C}int main(void){{run_race();return 0;}}\n").as_bytes(),
+            )?;
             child.wait()
         })
         .map(|status| status.success())
@@ -117,6 +145,50 @@ fn tsan_fixture_report(binary: &Path, input: &Path, log: &Path) -> Option<String
     std::fs::read_to_string(log).ok()
 }
 
+/// A replay that runs the fixture once must see its race, so the fixture has to
+/// report on every run. Forty runs fail about seven times in eight when a single
+/// run misses one time in twenty, as the unordered writes did.
+#[test]
+fn the_fixture_race_is_reported_on_every_run() {
+    if !clang_has_tsan() {
+        eprintln!("skip: clang has no working ThreadSanitizer");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("bhf-tsan-every-run-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let source = tmp.join("race_main.c");
+    std::fs::write(
+        &source,
+        format!("{RACE_C}int main(void){{run_race();return 0;}}\n"),
+    )
+    .unwrap();
+    let binary = tmp.join("race_main");
+    let built = Command::new("clang")
+        .args(["-O0", "-g", "-fsanitize=thread", "-pthread", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(
+        built.success(),
+        "the fixture did not build after the preflight did"
+    );
+    let log = tmp.join("run.log");
+    for run in 1..=40 {
+        let Some(report) = tsan_fixture_report(&binary, &source, &log) else {
+            eprintln!("skip: ThreadSanitizer stopped completing runs (run {run})");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        assert!(
+            report.contains("data race"),
+            "run {run} of the fixture reported no race:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn tsan_replay_writes_bhf556_for_target_source_data_race() {
     if !clang_has_tsan() {
@@ -137,23 +209,7 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
     // The race lives in a SEPARATE target source, so its frame is not under the
     // harness dir (which the finding filter treats as bhf scaffolding).
     let race_c = target_dir.join("race.c");
-    std::fs::write(
-        &race_c,
-        "#include <pthread.h>\n\
-         static int g_shared;\n\
-         static void *worker(void *arg) {\n\
-             (void)arg;\n\
-             g_shared = 1;\n\
-             return 0;\n\
-         }\n\
-         void run_race(void) {\n\
-             pthread_t t;\n\
-             pthread_create(&t, 0, worker, 0);\n\
-             g_shared = 2;\n\
-             pthread_join(t, 0);\n\
-         }\n",
-    )
-    .unwrap();
+    std::fs::write(&race_c, RACE_C).unwrap();
 
     // The harness "driver" (analog of bhf's generated main.c) just invokes the
     // target; the bhf driver passes the replayed input as argv[1], which this
