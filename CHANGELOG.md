@@ -5,6 +5,10 @@
 ## Unreleased
 
 ### Fixed
+- `bhf replay` and `bhf minimize` symbolize a crash without the network
+  debuginfod client, as fuzz children already did. On a host whose
+  `DEBUGINFOD_URLS` names a server, ASan's symbolizer could wait on it past
+  the replay timeout and the replay came back unverified.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

@@ -661,6 +661,10 @@ pub(crate) fn replay_env(
         is_leak_finding(parsed),
         runner.qemu_prefix().is_some(),
     );
+    // As for a fuzz child: ASan's crash symbolizer would consult the host's
+    // debuginfod server (`DEBUGINFOD_URLS`, set on stock Ubuntu) and can wait
+    // on it past the replay timeout. Local symbolization still names frames.
+    env.push(("DEBUGINFOD_URLS".to_owned(), String::new()));
     if input == CInput::Stdin {
         return env;
     }
@@ -2390,6 +2394,20 @@ mod tests {
                 Some("abort_on_error=1"),
                 "{key}"
             );
+        }
+    }
+
+    /// A replay, like a fuzz child, symbolizes a crash without the network
+    /// debuginfod client: on a host whose `DEBUGINFOD_URLS` names a server,
+    /// ASan's symbolizer would otherwise wait on it past the replay timeout.
+    #[test]
+    fn a_replay_symbolizes_without_debuginfod() {
+        let raw = serde_json::json!({"rule_id": "BHF-201"});
+        let native = replay_min::HarnessRunner::direct("/w/main");
+        for input in [super::CInput::ArgvFile, super::CInput::Stdin] {
+            let env = super::replay_env(&raw, &native, input);
+            let hits: Vec<_> = env.iter().filter(|(k, _)| k == "DEBUGINFOD_URLS").collect();
+            assert_eq!(hits, [&("DEBUGINFOD_URLS".to_owned(), String::new())]);
         }
     }
 
