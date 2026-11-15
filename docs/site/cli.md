@@ -902,8 +902,9 @@ and explain it — all offline and deterministic (no LLM):
 
   Each block names its harness. Findings of one root
   cause (the same `cluster_key_full`, such as one site reached through several
-  harnesses) are explained once, by the first, which lists the others and
-  their harnesses; `--all-members` explains each one. explain covers runtime
+  harnesses; for a finding an earlier release keyed on one constant per rule,
+  the key its report gets now) are explained once, by the first, which lists
+  the others and their harnesses; `--all-members` explains each one. explain covers runtime
   crashes (`classification: unhandled`) and oracle findings (`oracle_hit`);
   an oracle finding's WHAT HAPPENED names the oracle, the API it watched and
   its evidence (`Oracle:` and `Evidence:` lines) instead of a sanitizer

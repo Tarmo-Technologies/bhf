@@ -1364,6 +1364,226 @@ mod tests {
         assert_ne!(group_of(&a1), group_of(&b));
     }
 
+    /// Split one CSV record into its cells (quoted cells may hold commas).
+    fn csv_cells(line: &str) -> Vec<String> {
+        let mut cells = vec![String::new()];
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    cells.last_mut().unwrap().push('"');
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => cells.push(String::new()),
+                _ => cells.last_mut().unwrap().push(c),
+            }
+        }
+        cells
+    }
+
+    /// A work dir from an earlier release keyed every frame-less UBSan finding
+    /// of a rule on one constant, so unrelated sites were one root-cause
+    /// group. Opened by this release (migrated, then rebuilt), each site is
+    /// its own group in findings.json, INDEX.md and findings.csv, and one site
+    /// reached from two harnesses is still one.
+    #[test]
+    fn earlier_frameless_ubsan_findings_get_a_group_per_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rule = "BHF-210";
+        let kind = "undefined-behavior";
+        let signature = {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(format!("{rule}|{kind}").as_bytes());
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let sites = [
+            ("F-0000", "H-C0001", "/src/widget/parse.cpp:12:1"),
+            ("F-0001", "H-C0002", "/src/widget/parse.cpp:19:1"),
+            ("F-0002", "H-C0003", "/src/widget/scale.cpp:7:1"),
+            ("F-0003", "H-C0004", "/src/widget/parse.cpp:12:1"),
+        ];
+        let mut ids = Vec::new();
+        for (ordinal, harness, site) in sites {
+            let id = format!("{ordinal}-{}", &signature[..8]);
+            let dir = tmp.path().join("findings").join(&id);
+            write(
+                &dir.join("finding.json"),
+                json!({
+                    "id": id,
+                    "signature": signature,
+                    "cluster_key": &signature[..16],
+                    "cluster_key_full": signature,
+                    "cluster_normalized_frames": [],
+                    "cluster_fallback": true,
+                    "rule_id": rule,
+                    "classification": "unhandled",
+                    "harness_id": harness,
+                    "dialect": "cpp",
+                    "fixture_path": "",
+                    "exception": {
+                        "name": "UBSAN_UNDEFINED_BEHAVIOR",
+                        "message": format!(
+                            "{site}: runtime error: execution reached the end of a \
+                             value-returning function without returning a value"
+                        ),
+                        "sanitizer": "ubsan",
+                        "stack": [],
+                    },
+                    "paths": {
+                        "testcase": "testcase.bin",
+                        "decoded": "decoded.json",
+                        "finding": "finding.json",
+                    },
+                }),
+            );
+            std::fs::write(dir.join("testcase.bin"), b"x").unwrap();
+            ids.push(id);
+        }
+        assert_eq!(
+            crate::migrate::migrate_legacy(tmp.path()).unwrap(),
+            crate::migrate::MigrationOutcome::Migrated
+        );
+        rebuild(tmp.path(), &opts()).unwrap();
+
+        let doc = read_doc(tmp.path());
+        assert_eq!(doc.findings.len(), 4);
+        assert_eq!(doc.groups.len(), 3, "{:#?}", doc.groups);
+        let finding = |id: &str| doc.findings.iter().find(|f| f.id == id).unwrap();
+        let group = |id: &str| finding(id).group.clone().unwrap();
+        assert_ne!(group(&ids[0]), signature, "the constant key is gone");
+        assert_ne!(group(&ids[0]), group(&ids[1]));
+        assert_ne!(group(&ids[0]), group(&ids[2]));
+        assert_ne!(group(&ids[1]), group(&ids[2]));
+        assert_eq!(group(&ids[0]), group(&ids[3]), "one site, two harnesses");
+        let occurrences: Vec<usize> = ids.iter().map(|id| finding(id).occurrences).collect();
+        assert_eq!(occurrences, [2, 1, 1, 2]);
+        assert_ne!(
+            finding(&ids[0]).fingerprint.primary,
+            finding(&ids[1]).fingerprint.primary
+        );
+
+        let index = std::fs::read_to_string(tmp.path().join("results/INDEX.md")).unwrap();
+        assert!(
+            index.contains("**4 findings** in 3 root-cause groups"),
+            "{index}"
+        );
+        let csv = std::fs::read_to_string(tmp.path().join("results/findings.csv")).unwrap();
+        let mut lines = csv.lines();
+        let header = csv_cells(lines.next().unwrap());
+        let column = |name: &str| header.iter().position(|cell| cell == name).unwrap();
+        let rows: Vec<Vec<String>> = lines.map(csv_cells).collect();
+        let row = |id: &str| rows.iter().find(|row| row[column("id")] == id).unwrap();
+        let cell = |id: &str, name: &str| row(id)[column(name)].clone();
+        for id in &ids {
+            assert_eq!(cell(id, "group"), group(id), "{csv}");
+            assert_eq!(
+                cell(id, "occurrences"),
+                finding(id).occurrences.to_string(),
+                "{csv}"
+            );
+        }
+        assert_ne!(cell(&ids[1], "group"), cell(&ids[2], "group"));
+    }
+
+    /// 0.2.x recorded a crash with no sanitizer report (a fatal signal, a
+    /// transport-reported fault) as an AddressSanitizer crash with no frames,
+    /// keyed on one constant per rule and kind, so the same kind of crash in
+    /// unrelated harnesses was one root-cause group. Opened by this release,
+    /// each harness (and signal) is its own group.
+    #[test]
+    fn earlier_crashes_with_no_sanitizer_report_get_a_group_per_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signature = |rule: &str, kind: &str| {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(format!("{rule}|{kind}").as_bytes());
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let segv = "harness crashed with SIGSEGV and no sanitizer report — a reachable crash";
+        let trap = "target transport reported a target memory-protection (MMU/MPU) trap with no \
+                    sanitizer report (fault address 0x20001000)";
+        let records = [
+            ("F-0000", "H-C0001", "fatal-signal", segv),
+            ("F-0001", "H-C0002", "fatal-signal", segv),
+            ("F-0002", "H-C0001", "fatal-signal", segv),
+            ("F-0003", "H-T0001", "target-memory-protection", trap),
+            ("F-0004", "H-T0002", "target-memory-protection", trap),
+        ];
+        let mut ids = Vec::new();
+        for (ordinal, harness, kind, message) in records {
+            let rule = "BHF-210";
+            let signature = signature(rule, kind);
+            let id = format!("{ordinal}-{}", &signature[..8]);
+            let dir = tmp.path().join("findings").join(&id);
+            write(
+                &dir.join("finding.json"),
+                json!({
+                    "id": id,
+                    "signature": signature,
+                    "cluster_key": &signature[..16],
+                    "cluster_key_full": signature,
+                    "cluster_normalized_frames": [],
+                    "cluster_fallback": true,
+                    "rule_id": rule,
+                    "classification": "unhandled",
+                    "harness_id": harness,
+                    "dialect": "cpp",
+                    "fixture_path": "",
+                    "exception": {
+                        "name": format!("ASAN_{}", kind.to_uppercase().replace('-', "_")),
+                        "message": message,
+                        "sanitizer": "asan",
+                        "stack": [],
+                    },
+                    "paths": {
+                        "testcase": "testcase.bin",
+                        "decoded": "decoded.json",
+                        "finding": "finding.json",
+                    },
+                }),
+            );
+            std::fs::write(dir.join("testcase.bin"), b"x").unwrap();
+            ids.push(id);
+        }
+        assert_eq!(
+            crate::migrate::migrate_legacy(tmp.path()).unwrap(),
+            crate::migrate::MigrationOutcome::Migrated
+        );
+        rebuild(tmp.path(), &opts()).unwrap();
+
+        let doc = read_doc(tmp.path());
+        assert_eq!(doc.findings.len(), 5);
+        assert_eq!(doc.groups.len(), 4, "{:#?}", doc.groups);
+        let finding = |id: &str| doc.findings.iter().find(|f| f.id == id).unwrap();
+        let group = |id: &str| finding(id).group.clone().unwrap();
+        assert_ne!(group(&ids[0]), group(&ids[1]), "two harnesses");
+        assert_eq!(group(&ids[0]), group(&ids[2]), "one harness, one signal");
+        assert_ne!(group(&ids[3]), group(&ids[4]), "two harnesses");
+        let occurrences: Vec<usize> = ids.iter().map(|id| finding(id).occurrences).collect();
+        assert_eq!(occurrences, [2, 1, 2, 1, 1]);
+        let index = std::fs::read_to_string(tmp.path().join("results/INDEX.md")).unwrap();
+        assert!(
+            index.contains("**5 findings** in 4 root-cause groups"),
+            "{index}"
+        );
+        let csv = std::fs::read_to_string(tmp.path().join("results/findings.csv")).unwrap();
+        let mut lines = csv.lines();
+        let header = csv_cells(lines.next().unwrap());
+        let column = |name: &str| header.iter().position(|cell| cell == name).unwrap();
+        let rows: Vec<Vec<String>> = lines.map(csv_cells).collect();
+        for id in &ids {
+            let row = rows.iter().find(|row| &row[column("id")] == id).unwrap();
+            assert_eq!(row[column("group")], group(id), "{csv}");
+        }
+    }
+
     #[test]
     fn producer_run_appends_history_and_rebuilds() {
         let tmp = tempfile::tempdir().unwrap();

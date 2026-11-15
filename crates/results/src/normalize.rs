@@ -643,9 +643,16 @@ fn split_source_evidence(text: &str) -> Option<(&str, u64, Option<String>)> {
 /// The record's own `cluster_key_full`, else the loader's. The persisted value
 /// is what the emitter wrote and what importers already key on; the loader
 /// recomputes from the stack when `cluster_normalized_frames` is absent, and
-/// that recompute drifts whenever the clustering algorithm changes.
+/// that recompute drifts whenever the clustering algorithm changes. The one
+/// exception is a frame-less sanitizer crash an earlier release keyed on one
+/// constant per rule, which made every such finding of the rule one root
+/// cause: it takes the key this release gives its stored report
+/// ([`corpus::cluster::legacy_fallback_cluster_key`]).
 fn persisted_cluster_key_full(f: &report::FindingReport) -> Option<String> {
-    str_at(&f.raw, &["cluster_key_full"]).or_else(|| f.cluster_key_full.clone())
+    corpus::cluster::legacy_fallback_cluster_key(&f.raw)
+        .map(|key| key.full)
+        .or_else(|| str_at(&f.raw, &["cluster_key_full"]))
+        .or_else(|| f.cluster_key_full.clone())
 }
 
 /// Cross-run identity. Static: the static fingerprint, else `rule:file:line`.

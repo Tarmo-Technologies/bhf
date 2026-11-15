@@ -1102,6 +1102,20 @@
   first hit that does not reproduce no longer hides a later one.
 - Crashes inside `memcmp`/`bcmp` and other interceptors no longer share one
   root-cause key across unrelated callers.
+- A work dir from an earlier release no longer keeps its frame-less UBSan
+  findings of one rule, or its frame-less crashes with no sanitizer report (a
+  fatal signal, which 0.2.x recorded as `ASAN_FATAL_SIGNAL`; a
+  transport-reported fault or deadline), in a single root-cause group. Those
+  releases keyed each on the same constant; `results/` (`group`,
+  `occurrences`, `fingerprint.primary` and the `INDEX.md` group count),
+  SARIF clusters, the report JSON and `bhf explain` now key such a finding on
+  the site, check and frames its stored report names, or on its rule, kind,
+  check (a crash's signal) and harness when it names no site. The key in
+  `finding.json` is not rewritten. Where the new key names a site (a UBSan
+  finding's location), `bhf report --baseline` and `--triage` match the
+  finding on that key instead of its signature, so its issue key changes:
+  save the baseline again and re-check triage decisions after opening a work
+  dir from 0.3.0 or earlier.
 - A crash the fork-server missed and the fresh re-run caught now gets its
   `sanitizer.log`.
 - UBSan findings can be minimized: the minimizer's child now halts on the

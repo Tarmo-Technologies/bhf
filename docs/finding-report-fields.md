@@ -274,6 +274,26 @@ What a migrated work dir has, and what it does not:
   where the harness still exists and still reports the same crash. A replay
   that comes back unsymbolized is skipped; put `llvm-symbolizer` on `PATH` (or
   set `ASAN_SYMBOLIZER_PATH`) and run it again.
+- Earlier releases gave a sanitizer crash with no frames, and a crash with no
+  sanitizer report and no frames (a fatal signal, `FATAL_SIGNAL` or, in
+  0.2.x, `ASAN_FATAL_SIGNAL` tagged `asan`; a transport-reported fault,
+  `TARGET_*`; a transport deadline, `TRANSPORT_DEADLINE_EXCEEDED`), one
+  root-cause key per rule and kind, so frame-less UBSan findings at unrelated
+  sites, and fatal signals of unrelated harnesses, shared one group.
+  `results/` (the `group` and `occurrences` columns, `fingerprint.primary`,
+  the `INDEX.md` group count), `findings.sarif`, the report JSON
+  (`cluster_key_full`, `cluster_fallback`) and `bhf explain` key such a
+  finding as this release does: on the site and check its stored report
+  names, or, with no site, its rule, kind, check (a crash's signal) and
+  harness. `finding.json` keeps the key it was written with.
+- Where that key names a site (a UBSan finding's location), the report JSON
+  gives the finding `cluster_fallback: false`, so `bhf report --baseline` and
+  `--triage` match it on its `cluster_key_full` instead of its signature and
+  its `bhf-issue-v1` key changes. A baseline saved before the upgrade then
+  shows such an issue as new and the old one as unobserved, and a triage
+  decision recorded for the old key no longer applies: save the baseline
+  again and re-check those decisions after opening a work dir from 0.3.0 or
+  earlier.
 - `results/legacy/` keeps the old `FINDINGS.md`, `findings.csv`,
   `auto/findings.csv` and `replay.py` scripts; `results/INDEX.md` and
   `results/findings.{json,csv,sarif}` replace them, and each finding gets a

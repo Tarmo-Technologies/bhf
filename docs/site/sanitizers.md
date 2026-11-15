@@ -207,7 +207,17 @@ per crashing input.
   there is one, and the harness that found it (its id and the function it
   calls): frame-less crashes of two harnesses are two groups, and two crash
   sites of one harness are two groups when the driver printed their pc. Its
-  `cluster_fallback` is `true`.
+  `cluster_fallback` is `true`. Releases up to 0.3.0 keyed such a crash on
+  its signature, then only the rule and kind, so every frame-less finding of
+  a rule was one group, and so was every frame-less crash with no sanitizer
+  report of a kind: a fatal signal (which 0.2.x named `ASAN_FATAL_SIGNAL` and
+  tagged `asan`), a transport-reported fault or a transport deadline.
+  Findings in a work dir from those releases are grouped by the key this
+  release gives their stored report (its message, `location`, `check` or
+  signal, and any frames `bhf report --backfill` added; a crash with no
+  sanitizer report is keyed with no sanitizer, as it is now) in `results/`,
+  SARIF, the report JSON and `bhf explain`; `finding.json` is not
+  rewritten.
 - **Per-run dedup.** The fuzz loop, AFL++ crash ingestion and the pre-seed from
   findings an earlier pass wrote all use the root-cause key. A key is used up
   only when its finding is written: a first hit that does not reproduce in a

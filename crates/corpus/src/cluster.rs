@@ -571,6 +571,9 @@ pub fn cluster_for_ada(testcase: &Testcase, handler: &HandlerEvent) -> ClusterKe
 
 /// Reconstruct a `ClusterKey` from a `finding.json` value. Order of
 /// precedence:
+/// 0. A frame-less sanitizer crash an earlier release keyed on its
+///    rule-wide signature: the key this release gives its stored report
+///    ([`legacy_fallback_cluster_key`]).
 /// 1. `cluster_key_full` + `cluster_normalized_frames` already on
 ///    the record — return them as-is.
 /// 2. `exception.stack` array — normalize and hash.
@@ -578,6 +581,9 @@ pub fn cluster_for_ada(testcase: &Testcase, handler: &HandlerEvent) -> ClusterKe
 /// 4. Otherwise return `None`; the caller falls back to the
 ///    per-input signature.
 pub fn cluster_from_finding_json(raw: &serde_json::Value) -> Option<ClusterKey> {
+    if let Some(key) = legacy_fallback_cluster_key(raw) {
+        return Some(key);
+    }
     if let (Some(full), Some(frames)) = (
         raw.get("cluster_key_full").and_then(|v| v.as_str()),
         raw.get("cluster_normalized_frames")
@@ -666,6 +672,157 @@ pub fn cluster_from_finding_json(raw: &serde_json::Value) -> Option<ClusterKey> 
         }
     }
     None
+}
+
+/// The root-cause key this release gives a sanitizer crash that an earlier
+/// release recorded with no informative frame, rebuilt from the report the
+/// finding stores.
+///
+/// Releases up to 0.3.0 keyed such a crash on its signature, which then hashed
+/// only the rule and the crash kind: one constant key per rule, so every
+/// frame-less UBSan report of a rule, at any site and in any harness, was one
+/// root cause, and so was every frame-less crash with no sanitizer report of a
+/// kind: a fatal signal (`FATAL_SIGNAL`, which 0.2.x named
+/// `ASAN_FATAL_SIGNAL` and tagged `asan`), a transport-reported fault
+/// (`TARGET_*`) and a transport deadline (`TRANSPORT_DEADLINE_EXCEEDED`). A
+/// finding is read as one of those when its `cluster_key_full` is its
+/// `signature`, marked `cluster_fallback`, with no normalized frames. A
+/// sanitizer report is parsed again from its stored message; a crash with no
+/// sanitizer report is rebuilt as the shared crash builder builds it now, with
+/// no sanitizer and a fatal signal as its check. The location, check name,
+/// crash stack (written later by `bhf report --backfill`) and pc offset the
+/// record holds take precedence, and the key is computed in the finding's
+/// harness scope as the emitter computes it ([`cluster_for_sanitizer_scoped`]).
+///
+/// `None` for any other record: one this release keyed (whose fallback key is
+/// already scoped and sited), an oracle hit, a finding that is not a sanitizer
+/// crash, and one whose stored report gives no better key than the one it has.
+pub fn legacy_fallback_cluster_key(raw: &serde_json::Value) -> Option<ClusterKey> {
+    use serde_json::Value;
+    if raw.get("oracle").is_some()
+        || raw.get("cluster_fallback").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let persisted = raw
+        .get("cluster_key_full")
+        .and_then(Value::as_str)
+        .filter(|full| !full.is_empty())?;
+    if raw.get("signature").and_then(Value::as_str) != Some(persisted) {
+        return None;
+    }
+    let framed = raw
+        .get("cluster_normalized_frames")
+        .and_then(Value::as_array)
+        .is_some_and(|frames| !frames.is_empty());
+    let exception = raw.get("exception")?;
+    let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
+    let undiagnosed = undiagnosed_crash_kind(name);
+    let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
+        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    if framed || !(sanitizer_crash || undiagnosed.is_some()) {
+        return None;
+    }
+    let message = exception.get("message").and_then(Value::as_str)?;
+    let mut report = match undiagnosed {
+        Some(kind) => earlier_undiagnosed_crash_report(raw, exception, kind, message)?,
+        None => crate::sanitizer::parse_sanitizer_report(message)?,
+    };
+    if let Some(location) = exception
+        .get("location")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        report.location = Some(location);
+    }
+    if let Some(check) = exception
+        .get("check")
+        .and_then(Value::as_str)
+        .filter(|check| !check.is_empty())
+    {
+        // The check name decides a UBSan report's kind, as when the report
+        // printed it.
+        if report.sanitizer == Some(Sanitizer::UndefinedBehaviorSanitizer) {
+            if let Some(kind) = finding_rules::ubsan::kind_for_check_name(check) {
+                report.kind = kind.to_owned();
+                report.rule_id = finding_rules::ubsan::rule_for_kind(kind);
+            }
+        }
+        report.check = Some(check.to_owned());
+    }
+    if let Some(stack) = exception
+        .get("stack")
+        .and_then(|value| serde_json::from_value::<Vec<StackFrame>>(value.clone()).ok())
+        .filter(|stack| !stack.is_empty())
+    {
+        report.stack = stack;
+    }
+    if let Some(offset) = exception
+        .get("pc_offset")
+        .and_then(Value::as_str)
+        .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+    {
+        report.pc_offset = Some(offset);
+    }
+    let harness = raw.get("harness_id").and_then(Value::as_str).unwrap_or("");
+    let key = cluster_for_sanitizer_scoped(&report, &crash_scope(harness, None));
+    (!key.is_placeholder() && key.full != persisted).then_some(key)
+}
+
+/// The kind of a crash with no sanitizer report, read from the name an
+/// earlier release gave it: the shared crash builder's kind in upper case
+/// (`FATAL_SIGNAL`, `TARGET_CPU_EXCEPTION`, `TRANSPORT_DEADLINE_EXCEEDED`),
+/// which 0.2.x prefixed with `ASAN_`, as it tagged every such crash with
+/// AddressSanitizer. No sanitizer report has one of these kinds.
+fn undiagnosed_crash_kind(name: &str) -> Option<String> {
+    let kind = name
+        .strip_prefix("ASAN_")
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    (kind == "fatal-signal" || kind == "transport-deadline-exceeded" || kind.starts_with("target-"))
+        .then_some(kind)
+}
+
+/// The report of a crash with no sanitizer report as the shared crash builder
+/// makes it now: no sanitizer, whatever an earlier release tagged it with, and,
+/// for a fatal signal, the signal it died by (recorded, or named in the
+/// message, `harness crashed with SIGSEGV ...`) as its check.
+fn earlier_undiagnosed_crash_report(
+    raw: &serde_json::Value,
+    exception: &serde_json::Value,
+    kind: String,
+    message: &str,
+) -> Option<SanitizerReport> {
+    use serde_json::Value;
+    let rule_id = finding_rules::by_id(raw.get("rule_id").and_then(Value::as_str)?)?.id;
+    let signal = (kind == "fatal-signal")
+        .then(|| {
+            ["signal", "check"]
+                .iter()
+                .find_map(|key| exception.get(*key).and_then(Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| {
+                    message
+                        .split_whitespace()
+                        .find(|word| {
+                            word.len() > 3
+                                && word.starts_with("SIG")
+                                && word[3..].bytes().all(|b| b.is_ascii_uppercase())
+                        })
+                        .map(str::to_owned)
+                })
+        })
+        .flatten();
+    Some(SanitizerReport {
+        sanitizer: None,
+        kind,
+        rule_id,
+        message: message.to_owned(),
+        check: signal,
+        ..Default::default()
+    })
 }
 
 fn input_frame_from_json(v: &serde_json::Value) -> Option<InputFrame> {
@@ -1633,5 +1790,369 @@ mod tests {
             cluster_for_sanitizer_scoped(&report, "H-A"),
             cluster_for_sanitizer(&report)
         );
+    }
+
+    const MISSING_RETURN: &str =
+        "runtime error: execution reached the end of a value-returning function without returning a value";
+
+    /// A finding as releases up to 0.3.0 recorded a sanitizer crash with no
+    /// frames: its signature hashed only the rule and kind, and its cluster
+    /// key was that signature, one constant per rule.
+    fn earlier_frameless(
+        harness: &str,
+        message: &str,
+        rule: &str,
+        kind: &str,
+    ) -> serde_json::Value {
+        let signature = hex_lower(&Sha256::digest(format!("{rule}|{kind}").as_bytes()));
+        serde_json::json!({
+            "id": format!("F-0000-{}", &signature[..8]),
+            "signature": signature,
+            "cluster_key": &signature[..16],
+            "cluster_key_full": signature,
+            "cluster_normalized_frames": [],
+            "cluster_fallback": true,
+            "rule_id": rule,
+            "classification": "unhandled",
+            "harness_id": harness,
+            "exception": {
+                "name": format!("UBSAN_{}", kind.to_uppercase().replace('-', "_")),
+                "message": message,
+                "sanitizer": "ubsan",
+                "stack": [],
+            },
+        })
+    }
+
+    fn earlier_missing_return(harness: &str, site: &str) -> serde_json::Value {
+        earlier_frameless(
+            harness,
+            &format!("{site}: {MISSING_RETURN}"),
+            "BHF-210",
+            "undefined-behavior",
+        )
+    }
+
+    /// Frame-less UBSan findings an earlier release recorded share one key per
+    /// rule. Read back, each is keyed on its reported site as this release
+    /// keys it, so unrelated sites are separate root causes and one site
+    /// reached from two harnesses is still one.
+    #[test]
+    fn earlier_frameless_findings_are_rekeyed_on_their_reported_site() {
+        let records = [
+            earlier_missing_return("H-C0001", "/src/widget/parse.cpp:12:1"),
+            earlier_missing_return("H-C0002", "/src/widget/parse.cpp:19:1"),
+            earlier_missing_return("H-C0003", "/src/widget/scale.cpp:7:1"),
+            earlier_missing_return("H-C0004", "/src/widget/parse.cpp:12:1"),
+        ];
+        let persisted = records[0]["cluster_key_full"].as_str().unwrap().to_owned();
+        assert!(records
+            .iter()
+            .all(|r| r["cluster_key_full"].as_str() == Some(persisted.as_str())));
+        let keys: Vec<ClusterKey> = records
+            .iter()
+            .map(|r| cluster_from_finding_json(r).expect("a key"))
+            .collect();
+        for key in &keys {
+            assert_ne!(key.full, persisted, "{key:?}");
+            assert_eq!(key.short, key.full[..16]);
+            assert!(!key.fallback, "the site is an identity: {key:?}");
+        }
+        assert_ne!(keys[0].full, keys[1].full);
+        assert_ne!(keys[0].full, keys[2].full);
+        assert_ne!(keys[1].full, keys[2].full);
+        assert_eq!(keys[0].full, keys[3].full, "one site, two harnesses");
+        // The key this release gives the same frame-less report.
+        let report = crate::sanitizer::parse_sanitizer_report(&format!(
+            "/src/widget/parse.cpp:12:1: {MISSING_RETURN}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            keys[0],
+            cluster_for_sanitizer_scoped(&report, &crash_scope("H-C0001", None))
+        );
+        assert_eq!(
+            Some(keys[0].clone()),
+            legacy_fallback_cluster_key(&records[0])
+        );
+    }
+
+    /// Frames recorded later (`bhf report --backfill`) key the finding as
+    /// they key a report that carries them.
+    #[test]
+    fn an_earlier_frameless_finding_with_backfilled_frames_keys_on_them() {
+        let mut record = earlier_missing_return("H-C0001", "/src/widget/parse.cpp:12:1");
+        record["exception"]["stack"] = serde_json::json!([
+            {"function": "classify", "file": "/src/widget/parse.cpp", "line": 12},
+            {"function": "bhf_run_one", "file": "/work/harnesses/H-C0001/main.cpp", "line": 9},
+        ]);
+        record["exception"]["check"] = serde_json::json!("missing-return");
+        let report = crate::sanitizer::parse_sanitizer_report(&format!(
+            "/src/widget/parse.cpp:12:1: {MISSING_RETURN}\n    \
+             #0 0x1 in classify /src/widget/parse.cpp:12\n    \
+             #1 0x2 in bhf_run_one /work/harnesses/H-C0001/main.cpp:9\n\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/parse.cpp:12:1 \n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cluster_from_finding_json(&record),
+            Some(cluster_for_sanitizer_scoped(&report, "H-C0001"))
+        );
+    }
+
+    /// An earlier frame-less crash with no reported site either is grouped
+    /// per harness, as this release groups one.
+    #[test]
+    fn an_earlier_siteless_frameless_finding_is_grouped_per_harness() {
+        let segv = |harness: &str| {
+            let mut record = earlier_frameless(
+                harness,
+                "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 \
+                 (pc 0x55 bp 0x1 sp 0x2 T0) (WRITE memory access)",
+                "BHF-206",
+                "SEGV",
+            );
+            record["exception"]["name"] = serde_json::json!("ASAN_SEGV");
+            record["exception"]["sanitizer"] = serde_json::json!("asan");
+            record
+        };
+        let a = cluster_from_finding_json(&segv("H-C0001")).unwrap();
+        let b = cluster_from_finding_json(&segv("H-C0002")).unwrap();
+        assert_ne!(a.full, b.full);
+        assert!(a.fallback, "no source location: {a:?}");
+        assert_eq!(a, cluster_from_finding_json(&segv("H-C0001")).unwrap());
+    }
+
+    /// An earlier release's crash with no sanitizer report had no frames and
+    /// one key per rule too. Read back, it is grouped by its harness and its
+    /// signal, as this release groups one.
+    #[test]
+    fn an_earlier_fatal_signal_finding_is_grouped_per_harness_and_signal() {
+        let fatal = |harness: &str, signal: &str| {
+            let mut record = earlier_frameless(
+                harness,
+                &format!(
+                    "harness crashed with {signal} and no sanitizer report — a reachable crash"
+                ),
+                "BHF-210",
+                "fatal-signal",
+            );
+            record["exception"] = serde_json::json!({
+                "name": "FATAL_SIGNAL",
+                "message": record["exception"]["message"].clone(),
+                "stack": [],
+            });
+            record
+        };
+        let a = cluster_from_finding_json(&fatal("H-C0001", "SIGSEGV")).unwrap();
+        let b = cluster_from_finding_json(&fatal("H-C0002", "SIGSEGV")).unwrap();
+        let c = cluster_from_finding_json(&fatal("H-C0001", "SIGILL")).unwrap();
+        assert_ne!(a.full, b.full);
+        assert_ne!(a.full, c.full);
+        let persisted = fatal("H-C0001", "SIGSEGV")["cluster_key_full"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(a.full, persisted);
+        let report = SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report — a reachable crash"
+                .to_owned(),
+            check: Some("SIGSEGV".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(a, cluster_for_sanitizer_scoped(&report, "H-C0001"));
+    }
+
+    /// A crash with no sanitizer report as 0.2.x recorded it: the shared crash
+    /// builder tagged it with AddressSanitizer, so its name carries an
+    /// `ASAN_` prefix and its record a `sanitizer` of `asan`.
+    fn earlier_asan_tagged(
+        harness: &str,
+        message: &str,
+        rule: &str,
+        kind: &str,
+    ) -> serde_json::Value {
+        let mut record = earlier_frameless(harness, message, rule, kind);
+        record["exception"]["name"] =
+            serde_json::json!(format!("ASAN_{}", kind.to_uppercase().replace('-', "_")));
+        record["exception"]["sanitizer"] = serde_json::json!("asan");
+        record
+    }
+
+    /// The same frame-less crash with no sanitizer report as 0.3.0 recorded
+    /// it: no `sanitizer` tag and the kind alone as its name.
+    fn earlier_untagged(harness: &str, message: &str, rule: &str, kind: &str) -> serde_json::Value {
+        let mut record = earlier_frameless(harness, message, rule, kind);
+        record["exception"] = serde_json::json!({
+            "name": kind.to_uppercase().replace('-', "_"),
+            "message": message,
+            "stack": [],
+        });
+        record
+    }
+
+    /// A 0.2.x crash with no sanitizer report (`ASAN_FATAL_SIGNAL`, tagged
+    /// `asan`) had the constant key of its rule too. Read back, it is grouped
+    /// by its harness and its signal, with the key the same crash gets when
+    /// 0.3.0 recorded it, and when this release does.
+    #[test]
+    fn an_earlier_asan_tagged_fatal_signal_finding_is_grouped_per_harness_and_signal() {
+        let message = |signal: &str| {
+            format!("harness crashed with {signal} and no sanitizer report — a reachable crash")
+        };
+        let tagged = |harness: &str, signal: &str| {
+            earlier_asan_tagged(harness, &message(signal), "BHF-210", "fatal-signal")
+        };
+        let record = tagged("H-C0001", "SIGSEGV");
+        let persisted = record["cluster_key_full"].as_str().unwrap().to_owned();
+        let a = legacy_fallback_cluster_key(&record).expect("a recomputed key");
+        let b = legacy_fallback_cluster_key(&tagged("H-C0002", "SIGSEGV")).unwrap();
+        let c = legacy_fallback_cluster_key(&tagged("H-C0001", "SIGBUS")).unwrap();
+        assert_ne!(a.full, persisted, "the constant key is gone");
+        assert_ne!(a.full, b.full, "two harnesses");
+        assert_ne!(a.full, c.full, "two signals");
+        assert_eq!(cluster_from_finding_json(&record), Some(a.clone()));
+        let untagged = earlier_untagged("H-C0001", &message("SIGSEGV"), "BHF-210", "fatal-signal");
+        assert_eq!(legacy_fallback_cluster_key(&untagged), Some(a.clone()));
+        let report = SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: message("SIGSEGV"),
+            check: Some("SIGSEGV".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(a, cluster_for_sanitizer_scoped(&report, "H-C0001"));
+    }
+
+    /// The transport lane's frame-less findings an earlier release recorded
+    /// (a 0.2.x fault, tagged `asan`; a 0.3.0 deadline or timeout) had the
+    /// constant key of their rule and kind. Read back, each is grouped by its
+    /// harness and fault class, as this release groups a frame-less one.
+    #[test]
+    fn earlier_transport_faults_and_deadlines_are_grouped_per_harness_and_class() {
+        let trap = "target transport reported a target memory-protection (MMU/MPU) trap with no \
+                    sanitizer report (fault address 0x20001000)";
+        let crash = "target transport reported a crash with no fault detail — a reachable crash";
+        let deadline = "target transport completed but its host-observed execution time 950ms \
+                        exceeded the configured deadline 500ms — a timing/availability finding";
+        let timeout =
+            "target transport reported a target deadline / watchdog timeout with no sanitizer report";
+        for (shape, rule, kind, message) in [
+            ("tagged", "BHF-210", "target-memory-protection", trap),
+            ("tagged", "BHF-210", "target-crash", crash),
+            ("tagged", "BHF-210", "target-timeout", timeout),
+            (
+                "untagged",
+                "BHF-555",
+                "transport-deadline-exceeded",
+                deadline,
+            ),
+            ("untagged", "BHF-555", "target-timeout", timeout),
+        ] {
+            let record = |harness: &str| match shape {
+                "tagged" => earlier_asan_tagged(harness, message, rule, kind),
+                _ => earlier_untagged(harness, message, rule, kind),
+            };
+            let persisted = record("H-T0001")["cluster_key_full"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let a = legacy_fallback_cluster_key(&record("H-T0001"))
+                .unwrap_or_else(|| panic!("{shape} {kind}: a recomputed key"));
+            let b = legacy_fallback_cluster_key(&record("H-T0002")).unwrap();
+            assert_ne!(a.full, persisted, "{shape} {kind}");
+            assert_ne!(a.full, b.full, "{shape} {kind}: two harnesses");
+            assert_eq!(
+                cluster_from_finding_json(&record("H-T0001")),
+                Some(a.clone()),
+                "{shape} {kind}"
+            );
+            // The key this release gives the frame-less report it builds.
+            let report = SanitizerReport {
+                kind: kind.to_owned(),
+                rule_id: finding_rules::by_id(rule).unwrap().id,
+                message: message.to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(
+                a,
+                cluster_for_sanitizer_scoped(&report, "H-T0001"),
+                "{shape} {kind}"
+            );
+        }
+    }
+
+    /// What this release wrote keeps its key, and so does a fallback record
+    /// that is not a sanitizer crash.
+    #[test]
+    fn records_this_release_keys_are_not_rekeyed() {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-cluster-rekey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let emitter = crate::finding::FindingEmitter::with_metadata(
+            dir.clone(),
+            "H-C0001".to_owned(),
+            "cpp".to_owned(),
+            String::new(),
+        );
+        let report = crate::sanitizer::parse_sanitizer_report(&format!(
+            "/src/widget/parse.cpp:12:1: {MISSING_RETURN}\n"
+        ))
+        .unwrap();
+        let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
+        let path = crate::layout::findings_dir(&dir)
+            .join(&id.0)
+            .join("finding.json");
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(legacy_fallback_cluster_key(&current), None);
+        assert_eq!(
+            cluster_from_finding_json(&current).map(|key| key.full),
+            current["cluster_key_full"].as_str().map(str::to_owned)
+        );
+        // Nor does a crash with no sanitizer report this release wrote.
+        for (kind, rule_id, check) in [
+            ("fatal-signal", "BHF-210", Some("SIGSEGV")),
+            ("transport-deadline-exceeded", "BHF-555", None),
+            ("target-timeout", "BHF-555", None),
+        ] {
+            let report = SanitizerReport {
+                kind: kind.to_owned(),
+                rule_id,
+                message: format!("{kind} with no sanitizer report"),
+                check: check.map(str::to_owned),
+                ..Default::default()
+            };
+            let id = emitter.emit_sanitizer_crash(b"y", &report).unwrap();
+            let path = crate::layout::findings_dir(&dir)
+                .join(&id.0)
+                .join("finding.json");
+            let current: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(legacy_fallback_cluster_key(&current), None, "{kind}");
+            assert_eq!(
+                cluster_from_finding_json(&current).map(|key| key.full),
+                current["cluster_key_full"].as_str().map(str::to_owned),
+                "{kind}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut ada = earlier_missing_return("H-A0001", "/src/widget/parse.cpp:12:1");
+        ada["exception"] = serde_json::json!({
+            "name": "CONSTRAINT_ERROR",
+            "message": "parser.adb:17 range check failed",
+        });
+        assert_eq!(legacy_fallback_cluster_key(&ada), None);
+        let mut oracle = earlier_missing_return("H-C0001", "/src/widget/parse.cpp:12:1");
+        oracle["oracle"] = serde_json::json!({"name": "path-traversal"});
+        assert_eq!(legacy_fallback_cluster_key(&oracle), None);
     }
 }

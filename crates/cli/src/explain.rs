@@ -55,9 +55,11 @@ pub struct ExplainArgs {
     pub finding_id: Option<String>,
 
     /// Explain every finding of a root-cause group. By default a group (the
-    /// findings that share a `cluster_key_full`, such as one site reached
-    /// through several harnesses) is explained once, by its first finding,
-    /// which lists the others and their harnesses.
+    /// findings with one root-cause key, such as one site reached through
+    /// several harnesses: their `cluster_key_full`, or for a finding an
+    /// earlier release keyed on one constant per rule, the key its report
+    /// gets now) is explained once, by its first finding, which lists the
+    /// others and their harnesses.
     #[arg(long = "all-members")]
     pub all_members: bool,
 }
@@ -106,7 +108,7 @@ pub fn run(args: ExplainArgs) -> i32 {
 /// `all_members`. Each block names the other findings of its group.
 fn render(work_dir: &Path, only: Option<&str>, all_members: bool) -> anyhow::Result<Vec<String>> {
     let findings = collect(work_dir)?;
-    let mut groups: std::collections::BTreeMap<&str, Vec<&Finding>> = Default::default();
+    let mut groups: std::collections::BTreeMap<String, Vec<&Finding>> = Default::default();
     for f in &findings {
         groups.entry(group_key(f)).or_default().push(f);
     }
@@ -116,7 +118,7 @@ fn render(work_dir: &Path, only: Option<&str>, all_members: bool) -> anyhow::Res
         if only.is_some_and(|want| f.id != want) {
             continue;
         }
-        let members = &groups[group_key(f)];
+        let members = &groups[&group_key(f)];
         if collapse && members.first().is_some_and(|first| first.id != f.id) {
             continue;
         }
@@ -136,11 +138,18 @@ fn render(work_dir: &Path, only: Option<&str>, all_members: bool) -> anyhow::Res
 }
 
 /// The root-cause group a finding belongs to: its `cluster_key_full`, the key
-/// the results reports group on, else the finding alone.
-fn group_key(f: &Finding) -> &str {
-    str_at(&f.raw, "/cluster_key_full")
-        .filter(|key| !key.is_empty())
-        .unwrap_or(&f.id)
+/// the results reports group on (for a frame-less crash an earlier release
+/// keyed on one constant per rule, the key its stored report gets now), else
+/// the finding alone.
+fn group_key(f: &Finding) -> String {
+    corpus::cluster::legacy_fallback_cluster_key(&f.raw)
+        .map(|key| key.full)
+        .or_else(|| {
+            str_at(&f.raw, "/cluster_key_full")
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| f.id.clone())
 }
 
 /// ``H-C0001 (`target`)``, or `H-C0001` when the harness's target is unknown.
@@ -2328,6 +2337,93 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!(one[0].starts_with("━━━ F-0002-bbbbbbbb"), "{}", one[0]);
         assert!(one[0].contains("F-0001-aaaaaaaa (H-C0001)"), "{}", one[0]);
+    }
+
+    /// Frame-less UBSan findings an earlier release keyed on one constant per
+    /// rule are explained one block per reported site, as the results reports
+    /// group them, not as one root cause.
+    #[test]
+    fn earlier_frameless_findings_are_explained_per_site() {
+        let work = tempfile::tempdir().unwrap();
+        let signature = "5ca1ab1e".repeat(8);
+        for (id, harness, site) in [
+            ("F-0000-5ca1ab1e", "H-C0001", "/src/widget/parse.cpp:12:1"),
+            ("F-0001-5ca1ab1e", "H-C0002", "/src/widget/parse.cpp:19:1"),
+            ("F-0002-5ca1ab1e", "H-C0003", "/src/widget/scale.cpp:7:1"),
+        ] {
+            let dir = corpus::layout::findings_dir(work.path()).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw = serde_json::json!({
+                "id": id,
+                "signature": signature,
+                "cluster_key_full": signature,
+                "cluster_normalized_frames": [],
+                "cluster_fallback": true,
+                "rule_id": "BHF-210",
+                "harness_id": harness,
+                "classification": "unhandled",
+                "exception": {
+                    "name": "UBSAN_UNDEFINED_BEHAVIOR",
+                    "sanitizer": "ubsan",
+                    "message": format!(
+                        "{site}: runtime error: execution reached the end of a \
+                         value-returning function without returning a value"
+                    ),
+                    "stack": [],
+                },
+            });
+            std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+        }
+        let blocks = render(work.path(), None, false).unwrap();
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !block.contains("Root cause shared")),
+            "{blocks:#?}"
+        );
+    }
+
+    /// 0.2.x recorded a crash with no sanitizer report as `ASAN_FATAL_SIGNAL`,
+    /// tagged `asan`, on the constant key of its rule. The same signal in two
+    /// harnesses is two root causes, each explained on its own.
+    #[test]
+    fn earlier_fatal_signal_findings_are_explained_per_harness() {
+        let work = tempfile::tempdir().unwrap();
+        let signature = "f00dfeed".repeat(8);
+        for (id, harness) in [
+            ("F-0000-f00dfeed", "H-C0001"),
+            ("F-0001-f00dfeed", "H-C0002"),
+        ] {
+            let dir = corpus::layout::findings_dir(work.path()).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw = serde_json::json!({
+                "id": id,
+                "signature": signature,
+                "cluster_key_full": signature,
+                "cluster_normalized_frames": [],
+                "cluster_fallback": true,
+                "rule_id": "BHF-210",
+                "harness_id": harness,
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_FATAL_SIGNAL",
+                    "sanitizer": "asan",
+                    "message": "harness crashed with SIGSEGV and no sanitizer report — a \
+                                reachable crash",
+                    "stack": [],
+                },
+            });
+            std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+        }
+        let blocks = render(work.path(), None, false).unwrap();
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !block.contains("Root cause shared")),
+            "{blocks:#?}"
+        );
     }
 
     /// The decoded arguments recorded in decoded.json are tabulated, and the
