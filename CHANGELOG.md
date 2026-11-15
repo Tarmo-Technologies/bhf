@@ -445,6 +445,15 @@
   partner is a heap copy of the input, as a spelled `const unsigned char *`
   is, instead of one byte of storage the callee read past; with a count it
   pairs in both lanes without a typedef in the scanned tree.
+- A lone writable byte pointer whose element type is a typedef or
+  `std::uint8_t` (`u8_t *`, `BYTE *`, `std::uint8_t *`), alone or before a
+  scalar that is not its length, is a heap copy of the input with 64 KiB of
+  headroom in both lanes, as a spelled `unsigned char *` is, instead of one
+  byte of stack storage. A writable pointer to a `char` typedef (`CHAR *`, a
+  project `typedef char text_t`) is the fixed-capacity writable string a
+  spelled `char *` is. A correct function writing a few bytes into either was
+  reported as a stack-buffer-overflow the harness caused. This is part of
+  harness input format 4.
 - A target parameter named like one of the harness's own locals (`Data`,
   `Size`, `Cur`, `R`, a `_bhf_` or `bhf_` name) gets a local of its own
   (`bhf_arg_<name>`). Such a harness used to initialise the parameter from

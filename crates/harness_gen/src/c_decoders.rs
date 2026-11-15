@@ -1082,9 +1082,8 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         // scalar scratch is not sufficient and lets the callee write out of
         // bounds. Give it bounded, writable headroom and seed the prefix from
         // the fuzz input so in/out buffers remain fuzz-driven.
-        "unsigned char *" | "uint8_t *" | "int8_t *" | "signed char *" => {
-            Some(mutable_byte_pointer(normalized.as_str(), name))
-        }
+        "unsigned char *" | "uint8_t *" | "int8_t *" | "signed char *" | "std::uint8_t *"
+        | "std::int8_t *" => Some(mutable_byte_pointer(normalized.as_str(), name)),
         "const void *" | "void const *" => Some(const_void_pointer(name)),
         "void *" => Some(mutable_void_pointer(name)),
         "FILE *" => Some(file_pointer("FILE *", name)),
@@ -1336,6 +1335,31 @@ fn emit_top_level_pointer(
                 // defined (a fixed-width read sees zeros, not heap garbage), then copy
                 // the fuzz bytes and keep the C-string NUL terminator.
                 emit_nul_terminated_byte_copy(ctx, c_type, name);
+                return Ok(name.to_owned());
+            }
+            if is_writable_char_typedef_pointer(c_type, *kind, ctx.registry) {
+                // A writable pointer to a `char` typedef (Win32 `CHAR *`, a
+                // project `typedef char text_t`) is the writable string a
+                // spelled `char *` is: a fixed-capacity, NUL-terminated buffer,
+                // see `bhf_c_string_out`. One byte of scratch storage let a
+                // correct callee write past it. The typedef can hide a `const`
+                // the registry does not record, so the free goes through
+                // `(void *)`.
+                ctx.push(format!("{c_type} {name} = bhf_c_string_out(&Cur, 4096)"));
+                ctx.cleanups.push(format!("free((void *){name})"));
+                return Ok(name.to_owned());
+            }
+            if is_writable_byte_buffer(c_type, *kind, ctx.registry) {
+                // A writable byte pointer whose element type is spelled through
+                // a typedef (`octet_t *`, Win32 `BYTE *`) is the same
+                // caller-owned buffer as the spelled `unsigned char *`, and
+                // gets the same input copy plus headroom: one byte of scratch
+                // storage let a correct callee write past it. The typedef can
+                // hide a `const` the registry does not record, so the copy and
+                // the free go through `(void *)`.
+                let emission = byte_buffer_with_headroom(c_type, name, true);
+                ctx.push(emission.decl);
+                ctx.cleanups.extend(emission.free);
                 return Ok(name.to_owned());
             }
             let storage_type = output_pointer_storage_type(c_type, pointer_base_hint, name)?;
@@ -1654,6 +1678,35 @@ fn emit_nul_terminated_byte_copy(ctx: &mut DecodeContext<'_>, c_type: &str, name
 /// `LPCBYTE` or `cbytes_t`), so its spelling hides the pointee.
 fn is_hidden_pointer(c_type: &str) -> bool {
     !c_type.contains('*') && !c_type.contains('[') && !c_type.contains('(')
+}
+
+/// A spelled, non-const `T *` whose element `T` resolves to a byte scalar
+/// through the registry. A `T` that is a plain `char` is a string instead,
+/// see [`is_writable_char_typedef_pointer`].
+fn is_writable_byte_buffer(c_type: &str, kind: ScalarKind, registry: &TypeRegistry) -> bool {
+    matches!(kind, ScalarKind::U8 | ScalarKind::I8)
+        && !is_const_byte_pointer(c_type, kind)
+        && !pointee_is_plain_char(c_type, registry)
+}
+
+/// A spelled, non-const `T *` whose element `T` is a plain `char` through
+/// typedefs: a project `typedef char text_t` (or a chain of them), or Win32
+/// `CHAR`, which resolves without a typedef in the scanned tree.
+fn is_writable_char_typedef_pointer(
+    c_type: &str,
+    kind: ScalarKind,
+    registry: &TypeRegistry,
+) -> bool {
+    kind == ScalarKind::I8
+        && !is_const_byte_pointer(c_type, kind)
+        && pointee_is_plain_char(c_type, registry)
+}
+
+fn pointee_is_plain_char(c_type: &str, registry: &TypeRegistry) -> bool {
+    pointer_base_owned(c_type).is_some_and(|base| {
+        let target = registry.alias_target_spelling(&base).unwrap_or(base);
+        matches!(target.as_str(), "char" | "CHAR")
+    })
 }
 
 fn is_const_byte_pointer(c_type: &str, kind: ScalarKind) -> bool {
@@ -2838,19 +2891,32 @@ fn canonical_c_type_for_decoder(c_type: &str) -> String {
 }
 
 fn mutable_byte_pointer(c_type: &str, name: &str) -> CParamEmission {
+    byte_buffer_with_headroom(c_type, name, false)
+}
+
+/// A heap copy of the input with 64 KiB of headroom, for a writable byte
+/// buffer whose capacity the signature does not state. `via_void` writes the
+/// copy and the free through `(void *)`, for an element type whose constness
+/// is not known.
+fn byte_buffer_with_headroom(c_type: &str, name: &str, via_void: bool) -> CParamEmission {
     let cap = format!("_bhf_cap_{name}");
     let copy = format!("_bhf_copy_{name}");
+    let target = if via_void {
+        format!("(void *){name}")
+    } else {
+        name.to_owned()
+    };
     CParamEmission {
         support: None,
         decl: format!(
             "size_t {cap} = Size <= (1024 * 1024) ? (size_t)Size + 65536 : (1024 * 1024 + 65536); \
              {c_type} {name} = ({c_type})malloc({cap} ? {cap} : 1); \
              size_t {copy} = (size_t)Size < {cap} ? (size_t)Size : {cap}; \
-             if ({name} && {copy}) memcpy({name}, Data, {copy})"
+             if ({name} && {copy}) memcpy({target}, Data, {copy})"
         ),
         arg: name.to_owned(),
         c_type: c_type.to_owned(),
-        free: Some(format!("free({name})")),
+        free: Some(format!("free({target})")),
     }
 }
 

@@ -6104,6 +6104,87 @@ mod tests {
         .collect()
     }
 
+    /// A lone writable byte buffer spelled through a typedef (or a chain of
+    /// them) is the same caller-owned storage as `unsigned char *`: the input
+    /// plus headroom, alone or before a scalar that is not its length. The
+    /// copy and the free go through `(void *)`, since the typedef can hide a
+    /// `const`; a writable `char` typedef stays a string.
+    #[test]
+    fn lone_writable_typedef_byte_buffer_gets_headroom() {
+        let defs = c_parser::parse_c_type_defs(
+            "typedef unsigned char octet_t;\n\
+             typedef octet_t flag_byte;\n\
+             typedef signed char sbyte_t;\n\
+             typedef char text_t;\n\
+             typedef unsigned int word_t;\n",
+        )
+        .unwrap();
+        let registry = TypeRegistry::from_defs(std::iter::once(&defs));
+        let emissions = |params: &[(&str, &str)]| -> Vec<CParamEmission> {
+            let params: Vec<CParameter> = params
+                .iter()
+                .map(|(name, c_type)| CParameter {
+                    name: (*name).to_owned(),
+                    c_type: (*c_type).to_owned(),
+                })
+                .collect();
+            build_param_decoders(
+                &params,
+                &registry,
+                &[],
+                None,
+                false,
+                false,
+                DecoderLimits::default(),
+                "set_flag",
+                false,
+            )
+            .expect("decoders")
+        };
+        for buffer_type in ["octet_t *", "flag_byte *", "sbyte_t *", "BYTE *"] {
+            for params in [
+                vec![("bits", buffer_type)],
+                vec![("bits", buffer_type), ("bit_index", "word_t")],
+            ] {
+                let emissions = emissions(&params);
+                let bits = &emissions[0];
+                assert!(
+                    bits.decl.contains(
+                        "size_t _bhf_cap_bits = Size <= (1024 * 1024) ? (size_t)Size + 65536"
+                    ) && bits
+                        .decl
+                        .contains("memcpy((void *)bits, Data, _bhf_copy_bits)")
+                        && !bits.decl.contains("_bhf_out_bits"),
+                    "{params:?}: {emissions:#?}"
+                );
+                assert_eq!(bits.free.as_deref(), Some("free((void *)bits)"));
+                if let Some(index) = emissions.get(1) {
+                    assert!(
+                        !index.decl.contains("Size") && !index.decl.contains("_bhf_cap_bits"),
+                        "{params:?}: {emissions:#?}"
+                    );
+                }
+            }
+        }
+        // A writable `char` typedef is a writable string, as a spelled
+        // `char *` is, never one byte of storage.
+        for buffer_type in ["text_t *", "CHAR *"] {
+            for params in [
+                vec![("bits", buffer_type)],
+                vec![("bits", buffer_type), ("bit_index", "word_t")],
+            ] {
+                let text = emissions(&params);
+                assert!(
+                    text[0].decl.contains("bits = bhf_c_string_out(&Cur, 4096)")
+                        && !text[0].decl.contains("_bhf_out_bits")
+                        && !text[0].decl.contains("_bhf_cap_bits"),
+                    "{params:?}: {text:#?}"
+                );
+                assert_eq!(text[0].free.as_deref(), Some("free((void *)bits)"));
+            }
+        }
+    }
+
     #[test]
     fn buffer_name_alone_does_not_bind_the_next_integer_to_the_input_length() {
         // `copy_at(src, offset, size)`: `src` is buffer-shaped, but `offset` is

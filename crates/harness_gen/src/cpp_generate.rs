@@ -5172,6 +5172,100 @@ mod tests {
         );
     }
 
+    /// A lone writable byte buffer is caller-owned storage whose size the
+    /// signature does not state, however its element type is spelled: a
+    /// project typedef (or a chain of them), Win32 `BYTE` and `std::uint8_t`
+    /// get the input plus headroom, as `unsigned char *` does, alone and
+    /// before a scalar that is not its length. One byte of scratch storage let
+    /// a correct callee write past it.
+    #[test]
+    fn cpp_lone_writable_byte_buffer_gets_headroom_whatever_its_spelling() {
+        let registry = typedef_registry(
+            "typedef unsigned char octet_t;\n\
+             typedef octet_t flag_byte;\n\
+             typedef unsigned int word_t;\n",
+        );
+        for buffer_type in [
+            "octet_t *",
+            "octet_t*",
+            "flag_byte *",
+            "BYTE *",
+            "BYTE*",
+            "std::uint8_t *",
+            "std::int8_t *",
+            "unsigned char *",
+            "uint8_t *",
+        ] {
+            for params in [
+                vec![("bits", buffer_type)],
+                vec![("bits", buffer_type), ("bit_index", "word_t")],
+                vec![("bits", buffer_type), ("bit_index", "unsigned int")],
+            ] {
+                let decls = cpp_param_decls(&registry, &params);
+                let bits = &decls[0];
+                assert!(
+                    bits.contains(
+                        "size_t _bhf_cap_bits = Size <= (1024 * 1024) ? (size_t)Size + 65536"
+                    ) && bits.contains("malloc(_bhf_cap_bits ? _bhf_cap_bits : 1)")
+                        && (bits.contains("memcpy(bits, Data, _bhf_copy_bits)")
+                            || bits.contains("memcpy((void *)bits, Data, _bhf_copy_bits)"))
+                        && !bits.contains("_bhf_out_bits"),
+                    "{params:?} must allocate the input plus headroom: {decls:#?}"
+                );
+                if let Some(index) = decls.get(1) {
+                    assert!(
+                        !index.contains("Size") && !index.contains("_bhf_cap_bits"),
+                        "{params:?}: bit_index is not a length: {decls:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A writable pointer to a `char` typedef (Win32 `CHAR *`, a project
+    /// `text_t *`, a chain of them) is a writable string, as a spelled
+    /// `char *` is: a fixed-capacity, NUL-terminated buffer, alone and before
+    /// a scalar that is not its length, never one byte of stack storage.
+    #[test]
+    fn cpp_lone_writable_char_typedef_pointer_is_a_string_buffer() {
+        let with_typedefs = typedef_registry(
+            "typedef char CHAR;\n\
+             typedef char text_t;\n\
+             typedef text_t label_t;\n\
+             typedef unsigned int word_t;\n",
+        );
+        // Win32 `CHAR` resolves without a typedef in the scanned tree too.
+        let without_typedefs = typedef_registry("typedef unsigned int word_t;\n");
+        for (registry, buffer_type) in [
+            (&with_typedefs, "CHAR *"),
+            (&with_typedefs, "CHAR*"),
+            (&with_typedefs, "text_t *"),
+            (&with_typedefs, "label_t *"),
+            (&without_typedefs, "CHAR *"),
+            (&with_typedefs, "char *"),
+        ] {
+            for params in [
+                vec![("out", buffer_type)],
+                vec![("out", buffer_type), ("bit_index", "word_t")],
+                vec![("out", buffer_type), ("bit_index", "unsigned int")],
+            ] {
+                let decls = cpp_param_decls(registry, &params);
+                let out = &decls[0];
+                assert!(
+                    out.contains("out = bhf_c_string_out(&Cur, 4096)")
+                        && !out.contains("_bhf_out_out"),
+                    "{params:?} must be a writable string buffer: {decls:#?}"
+                );
+                if let Some(index) = decls.get(1) {
+                    assert!(
+                        !index.contains("Size") && !index.contains("_bhf_out_out"),
+                        "{params:?}: bit_index is not a length: {decls:#?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A byte buffer spelled through a POINTER typedef (`LPCBYTE`, `PBYTE`,
     /// `typedef const u8_t *cu8_ptr`) pairs with its length. The typedef hides
     /// whether the bytes are const, so the buffer is a heap copy of the input and
@@ -8350,6 +8444,184 @@ mod tests {
             String::from_utf8_lossy(&run.stderr)
         );
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// A correct function that sets a bit in a caller-owned 8-byte array must
+    /// not crash under its harness, whether the array's element type is a
+    /// project typedef, Win32 `BYTE`, `std::uint8_t` or a `char` typedef
+    /// (Win32 `CHAR`, a project `text_t`). The harness used to pass one byte
+    /// of stack storage, so any bit index of 8 or more was a
+    /// stack-buffer-overflow the harness itself caused. A byte typedef gets
+    /// the input plus headroom and a `char` typedef a writable string buffer;
+    /// an element typedef that hides a `const` still builds.
+    #[test]
+    fn built_cpp_harness_gives_a_writable_typedef_byte_buffer_room() {
+        let Some(cxx_flags) = clangxx_compile_flags("cpp-writable-byte-buffer") else {
+            eprintln!("skipping writable byte buffer e2e: clang++ C++ headers unavailable");
+            return;
+        };
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping writable byte buffer e2e: make unavailable");
+            return;
+        }
+        let set = |buffer_type: &str| {
+            format!(
+                "bits[bit_index / 8] |= ({buffer_type})(1u << (bit_index % 8));\n  return true;"
+            )
+        };
+        let write_char = "bits[bit_index / 8] = 'a';\n  return true;".to_owned();
+        for (label, typedef, buffer_type, body, string) in [
+            (
+                "typedef",
+                "typedef unsigned char octet_t;\n",
+                "octet_t",
+                set("octet_t"),
+                false,
+            ),
+            (
+                "win32",
+                "typedef unsigned char BYTE;\n",
+                "BYTE",
+                set("BYTE"),
+                false,
+            ),
+            ("std", "", "std::uint8_t", set("std::uint8_t"), false),
+            (
+                "const",
+                "typedef const unsigned char cflag_t;\n",
+                "cflag_t",
+                "return (bits[bit_index / 8] >> (bit_index % 8)) & 1u;".to_owned(),
+                false,
+            ),
+            (
+                "win32-char",
+                "typedef char CHAR;\n",
+                "CHAR",
+                write_char.clone(),
+                true,
+            ),
+            (
+                "char-typedef",
+                "typedef char text_t;\n",
+                "text_t",
+                write_char.clone(),
+                true,
+            ),
+        ] {
+            let out = temp_dir(&format!("cpp-writable-byte-buffer-{label}"));
+            let header = format!(
+                "#include <cstdint>\n\
+                 {typedef}\
+                 typedef unsigned int word_t;\n\
+                 namespace demo {{\n\
+                 bool set_flag({buffer_type} *bits, word_t bit_index);\n\
+                 }}\n"
+            );
+            fs::write(out.join("flags.hpp"), &header).unwrap();
+            let target_cpp = out.join("flags.cpp");
+            fs::write(
+                &target_cpp,
+                format!(
+                    "#include \"flags.hpp\"\n\
+                     namespace demo {{\n\
+                     bool set_flag({buffer_type} *bits, word_t bit_index) {{\n\
+                     \x20 if (bit_index >= 64) return false;\n\
+                     \x20 {body}\n\
+                     }}\n\
+                     }}\n"
+                ),
+            )
+            .unwrap();
+            let mut target = cppfunction("set_flag");
+            target.qualifier_path = vec!["demo".to_owned()];
+            let args = GenerateCppDirectArgs {
+                decoder_limits: Default::default(),
+                force: false,
+                harness_id: format!("H-CPP-WRITABLE-BYTES-{label}"),
+                output_dir: out.clone(),
+                source_path: out.join("flags.hpp"),
+                target,
+                params: vec![
+                    CppParameter {
+                        name: "bits".to_owned(),
+                        cpp_type: format!("{buffer_type} *"),
+                    },
+                    CppParameter {
+                        name: "bit_index".to_owned(),
+                        cpp_type: "word_t".to_owned(),
+                    },
+                ],
+                return_type: "bool".to_owned(),
+                target_includes: vec!["flags.hpp".to_owned()],
+                target_includes_dirs: vec![out.clone()],
+                target_sources: vec![target_cpp],
+                compile_flags: cxx_flags.clone(),
+                c_runtime_include: runtime_dir(),
+                using_namespaces: Vec::new(),
+                result_cleanup: None,
+                constructor_params: Vec::new(),
+                type_defs: vec![c_parser::parse_c_type_defs(&header).unwrap()],
+                default_constructible_classes: Vec::new(),
+                parameter_constructions: Vec::new(),
+                receiver_class_override: None,
+                factory_plan: None,
+            };
+            generate_cpp_direct_harness(args).unwrap();
+            let main_cpp = fs::read_to_string(out.join("main.cpp")).unwrap();
+            if string {
+                // A fixed-capacity, NUL-terminated writable string.
+                assert!(
+                    main_cpp.contains("bits = bhf_c_string_out(&Cur, 4096)")
+                        && !main_cpp.contains("_bhf_out_bits"),
+                    "{label}: the buffer must be a writable string:\n{main_cpp}"
+                );
+            } else {
+                // The input bytes the cursor left, plus 64 KiB of headroom.
+                assert!(
+                    main_cpp.contains(
+                        "size_t _bhf_cap_bits = _bhf_rest_size_p <= (1024 * 1024) ? \
+                         (size_t)_bhf_rest_size_p + 65536"
+                    ) && main_cpp.contains("malloc(_bhf_cap_bits ? _bhf_cap_bits : 1)")
+                        && !main_cpp.contains("_bhf_out_bits"),
+                    "{label}: the buffer must be the input plus headroom:\n{main_cpp}"
+                );
+            }
+            let build = Command::new("make")
+                .arg("main")
+                .current_dir(&out)
+                .output()
+                .expect("run make");
+            assert!(
+                build.status.success(),
+                "{label}: make main failed:\n{}\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            );
+            // Whichever bytes the index is read from, one of these inputs makes
+            // it 40: a write to byte 5 of the array.
+            for (index, bytes) in [[40u8, 0, 0, 0, 0, 0], [0, 40, 0, 0, 0, 0]]
+                .iter()
+                .enumerate()
+            {
+                let input = out.join(format!("input-{index}.bin"));
+                fs::write(&input, bytes).unwrap();
+                let run = crate::harness_command(out.join("main"))
+                    .arg(&input)
+                    .output()
+                    .unwrap();
+                assert!(
+                    run.status.success(),
+                    "{label}: a correct function must not crash under its harness on \
+                     {bytes:?}:\n{}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
     }
 
     #[test]

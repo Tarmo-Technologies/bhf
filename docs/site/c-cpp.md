@@ -424,7 +424,7 @@ it did not reach. The per-type rules are:
 | `channels`, `req_comps` and other channel counts | 4 | a 32-bit read modulo 9 |
 | integer named `flags`, `flag`, `flg`, `cflags`, `eflags`, `mode`, `modes`, `options`, `option`, `opts` or ending in `_flags`, `_flag`, `_mode`, `_options`, `_opts`, or whose type is named `flag`, `flags` or ends in `_flag`, `_flags`, `_flag_t`, `_flags_t` | 0 | pinned to 0, the default mode: such a value selects a variant or a dispatch, and a fuzzed one trips reserved bits no real caller sets |
 | `const char *` | 2 + L | a 16-bit length prefix, then L bytes (at most 4096 and at most what is left) in a heap copy of L + 1 bytes ending in NUL |
-| `char *` (writable) | up to 4096 | a fixed 4097-byte heap buffer holding the next 4096 bytes (or what is left), no prefix |
+| `char *` (writable), or a `char` typedef such as `CHAR *` | up to 4096 | a fixed 4097-byte heap buffer holding the next 4096 bytes (or what is left), no prefix |
 | `fmt`, `format` and the last `char *` of a variadic function | 2 + L | as `const char *`, with every `%` replaced by a space |
 | `const wchar_t *` | 2 + L wide characters | a 16-bit prefix counting wide characters (4 bytes each on Linux), at most 2048 |
 | `const char **` with a count | 8, then strings | a count modulo 17, then that many length-prefixed strings of at most 256 bytes |
@@ -453,8 +453,10 @@ with no cursor parameter, that is the whole testcase:
   allocation;
 - `const void *` with no partner: a view of the remaining input; `void *`: a
   heap copy;
-- a writable byte pointer with no partner (`unsigned char *`, `uint8_t *`): a
-  heap copy of the remaining input with 64 KiB of zeroed headroom;
+- a writable byte pointer with no partner (`unsigned char *`, `uint8_t *`,
+  or an element type spelled through a typedef such as `u8_t *`, `BYTE *` or
+  `std::uint8_t *`): a heap copy of the remaining input with 64 KiB of
+  headroom;
 - C++ byte vectors and spans (`std::vector<uint8_t>`,
   `std::span<const uint8_t>`): a copy or view of the remaining input;
 - `FILE *`: `fmemopen` over a copy of the remaining input (on Windows, which
@@ -721,13 +723,16 @@ Format 4 gives every buffer of a call that takes several its own bytes (each
 but the last a sized slice, above) instead of the same remaining input, and
 binds every `(buffer, length)` pair of a call, not only the first. It also
 pairs the counts named `nElem`, `numberOfElements` or a bare `cb`, gives a
-lone pointer-typedef buffer (`LPCBYTE`) a heap copy of the input instead of
-one byte, renames a parameter named like a harness local, resolves the
-scalar typedefs a C target declares in its own `.c`, in C++ sizes a typed
-array to its element count as the C lane does, and in both lanes decodes
-each element of such an array from the input. A testcase of
-a call with any of these shapes decodes differently under format 3; any
-other harness decodes its inputs as format 3 did.
+lone pointer-typedef buffer (`LPCBYTE`), and a lone writable byte pointer
+whose element type is a typedef or `std::uint8_t` (`u8_t *`, `BYTE *`), a
+heap copy of the input instead of one byte, decodes a writable pointer to a
+`char` typedef (`CHAR *`) as the writable `char *` above instead of one
+byte, renames a parameter named like a harness local, resolves the scalar
+typedefs a C target declares in its own `.c`, in C++ sizes a typed array to
+its element count as the C lane does, and in both lanes decodes each element
+of such an array from the input. A testcase of a call with any of these
+shapes decodes differently under format 3; any other harness decodes its
+inputs as format 3 did.
 
 A harness generated with `BHF_BUFFER_LEN_DIMENSION=1` decodes the same
 format differently again, so a finding also records `buffer_len_dimension`

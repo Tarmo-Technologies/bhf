@@ -33,8 +33,12 @@ pub use generate::{
 ///   them sharing those bytes (and a second `(buffer, length)` pair's length
 ///   being decoded on its own). Counts named `nElem`, `numberOfItems` or a
 ///   bare Win32 `cb`/`cch`, and buffers spelled through a pointer typedef
-///   (`LPCBYTE`), now pair, and a parameter named like a harness local
-///   (`Data`, `Size`, `Cur`) gets a local of its own. It also resolves the
+///   (`LPCBYTE`), now pair, a lone writable byte pointer whose element type
+///   is a typedef or `std::uint8_t` (`u8_t *`, `BYTE *`) is a copy of the
+///   input with headroom and one whose element type is a `char` typedef
+///   (`CHAR *`) a writable string, instead of one decoded byte, and a
+///   parameter named like a harness local (`Data`, `Size`, `Cur`) gets a
+///   local of its own. It also resolves the
 ///   scalar typedefs a C target declares in its own `.c`, in C++ sizes a
 ///   typed array to its element count as the C lane does, and in both lanes
 ///   decodes each element of such an array from the input.
