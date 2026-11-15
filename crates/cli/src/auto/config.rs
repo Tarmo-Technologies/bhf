@@ -938,14 +938,16 @@ mod tests {
             applied("rss-limit-mb = 7\n", &["bhf", "tree"]).rss_limit_mb,
             7
         );
-        let default_rss = crate::auto::cli::default_auto_rss_limit_mb().to_string();
+        // The default follows the host's free memory, so it is read once: a
+        // second read can differ by a few MiB.
+        let default_rss = crate::auto::cli::default_auto_rss_limit_mb();
         assert_eq!(
             applied(
                 "rss-limit-mb = 7\n",
-                &["bhf", "tree", "--rss-limit-mb", &default_rss]
+                &["bhf", "tree", "--rss-limit-mb", &default_rss.to_string()]
             )
             .rss_limit_mb,
-            crate::auto::cli::default_auto_rss_limit_mb()
+            default_rss
         );
     }
 
