@@ -3867,6 +3867,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/replay_min/src/raised.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/replay_min/src/replay.rs",
       "license": "Apache-2.0"
     },

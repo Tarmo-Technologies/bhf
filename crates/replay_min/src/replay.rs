@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use corpus::{classify, compute_signature, resolve_handler, Signature};
+use crate::raised::{closest_to, raised_exceptions, RaisedException};
+use corpus::{classify, compute_signature, resolve_handler, Signature, SourceLineMaps};
 use event_log::{group_into_testcases, EventReader};
 use serde::Serialize;
 use serde_json::Value;
@@ -23,20 +24,78 @@ pub fn replay_with_runner(
     finding_dir: &Path,
     runner: &HarnessRunner,
 ) -> Result<ReplayResult, ReplayError> {
-    let ReplayInput { recorded, input } = load_finding(finding_dir)?;
-    let computed = signatures_for_input_with_runner(runner, &input)?;
+    replay_report_with_runner(finding_dir, runner, &SourceLineMaps::default())
+        .map(|report| report.result)
+}
 
-    if computed.contains(&recorded) {
-        Ok(ReplayResult::Match)
-    } else {
-        let actual = computed.first().copied();
-        Ok(ReplayResult::Mismatch { recorded, actual })
+/// A replay's verdict with what it compared: the exception the finding
+/// records and every exception the replayed testcase raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayReport {
+    pub result: ReplayResult,
+    /// The signature the finding records.
+    pub recorded_signature: Signature,
+    /// What the finding records it raised; `None` for a finding.json that
+    /// holds only a signature.
+    pub recorded: Option<RaisedException>,
+    /// What the replayed testcase raised, in event-log order: the signatures
+    /// the verdict compared.
+    pub replayed: Vec<RaisedException>,
+}
+
+impl ReplayReport {
+    /// The replayed exception the verdict rests on: the one with the recorded
+    /// signature on a match; otherwise the one closest to the recorded
+    /// exception ([`closest_to`]), whose signature is the `actual` one.
+    pub fn deciding(&self) -> Option<&RaisedException> {
+        match &self.result {
+            ReplayResult::Match => self
+                .replayed
+                .iter()
+                .find(|raised| raised.signature == self.recorded_signature),
+            ReplayResult::Mismatch { .. } => closest_to(self.recorded.as_ref(), &self.replayed),
+        }
     }
+}
+
+/// Replay a finding and describe what both runs raised. `line_maps` maps the
+/// instrumented lines in the replayed messages back to the source, as the
+/// finding's messages were when it was recorded.
+pub fn replay_report_with_runner(
+    finding_dir: &Path,
+    runner: &HarnessRunner,
+    line_maps: &SourceLineMaps,
+) -> Result<ReplayReport, ReplayError> {
+    let ReplayInput {
+        recorded,
+        input,
+        finding,
+    } = load_finding(finding_dir)?;
+    let testcases = testcases_for_input_with_runner(runner, &input)?;
+    let replayed = raised_exceptions(&testcases, line_maps);
+    let mut described = RaisedException::from_finding(&finding);
+    // A description whose signature is not the recorded one describes
+    // something else.
+    described.take_if(|raised| raised.signature != recorded);
+    let result = if replayed.iter().any(|raised| raised.signature == recorded) {
+        ReplayResult::Match
+    } else {
+        let actual = closest_to(described.as_ref(), &replayed).map(|raised| raised.signature);
+        ReplayResult::Mismatch { recorded, actual }
+    };
+    Ok(ReplayReport {
+        result,
+        recorded_signature: recorded,
+        recorded: described,
+        replayed,
+    })
 }
 
 pub(crate) struct ReplayInput {
     pub recorded: Signature,
     pub input: Vec<u8>,
+    /// The finding.json it was read from.
+    pub finding: Value,
 }
 
 pub(crate) fn load_finding(finding_dir: &Path) -> Result<ReplayInput, ReplayError> {
@@ -76,7 +135,11 @@ pub(crate) fn load_finding(finding_dir: &Path) -> Result<ReplayInput, ReplayErro
         source,
     })?;
 
-    Ok(ReplayInput { recorded, input })
+    Ok(ReplayInput {
+        recorded,
+        input,
+        finding,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -675,6 +738,15 @@ pub(crate) fn signatures_for_input_with_runner(
     runner: &HarnessRunner,
     input: &[u8],
 ) -> Result<Vec<Signature>, ReplayError> {
+    testcases_for_input_with_runner(runner, input).map(|testcases| computed_signatures(&testcases))
+}
+
+/// Run the harness on `input` and read back the testcases its event log
+/// reports.
+fn testcases_for_input_with_runner(
+    runner: &HarnessRunner,
+    input: &[u8],
+) -> Result<Vec<event_log::Testcase>, ReplayError> {
     let events_path = TempEventFile::new();
     let mut command = runner.command_for_events(events_path.path())?;
     command
@@ -741,24 +813,24 @@ pub(crate) fn signatures_for_input_with_runner(
         path: events_path.path().to_path_buf(),
         source,
     })?;
-    let testcases =
-        group_into_testcases(EventReader::new(event_bytes.as_slice())).map_err(|source| {
-            ReplayError::EventLogAt {
-                path: events_path.path().to_path_buf(),
-                source,
-            }
-        })?;
-    Ok(computed_signatures(&testcases))
+    group_into_testcases(EventReader::new(event_bytes.as_slice())).map_err(|source| {
+        ReplayError::EventLogAt {
+            path: events_path.path().to_path_buf(),
+            source,
+        }
+    })
 }
 
 /// Most bytes of a harness's stderr kept for an error message.
 const MAX_HARNESS_STDERR: usize = 1024 * 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayResult {
     Match,
     Mismatch {
         recorded: Signature,
+        /// The signature of the replayed exception closest to the recorded
+        /// one ([`closest_to`]); `None` when the replay raised none.
         actual: Option<Signature>,
     },
 }

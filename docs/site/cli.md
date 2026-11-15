@@ -551,8 +551,9 @@ MATCH
   and any `--debugger` transcript. The summary names it (`log`, and
   `replay_log` in `--json`). It is overwritten by the next replay, is not one
   of the finding's evidence files, and results/ is rebuilt after it is
-  written so `attestation.json` stays current. A lane with no local harness
-  (session, collector, transport, Ada event log) writes the verdict and why
+  written so `attestation.json` stays current. It also has the summary's
+  crash, differences and details lines. A lane with no harness output to
+  keep (session, collector, transport, Ada event log) writes those and why
   there is no output.
 - **`--show-args`** runs a generated C/C++ harness with `BHF_TRACE_ARGS=1` and
   prints the value it decoded for each parameter under the summary: name,
@@ -601,8 +602,29 @@ MATCH
   the same `bhf.replay.v1` document with `lane` (`binary`, `session`,
   `collector` or `transport`) and `details`; `harness` is present only for a
   binary finding. `--show-output` prints a binary target's stderr; the other
-  lanes run no local harness. An Ada (event-log) replay shows the harness exit
-  status and duration, and compares event-log signatures.
+  lanes run no local harness.
+- **Ada (event-log) findings.** The verdict compares event-log signatures;
+  the summary says what both runs raised. `crash` is the replayed exception
+  the verdict rests on (the rule and classification, then `NAME: message`),
+  `reported` its raise site (the explicit `raise` the event log records, or
+  the `file.adb:LINE` GNAT puts first in a failed check's message, put back
+  on the source line through `src_instrumented/` of the harness's work dir,
+  or of the finding's when the harness is outside one), `handled` its
+  handler or that it reached the harness, and `recorded` the same for the
+  exception the finding recorded. On a `MATCH` that is the exception with
+  the recorded signature. On a `MISMATCH` it is the replayed exception
+  closest to the recorded one, wherever it came in the run: the same
+  exception with the same classification and handler, then with either,
+  then at the same raise site; failing that, one that reached the harness,
+  then the first. `actual=`, `crash` and the `differs` lines (the
+  exception, the raise site, the handler, the classification, the target or
+  the last breadcrumb) all describe that one, or say that the replay raised
+  none; any other exception the replay raised, such as one it handled
+  first, is listed under `also`. `--json` carries both sides in
+  `exceptions` (`recorded`, and `replayed` in event-log order, each with
+  `name`, `message`, `classification`, `raised_at`, `handled_at`,
+  `target_id`, `last_breadcrumb` and `signature`), with the harness exit
+  status and duration in `exit`.
 - **Sanitizer options.** C/C++ replays use the fuzz child's options:
   `ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1:symbolize=1` (plus
   `detect_leaks=1` for a leak finding) and `UBSAN_OPTIONS` also

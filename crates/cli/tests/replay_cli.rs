@@ -2067,6 +2067,363 @@ fn the_event_log_replay_summary_has_an_exit_status() {
     assert_eq!(value["exit"]["code"], 0);
 }
 
+/// The testcase the fake harness reports for the input `escaped`: a
+/// `raise Program_Error with "empty record"` at widgets.adb:6 that escapes to
+/// the harness.
+fn escaped_testcase() -> event_log::Testcase {
+    event_log::Testcase {
+        testcase_id: 1,
+        target_id: 0x42,
+        target_entered: false,
+        crumbs: vec![1],
+        handlers: Vec::new(),
+        raises: vec![event_log::RaiseEvent {
+            sequence_index: 3,
+            exception_name: "Program_Error".to_owned(),
+            file: "widgets.adb".to_owned(),
+            line: 6,
+            breadcrumb: 1,
+        }],
+        top_level: Some(event_log::TopLevelEvent {
+            exception_name: "PROGRAM_ERROR".to_owned(),
+            exception_message: "empty record".to_owned(),
+        }),
+        end: None,
+        mocks: Vec::new(),
+    }
+}
+
+/// An event-log replay says what was raised and where, for the recorded run
+/// and the replayed one: the exception, its message, the raise site and the
+/// handler, on a MATCH and on a MISMATCH, in text and in --json.
+#[cfg(unix)]
+#[test]
+fn the_event_log_replay_says_what_was_raised_and_where() {
+    let work = temp_dir("event-log-detail").join("work");
+    let id = corpus::FindingEmitter::new(work.clone())
+        .emit(
+            b"escaped",
+            &escaped_testcase(),
+            corpus::UNHANDLED_HANDLER_INDEX,
+        )
+        .expect("finding emitted");
+    let finding = corpus::layout::findings_dir(&work).join(id.0);
+    let finding_arg = finding.to_str().unwrap();
+    let harness = fake_harness().to_str().unwrap();
+
+    let output = replay_output(&[finding_arg, "--harness", harness]);
+    let stdout = text(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        text(&output.stderr)
+    );
+    assert_eq!(stdout.lines().next(), Some("MATCH"), "{stdout}");
+    for needle in [
+        "crash      BHF-101 unhandled: PROGRAM_ERROR: empty record",
+        "reported   widgets.adb:6",
+        "handled    not handled: it reached the harness",
+        "recorded   BHF-101 unhandled: PROGRAM_ERROR: empty record",
+        "           raised at widgets.adb:6; not handled: it reached the harness",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?} in:\n{stdout}");
+    }
+    let log = fs::read_to_string(finding.join("replay.log")).unwrap();
+    assert!(log.contains("PROGRAM_ERROR: empty record"), "{log}");
+
+    let output = replay_output(&[finding_arg, "--harness", harness, "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["crash"]["rule"], "BHF-101", "{value:#}");
+    assert_eq!(value["crash"]["kind"], "unhandled");
+    assert_eq!(value["crash"]["location"], "widgets.adb:6");
+    let exceptions = &value["exceptions"];
+    for raised in [&exceptions["recorded"], &exceptions["replayed"][0]] {
+        assert_eq!(raised["name"], "PROGRAM_ERROR", "{value:#}");
+        assert_eq!(raised["message"], "empty record");
+        assert_eq!(raised["raised_at"], "widgets.adb:6");
+        assert!(raised["handled_at"].is_null());
+        assert_eq!(raised["classification"], "unhandled");
+    }
+
+    // Another fault from the same harness: both sides are named, and so is
+    // what differs between them.
+    fs::write(finding.join("testcase.bin"), b"index").unwrap();
+    let output = replay_output(&[finding_arg, "--harness", harness]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.starts_with("MISMATCH recorded="), "{stderr}");
+    for needle in [
+        "differs    exception: recorded PROGRAM_ERROR, replayed CONSTRAINT_ERROR",
+        "differs    raised at: recorded widgets.adb:6, replayed widgets.adb:16",
+        "crash      BHF-101 unhandled: CONSTRAINT_ERROR: widgets.adb:16 index check failed",
+        "reported   widgets.adb:16",
+        "recorded   BHF-101 unhandled: PROGRAM_ERROR: empty record",
+        "           raised at widgets.adb:6; not handled: it reached the harness",
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?} in:\n{stderr}");
+    }
+}
+
+/// A MISMATCH compares the recorded exception with the replayed one closest
+/// to it. Here the replay first raises and handles another exception, then
+/// raises the recorded one unhandled, at another site and after another
+/// breadcrumb: `crash`, `actual=` and `differs` are about the escaped one,
+/// and the handled one is listed under `also`.
+#[cfg(unix)]
+#[test]
+fn an_event_log_mismatch_compares_the_closest_replayed_exception() {
+    let work = temp_dir("event-log-closest").join("work");
+    let recorded = event_log::Testcase {
+        testcase_id: 1,
+        target_id: 0x42,
+        target_entered: false,
+        crumbs: vec![1, 3],
+        handlers: vec![event_log::HandlerEvent {
+            sequence_index: 4,
+            exception_name: "WIDGET_ERROR".to_owned(),
+            exception_message: "bad widget".to_owned(),
+            handler_file: "widgets.adb".to_owned(),
+            handler_line: 18,
+            last_breadcrumb: 3,
+            target_id: 0x42,
+            testcase_id: 1,
+        }],
+        raises: vec![event_log::RaiseEvent {
+            sequence_index: 3,
+            exception_name: "Widget_Error".to_owned(),
+            file: "widgets.adb".to_owned(),
+            line: 14,
+            breadcrumb: 3,
+        }],
+        top_level: Some(event_log::TopLevelEvent {
+            exception_name: "CONSTRAINT_ERROR".to_owned(),
+            exception_message: "widgets.adb:19 index check failed".to_owned(),
+        }),
+        end: None,
+        mocks: Vec::new(),
+    };
+    let id = corpus::FindingEmitter::new(work.clone())
+        .emit(
+            b"handled-then-escaped",
+            &recorded,
+            corpus::UNHANDLED_HANDLER_INDEX,
+        )
+        .expect("finding emitted");
+    let finding = corpus::layout::findings_dir(&work).join(id.0);
+    let finding_arg = finding.to_str().unwrap();
+    let harness = fake_harness().to_str().unwrap();
+
+    let output = replay_output(&[finding_arg, "--harness", harness]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let differs: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("differs "))
+        .map(str::trim_start)
+        .filter(|difference| !difference.starts_with("signature:"))
+        .collect();
+    assert_eq!(
+        differs,
+        [
+            "raised at: recorded widgets.adb:19, replayed widgets.adb:22",
+            "last breadcrumb: recorded 3, replayed 4",
+        ],
+        "{stderr}"
+    );
+    for needle in [
+        "crash      BHF-101 unhandled: CONSTRAINT_ERROR: widgets.adb:22 index check failed",
+        "reported   widgets.adb:22",
+        "handled    not handled: it reached the harness",
+        "also       BHF-106 explicit_raise: WIDGET_ERROR: bad widget",
+        "           raised at widgets.adb:17; handled at widgets.adb:21",
+        "recorded   BHF-101 unhandled: CONSTRAINT_ERROR: widgets.adb:19 index check failed",
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?} in:\n{stderr}");
+    }
+
+    let output = replay_output(&[finding_arg, "--harness", harness, "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let replayed = &value["exceptions"]["replayed"];
+    assert_eq!(replayed[0]["name"], "WIDGET_ERROR", "{value:#}");
+    assert_eq!(replayed[1]["name"], "CONSTRAINT_ERROR", "{value:#}");
+    let escaped = replayed[1]["signature"].as_str().expect("a signature");
+    assert_eq!(value["signature"]["replayed"], escaped, "{value:#}");
+    assert_eq!(
+        value["crash"]["message"],
+        "CONSTRAINT_ERROR: widgets.adb:22 index check failed"
+    );
+    let recorded_hex = value["signature"]["recorded"].as_str().unwrap();
+    assert!(
+        stderr.starts_with(&format!(
+            "MISMATCH recorded={recorded_hex} actual={escaped}"
+        )),
+        "{stderr}"
+    );
+}
+
+/// A replay that raised nothing says so, beside what the finding recorded.
+#[cfg(unix)]
+#[test]
+fn an_event_log_replay_that_raised_nothing_says_so() {
+    let work = temp_dir("event-log-nothing").join("work");
+    let id = corpus::FindingEmitter::new(work.clone())
+        .emit(
+            b"escaped",
+            &escaped_testcase(),
+            corpus::UNHANDLED_HANDLER_INDEX,
+        )
+        .expect("finding emitted");
+    let finding = corpus::layout::findings_dir(&work).join(id.0);
+    // The fake harness reports one handled exception for any other input;
+    // a shell harness that writes an empty event log raises nothing.
+    let harness = work.join("quiet.sh");
+    fs::write(
+        &harness,
+        "#!/bin/sh\ncat >/dev/null\n: > \"$BHF_EVENTS_PATH\"\n",
+    )
+    .unwrap();
+    make_executable(&harness);
+    let output = replay_output(&[
+        finding.to_str().unwrap(),
+        "--harness",
+        harness.to_str().unwrap(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    for needle in [
+        "actual=<none>",
+        "differs    exception: recorded PROGRAM_ERROR, the replay raised none",
+        "crash      none: the replayed run raised no exception",
+        "recorded   BHF-101 unhandled: PROGRAM_ERROR: empty record",
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?} in:\n{stderr}");
+    }
+}
+
+/// An Ada package with two faults: an empty record is rejected with
+/// `Program_Error` (an explicit raise at line 6), and any other record fails
+/// the index check at line 8.
+const WIDGETS_ADS: &str = "package Widgets is
+   function Parse_Record (Data : String) return Natural;
+end Widgets;
+";
+const WIDGETS_ADB: &str = "--  Reads one byte past the end of a record.
+package body Widgets is
+   function Parse_Record (Data : String) return Natural is
+   begin
+      if Data'Length = 0 then
+         raise Program_Error with \"empty record\";
+      end if;
+      return Character'Pos (Data (Data'Last + 1));
+   end Parse_Record;
+end Widgets;
+";
+
+/// The findings `bhf auto` records for a real Ada target replay with what
+/// was raised and where (on the source's own lines), on a MATCH and, when
+/// one fault's input is replayed against the other's finding, on a MISMATCH.
+#[cfg(unix)]
+#[test]
+fn an_ada_finding_replay_says_what_was_raised_and_where() {
+    if which::which("gnatmake").is_err() || which::which("gprbuild").is_err() {
+        eprintln!("SKIP: gnatmake/gprbuild not installed; the Ada lane is unavailable");
+        return;
+    }
+    let root = temp_dir("ada-replay-detail");
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("widgets.ads"), WIDGETS_ADS).unwrap();
+    fs::write(src.join("widgets.adb"), WIDGETS_ADB).unwrap();
+    let work = root.join("work");
+    let auto = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .arg("--per-target-time")
+        .arg("3")
+        .output()
+        .unwrap();
+    let findings: Vec<(PathBuf, serde_json::Value)> =
+        fs::read_dir(corpus::layout::findings_dir(&work))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter_map(|dir| {
+                        let raw = fs::read(dir.join("finding.json")).ok()?;
+                        Some((dir, serde_json::from_slice(&raw).ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let by_name = |name: &str| {
+        findings
+            .iter()
+            .find(|(_, finding)| finding["exception"]["name"] == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {name} finding in {findings:#?}\nbhf auto exit {:?}\n{}",
+                    auto.status.code(),
+                    text(&auto.stderr)
+                )
+            })
+    };
+    let (empty, empty_finding) = by_name("PROGRAM_ERROR");
+    let (check, _) = by_name("CONSTRAINT_ERROR");
+    let empty_what = "PROGRAM_ERROR: empty record";
+    let check_what = "CONSTRAINT_ERROR: widgets.adb:8 index check failed";
+    for (finding, what, site) in [
+        (empty, empty_what, "widgets.adb:6"),
+        (check, check_what, "widgets.adb:8"),
+    ] {
+        let output = replay_output(&[finding.to_str().unwrap()]);
+        let stdout = text(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{stdout}{}",
+            text(&output.stderr)
+        );
+        assert_eq!(stdout.lines().next(), Some("MATCH"), "{stdout}");
+        for needle in [
+            format!("crash      BHF-101 unhandled: {what}"),
+            format!("reported   {site}"),
+            "handled    not handled: it reached the harness".to_owned(),
+            format!("recorded   BHF-101 unhandled: {what}"),
+            format!("           raised at {site}; not handled: it reached the harness"),
+        ] {
+            assert!(stdout.contains(&needle), "missing {needle:?} in:\n{stdout}");
+        }
+    }
+
+    // The empty-record finding, replayed with the failing check's input.
+    let swapped = root.join("swapped/findings/F-0000-swapped");
+    fs::create_dir_all(&swapped).unwrap();
+    fs::copy(empty.join("finding.json"), swapped.join("finding.json")).unwrap();
+    fs::copy(check.join("testcase.bin"), swapped.join("testcase.bin")).unwrap();
+    let harness = work.join(empty_finding["fixture_path"].as_str().unwrap());
+    let output = replay_output(&[
+        swapped.to_str().unwrap(),
+        "--harness",
+        harness.to_str().unwrap(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.starts_with("MISMATCH recorded="), "{stderr}");
+    for needle in [
+        "differs    exception: recorded PROGRAM_ERROR, replayed CONSTRAINT_ERROR".to_owned(),
+        "differs    raised at: recorded widgets.adb:6, replayed widgets.adb:8".to_owned(),
+        format!("crash      BHF-101 unhandled: {check_what}"),
+        "reported   widgets.adb:8".to_owned(),
+        format!("recorded   BHF-101 unhandled: {empty_what}"),
+        "           raised at widgets.adb:6; not handled: it reached the harness".to_owned(),
+    ] {
+        assert!(stderr.contains(&needle), "missing {needle:?} in:\n{stderr}");
+    }
+}
+
 /// A reproduction recorded by replay leaves results/ consistent: every
 /// attested digest matches the file on disk.
 #[cfg(unix)]

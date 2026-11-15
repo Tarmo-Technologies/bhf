@@ -60,6 +60,16 @@
   and then made up by the repair loop. One above the tree, and a toolset import
   other than the standard three, are named on the console instead of skipped
   silently.
+- `bhf replay` of an Ada (event-log) finding printed only the two signatures.
+  It now says what the recorded and the replayed run raised: the exception's
+  name and message, its raise site (on the source line) and its handler, and
+  on a `MISMATCH` what differs between them, or that the replay raised
+  nothing. A `MISMATCH` compares the recorded exception with the replayed
+  one closest to it (by name, classification, handler and raise site), not
+  with whichever came first, and `actual=` is that one's signature.
+  `--json` gains `exceptions` (an additive `bhf.replay.v1` field),
+  and every `replay.log` also holds the summary's crash, difference and
+  detail lines.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

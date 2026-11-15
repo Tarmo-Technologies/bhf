@@ -3,6 +3,7 @@
 pub mod differential;
 pub mod minimize;
 pub mod process;
+pub mod raised;
 pub mod replay;
 
 pub use differential::{
@@ -16,7 +17,8 @@ pub use minimize::{
     minimize_finding_typed_values_with_spans, minimize_typed_values, ByteMinimization,
     MinimizeError, TypedValueMinimization,
 };
+pub use raised::{closest_to, raised_exceptions, RaisedException};
 pub use replay::{
-    replay, replay_with_runner, HarnessRunner, ReplayError, ReplayResult, SandboxConfig,
-    SandboxMetadata,
+    replay, replay_report_with_runner, replay_with_runner, HarnessRunner, ReplayError,
+    ReplayReport, ReplayResult, SandboxConfig, SandboxMetadata,
 };

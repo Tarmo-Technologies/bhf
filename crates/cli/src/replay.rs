@@ -1098,6 +1098,14 @@ struct CrashSummary {
     allocated: Vec<String>,
 }
 
+/// What an event-log replay compared, in words: the exception the finding
+/// records and every exception the replayed testcase raised.
+#[derive(Debug, Serialize)]
+struct ExceptionReport {
+    recorded: Option<replay_min::RaisedException>,
+    replayed: Vec<replay_min::RaisedException>,
+}
+
 #[derive(Debug, Serialize)]
 struct OutputCapture {
     stdout: String,
@@ -1140,6 +1148,10 @@ struct ReplaySummary {
     /// The Ada lane compares event-log signatures instead of reports.
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<Value>,
+    /// The Ada lane: what the finding recorded it raised and what the replay
+    /// raised, each with its message, raise site and handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exceptions: Option<ExceptionReport>,
     /// What a non-harness lane reports beyond its verdict.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     details: Vec<Detail>,
@@ -1366,11 +1378,11 @@ fn render_text(summary: &ReplaySummary) -> Vec<String> {
         }
         None => {}
     }
-    if let Some(signature) = &summary.signature {
-        push("signature", signature_text(signature));
-    }
     for detail in &summary.details {
         push(&detail.label, detail.value.clone());
+    }
+    if let Some(signature) = &summary.signature {
+        push("signature", signature_text(signature));
     }
     if let Some(exit) = &summary.exit {
         push("exit", exit.text.clone());
@@ -1455,6 +1467,25 @@ fn write_replay_log(
     log.push_str(&format!("testcase: {}\n", summary.testcase.path));
     if let Some(exit) = &summary.exit {
         log.push_str(&format!("exit: {}\n", exit.text));
+    }
+    if let Some(crash) = &summary.crash {
+        log.push_str(&format!(
+            "crash: {} {}: {}\n",
+            crash.rule, crash.kind, crash.message
+        ));
+        if let Some(location) = &crash.location {
+            log.push_str(&format!("reported: {location}\n"));
+        }
+    }
+    for difference in &summary.differences {
+        log.push_str(&format!("differs: {difference}\n"));
+    }
+    for detail in &summary.details {
+        if detail.label.is_empty() {
+            log.push_str(&format!("  {}\n", detail.value));
+        } else {
+            log.push_str(&format!("{}: {}\n", detail.label, detail.value));
+        }
     }
     match streams {
         Some((stdout, stderr)) => {
@@ -1780,6 +1811,7 @@ pub(crate) fn finish_lane(
         notes: Vec::new(),
         crash: report.as_ref().map(crash_summary),
         signature: None,
+        exceptions: None,
         details: lane.details,
         exit: lane.exit,
         harness: lane.binary.as_ref().map(|(path, mode)| {
@@ -2012,6 +2044,7 @@ pub(crate) fn replay_c(
         notes,
         crash: report.as_ref().map(crash_summary),
         signature: None,
+        exceptions: None,
         details: Vec::new(),
         exit: Some(run.exit()),
         harness: Some(harness_info),
@@ -2102,7 +2135,9 @@ fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
     )
 }
 
-/// Reproduce an Ada (event-log) finding by its handler signature.
+/// Reproduce an Ada (event-log) finding by its handler signature, and say
+/// what the finding recorded and what the replay raised: each exception's
+/// name, message, raise site and handler.
 fn replay_ada(
     finding_dir: &Path,
     runner: &HarnessRunner,
@@ -2111,38 +2146,14 @@ fn replay_ada(
 ) -> i32 {
     let raw = read_finding(finding_dir).unwrap_or(Value::Null);
     let started = Instant::now();
-    let replayed = replay_min::replay_with_runner(finding_dir, runner);
+    let line_maps = ada_line_maps(finding_dir, runner.harness_path());
+    let replayed = replay_min::replay_report_with_runner(finding_dir, runner, &line_maps);
     // replay_min returns a result only for a harness that exited 0 (any other
     // exit is an error), so a result's exit status is 0; the time covers the
     // run and reading back its event log.
     let exit = ExitSummary::process(Some(0), None, None, started.elapsed());
-    let (verdict, status_line, signature, differences) = match replayed {
-        Ok(replay_min::ReplayResult::Match) => {
-            let recorded = raw
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            (
-                "match",
-                "MATCH".to_owned(),
-                json!({"recorded": recorded, "replayed": recorded}),
-                Vec::new(),
-            )
-        }
-        Ok(replay_min::ReplayResult::Mismatch { recorded, actual }) => {
-            let actual = actual
-                .map(|signature| signature.hex())
-                .unwrap_or_else(|| "<none>".to_owned());
-            (
-                "mismatch",
-                format!("MISMATCH recorded={} actual={actual}", recorded.hex()),
-                json!({"recorded": recorded.hex(), "replayed": actual}),
-                vec![format!(
-                    "signature: recorded {}, replayed {actual}",
-                    recorded.hex()
-                )],
-            )
-        }
+    let report = match replayed {
+        Ok(report) => report,
         Err(error) => {
             let mut message = error_chain(&error);
             if detection.protocol == HarnessProtocol::StdinEventLog {
@@ -2156,6 +2167,61 @@ fn replay_ada(
             return report_error(&output, finding_dir, &message);
         }
     };
+    let recorded_hex = report.recorded_signature.hex();
+    let deciding = report.deciding();
+    let (verdict, status_line, signature, mut differences) = match &report.result {
+        replay_min::ReplayResult::Match => (
+            "match",
+            "MATCH".to_owned(),
+            json!({"recorded": recorded_hex, "replayed": recorded_hex}),
+            Vec::new(),
+        ),
+        replay_min::ReplayResult::Mismatch { actual, .. } => {
+            let actual = actual
+                .map(|signature| signature.hex())
+                .unwrap_or_else(|| "<none>".to_owned());
+            (
+                "mismatch",
+                format!("MISMATCH recorded={recorded_hex} actual={actual}"),
+                json!({"recorded": recorded_hex, "replayed": actual}),
+                vec![format!(
+                    "signature: recorded {recorded_hex}, replayed {actual}"
+                )],
+            )
+        }
+    };
+    if verdict == "mismatch" {
+        if let Some(recorded) = &report.recorded {
+            differences.extend(exception_differences(recorded, deciding));
+        }
+    }
+    let mut details = Vec::new();
+    match deciding {
+        Some(raised) => details.push(Detail::new("handled", raised.handled_text())),
+        None => details.push(Detail::new(
+            "crash",
+            "none: the replayed run raised no exception its event log reports",
+        )),
+    }
+    for other in report
+        .replayed
+        .iter()
+        .filter(|raised| !deciding.is_some_and(|deciding| std::ptr::eq(*raised, deciding)))
+        .take(ADA_EXTRA_EXCEPTIONS)
+    {
+        details.push(Detail::new("also", exception_line(other)));
+        details.push(Detail::new("", other.where_text()));
+    }
+    match &report.recorded {
+        Some(recorded) => {
+            details.push(Detail::new("recorded", exception_line(recorded)));
+            details.push(Detail::new("", recorded.where_text()));
+        }
+        None => details.push(Detail::new(
+            "recorded",
+            "finding.json records only the signature, not the exception",
+        )),
+    }
     let testcase_path = finding_dir.join("testcase.bin");
     let summary = ReplaySummary {
         schema_version: REPLAY_SCHEMA,
@@ -2171,9 +2237,13 @@ fn replay_ada(
         compared_line: "event-log signature".to_owned(),
         differences,
         notes: Vec::new(),
-        crash: None,
+        crash: deciding.map(exception_crash),
         signature: Some(signature),
-        details: Vec::new(),
+        exceptions: Some(ExceptionReport {
+            recorded: report.recorded.clone(),
+            replayed: report.replayed.clone(),
+        }),
+        details,
         exit: Some(exit),
         harness: Some(harness_summary(&raw, runner.harness_path(), detection)),
         testcase: testcase_summary(&testcase_path),
@@ -2190,7 +2260,7 @@ fn replay_ada(
         finding_dir,
         &summary,
         None,
-        "an Ada harness reports through its event log, whose signature the verdict compares",
+        "an Ada harness reports through its event log, which is summarized above",
     );
     let history = replay_backend(runner);
     settle_finding(
@@ -2209,6 +2279,126 @@ fn replay_ada(
     } else {
         3
     }
+}
+
+/// Replayed exceptions listed beside the one the verdict rests on.
+const ADA_EXTRA_EXCEPTIONS: usize = 3;
+
+/// The line maps that put an Ada harness's instrumented lines back on the
+/// source: `src_instrumented/` of the work dir the harness sits in, since the
+/// replayed messages are its own, or else of the finding's work dir. The
+/// recorded side needs none: finding.json was mapped when it was written.
+fn ada_line_maps(finding_dir: &Path, harness: &Path) -> corpus::SourceLineMaps {
+    [
+        crate::protocol_detect::work_dir_for_harness(harness),
+        corpus::layout::work_dir_for_finding(finding_dir),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|work| corpus::SourceLineMaps::load(&work.join("src_instrumented")))
+    .find(|maps| !maps.is_empty())
+    .unwrap_or_default()
+}
+
+fn classification_label(classification: corpus::Classification) -> &'static str {
+    match classification {
+        corpus::Classification::Unhandled => "unhandled",
+        corpus::Classification::SwallowedPredefined => "swallowed_predefined",
+        corpus::Classification::SwallowedUser => "swallowed_user",
+        corpus::Classification::ExplicitRaise => "explicit_raise",
+    }
+}
+
+/// The rule an exception gives a finding, as the fuzz lane derives it.
+fn exception_rule(raised: &replay_min::RaisedException) -> String {
+    finding_rules::derive_rule_id(
+        Some(classification_label(raised.classification)),
+        Some(&raised.name),
+    )
+    .map_or_else(|| raised.name.clone(), str::to_owned)
+}
+
+/// `RULE kind: NAME: message`, the form of a summary's crash line.
+fn exception_line(raised: &replay_min::RaisedException) -> String {
+    format!(
+        "{} {}: {}",
+        exception_rule(raised),
+        classification_label(raised.classification),
+        raised.what()
+    )
+}
+
+/// The replayed exception as a crash: its rule and classification, what was
+/// raised, and where (the summary's reported site).
+fn exception_crash(raised: &replay_min::RaisedException) -> CrashSummary {
+    CrashSummary {
+        rule: exception_rule(raised),
+        kind: classification_label(raised.classification).to_owned(),
+        sanitizer: None,
+        message: raised.what(),
+        sink: None,
+        location: raised.raised_at.clone(),
+        frames: Vec::new(),
+        access: None,
+        access_text: None,
+        allocated: Vec::new(),
+    }
+}
+
+/// What differs between the exception the finding records and the one the
+/// replay raised (`None`: it raised none).
+fn exception_differences(
+    recorded: &replay_min::RaisedException,
+    replayed: Option<&replay_min::RaisedException>,
+) -> Vec<String> {
+    let Some(replayed) = replayed else {
+        return vec![format!(
+            "exception: recorded {}, the replay raised none",
+            recorded.name
+        )];
+    };
+    let site = |site: &Option<String>, none: &str| site.clone().unwrap_or_else(|| none.to_owned());
+    let mut differences = Vec::new();
+    if !recorded.name.eq_ignore_ascii_case(&replayed.name) {
+        differences.push(format!(
+            "exception: recorded {}, replayed {}",
+            recorded.name, replayed.name
+        ));
+    }
+    if recorded.raised_at != replayed.raised_at {
+        differences.push(format!(
+            "raised at: recorded {}, replayed {}",
+            site(&recorded.raised_at, "an unknown location"),
+            site(&replayed.raised_at, "an unknown location")
+        ));
+    }
+    if recorded.handled_at != replayed.handled_at {
+        differences.push(format!(
+            "handled at: recorded {}, replayed {}",
+            site(&recorded.handled_at, "no handler"),
+            site(&replayed.handled_at, "no handler")
+        ));
+    }
+    if recorded.classification != replayed.classification {
+        differences.push(format!(
+            "classification: recorded {}, replayed {}",
+            classification_label(recorded.classification),
+            classification_label(replayed.classification)
+        ));
+    }
+    if recorded.target_id != replayed.target_id {
+        differences.push(format!(
+            "target: recorded {}, replayed {}",
+            recorded.target_id, replayed.target_id
+        ));
+    }
+    if recorded.last_breadcrumb != replayed.last_breadcrumb {
+        differences.push(format!(
+            "last breadcrumb: recorded {}, replayed {}",
+            recorded.last_breadcrumb, replayed.last_breadcrumb
+        ));
+    }
+    differences
 }
 
 /// Spawn a freshly-written harness, retrying the two transient failures that make
@@ -2416,6 +2606,49 @@ mod tests {
         let exit =
             super::ExitSummary::process(None, Some(5), None, std::time::Duration::from_millis(10));
         assert!(exit.text.starts_with("signal 5 (SIGTRAP)"), "{}", exit.text);
+    }
+
+    /// The replayed messages come from the harness, so its work dir's line
+    /// maps win over the finding's when the two differ (a harness rebuilt in
+    /// another tree); the finding's are the fallback.
+    #[test]
+    fn ada_line_maps_prefer_the_harness_work_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let sidecar = |work: &std::path::Path, original: u32| {
+            let dir = work.join("src_instrumented");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("widgets.adb.bhf-lines.json"),
+                format!(
+                    r#"{{"source_path": "/src/widgets.adb", "anchors": [[1, 1], [30, {original}]]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let finding_work = root.path().join("old/work");
+        let finding = finding_work.join("results/findings/F-0000-x");
+        std::fs::create_dir_all(&finding).unwrap();
+        sidecar(&finding_work, 23);
+        let harness_work = root.path().join("new/work");
+        let harness = harness_work.join("build/H-A0001-x/obj/main");
+        std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        sidecar(&harness_work, 22);
+        let remap = |maps: &corpus::SourceLineMaps| {
+            maps.remap_message("widgets.adb:30 index check failed").0
+        };
+
+        let maps = super::ada_line_maps(&finding, &harness);
+        assert_eq!(remap(&maps), "widgets.adb:22 index check failed");
+
+        // A harness outside any work dir: the finding's maps are used.
+        let loose = root.path().join("loose/main");
+        let maps = super::ada_line_maps(&finding, &loose);
+        assert_eq!(remap(&maps), "widgets.adb:23 index check failed");
+
+        // A harness work dir without maps falls back to the finding's too.
+        std::fs::remove_dir_all(harness_work.join("src_instrumented")).unwrap();
+        let maps = super::ada_line_maps(&finding, &harness);
+        assert_eq!(remap(&maps), "widgets.adb:23 index check failed");
     }
 
     #[test]

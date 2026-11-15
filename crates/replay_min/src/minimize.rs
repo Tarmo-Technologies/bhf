@@ -256,7 +256,9 @@ fn load_reproducing_input_with_runner(
     finding_dir: &Path,
     runner: &HarnessRunner,
 ) -> Result<(Signature, Vec<u8>), MinimizeError> {
-    let ReplayInput { recorded, input } = load_finding(finding_dir)?;
+    let ReplayInput {
+        recorded, input, ..
+    } = load_finding(finding_dir)?;
     let original = signatures_for_input_with_runner(runner, &input)?;
     if !original.contains(&recorded) {
         return Err(MinimizeError::OriginalMismatch {
