@@ -995,21 +995,19 @@ fn the_shim_leaves_errno_alone_when_its_log_cannot_be_read_back() {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        let reader_path = fifo.clone();
-        let reader = std::thread::spawn(move || {
-            let mut text = Vec::new();
-            let mut file = std::fs::File::open(&reader_path).unwrap();
-            std::io::Read::read_to_end(&mut file, &mut text).unwrap();
-            text
-        });
-        let out = run_bounded(bin, &shim, &fifo);
-        // Release a reader still waiting for a writer, should the shim not
-        // have opened the FIFO at all.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
+        // The read end is open before the probe starts: the shim's open of
+        // a FIFO does not wait for a reader, and what it writes is gone once
+        // the probe exits with no reader holding the FIFO.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo);
-        let read = reader.join().unwrap();
+            .open(&fifo)
+            .unwrap();
+        let out = run_bounded(bin, &shim, &fifo);
+        // The probe has exited, so no writer is left: the read returns what
+        // the FIFO holds, then end of file.
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut &reader, &mut read).unwrap();
         assert!(
             String::from_utf8_lossy(&read).contains(SHIM_LOADED_LINE),
             "the shim wrote no marker into the FIFO"
