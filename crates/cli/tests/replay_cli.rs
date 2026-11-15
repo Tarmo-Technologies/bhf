@@ -2231,6 +2231,7 @@ fn the_event_log_replay_summary_has_an_exit_status() {
 /// The testcase the fake harness reports for the input `escaped`: a
 /// `raise Program_Error with "empty record"` at widgets.adb:6 that escapes to
 /// the harness.
+#[cfg(unix)]
 fn escaped_testcase() -> event_log::Testcase {
     event_log::Testcase {
         testcase_id: 1,
@@ -2465,10 +2466,12 @@ fn an_event_log_replay_that_raised_nothing_says_so() {
 /// An Ada package with two faults: an empty record is rejected with
 /// `Program_Error` (an explicit raise at line 6), and any other record fails
 /// the index check at line 8.
+#[cfg(unix)]
 const WIDGETS_ADS: &str = "package Widgets is
    function Parse_Record (Data : String) return Natural;
 end Widgets;
 ";
+#[cfg(unix)]
 const WIDGETS_ADB: &str = "--  Reads one byte past the end of a record.
 package body Widgets is
    function Parse_Record (Data : String) return Natural is
