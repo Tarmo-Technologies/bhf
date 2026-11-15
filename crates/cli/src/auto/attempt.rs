@@ -8703,7 +8703,10 @@ make: *** [Makefile:327: main] Error 1\n";
         .unwrap();
         let canonical = crate::workdir::plain_canonical(&file);
         assert!(
-            include.contains(&format!("#include \"{}\"\n", canonical.display())),
+            include.contains(&format!(
+                "#include \"{}\"\n",
+                crate::auto::repair::include_spelling(&canonical)
+            )),
             "{include}"
         );
 

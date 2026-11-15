@@ -2485,7 +2485,7 @@ pub(crate) fn write_std_prelude_include(repairs_dir: &Path, prelude: &Path) -> s
 /// `/` and without the `\\?\` prefix, which every Windows compiler accepts,
 /// so a header has one spelling however it was found and one include line can
 /// be matched against another. Elsewhere a `\` or `"` in the path is escaped.
-fn include_spelling(path: &Path) -> String {
+pub(crate) fn include_spelling(path: &Path) -> String {
     if cfg!(windows) {
         harness_gen::build_safety::make_path(path)
     } else {
