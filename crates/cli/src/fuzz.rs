@@ -4042,9 +4042,9 @@ fn run_builtin_with_progress(
         }
         adopt_fresh_reruns!(std::mem::take(&mut arrived));
     }
-    // Past this share of the pass, the loop stops early enough for the
+    // In this last part of the pass, the loop stops early enough for the
     // outstanding re-runs to finish inside `--time`.
-    let drain_window = prepared.time.map(|budget| budget / FRESH_RERUN_DRAIN_SHARE);
+    let drain_window = prepared.time.map(fresh_rerun_drain_window);
     // The empty input always runs in a fresh process (an empty frame ends the
     // framed loop in some drivers). Run it once per pass and reuse the result.
     let mut empty_input_run: Option<HarnessRun> = None;
@@ -8220,6 +8220,37 @@ const FORK_STARTUP_FLOOR: Duration = Duration::from_secs(10);
 /// The last part of a pass (one over this share of `--time`) in which the loop
 /// stops issuing inputs once the fresh re-runs still out need the time left.
 const FRESH_RERUN_DRAIN_SHARE: u32 = 4;
+/// The least of a pass the loop may give to its fresh re-runs: all of a
+/// shorter pass. A quarter of a pass of a few seconds is too little to check
+/// the handful of inputs it finds, and an input left unchecked stays out of the
+/// queue. A re-run started in that window is not lowered either: beside busy
+/// processes a lowered one waits seconds for a CPU (a 2 s re-run took 8 s at
+/// nice +10 next to eight busy loops on two CPUs, 3 s at normal priority), so
+/// it would outlast a short pass.
+const FRESH_RERUN_DRAIN_FLOOR: Duration = Duration::from_secs(5);
+
+/// How much of the end of a `budget`-long pass the loop may give to the fresh
+/// re-runs still out: [`FRESH_RERUN_DRAIN_SHARE`] of it, but at least
+/// [`FRESH_RERUN_DRAIN_FLOOR`], and all of a pass shorter than that. Within it
+/// the loop stops issuing inputs once their measured re-run time
+/// ([`FreshReruns::drain_estimate`]) needs what is left.
+fn fresh_rerun_drain_window(budget: Duration) -> Duration {
+    (budget / FRESH_RERUN_DRAIN_SHARE).max(budget.min(FRESH_RERUN_DRAIN_FLOOR))
+}
+
+#[cfg(test)]
+#[test]
+fn a_short_pass_may_give_all_its_time_to_its_fresh_reruns() {
+    let window = |millis| fresh_rerun_drain_window(Duration::from_millis(millis));
+    // A pass of `bhf auto --per-target-time 2`, split three ways.
+    assert_eq!(window(333), Duration::from_millis(333));
+    assert_eq!(window(4_000), Duration::from_secs(4));
+    assert_eq!(window(5_000), Duration::from_secs(5));
+    assert_eq!(window(8_000), Duration::from_secs(5));
+    // A longer pass keeps three quarters of its time for fuzzing.
+    assert_eq!(window(20_000), Duration::from_secs(5));
+    assert_eq!(window(60_000), Duration::from_secs(15));
+}
 
 /// The rule of a response-deadline (`--deadline`) report.
 const RESPONSE_DEADLINE_RULE: &str = "BHF-555";
@@ -8630,6 +8661,10 @@ fn start_fresh_reruns(
         prepared.deadline,
     );
     let placement = fresh_rerun_placement(usable_cpus(), deadline.is_some());
+    let drain_from = pass_deadline.zip(prepared.time).map(|(end, budget)| {
+        end.checked_sub(fresh_rerun_drain_window(budget))
+            .unwrap_or(end)
+    });
     FreshReruns::start(
         move |input: &[u8], context: &RerunContext<'_>| {
             run_fresh_rerun(
@@ -8643,6 +8678,7 @@ fn start_fresh_reruns(
                     deadline,
                     pass_deadline,
                     lower_priority: placement.lower_priority,
+                    drain_from,
                 },
                 context,
             )
@@ -8749,6 +8785,61 @@ struct FreshRerunLimits {
     pass_deadline: Option<Instant>,
     /// Start a background re-run's process at a lower priority.
     lower_priority: bool,
+    /// When the pass enters its drain window ([`fresh_rerun_drain_window`]).
+    drain_from: Option<Instant>,
+}
+
+/// Whether a re-run starting at `now` starts its process at a lower priority.
+/// Only a background one does, where the placement lowers re-runs, and only
+/// before the pass's drain window and while the loop still runs (`draining`
+/// unset). Once either has come, the loop may be about to wait for the re-run
+/// and has nothing left to give way to, and an unprivileged Unix process could
+/// not raise a nice back later: lowered then, a re-run on a busy machine takes
+/// many times as long and the pass ends before it is checked.
+fn fresh_rerun_starts_lowered(
+    background: bool,
+    limits: &FreshRerunLimits,
+    draining: bool,
+    now: Instant,
+) -> bool {
+    background
+        && limits.lower_priority
+        && !draining
+        && limits.drain_from.is_none_or(|from| now < from)
+}
+
+#[cfg(test)]
+#[test]
+fn a_fresh_rerun_the_pass_may_wait_for_runs_at_normal_priority() {
+    let now = Instant::now();
+    let limits = |lower_priority, drain_from| FreshRerunLimits {
+        timeout: Duration::from_secs(10),
+        rss_limit_mb: 0,
+        deadline: None,
+        pass_deadline: None,
+        lower_priority,
+        drain_from,
+    };
+    let later = Some(now + Duration::from_secs(5));
+    let earlier = Some(now - Duration::from_millis(1));
+    let lowered = |background, lower_priority, drain_from, draining| {
+        fresh_rerun_starts_lowered(
+            background,
+            &limits(lower_priority, drain_from),
+            draining,
+            now,
+        )
+    };
+    // Before the drain window, beside the running loop: lowered.
+    assert!(lowered(true, true, later, false));
+    assert!(lowered(true, true, None, false));
+    // The loop has stopped, or the pass is in its drain window: normal.
+    assert!(!lowered(true, true, later, true));
+    assert!(!lowered(true, true, None, true));
+    assert!(!lowered(true, true, earlier, false));
+    // Never lowered where the placement does not lower, or inline.
+    assert!(!lowered(true, false, later, false));
+    assert!(!lowered(false, true, later, false));
 }
 
 /// Re-run `input` in a fresh process, in a scratch directory of its own (a
@@ -8781,6 +8872,12 @@ fn run_fresh_rerun(
         env.push(((*key).to_owned(), scratch.display().to_string()));
     }
     let background = context.placement == Placement::Background;
+    let low_priority = fresh_rerun_starts_lowered(
+        background,
+        &limits,
+        context.draining.load(Ordering::SeqCst),
+        Instant::now(),
+    );
     let started = Instant::now();
     let run = run_c_libfuzzer_single_input_in(
         runner,
@@ -8792,7 +8889,7 @@ fn run_fresh_rerun(
         limits.rss_limit_mb,
         limits.deadline,
         SpawnTweaks {
-            low_priority: background && limits.lower_priority,
+            low_priority,
             cancel: background.then_some(context.cancelled),
             restore_priority: background.then_some(context.draining),
             // Announced where the report is adopted, once it is a finding.

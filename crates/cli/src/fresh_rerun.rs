@@ -637,6 +637,52 @@ mod tests {
         let _ = reruns.finish(Some(Duration::from_secs(10)));
     }
 
+    /// Quick re-runs leave a quick estimate whatever the per-input cap: a
+    /// short pass that found eight inputs is told it needs about eight quick
+    /// re-runs, not eight per-input timeouts, so it stops in time to check
+    /// them.
+    #[test]
+    fn the_drain_estimate_counts_measured_reruns_not_the_timeout() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = release.clone();
+        let mut reruns = FreshReruns::start(
+            move |input: &[u8], _: &RerunContext<'_>| {
+                std::thread::sleep(Duration::from_millis(20));
+                // Every input after the first waits here, so eight stay out.
+                let give_up = Instant::now() + Duration::from_secs(30);
+                while input != b"first" && !held.load(Ordering::SeqCst) && Instant::now() < give_up
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                input.len()
+            },
+            1,
+            16,
+            1 << 20,
+        );
+        assert!(reruns.submit(b"first".to_vec()).is_empty());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut done = Vec::new();
+        while done.is_empty() && Instant::now() < deadline {
+            done = reruns.take_checked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(done.len(), 1, "the first re-run came back");
+        for n in 0..8u8 {
+            assert!(reruns.submit(vec![n]).is_empty());
+        }
+        // `bhf fuzz`'s default --timeout is the cap.
+        let estimate = reruns.drain_estimate(Duration::from_secs(10));
+        release.store(true, Ordering::SeqCst);
+        assert!(
+            estimate >= Duration::from_millis(8 * 20) && estimate < Duration::from_secs(1),
+            "eight 20 ms re-runs estimated at {estimate:?}"
+        );
+        let finished = reruns.finish(Some(Duration::from_secs(10)));
+        assert_eq!(finished.checked.len(), 8);
+        assert!(finished.unchecked.is_empty());
+    }
+
     /// With no worker thread at all, re-runs still happen, inline.
     #[test]
     fn without_a_worker_reruns_run_inline() {

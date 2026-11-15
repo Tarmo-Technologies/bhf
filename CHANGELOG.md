@@ -219,11 +219,14 @@
   with the fork-server. With two or more CPUs a re-run's process runs at a
   lower priority; with one CPU it keeps the loop's priority, and with
   `--deadline` it runs in the loop, so a response time is never judged while
-  the two compete for the CPU. A deadline report from a background re-run is
-  re-checked in the loop at normal priority before it becomes a finding;
-  stderr announces the finding only then, and notes an overrun the re-check
-  cleared. The empty input runs in a fresh process once per pass instead of
-  once per occurrence.
+  the two compete for the CPU. A pass may give its last quarter, at least 5 s
+  and all of a shorter pass, to the re-runs, and one that starts then runs at
+  normal priority, so a short pass on a busy machine still checks the seeds
+  and inputs it found and queues the clean ones. A deadline report from a
+  background re-run is re-checked in the loop at normal priority before it
+  becomes a finding; stderr announces the finding only then, and notes an
+  overrun the re-check cleared. The empty input runs in a fresh process once
+  per pass instead of once per occurrence.
 - Windows: the ASan runtime of the clang that builds the harnesses now always
   comes first on PATH. When it was already listed there, the Visual Studio
   environment put MSVC's own ASan DLL ahead of it, and clang-built harnesses

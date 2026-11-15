@@ -239,7 +239,7 @@ bhf may use (its affinity and CPU quota) and on `--deadline`:
 
 | Usable CPUs | `--deadline` | Re-runs run | Their priority |
 |---|---|---|---|
-| 2 or more | either | on a background thread | lower: nice +10 on Linux, below-normal on Windows (back to normal once the loop stops) |
+| 2 or more | either | on a background thread | lower: nice +10 on Linux, below-normal on Windows (back to normal once the loop stops); normal for a re-run that starts in the pass's drain window or after the loop stops |
 | 1 | not set | on a background thread | the loop's own |
 | 1 | set | inline, as the loop's own step | the loop's own |
 
@@ -261,9 +261,12 @@ never judged while it competes with the loop.
   re-run has come back clean. Until then it is only a mutation base in memory.
 - **Bounds.** At most 32 re-runs (64 MiB of inputs) are outstanding; beyond
   that the loop waits for the oldest.
-- **End of a pass.** Near the end of `--time` the loop stops issuing inputs
-  early enough for the outstanding re-runs to finish inside it; a re-run still
-  going at `--time` is stopped. A pass without `--time` waits for every
+- **End of a pass.** In the drain window at the end of `--time` (a quarter
+  of it, but at least 5 s, and all of a shorter pass) the loop stops issuing
+  inputs once the outstanding re-runs, at the time re-runs have taken so far,
+  need what is left; a re-run still going at `--time` is stopped. A re-run
+  that starts in that window does not run at a lower priority: the pass may
+  be about to wait for it. A pass without `--time` waits for every
   re-run. A pass that stopped at its finding count does not wait, and a crash
   a re-run reports after that count is reached is kept for the next pass
   instead of reported.
