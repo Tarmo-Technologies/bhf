@@ -281,7 +281,17 @@ searches, and the `--extra-source`/`--extra-include`/`--source-root` paths
 `generation-metadata.json` records, so a harness kept beside its library
 outside a checkout (`harness/` + `lib/`) finds the definer too. It
 also suggests `AUTO_EXTRA_INCLUDES='-include iostream'` for standard streams
-used without their header, and `-fms-extensions` (clang++) or `-fpermissive`
+used without their header. For standard-library names a pre-standard header
+writes without `std::` (`string`, `map`, `list`), relying on a `using
+namespace std;` in the sources that include it, it writes a prelude header
+with their headers and `using std::` declarations
+(`<harness dir>/std_prelude.h`) and prints the `-include` command for it (see
+[Custom harnesses](custom-harness.md#headers-that-rely-on-using-namespace-std)).
+A later build adds the new names it reports to that file and keeps the other
+lines. `bhf auto` lists such names in `missing-deps.txt` as types the tree
+does not define; the same prelude, set through `AUTO_EXTRA_INCLUDES`, fixes
+its builds too.
+It suggests `-fms-extensions` (clang++) or `-fpermissive`
 (g++) for a member declared with an extra class qualification
 (`int Widget::name();` inside class `Widget`), which only MSVC accepts. Each
 suggested command keeps the build variables you already set, and when several

@@ -1107,6 +1107,19 @@
   manipulators `ends`, `flush` and `ws` map to `<iostream>` only when written
   `std::`-qualified, so a project type with one of those names still gets the
   usual placeholder.
+- A failed C++ `bhf build` whose sources use standard-library names without
+  `std::` (`string`, `map<string, int>`, `list`, `vector`, `pair`, relying on
+  a `using namespace std;` the project's own sources provide) now says so. It
+  names the types, writes `<harness dir>/std_prelude.h` with their headers and
+  `using std::` declarations, and prints the
+  `AUTO_EXTRA_INCLUDES='-include <prelude>'` command that builds the harness.
+  A later failed build adds the new names it reports to the same file and
+  keeps every other line in it. Errors in C code (`.c` sources and the
+  headers they include) get no prelude. Before, the build failed with no
+  hint. An unqualified stream object such as `cerr` still gets the
+  `-include iostream` hint unless that cannot help. `bhf auto` still reports
+  such names as missing types; the same prelude fixes it through
+  `AUTO_EXTRA_INCLUDES`.
 - A member declared with an extra class qualification (`int Widget::name();`
   inside class `Widget`) is classified as its own build error
   (`extra_qualification` in `run.json`) instead of an unrecognised one. `bhf

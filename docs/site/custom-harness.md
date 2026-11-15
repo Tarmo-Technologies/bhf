@@ -146,6 +146,10 @@ prints what was missing and the exact fix:
   so the `harness/` + `lib/` layout above works outside a git checkout too.
 - Standard streams used without their header (`cerr`, `cout`, `endl`,
   `std::istream`): an `AUTO_EXTRA_INCLUDES='-include iostream'` command.
+- Standard-library names used without `std::` (`string`, `map`, `vector`,
+  `list`, `pair`, the other containers, `shared_ptr`, `runtime_error`): a
+  prelude header and the command that force-includes it. See
+  [Headers that rely on `using namespace std;`](#headers-that-rely-on-using-namespace-std).
 - A member declared with an extra class qualification, which only MSVC
   accepts by default: `-fms-extensions` for clang++ (`-fpermissive` for g++).
 
@@ -166,6 +170,70 @@ Makefile appends them to its own flags:
 ```sh
 CXX_STD=gnu++14 AUTO_EXTRA_INCLUDES="-DWIDGETS_LEGACY=1 -include iostream" \
   AUTO_EXTRA_SOURCES="$PWD/lib/src/table.cpp" bhf build bhf_work --harness H-XDECODE
+```
+
+### Headers that rely on `using namespace std;`
+
+Pre-standard C++ headers often write `string`, `map<string, int>` or
+`list<T>` without `std::`, because every source of the project puts
+`using namespace std;` before including them. The generated `main.cpp` does
+not, so the build fails with `unknown type name 'string'` or `no template
+named 'map'` (clang++), or `'map' does not name a type` (g++).
+`-include string` alone does not fix that: the names stay unqualified.
+
+`bhf build` names the standard types it saw, writes a prelude header with
+their headers and a `using` declaration for each into the harness directory
+(`bhf_work/harnesses/<id>/std_prelude.h`), and prints the command that
+force-includes it into every translation unit:
+
+```cpp
+#pragma once
+#ifdef __cplusplus
+#include <list>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+using std::list;
+using std::map;
+using std::pair;
+using std::string;
+using std::vector;
+#endif
+```
+
+```sh
+AUTO_EXTRA_INCLUDES="-include $PWD/bhf_work/harnesses/H-XRECORD/std_prelude.h" \
+  bhf build bhf_work --harness H-XRECORD
+```
+
+The project's own sources build with the prelude too: next to their
+`using namespace std;`, `using std::string;` names the same type. When the
+next build reports more names, `bhf build` adds their `#include` and `using`
+lines to the same file and leaves every other line as it is, including lines
+you added, so run the same command again. Errors in C code (`.c` sources and
+the headers they include) get no prelude: a C source's `list` or `stack` is
+its own type, which needs the project header that declares it. An
+unqualified stream object such as `cerr` gets the `-include iostream` hint
+while that is enough. It goes into the prelude when other names need one or
+the build already force-includes the prelude, when the compiler shows that
+`std::cerr` is already declared, or when `-include iostream` is already set.
+Delete a `using` line whose name a project source declares itself.
+
+To write a prelude by hand, list the headers and names your sources use
+(`<algorithm>` with `using std::min;`, `<iostream>` with `using std::cerr;`),
+save it anywhere, and force-include it the same way, by its absolute path as
+the hint does.
+
+`bhf auto` does not write a prelude. On such a tree, `missing-deps.txt` lists
+the names as types the scanned tree does not define (`'string' is undefined
+in the scanned tree`) or that the harness cannot construct, although the
+header that declares them is the standard one. The same prelude fixes
+`bhf auto` too, whether `bhf build` wrote it or you did:
+
+```sh
+AUTO_EXTRA_INCLUDES="-include $PWD/bhf_work/harnesses/H-XRECORD/std_prelude.h" \
+  bhf auto lib --work-dir bhf_auto
 ```
 
 ## Fuzz

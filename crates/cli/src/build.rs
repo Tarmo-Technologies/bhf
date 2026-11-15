@@ -1923,13 +1923,256 @@ fn shell_text(text: &str) -> String {
     }
 }
 
+/// The prelude header a failed C++ harness build writes into the harness
+/// directory for standard-library names the sources use without `std::`.
+const STD_PRELUDE_HEADER: &str = "std_prelude.h";
+
+/// A prelude header [`write_std_prelude`] wrote or extended.
+struct StdPrelude {
+    /// Resolved, as shown in the suggested command.
+    path: PathBuf,
+    /// The standard headers it includes, sorted.
+    headers: Vec<String>,
+    /// What this build did to the file.
+    change: PreludeChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreludeChange {
+    Created,
+    Extended,
+    Unchanged,
+}
+
+/// The prelude for `names` (each with its header): the headers, then a
+/// `using std::<name>;` for each name, both sorted. Including a header twice
+/// and repeating a using declaration are harmless, so a source that has its
+/// own `#include <string>` and `using namespace std;` still compiles with it.
+fn std_prelude_text(names: &[(String, &'static str)]) -> String {
+    let (headers, sorted) = std_prelude_lines(names);
+    let mut text = String::from(
+        "/* Written by `bhf build`: standard-library names this project's sources use\n \
+         * without `std::`, relying on a `using namespace std;` that is not in effect\n \
+         * everywhere they are compiled. Force-include it into every translation unit:\n \
+         * AUTO_EXTRA_INCLUDES='-include <this file>'. A later failed build adds the\n \
+         * names it reports and keeps every other line. Delete a `using` line whose\n \
+         * name a project source declares itself. */\n\
+         #pragma once\n\
+         #ifdef __cplusplus\n",
+    );
+    for line in headers.iter().chain(&sorted) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.push_str("#endif\n");
+    text
+}
+
+/// The sorted `#include <header>` and `using std::<name>;` lines for `names`.
+fn std_prelude_lines(names: &[(String, &'static str)]) -> (Vec<String>, Vec<String>) {
+    let mut headers: Vec<&str> = names.iter().map(|(_, header)| *header).collect();
+    headers.sort_unstable();
+    headers.dedup();
+    let mut sorted: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    (
+        headers
+            .iter()
+            .map(|header| format!("#include <{header}>"))
+            .collect(),
+        sorted
+            .iter()
+            .map(|name| format!("using std::{name};"))
+            .collect(),
+    )
+}
+
+/// The keyword and the rest of a preprocessor directive line (`#  include
+/// <map>` gives `("include", "<map>")`).
+fn prelude_directive(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix('#')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    Some((&rest[..end], rest[end..].trim()))
+}
+
+/// The header of an `#include <header>` line.
+fn prelude_include(line: &str) -> Option<&str> {
+    match prelude_directive(line)? {
+        ("include", rest) => Some(rest.strip_prefix('<')?.split_once('>')?.0.trim()),
+        _ => None,
+    }
+}
+
+/// The name of a `using std::<name>;` line.
+fn prelude_using(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("using")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
+    let rest = rest.strip_prefix("std")?.trim_start().strip_prefix("::")?;
+    let (name, after) = rest.split_once(';')?;
+    let after = after.trim();
+    (after.is_empty() || after.starts_with("//")).then(|| name.trim())
+}
+
+/// The first and last line of the `#ifdef __cplusplus` section of `lines`
+/// (its `#endif`), unless it has an `#else` or `#elif` branch of its own.
+fn cplusplus_section(lines: &[&str]) -> Option<(usize, usize)> {
+    let open = lines.iter().position(|line| {
+        let Some((keyword, rest)) = prelude_directive(line) else {
+            return false;
+        };
+        let condition = rest.split('/').next().unwrap_or_default().trim();
+        matches!(
+            (keyword, condition),
+            ("ifdef", "__cplusplus") | ("if", "defined(__cplusplus)" | "defined __cplusplus")
+        )
+    })?;
+    let mut depth = 0usize;
+    for (index, line) in lines.iter().enumerate().skip(open) {
+        match prelude_directive(line) {
+            Some(("if" | "ifdef" | "ifndef", _)) => depth += 1,
+            Some(("else" | "elif" | "elifdef" | "elifndef", _)) if depth == 1 => return None,
+            Some(("endif", _)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `text`, an existing prelude, with the `#include` and `using` lines for
+/// `names` that it lacks: the includes after the last one directly in its
+/// `#ifdef __cplusplus` section (or after the `#ifdef`), the `using` lines
+/// before the section's `#endif`. Without such a section they come in a
+/// guarded block of their own at the end. Every other line stays as it is,
+/// including its line ending.
+fn extend_std_prelude(text: &str, names: &[(String, &'static str)]) -> String {
+    let segments: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines: Vec<&str> = segments
+        .iter()
+        .map(|segment| segment.trim_end_matches(['\n', '\r']))
+        .collect();
+    let missing: Vec<(String, &'static str)> = names
+        .iter()
+        .filter(|(name, _)| !lines.iter().any(|line| prelude_using(line) == Some(name)))
+        .cloned()
+        .collect();
+    let usings = std_prelude_lines(&missing).1;
+    let includes: Vec<String> = std_prelude_lines(names)
+        .0
+        .into_iter()
+        .filter(|include| {
+            let header = prelude_include(include);
+            !lines.iter().any(|line| prelude_include(line) == header)
+        })
+        .collect();
+    if includes.is_empty() && usings.is_empty() {
+        return text.to_owned();
+    }
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let block = |lines: &[String]| -> String {
+        lines
+            .iter()
+            .map(|line| format!("{line}{newline}"))
+            .collect()
+    };
+    let Some((open, close)) = cplusplus_section(&lines) else {
+        let mut extended = text.to_owned();
+        if !extended.is_empty() && !extended.ends_with('\n') {
+            extended.push_str(newline);
+        }
+        extended.push_str(&format!("#ifdef __cplusplus{newline}"));
+        extended.push_str(&block(&includes));
+        extended.push_str(&block(&usings));
+        extended.push_str(&format!("#endif{newline}"));
+        return extended;
+    };
+    // The last `#include` directly in the section, not in a nested condition.
+    let mut after = open;
+    let mut depth = 0usize;
+    for (index, line) in lines.iter().enumerate().take(close).skip(open + 1) {
+        match prelude_directive(line) {
+            Some(("if" | "ifdef" | "ifndef", _)) => depth += 1,
+            Some(("endif", _)) => depth = depth.saturating_sub(1),
+            _ if depth == 0 && prelude_include(line).is_some() => after = index,
+            _ => {}
+        }
+    }
+    let mut extended = String::with_capacity(text.len() + 64);
+    for (index, segment) in segments.iter().enumerate() {
+        if index == close {
+            extended.push_str(&block(&usings));
+        }
+        extended.push_str(segment);
+        if index == after {
+            extended.push_str(&block(&includes));
+        }
+    }
+    extended
+}
+
+/// Write `<harness_dir>/std_prelude.h` so it declares `names`, or add the
+/// ones it lacks to the file an earlier build wrote (and the operator may
+/// have edited), keeping every line it has. A file that cannot be read as
+/// text is never replaced.
+fn write_std_prelude(
+    harness_dir: &Path,
+    names: &[(String, &'static str)],
+) -> std::io::Result<StdPrelude> {
+    let file = harness_dir.join(STD_PRELUDE_HEADER);
+    let existing = match fs::read_to_string(&file) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let (text, change) = match &existing {
+        None => (std_prelude_text(names), PreludeChange::Created),
+        Some(existing) => {
+            let text = extend_std_prelude(existing, names);
+            let change = if &text == existing {
+                PreludeChange::Unchanged
+            } else {
+                PreludeChange::Extended
+            };
+            (text, change)
+        }
+    };
+    if change != PreludeChange::Unchanged {
+        fs::write(&file, &text)?;
+    }
+    let mut headers: Vec<String> = text
+        .lines()
+        .filter_map(prelude_include)
+        .map(str::to_owned)
+        .collect();
+    headers.sort_unstable();
+    headers.dedup();
+    Ok(StdPrelude {
+        path: crate::workdir::plain_canonical(&file),
+        headers,
+        change,
+    })
+}
+
 /// What a failed C/C++ harness build was missing, with the exact command that
 /// adds it: in-tree sources that define the symbols the link could not
 /// resolve (`AUTO_EXTRA_SOURCES` or `--extra-source`), standard stream headers
 /// an old source never included (`AUTO_EXTRA_INCLUDES='-include iostream'`),
-/// system libraries (`AUTO_EXTRA_LDFLAGS`), and the MSVC-only extra member
-/// qualification. Every suggested command keeps the operator's own build
-/// variables (`inherited`); when several hints apply, a last line combines them.
+/// a prelude header (written into the harness directory) for standard-library
+/// names a pre-standard C++ source uses without `std::`, system libraries
+/// (`AUTO_EXTRA_LDFLAGS`), and the MSVC-only extra member qualification.
+/// Every suggested command keeps the operator's own build variables
+/// (`inherited`); when several hints apply, a last line combines them.
 fn c_build_failure_hints(
     work_dir: &Path,
     harness_id: &str,
@@ -1944,12 +2187,62 @@ fn c_build_failure_hints(
     let mut combined = inherited.clone();
     let mut suggestions = 0usize;
 
+    // Standard-library names a pre-standard C++ source writes without `std::`
+    // (`string`, `map<string, int>`), relying on a `using namespace std;` its
+    // includer provides. A name still reported with its header force-included
+    // is declared but unqualified, as when the compiler says so.
+    let forced_includes: Vec<String> = inherited
+        .get("AUTO_EXTRA_INCLUDES")
+        .map(recipe_words)
+        .unwrap_or_default();
+    let force_included = |header: &str| {
+        forced_includes
+            .windows(2)
+            .any(|pair| pair[0] == "-include" && pair[1] == header)
+            || forced_includes
+                .iter()
+                .any(|word| word.strip_prefix("-include") == Some(header))
+    };
+    let mut unqualified = if harness_dir.join("main.cpp").is_file() {
+        build_classifier::unqualified_std_names(output)
+    } else {
+        Vec::new()
+    };
+    for name in &mut unqualified {
+        name.declared |= force_included(name.header);
+    }
+    // An unqualified stream object (`cerr`) whose declaration the compiler has
+    // not seen needs only its header when the source has `using namespace
+    // std;`, so the `-include iostream` hint below covers it. Every other
+    // unqualified name needs a `using` declaration as well, which only a
+    // force-included prelude header can add; once there is a prelude (this
+    // build's, or one the build already force-includes), the stream objects
+    // go into it too.
+    let prelude_file = harness_dir.join(STD_PRELUDE_HEADER);
+    let prelude_in_use = prelude_file.is_file()
+        && force_included(
+            &crate::workdir::plain_canonical(&prelude_file)
+                .display()
+                .to_string(),
+        );
+    if !prelude_in_use
+        && !unqualified
+            .iter()
+            .any(|name| name.declared || build_classifier::std_stream_header(&name.name).is_none())
+    {
+        unqualified.clear();
+    }
+    let in_prelude = |name: &str| unqualified.iter().any(|entry| entry.name == name);
+
     // Standard stream headers a pre-standard source relied on getting
     // transitively.
     let mut stream_names: Vec<&str> = Vec::new();
     let mut stream_headers: Vec<&str> = Vec::new();
     for kind in &classified {
         if let build_classifier::BuildErrorKind::MissingType { name } = kind {
+            if in_prelude(name) {
+                continue;
+            }
             if let Some(header) = build_classifier::std_stream_header(name) {
                 if !stream_names.contains(&name.as_str()) {
                     stream_names.push(name);
@@ -1976,6 +2269,73 @@ fn c_build_failure_hints(
         ));
         combined = combined.with("AUTO_EXTRA_INCLUDES", &includes);
         suggestions += 1;
+    }
+    if !unqualified.is_empty() {
+        let names: Vec<(String, &'static str)> = unqualified
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.header))
+            .collect();
+        let shown = names
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let why = format!(
+            "hint: the sources use {shown} without `std::`, relying on a `using namespace std;` \
+             that is not in effect where they are compiled"
+        );
+        match write_std_prelude(harness_dir, &names) {
+            Ok(prelude) => {
+                let path = prelude.path.display().to_string();
+                let flags = [format!("-include {path}")];
+                let headers = prelude.headers.join(">, <");
+                let done = match prelude.change {
+                    PreludeChange::Created => format!(
+                        "wrote {path}, which includes <{headers}> and declares each name with \
+                         `using std::`"
+                    ),
+                    PreludeChange::Extended => format!(
+                        "added the missing lines to {path}, which now includes <{headers}> and \
+                         declares each name with `using std::`"
+                    ),
+                    PreludeChange::Unchanged => format!(
+                        "{path} already includes <{headers}> and declares each name with \
+                         `using std::`"
+                    ),
+                };
+                hints.push(format!(
+                    "{why}; {done}; force-include it into every translation unit: {}",
+                    inherited
+                        .with("AUTO_EXTRA_INCLUDES", &flags)
+                        .command(&rebuild)
+                ));
+                if path
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+                {
+                    hints.push(
+                        "  the Makefile splits AUTO_EXTRA_INCLUDES at whitespace: copy the \
+                         prelude to a path without spaces and force-include the copy"
+                            .to_owned(),
+                    );
+                }
+                combined = combined.with("AUTO_EXTRA_INCLUDES", &flags);
+                suggestions += 1;
+            }
+            Err(error) => {
+                hints.push(format!(
+                    "{why}; could not write {}: {error}; save these lines as a header (or \
+                     add them to that one) and force-include it into every translation unit \
+                     (AUTO_EXTRA_INCLUDES='-include <header>'):",
+                    harness_dir.join(STD_PRELUDE_HEADER).display()
+                ));
+                hints.extend(
+                    std_prelude_text(&names)
+                        .lines()
+                        .map(|line| format!("  {line}")),
+                );
+            }
+        }
     }
     let qualified: Vec<(&str, u32, &str)> = classified
         .iter()
@@ -4743,6 +5103,382 @@ mod tests {
         assert!(
             !hints.contains("at once"),
             "a single fix needs no combined line: {hints}"
+        );
+    }
+
+    /// clang++ and g++ output for a pre-standard header the harness includes
+    /// without the `using namespace std;` the project's own sources put
+    /// before it (`map<string, int> fields; vector<int> sizes; list<string>
+    /// names; pair<int, int> span;`).
+    const CLANG_UNQUALIFIED_STD: &str = "In file included from main.cpp:3:\n\
+./widget.h:6:9: error: use of undeclared identifier 'string'\n\
+    6 |     map<string, int> fields;\n\
+      |         ^\n\
+./widget.h:7:5: error: no template named 'vector'\n\
+    7 |     vector<int> sizes;\n\
+      |     ^\n\
+./widget.h:8:10: error: use of undeclared identifier 'string'\n\
+    8 |     list<string> names;\n\
+      |          ^\n\
+./widget.h:9:5: error: no template named 'pair'\n\
+    9 |     pair<int, int> span;\n\
+      |     ^\n\
+4 errors generated.\n";
+    const GCC_UNQUALIFIED_STD: &str = "In file included from main.cpp:3:\n\
+widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+    6 |     map<string, int> fields;\n\
+      |     ^~~\n\
+widget.h:7:5: error: \u{2018}vector\u{2019} does not name a type\n\
+    7 |     vector<int> sizes;\n\
+      |     ^~~~~~\n\
+widget.h:8:5: error: \u{2018}list\u{2019} does not name a type\n\
+    8 |     list<string> names;\n\
+      |     ^~~~\n\
+widget.h:9:5: error: \u{2018}pair\u{2019} does not name a type\n\
+    9 |     pair<int, int> span;\n\
+      |     ^~~~\n";
+
+    #[test]
+    fn unqualified_std_names_get_a_written_prelude_and_the_command_that_includes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        for output in [CLANG_UNQUALIFIED_STD, GCC_UNQUALIFIED_STD] {
+            let _ = fs::remove_file(&prelude_file);
+            let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &none);
+            let text = hints.join("\n");
+            let hint = hints
+                .iter()
+                .find(|line| line.contains("without `std::`"))
+                .unwrap_or_else(|| panic!("no hint for the unqualified names: {text}"));
+            for name in ["string", "map", "vector", "list", "pair"] {
+                assert!(hint.contains(name), "{name}: {text}");
+            }
+            let prelude = fs::read_to_string(&prelude_file)
+                .unwrap_or_else(|error| panic!("no prelude written ({error}): {text}"));
+            for header in ["list", "map", "string", "utility", "vector"] {
+                assert!(
+                    prelude.contains(&format!("#include <{header}>\n")),
+                    "{prelude}"
+                );
+            }
+            for name in ["list", "map", "pair", "string", "vector"] {
+                assert!(
+                    prelude.contains(&format!("using std::{name};\n")),
+                    "{prelude}"
+                );
+            }
+            let path = crate::workdir::plain_canonical(&prelude_file);
+            assert!(
+                hint.contains(&format!(
+                    "AUTO_EXTRA_INCLUDES={} bhf build {} --harness H-ONE",
+                    shell_text(&format!("-include {}", path.display())),
+                    shell_word(&work)
+                )),
+                "{text}"
+            );
+            // `-include <string>` alone would leave the names unqualified.
+            assert!(!text.contains("-include string"), "{text}");
+        }
+
+        // The next build, with the prelude force-included, reports a name the
+        // first one did not reach: the prelude keeps the earlier names, and the
+        // command does not repeat the include.
+        let path = crate::workdir::plain_canonical(&prelude_file);
+        let include = format!("-include {}", path.display());
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_INCLUDES" => Some(include.clone()),
+            "CXX_STD" => Some("gnu++98".to_owned()),
+            _ => None,
+        });
+        let later = "./widget.h:10:5: error: no template named 'deque'\n";
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, later, &inherited);
+        let text = hints.join("\n");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        for name in ["deque", "list", "map", "pair", "string", "vector"] {
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{prelude}"
+            );
+        }
+        assert!(prelude.contains("#include <deque>\n"), "{prelude}");
+        let command = hints
+            .iter()
+            .find(|line| line.contains("without `std::`"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(command.matches(&include).count(), 1, "{text}");
+        assert!(command.contains("CXX_STD=gnu++98 bhf build"), "{text}");
+        // With the prelude already in use, an unqualified stream object goes
+        // into it rather than into a second force-include.
+        let streams = "./widget.h:12:9: error: use of undeclared identifier 'cerr'\n";
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, streams, &inherited);
+        let text = hints.join("\n");
+        assert!(!text.contains("-include iostream"), "{text}");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        assert!(prelude.contains("using std::cerr;\n"), "{prelude}");
+        assert!(prelude.contains("#include <iostream>\n"), "{prelude}");
+
+        // When the prelude cannot be written, the hint prints it instead.
+        let blocked = work.join("harnesses").join("H-BLOCKED");
+        fs::create_dir_all(blocked.join("std_prelude.h")).unwrap();
+        fs::write(blocked.join("main.cpp"), "").unwrap();
+        let hints = c_build_failure_hints(&work, "H-BLOCKED", &blocked, GCC_UNQUALIFIED_STD, &none);
+        let text = hints.join("\n");
+        assert!(text.contains("could not write"), "{text}");
+        for line in [
+            "  #include <map>",
+            "  using std::map;",
+            "  using std::string;",
+        ] {
+            assert!(hints.iter().any(|hint| hint == line), "{line}: {text}");
+        }
+
+        // A C harness never gets one.
+        let c_harness = work.join("harnesses").join("H-C");
+        fs::create_dir_all(&c_harness).unwrap();
+        fs::write(c_harness.join("main.c"), "").unwrap();
+        let hints = c_build_failure_hints(&work, "H-C", &c_harness, CLANG_UNQUALIFIED_STD, &none);
+        assert!(!hints.join("\n").contains("without `std::`"), "{hints:?}");
+        assert!(!c_harness.join("std_prelude.h").exists());
+    }
+
+    #[test]
+    fn extending_the_std_prelude_keeps_the_lines_written_by_hand() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        let prelude_hint = |hints: &[String]| {
+            hints
+                .iter()
+                .find(|line| line.contains("without `std::`"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no prelude hint: {hints:?}"))
+        };
+        c_build_failure_hints(&work, "H-ONE", &harness, GCC_UNQUALIFIED_STD, &none);
+        let written = fs::read_to_string(&prelude_file).unwrap();
+
+        // Lines added by hand inside the guard (a header and a name the
+        // compiler never reported, one under a condition of its own) and
+        // after it.
+        let guard_end = written.rfind("#endif\n").unwrap();
+        let edited = format!(
+            "{}#include <algorithm>\n#if defined(WIDGET_EXTRA)\n#include <numeric>\n#endif\n\
+             using std::min;\n#endif\n// kept by hand\n",
+            &written[..guard_end]
+        );
+        fs::write(&prelude_file, &edited).unwrap();
+        let later = "./widget.h:10:5: error: no template named 'deque'\n";
+        let hint = prelude_hint(&c_build_failure_hints(
+            &work, "H-ONE", &harness, later, &none,
+        ));
+        assert!(hint.contains("; added the missing lines to "), "{hint}");
+        assert!(hint.contains("<algorithm>, <deque>, <list>"), "{hint}");
+        let extended = fs::read_to_string(&prelude_file).unwrap();
+        let lines: Vec<&str> = extended.lines().collect();
+        let added = ["#include <deque>", "using std::deque;"];
+        assert_eq!(
+            lines
+                .iter()
+                .copied()
+                .filter(|line| !added.contains(line))
+                .collect::<Vec<_>>(),
+            edited.lines().collect::<Vec<_>>(),
+            "every line written by hand stays, in order: {extended}"
+        );
+        let at = |line: &str| {
+            let found: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == line).collect();
+            assert_eq!(found.len(), 1, "{line}: {extended}");
+            found[0]
+        };
+        let (include, using) = (at("#include <deque>"), at("using std::deque;"));
+        let nested = at("#if defined(WIDGET_EXTRA)");
+        let guard_close = lines.iter().rposition(|line| *line == "#endif").unwrap();
+        assert!(at("#ifdef __cplusplus") < include, "{extended}");
+        assert!(include < using && using < guard_close, "{extended}");
+        // Not inside the hand-written condition.
+        assert!(include < nested || include > nested + 2, "{extended}");
+        assert!(using < nested || using > nested + 2, "{extended}");
+
+        // A name the file already declares changes nothing; a name whose
+        // header it already includes adds only its `using` line.
+        let hint = prelude_hint(&c_build_failure_hints(
+            &work, "H-ONE", &harness, later, &none,
+        ));
+        assert!(hint.contains(" already includes <"), "{hint}");
+        assert_eq!(fs::read_to_string(&prelude_file).unwrap(), extended);
+        let multimap = "./widget.h:11:5: error: no template named 'multimap'\n";
+        c_build_failure_hints(&work, "H-ONE", &harness, multimap, &none);
+        let again = fs::read_to_string(&prelude_file).unwrap();
+        assert_eq!(again.matches("#include <map>\n").count(), 1, "{again}");
+        assert_eq!(
+            again.replace("using std::multimap;\n", ""),
+            extended,
+            "{again}"
+        );
+
+        // A prelude written by hand, without the guard and with CRLF line
+        // ends: the new names come in a guarded block after it.
+        let by_hand = "// project prelude\r\n#include <string>\r\nusing std::string;\r\n";
+        fs::write(&prelude_file, by_hand).unwrap();
+        c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+        assert_eq!(
+            fs::read_to_string(&prelude_file).unwrap(),
+            format!(
+                "{by_hand}#ifdef __cplusplus\r\n#include <deque>\r\nusing std::deque;\r\n\
+                 #endif\r\n"
+            )
+        );
+
+        // A hand-written guard with a comment on it takes the new lines; one
+        // with an `#else` branch does not, so they never land in that branch.
+        for (by_hand, extended) in [
+            (
+                "#ifdef __cplusplus // C++ only\n#include <string>\n#endif\n",
+                "#ifdef __cplusplus // C++ only\n#include <string>\n#include <deque>\n\
+                 using std::deque;\n#endif\n",
+            ),
+            (
+                "#if defined(__cplusplus)\n#include <string>\nusing std::string;\n#else\n\
+                 typedef struct widget widget;\n#endif\n",
+                "#if defined(__cplusplus)\n#include <string>\nusing std::string;\n#else\n\
+                 typedef struct widget widget;\n#endif\n#ifdef __cplusplus\n#include <deque>\n\
+                 using std::deque;\n#endif\n",
+            ),
+        ] {
+            fs::write(&prelude_file, by_hand).unwrap();
+            c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+            assert_eq!(fs::read_to_string(&prelude_file).unwrap(), extended);
+        }
+
+        // A file that is not text is never replaced: the hint prints the lines
+        // to add instead.
+        fs::write(&prelude_file, b"// \xff\n#include <string>\n").unwrap();
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+        assert_eq!(
+            fs::read(&prelude_file).unwrap(),
+            b"// \xff\n#include <string>\n"
+        );
+        assert!(
+            hints.iter().any(|line| line == "  using std::deque;"),
+            "{hints:?}"
+        );
+    }
+
+    #[test]
+    fn a_c_source_of_a_cpp_harness_gets_no_std_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        // An extra C source with its own `list` type that its header did not
+        // declare. The Makefile compiles it with $(CXX) (clang++ warns about
+        // that, g++ reports in C++ wording), where a prelude would make `list`
+        // the standard template: not a fix.
+        let clang = "clang++: warning: treating 'c' input as 'c++' when in C++ mode, this \
+                     behavior is deprecated [-Wdeprecated]\n\
+                     lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                     \x20   2 | int walk(void) { list *head = 0; return head != 0; }\n\
+                     \x20     |                  ^\n\
+                     1 error generated.\n";
+        let gcc = "lib/src/node.c:1:1: error: \u{2018}list\u{2019} does not name a type\n\
+                   \x20   1 | list *roots;\n\
+                   \x20     | ^~~~\n";
+        for output in [clang, gcc] {
+            let hints =
+                c_build_failure_hints(&work, "H-ONE", &harness, output, &RebuildEnv::default());
+            assert!(
+                !hints.iter().any(|line| line.contains("without `std::`")),
+                "{hints:?}"
+            );
+            assert!(!harness.join("std_prelude.h").exists(), "{hints:?}");
+        }
+    }
+
+    #[test]
+    fn unqualified_stream_names_join_the_prelude_when_an_include_cannot_help() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        let stream_hint = |hints: &[String]| {
+            hints
+                .iter()
+                .find(|line| line.contains("without including"))
+                .cloned()
+        };
+
+        // `cerr` whose header is missing: a source with `using namespace std;`
+        // needs only the header.
+        let missing = "src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, missing, &none);
+        assert!(
+            stream_hint(&hints).is_some_and(|line| line.contains("'-include iostream'")),
+            "{hints:?}"
+        );
+        assert!(!prelude_file.exists(), "{hints:?}");
+
+        // Declared but unqualified (the header is in, `using namespace std;` is
+        // not), or still reported with <iostream> force-included: only a
+        // `using` declaration helps.
+        let declared =
+            "./log.h:4:18: error: use of undeclared identifier 'cerr'; did you mean 'std::cerr'?\n";
+        let gcc_after_include =
+            "log.h:4:15: error: \u{2018}ostream\u{2019} has not been declared\n";
+        let with_iostream = RebuildEnv::from_lookup(|name| {
+            (name == "AUTO_EXTRA_INCLUDES").then(|| "-include iostream".to_owned())
+        });
+        for (output, inherited, name) in [
+            (declared, &none, "cerr"),
+            (gcc_after_include, &with_iostream, "ostream"),
+        ] {
+            let _ = fs::remove_file(&prelude_file);
+            let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, inherited);
+            assert!(stream_hint(&hints).is_none(), "{hints:?}");
+            let prelude = fs::read_to_string(&prelude_file)
+                .unwrap_or_else(|error| panic!("no prelude ({error}): {hints:?}"));
+            assert!(prelude.contains("#include <iostream>\n"), "{prelude}");
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{prelude}"
+            );
+        }
+
+        // With other names in a prelude, an unqualified stream object goes into
+        // it too; a qualified stream name still only needs its header, and the
+        // last line applies both.
+        let _ = fs::remove_file(&prelude_file);
+        let mixed = "./widget.h:4:28: error: unknown type name 'string'\n\
+                     src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n\
+                     src/lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_istream<char>'\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, mixed, &none);
+        let text = hints.join("\n");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        assert!(prelude.contains("using std::cerr;\n"), "{prelude}");
+        assert!(prelude.contains("using std::string;\n"), "{prelude}");
+        let streams = stream_hint(&hints).unwrap_or_else(|| panic!("{text}"));
+        assert!(streams.contains("std::istream"), "{text}");
+        assert!(!streams.contains("cerr"), "{text}");
+        let path = crate::workdir::plain_canonical(&prelude_file);
+        assert!(
+            hints
+                .iter()
+                .find(|line| line.contains("at once"))
+                .is_some_and(|line| line.contains(&shell_text(&format!(
+                    "-include iostream -include {}",
+                    path.display()
+                )))),
+            "{text}"
         );
     }
 

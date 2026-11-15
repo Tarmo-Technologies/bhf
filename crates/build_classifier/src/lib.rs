@@ -140,6 +140,82 @@ pub fn std_stream_header(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The C++ standard header that declares a library name pre-standard code
+/// often writes without `std::`, relying on a `using namespace std;`:
+/// `string` -> `string`, `map`/`multimap` -> `map`, `list` -> `list`, `vector`
+/// -> `vector`, `pair`/`make_pair` -> `utility`, the other containers, smart
+/// pointers, standard exceptions, `numeric_limits`, the `<ios>` types, and
+/// every stream name [`std_stream_header`] knows. Accepts the bare or the
+/// `std::`-qualified spelling; `None` for any other name.
+pub fn std_library_header(name: &str) -> Option<&'static str> {
+    if let Some(header) = std_stream_header(name) {
+        return Some(header);
+    }
+    let name = name.trim();
+    let bare = name.strip_prefix("std::").unwrap_or(name);
+    Some(match bare {
+        "string" | "wstring" | "u16string" | "u32string" | "basic_string" => "string",
+        "vector" => "vector",
+        "map" | "multimap" => "map",
+        "set" | "multiset" => "set",
+        "list" => "list",
+        "deque" => "deque",
+        "queue" | "priority_queue" => "queue",
+        "stack" => "stack",
+        "pair" | "make_pair" => "utility",
+        "bitset" => "bitset",
+        "unordered_map" | "unordered_multimap" => "unordered_map",
+        "unordered_set" | "unordered_multiset" => "unordered_set",
+        "unique_ptr" | "shared_ptr" | "weak_ptr" | "make_unique" | "make_shared" => "memory",
+        "exception" => "exception",
+        "runtime_error" | "logic_error" | "invalid_argument" | "out_of_range" | "length_error"
+        | "domain_error" | "range_error" | "overflow_error" | "underflow_error" => "stdexcept",
+        "numeric_limits" => "limits",
+        "ios" | "ios_base" | "streamsize" | "streamoff" | "streampos" => "ios",
+        _ => return None,
+    })
+}
+
+/// A standard-library name that C++ compiler output shows a source using
+/// without `std::` (see [`unqualified_std_names`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnqualifiedStdName {
+    /// The name as the source writes it: `string`, `map`, `cerr`.
+    pub name: String,
+    /// The standard header that declares it ([`std_library_header`]).
+    pub header: &'static str,
+    /// The compiler named the `std::` declaration (clang's and gcc's "did you
+    /// mean 'std::string'?", or a note pointing at it): the header is already
+    /// included, so including it again cannot help; the name needs a `using`
+    /// declaration (or the `std::` qualification).
+    pub declared: bool,
+}
+
+/// Every C++ standard-library name the g++/clang++ output `stderr` shows a
+/// source using without `std::`, in first-seen order, each once. Pre-standard
+/// headers write `string`, `map<string, int>` or `list<T>` and rely on a
+/// `using namespace std;` the project's own sources put before including
+/// them; a translation unit without it (a generated harness) fails with
+/// "unknown type name 'string'", "no template named 'map'", "'list' does not
+/// name a type" or "'string' has not been declared". `-include <string>`
+/// alone does not fix that: the names stay unqualified.
+///
+/// Type-position diagnostics count for every name [`std_library_header`]
+/// knows. An undeclared identifier counts when the name cannot be an ordinary
+/// variable or function (`string`, `vector`, `cerr`, `runtime_error`), or when
+/// the compiler pointed at the `std::` declaration, or the source shows it as
+/// a template (`set<int>`) or a scope (`ios::binary`). The source line clang
+/// and gcc print under such a diagnostic is read too, because clang reports
+/// only the first unknown name of `map<string, int>`.
+///
+/// Diagnostics in C code (a `.c` file, or a header whose include chain above
+/// the diagnostic passes through one) do not count: a C source's `list` is its
+/// own type, which a C compile never takes from a C++ prelude and which a
+/// C++ compile of the `.c` file would wrongly take as `std::list`.
+pub fn unqualified_std_names(stderr: &str) -> Vec<UnqualifiedStdName> {
+    gcc_clang::unqualified_std_names(stderr)
+}
+
 /// Classify a captured stderr against both toolchain regex packs.
 /// Returns one event per distinct error in source order. `Other` is
 /// emitted only when no known pattern matched any line - so a
@@ -1338,6 +1414,348 @@ main.exe : fatal error LNK1120: 4 unresolved externals\r\n";
                 "{bare}"
             );
         }
+    }
+
+    #[test]
+    fn std_library_header_names_the_declaring_header() {
+        for (name, header) in [
+            ("string", "string"),
+            ("std::wstring", "string"),
+            ("map", "map"),
+            ("multimap", "map"),
+            ("vector", "vector"),
+            ("list", "list"),
+            ("pair", "utility"),
+            ("make_pair", "utility"),
+            ("set", "set"),
+            ("deque", "deque"),
+            ("priority_queue", "queue"),
+            ("stack", "stack"),
+            ("unordered_map", "unordered_map"),
+            ("shared_ptr", "memory"),
+            ("runtime_error", "stdexcept"),
+            ("numeric_limits", "limits"),
+            ("ios_base", "ios"),
+            // The stream names keep their headers.
+            ("cerr", "iostream"),
+            ("ostream", "iostream"),
+            ("ifstream", "fstream"),
+        ] {
+            assert_eq!(std_library_header(name), Some(header), "{name}");
+        }
+        for other in ["Widget", "state", "flush", "copy_at", "std::copy_at"] {
+            assert_eq!(std_library_header(other), None, "{other}");
+        }
+    }
+
+    /// `(name, declared)` for each unqualified standard name in `output`.
+    fn unqualified(output: &str) -> Vec<(String, &'static str, bool)> {
+        unqualified_std_names(output)
+            .into_iter()
+            .map(|name| (name.name, name.header, name.declared))
+            .collect()
+    }
+
+    /// The header the generated harness includes, with the project's own
+    /// sources providing `using namespace std;` before including it:
+    ///
+    /// ```cpp
+    /// class Widget {
+    /// public:
+    ///     int parse_record(const unsigned char *data, size_t size);
+    ///     map<string, int> fields;
+    ///     vector<int> sizes;
+    ///     list<string> names;
+    ///     pair<int, int> span;
+    /// };
+    /// ```
+    #[test]
+    fn clang_unqualified_std_types_are_named_with_their_headers() {
+        // Nothing included the standard headers: clang reports `string` for
+        // `map<string, int>` and `list<string>`, and the source lines name the
+        // templates.
+        let missing = "In file included from main.cpp:1:\n\
+./widget.h:6:9: error: use of undeclared identifier 'string'\n\
+    6 |     map<string, int> fields;\n\
+      |         ^\n\
+./widget.h:7:5: error: no template named 'vector'\n\
+    7 |     vector<int> sizes;\n\
+      |     ^\n\
+./widget.h:8:10: error: use of undeclared identifier 'string'\n\
+    8 |     list<string> names;\n\
+      |          ^\n\
+./widget.h:9:5: error: no template named 'pair'\n\
+    9 |     pair<int, int> span;\n\
+      |     ^\n\
+4 errors generated.\n";
+        assert_eq!(
+            unqualified(missing),
+            vec![
+                ("string".to_owned(), "string", false),
+                ("map".to_owned(), "map", false),
+                ("vector".to_owned(), "vector", false),
+                ("list".to_owned(), "list", false),
+                ("pair".to_owned(), "utility", false),
+            ]
+        );
+        // The headers are included but the names unqualified: clang points at
+        // each `std::` declaration.
+        let declared = "In file included from main.cpp:6:\n\
+./widget.h:6:9: error: unknown type name 'string'; did you mean 'std::string'?\n\
+    6 |     map<string, int> fields;\n\
+      |         ^~~~~~\n\
+      |         std::string\n\
+/usr/lib/gcc/x86_64-linux-gnu/14/../../../../include/c++/14/bits/stringfwd.h:77:33: note: 'std::string' declared here\n\
+   77 |   typedef basic_string<char>    string;\n\
+      |                                 ^\n\
+./widget.h:6:5: error: no template named 'map'; did you mean 'std::map'?\n\
+    6 |     map<string, int> fields;\n\
+      |     ^~~\n\
+      |     std::map\n\
+./widget.h:7:5: error: no template named 'vector'; did you mean 'std::vector'?\n\
+./widget.h:8:5: error: no template named 'list'; did you mean 'std::list'?\n\
+./widget.h:9:5: error: no template named 'pair'; did you mean 'std::pair'?\n\
+6 errors generated.\n";
+        assert_eq!(
+            unqualified(declared),
+            vec![
+                ("string".to_owned(), "string", true),
+                ("map".to_owned(), "map", true),
+                ("vector".to_owned(), "vector", true),
+                ("list".to_owned(), "list", true),
+                ("pair".to_owned(), "utility", true),
+            ]
+        );
+        // More names in type position, and the stream objects.
+        let more = "./doc.h:4:15: error: unknown type name 'ostream'\n\
+./doc.h:6:5: error: no template named 'shared_ptr'\n\
+./doc.h:8:5: error: no template named 'unordered_map'\n\
+./doc.h:9:25: error: use of undeclared identifier 'runtime_error'\n\
+    9 |     void fail() { throw runtime_error(\"bad list\"); }\n\
+./doc.h:10:24: error: no template named 'numeric_limits'\n\
+./doc.h:11:18: error: use of undeclared identifier 'cerr'\n\
+   11 |     void say() { cerr << \"x\" << endl; }\n\
+./doc.h:12:49: error: use of undeclared identifier 'make_pair'\n";
+        let names: Vec<(String, &str, bool)> = unqualified(more);
+        assert_eq!(
+            names,
+            vec![
+                ("ostream".to_owned(), "iostream", false),
+                ("shared_ptr".to_owned(), "memory", false),
+                ("unordered_map".to_owned(), "unordered_map", false),
+                ("runtime_error".to_owned(), "stdexcept", false),
+                ("numeric_limits".to_owned(), "limits", false),
+                ("cerr".to_owned(), "iostream", false),
+                ("endl".to_owned(), "iostream", false),
+                ("make_pair".to_owned(), "utility", false),
+            ],
+            "the literal's `list` is not a use"
+        );
+    }
+
+    #[test]
+    fn gcc_unqualified_std_types_are_named_with_their_headers() {
+        // gcc reports the template of `map<string, int>`; `string` is on the
+        // source line. UTF-8 quotes, as in a UTF-8 locale.
+        let missing = "In file included from main.cpp:1:\n\
+widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+    6 |     map<string, int> fields;\n\
+      |     ^~~\n\
+widget.h:7:5: error: \u{2018}vector\u{2019} does not name a type\n\
+    7 |     vector<int> sizes;\n\
+      |     ^~~~~~\n\
+widget.h:8:5: error: \u{2018}list\u{2019} does not name a type\n\
+    8 |     list<string> names;\n\
+      |     ^~~~\n\
+widget.h:9:5: error: \u{2018}pair\u{2019} does not name a type\n\
+    9 |     pair<int, int> span;\n\
+      |     ^~~~\n";
+        let expected = vec![
+            ("map".to_owned(), "map", false),
+            ("string".to_owned(), "string", false),
+            ("vector".to_owned(), "vector", false),
+            ("list".to_owned(), "list", false),
+            ("pair".to_owned(), "utility", false),
+        ];
+        assert_eq!(unqualified(missing), expected);
+        // The C locale's ASCII quotes.
+        let ascii = missing.replace(['\u{2018}', '\u{2019}'], "'");
+        assert_eq!(unqualified(&ascii), expected);
+
+        // Parameter and local-variable positions. gcc names the `std::`
+        // declaration in "did you mean" or a "suggested alternatives" note when
+        // the header is included; `does not name a type` never does.
+        let contexts = "ctx.h:2:17: error: \u{2018}string\u{2019} was not declared in this scope\n\
+ctx.h:2:17: note: suggested alternatives:\n\
+/usr/include/c++/13/bits/stringfwd.h:77:33: note:   \u{2018}std::string\u{2019}\n\
+/usr/include/c++/13/string:66:11: note:   \u{2018}std::pmr::string\u{2019}\n\
+ctx.h:3:22: error: \u{2018}vector\u{2019} does not name a type\n\
+ctx.h:4:31: error: \u{2018}list\u{2019} was not declared in this scope\n\
+ctx.h:4:31: note: suggested alternatives:\n\
+/usr/include/c++/13/bits/stl_list.h:632:11: note:   \u{2018}std::__cxx11::list\u{2019}\n\
+ctx.h:5:8: error: \u{2018}pair\u{2019} does not name a type\n\
+doc.h:4:15: error: \u{2018}ostream\u{2019} has not been declared\n\
+doc.h:9:25: error: \u{2018}runtime_error\u{2019} was not declared in this scope; did you mean \u{2018}std::runtime_error\u{2019}?\n\
+doc.h:11:18: error: \u{2018}cerr\u{2019} was not declared in this scope\n\
+doc.h:11:18: note: \u{2018}std::cerr\u{2019} is defined in header \u{2018}<iostream>\u{2019}; this is probably fixable by adding \u{2018}#include <iostream>\u{2019}\n";
+        assert_eq!(
+            unqualified(contexts),
+            vec![
+                ("string".to_owned(), "string", true),
+                ("vector".to_owned(), "vector", false),
+                ("list".to_owned(), "list", true),
+                ("pair".to_owned(), "utility", false),
+                ("ostream".to_owned(), "iostream", false),
+                ("runtime_error".to_owned(), "stdexcept", true),
+                ("cerr".to_owned(), "iostream", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_names_and_qualified_uses_are_not_unqualified_std_names() {
+        for output in [
+            // A project type, and names qualified with a namespace.
+            "w.h:3:5: error: unknown type name 'Widget'\n",
+            "w.h:3:5: error: no template named 'vector' in namespace 'std'\n",
+            "w.h:3:5: error: no template named 'map' in namespace 'widgets'\n",
+            "w.h:3:5: error: \u{2018}string\u{2019} in namespace \u{2018}std\u{2019} does not name a type\n",
+            "w.h:3:5: error: \u{2018}map\u{2019} is not a member of \u{2018}std\u{2019}\n",
+            // A manipulator name is a project identifier unless qualified.
+            "w.cpp:3:5: error: use of undeclared identifier 'flush'\n",
+            // An everyday word as an undeclared variable or call (clang's C and
+            // C++ wording, gcc's C++ wording) is not the standard name.
+            "w.c:3:5: error: use of undeclared identifier 'list'\n    3 |     list = list->next;\n      |     ^\n",
+            "w.cpp:3:5: error: \u{2018}set\u{2019} was not declared in this scope\n    3 |     set(value);\n      |     ^~~\n",
+            "w.cpp:3:5: error: use of undeclared identifier 'pair'\n",
+            // A warning is not a build error.
+            "w.h:3:5: warning: unknown type name 'string'\n",
+        ] {
+            assert_eq!(unqualified_std_names(output), Vec::new(), "{output}");
+        }
+        // With evidence an everyday word counts: written as a template or a
+        // scope, or the compiler named the `std::` declaration.
+        for (output, name) in [
+            (
+                "w.cpp:3:5: error: \u{2018}set\u{2019} was not declared in this scope\n    3 |     set<int> seen;\n      |     ^~~\n",
+                "set",
+            ),
+            (
+                "w.cpp:3:5: error: use of undeclared identifier 'ios'\n    3 |     open(path, ios::binary);\n      |                ^\n",
+                "ios",
+            ),
+            (
+                "w.cpp:3:5: error: use of undeclared identifier 'pair'; did you mean 'std::pair'?\n",
+                "pair",
+            ),
+        ] {
+            assert_eq!(
+                unqualified_std_names(output)
+                    .into_iter()
+                    .map(|found| found.name)
+                    .collect::<Vec<_>>(),
+                vec![name.to_owned()],
+                "{output}"
+            );
+        }
+        // Old compilers print the source line without a gutter, then a caret.
+        let old = "w.h:6:9: error: use of undeclared identifier 'string'\n\
+                   \x20   map<string, int> fields;\n\
+                   \x20       ^\n";
+        assert_eq!(
+            unqualified(old),
+            vec![
+                ("string".to_owned(), "string", false),
+                ("map".to_owned(), "map", false),
+            ]
+        );
+    }
+
+    /// C code of a C++ harness (a `.c` extra source, or a header it includes)
+    /// may name its own `list` or `stack` type. A C++ prelude cannot reach a C
+    /// compile, and where the harness Makefile compiles the `.c` file with the
+    /// C++ compiler it would bind the name to the standard template, so those
+    /// diagnostics are not unqualified standard names.
+    #[test]
+    fn c_code_diagnostics_are_not_unqualified_std_names() {
+        for output in [
+            // The C source itself: clang, gcc with a function context line, and
+            // the parenthesised location of clang-cl.
+            "lib/src/node.c:2:18: error: unknown type name 'list'\n    2 | int walk(void) { list *head = 0; return 0; }\n      |                  ^\n",
+            "lib/src/node.c: In function \u{2018}walk\u{2019}:\n\
+             lib/src/node.c:2:18: error: unknown type name \u{2018}list\u{2019}\n",
+            "lib\\src\\node.c(2,18): error: unknown type name 'list'\n",
+            // The same source compiled by g++ (the harness compiles extra
+            // sources with $(CXX)), in C++ wording.
+            "lib/src/node.c:1:1: error: \u{2018}list\u{2019} does not name a type\n\
+             \x20   1 | list *roots;\n\
+             \x20     | ^~~~\n",
+            // A header a C source includes: clang prints the chain once and not
+            // again for the next diagnostic from the same place; gcc prints a
+            // nested chain innermost first, on continuation lines.
+            "In file included from lib/src/node.c:1:\n\
+             lib/include/node.h:3:5: error: unknown type name 'list'\n\
+             lib/include/node.h:4:5: error: unknown type name 'stack'\n",
+            "In file included from lib/include/node.h:2,\n\
+             \x20                from lib/src/node.c:1:\n\
+             lib/include/queue.h: At top level:\n\
+             lib/include/queue.h:3:5: error: unknown type name \u{2018}queue\u{2019}\n",
+            "In file included from C:\\w\\lib\\src\\node.c:1:\n\
+             C:\\w\\lib\\include\\node.h:3:5: error: unknown type name 'list'\n",
+            // clang prints a nested chain outermost first.
+            "In file included from lib/src/node.c:1:\n\
+             In file included from lib/include/node.h:2:\n\
+             lib/include/queue.h:3:5: error: unknown type name 'queue'\n",
+            // A `.c` file a C++ source includes is C code too, and so are the
+            // headers it includes. gcc prints no chain when it returns to that
+            // file from one of them.
+            "In file included from main.cpp:2:\n\
+             lib/legacy.c:3:5: error: unknown type name 'list'\n\
+             lib/legacy.c:4:5: error: unknown type name 'stack'\n",
+            "In file included from main.cpp:2:\n\
+             In file included from lib/legacy.c:1:\n\
+             lib/legacy.h:3:5: error: unknown type name 'list'\n",
+            "In file included from lib/legacy.h:1,\n\
+             \x20                from lib/legacy.c:1,\n\
+             \x20                from main.cpp:2:\n\
+             lib/types.h:3:1: error: \u{2018}list\u{2019} does not name a type\n\
+             lib/legacy.c: In function \u{2018}int walk()\u{2019}:\n\
+             lib/legacy.c:4:5: error: \u{2018}stack\u{2019} does not name a type\n",
+        ] {
+            assert_eq!(unqualified(output), Vec::new(), "{output}");
+        }
+
+        // The C++ code's names still count, before or after the C code's.
+        let cpp_then_c = "In file included from main.cpp:3:\n\
+                          ./widget.h:6:5: error: unknown type name 'string'\n\
+                          lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                          In file included from lib/src/node.c:1:\n\
+                          lib/include/node.h:3:5: error: unknown type name 'stack'\n";
+        let c_then_cpp = "lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                          In file included from main.cpp:3:\n\
+                          ./widget.h:6:5: error: unknown type name 'string'\n\
+                          ./widget.h:7:5: error: no template named 'deque'\n\
+                          src/log.cpp:9:5: error: unknown type name 'stack'\n";
+        assert_eq!(
+            unqualified(cpp_then_c),
+            vec![("string".to_owned(), "string", false)]
+        );
+        assert_eq!(
+            unqualified(c_then_cpp),
+            vec![
+                ("string".to_owned(), "string", false),
+                ("deque".to_owned(), "deque", false),
+                ("stack".to_owned(), "stack", false),
+            ]
+        );
+        // A header error with no include chain at all stays a C++ one, as is
+        // a force-included header's under its `<command-line>` chain.
+        let forced = "In file included from <command-line>:\n\
+                      ./std_prelude.h:9:5: error: unknown type name 'string'\n";
+        assert_eq!(
+            unqualified(forced),
+            vec![("string".to_owned(), "string", false)]
+        );
     }
 
     #[test]

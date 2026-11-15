@@ -1385,7 +1385,10 @@ bhf fuzz bhf_work --harness H-CPP000A --iterations 1000 --seed-input smoke
 `bhf_work/harnesses/<id>` and says so). When the lookup fails it names the
 harness ids it found, and when the link fails it names the in-tree sources
 that define the missing symbols, with the `--extra-source` flags and an
-`AUTO_EXTRA_SOURCES` command to add them.
+`AUTO_EXTRA_SOURCES` command to add them. When C++ sources use standard
+library names without `std::` (`string`, `map`, `list`), it writes a prelude
+header with `using std::` declarations into the harness directory and prints
+the `AUTO_EXTRA_INCLUDES='-include <prelude>'` command.
 
 `bhf build` takes the toolchain from `--cc`/`--cxx`, `--target <triple>` (or
 `--toolchain <prefix>`: `<prefix>-gcc`/`<prefix>-g++`), `--sysroot`, `--cflags`,

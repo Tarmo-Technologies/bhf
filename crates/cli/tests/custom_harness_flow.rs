@@ -798,6 +798,157 @@ mod linux {
         assert!(work.join("build").join(id).join("main").is_file());
     }
 
+    /// A pre-standard library: `widget.h` writes `string`, `map`, `vector`,
+    /// `list` and `pair` without `std::`, relying on the `using namespace std;`
+    /// that `widget.cpp` puts before including it.
+    fn write_pre_standard_library(root: &Path) -> PathBuf {
+        let src = root.join("lib/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("widget.h"),
+            "#pragma once\n#include <cstddef>\n\
+             class Widget {\n\
+             public:\n\
+             \x20   int parse_record(const unsigned char *data, size_t size);\n\
+             \x20   map<string, int> fields;\n\
+             \x20   vector<int> sizes;\n\
+             \x20   list<string> names;\n\
+             \x20   pair<int, int> span;\n\
+             };\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("widget.cpp"),
+            "#include <list>\n#include <map>\n#include <string>\n#include <utility>\n#include <vector>\n\
+             using namespace std;\n\
+             #include \"widget.h\"\n\
+             int Widget::parse_record(const unsigned char *data, size_t size) {\n\
+             \x20   string text(reinterpret_cast<const char *>(data), size);\n\
+             \x20   fields[text] = static_cast<int>(size);\n\
+             \x20   names.push_back(text);\n\
+             \x20   sizes.push_back(static_cast<int>(size));\n\
+             \x20   span = make_pair(0, static_cast<int>(size));\n\
+             \x20   return static_cast<int>(fields.size() + names.size());\n\
+             }\n",
+        )
+        .unwrap();
+        src.join("widget.cpp")
+    }
+
+    /// The harness includes `widget.h` without the `using namespace std;`, so
+    /// its build fails. The hint names the standard types, writes a prelude
+    /// with their headers and `using std::` declarations, and the command it
+    /// prints builds the harness, with clang++ and with g++.
+    #[test]
+    fn unqualified_std_types_get_a_prelude_whose_command_builds_the_harness() {
+        if !cpp_toolchain() {
+            eprintln!("skipping std prelude flow: clang++ or make unavailable");
+            return;
+        }
+        let gxx = Command::new("g++")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let mut compilers: Vec<(&str, Vec<(&str, OsString)>)> = vec![("clang++", Vec::new())];
+        if gxx {
+            compilers.push(("g++", vec![("CC", "gcc".into()), ("CXX", "g++".into())]));
+        } else {
+            eprintln!("g++ unavailable: checking the std prelude flow with clang++ only");
+        }
+        for (compiler, compiler_env) in compilers {
+            let root = tempfile::tempdir().unwrap();
+            let target = write_pre_standard_library(root.path());
+            let work = root.path().join("bhf_work");
+            let id = "H-XPRELUDE";
+            let generated = bhf(
+                &args(&[
+                    &"generate-harness",
+                    &target,
+                    &"--target",
+                    &"Widget::parse_record",
+                    &"--id",
+                    &id,
+                    &"--output",
+                    &work.join("harnesses"),
+                ]),
+                &[],
+                Duration::from_secs(60),
+            );
+            assert!(generated.status.success(), "{}", text(&generated));
+
+            let failed = bhf(
+                &args(&[&"build", &work, &"--harness", &id]),
+                &compiler_env,
+                Duration::from_secs(300),
+            );
+            let failed_text = text(&failed);
+            assert_eq!(failed.status.code(), Some(1), "{compiler}: {failed_text}");
+            let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+            let hint = stderr
+                .lines()
+                .find(|line| line.starts_with("hint:") && line.contains("without `std::`"))
+                .unwrap_or_else(|| panic!("{compiler}: no std prelude hint: {failed_text}"));
+            let (names, _) = hint.split_once(" without `std::`").unwrap();
+            for name in ["string", "map", "vector", "list", "pair"] {
+                assert!(
+                    names.split([' ', ',']).any(|word| word == name),
+                    "{compiler}: {name} not named: {hint}"
+                );
+            }
+            let prelude = work.join("harnesses").join(id).join("std_prelude.h");
+            let written = fs::read_to_string(&prelude)
+                .unwrap_or_else(|error| panic!("{compiler}: no prelude ({error}): {hint}"));
+            for (header, name) in [
+                ("string", "string"),
+                ("map", "map"),
+                ("vector", "vector"),
+                ("list", "list"),
+                ("utility", "pair"),
+            ] {
+                assert!(
+                    written.contains(&format!("#include <{header}>\n"))
+                        && written.contains(&format!("using std::{name};\n")),
+                    "{compiler}: {written}"
+                );
+            }
+            let command = hint
+                .split_once("force-include it into every translation unit: ")
+                .map(|(_, command)| command)
+                .unwrap_or_else(|| panic!("{compiler}: no command: {hint}"));
+            let (envs, words) = split_suggested_command(command);
+            assert_eq!(&words[..2], ["bhf", "build"], "{command}");
+            let includes = envs
+                .iter()
+                .find(|(name, _)| name == "AUTO_EXTRA_INCLUDES")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            let expected = fs::canonicalize(&prelude).unwrap();
+            assert_eq!(
+                includes,
+                format!("-include {}", expected.display()),
+                "{command}"
+            );
+
+            // Running the command as printed (with the same compiler) builds
+            // the harness.
+            let mut rebuild_env: Vec<(&str, OsString)> = compiler_env.clone();
+            rebuild_env.extend(
+                envs.iter()
+                    .map(|(name, value)| (name.as_str(), OsString::from(value))),
+            );
+            let rebuild_args: Vec<OsString> = words[1..].iter().map(OsString::from).collect();
+            let built = bhf(&rebuild_args, &rebuild_env, Duration::from_secs(300));
+            assert!(
+                built.status.success(),
+                "{compiler}: the suggested command failed: {}",
+                text(&built)
+            );
+            assert!(work.join("build").join(id).join("main").is_file());
+        }
+    }
+
     #[test]
     fn auto_target_exact_spelling_beats_a_suffix_match() {
         let root = tempfile::tempdir().unwrap();
