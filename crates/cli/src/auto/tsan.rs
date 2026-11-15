@@ -18,7 +18,7 @@
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -49,6 +49,19 @@ const TSAN_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// harness-wide so a permanently incompatible host cannot multiply it by every
 /// corpus input.
 const TSAN_MAPPING_FAILURE_LIMIT: usize = 256;
+
+/// Extra runs for an input whose replay exited cleanly with no race report,
+/// before that input counts as race-free.
+///
+/// A clean run is not proof. TSan checks and updates an address's shadow cells
+/// without an atomic step, so when two threads make their first accesses to an
+/// address at the same instant, each can find the shadow empty and neither
+/// reports. Two unsynchronized writes on either side of a `pthread_create`
+/// exited 0 with no report on 26 of 500 runs on an idle host, and on 84 of 300
+/// when the writes were released together. Each run is an independent draw, so
+/// one more run takes a ~5% miss to ~0.25%. The re-run uses the same per-run
+/// timeout and harness-wide timeout budget as every other run.
+const TSAN_CLEAN_RECHECKS: usize = 1;
 
 /// What a replay produced, and what it could not measure.
 ///
@@ -81,6 +94,11 @@ pub struct TsanReplay {
     /// says the opposite, which is the same false-clean `unmeasured` exists to
     /// prevent.
     pub unattributed: usize,
+    /// Inputs whose replay exited cleanly with no report and were run again
+    /// (`TSAN_CLEAN_RECHECKS`) before counting as race-free.
+    pub rechecked: usize,
+    /// Races written as findings that only the re-run of a clean input showed.
+    pub found_on_recheck: usize,
 }
 
 /// Replay every C harness's corpus through its TSan build, writing a BHF-556 finding
@@ -108,6 +126,8 @@ fn run_tsan_replay_with(work_dir: &Path, run_timeout: Duration) -> TsanReplay {
         total.findings += one.findings;
         total.unmeasured += one.unmeasured;
         total.unattributed += one.unattributed;
+        total.rechecked += one.rechecked;
+        total.found_on_recheck += one.found_on_recheck;
     }
     total
 }
@@ -146,6 +166,9 @@ fn replay_one(
     let mut unmeasured = 0usize;
     let mut unattributed = 0usize;
     let mut harness_timeouts = 0usize;
+    let mut rechecked = 0usize;
+    // Sites first shown by a re-run of a clean input.
+    let mut shown_on_recheck: BTreeSet<(String, u64)> = BTreeSet::new();
     'inputs: for input in inputs.flatten() {
         if replayed >= MAX_INPUTS || harness_timeouts >= TSAN_TIMEOUT_LIMIT {
             break;
@@ -161,6 +184,7 @@ fn replay_one(
         // initialization failures do not consume that per-input retry budget;
         // they use a larger harness-wide bound because target code never ran.
         let mut run_retries = 0usize;
+        let mut clean_rechecks = 0usize;
         let mut never_completed = false;
         loop {
             let run = crate::command_output::output_with_timeout_flagged(
@@ -181,6 +205,11 @@ fn replay_one(
                 Ok((out, false)) => out,
                 Ok((_, true)) | Err(_) => {
                     harness_timeouts += 1;
+                    // A re-run of a clean input that does not complete leaves
+                    // the clean run it was checking: the input was measured.
+                    if clean_rechecks > 0 {
+                        break;
+                    }
                     if run_retries < TSAN_RUN_RETRIES && harness_timeouts < TSAN_TIMEOUT_LIMIT {
                         run_retries += 1;
                         continue;
@@ -194,7 +223,11 @@ fn replay_one(
                 consecutive_mapping_failures = 0;
                 match classify_race(&stderr, hdir) {
                     RaceAttribution::Target(file, line_no) => {
-                        sites.entry((file, line_no)).or_insert_with(|| path.clone());
+                        let site = (file, line_no);
+                        if clean_rechecks > 0 && !sites.contains_key(&site) {
+                            shown_on_recheck.insert(site.clone());
+                        }
+                        sites.entry(site).or_insert_with(|| path.clone());
                         break;
                     }
                     // Retry first: a report can come back unsymbolized once and
@@ -217,9 +250,18 @@ fn replay_one(
                     }
                 }
             }
-            // No race report: a clean exit is a genuine no-race run (stop).
+            // No race report and a clean exit. Run it again before calling the
+            // input race-free: TSan can miss a race on any single run
+            // (`TSAN_CLEAN_RECHECKS`).
             if out.status.success() {
                 consecutive_mapping_failures = 0;
+                if clean_rechecks < TSAN_CLEAN_RECHECKS {
+                    if clean_rechecks == 0 {
+                        rechecked += 1;
+                    }
+                    clean_rechecks += 1;
+                    continue;
+                }
                 break;
             }
             if is_tsan_mapping_failure(&stderr) {
@@ -248,14 +290,17 @@ fn replay_one(
     }
 
     let mut written = 0usize;
+    let mut found_on_recheck = 0usize;
     if !sites.is_empty() {
         let queue = crate::fuzz_lineage::ReplayedQueue::open(work_dir, harness_id);
         for ((file, line), input) in sites {
             let id = format!("F-TSAN-{:04}", *index);
             *index += 1;
             let shown_by = queue.entry(&input);
+            let from_recheck = shown_on_recheck.contains(&(file.clone(), line));
             if write_tsan_finding(work_dir, &id, harness_id, &file, line, &shown_by) {
                 written += 1;
+                found_on_recheck += usize::from(from_recheck);
             }
         }
     }
@@ -263,6 +308,8 @@ fn replay_one(
         findings: written,
         unmeasured,
         unattributed,
+        rechecked,
+        found_on_recheck,
     }
 }
 
@@ -724,6 +771,100 @@ WARNING: ThreadSanitizer: data race (pid=1)\n\
         ));
     }
 
+    /// A replay fixture whose runs are recorded one line each in `attempts`.
+    /// From run `race_from` on it prints a symbolized race, and from run
+    /// `hang_from` on it sleeps past any test timeout (0 means never for
+    /// either); otherwise it exits cleanly with no report.
+    #[cfg(unix)]
+    fn recheck_fixture(
+        name: &str,
+        race_from: usize,
+        hang_from: usize,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::Builder::new().prefix(name).tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        let hdir = work.join("harnesses").join("H-C0001");
+        let queue = work.join("corpus").join("H-C0001").join("queue");
+        std::fs::create_dir_all(&hdir).unwrap();
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("seed"), b"input").unwrap();
+        std::fs::write(hdir.join("Makefile"), "tsan:\n\tchmod +x main_tsan\n").unwrap();
+        let attempts = hdir.join("attempts");
+        let bin = hdir.join("main_tsan");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 printf 'x\\n' >> '{attempts}'\n\
+                 runs=$(wc -l < '{attempts}')\n\
+                 if [ {hang_from} -gt 0 ] && [ \"$runs\" -ge {hang_from} ]; then\n\
+                   sleep 5\n\
+                 fi\n\
+                 if [ {race_from} -gt 0 ] && [ \"$runs\" -ge {race_from} ]; then\n\
+                   printf '%s\\n' 'WARNING: ThreadSanitizer: data race' >&2\n\
+                   printf '%s\\n' '    #0 worker /project/race.c:12:7 (main_tsan+0x1)' >&2\n\
+                   exit 86\n\
+                 fi\n\
+                 exit 0\n",
+                attempts = attempts.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (temp, work, attempts)
+    }
+
+    #[cfg(unix)]
+    fn runs(attempts: &Path) -> usize {
+        std::fs::read_to_string(attempts).unwrap().lines().count()
+    }
+
+    /// One clean run does not make an input race-free: TSan can miss a race on
+    /// any single run. The input is run once more, and only once more.
+    #[test]
+    #[cfg(unix)]
+    fn a_clean_replay_is_run_once_more_before_it_counts_as_race_free() {
+        let (_temp, work, attempts) = recheck_fixture("bhf-tsan-recheck-clean-", 0, 0);
+        let replay = run_tsan_replay(&work);
+        assert_eq!(replay.findings, 0);
+        assert_eq!(replay.rechecked, 1, "{replay:?}");
+        assert_eq!(replay.found_on_recheck, 0, "{replay:?}");
+        assert_eq!(runs(&attempts), 1 + TSAN_CLEAN_RECHECKS);
+    }
+
+    /// The miss this re-run exists for: the first run exits cleanly with no
+    /// report and the second shows the race. It is a finding, and the summary
+    /// says the re-run found it.
+    #[test]
+    #[cfg(unix)]
+    fn a_race_only_the_rerun_of_a_clean_input_shows_is_a_finding() {
+        let (_temp, work, attempts) = recheck_fixture("bhf-tsan-recheck-race-", 2, 0);
+        let replay = run_tsan_replay(&work);
+        assert_eq!(replay.findings, 1, "{replay:?}");
+        assert_eq!(replay.rechecked, 1, "{replay:?}");
+        assert_eq!(replay.found_on_recheck, 1, "{replay:?}");
+        assert_eq!(runs(&attempts), 2);
+        let finding =
+            std::fs::read_to_string(work.join("results/findings/F-TSAN-0000/finding.json"))
+                .unwrap();
+        assert!(finding.contains("race.c"), "{finding}");
+    }
+
+    /// A re-run that never completes takes nothing from the clean run it was
+    /// checking: the input ran to completion once, so it is not unmeasured,
+    /// and the re-run is not retried.
+    #[test]
+    #[cfg(unix)]
+    fn a_rerun_that_never_completes_leaves_the_clean_run_measured() {
+        let (_temp, work, attempts) = recheck_fixture("bhf-tsan-recheck-hang-", 0, 2);
+        let replay = run_tsan_replay_with(&work, Duration::from_millis(500));
+        assert_eq!(replay.findings, 0, "{replay:?}");
+        assert_eq!(replay.unmeasured, 0, "{replay:?}");
+        assert_eq!(replay.rechecked, 1, "{replay:?}");
+        assert_eq!(runs(&attempts), 2);
+    }
+
     /// A TSan finding carries the lineage of the queue entry that showed the
     /// race; an entry with no record beside the queue is a corpus root, and
     /// the reason says why nothing earlier is known.
@@ -750,7 +891,12 @@ WARNING: ThreadSanitizer: data race (pid=1)\n\
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert_eq!(run_tsan_replay(work).findings, 1);
+        let replay = run_tsan_replay(work);
+        assert_eq!(replay.findings, 1);
+        assert_eq!(
+            replay.rechecked, 0,
+            "a run that showed the race needs no re-run"
+        );
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(work.join("results/findings/F-TSAN-0000/finding.json")).unwrap(),
         )

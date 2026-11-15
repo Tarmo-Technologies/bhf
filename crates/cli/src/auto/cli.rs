@@ -3031,6 +3031,17 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             tsan.unattributed
         );
     }
+    // A clean run is not proof (TSan can miss a race on one run), so each clean
+    // input was run once more. Say how many, and how many races only that re-run
+    // showed.
+    if tsan.rechecked > 0 {
+        bhfeprintln!(
+            "bhf auto: ThreadSanitizer — {} corpus input(s) ran clean and were run again \
+             before counting as race-free; {} data race(s) were shown only by that re-run",
+            tsan.rechecked,
+            tsan.found_on_recheck
+        );
+    }
 
     // Memory-consumption profile (C/C++): replay the corpus in fresh processes and
     // flag an input whose peak resident set is far above baseline and amplified vs its

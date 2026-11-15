@@ -311,6 +311,10 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
          ({} unmeasured, {} unattributed)",
         replay.unmeasured, replay.unattributed
     );
+    assert_eq!(
+        replay.rechecked, 0,
+        "the first run showed the race, so no input needed a re-run: {replay:?}"
+    );
 
     let finding = work
         .join("results")
@@ -343,5 +347,83 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
         "the two racing writes at one site must collapse to a single finding"
     );
 
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The replay's re-run of a clean input, against a real TSan build. The first
+/// run of this fixture returns before it starts the racing thread, which is how
+/// a run TSan misses looks to the replay: exit 0, no report. The re-run must
+/// still find the race, and the summary must say the re-run found it.
+#[test]
+fn a_race_tsan_misses_on_the_first_run_is_found_by_the_rerun() {
+    if !clang_has_tsan() {
+        eprintln!("skip: clang has no working ThreadSanitizer");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("bhf-tsan-rerun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let work = tmp.join("work");
+    let hdir = work.join("harnesses").join("H-C0001");
+    let queue = work.join("corpus").join("H-C0001").join("queue");
+    let target_dir = work.join("target");
+    for d in [&hdir, &queue, &target_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let race_c = target_dir.join("race.c");
+    std::fs::write(&race_c, RACE_C).unwrap();
+    let marker = tmp.join("ran-once");
+    std::fs::write(
+        hdir.join("main.c"),
+        format!(
+            "#include <stdio.h>\n\
+             extern void run_race(void);\n\
+             int main(void) {{\n\
+                 FILE *seen = fopen(\"{marker}\", \"r\");\n\
+                 if (!seen) {{\n\
+                     FILE *mark = fopen(\"{marker}\", \"w\");\n\
+                     if (mark) fclose(mark);\n\
+                     return 0;\n\
+                 }}\n\
+                 fclose(seen);\n\
+                 run_race();\n\
+                 return 0;\n\
+             }}\n",
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        hdir.join("Makefile"),
+        format!(
+            "tsan: main_tsan\n\
+             main_tsan: main.c\n\
+             \tclang -O0 -g -fsanitize=thread -pthread -o main_tsan main.c {race}\n",
+            race = race_c.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(queue.join("seed"), b"anything").unwrap();
+
+    let replay = run_tsan_replay(&work);
+    if replay.unmeasured > 0 {
+        eprintln!("skip: ThreadSanitizer never completed a replay run: {replay:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+    assert!(
+        marker.is_file(),
+        "the fixture's first run did not run: {replay:?}"
+    );
+    assert_eq!(replay.rechecked, 1, "{replay:?}");
+    assert_eq!(replay.found_on_recheck, 1, "{replay:?}");
+    assert_eq!(replay.findings, 1, "{replay:?}");
+    let finding = std::fs::read_to_string(
+        work.join("results")
+            .join("findings")
+            .join("F-TSAN-0000")
+            .join("finding.json"),
+    )
+    .unwrap();
+    assert!(finding.contains("race.c"), "{finding}");
     let _ = std::fs::remove_dir_all(&tmp);
 }

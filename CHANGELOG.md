@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Fixed
+- TSan corpus replay: an input whose run exits cleanly with no race report is
+  run once more before it counts as race-free. TSan's shadow-memory update is
+  not atomic, so two threads that first touch an address at the same moment
+  can both go unreported. A race on either side of a `pthread_create` was
+  missed on about one run in twenty. The run summary gives how many inputs ran
+  again and how many races only the second run showed.
 - Ada: a build that recovered a missing unit could fail to bind with
   `"<unit>" must be recompiled` and `no object specified`. A repair round's
   semantic check (`-gnatc`) compiles into the same object directories as the

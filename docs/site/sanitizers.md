@@ -372,6 +372,29 @@ swapcontext(&co_uc, &main_uc);
 The calls are no-ops without ASan, so the same source still builds under
 `--sanitizers none`, on the cross path, and normally.
 
+## The ThreadSanitizer corpus replay
+
+Unless `--sanitizers` leaves `tsan` out, `bhf auto` builds each C harness's
+TSan variant (`make tsan`) and replays the saved corpus through it. A data
+race whose report names a frame in the target's own source becomes a BHF-556
+(CWE-362) finding.
+The run summary says what the replay could not conclude:
+
+- **unmeasured:** inputs whose TSan run never completed (a timeout or a failed
+  start), after retries. They are not race-free, only unexamined.
+- **unattributed:** races TSan reported with no symbolized frame. They are real
+  but unlocated. Install `llvm-symbolizer` or keep debug info to locate them.
+- **run again:** inputs whose first run exited cleanly with no report. Each such
+  input is run once more before it counts as race-free, and the summary gives
+  the number of races only that second run showed. TSan can miss a race on any
+  single run. It checks and updates an address's shadow memory in a step that
+  is not atomic, so two threads that first touch an address at the same moment
+  can both miss the other's access. A race on either side of a
+  `pthread_create` went unreported on about one run in twenty, and the second
+  run brings that to about one in four hundred. The extra run uses the same
+  per-run timeout and timeout budget as every other replay run. If it does not
+  finish, the input keeps the clean result of its first run.
+
 ## When to use which
 
 - **Default sweep:** omit `--sanitizers` — ASan + UBSan is the right baseline.
