@@ -387,6 +387,7 @@ pub(crate) fn import_tree(tree: &Path, request: &ImportRequest) -> Option<Soluti
                     .map(|mapped| choose_configuration(&[], Some(mapped)))
                     .unwrap_or_else(|| (configuration.clone(), platform.clone()));
                 projects.push(evaluate_project(
+                    tree,
                     &project.path,
                     Some(&solution_path),
                     &project_config,
@@ -411,7 +412,7 @@ pub(crate) fn import_tree(tree: &Path, request: &ImportRequest) -> Option<Soluti
                 choose_configuration(&listed, request.configuration.as_deref());
             let projects = project_paths
                 .iter()
-                .map(|path| evaluate_project(path, None, &configuration, &platform, &env))
+                .map(|path| evaluate_project(tree, path, None, &configuration, &platform, &env))
                 .collect();
             Some(SolutionImport {
                 solution: None,
@@ -444,8 +445,11 @@ pub(crate) fn project_configurations(project: &Path) -> Vec<String> {
     configs
 }
 
-/// Statically evaluate one project for `configuration|platform`.
+/// Statically evaluate one project for `configuration|platform`. `tree` is
+/// the scanned tree: the implicit `Directory.Build.props`/`.targets` are read
+/// from inside it only.
 pub(crate) fn evaluate_project(
+    tree: &Path,
     project: &Path,
     solution: Option<&Path>,
     configuration: &str,
@@ -453,8 +457,74 @@ pub(crate) fn evaluate_project(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> ImportedProject {
     let mut evaluator = Evaluator::new(project, solution, configuration, platform, env);
+    evaluator.tree = absolute_lexically(tree);
     evaluator.load(project, 0);
     evaluator.finish()
+}
+
+/// The two files MSBuild's common props and targets import into every
+/// project from the nearest directory above it that has one:
+/// `Directory.Build.props` early (Microsoft.Cpp.Default.props imports
+/// Microsoft.Common.props, which reads it) and `Directory.Build.targets`
+/// late (through Microsoft.Cpp.targets and Microsoft.Common.targets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryBuild {
+    Props,
+    Targets,
+}
+
+impl DirectoryBuild {
+    fn file_name(self) -> &'static str {
+        match self {
+            DirectoryBuild::Props => "Directory.Build.props",
+            DirectoryBuild::Targets => "Directory.Build.targets",
+        }
+    }
+
+    /// The property that turns MSBuild's import of the file off.
+    fn switch(self) -> &'static str {
+        match self {
+            DirectoryBuild::Props => "ImportDirectoryBuildProps",
+            DirectoryBuild::Targets => "ImportDirectoryBuildTargets",
+        }
+    }
+
+    /// The toolset import (lower case, `/` separators) MSBuild reads the
+    /// file through.
+    fn toolset_import(self) -> &'static str {
+        match self {
+            DirectoryBuild::Props => "/microsoft.cpp.default.props",
+            DirectoryBuild::Targets => "/microsoft.cpp.targets",
+        }
+    }
+
+    /// Whether `raw` (an `<Import Project=...>`) is the toolset import the
+    /// file is read through.
+    fn is_read_through(self, raw: &str) -> bool {
+        is_toolset_import(raw)
+            && slashes(raw.trim())
+                .to_ascii_lowercase()
+                .ends_with(self.toolset_import())
+    }
+}
+
+/// The toolset's standard imports. Apart from the `Directory.Build` files
+/// (read where they import them) they carry the toolset's defaults, which
+/// the compiler supplies itself, so skipping them needs no note.
+const STANDARD_TOOLSET_IMPORTS: &[&str] = &[
+    "/microsoft.cpp.default.props",
+    "/microsoft.cpp.props",
+    "/microsoft.cpp.targets",
+];
+
+/// How many directories above a project the search for a `Directory.Build`
+/// file climbs at most.
+const MAX_DIRECTORY_BUILD_DEPTH: usize = 64;
+
+/// `path` made absolute against the working directory, then normalised
+/// lexically, so a relative tree and the projects under it compare.
+fn absolute_lexically(path: &Path) -> PathBuf {
+    normalize_lexically(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// Marks an unresolved `$(...)` inside an expanded value. NUL never appears in
@@ -511,6 +581,16 @@ struct Item {
 struct Evaluator<'a> {
     project: PathBuf,
     project_dir: PathBuf,
+    /// The scanned tree, the highest directory a `Directory.Build` file is
+    /// read from.
+    tree: PathBuf,
+    /// Whether each `Directory.Build` file has had its turn (read, turned
+    /// off, absent, or named as outside the tree).
+    directory_build_props_done: bool,
+    directory_build_targets_done: bool,
+    /// Toolset imports outside [`STANDARD_TOOLSET_IMPORTS`] left unread, as
+    /// written.
+    skipped_toolset_imports: BTreeSet<String>,
     props: BTreeMap<String, String>,
     env: &'a dyn Fn(&str) -> Option<String>,
     unresolved: BTreeSet<String>,
@@ -604,8 +684,12 @@ impl<'a> Evaluator<'a> {
         set("OutDir", out_dir);
         set("IntDir", int_dir);
         Evaluator {
+            tree: absolute_lexically(&project_dir),
             project,
             project_dir,
+            directory_build_props_done: false,
+            directory_build_targets_done: false,
+            skipped_toolset_imports: BTreeSet::new(),
             props,
             env,
             unresolved: BTreeSet::new(),
@@ -642,8 +726,79 @@ impl<'a> Evaluator<'a> {
                 return;
             }
         };
+        // The project itself: its `Directory.Build` files come in where the
+        // toolset imports would read them, or around its body when it has no
+        // such import.
+        let project_file = depth == 0;
+        let imports = |kind: DirectoryBuild| {
+            let mut found = false;
+            root.walk(&mut |element| {
+                found |= element.name == "Import"
+                    && element
+                        .attr("Project")
+                        .is_some_and(|raw| kind.is_read_through(raw));
+            });
+            found
+        };
+        let (props_at_import, targets_at_import) = if project_file {
+            (
+                imports(DirectoryBuild::Props),
+                imports(DirectoryBuild::Targets),
+            )
+        } else {
+            (true, true)
+        };
+        if project_file && !props_at_import {
+            self.import_directory_build(DirectoryBuild::Props);
+        }
         for child in root.elements() {
             self.load_element(child, &file, depth, true);
+        }
+        if project_file && !targets_at_import {
+            self.import_directory_build(DirectoryBuild::Targets);
+        }
+    }
+
+    /// Read the nearest `kind` file above the project, as MSBuild's implicit
+    /// import does, once: a file inside the scanned tree is loaded like an
+    /// explicit import (so `$(MSBuildThisFileDirectory)` is its directory); one
+    /// above the tree is named in a note and not read. `Import<kind>=false`
+    /// turns it off, as in MSBuild.
+    fn import_directory_build(&mut self, kind: DirectoryBuild) {
+        let done = match kind {
+            DirectoryBuild::Props => &mut self.directory_build_props_done,
+            DirectoryBuild::Targets => &mut self.directory_build_targets_done,
+        };
+        if std::mem::replace(done, true) {
+            return;
+        }
+        let project = self.project.clone();
+        let switched_off = self
+            .property(kind.switch(), &project)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"));
+        if switched_off {
+            return;
+        }
+        let mut dir = Some(absolute_lexically(&self.project_dir));
+        for _ in 0..MAX_DIRECTORY_BUILD_DEPTH {
+            let Some(current) = dir else {
+                return;
+            };
+            let candidate = current.join(kind.file_name());
+            if candidate.is_file() {
+                if current.starts_with(&self.tree) {
+                    self.load(&candidate, 1);
+                } else {
+                    self.notes.push(format!(
+                        "did not read {}: it is outside the scanned tree, and MSBuild imports it \
+                         into this project; add the include dirs and defines it sets with \
+                         --extra-include or AUTO_EXTRA_INCLUDES, or scan from its directory",
+                        slash_text(&candidate)
+                    ));
+                }
+                return;
+            }
+            dir = current.parent().map(Path::to_path_buf);
         }
     }
 
@@ -693,6 +848,21 @@ impl<'a> Evaluator<'a> {
                     return;
                 };
                 if is_toolset_import(raw) {
+                    // MSBuild reads the `Directory.Build` files through two
+                    // of these; the rest are the toolset's own.
+                    if DirectoryBuild::Props.is_read_through(raw) {
+                        self.import_directory_build(DirectoryBuild::Props);
+                    } else if DirectoryBuild::Targets.is_read_through(raw) {
+                        self.import_directory_build(DirectoryBuild::Targets);
+                    } else {
+                        let lower = slashes(raw.trim()).to_ascii_lowercase();
+                        if !STANDARD_TOOLSET_IMPORTS
+                            .iter()
+                            .any(|standard| lower.ends_with(standard))
+                        {
+                            self.skipped_toolset_imports.insert(raw.trim().to_owned());
+                        }
+                    }
                     return;
                 }
                 let expanded = self.expand(raw, file, None);
@@ -1098,6 +1268,19 @@ impl<'a> Evaluator<'a> {
             }
         }
 
+        if !self.skipped_toolset_imports.is_empty() {
+            let skipped: Vec<&str> = self
+                .skipped_toolset_imports
+                .iter()
+                .map(String::as_str)
+                .collect();
+            self.notes.push(format!(
+                "did not read the toolset import(s) {}: the static reading does not evaluate \
+                 the Visual Studio installation's files (--msbuild-evaluate has MSBuild read \
+                 them)",
+                skipped.join(", ")
+            ));
+        }
         let configuration = self.props.get("configuration").cloned().unwrap_or_default();
         let platform = self.props.get("platform").cloned().unwrap_or_default();
         ImportedProject {
@@ -2212,7 +2395,7 @@ mod tests {
         )
         .unwrap();
         let env = |name: &str| (name == "WIDGET_SDK").then(|| "C:/sdk".to_owned());
-        let project = evaluate_project(&dir.join("p.vcxproj"), None, "Debug", "x64", &env);
+        let project = evaluate_project(dir, &dir.join("p.vcxproj"), None, "Debug", "x64", &env);
         assert_eq!(project.sources.len(), 3);
         let a = &project.sources[0];
         assert_eq!(
@@ -2269,12 +2452,199 @@ mod tests {
             project.link_inputs
         );
 
-        let without_env = evaluate_project(&dir.join("p.vcxproj"), None, "Debug", "x64", &no_env);
+        let without_env =
+            evaluate_project(dir, &dir.join("p.vcxproj"), None, "Debug", "x64", &no_env);
         assert!(without_env.unresolved.contains("$(WIDGET_SDK)"));
         assert_eq!(
             without_env.sources[0].include_dirs,
             vec![normalize_lexically(&dir.join("local"))],
             "a dir built on an unresolved macro is left out, not rooted at the drive"
+        );
+    }
+
+    /// A Visual Studio C++ project in the usual shape: the toolset's
+    /// standard imports around a configuration group, one item definition
+    /// and one source. `globals` goes into the Globals group.
+    fn standard_project(dir: &Path, name: &str, source: &str, globals: &str, defines: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(source), "int widget;\n").unwrap();
+        fs::write(
+            dir.join(format!("{name}.vcxproj")),
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><RootNamespace>{name}</RootNamespace>{globals}</PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <WidgetLevel>2</WidgetLevel>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><PreprocessorDefinitions>{defines}%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="{source}" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// MSBuild imports the nearest `Directory.Build.props` above a project
+    /// (through Microsoft.Cpp.Default.props) and the nearest
+    /// `Directory.Build.targets` (through Microsoft.Cpp.targets). The static
+    /// reading reads them where MSBuild does, with `$(MSBuildThisFileDirectory)`
+    /// their own directory, up to the scanned tree's root; one above the root
+    /// is named and not read. Their include dirs and defines used to be lost,
+    /// and the repair loop then made up the defines.
+    #[test]
+    fn directory_build_files_are_read_up_to_the_tree_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(
+            tree.join("App.sln"),
+            "Microsoft Visual Studio Solution File, Format Version 12.00\n\
+             Project(\"{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}\") = \"Lib\", \"proj\\Lib.vcxproj\", \"{11111111-1111-1111-1111-111111111111}\"\nEndProject\n\
+             Project(\"{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}\") = \"Other\", \"other\\Other.vcxproj\", \"{22222222-2222-2222-2222-222222222222}\"\nEndProject\n\
+             Global\n\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\t\tDebug|x64 = Debug|x64\n\tEndGlobalSection\nEndGlobal\n",
+        )
+        .unwrap();
+        fs::write(
+            tree.join("Directory.Build.props"),
+            r#"<Project>
+  <PropertyGroup><WidgetLevel>1</WidgetLevel></PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)dbinc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>FROM_DBP=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile><PreprocessorDefinitions>DBP_DEBUG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
+</Project>"#,
+        )
+        .unwrap();
+        fs::write(
+            tree.join("Directory.Build.targets"),
+            r#"<Project>
+  <ItemDefinitionGroup>
+    <ClCompile><PreprocessorDefinitions>%(PreprocessorDefinitions);FROM_DBT=1;TARGETS_LEVEL=$(WidgetLevel)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
+</Project>"#,
+        )
+        .unwrap();
+        standard_project(
+            &tree.join("proj"),
+            "Lib",
+            "lib.c",
+            "",
+            "LEVEL=$(WidgetLevel);",
+        );
+        // The nearest file wins, and a project can turn the import off.
+        standard_project(
+            &tree.join("other"),
+            "Other",
+            "other.c",
+            "<ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>",
+            "",
+        );
+        fs::write(
+            tree.join("other/Directory.Build.props"),
+            "<Project><ItemDefinitionGroup><ClCompile><PreprocessorDefinitions>NEAREST=1;\
+             %(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>\
+             </ItemDefinitionGroup></Project>",
+        )
+        .unwrap();
+
+        let import = import_tree(&tree, &ImportRequest::default()).expect("import");
+        assert_eq!(import.source_count(), 2, "{import:?}");
+        let lib = &import.projects[0];
+        let source = &lib.sources[0];
+        assert!(
+            source
+                .include_dirs
+                .contains(&normalize_lexically(&tree.join("dbinc"))),
+            "the props file's include dir, from its own directory: {:?}",
+            source.include_dirs
+        );
+        for define in [
+            "FROM_DBP=1",
+            "DBP_DEBUG=1",
+            "FROM_DBT=1",
+            // The project's own value wins over the props file's, and the
+            // targets file, read after the project, sees it.
+            "LEVEL=2",
+            "TARGETS_LEVEL=2",
+        ] {
+            assert!(
+                source.defines.iter().any(|d| d == define),
+                "{define}: {:?}",
+                source.defines
+            );
+        }
+        assert!(
+            lib.notes
+                .iter()
+                .any(|note| note.contains("BuildCustomizations") && note.contains("masm.props")),
+            "a skipped toolset import is named: {:?}",
+            lib.notes
+        );
+        assert!(
+            !lib.notes
+                .iter()
+                .any(|note| note.contains("Microsoft.Cpp.props")),
+            "the toolset's standard imports need no note: {:?}",
+            lib.notes
+        );
+        let other = &import.projects[1].sources[0];
+        assert!(
+            other.defines.iter().any(|d| d == "NEAREST=1"),
+            "{:?}",
+            other.defines
+        );
+        assert!(
+            !other
+                .defines
+                .iter()
+                .any(|d| d == "FROM_DBP=1" || d == "FROM_DBT=1"),
+            "{:?}",
+            other.defines
+        );
+
+        // A Directory.Build.props above the scanned tree is named, not read.
+        let outer = temp.path().join("outer");
+        let inner = outer.join("tree");
+        standard_project(&inner, "Solo", "solo.c", "", "");
+        fs::write(
+            outer.join("Directory.Build.props"),
+            "<Project><ItemDefinitionGroup><ClCompile><PreprocessorDefinitions>OUTSIDE=1;\
+             %(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>\
+             </ItemDefinitionGroup></Project>",
+        )
+        .unwrap();
+        let import = import_tree(&inner, &ImportRequest::default()).expect("import");
+        let solo = &import.projects[0];
+        assert!(
+            !solo.sources[0].defines.iter().any(|d| d == "OUTSIDE=1"),
+            "{:?}",
+            solo.sources[0].defines
+        );
+        let shown = slash_text(&normalize_lexically(&outer.join("Directory.Build.props")));
+        assert!(
+            solo.notes
+                .iter()
+                .any(|note| note.contains(&shown) && note.contains("outside the scanned tree")),
+            "{:?}",
+            solo.notes
         );
     }
 
@@ -2349,7 +2719,7 @@ mod tests {
         )
         .unwrap();
         let started = std::time::Instant::now();
-        let project = evaluate_project(&dir.join("w.vcxproj"), None, "Debug", "x64", &no_env);
+        let project = evaluate_project(dir, &dir.join("w.vcxproj"), None, "Debug", "x64", &no_env);
         assert!(project.sources.is_empty());
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -2378,6 +2748,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("widget.vcxproj"), &text).unwrap();
         let project = evaluate_project(
+            temp.path(),
             &temp.path().join("widget.vcxproj"),
             None,
             "Debug",
@@ -2415,7 +2786,14 @@ mod tests {
         )
         .unwrap();
         let started = std::time::Instant::now();
-        let project = evaluate_project(&dir.join("double.vcxproj"), None, "Debug", "x64", &no_env);
+        let project = evaluate_project(
+            dir,
+            &dir.join("double.vcxproj"),
+            None,
+            "Debug",
+            "x64",
+            &no_env,
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(20));
         assert_eq!(project.sources.len(), 1);
         let defines = &project.sources[0].defines;
@@ -2455,7 +2833,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let project = evaluate_project(&dir.join("copies.vcxproj"), None, "Debug", "x64", &no_env);
+        let project = evaluate_project(
+            dir,
+            &dir.join("copies.vcxproj"),
+            None,
+            "Debug",
+            "x64",
+            &no_env,
+        );
         assert!(
             project.notes.iter().any(|note| note.contains("budget")),
             "{:?}",

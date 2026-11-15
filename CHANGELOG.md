@@ -53,6 +53,13 @@
   `summary.sanitizer_runtime_unavailable`), whose reason names the line and
   the compiler; `--resume` tries such a target again, and the PR action counts
   it as a result.
+- The static Visual Studio import reads the nearest `Directory.Build.props`
+  and `Directory.Build.targets` above each project, where MSBuild's toolset
+  imports would, with `$(MSBuildThisFileDirectory)` their own directory and up
+  to the scanned tree's root; their include dirs and defines used to be lost
+  and then made up by the repair loop. One above the tree, and a toolset import
+  other than the standard three, are named on the console instead of skipped
+  silently.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

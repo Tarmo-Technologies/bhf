@@ -500,8 +500,18 @@ evaluates them the way MSBuild would for one configuration:
 
 - `$(SolutionDir)` is the solution's directory, `$(ProjectDir)` the project's;
   `$(MSBuildThisFileDirectory)` is the directory of the file it appears in.
-- Local `<Import>`s and `ImportGroup` property sheets (`.props`) are followed;
-  the Visual Studio toolset imports (`$(VCTargetsPath)\...`) are not needed.
+- Local `<Import>`s and `ImportGroup` property sheets (`.props`) are followed.
+  The nearest `Directory.Build.props` above each project is read where
+  MSBuild's toolset imports it (at `Microsoft.Cpp.Default.props`) and the
+  nearest `Directory.Build.targets` at `Microsoft.Cpp.targets`, with
+  `$(MSBuildThisFileDirectory)` their own directory; `ImportDirectoryBuildProps`
+  / `ImportDirectoryBuildTargets` set to `false` turn them off, as in MSBuild.
+  The search stops at the scanned tree's root: such a file above it is named
+  on the console and not read. The rest of the Visual Studio
+  toolset's standard imports (`$(VCTargetsPath)\Microsoft.Cpp.props`) carry the
+  toolset's defaults, which the compiler supplies; any other toolset import
+  (`$(VCTargetsPath)\BuildCustomizations\...`, `$(MSBuildExtensionsPath)\...`)
+  is named on the console as not read.
 - `Condition=` is evaluated (`'$(Configuration)|$(Platform)'=='Debug|x64'`,
   `Exists(...)`, `and`/`or`/`!`, version comparisons) for the chosen
   configuration: the first one the solution lists for x64, else the first,
