@@ -62,7 +62,7 @@ pub struct ProjectArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
-    /// Resolve and hash every referenced asset, type-check each target's launch, and report problems (missing assets, duplicate ids, unsupported schema/bhf version, invalid relative paths, unsafe secret interpolation) WITHOUT running a campaign or the build command
+    /// Resolve and hash every referenced asset, type-check each target's launch, and report problems (missing assets, duplicate ids, unsupported schema/bhf version, invalid relative paths, unsafe secret interpolation, a -fsanitize=fuzzer binary without bhf's driver on the builtin engine) WITHOUT running a campaign or the build command
     Validate(ValidateArgs),
     /// List the targets declared in the manifest with their engine, input mode, and a summary of declared seeds/dictionaries/grammar
     List(ListArgs),
@@ -192,6 +192,7 @@ fn run_validate(a: &ValidateArgs) -> Result<()> {
     let mut provenances = Vec::with_capacity(target_ids.len());
     for id in &target_ids {
         let resolved = resolve(&manifest, &text, &manifest_dir, id, &opts, &ctx, &env)?;
+        check_native_binary(id, &resolved.launch, &resolved.resolved_binary)?;
         provenances.push(resolved.provenance);
     }
 
@@ -329,6 +330,8 @@ fn run_run(a: &RunArgs) -> Result<i32> {
         &ctx,
         &env,
     )?;
+    // Refuse a binary the engine cannot drive before anything is staged.
+    check_native_binary(&target.id, &resolved.launch, &resolved.resolved_binary)?;
 
     // Write the authoritative provenance, co-existing with unified results.
     let results_dir = ::corpus::layout::results_dir(&work_dir);
@@ -420,6 +423,35 @@ fn run_run(a: &RunArgs) -> Result<i32> {
     stamp_provenance(&work_dir, &provenance_json, is_native)?;
 
     Ok(exit)
+}
+
+/// Refuse a `builtin` target whose binary is a `-fsanitize=fuzzer` build
+/// without bhf's driver. The builtin engine drives a bhf harness through the
+/// framed protocol and its coverage map; such a binary speaks neither, so
+/// libFuzzer would run its own fuzzing loop inside each execution, with no
+/// coverage bhf sees and its crashes in files bhf never records. The binary
+/// is only scanned, never run.
+fn check_native_binary(target_id: &str, launch: &LoweredLaunch, binary: &Path) -> Result<()> {
+    let LoweredLaunch::Native(native) = launch else {
+        return Ok(());
+    };
+    if native.engine != PpNativeEngine::Builtin
+        || !crate::protocol_detect::libfuzzer_without_bhf_driver(binary)
+    {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "target '{target_id}': {} is a libFuzzer (-fsanitize=fuzzer) binary without bhf's \
+         driver, so engine = \"builtin\" cannot drive it: that engine runs a bhf harness \
+         through its framed protocol and coverage map, and this binary would run \
+         libFuzzer's own fuzzing loop inside each execution instead. Run it as it is with \
+         engine = \"binary\" and input-mode = \"file\" (one input file per process, \
+         without coverage guidance), or, for coverage-guided fuzzing, wrap the fuzz \
+         target with `bhf generate-harness <fuzz_target.cc> --target \
+         LLVMFuzzerTestOneInput`, build that harness (`make main`) and point `binary` at \
+         it",
+        binary.display()
+    ))
 }
 
 /// Materialize a resolved `[[extension]]` as a standalone
@@ -869,6 +901,41 @@ mod tests {
             detection.basis,
             crate::protocol_detect::ProtocolBasis::Declared("framed".to_owned())
         );
+    }
+
+    /// A `-fsanitize=fuzzer` binary without bhf's driver is refused on the
+    /// builtin engine, with the two ways to run it; bhf's driver linked with
+    /// the libFuzzer runtime, the afl++ engine and the binary lane are not.
+    #[test]
+    fn a_libfuzzer_binary_is_refused_on_the_builtin_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("parse_record");
+        let mut bytes = b"\x7fELF\0".to_vec();
+        bytes.extend_from_slice(b"INFO: libFuzzer ignores flags that start with '--'\0");
+        std::fs::write(&binary, &bytes).unwrap();
+        let builtin = LoweredLaunch::Native(native(PpNativeEngine::Builtin));
+        let error = check_native_binary("parse-record", &builtin, &binary)
+            .expect_err("refused")
+            .to_string();
+        for needle in [
+            "target 'parse-record'",
+            "without bhf's driver",
+            "engine = \"binary\" and input-mode = \"file\"",
+            "--target LLVMFuzzerTestOneInput",
+        ] {
+            assert!(error.contains(needle), "missing {needle:?} in: {error}");
+        }
+        let afl = LoweredLaunch::Native(native(PpNativeEngine::AflPlusPlus));
+        assert!(check_native_binary("parse-record", &afl, &binary).is_ok());
+        let plain = LoweredLaunch::Binary(binary_launch());
+        assert!(check_native_binary("parse-record", &plain, &binary).is_ok());
+
+        let driver = tmp.path().join("driver");
+        bytes.extend_from_slice(b"BHF_FRAMED\0");
+        std::fs::write(&driver, &bytes).unwrap();
+        assert!(check_native_binary("parse-record", &builtin, &driver).is_ok());
+        let missing = tmp.path().join("missing");
+        assert!(check_native_binary("parse-record", &builtin, &missing).is_ok());
     }
 
     #[test]

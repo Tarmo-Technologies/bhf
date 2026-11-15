@@ -244,6 +244,8 @@ from a harness directory bhf generated.
 - Do not link your harness with `-fsanitize=fuzzer` and give it to
   `bhf fuzz`. bhf runs such a binary on one input file per process, without
   coverage guidance; the coverage-guided driver is the generated `main`.
+  A `bhf.project.v1` target with `engine = "builtin"` refuses such a binary;
+  give it `engine = "binary"` and `input-mode = "file"` instead.
   `make libfuzzer` in the harness directory builds a separate libFuzzer binary
   for other fuzzers; see the harness's `PORTABILITY.md`.
 - `CXXFLAGS` and `CFLAGS` add flags to the `main` build, after the

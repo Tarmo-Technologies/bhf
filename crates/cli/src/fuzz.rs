@@ -2075,6 +2075,11 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
             return 3;
         }
     };
+    // Each worker's stderr goes to its own log, so what a single-worker run
+    // says about the harness is said here, once.
+    for note in multicore_harness_notes(&args, &harness_path) {
+        bhfeprintln!("note: {note}");
+    }
     let (harness_dirs, harness_executable) =
         worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
     if let Err(error) = worker_seed_files(&mut args, &harness_path) {
@@ -2205,6 +2210,19 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
             }
         }
     }
+}
+
+/// The notes a single-worker run prints about its harness that a
+/// multi-worker campaign prints once for all workers: that a builtin-engine
+/// harness is a libFuzzer binary without bhf's driver.
+fn multicore_harness_notes(args: &FuzzArgs, harness: &Path) -> Vec<String> {
+    if args.engine != FuzzEngine::Builtin {
+        return Vec::new();
+    }
+    let detection = crate::protocol_detect::detect(harness, &[&args.work_dir]);
+    libfuzzer_binary_note(&detection, harness)
+        .into_iter()
+        .collect()
 }
 
 /// What a multi-worker `bhf fuzz` prints: the campaign summary plus what the
@@ -13337,6 +13355,29 @@ exit 0
             resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
             HarnessProtocol::LibFuzzerSingleInput
         );
+    }
+
+    /// A multi-worker campaign's parent prints the libFuzzer-binary note
+    /// itself (its workers' stderr goes to their logs), for the builtin
+    /// engine only, which is the one that runs such a binary on one input.
+    #[test]
+    fn a_multicore_campaign_notes_a_libfuzzer_binary_once() {
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let dir = args.work_dir.join("build/H-X");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, binary_with(b"libFuzzer ignores flags\0")).unwrap();
+        let notes = multicore_harness_notes(&args, &binary);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("--target LLVMFuzzerTestOneInput"),
+            "{notes:?}"
+        );
+        args.engine = FuzzEngine::AflPlusPlus;
+        assert!(multicore_harness_notes(&args, &binary).is_empty());
+        args.engine = FuzzEngine::Builtin;
+        fs::write(&binary, binary_with(b"BHF_FRAMED\0")).unwrap();
+        assert!(multicore_harness_notes(&args, &binary).is_empty());
     }
 
     /// The operator is told why a libFuzzer binary gets no coverage and how to

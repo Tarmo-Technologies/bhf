@@ -179,6 +179,124 @@ seeds = ["corpus/ghost"]
     assert!(stderr.contains("asset not found"), "stderr: {stderr}");
 }
 
+/// An ELF-looking binary carrying the libFuzzer runtime's flag message, as a
+/// `-fsanitize=fuzzer` build does, with `extra` strings beside it.
+fn libfuzzer_binary(extra: &[u8]) -> Vec<u8> {
+    let mut bytes = b"\x7fELF\x02\x01\x01\0".to_vec();
+    bytes.resize(8192, 0);
+    bytes.extend_from_slice(extra);
+    bytes.extend_from_slice(b"INFO: libFuzzer ignores flags that start with '--'\0");
+    bytes.extend_from_slice(&[0u8; 64]);
+    bytes
+}
+
+fn write_libfuzzer_project(dir: &Path, engine_lines: &str, binary: &[u8]) -> PathBuf {
+    fs::create_dir_all(dir.join("prebuilt")).unwrap();
+    fs::create_dir_all(dir.join("corpus")).unwrap();
+    fs::write(dir.join("corpus/seed"), b"hello").unwrap();
+    fs::write(dir.join("prebuilt/parse_record"), binary).unwrap();
+    make_executable(&dir.join("prebuilt/parse_record"));
+    let manifest = dir.join("manifest.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"schema = "bhf.project.v1"
+[project]
+id = "p"
+version = "1"
+[[target]]
+id = "parse-record"
+{engine_lines}
+binary = "prebuilt/parse_record"
+seeds = ["corpus"]
+"#
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+/// A `-fsanitize=fuzzer` binary without bhf's driver cannot run on the
+/// builtin engine (driven framed, libFuzzer runs its own loop inside each
+/// execution, with no coverage and no finding bhf can record): validate and
+/// run refuse it, naming `engine = "binary"` and the passthrough wrap, and
+/// run stages and fuzzes nothing.
+#[test]
+fn project_validate_and_run_refuse_a_libfuzzer_binary_on_the_builtin_engine() {
+    let dir = temp_dir("libfuzzer-builtin");
+    let manifest = write_libfuzzer_project(&dir, r#"engine = "builtin""#, &libfuzzer_binary(b""));
+    let assert_refused = |out: &std::process::Output| {
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for needle in [
+            "target 'parse-record'",
+            "libFuzzer (-fsanitize=fuzzer) binary without bhf's driver",
+            r#"engine = "binary""#,
+            r#"input-mode = "file""#,
+            "bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput",
+        ] {
+            assert!(stderr.contains(needle), "missing {needle:?} in: {stderr}");
+        }
+    };
+    for json in [false, true] {
+        let mut validate = bhf();
+        validate
+            .args(["project", "validate", "--manifest"])
+            .arg(&manifest);
+        if json {
+            validate.arg("--json");
+        }
+        assert_refused(&validate.output().expect("run validate"));
+    }
+    let work = dir.join("work");
+    let out = bhf()
+        .args([
+            "project",
+            "run",
+            "--skip-build",
+            "--target",
+            "parse-record",
+            "--manifest",
+        ])
+        .arg(&manifest)
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run project run");
+    assert_refused(&out);
+    assert!(!work.join("build/parse-record").exists(), "nothing staged");
+    assert!(!work.join("fuzz_scratch").exists(), "nothing fuzzed");
+    assert!(!work.join("results/project.json").exists());
+
+    // bhf's driver linked with the libFuzzer runtime is a bhf harness.
+    let driver = temp_dir("libfuzzer-driver");
+    let manifest = write_libfuzzer_project(
+        &driver,
+        r#"engine = "builtin""#,
+        &libfuzzer_binary(b"BHF_FRAMED\0"),
+    );
+    let out = bhf()
+        .args(["project", "validate", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("run validate");
+    assert!(out.status.success(), "{out:?}");
+
+    // The pointer is a working one: the binary lane takes the same binary.
+    let plain = temp_dir("libfuzzer-binary-lane");
+    let manifest = write_libfuzzer_project(
+        &plain,
+        "engine = \"binary\"\ninput-mode = \"file\"",
+        &libfuzzer_binary(b""),
+    );
+    let out = bhf()
+        .args(["project", "validate", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .expect("run validate");
+    assert!(out.status.success(), "{out:?}");
+}
+
 #[test]
 fn project_validate_rejects_parent_escape_path() {
     let dir = temp_dir("validate-escape");

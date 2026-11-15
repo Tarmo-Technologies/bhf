@@ -70,6 +70,15 @@
   `--json` gains `exceptions` (an additive `bhf.replay.v1` field),
   and every `replay.log` also holds the summary's crash, difference and
   detail lines.
+- A `bhf.project.v1` target with `engine = "builtin"` whose binary is a
+  `-fsanitize=fuzzer` build without bhf's driver was run framed: libFuzzer ran
+  its own loop inside each execution, with no coverage, and its crashes went
+  unrecorded. `bhf project validate` and `run` now refuse it, naming
+  `engine = "binary"` with `input-mode = "file"` and the
+  `bhf generate-harness --target LLVMFuzzerTestOneInput` wrap, and the
+  libFuzzer runtime in a binary without bhf's driver outranks a declared
+  `framed` input mode. `bhf fuzz --workers N` prints the libFuzzer-binary
+  note once on the terminal, not only in each worker's stderr log.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

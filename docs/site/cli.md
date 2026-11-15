@@ -650,7 +650,8 @@ MATCH
   [Cross-compilation](cross-compilation.md#qemu-user-replay).
 - **Protocol.** `bhf fuzz`, `bhf replay` and `bhf minimize` decide how a
   harness takes its input the same way: a `harness-protocol.json` next to the
-  binary (written by `bhf project run`), the `BHF_FRAMED` marker in a launcher
+  binary (written by `bhf project run`; a libFuzzer binary without bhf's
+  driver is not framed whatever it declares), the `BHF_FRAMED` marker in a launcher
   script, the libFuzzer runtime in a binary without bhf's driver (which
   decides it before any source beside the binary), a bhf `main.c`/`main.cpp`
   beside the binary or in any harness dir of the work dir, bhf's driver
@@ -1285,7 +1286,9 @@ binary for other fuzzers). A binary you compiled yourself with
 `-fsanitize=fuzzer` and placed at `build/<id>/main` is recognised by the
 libFuzzer runtime in it and run on one input file per process, so a crash it
 finds is recorded with the input that caused it. It gets no coverage guidance
-without bhf's runtime, and `bhf fuzz` says so: wrap the fuzz target with
+without bhf's runtime, and `bhf fuzz` says so (once, also for a
+`--workers` campaign, whose workers' own stderr goes to their logs): wrap the
+fuzz target with
 `bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput`, build
 that harness and fuzz it instead. The standalone libFuzzer/LibAFL/Nyx adapters
 are not reachable through `bhf fuzz --engine`, and the Ada libFuzzer adapter
@@ -1613,7 +1616,12 @@ stable target ids, so a private campaign is reproducible without vendoring it
 into bhf. A `builtin` or `afl++` target's `binary` must be a bhf harness binary,
 built from a harness directory bhf generated (for C/C++, its `make main` or
 `make afl`), because `bhf fuzz` drives it through bhf's harness protocol and
-coverage map. Any other executable belongs on `engine = "binary"`. `run`
+coverage map. Any other executable belongs on `engine = "binary"`; `validate`
+and `run` refuse a `builtin` target whose binary is a `-fsanitize=fuzzer` build
+without bhf's driver (libFuzzer would run its own fuzzing loop inside every
+execution), and name the two ways to run it: `engine = "binary"` with
+`input-mode = "file"`, or wrapping the fuzz target with
+`bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput`. `run`
 reuses the existing engines — `builtin`/`afl++` go through the
 `bhf fuzz` lane, `binary` through the `bhf binary fuzz` lane — and adds no new
 execution path.
@@ -1642,7 +1650,9 @@ validation/provenance report on any of the three subcommands.
 `<work>/build/<id>/main` with a `harness-protocol.json` beside it declaring the
 target's input mode (`framed`). `bhf fuzz` (and later `bhf replay` and
 `bhf minimize`) use it instead of re-detecting the protocol from the binary, so
-a prebuilt bhf harness gets the framed protocol and its coverage map.
+a prebuilt bhf harness gets the framed protocol and its coverage map. The
+libFuzzer runtime in a binary without bhf's driver outranks a declared
+`framed`: such a binary is run on one input file per process.
 
 **Trust boundary.** The manifest is only ever loaded through an explicit
 `--manifest` path — there is no auto-discovery. `validate` and `list` never

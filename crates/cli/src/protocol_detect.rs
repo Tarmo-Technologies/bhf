@@ -6,7 +6,8 @@
 //! The evidence, strongest first:
 //!
 //! 1. a declared input mode in a `harness-protocol.json` sidecar next to the
-//!    binary (written by `bhf project run` from a `bhf.project.v1` target);
+//!    binary (written by `bhf project run` from a `bhf.project.v1` target),
+//!    unless the binary is a libFuzzer one without bhf's driver (3);
 //! 2. the `BHF_FRAMED` marker in a launcher script that is the harness itself;
 //! 3. the libFuzzer runtime's messages in a binary without bhf's driver
 //!    (`BHF_FRAMED`): a libFuzzer target, whatever source sits beside it;
@@ -177,7 +178,9 @@ pub(crate) fn detect(harness: &Path, work_dirs: &[&Path]) -> Detection {
         markers
     };
     if let Some(mode) = declared_input_mode(harness) {
-        if mode == "framed" {
+        // A declaration cannot make a libFuzzer binary without bhf's driver
+        // speak the framed protocol; the libFuzzer branch below decides it.
+        if mode == "framed" && !libfuzzer_without_bhf_driver(harness) {
             let protocol = if embedded().ada_runtime() {
                 HarnessProtocol::StdinEventLog
             } else {
@@ -245,6 +248,15 @@ pub(crate) fn detect(harness: &Path, work_dirs: &[&Path]) -> Detection {
             ProtocolBasis::Default
         },
     }
+}
+
+/// Whether `binary` carries the libFuzzer runtime and not bhf's driver (no
+/// `BHF_FRAMED`): a `-fsanitize=fuzzer` build of a fuzz target, which runs
+/// its own fuzzing loop when started without an input file and cannot speak
+/// the framed protocol, whatever is declared for it.
+pub(crate) fn libfuzzer_without_bhf_driver(binary: &Path) -> bool {
+    let markers = embedded_markers(binary);
+    markers.libfuzzer && !markers.framed
 }
 
 /// Whether `harness` is known to speak the framed fork-server protocol: bhf's
@@ -575,8 +587,12 @@ mod tests {
         );
     }
 
+    /// A declared framed mode cannot make a libFuzzer binary without bhf's
+    /// driver speak the framed protocol: run framed, libFuzzer runs its own
+    /// fuzzing loop inside each execution. The binary's runtime outranks the
+    /// declaration; bhf's driver linked with the libFuzzer runtime keeps it.
     #[test]
-    fn a_declared_framed_mode_wins_over_a_libfuzzer_binary() {
+    fn a_libfuzzer_binary_without_the_driver_outranks_a_declared_framed_mode() {
         let work = tempfile::tempdir().unwrap();
         let dir = work.path().join("build/H-X");
         let harness = binary(
@@ -587,6 +603,20 @@ mod tests {
             ),
         );
         write_declared_input_mode(&dir, "framed", "bhf.project.v1 manifest").unwrap();
+        assert!(libfuzzer_without_bhf_driver(&harness));
+        let detection = detect(&harness, &[work.path()]);
+        assert_eq!(detection.protocol, HarnessProtocol::LibFuzzerSingleInput);
+        assert_eq!(detection.basis, ProtocolBasis::LibFuzzerBinary);
+
+        fs::write(
+            &harness,
+            padded(
+                b"BHF_FRAMED\0INFO: libFuzzer ignores flags that start with '--'\0",
+                9000,
+            ),
+        )
+        .unwrap();
+        assert!(!libfuzzer_without_bhf_driver(&harness));
         let detection = detect(&harness, &[work.path()]);
         assert_eq!(detection.protocol, HarnessProtocol::BhfFramed);
         assert_eq!(

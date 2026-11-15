@@ -393,6 +393,59 @@ fn fuzz_process(work_dir: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
     (output.status.code(), json, stderr)
 }
 
+/// A stand-in for a `-fsanitize=fuzzer` binary without bhf's driver: it
+/// carries the libFuzzer runtime's flag message and runs the one input file
+/// it is given.
+#[cfg(unix)]
+fn install_libfuzzer_binary(work_dir: &Path, harness_id: &str) -> PathBuf {
+    let target = work_dir.join("build").join(harness_id).join("main");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "#!/bin/sh\n# INFO: libFuzzer ignores flags that start with '--'\ncat \"$1\" >/dev/null\n",
+    )
+    .unwrap();
+    make_executable(&target);
+    target
+}
+
+/// The note that a libFuzzer binary runs without coverage, and how to wrap
+/// it, reaches the terminal once for a multi-worker campaign too, not only
+/// each worker's stderr log.
+#[cfg(unix)]
+#[test]
+fn a_multi_worker_campaign_prints_the_libfuzzer_binary_note_once() {
+    const NOTE: &str = "is a libFuzzer (-fsanitize=fuzzer) binary without bhf's driver";
+    for workers in ["1", "2"] {
+        let temp = temp_dir(&format!("libfuzzer-note-{workers}"));
+        let work_dir = temp.join("bhf_work");
+        install_libfuzzer_binary(&work_dir, "H-LF");
+        let (code, _, stderr) = fuzz_process(
+            &work_dir,
+            &[
+                "--harness",
+                "H-LF",
+                "--iterations",
+                "2",
+                "--seed-input",
+                "hello",
+                "--workers",
+                workers,
+            ],
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(
+            stderr.matches(NOTE).count(),
+            1,
+            "--workers {workers}: {stderr}"
+        );
+        assert!(
+            stderr.contains("--target LLVMFuzzerTestOneInput"),
+            "{stderr}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn fuzz_workers_find_an_auto_layout_harness() {
