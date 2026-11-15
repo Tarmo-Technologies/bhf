@@ -2588,6 +2588,7 @@ fn ambient_cflags_and_cxxflags_add_to_the_harness_flags() {
 
 /// What a sanitizer runtime prints when it cannot start on the host (GCC's
 /// ThreadSanitizer under a kernel's high-entropy ASLR).
+#[cfg(unix)]
 const RUNTIME_START_FAILURE: &str =
     "FATAL: ThreadSanitizer: unexpected memory mapping 0x7f0000000000-0x7f0000001000";
 
@@ -2638,6 +2639,7 @@ fn wrapper_whose_programs_fail_at_startup(dir: &Path, name: &str, real: &str) ->
 }
 
 /// The sanitizer logs of every finding `work` recorded.
+#[cfg(unix)]
 fn finding_logs(work: &Path) -> Vec<String> {
     std::fs::read_dir(work.join("results/findings"))
         .into_iter()
