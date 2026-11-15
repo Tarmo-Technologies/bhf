@@ -419,6 +419,7 @@ it did not reach. The per-type rules are:
 | enum with N named members | 4 | a 32-bit read modulo N picks the member, in declaration order |
 | enum with no named members | 4 | a 32-bit read modulo 256 |
 | `channels`, `req_comps` and other channel counts | 4 | a 32-bit read modulo 9 |
+| integer named `flags`, `flag`, `flg`, `cflags`, `eflags`, `mode`, `modes`, `options`, `option`, `opts` or ending in `_flags`, `_flag`, `_mode`, `_options`, `_opts`, or whose type is named `flag`, `flags` or ends in `_flag`, `_flags`, `_flag_t`, `_flags_t` | 0 | pinned to 0, the default mode: such a value selects a variant or a dispatch, and a fuzzed one trips reserved bits no real caller sets |
 | `const char *` | 2 + L | a 16-bit length prefix, then L bytes (at most 4096 and at most what is left) in a heap copy of L + 1 bytes ending in NUL |
 | `char *` (writable) | up to 4096 | a fixed 4097-byte heap buffer holding the next 4096 bytes (or what is left), no prefix |
 | `fmt`, `format` and the last `char *` of a variadic function | 2 + L | as `const char *`, with every `%` replaced by a space |
@@ -469,8 +470,9 @@ same read is reported there as `use-after-poison`.
 
 So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
 bytes 4-7 and `data` the bytes from 8 on, and for
-`g(const char *buf, size_t len, int flags)`, `flags` is bytes 0-3 and the pair
-the rest. No input byte feeds two parameters of one call. A seed (a sample
+`g(const char *buf, size_t len, int depth)`, `depth` is bytes 0-3 and the pair
+the rest; with `int flags` in place of `depth`, `flags` is pinned to 0 and the
+pair is the whole input. No input byte feeds two parameters of one call. A seed (a sample
 file of the buffer's format) is therefore also given behind as many zero
 bytes as the fixed-width parameters before the buffer take, 8 for `f`, so the
 buffer starts with it (see [Seeds](auto.md#seeds)).
