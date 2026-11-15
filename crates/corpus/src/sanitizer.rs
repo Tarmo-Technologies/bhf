@@ -1059,8 +1059,9 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         "double-free" | "free" => "BHF-204",
         // A SEGV is a NULL dereference (BHF-206) only when it faults in the
         // first page; anything else is a wild pointer (BHF-223). Decided below,
-        // once the address and ASan's hint about it are parsed.
-        "SEGV" => "BHF-223",
+        // once the address and ASan's hint about it are parsed. Windows ASan
+        // names the same fault by its exception (see `is_memory_fault_kind`).
+        kind if is_memory_fault_kind(kind) => "BHF-223",
         // Global / static buffers and intra-object are all "OOB writes/reads"
         // at the rule-catalog level - one heuristic, same CWE-787.
         "global-buffer-overflow"
@@ -1108,11 +1109,12 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
     };
     let stacks = split_asan_stacks(rest);
     let access = memory_access(rest, line, stacks.alloc, stacks.free);
-    let rule_id = if kind == "SEGV" && access.as_deref().is_some_and(faults_in_null_page) {
-        "BHF-206"
-    } else {
-        rule_id
-    };
+    let rule_id =
+        if is_memory_fault_kind(&kind) && access.as_deref().is_some_and(faults_in_null_page) {
+            "BHF-206"
+        } else {
+            rule_id
+        };
     Some(SanitizerReport {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
@@ -1477,6 +1479,15 @@ fn memory_access(
 /// field or element offset.
 const NULL_PAGE_LIMIT: u64 = 0x1000;
 
+/// Whether an ASan report kind is a deadly memory-access signal: `SEGV` on
+/// POSIX, and on Windows, where ASan names the exception instead of a signal,
+/// `access-violation` and `in-page-error` (`EXCEPTION_ACCESS_VIOLATION`,
+/// `EXCEPTION_IN_PAGE_ERROR`). ASan reports each as `<kind> on unknown
+/// address`, with the access direction and its zero-page hint.
+pub fn is_memory_fault_kind(kind: &str) -> bool {
+    matches!(kind, "SEGV" | "access-violation" | "in-page-error")
+}
+
 /// Whether a SEGV faulted in the first memory page (a NULL dereference), by
 /// ASan's `zero page` hint or by the faulting address itself.
 fn faults_in_null_page(access: &MemoryAccess) -> bool {
@@ -1495,8 +1506,9 @@ fn faults_in_null_page(access: &MemoryAccess) -> bool {
 
 /// The rule an earlier bhf release recorded for this report, where it differs
 /// from today's. Earlier releases classified a UBSan report by five shapes of
-/// the text after `runtime error:` ([`earlier_ubsan_rule`]) and gave every
-/// ASan SEGV BHF-206. `None` when the rule did not change.
+/// the text after `runtime error:` ([`earlier_ubsan_rule`]), gave every ASan
+/// SEGV BHF-206, and gave a Windows ASan access violation or in-page error the
+/// catch-all heap-overflow rule BHF-201. `None` when the rule did not change.
 pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
     let legacy = match report.sanitizer {
         Some(Sanitizer::UndefinedBehaviorSanitizer) => {
@@ -1507,6 +1519,7 @@ pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
             earlier_ubsan_rule(after)
         }
         Some(Sanitizer::AddressSanitizer) if report.kind == "SEGV" => "BHF-206",
+        Some(Sanitizer::AddressSanitizer) if is_memory_fault_kind(&report.kind) => "BHF-201",
         _ => return None,
     };
     (legacy != report.rule_id).then_some(legacy)
@@ -3041,6 +3054,84 @@ SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:
         let access = zeroed.access.unwrap();
         assert_eq!(access.direction, AccessDirection::Unknown);
         assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
+    }
+
+    /// A deadly memory-access signal as ASan reports it on Windows
+    /// (`access-violation`, `in-page-error`), in the form compiler-rt prints
+    /// it there.
+    fn windows_fault(kind: &str, address: &str, direction: &str, hint: &str) -> SanitizerReport {
+        parse_sanitizer_report(&format!(
+            "==4242==ERROR: AddressSanitizer: {kind} on unknown address {address} \
+             (pc 0x7ff6a1b21234 bp 0x00a1b2c3d4e0 sp 0x00a1b2c3d4a0 T0)\n\
+             ==4242==The signal is caused by a {direction} memory access.\n\
+             {hint}\
+             \x20   #0 0x7ff6a1b21234 in store_word C:\\src\\widget\\obj.c:18\n\
+             \x20   #1 0x7ff6a1b25678 in bhf_run_one C:\\work\\harnesses\\H-1\\main.c:9\n\n\
+             SUMMARY: AddressSanitizer: {kind} C:\\src\\widget\\obj.c:18 in store_word\n\
+             ==4242==ABORTING\n"
+        ))
+        .unwrap()
+    }
+
+    /// Windows ASan names a deadly memory-access signal by its exception
+    /// (`access-violation`, `in-page-error`) where Linux prints `SEGV`. It is
+    /// the same fault: a NULL dereference in the first page, a wild pointer
+    /// elsewhere, never a heap buffer overflow.
+    #[test]
+    fn windows_access_faults_are_split_like_a_segv() {
+        let zero_page = "==4242==Hint: address points to the zero page.\n";
+        let null = windows_fault("access-violation", "0x000000000000", "WRITE", zero_page);
+        assert_eq!(
+            (null.kind.as_str(), null.rule_id),
+            ("access-violation", "BHF-206")
+        );
+        let access = null.access.as_deref().unwrap();
+        assert_eq!(access.direction, AccessDirection::Write);
+        assert_eq!(access.address_hint.as_deref(), Some("zero-page"));
+        assert_eq!(access.address.as_deref(), Some("0x000000000000"));
+        assert_eq!(null.stack[0].function, "store_word");
+        // A sub-page address with no hint is in the null page too.
+        assert_eq!(
+            windows_fault("access-violation", "0x000000000010", "READ", "").rule_id,
+            "BHF-206"
+        );
+        let wild = windows_fault("access-violation", "0x7f0000001000", "WRITE", "");
+        assert_eq!(wild.rule_id, "BHF-223");
+        assert_eq!(
+            wild.access.as_deref().unwrap().direction,
+            AccessDirection::Write
+        );
+        let high = windows_fault(
+            "access-violation",
+            "0x000000000000",
+            "READ",
+            "==4242==Hint: this fault was caused by a dereference of a high value address \
+             (see register values below).\n",
+        );
+        assert_eq!(high.rule_id, "BHF-223");
+        let paged = windows_fault("in-page-error", "0x7f0000001000", "READ", "");
+        assert_eq!(
+            (paged.kind.as_str(), paged.rule_id),
+            ("in-page-error", "BHF-223")
+        );
+        assert_eq!(
+            windows_fault("in-page-error", "0x000000000008", "READ", zero_page).rule_id,
+            "BHF-206"
+        );
+
+        // Earlier releases recorded these with the catch-all heap-overflow
+        // rule; a replay of such a finding still matches.
+        for report in [&null, &wild, &paged] {
+            assert_eq!(
+                legacy_rule_id(report),
+                Some("BHF-201"),
+                "{}",
+                report.message
+            );
+            assert!(rule_matches("BHF-201", report), "{}", report.message);
+            assert!(rule_matches(report.rule_id, report));
+            assert!(!rule_matches("BHF-202", report));
+        }
     }
 
     /// The rule an earlier release recorded for the same report, so a replay

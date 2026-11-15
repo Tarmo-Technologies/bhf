@@ -1143,6 +1143,11 @@
 - A SEGV's direction is ASan's READ/WRITE token. An unknown direction, or a
   non-canonical high address, is CWE-119 instead of an assumed write
   (CWE-787).
+- Windows: an ASan `access-violation` or `in-page-error` report is split like
+  a SEGV, BHF-206 in the first memory page and BHF-223 elsewhere, instead of
+  reporting under the heap-buffer-overflow rule BHF-201 (in SARIF `ruleId`
+  and the `bhf explain` header). `bhf replay` still matches findings recorded
+  under BHF-201.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer

@@ -3155,7 +3155,15 @@ fn classify_bug(raw: &Value) -> BugClass {
     {
         return BugClass::UncaughtException;
     }
-    if has("segv") || has("sigsegv") || has("segmentation") || has("access-violation") {
+    // Windows ASan names the deadly memory-access signal by its exception:
+    // `access-violation`, or `in-page-error` for a mapped page that could not
+    // be read in.
+    if has("segv")
+        || has("sigsegv")
+        || has("segmentation")
+        || has("access-violation")
+        || has("in-page-error")
+    {
         // The parser already split SEGVs into NULL (BHF-206) and wild-address
         // (BHF-223) rules; a wild-address rule is never a NULL dereference.
         if rule_id == "BHF-223" {

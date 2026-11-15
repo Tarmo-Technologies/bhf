@@ -168,7 +168,10 @@ wild or corrupted pointer, BHF-223: CWE-125 for a READ, CWE-787 for a WRITE,
 and CWE-119 when ASan reports no direction or the address is a non-canonical
 "high value address", for which ASan prints READ whatever the access was. The
 direction is ASan's `READ`/`WRITE` token, recorded as
-`exception.access.direction`.
+`exception.access.direction`. On Windows, ASan names the fault by its
+exception instead (`access-violation on unknown address`, or `in-page-error`
+for a mapped page that could not be read in); bhf treats both as a SEGV, with
+the same rules and CWEs.
 
 The SARIF result's `properties.cwe` is the finding's CWE (the first of
 `properties.cwes`); the rule entry keeps its catalog CWE. `bhf replay` still
@@ -178,7 +181,8 @@ overflow, division by zero and any "cannot be represented in type" report
 (a left shift included) were BHF-205, the load, store, member-access,
 reference-binding and NULL-argument or NULL-return reports BHF-206, an array
 index BHF-201, and every other check (a member call on NULL included)
-BHF-210. Every ASan SEGV was BHF-206.
+BHF-210. Every ASan SEGV was BHF-206, and a Windows access violation or
+in-page error BHF-201.
 
 ## How a sanitizer finding is identified
 

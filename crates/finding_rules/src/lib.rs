@@ -675,7 +675,7 @@ pub const RULES: &[Rule] = &[
         id: "BHF-223",
         slug: "bhf.c/wild-pointer-dereference",
         name: "Invalid memory access (SEGV on a non-null address)",
-        description: "AddressSanitizer reported a segmentation fault on an address outside the first memory page: a wild, corrupted or uninitialized pointer, or an out-of-range offset from a valid one, rather than a NULL dereference (BHF-206). When ASan states the access direction the finding carries the out-of-bounds read or write CWE; a non-canonical high address faults before the direction is known, and the finding then carries CWE-119.",
+        description: "AddressSanitizer reported a segmentation fault (on Windows, an access violation or in-page error) on an address outside the first memory page: a wild, corrupted or uninitialized pointer, or an out-of-range offset from a valid one, rather than a NULL dereference (BHF-206). When ASan states the access direction the finding carries the out-of-bounds read or write CWE; a non-canonical high address faults before the direction is known, and the finding then carries CWE-119.",
         cwe: "CWE-119",
         cwe_top_25: Some(20),
         default_severity: Severity::High,

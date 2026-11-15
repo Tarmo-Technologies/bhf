@@ -675,6 +675,53 @@ fn wild_address_segv_is_not_a_null_dereference() {
     );
 }
 
+/// Windows ASan names a deadly memory-access signal by its exception
+/// (`access-violation`, `in-page-error`); each is classified like a SEGV.
+#[test]
+fn windows_access_faults_are_classified_like_a_segv() {
+    let fault = |rule: &str, name: &str, kind: &str, address: &str, access: serde_json::Value| {
+        let mut raw = segv_record(
+            rule,
+            &format!(
+                "ERROR: AddressSanitizer: {kind} on unknown address {address} (pc 0x1 bp 0x2 sp \
+                 0x3 T0) (READ memory access)"
+            ),
+            Some(access),
+        );
+        raw["exception"]["name"] = json!(name);
+        backfill_actionability(RunMode::Reporting, &raw, None)
+    };
+    for (name, kind) in [
+        ("ASAN_ACCESS_VIOLATION", "access-violation"),
+        ("ASAN_IN_PAGE_ERROR", "in-page-error"),
+    ] {
+        let wild = fault(
+            "BHF-223",
+            name,
+            kind,
+            "0x7f0000001000",
+            json!({"direction": "read", "address": "0x7f0000001000"}),
+        );
+        assert_eq!(wild.cwe, ["CWE-125"], "{kind}");
+        assert!(
+            wild.explanation
+                .as_deref()
+                .is_some_and(|text| text.contains("invalid-memory access")),
+            "{kind}: {:?}",
+            wild.explanation
+        );
+        let null = fault(
+            "BHF-206",
+            name,
+            kind,
+            "0x000000000000",
+            json!({"direction": "read", "address": "0x000000000000",
+                   "address_hint": "zero-page"}),
+        );
+        assert_eq!(null.cwe, ["CWE-476"], "{kind}");
+    }
+}
+
 /// The reachability of an event-driven entry says what the call-graph scan
 /// matched: the registrar a handler is passed to, or the channel a consumer
 /// reads, and that the match was not recorded for an older finding.
