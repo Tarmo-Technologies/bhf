@@ -528,6 +528,7 @@ C / C++ (`crates/c_stub_gen`):
 | `MissingType{name}` | `typedef void *T;` appended to `<harness>/repairs/auto_types.h` |
 | `UndefinedSymbol{name}` | Looked up in the declaration index. Match → declared stub. No match → blind `void(void)` stub. Appended to `<harness>/repairs/auto_stubs.c`. A name of a compiler or sanitizer runtime (`__asan_*`, `__llvm_profile_*`, `__cxa_*`, `__stack_chk_fail`) is never stubbed, nor, on a link against the Windows C runtime, a name of that runtime or MinGW's (`_dup`, `__mingw_fprintf`, `__main`, `__chkstk`): only the tree's own definition of it is linked, otherwise the build fails with the linker's error, since such a reference means a runtime library is missing or objects of two toolchains were mixed. Off Windows, `_write` and `_read` (a newlib port's syscall hooks) are ordinary symbols |
 | `MissingSharedLib{name}` | Not auto-repaired. Flows to `needed_for_build.missing_libraries` and the `missing-deps` manifest; the target is marked `unrecoverable_link` |
+| Standard-library names used without `std::` (`unknown type name 'string'`, `no template named 'map'`, g++'s `'map' does not name a type`) | The std prelude `bhf build` writes, `<harness>/std_prelude.h`, force-included into every translation unit; see below |
 | `ConfigGuardError{file,line}` | A `#error` a build-config guard reached (libssh's `#error "no strtoull function found"`). The conditional owning the `#error` is read and the macro it tests is `#define`d into `auto_defines.h`, with the value the guard requires (`#if (DEPTH != 8)` → `8`, a plain feature test → `1`). An undecidable guard — a comparison, a compound condition, or an error that fires *because* a macro is defined — is refused rather than guessed |
 
 Ada (`crates/stub_gen`):
@@ -539,6 +540,38 @@ Ada (`crates/stub_gen`):
 | `"X.Y" is not visible` | `Visibility` stub |
 | `missing body for unit "X"` | Empty `PackageBody` |
 | `cannot find "X.gpr"` | Not auto-repaired; flows to `needed_for_build.missing_gpr_imports` |
+
+A pre-standard C++ header often writes `string`, `map<string, int>` or
+`list<T>` without `std::`, relying on a `using namespace std;` that the
+project's own sources put before including it; the generated harness has
+none. When a C++ harness build fails on such names, before the other retries
+(the dialect ladder, the other compiler) the build writes the prelude
+`bhf build` writes, `<harness>/std_prelude.h` (each name's standard header
+and a `using std::` declaration for it; an existing file only gains the
+lines it lacks), force-includes it into every translation unit of the
+harness through `<harness>/repairs/auto_std_prelude.h`, and builds again.
+clang++ stops after 20 errors, so a long header can hide names behind the
+first ones: while a rebuild reports names the prelude lacks, they are added
+and the harness is rebuilt. Each pass adds at least one standard name, so
+this ends. The build prints one note naming the types (``bhf auto: <id>: the
+sources use string, map, ... without `std::` ...``), and a later round that
+reports more names adds them to the same file. The rules are `bhf build`'s
+(see [Custom harnesses](custom-harness.md#headers-that-rely-on-using-namespace-std)):
+diagnostics in C code get no prelude, and a stream object alone (`cerr`)
+keeps the stream-header repair. A name the scanned tree declares as a C++
+type of its own is never declared from `std`: a class, struct, enum or
+typedef in a C++ source or header, or in a `.h` header that C++ code
+includes. Where the source writes the name as a template (`list<string>`,
+`no template named 'list'`), only a class template of the tree's own counts.
+A C struct of the same name, in a `.c` source or in a header only C sources
+include, never does. The repair is recorded among the target's repairs as
+`std_prelude` (`path`, `names`, `headers`) in `run.json`, and
+`targets[].real_headers_included` and `run.md` list it; every lane's build
+and the target's capsule force-include it too. If the build still fails on
+standard names used without `std::`, whether the prelude declares them or
+not, their `missing-deps` entries say so and name the prelude (or, when the
+build wrote none, the declarations to force-include), and they are not
+listed as harness/codegen errors.
 
 The declaration index is built once per `auto` run before the attempt loop
 and held in memory across all targets.

@@ -1925,20 +1925,22 @@ fn shell_text(text: &str) -> String {
 
 /// The prelude header a failed C++ harness build writes into the harness
 /// directory for standard-library names the sources use without `std::`.
-const STD_PRELUDE_HEADER: &str = "std_prelude.h";
+/// `bhf build` writes it and prints the command that force-includes it;
+/// `bhf auto` writes the same file and force-includes it itself.
+pub(crate) const STD_PRELUDE_HEADER: &str = "std_prelude.h";
 
 /// A prelude header [`write_std_prelude`] wrote or extended.
-struct StdPrelude {
+pub(crate) struct StdPrelude {
     /// Resolved, as shown in the suggested command.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// The standard headers it includes, sorted.
-    headers: Vec<String>,
+    pub(crate) headers: Vec<String>,
     /// What this build did to the file.
-    change: PreludeChange,
+    pub(crate) change: PreludeChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreludeChange {
+pub(crate) enum PreludeChange {
     Created,
     Extended,
     Unchanged,
@@ -1951,9 +1953,10 @@ enum PreludeChange {
 fn std_prelude_text(names: &[(String, &'static str)]) -> String {
     let (headers, sorted) = std_prelude_lines(names);
     let mut text = String::from(
-        "/* Written by `bhf build`: standard-library names this project's sources use\n \
-         * without `std::`, relying on a `using namespace std;` that is not in effect\n \
-         * everywhere they are compiled. Force-include it into every translation unit:\n \
+        "/* Written by bhf: standard-library names this project's sources use without\n \
+         * `std::`, relying on a `using namespace std;` that is not in effect\n \
+         * everywhere they are compiled. `bhf auto` force-includes it into every\n \
+         * translation unit of this harness; for `bhf build`, pass\n \
          * AUTO_EXTRA_INCLUDES='-include <this file>'. A later failed build adds the\n \
          * names it reports and keeps every other line. Delete a `using` line whose\n \
          * name a project source declares itself. */\n\
@@ -2125,7 +2128,7 @@ fn extend_std_prelude(text: &str, names: &[(String, &'static str)]) -> String {
 /// ones it lacks to the file an earlier build wrote (and the operator may
 /// have edited), keeping every line it has. A file that cannot be read as
 /// text is never replaced.
-fn write_std_prelude(
+pub(crate) fn write_std_prelude(
     harness_dir: &Path,
     names: &[(String, &'static str)],
 ) -> std::io::Result<StdPrelude> {
@@ -2162,6 +2165,45 @@ fn write_std_prelude(
         headers,
         change,
     })
+}
+
+/// The standard-library names in `output`, a failed build of the harness in
+/// `harness_dir`, that belong in a std prelude
+/// ([`build_classifier::unqualified_std_names`]): none for a C harness, and
+/// none for diagnostics in C code, as the classifier decides, nor for a name
+/// `project_defines` says is the project's own (its own `list` type; it sees
+/// how the source uses the name, as a template or not). A name
+/// whose header `force_included` says the build already force-includes counts
+/// as declared. An unqualified stream object (`cerr`) whose declaration the
+/// compiler has not seen needs only its header when the source has `using
+/// namespace std;`, so stream objects alone are left out, unless the build
+/// already force-includes a prelude (`prelude_in_use`): every other name
+/// needs a `using` declaration as well, which only a force-included prelude
+/// can add, and once there is one the stream objects go into it too.
+/// `bhf build` and `bhf auto` decide with this the same way.
+pub(crate) fn std_prelude_names(
+    harness_dir: &Path,
+    output: &str,
+    force_included: &dyn Fn(&str) -> bool,
+    project_defines: &dyn Fn(&build_classifier::UnqualifiedStdName) -> bool,
+    prelude_in_use: bool,
+) -> Vec<build_classifier::UnqualifiedStdName> {
+    if !harness_dir.join("main.cpp").is_file() {
+        return Vec::new();
+    }
+    let mut unqualified = build_classifier::unqualified_std_names(output);
+    unqualified.retain(|name| !project_defines(name));
+    for name in &mut unqualified {
+        name.declared |= force_included(name.header);
+    }
+    if !prelude_in_use
+        && !unqualified
+            .iter()
+            .any(|name| name.declared || build_classifier::std_stream_header(&name.name).is_none())
+    {
+        unqualified.clear();
+    }
+    unqualified
 }
 
 /// What a failed C/C++ harness build was missing, with the exact command that
@@ -2203,21 +2245,6 @@ fn c_build_failure_hints(
                 .iter()
                 .any(|word| word.strip_prefix("-include") == Some(header))
     };
-    let mut unqualified = if harness_dir.join("main.cpp").is_file() {
-        build_classifier::unqualified_std_names(output)
-    } else {
-        Vec::new()
-    };
-    for name in &mut unqualified {
-        name.declared |= force_included(name.header);
-    }
-    // An unqualified stream object (`cerr`) whose declaration the compiler has
-    // not seen needs only its header when the source has `using namespace
-    // std;`, so the `-include iostream` hint below covers it. Every other
-    // unqualified name needs a `using` declaration as well, which only a
-    // force-included prelude header can add; once there is a prelude (this
-    // build's, or one the build already force-includes), the stream objects
-    // go into it too.
     let prelude_file = harness_dir.join(STD_PRELUDE_HEADER);
     let prelude_in_use = prelude_file.is_file()
         && force_included(
@@ -2225,13 +2252,13 @@ fn c_build_failure_hints(
                 .display()
                 .to_string(),
         );
-    if !prelude_in_use
-        && !unqualified
-            .iter()
-            .any(|name| name.declared || build_classifier::std_stream_header(&name.name).is_none())
-    {
-        unqualified.clear();
-    }
+    let unqualified = std_prelude_names(
+        harness_dir,
+        output,
+        &force_included,
+        &|_| false,
+        prelude_in_use,
+    );
     let in_prelude = |name: &str| unqualified.iter().any(|entry| entry.name == name);
 
     // Standard stream headers a pre-standard source relied on getting
@@ -2951,19 +2978,17 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
 
 /// Synthesised repair headers that must be force-included into every TU of
 /// the harness compile so their content precedes the first use in `main` and
-/// in the target source: the collision-safe C++-stdlib `#include`s and the
-/// build-config macro `#define`s. Never `auto_types.h`, whose `void *`
-/// placeholders would clash with a real typedef in any target TU.
+/// in the target source: the std prelude `bhf auto` wrote, the collision-safe
+/// C++-stdlib `#include`s and the build-config macro `#define`s. Never
+/// `auto_types.h`, whose `void *` placeholders would clash with a real
+/// typedef in any target TU.
 fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
     let repairs = harness_dir.join("repairs");
-    [
-        crate::auto::repair::AUTO_CPP_INCLUDES_FILE,
-        crate::auto::repair::AUTO_DEFINES_FILE,
-    ]
-    .iter()
-    .map(|name| repairs.join(name))
-    .filter(|path| path.is_file())
-    .collect()
+    crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES
+        .iter()
+        .map(|name| repairs.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn apply_c_family_make_env(

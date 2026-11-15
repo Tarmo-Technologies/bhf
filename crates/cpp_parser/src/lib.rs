@@ -137,6 +137,9 @@ pub struct CppClassInfo {
     pub class_path: Vec<String>,
     pub complete: bool,
     pub is_abstract: bool,
+    /// Declared by a `template <...>` declaration (`template <class T> class
+    /// list;`): the name is a class template.
+    pub is_template: bool,
     pub constructors: Vec<CppConstructorInfo>,
 }
 
@@ -1477,15 +1480,25 @@ pub fn parse_cpp_class_info(source: &str) -> Result<Vec<CppClassInfo>, CppParseE
         .map_err(|_| CppParseError::Grammar)?;
     let tree = parser.parse(source, None).ok_or(CppParseError::Parse)?;
     let mut out = Vec::new();
-    collect_cpp_class_info(tree.root_node(), source.as_bytes(), &[], &[], &mut out);
+    collect_cpp_class_info(
+        tree.root_node(),
+        source.as_bytes(),
+        &[],
+        &[],
+        false,
+        &mut out,
+    );
     Ok(out)
 }
 
+/// `templated`: `node` is the declaration of a `template_declaration` (its
+/// direct child), so a class it declares is a class template.
 fn collect_cpp_class_info(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     namespace_stack: &[String],
     class_stack: &[String],
+    templated: bool,
     out: &mut Vec<CppClassInfo>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
@@ -1541,6 +1554,7 @@ fn collect_cpp_class_info(
                 class_path: next_classes.clone(),
                 complete: body.is_some(),
                 is_abstract: body.is_some_and(|body| class_body_has_pure_virtual(body, source)),
+                is_template: templated,
                 constructors,
             });
         }
@@ -1551,9 +1565,17 @@ fn collect_cpp_class_info(
     } else {
         class_stack
     };
+    let template = node.kind() == "template_declaration";
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_cpp_class_info(child, source, active_namespaces, active_classes, out);
+        collect_cpp_class_info(
+            child,
+            source,
+            active_namespaces,
+            active_classes,
+            template,
+            out,
+        );
     }
 }
 
@@ -5071,6 +5093,37 @@ struct MappedFile {
             2,
             "namespace identity must not collapse same-leaf classes"
         );
+    }
+
+    #[test]
+    fn class_info_marks_class_templates() {
+        let source = r#"
+            template <class T, class A = allocator<T> > class list {
+            public:
+                T *items;
+            };
+            template <typename K> struct table;
+            namespace one { template <class T> class stack; }
+            class Widget {
+                template <class U> struct Slot { U value; };
+                int size;
+            };
+            struct record { int value; };
+        "#;
+        let infos = parse_cpp_class_info(source).expect("class metadata parses");
+        let template = |qualified: &str| {
+            infos
+                .iter()
+                .find(|info| info.qualified_name == qualified)
+                .unwrap_or_else(|| panic!("missing {qualified}: {infos:?}"))
+                .is_template
+        };
+        assert!(template("list"));
+        assert!(template("table"));
+        assert!(template("one::stack"));
+        assert!(template("Widget::Slot"));
+        assert!(!template("Widget"));
+        assert!(!template("record"));
     }
 
     #[test]

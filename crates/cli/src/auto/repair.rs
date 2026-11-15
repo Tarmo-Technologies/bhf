@@ -21,6 +21,20 @@ pub const AUTO_CPP_INCLUDES_FILE: &str = "auto_cpp_includes.h";
 /// Force-included into every TU of the C/C++ build (see build.rs). Holds
 /// `#define`s for build-config macros the project's build system would inject.
 pub const AUTO_DEFINES_FILE: &str = "auto_defines.h";
+/// Force-included into every TU of the C/C++ build (see build.rs), ahead of
+/// the other repair headers. Holds only the `#include` of the harness's std
+/// prelude ([`Repair::StdPrelude`]), so the prelude itself stays the
+/// `<harness>/std_prelude.h` that `bhf build` writes and the operator may
+/// edit. Written only by a build that needed the prelude.
+pub const AUTO_STD_PRELUDE_FILE: &str = "auto_std_prelude.h";
+/// The repair headers every C/C++ harness build force-includes when they
+/// exist, in this order: `-include` puts each before the first line of every
+/// translation unit.
+pub const FORCE_INCLUDED_REPAIR_FILES: [&str; 3] = [
+    AUTO_STD_PRELUDE_FILE,
+    AUTO_CPP_INCLUDES_FILE,
+    AUTO_DEFINES_FILE,
+];
 pub const AUTO_ADA_STUBS_DIR: &str = "ada_stubs";
 /// Directory (under a target's `repairs/`) holding synthesized stub `.gpr`
 /// project files for missing external `with`ed GPR imports (force-fuzz only).
@@ -253,6 +267,19 @@ pub enum Repair {
         gcc: Vec<String>,
         reason: String,
     },
+    /// The C++ sources use standard-library names without `std::` (`string`,
+    /// `map<string, int>`), relying on a `using namespace std;` the project's
+    /// own sources put before including the header that uses them. The build
+    /// wrote the std prelude `bhf build` writes (`path`, the harness's
+    /// `std_prelude.h`: the standard `headers` and a `using std::` declaration
+    /// for each of `names`) and force-includes it through
+    /// [`AUTO_STD_PRELUDE_FILE`]. Applying it is a no-op: the build writes
+    /// both files itself; this records that it did.
+    StdPrelude {
+        path: PathBuf,
+        names: Vec<String>,
+        headers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -301,6 +328,7 @@ impl RepairManifest {
             Repair::ForcedSyntheticParams { .. } => key == "forced-synthetic-params",
             Repair::Win32Pack => key == "win32-pack",
             Repair::CompilerCompat { .. } => key == "compiler-compat",
+            Repair::StdPrelude { .. } => key == "std-prelude",
         })
     }
 }
@@ -2090,10 +2118,13 @@ pub fn apply_repair_with_source(
                 resolved_header: None,
             })
         }
-        Repair::ForcedSyntheticParams { .. } | Repair::CompilerCompat { .. } => {
+        Repair::ForcedSyntheticParams { .. }
+        | Repair::CompilerCompat { .. }
+        | Repair::StdPrelude { .. } => {
             // Label-only markers: the lane's own generator already emitted the
             // synthesized value into the harness source, and the build takes
-            // the compatibility fragment itself. Nothing to apply here.
+            // the compatibility fragment and writes the std prelude itself.
+            // Nothing to apply here.
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
@@ -2433,6 +2464,21 @@ fn header_defined_macro_names(source: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Write `<repairs_dir>/auto_std_prelude.h` ([`AUTO_STD_PRELUDE_FILE`]) so
+/// it includes `prelude`, the harness's std prelude, by absolute path. The
+/// build force-includes it ahead of every other repair header.
+pub(crate) fn write_std_prelude_include(repairs_dir: &Path, prelude: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(repairs_dir)?;
+    std::fs::write(
+        repairs_dir.join(AUTO_STD_PRELUDE_FILE),
+        format!(
+            "/* bhf auto: standard-library names this harness's sources use without `std::` */\n\
+             #include \"{}\"\n",
+            include_spelling(prelude)
+        ),
+    )
 }
 
 /// `path` spelled for a `#include "..."` line. On Windows it is spelled with

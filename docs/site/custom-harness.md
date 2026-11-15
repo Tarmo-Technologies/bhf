@@ -225,15 +225,21 @@ To write a prelude by hand, list the headers and names your sources use
 save it anywhere, and force-include it the same way, by its absolute path as
 the hint does.
 
-`bhf auto` does not write a prelude. On such a tree, `missing-deps.txt` lists
-the names as types the scanned tree does not define (`'string' is undefined
-in the scanned tree`) or that the harness cannot construct, although the
-header that declares them is the standard one. The same prelude fixes
-`bhf auto` too, whether `bhf build` wrote it or you did:
+`bhf auto` applies the prelude itself. When one of its C++ harness builds
+fails on such names, it writes (or extends) that harness's
+`std_prelude.h` by the same rules, force-includes it into every translation
+unit of the harness's builds, and builds again, adding names while a rebuild
+reports more (clang++ stops after 20 errors), then prints one note naming
+the types. A name the scanned tree declares as a C++ type of its own is left
+out; for a use written as a template (`list<string>`) only its own template
+of that name counts, and a C struct in C code never does. `run.json` records
+the repair as `std_prelude`, and if the build still fails, `missing-deps.txt`
+says the names are standard ones used without `std::` and names the prelude
+instead of asking for a header. A prelude you wrote by hand reaches
+`bhf auto` through `AUTO_EXTRA_INCLUDES` as well:
 
 ```sh
-AUTO_EXTRA_INCLUDES="-include $PWD/bhf_work/harnesses/H-XRECORD/std_prelude.h" \
-  bhf auto lib --work-dir bhf_auto
+AUTO_EXTRA_INCLUDES="-include $PWD/my_prelude.h" bhf auto lib --work-dir bhf_auto
 ```
 
 ## Fuzz

@@ -189,6 +189,11 @@ pub struct UnqualifiedStdName {
     /// included, so including it again cannot help; the name needs a `using`
     /// declaration (or the `std::` qualification).
     pub declared: bool,
+    /// The source writes it as a template (`map<string, int>`, clang's "no
+    /// template named 'map'"), which only a template of that name can
+    /// satisfy: a project's own non-template `list` (a C struct, say) is no
+    /// substitute for `std::list` there.
+    pub as_template: bool,
 }
 
 /// Every C++ standard-library name the g++/clang++ output `stderr` shows a
@@ -1609,6 +1614,45 @@ doc.h:11:18: note: \u{2018}std::cerr\u{2019} is defined in header \u{2018}<iostr
                 ("runtime_error".to_owned(), "stdexcept", true),
                 ("cerr".to_owned(), "iostream", false),
             ]
+        );
+    }
+
+    /// A name the source writes as a template (`list<string>`, clang's "no
+    /// template named 'list'") is marked, so only a template of the
+    /// project's own can stand for it; `string` in `map<string, int>` is a
+    /// plain type use.
+    #[test]
+    fn template_uses_of_unqualified_std_names_are_marked() {
+        let as_template = |output: &str| -> Vec<(String, bool)> {
+            unqualified_std_names(output)
+                .into_iter()
+                .map(|name| (name.name, name.as_template))
+                .collect()
+        };
+        let clang = "./widget.h:6:9: error: unknown type name 'string'\n\
+    6 |     map<string, int> fields;\n\
+      |         ^\n\
+./widget.h:8:5: error: no template named 'list'\n\
+./widget.h:9:20: error: use of undeclared identifier 'cerr'\n\
+    9 |     void say() { cerr << 1; }\n";
+        assert_eq!(
+            as_template(clang),
+            vec![
+                ("string".to_owned(), false),
+                ("map".to_owned(), true),
+                ("list".to_owned(), true),
+                ("cerr".to_owned(), false),
+            ]
+        );
+        let gcc = "widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+    6 |     map<string, int> fields;\n\
+      |     ^~~\n\
+widget.h:7:5: error: \u{2018}string\u{2019} does not name a type\n\
+    7 |     string title;\n\
+      |     ^~~~~~\n";
+        assert_eq!(
+            as_template(gcc),
+            vec![("map".to_owned(), true), ("string".to_owned(), false),]
         );
     }
 

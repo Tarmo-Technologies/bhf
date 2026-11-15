@@ -1069,6 +1069,9 @@ pub fn write_reports_with_output_limit(
     // other non-lib error produces an opaque `failed_build` with an empty
     // manifest (#418).
     let mut failed_targets: Vec<(String, Vec<build_classifier::BuildErrorKind>)> = Vec::new();
+    // The std prelude of each failed C++ target, so its missing-deps hints
+    // can say which names are standard ones.
+    let mut failed_std_preludes = StdPreludes::new();
 
     for r in results {
         let id = r.candidate.harness_id.clone();
@@ -1187,7 +1190,21 @@ pub fn write_reports_with_output_limit(
                 // Keep the full final diagnostic set for this target so the manifest
                 // surfaces a still-blocking entry for every unresolved error (#418).
                 failed_targets.push((id.clone(), last_errors.clone()));
+                let prelude = std_prelude_context(r, repairs);
+                if let Some(prelude) = &prelude {
+                    failed_std_preludes.insert(id.clone(), prelude.clone());
+                }
                 for e in last_errors {
+                    // Standard-library names used without `std::` (clang's "no
+                    // template named 'vector'; did you mean 'std::vector'?")
+                    // are neither codegen errors nor dependencies: their
+                    // missing-deps entry says so.
+                    if prelude
+                        .as_ref()
+                        .is_some_and(|prelude| !std_residue_names(e, prelude).is_empty())
+                    {
+                        continue;
+                    }
                     // #5: a harness/codegen error is bhf's own (or a project
                     // build-config) problem, not a dependency — record it in its
                     // own bag and keep it out of the missing-dependency paths.
@@ -1607,7 +1624,12 @@ pub fn write_reports_with_output_limit(
     // #418: guarantee no opaque `failed_build`. Fold every failed target's final
     // unresolved diagnostics into the manifest as still-blocking entries (with
     // remediation), and ensure each failed target contributes at least one entry.
-    record_failed_build_blockers(&mut manifest, &failed_targets, source_root);
+    record_failed_build_blockers(
+        &mut manifest,
+        &failed_targets,
+        &failed_std_preludes,
+        source_root,
+    );
     // Targets that SKIPPED on an opaque IDL type never reached the build, so their
     // missing CORBA stub headers aren't in the ledger. Scan skipped targets'
     // sources for unresolved `*C.h`/`*S.h` includes and record the missing IDL —
@@ -1829,20 +1851,35 @@ fn build_dependency_manifest(
 /// any `Other` diagnostic would otherwise leave an opaque `failed_build` behind
 /// an empty manifest. This makes the manifest the single honest record of WHY a
 /// target could not be built.
+///
+/// In a C++ target (`std_preludes`), a standard-library name the sources use
+/// without `std::` ([`std_residue_names`]) is not a project type or header
+/// to supply, nor a codegen error: its entry says so and names the std
+/// prelude.
 fn record_failed_build_blockers(
     manifest: &mut crate::auto::dep_manifest::DependencyManifest,
     failed_targets: &[(String, Vec<build_classifier::BuildErrorKind>)],
+    std_preludes: &StdPreludes,
     source_root: &Path,
 ) {
     use crate::auto::dep_manifest::DepKind;
     use build_classifier::BuildErrorKind as E;
     for (id, errors) in failed_targets {
+        let prelude = std_preludes.get(id);
         // #5: a target whose only unresolved errors are harness/codegen errors
         // is explained by the `harness_codegen_errors` ledger — it must NOT get a
         // generic "build failed → acquire dependency" manifest blocker.
         let mut had_codegen = false;
         for err in errors {
-            if build_classifier::is_codegen_error(err) {
+            let standard = prelude
+                .map(|prelude| std_residue_names(err, prelude))
+                .unwrap_or_default();
+            let standard_hint = || {
+                prelude
+                    .filter(|_| !standard.is_empty())
+                    .map(|prelude| std_prelude_hint(&standard, prelude))
+            };
+            if standard.is_empty() && build_classifier::is_codegen_error(err) {
                 had_codegen = true;
                 continue;
             }
@@ -1874,10 +1911,13 @@ fn record_failed_build_blockers(
                     name.clone(),
                     vec![id.clone()],
                     false,
-                    Some(format!(
-                        "'{name}' is undefined in the scanned tree — supply the header/source that \
-                         declares it (often a configure-generated or out-of-tree definition)"
-                    )),
+                    standard_hint().or_else(|| {
+                        Some(format!(
+                            "'{name}' is undefined in the scanned tree — supply the header/source \
+                             that declares it (often a configure-generated or out-of-tree \
+                             definition)"
+                        ))
+                    }),
                 ),
                 E::IncompleteType { name } => manifest.push_merge_with_hint(
                     DepKind::CType,
@@ -1894,10 +1934,12 @@ fn record_failed_build_blockers(
                     name.clone(),
                     vec![id.clone()],
                     false,
-                    Some(format!(
-                        "'{name}' is injected by the project's build config (generated config.h / \
-                         -D flags) — supply its real definition"
-                    )),
+                    standard_hint().or_else(|| {
+                        Some(format!(
+                            "'{name}' is injected by the project's build config (generated \
+                             config.h / -D flags) — supply its real definition"
+                        ))
+                    }),
                 ),
                 E::UndefinedSymbol { name } => manifest.push_merge_with_hint(
                     DepKind::Symbol,
@@ -1914,10 +1956,13 @@ fn record_failed_build_blockers(
                     name.clone(),
                     vec![id.clone()],
                     false,
-                    Some(format!(
-                        "'{name}' has no declaration visible at {file}:{line} — restore the damaged \
-                         header macro/declaration or supply the header that declares it"
-                    )),
+                    standard_hint().or_else(|| {
+                        Some(format!(
+                            "'{name}' has no declaration visible at {file}:{line} — restore the \
+                             damaged header macro/declaration or supply the header that declares \
+                             it"
+                        ))
+                    }),
                 ),
                 E::MalformedFunctionDecl { file, line } => manifest.push_merge_with_hint(
                     DepKind::Other,
@@ -1942,10 +1987,14 @@ fn record_failed_build_blockers(
                     first_error_line(tail),
                     vec![id.clone()],
                     false,
-                    Some(format!(
-                        "unrecognised build error for target {id} — see auto/run.json (this \
-                         target's outcome.last_errors) for the full diagnostic"
-                    )),
+                    // clang's "no template named 'map'" and g++'s "'map' does
+                    // not name a type" are not classified on their own.
+                    standard_hint().or_else(|| {
+                        Some(format!(
+                            "unrecognised build error for target {id} — see auto/run.json (this \
+                             target's outcome.last_errors) for the full diagnostic"
+                        ))
+                    }),
                 ),
                 // Shared libs / GPR imports / Ada units are already folded into the
                 // manifest from the `needed_for_build` bags (and already reference
@@ -1996,6 +2045,150 @@ fn record_failed_build_blockers(
             );
         }
     }
+}
+
+/// The std prelude of a failed C++ target ([`Repair::StdPrelude`]), for its
+/// missing-deps hints.
+#[derive(Debug, Clone)]
+struct StdPreludeContext {
+    /// `<harness>/std_prelude.h`.
+    path: PathBuf,
+    /// The standard-library names it declares.
+    declared: Vec<String>,
+    /// The build wrote it and force-includes it.
+    written: bool,
+}
+
+/// [`StdPreludeContext`] by harness id.
+type StdPreludes = BTreeMap<String, StdPreludeContext>;
+
+/// The std prelude of `result`, a C++ target whose build ended with
+/// `repairs`: the one its build wrote, or the path it would have, when it
+/// wrote none.
+fn std_prelude_context(result: &AttemptResult, repairs: &[Repair]) -> Option<StdPreludeContext> {
+    let written = repairs.iter().find_map(|repair| match repair {
+        Repair::StdPrelude { path, names, .. } => Some(StdPreludeContext {
+            path: path.clone(),
+            declared: names.clone(),
+            written: true,
+        }),
+        _ => None,
+    });
+    written.or_else(|| {
+        (result.candidate.lang == Lang::Cpp).then(|| StdPreludeContext {
+            path: result.harness_dir.join(crate::build::STD_PRELUDE_HEADER),
+            declared: Vec::new(),
+            written: false,
+        })
+    })
+}
+
+/// The C++ standard-library names an unresolved diagnostic of a C++ target
+/// shows the sources using without `std::`, in first-seen order: those
+/// [`build_classifier::unqualified_std_names`] finds in an unclassified
+/// diagnostic, a missing type that is a standard name, and an undeclared
+/// macro or function the prelude declares.
+fn std_residue_names(
+    error: &build_classifier::BuildErrorKind,
+    prelude: &StdPreludeContext,
+) -> Vec<String> {
+    use build_classifier::BuildErrorKind as E;
+    match error {
+        E::Other { tail } => {
+            let mut found: Vec<String> = Vec::new();
+            for name in build_classifier::unqualified_std_names(tail) {
+                if !found.contains(&name.name) {
+                    found.push(name.name);
+                }
+            }
+            found
+        }
+        E::MissingType { name }
+            if prelude.declared.contains(name)
+                || build_classifier::std_library_header(name).is_some() =>
+        {
+            vec![name.clone()]
+        }
+        E::MissingMacro { name, .. } | E::UndeclaredFunction { name, .. }
+            if prelude.declared.contains(name) =>
+        {
+            vec![name.clone()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The missing-deps hint for standard-library `names` the sources use
+/// without `std::`, a build of a target with the std prelude `prelude`
+/// still failed on.
+fn std_prelude_hint(names: &[String], prelude: &StdPreludeContext) -> String {
+    let quote = |names: &[&String]| {
+        names
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let path = prelude.path.display();
+    let undeclared: Vec<&String> = names
+        .iter()
+        .filter(|name| !prelude.declared.contains(name))
+        .collect();
+    let what = |count: usize| {
+        if count == 1 {
+            "is a C++ standard-library name"
+        } else {
+            "are C++ standard-library names"
+        }
+    };
+    let why = "the sources use without `std::` (relying on a `using namespace std;` that is \
+               not in effect where the harness compiles them), not a project header or type to \
+               supply";
+    if undeclared.is_empty() {
+        let declared = match names {
+            [name] => format!("declared it with `using std::{name};`"),
+            _ => "declared each with a `using std::` line".to_owned(),
+        };
+        let all: Vec<&String> = names.iter().collect();
+        return format!(
+            "{} {} {why}; bhf auto {declared} in the std prelude {path}, which every \
+             translation unit force-includes, and the build still fails: see auto/run.json \
+             (this target's outcome.last_errors) for the diagnostic, and delete a `using` line \
+             from the prelude whose name a project source declares itself",
+            quote(&all),
+            what(all.len())
+        );
+    }
+    let lines = undeclared
+        .iter()
+        .map(|name| match build_classifier::std_library_header(name) {
+            Some(header) => format!("`#include <{header}>` and `using std::{name};`"),
+            None => format!("`using std::{name};`"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (them, ones) = if undeclared.len() == 1 {
+        ("it", "one")
+    } else {
+        ("them", "ones")
+    };
+    let declare = if prelude.written {
+        format!(
+            "add {lines} to the std prelude {path}, which every translation unit force-includes"
+        )
+    } else {
+        format!(
+            "put {lines} in a header such as {path} and force-include it with \
+             AUTO_EXTRA_INCLUDES='-include <that header>'"
+        )
+    };
+    format!(
+        "{} {} {why}; bhf auto did not declare {them}, because the scanned tree declares a C++ \
+         type of that name or the build stopped before naming {them}: if the sources mean the \
+         standard {ones}, {declare}",
+        quote(&undeclared),
+        what(undeclared.len())
+    )
 }
 
 /// Remedy for a member declared inside its class with the class name repeated
@@ -2449,8 +2642,10 @@ fn add_checkpoint_result(
             // (#5's rule for codegen errors). The finding-level forced caveat and the
             // blocker histogram already carry it.
             | Repair::ForcedSyntheticParams { .. }
-            // A compiler compatibility flag is a build adjustment bhf made.
+            // A compiler compatibility flag is a build adjustment bhf made, and
+            // the std prelude declares standard names from their real headers.
             | Repair::CompilerCompat { .. }
+            | Repair::StdPrelude { .. }
             | Repair::Win32Pack => {}
         }
     }
@@ -2503,9 +2698,14 @@ fn add_checkpoint_result(
                     _ => {}
                 }
             }
+            let preludes: StdPreludes = std_prelude_context(result, repairs)
+                .map(|prelude| (id.clone(), prelude))
+                .into_iter()
+                .collect();
             record_failed_build_blockers(
                 manifest,
                 &[(id.clone(), last_errors.clone())],
+                &preludes,
                 source_root,
             );
         }
@@ -2932,6 +3132,9 @@ fn aggregate_repairs(
             Repair::ForcedSyntheticParams { .. } => {}
             // A compiler flag bhf added to the build, not a dependency.
             Repair::CompilerCompat { .. } => {}
+            // Standard names declared from their real headers: no dependency,
+            // nothing stubbed (listed under real_headers_included).
+            Repair::StdPrelude { .. } => {}
         }
     }
 }
@@ -3800,7 +4003,7 @@ mod tests {
                 path: "ares_build.h".to_owned(),
             }],
         )];
-        record_failed_build_blockers(&mut m, &failed, project_root);
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), project_root);
         let e = m
             .entries
             .iter()
@@ -3865,7 +4068,7 @@ mod tests {
             // still must not be silent.
             ("H-EMPTY".to_owned(), vec![]),
         ];
-        record_failed_build_blockers(&mut m, &failed, &PathBuf::from("/tmp"));
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), &PathBuf::from("/tmp"));
         for id in ["H-OTHER", "H-SYM", "H-LIB", "H-EMPTY"] {
             assert!(
                 manifest_reference_count(&m, id) >= 1,
@@ -3918,7 +4121,7 @@ mod tests {
                 member: "name".to_owned(),
             }],
         )];
-        record_failed_build_blockers(&mut m, &failed, &PathBuf::from("/tmp"));
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), &PathBuf::from("/tmp"));
         let text = m.render_text();
         assert!(text.contains("src/widget.h:136"), "{text}");
         assert!(text.contains("member 'name'"), "{text}");
@@ -3952,7 +4155,7 @@ mod tests {
                 }],
             ),
         ];
-        record_failed_build_blockers(&mut m, &failed, &PathBuf::from("/tmp"));
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), &PathBuf::from("/tmp"));
         assert_eq!(
             manifest_reference_count(&m, "H-YAML"),
             0,
@@ -4834,6 +5037,235 @@ mod tests {
         assert!(!target_already_complete(&work, "H-C0009"));
 
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A C++ target that still fails after its build force-included the std
+    /// prelude: missing-deps says that the names the prelude declares are
+    /// standard ones used without `std::` and names the prelude, in the final
+    /// report and in the per-target checkpoint, instead of asking for a
+    /// project header. A project type keeps its usual hint.
+    #[test]
+    fn a_build_failing_after_the_std_prelude_names_the_standard_names() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::repair::Repair;
+        use build_classifier::BuildErrorKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let prelude = temp.path().join("work/harnesses/H-XPRELUDE/std_prelude.h");
+        let result = AttemptResult {
+            candidate: cand("H-XPRELUDE"),
+            outcome: Outcome::FailedBuild {
+                repairs: vec![Repair::StdPrelude {
+                    path: prelude.clone(),
+                    names: ["list", "map", "pair", "string", "vector"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                    headers: ["list", "map", "string", "utility", "vector"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                }],
+                retries: 1,
+                last_errors: vec![
+                    BuildErrorKind::MissingType {
+                        name: "string".to_owned(),
+                    },
+                    BuildErrorKind::Other {
+                        tail: "/src/lib/src/widget.h:6:5: error: no template named 'map'\n\
+                               \x20   6 |     map<string, int> fields;\n"
+                            .to_owned(),
+                    },
+                    BuildErrorKind::MissingType {
+                        name: "Gadget".to_owned(),
+                    },
+                ],
+            },
+            harness_dir: temp.path().join("work/harnesses/H-XPRELUDE"),
+        };
+        let check = |manifest: &crate::auto::dep_manifest::DependencyManifest, what: &str| {
+            let hint = |name: &str| {
+                manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name.contains(name))
+                    .and_then(|entry| entry.acquisition_hint.clone())
+                    .unwrap_or_else(|| {
+                        panic!("{what}: no entry for {name}: {}", manifest.render_text())
+                    })
+            };
+            for name in ["string", "no template named 'map'"] {
+                let hint = hint(name);
+                assert!(
+                    hint.contains("standard-library name")
+                        && hint.contains("without `std::`")
+                        && hint.contains(&prelude.display().to_string()),
+                    "{what}: {name}: {hint}"
+                );
+                assert!(
+                    !hint.contains("supply the header"),
+                    "{what}: {name}: {hint}"
+                );
+            }
+            assert!(
+                hint("no template named 'map'").contains("'map'"),
+                "{what}: {}",
+                hint("no template named 'map'")
+            );
+            assert!(
+                hint("Gadget").contains("supply the header/source"),
+                "{what}: {}",
+                hint("Gadget")
+            );
+        };
+
+        let work = temp.path().join("final");
+        write_reports(
+            &source,
+            std::slice::from_ref(&result),
+            &work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        check(
+            &load_dependency_manifest(&work).expect("final manifest"),
+            "final",
+        );
+
+        let work = temp.path().join("checkpoint");
+        let mut durable = write_dependency_checkpoint(
+            &source,
+            &work,
+            &crate::auto::dep_manifest::DependencyManifest::new(),
+            &[],
+        )
+        .unwrap();
+        checkpoint_dependency_result(&source, &work, &mut durable, &result).unwrap();
+        check(
+            &load_dependency_manifest(&work).expect("checkpoint manifest"),
+            "checkpoint",
+        );
+    }
+
+    /// clang++'s "no template named 'vector'; did you mean 'std::vector'?"
+    /// for a standard name the target's std prelude lacks is no
+    /// harness/codegen error: run.json and run.md do not list it as one, and
+    /// missing-deps names the standard names and the prelude instead of
+    /// reporting nothing missing. A C++ target whose build wrote no prelude
+    /// gets the same explanation for a standard type, not a request for a
+    /// project header.
+    #[test]
+    fn standard_names_the_prelude_lacks_are_not_codegen_errors() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::repair::Repair;
+        use build_classifier::BuildErrorKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let harnesses = temp.path().join("work/harnesses");
+        let prelude = harnesses.join("H-XWIDGET/std_prelude.h");
+        let cpp = |id: &str| Candidate {
+            lang: Lang::Cpp,
+            ..cand(id)
+        };
+        let results = vec![
+            AttemptResult {
+                candidate: cpp("H-XWIDGET"),
+                outcome: Outcome::FailedBuild {
+                    repairs: vec![Repair::StdPrelude {
+                        path: prelude.clone(),
+                        names: vec!["map".to_owned(), "string".to_owned()],
+                        headers: vec!["map".to_owned(), "string".to_owned()],
+                    }],
+                    retries: 0,
+                    last_errors: vec![BuildErrorKind::Other {
+                        tail: "/src/lib/src/widget.h:16:5: error: no template named 'vector'; did \
+                               you mean 'std::vector'?\n\
+                               /src/lib/src/widget.h:17:5: error: no template named 'list'"
+                            .to_owned(),
+                    }],
+                },
+                harness_dir: harnesses.join("H-XWIDGET"),
+            },
+            AttemptResult {
+                candidate: cpp("H-XGADGET"),
+                outcome: Outcome::FailedBuild {
+                    repairs: vec![],
+                    retries: 0,
+                    last_errors: vec![BuildErrorKind::MissingType {
+                        name: "wstring".to_owned(),
+                    }],
+                },
+                harness_dir: harnesses.join("H-XGADGET"),
+            },
+        ];
+        let work = temp.path().join("final");
+        write_reports(
+            &source,
+            &results,
+            &work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let run: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+        assert!(
+            run["needed_for_build"]["harness_codegen_errors"]
+                .as_array()
+                .is_none_or(|errors| errors.is_empty()),
+            "{}",
+            run["needed_for_build"]
+        );
+        let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
+        assert!(!md.contains("Harness/codegen errors"), "{md}");
+        let manifest = load_dependency_manifest(&work).expect("final manifest");
+        let text = manifest.render_text();
+        assert!(
+            !text.contains("No external dependencies were missing"),
+            "{text}"
+        );
+        let hint = |name: &str| {
+            manifest
+                .entries
+                .iter()
+                .find(|entry| entry.name.contains(name))
+                .and_then(|entry| entry.acquisition_hint.clone())
+                .unwrap_or_else(|| panic!("no entry for {name}: {text}"))
+        };
+        let lacking = hint("no template named 'vector'");
+        assert!(
+            lacking.contains("'vector', 'list' are C++ standard-library names")
+                && lacking.contains("without `std::`")
+                && lacking.contains("`#include <vector>` and `using std::vector;`")
+                && lacking.contains("`#include <list>` and `using std::list;`")
+                && lacking.contains(&prelude.display().to_string()),
+            "{lacking}"
+        );
+        let unwritten = hint("wstring");
+        assert!(
+            unwritten.contains("'wstring' is a C++ standard-library name")
+                && unwritten.contains("`#include <string>` and `using std::wstring;`")
+                && unwritten.contains("AUTO_EXTRA_INCLUDES")
+                && !unwritten.contains("supply the header"),
+            "{unwritten}"
+        );
     }
 
     #[test]

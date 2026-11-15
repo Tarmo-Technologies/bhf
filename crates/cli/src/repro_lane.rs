@@ -2438,10 +2438,7 @@ impl CFamilyLane {
         // `AUTO_EXTRA_INCLUDES` as make got it: the force-included repair
         // headers, the operator's own flags, then the recovered include dirs.
         let mut extra_includes = Vec::new();
-        for name in [
-            crate::auto::repair::AUTO_CPP_INCLUDES_FILE,
-            crate::auto::repair::AUTO_DEFINES_FILE,
-        ] {
+        for name in crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES {
             let header = repairs.join(name);
             if header.is_file() {
                 extra_includes.push(Arg::Split("-include", header));

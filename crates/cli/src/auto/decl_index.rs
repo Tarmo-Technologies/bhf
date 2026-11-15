@@ -159,6 +159,15 @@ pub struct DeclarationIndex {
     /// module" (json11's `JsonParser`, defined in json11.cpp, absent from
     /// json11.hpp). Such members are pre-skipped instead of attempted-and-failed.
     cpp_source_class_names: HashSet<String>,
+    /// C++ standard-library names (`list`, `string`: those
+    /// [`build_classifier::std_library_header`] knows) that the tree declares
+    /// as a type of its own, outside `namespace std`, where a C++ compile sees
+    /// the declaration, each with whether one of its declarations is a
+    /// template. A C++ source or C++ header counts, and so does a `.h` header
+    /// unless only C sources include it (directly or through other headers);
+    /// a `.c` source never does: a C struct `list` there is no C++ type. See
+    /// [`Self::declares_cpp_type_named`].
+    std_named_cpp_types: HashMap<String, bool>,
     /// Tree-wide C opaque-handle lifecycle pairs (§27.2): init/destroy pairs found
     /// by scanning public C header declarations throughout the tree (not just a
     /// target's include closure), computed ONCE here. Threaded into the
@@ -509,6 +518,9 @@ impl DeclarationIndex {
             .extend(recovered.cpp_header_class_names);
         self.cpp_source_class_names
             .extend(recovered.cpp_source_class_names);
+        for (name, template) in recovered.std_named_cpp_types {
+            *self.std_named_cpp_types.entry(name).or_default() |= template;
+        }
         self.c_tree_lifecycle = std::sync::Arc::new(self.compute_c_tree_lifecycle());
         Ok(())
     }
@@ -614,6 +626,10 @@ impl DeclarationIndex {
         // tail; being killed costs everything.
         let deadline = crate::auto::discovery::deadline();
         let mut skipped_for_time = 0usize;
+        // The `.h` headers' standard-named types, kept until the include graph
+        // says which of the headers C++ code reaches (`std_named_cpp_types`).
+        let mut std_named_in_h: Vec<(String, Vec<(String, bool)>)> = Vec::new();
+        let mut header_includes = HeaderIncludes::default();
         for entry in entries {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 skipped_for_time += 1;
@@ -689,13 +705,16 @@ impl DeclarationIndex {
             // parser (a superset of C, and a `.h` is routinely a C++ header — e.g.
             // ada-url) so a forward declaration in a header still counts as
             // "declared", keeping out-of-line-defined classes harnessable.
+            let mut std_named = Vec::new();
             if matches!(ext, "h" | "hpp" | "hh" | "hxx" | "hp") {
                 if let Ok(classes) = cpp_parser::parse_cpp_class_info(&source) {
+                    std_named.extend(std_named_classes(&classes));
                     for class in classes {
                         idx.cpp_header_class_names.insert(class.name);
                     }
                 }
                 if let Ok(defs) = cpp_parser::parse_cpp_type_defs(&source) {
+                    std_named.extend(std_named_type_defs(&defs));
                     for s in &defs.structs {
                         idx.cpp_header_class_names.insert(s.name.clone());
                     }
@@ -704,14 +723,28 @@ impl DeclarationIndex {
                 && !cpp_source_uses_module_unit(&source)
             {
                 if let Ok(classes) = cpp_parser::parse_cpp_class_info(&source) {
+                    std_named.extend(std_named_classes(&classes));
                     for class in classes.into_iter().filter(|class| class.complete) {
                         idx.cpp_source_class_names.insert(class.name);
                     }
                 }
                 if let Ok(defs) = cpp_parser::parse_cpp_type_defs(&source) {
+                    std_named.extend(std_named_type_defs(&defs));
                     for s in defs.structs.iter().filter(|s| s.complete) {
                         idx.cpp_source_class_names.insert(s.name.clone());
                     }
+                }
+            }
+            header_includes.record(&entry, ext, &source);
+            if ext == "h" {
+                if !std_named.is_empty() {
+                    if let Some(name) = entry.file_name().and_then(|name| name.to_str()) {
+                        std_named_in_h.push((name.to_owned(), std_named));
+                    }
+                }
+            } else {
+                for (name, template) in std_named {
+                    *idx.std_named_cpp_types.entry(name).or_default() |= template;
                 }
             }
             match ext {
@@ -917,6 +950,15 @@ impl DeclarationIndex {
             }
         }
         idx.index_cpp_definition_headers(&cpp_sources, &cpp_headers);
+        let c_only = header_includes.c_only_headers();
+        for (header, std_named) in std_named_in_h {
+            if c_only.contains(&header) {
+                continue;
+            }
+            for (name, template) in std_named {
+                *idx.std_named_cpp_types.entry(name).or_default() |= template;
+            }
+        }
         // Keep the scalar/enum-resolving part of the tree-wide index plus
         // *flat-POD* structs (every field resolves to a scalar or enum) — the
         // ubiquitous military "strong typedef" wrapper idiom (cFS
@@ -1446,6 +1488,18 @@ impl DeclarationIndex {
                 .any(|definition| definition.name == leaf)
     }
 
+    /// Whether the tree declares `name`, a C++ standard-library name, as a
+    /// type of its own that C++ code sees (`std_named_cpp_types`): a class,
+    /// struct, enum or typedef in a C++ source or header, or in a `.h`
+    /// header that C++ code includes. For a use written as a template
+    /// (`as_template`: `list<string>`), only a class template of that name
+    /// counts, since no other type can stand for the standard one there.
+    pub(crate) fn declares_cpp_type_named(&self, name: &str, as_template: bool) -> bool {
+        self.std_named_cpp_types
+            .get(name)
+            .is_some_and(|&template| template || !as_template)
+    }
+
     pub fn lookup_c_definition_source(&self, name: &str) -> Option<&Path> {
         self.lookup_c_definition_source_impl(name, None)
     }
@@ -1811,6 +1865,115 @@ fn cpp_declaration_param_match_score(
         })
         .filter(|token| symbol_tokens.contains(token))
         .count()
+}
+
+/// The C++ standard-library names among `classes` declared outside
+/// `namespace std`, by leaf name, each with whether it is a class template.
+fn std_named_classes(classes: &[cpp_parser::CppClassInfo]) -> Vec<(String, bool)> {
+    classes
+        .iter()
+        .filter(|class| class.namespace_path.first().map(String::as_str) != Some("std"))
+        .filter(|class| build_classifier::std_library_header(&class.name).is_some())
+        .map(|class| (class.name.clone(), class.is_template))
+        .collect()
+}
+
+/// The C++ standard-library names among the structs, enums and typedefs of
+/// `defs` (none of them templates; the type-def parser skips templates)
+/// declared outside `namespace std`, by leaf name.
+fn std_named_type_defs(defs: &c_parser::CTypeDefs) -> Vec<(String, bool)> {
+    defs.structs
+        .iter()
+        .map(|def| def.name.as_str())
+        .chain(defs.enums.iter().map(|def| def.name.as_str()))
+        .chain(defs.typedefs.iter().map(|def| def.name.as_str()))
+        .filter(|name| !name.starts_with("std::"))
+        .map(|name| name.rsplit("::").next().unwrap_or(name))
+        .filter(|name| build_classifier::std_library_header(name).is_some())
+        .map(|name| (name.to_owned(), false))
+        .collect()
+}
+
+/// Which `.h` headers the tree's C and C++ files include, by file name,
+/// directly or through other `.h` headers: enough to tell a header only C
+/// sources reach from one C++ code reaches too.
+#[derive(Default)]
+struct HeaderIncludes {
+    /// The `.h` headers `.c` sources include directly.
+    from_c: HashSet<String>,
+    /// The `.h` headers C++ sources and C++ headers include directly.
+    from_cpp: HashSet<String>,
+    /// Each `.h` header -> the `.h` headers it includes.
+    between: HashMap<String, HashSet<String>>,
+}
+
+impl HeaderIncludes {
+    fn record(&mut self, file: &Path, ext: &str, source: &str) {
+        let included = included_h_headers(source);
+        if included.is_empty() {
+            return;
+        }
+        match ext {
+            "c" => self.from_c.extend(included),
+            "h" => {
+                if let Some(name) = file.file_name().and_then(|name| name.to_str()) {
+                    self.between
+                        .entry(name.to_owned())
+                        .or_default()
+                        .extend(included);
+                }
+            }
+            "cpp" | "cc" | "cxx" | "C" | "hpp" | "hh" | "hxx" | "hp" => {
+                self.from_cpp.extend(included)
+            }
+            _ => {}
+        }
+    }
+
+    /// Every header `roots` reach, the roots included.
+    fn reach(&self, roots: &HashSet<String>) -> HashSet<String> {
+        let mut seen: HashSet<String> = roots.clone();
+        let mut pending: Vec<String> = roots.iter().cloned().collect();
+        while let Some(header) = pending.pop() {
+            for next in self.between.get(&header).into_iter().flatten() {
+                if seen.insert(next.clone()) {
+                    pending.push(next.clone());
+                }
+            }
+        }
+        seen
+    }
+
+    /// The `.h` headers that C sources reach and no C++ file does. A header
+    /// nothing includes is not among them: the harness may include it.
+    fn c_only_headers(&self) -> HashSet<String> {
+        let from_cpp = self.reach(&self.from_cpp);
+        self.reach(&self.from_c)
+            .into_iter()
+            .filter(|header| !from_cpp.contains(header))
+            .collect()
+    }
+}
+
+/// The file names of the `.h` headers `source` includes, in either spelling
+/// (`#include "list.h"`, `#  include <util/list.h>`).
+fn included_h_headers(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix('#')?.trim_start();
+            let rest = rest.strip_prefix("include")?.trim_start();
+            let close = match rest.chars().next()? {
+                '"' => '"',
+                '<' => '>',
+                _ => return None,
+            };
+            let spelling = &rest[1..];
+            let spelling = &spelling[..spelling.find(close)?];
+            let name = spelling.rsplit(['/', '\\']).next()?.trim();
+            name.ends_with(".h").then(|| name.to_owned())
+        })
+        .collect()
 }
 
 fn quoted_includes(source: &str) -> Vec<String> {
@@ -2432,6 +2595,84 @@ typedef struct foo bar;
         assert!(!names.contains(&"local".to_owned()));
         assert!(!names.contains(&"crc".to_owned()));
         assert!(!names.contains(&"bar".to_owned()));
+    }
+
+    /// Which of the tree's own types named like a C++ standard one (`list`,
+    /// `string`) C++ code sees: a C struct in a `.c` source or in a header
+    /// only C sources include does not count, a C++ class, typedef or
+    /// template does, and for a use written as a template only a template.
+    #[test]
+    fn std_named_types_count_only_where_cpp_code_sees_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("include/util")).unwrap();
+        let files: &[(&str, &str)] = &[
+            // C code: a struct in a source, and one in a header that only C
+            // sources include, through another header.
+            (
+                "src/queue.c",
+                "#include \"queue.h\"\nstruct list { struct list *next; int value; };\n\
+                 int list_length(struct list *head) { return head ? 1 : 0; }\n",
+            ),
+            (
+                "src/queue.h",
+                "#pragma once\n#include <util/node.h>\nint list_length(struct list *head);\n",
+            ),
+            (
+                "include/util/node.h",
+                "#pragma once\nstruct string { char *text; int length; };\n",
+            ),
+            // C++ code: a class in a header a C++ source includes, a typedef in
+            // a C++ header, a template in a C++ source, and a declaration of
+            // the standard name itself in `namespace std`.
+            (
+                "src/widget.h",
+                "#pragma once\nstruct deque { int front; };\n",
+            ),
+            ("src/widget.cpp", "#include \"widget.h\"\n"),
+            ("src/pairs.hpp", "#pragma once\ntypedef int pair;\n"),
+            (
+                "src/table.cpp",
+                "template <class T> class stack { public: T *top; };\n",
+            ),
+            (
+                "src/compat.hpp",
+                "namespace std { template <class T> class vector; }\n",
+            ),
+        ];
+        for (path, text) in files {
+            fs::write(root.join(path), text).unwrap();
+        }
+        let index = DeclarationIndex::build(root).unwrap();
+        for (name, as_template, project) in [
+            // Not seen by C++ code, so the standard name in both uses.
+            ("list", true, false),
+            ("list", false, false),
+            ("string", false, false),
+            // A non-template C++ type: the project's in a plain use only.
+            ("deque", false, true),
+            ("deque", true, false),
+            ("pair", false, true),
+            ("pair", true, false),
+            // A template: the project's in both uses.
+            ("stack", true, true),
+            ("stack", false, true),
+            // `std::vector` is the standard one.
+            ("vector", true, false),
+            ("map", true, false),
+        ] {
+            assert_eq!(
+                index.declares_cpp_type_named(name, as_template),
+                project,
+                "{name} (template use: {as_template})"
+            );
+        }
+        // The same C header becomes C++-visible once a C++ source includes it.
+        fs::write(root.join("src/text.cpp"), "#include \"util/node.h\"\n").unwrap();
+        let index = DeclarationIndex::build(root).unwrap();
+        assert!(index.declares_cpp_type_named("string", false));
+        assert!(!index.declares_cpp_type_named("list", true));
     }
 
     #[test]

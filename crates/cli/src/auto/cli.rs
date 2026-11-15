@@ -5611,7 +5611,8 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
         mut incdirs,
         mut platforms,
         mut compat,
-    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        mut std_prelude,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     for repair in repairs {
         match repair {
             HeaderPlaceholder { .. } | ConfigHeaderSynth { .. } => headers += 1,
@@ -5636,6 +5637,7 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
             | StubGprImport { .. } => ada += 1,
             PlatformStub { .. } | Win32Pack | ForcedSyntheticParams { .. } => platforms += 1,
             CompilerCompat { .. } => compat += 1,
+            StdPrelude { .. } => std_prelude += 1,
         }
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -5678,6 +5680,9 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
     }
     if compat > 0 {
         parts.push("added a compiler compatibility flag".to_owned());
+    }
+    if std_prelude > 0 {
+        parts.push("force-included a std prelude".to_owned());
     }
     Some(parts.join(", "))
 }

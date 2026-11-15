@@ -1715,6 +1715,7 @@ fn attempt_unclassified(
                 last_errors,
                 decl_index,
                 &synthesized,
+                &declared_from_real_headers(repairs),
                 result.candidate.lang,
             ) {
                 let reason = format!(
@@ -1770,6 +1771,7 @@ fn attempt_unclassified(
                 last_errors,
                 decl_index,
                 &synthesized,
+                &declared_from_real_headers(repairs),
                 result.candidate.lang,
             );
             let evidence = match &unresolved_types {
@@ -2017,14 +2019,41 @@ fn undefined_external_types(
         last_errors,
         decl_index,
         synthesized,
+        &BTreeSet::new(),
         crate::auto::candidate::Lang::Cpp,
     )
 }
 
+/// The names `repairs` declared from their real headers rather than
+/// fabricating them: a type placeholder that resolved to a header, and every
+/// name of the std prelude.
+fn declared_from_real_headers(repairs: &[Repair]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for repair in repairs {
+        match repair {
+            Repair::TypePlaceholder {
+                type_name,
+                resolved_header: Some(_),
+            } => {
+                names.insert(type_name.clone());
+            }
+            Repair::StdPrelude {
+                names: declared, ..
+            } => names.extend(declared.iter().cloned()),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// As [`undefined_external_types`]; `real` holds the names the repairs
+/// declared from their real headers ([`declared_from_real_headers`]), which
+/// are never an external SDK's.
 fn undefined_external_types_for_lang(
     last_errors: &[BuildErrorKind],
     decl_index: &DeclarationIndex,
     synthesized: &BTreeSet<String>,
+    real: &BTreeSet<String>,
     lang: crate::auto::candidate::Lang,
 ) -> Option<Vec<String>> {
     if last_errors.is_empty() {
@@ -2042,9 +2071,12 @@ fn undefined_external_types_for_lang(
     // report-only scan. An in-tree synthesizable gap (a config typedef the tree
     // really is missing) is NOT in this set — it keeps its `failed_build` so the
     // `synthesized_types` manifest is preserved.
+    // A type resolved to its real header (`string` from <string>, or the std
+    // prelude's `using std::string;`) is no stand-in, so a diagnostic about
+    // its use is not a stand-in's residue either.
     let external_placeholders: Vec<&String> = synthesized
         .iter()
-        .filter(|name| !decl_index.type_defined_in_compiled_source(name))
+        .filter(|name| !decl_index.type_defined_in_compiled_source(name) && !real.contains(*name))
         .collect();
     let mut names: Vec<String> = Vec::new();
     let mut saw_placeholder_class_misuse = false;
@@ -2054,6 +2086,17 @@ fn undefined_external_types_for_lang(
             // actionable synthesized gap, not an unsynthesizable external type —
             // skip it so the attempt keeps its `synthesized_types` manifest.
             BuildErrorKind::MissingType { name } if synthesized.contains(name) => {}
+            // A standard-library name the std prelude declares that still fails
+            // is no external SDK type, nor is any C++ standard-library name
+            // used without `std::`: keep the failed build, whose missing-deps
+            // entry explains it.
+            BuildErrorKind::MissingType { name }
+                if real.contains(name)
+                    || (matches!(lang, crate::auto::candidate::Lang::Cpp)
+                        && build_classifier::std_library_header(name).is_some()) =>
+            {
+                return None
+            }
             BuildErrorKind::MissingType { name } if c_stub_gen::c_std_header(name).is_some() => {
                 // Standard/POSIX names are provided by the host SDK. A retained
                 // sequence attempt may not carry the direct fallback's header
@@ -3391,6 +3434,9 @@ fn run_attempt(
     // dead; from then on every round is a full build, because for this target the
     // check has demonstrably said something the compiler would not.
     let mut distrust_semantic_check = false;
+    // The std prelude the C++ builds write once the sources show
+    // standard-library names used without `std::`.
+    let mut std_prelude = StdPreludeState::default();
     for retry in 0..=max_repair_rounds {
         // A repair round is a full rebuild. Once the run's budget is gone, more
         // rounds cannot produce a fuzzed target — they only push the run past the
@@ -3424,7 +3470,7 @@ fn run_attempt(
         // pays for a check it did not need.
         let round = if distrust_semantic_check { 0 } else { retry };
         let mut built_standard = None;
-        match try_build(
+        let built = try_build(
             candidate,
             &harness_dir,
             &extra_sources,
@@ -3438,7 +3484,11 @@ fn run_attempt(
             &options.ada_toolchain,
             round,
             &mut built_standard,
-        ) {
+            decl_index,
+            &mut std_prelude,
+        );
+        record_std_prelude(&mut manifest, &std_prelude);
+        match built {
             BuildOutcome::Success => {
                 // Record the emulator this harness runs under beside it (or
                 // forget a stale one), so the replays after fuzzing, such as the
@@ -4471,6 +4521,9 @@ fn run_attempt(
                 // skip honestly instead of looping to an opaque `failed_build`.
                 let mut unavailable_target_blocker = false;
                 for err in &errors {
+                    if error_names_std_prelude_name(err, &std_prelude) {
+                        continue;
+                    }
                     // Several undefined symbols often live in one implementation
                     // source (XZ check.c defines init/update/finish). Once that
                     // source is added in this round, let the next build resolve all
@@ -4793,6 +4846,7 @@ fn repair_key(repair: &Repair) -> String {
         Repair::ForcedSyntheticParams { .. } => "forced-synthetic-params".to_owned(),
         Repair::Win32Pack => "win32-pack".to_owned(),
         Repair::CompilerCompat { .. } => "compiler-compat".to_owned(),
+        Repair::StdPrelude { .. } => "std-prelude".to_owned(),
     }
 }
 
@@ -4932,6 +4986,7 @@ fn repair_replaces_candidate_target(repair: &Repair, candidate: &Candidate) -> b
         | Repair::PlatformStub { .. }
         | Repair::ForcedSyntheticParams { .. }
         | Repair::CompilerCompat { .. }
+        | Repair::StdPrelude { .. }
         | Repair::Win32Pack => false,
     }
 }
@@ -6441,6 +6496,8 @@ fn try_build(
     ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
     built_standard: &mut Option<String>,
+    decl_index: &DeclarationIndex,
+    std_prelude: &mut StdPreludeState,
 ) -> BuildOutcome {
     use crate::auto::candidate::Lang;
     let work_dir = dir
@@ -6461,6 +6518,8 @@ fn try_build(
             sanitizers,
             round,
             built_standard,
+            decl_index,
+            std_prelude,
         ),
         Lang::Ada => try_build_ada(
             work_dir,
@@ -6656,7 +6715,10 @@ fn try_build(
 
 /// Build a C/C++ harness. On success `built_standard` holds the language
 /// standard the build that succeeded used (`None`: the Makefile's default),
-/// which the build recipe records.
+/// which the build recipe records. A C++ build that fails on standard-library
+/// names used without `std::` writes or extends the std prelude
+/// (`std_prelude`) and builds again with it, as long as each rebuild reports
+/// names the prelude lacks.
 #[allow(clippy::too_many_arguments)]
 fn try_build_c(
     work_dir: &Path,
@@ -6667,6 +6729,8 @@ fn try_build_c(
     sanitizers: &multicore_fuzz::SanitizerSelection,
     round: usize,
     built_standard: &mut Option<String>,
+    decl_index: &DeclarationIndex,
+    std_prelude: &mut StdPreludeState,
 ) -> BuildOutcome {
     use multicore_fuzz::SanitizerSelection;
     // `auto --sanitizers` arms an explicit `-fsanitize=` set for the native build.
@@ -6736,6 +6800,8 @@ fn try_build_c(
     // (nothing is linked), so the real build always runs before a target is
     // called built, and the dialect ladder and -fcommon retry below stay on the
     // real build where their evidence lives.
+    // What the std prelude steps below did, for the one note they print.
+    let mut prelude_note = StdPreludeNote::default();
     if round > 0 {
         let check = crate::build::try_run_c_make_build_with_target(
             work_dir,
@@ -6750,25 +6816,65 @@ fn try_build_c(
             let raw = combined_build_output(&check);
             let errors = build_classifier::classify(&raw);
             if !errors.is_empty() {
-                return BuildOutcome::Failed { errors };
+                // A check that shows standard-library names used without
+                // `std::` gets the prelude, and the build below runs with it.
+                if !(is_cpp
+                    && apply_std_prelude(
+                        work_dir,
+                        harness_id,
+                        &raw,
+                        decl_index,
+                        std_prelude,
+                        &mut prelude_note,
+                    ))
+                {
+                    return BuildOutcome::Failed { errors };
+                }
             }
         }
     }
-    let mut output = crate::build::try_run_c_make_build_with_target(
-        work_dir,
-        harness_id,
-        extra_sources,
-        extra_includes,
-        compiler,
-        None,
-        chosen_std.as_deref(),
-    );
-    if build_succeeded(&output) {
-        *built_standard = chosen_std.clone();
-        return BuildOutcome::Success;
+    // A pre-standard header that writes `string` or `map<string, int>` without
+    // `std::`, relying on a `using namespace std;` that the project's own
+    // sources put before including it: write the prelude `bhf build` writes
+    // and build again with it, before the compatibility retries, the dialect
+    // ladder and the other compiler, none of which can declare the names.
+    // clang++ stops after 20 errors, so the names of a long header come a
+    // build at a time: keep adding while a rebuild reports names the prelude
+    // lacks. Each pass adds at least one of the finite standard names
+    // `build_classifier::std_library_header` knows, so this ends.
+    let mut output;
+    let mut raw_output;
+    loop {
+        output = crate::build::try_run_c_make_build_with_target(
+            work_dir,
+            harness_id,
+            extra_sources,
+            extra_includes,
+            compiler,
+            None,
+            chosen_std.as_deref(),
+        );
+        if build_succeeded(&output) {
+            announce_std_prelude(harness_id, std_prelude, &prelude_note);
+            *built_standard = chosen_std.clone();
+            return BuildOutcome::Success;
+        }
+        raw_output = combined_build_output(&output);
+        persist_c_build_output(work_dir, harness_id, &raw_output);
+        if !(is_cpp
+            && apply_std_prelude(
+                work_dir,
+                harness_id,
+                &raw_output,
+                decl_index,
+                std_prelude,
+                &mut prelude_note,
+            ))
+        {
+            break;
+        }
     }
-    let mut raw_output = combined_build_output(&output);
-    persist_c_build_output(work_dir, harness_id, &raw_output);
+    announce_std_prelude(harness_id, std_prelude, &prelude_note);
     let mut errors = build_classifier::classify(&raw_output);
 
     // GCC 10 and Clang 11 changed C's default from -fcommon to -fno-common.
@@ -8155,6 +8261,677 @@ fn persist_c_build_output(work_dir: &Path, harness_id: &str, raw: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(log, raw);
+}
+
+/// The std prelude a C++ harness build of this attempt wrote and
+/// force-includes ([`apply_std_prelude`]), carried across its repair rounds.
+#[derive(Debug, Default)]
+struct StdPreludeState {
+    /// The prelude, `<harness>/std_prelude.h`, once a build wrote it.
+    path: Option<PathBuf>,
+    /// The standard-library names it declares for this attempt, sorted, each
+    /// with its header.
+    names: Vec<(String, &'static str)>,
+    /// Writing it failed: no later build tries again.
+    failed: bool,
+}
+
+impl StdPreludeState {
+    fn declares(&self, name: &str) -> bool {
+        self.names.iter().any(|(declared, _)| declared == name)
+    }
+
+    /// The ledger entry for the prelude, once there is one.
+    fn repair(&self) -> Option<Repair> {
+        let path = self.path.clone()?;
+        let mut headers: Vec<String> = self
+            .names
+            .iter()
+            .map(|(_, header)| (*header).to_owned())
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
+        Some(Repair::StdPrelude {
+            path,
+            names: self.names.iter().map(|(name, _)| name.clone()).collect(),
+            headers,
+        })
+    }
+}
+
+/// The standard-library names that `output`, a failed build of the C++
+/// harness in `harness_dir`, shows the sources using without `std::` and that
+/// the prelude does not declare yet, each with its header, in first-seen
+/// order. `bhf build`'s rules decide ([`crate::build::std_prelude_names`] over
+/// [`build_classifier::unqualified_std_names`]): nothing for a C harness or
+/// for diagnostics in C code, and unqualified stream objects alone are left
+/// to the stream-header repair. A name the scanned tree declares as a C++
+/// type of its own (its own `list` class, per
+/// [`DeclarationIndex::declares_cpp_type_named`]) is the project's, not the
+/// standard one, so it never gets a `using std::` declaration; where the
+/// source writes it as a template (`list<string>`), only a template of the
+/// project's own counts. A C struct of that name in C code is never one.
+fn std_prelude_additions(
+    harness_dir: &Path,
+    output: &str,
+    decl_index: &DeclarationIndex,
+    prelude: &StdPreludeState,
+) -> Vec<(String, &'static str)> {
+    crate::build::std_prelude_names(
+        harness_dir,
+        output,
+        &|_| false,
+        &|name| decl_index.declares_cpp_type_named(&name.name, name.as_template),
+        prelude.path.is_some(),
+    )
+    .into_iter()
+    .filter(|name| !prelude.declares(&name.name))
+    .map(|name| (name.name, name.header))
+    .collect()
+}
+
+/// What the std prelude steps of one build did, for the one note
+/// [`announce_std_prelude`] prints about them.
+#[derive(Debug, Default)]
+struct StdPreludeNote {
+    /// The names they added, in the order found.
+    names: Vec<String>,
+    /// They created the file, rather than adding to an existing one.
+    created: bool,
+    /// They changed the file.
+    changed: bool,
+    /// The standard headers the file includes after the last of them.
+    headers: Vec<String>,
+}
+
+/// Give the C++ sources of the harness the declarations of the
+/// standard-library names `output` shows them using without `std::` (see
+/// [`std_prelude_additions`]): write the prelude `bhf build` writes,
+/// `<harness>/std_prelude.h`, or add the names to it, and force-include it
+/// into every translation unit through `repairs/auto_std_prelude.h`. `note`
+/// collects what it did for [`announce_std_prelude`]. Returns whether the
+/// next build sees declarations the failed one did not; each time it does,
+/// the prelude declares at least one more name.
+fn apply_std_prelude(
+    work_dir: &Path,
+    harness_id: &str,
+    output: &str,
+    decl_index: &DeclarationIndex,
+    prelude: &mut StdPreludeState,
+    note: &mut StdPreludeNote,
+) -> bool {
+    if prelude.failed {
+        return false;
+    }
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    let added = std_prelude_additions(&harness_dir, output, decl_index, prelude);
+    if added.is_empty() {
+        return false;
+    }
+    let shown = added
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut names = prelude.names.clone();
+    names.extend(added.iter().cloned());
+    names.sort_unstable();
+    names.dedup();
+    let written = crate::build::write_std_prelude(&harness_dir, &names).and_then(|written| {
+        crate::auto::repair::write_std_prelude_include(
+            &harness_dir.join("repairs"),
+            &written.path,
+        )?;
+        Ok(written)
+    });
+    let written = match written {
+        Ok(written) => written,
+        Err(error) => {
+            bhfeprintln!(
+                "bhf auto: warning: {harness_id}: the sources use {shown} without `std::`, \
+                 but the std prelude {} could not be written: {error}",
+                harness_dir.join(crate::build::STD_PRELUDE_HEADER).display()
+            );
+            prelude.failed = true;
+            return false;
+        }
+    };
+    // A file that already declared every name does not help a build that
+    // already force-included it.
+    let progress =
+        prelude.path.is_none() || written.change != crate::build::PreludeChange::Unchanged;
+    for (name, _) in &added {
+        if !note.names.contains(name) {
+            note.names.push(name.clone());
+        }
+    }
+    note.created |=
+        prelude.path.is_none() && written.change == crate::build::PreludeChange::Created;
+    note.changed |= written.change != crate::build::PreludeChange::Unchanged;
+    note.headers = written.headers;
+    prelude.path = Some(written.path);
+    prelude.names = names;
+    progress
+}
+
+/// Print the one note naming the types the std prelude steps of a build
+/// declared (`note`), if they declared any.
+fn announce_std_prelude(harness_id: &str, prelude: &StdPreludeState, note: &StdPreludeNote) {
+    if let Some(line) = std_prelude_note_line(harness_id, prelude, note) {
+        bhfeprintln!("{line}");
+    }
+}
+
+fn std_prelude_note_line(
+    harness_id: &str,
+    prelude: &StdPreludeState,
+    note: &StdPreludeNote,
+) -> Option<String> {
+    if note.names.is_empty() {
+        return None;
+    }
+    let path = prelude.path.as_deref()?.display();
+    let done = if note.created {
+        format!(
+            "wrote {path} (<{}> and a `using std::` declaration for each)",
+            note.headers.join(">, <")
+        )
+    } else if note.changed {
+        format!("added them to {path}")
+    } else {
+        format!("{path} declares them")
+    };
+    Some(format!(
+        "bhf auto: {harness_id}: the sources use {} without `std::`, relying on a \
+         `using namespace std;` that is not in effect where they are compiled; {done}, \
+         force-included into every translation unit",
+        note.names.join(", ")
+    ))
+}
+
+/// Record the prelude [`apply_std_prelude`] wrote in the repair ledger, as one
+/// entry naming every standard-library name it declares for this attempt.
+fn record_std_prelude(manifest: &mut RepairManifest, prelude: &StdPreludeState) {
+    let Some(repair) = prelude.repair() else {
+        return;
+    };
+    match manifest
+        .repairs
+        .iter_mut()
+        .find(|entry| matches!(entry, Repair::StdPrelude { .. }))
+    {
+        Some(entry) => *entry = repair,
+        None => manifest.repairs.push(repair),
+    }
+}
+
+/// Whether `error` names a standard-library name the std prelude declares.
+/// The planner leaves such an error alone: any stand-in it would fabricate
+/// (`typedef void *list;`, `#define make_pair(...) 0`) collides with the
+/// prelude's `using std::` declaration of the real one.
+fn error_names_std_prelude_name(error: &BuildErrorKind, prelude: &StdPreludeState) -> bool {
+    match error {
+        BuildErrorKind::MissingType { name }
+        | BuildErrorKind::MissingMacro { name, .. }
+        | BuildErrorKind::UndeclaredFunction { name, .. } => prelude.declares(name),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod std_prelude_tests {
+    use super::*;
+
+    /// clang++ building a harness for a method of a header that declares
+    /// `map<string, int>`, `vector<int>`, `list<string>` and `pair<int, int>`
+    /// members without `std::` (the project's own source puts `using
+    /// namespace std;` before including it). The generated `main.cpp`
+    /// includes `<string>`, `<vector>` and `<utility>`, so clang names some
+    /// of the `std::` declarations.
+    const CLANG: &str = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:9: error: unknown type name 'string'; did you mean 'std::string'?\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |         ^~~~~~\n\
+\x20     |         std::string\n\
+/usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/c++/14/bits/stringfwd.h:77:33: note: 'std::string' declared here\n\
+\x20  77 |   typedef basic_string<char>    string;\n\
+\x20     |                                 ^\n\
+In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:5: error: no template named 'map'\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |     ^\n\
+/src/lib/src/widget.h:7:5: error: no template named 'vector'; did you mean 'std::vector'?\n\
+\x20   7 |     vector<int> sizes;\n\
+\x20     |     ^~~~~~\n\
+\x20     |     std::vector\n\
+/usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/c++/14/bits/stl_vector.h:428:11: note: 'std::vector' declared here\n\
+\x20 428 |     class vector : protected _Vector_base<_Tp, _Alloc>\n\
+\x20     |           ^\n\
+In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:8:5: error: no template named 'list'\n\
+\x20   8 |     list<string> names;\n\
+\x20     |     ^\n\
+/src/lib/src/widget.h:9:5: error: no template named 'pair'; did you mean 'std::pair'?\n\
+\x20   9 |     pair<int, int> span;\n\
+\x20     |     ^~~~\n\
+\x20     |     std::pair\n\
+6 errors generated.\n\
+make: *** [Makefile:327: main] Error 1\n";
+
+    /// g++ on the same harness, in a UTF-8 locale.
+    const GCC: &str = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:9: error: \u{2018}string\u{2019} was not declared in this scope\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |         ^~~~~~\n\
+/src/lib/src/widget.h:6:9: note: suggested alternatives:\n\
+In file included from /usr/include/c++/13/string:41,\n\
+\x20                from main.cpp:21:\n\
+/usr/include/c++/13/bits/stringfwd.h:77:33: note:   \u{2018}std::string\u{2019}\n\
+\x20  77 |   typedef basic_string<char>    string;\n\
+\x20     |                                 ^~~~~~\n\
+/src/lib/src/widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |     ^~~\n\
+/src/lib/src/widget.h:7:5: error: \u{2018}vector\u{2019} does not name a type\n\
+\x20   7 |     vector<int> sizes;\n\
+\x20     |     ^~~~~~\n\
+/src/lib/src/widget.h:8:5: error: \u{2018}list\u{2019} does not name a type\n\
+\x20   8 |     list<string> names;\n\
+\x20     |     ^~~~\n\
+/src/lib/src/widget.h:9:5: error: \u{2018}pair\u{2019} does not name a type\n\
+\x20   9 |     pair<int, int> span;\n\
+\x20     |     ^~~~\n\
+make: *** [Makefile:327: main] Error 1\n";
+
+    /// `<work>/harnesses/<id>` with a generated C++ (or C) driver.
+    fn harness(work: &Path, id: &str, driver: &str) -> PathBuf {
+        let dir = crate::auto::layout::harness_dir(work, id);
+        std::fs::create_dir_all(dir.join("repairs")).unwrap();
+        std::fs::write(dir.join(driver), "").unwrap();
+        dir
+    }
+
+    fn sorted_names(additions: &[(String, &'static str)]) -> Vec<String> {
+        let mut names: Vec<String> = additions.iter().map(|(name, _)| name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn captured_clang_and_gcc_output_needs_the_prelude_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(temp.path(), "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        for output in [CLANG, GCC] {
+            let mut prelude = StdPreludeState::default();
+            let added = std_prelude_additions(&dir, output, &index, &prelude);
+            assert_eq!(
+                sorted_names(&added),
+                ["list", "map", "pair", "string", "vector"],
+                "{output}"
+            );
+            assert!(added.contains(&("pair".to_owned(), "utility")), "{added:?}");
+            // Once the prelude declares them, the same diagnostics ask for
+            // nothing more, so no build is retried for them.
+            prelude.path = Some(dir.join("std_prelude.h"));
+            prelude.names = added;
+            assert_eq!(
+                std_prelude_additions(&dir, output, &index, &prelude),
+                Vec::new()
+            );
+        }
+    }
+
+    /// A tree with its own `list` template and `string` class in C++ code:
+    /// those are the project's. Its non-template C++ `map` cannot stand for
+    /// `map<string, int>`, and a C struct `pair` in a `.c` source or `vector`
+    /// in a header only C sources include is no C++ type at all, so those
+    /// still get the prelude.
+    #[test]
+    fn project_names_c_code_and_stream_objects_alone_get_no_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(&temp.path().join("work"), "H-ONE", "main.cpp");
+        let tree = temp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for (file, text) in [
+            (
+                "list.h",
+                "#pragma once\ntemplate <class T> class list {\npublic:\n    T *items;\n    int size;\n};\n",
+            ),
+            (
+                "list.cpp",
+                "#include \"list.h\"\nint list_size(list<int> *items) { return items->size; }\n",
+            ),
+            (
+                "text.h",
+                "#pragma once\nclass string {\npublic:\n    char *chars;\n};\n",
+            ),
+            ("text.cpp", "#include \"text.h\"\n"),
+            ("table.hpp", "#pragma once\nstruct map { int size; };\n"),
+            (
+                "pair.c",
+                "struct pair { int first; int second; };\nint pair_sum(struct pair *p) { return p->first + p->second; }\n",
+            ),
+            ("vec.h", "#pragma once\nstruct vector { int *items; int count; };\n"),
+            ("vec.c", "#include \"vec.h\"\n"),
+        ] {
+            std::fs::write(tree.join(file), text).unwrap();
+        }
+        let index = DeclarationIndex::build(&tree).unwrap();
+        let none = StdPreludeState::default();
+        for output in [CLANG, GCC] {
+            assert_eq!(
+                sorted_names(&std_prelude_additions(&dir, output, &index, &none)),
+                ["map", "pair", "vector"],
+                "{output}"
+            );
+        }
+
+        let empty = DeclarationIndex::default();
+        // A C source's `list`, compiled as C++ by the harness Makefile.
+        let c_code = "lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                      \x20   2 | int walk(void) { list *head = 0; return head != 0; }\n\
+                      \x20     |                  ^\n";
+        assert_eq!(
+            std_prelude_additions(&dir, c_code, &empty, &none),
+            Vec::new()
+        );
+        // A C harness never gets one.
+        let c_dir = harness(&temp.path().join("work"), "H-C", "main.c");
+        assert_eq!(
+            std_prelude_additions(&c_dir, CLANG, &empty, &none),
+            Vec::new()
+        );
+        // `cerr` without its header is the stream repair's, until a prelude
+        // is in use.
+        let streams = "src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n";
+        assert_eq!(
+            std_prelude_additions(&dir, streams, &empty, &none),
+            Vec::new()
+        );
+        let in_use = StdPreludeState {
+            path: Some(dir.join("std_prelude.h")),
+            names: vec![("string".to_owned(), "string")],
+            failed: false,
+        };
+        assert_eq!(
+            std_prelude_additions(&dir, streams, &empty, &in_use),
+            vec![("cerr".to_owned(), "iostream")]
+        );
+    }
+
+    #[test]
+    fn the_prelude_is_written_force_included_recorded_and_extended_for_new_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let file = dir.join(crate::build::STD_PRELUDE_HEADER);
+        let written = std::fs::read_to_string(&file).unwrap();
+        for (header, name) in [
+            ("list", "list"),
+            ("map", "map"),
+            ("utility", "pair"),
+            ("string", "string"),
+            ("vector", "vector"),
+        ] {
+            assert!(
+                written.contains(&format!("#include <{header}>\n"))
+                    && written.contains(&format!("using std::{name};\n")),
+                "{written}"
+            );
+        }
+        // Force-included ahead of every other repair header, by its path.
+        assert_eq!(
+            crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES[0],
+            crate::auto::repair::AUTO_STD_PRELUDE_FILE
+        );
+        let include = std::fs::read_to_string(
+            dir.join("repairs")
+                .join(crate::auto::repair::AUTO_STD_PRELUDE_FILE),
+        )
+        .unwrap();
+        let canonical = crate::workdir::plain_canonical(&file);
+        assert!(
+            include.contains(&format!("#include \"{}\"\n", canonical.display())),
+            "{include}"
+        );
+
+        // The same diagnostics again: nothing new, no rebuild.
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            GCC,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+
+        // One ledger entry, however often it is recorded.
+        let mut manifest = crate::auto::repair::RepairManifest::default();
+        record_std_prelude(&mut manifest, &prelude);
+        record_std_prelude(&mut manifest, &prelude);
+        assert_eq!(manifest.repairs.len(), 1, "{:?}", manifest.repairs);
+        assert!(manifest.already_attempted("std-prelude"));
+
+        // A later build reports one more: it joins the same file and entry.
+        let later = "/src/lib/src/widget.h:10:5: error: no template named 'deque'\n";
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            later,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let extended = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            extended.contains("#include <deque>\n") && extended.contains("using std::deque;\n"),
+            "{extended}"
+        );
+        assert!(extended.contains("using std::list;\n"), "{extended}");
+        record_std_prelude(&mut manifest, &prelude);
+        assert_eq!(manifest.repairs.len(), 1, "{:?}", manifest.repairs);
+        match &manifest.repairs[0] {
+            Repair::StdPrelude {
+                path,
+                names,
+                headers,
+            } => {
+                assert_eq!(path, &canonical);
+                assert_eq!(names, &["deque", "list", "map", "pair", "string", "vector"]);
+                assert_eq!(
+                    headers,
+                    &["deque", "list", "map", "string", "utility", "vector"]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let json = serde_json::to_value(&manifest.repairs[0]).unwrap();
+        assert_eq!(json["kind"], "std_prelude", "{json}");
+
+        // The planner leaves the declared names alone, and only them.
+        for error in [
+            BuildErrorKind::MissingType {
+                name: "list".to_owned(),
+            },
+            BuildErrorKind::MissingMacro {
+                name: "pair".to_owned(),
+                as_value: true,
+            },
+        ] {
+            assert!(error_names_std_prelude_name(&error, &prelude), "{error:?}");
+        }
+        for error in [
+            BuildErrorKind::MissingType {
+                name: "Widget".to_owned(),
+            },
+            BuildErrorKind::MissingType {
+                name: "set".to_owned(),
+            },
+            BuildErrorKind::UndefinedSymbol {
+                name: "list".to_owned(),
+            },
+        ] {
+            assert!(!error_names_std_prelude_name(&error, &prelude), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_prelude_that_cannot_be_written_is_not_retried_or_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        std::fs::create_dir_all(dir.join(crate::build::STD_PRELUDE_HEADER)).unwrap();
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(prelude.failed);
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            GCC,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(prelude.repair().is_none());
+        assert!(!dir
+            .join("repairs")
+            .join(crate::auto::repair::AUTO_STD_PRELUDE_FILE)
+            .exists());
+        assert_eq!(std_prelude_note_line("H-ONE", &prelude, &note), None);
+    }
+
+    /// A mixed C/C++ tree whose unrelated `.c` source has its own `struct
+    /// list`: the C++ header's `list<string>` still means `std::list`.
+    #[test]
+    fn a_c_struct_named_like_a_std_template_still_gets_the_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(&temp.path().join("work"), "H-ONE", "main.cpp");
+        let tree = temp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join("queue.c"),
+            "struct list { struct list *next; int value; };\n\
+             int list_length(struct list *head) {\n\
+             \x20   int count = 0;\n\
+             \x20   for (; head; head = head->next) count++;\n\
+             \x20   return count;\n\
+             }\n",
+        )
+        .unwrap();
+        let index = DeclarationIndex::build(&tree).unwrap();
+        for output in [CLANG, GCC] {
+            assert_eq!(
+                sorted_names(&std_prelude_additions(
+                    &dir,
+                    output,
+                    &index,
+                    &StdPreludeState::default()
+                )),
+                ["list", "map", "pair", "string", "vector"],
+                "{output}"
+            );
+        }
+    }
+
+    /// clang++ stops after 20 errors: a header with ten `map<string, int>`
+    /// members reports only `string` and `map`, and the names after them
+    /// (`vector`, `list`) appear once the prelude declares those. Each build's
+    /// names join the same prelude, and the build prints one note for all.
+    #[test]
+    fn names_behind_the_error_limit_join_the_prelude_and_one_note() {
+        let mut first = String::from("In file included from main.cpp:27:\n");
+        for line in 5..15 {
+            first.push_str(&format!(
+                "/src/lib/src/widget.h:{line}:9: error: unknown type name 'string'; did you mean 'std::string'?\n\
+                 \x20  {line} |     map<string, int> table{line};\n\
+                 /src/lib/src/widget.h:{line}:5: error: no template named 'map'; did you mean 'std::map'?\n"
+            ));
+        }
+        first.push_str(
+            "fatal error: too many errors emitted, stopping now [-ferror-limit=]\n\
+             20 errors generated.\n",
+        );
+        let second = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:16:5: error: no template named 'vector'; did you mean 'std::vector'?\n\
+\x20  16 |     vector<int> sizes;\n\
+/src/lib/src/widget.h:17:5: error: no template named 'list'; did you mean 'std::list'?\n\
+\x20  17 |     list<string> names;\n\
+2 errors generated.\n";
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            &first,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            second,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        // Nothing more to add: the build loop stops here.
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            second,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let written = std::fs::read_to_string(dir.join(crate::build::STD_PRELUDE_HEADER)).unwrap();
+        for name in ["list", "map", "string", "vector"] {
+            assert!(
+                written.contains(&format!("using std::{name};\n")),
+                "{written}"
+            );
+        }
+        let line = std_prelude_note_line("H-ONE", &prelude, &note).unwrap();
+        assert!(
+            line.contains("the sources use string, map, vector, list without `std::`")
+                && line.contains("wrote ")
+                && line.contains("<list>, <map>, <string>, <vector>"),
+            "{line}"
+        );
+    }
 }
 
 /// Whether `errors` name a standard stream object or class (`cerr`,
@@ -10363,11 +11140,15 @@ mod env_injection_tests {
 
 #[cfg(test)]
 mod undefined_external_types_tests {
-    use super::{undefined_external_types, undefined_external_types_for_lang};
+    use super::{
+        declared_from_real_headers, undefined_external_types, undefined_external_types_for_lang,
+    };
     use crate::auto::candidate::Lang;
     use crate::auto::decl_index::DeclarationIndex;
+    use crate::auto::repair::Repair;
     use build_classifier::BuildErrorKind;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     #[test]
     fn placeholder_synthesized_type_is_not_an_external_type() {
@@ -10448,9 +11229,104 @@ mod undefined_external_types_tests {
             name: "inflate_state".to_owned(),
         }];
         assert_eq!(
-            undefined_external_types_for_lang(&errors, &idx, &BTreeSet::new(), Lang::C),
+            undefined_external_types_for_lang(
+                &errors,
+                &idx,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Lang::C
+            ),
             None,
             "an in-tree C type is a recoverable include/source problem, not an external SDK"
+        );
+    }
+
+    /// A standard-library name bhf declared from its real header (a type
+    /// resolved to `<string>`, or the std prelude's `using std::list;`) is
+    /// never an external SDK type, so a build that still fails on one, or
+    /// on diagnostics in the project's header that uses it, keeps its
+    /// failed build instead of a report-only "external SDK" reason.
+    #[test]
+    fn standard_names_declared_from_real_headers_are_not_external_types() {
+        let idx = DeclarationIndex::default();
+        let repairs = vec![
+            Repair::TypePlaceholder {
+                type_name: "string".to_owned(),
+                resolved_header: Some("<string>".to_owned()),
+            },
+            Repair::StdPrelude {
+                path: PathBuf::from("/w/harnesses/H-ONE/std_prelude.h"),
+                names: vec!["list".to_owned(), "map".to_owned()],
+                headers: vec!["list".to_owned(), "map".to_owned()],
+            },
+            Repair::TypePlaceholder {
+                type_name: "CString".to_owned(),
+                resolved_header: None,
+            },
+        ];
+        let real = declared_from_real_headers(&repairs);
+        assert_eq!(
+            real.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["list", "map", "string"]
+        );
+        let string_only: BTreeSet<String> = ["string".to_owned()].into_iter().collect();
+        let residue = vec![BuildErrorKind::Other {
+            tail: "/src/lib/src/widget.h:6:5: error: no template named 'map'\n".to_owned(),
+        }];
+        // Without that knowledge the `string` type reads as an external SDK's.
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &residue,
+                &idx,
+                &string_only,
+                &BTreeSet::new(),
+                Lang::Cpp
+            ),
+            Some(vec!["string".to_owned()])
+        );
+        assert_eq!(
+            undefined_external_types_for_lang(&residue, &idx, &string_only, &real, Lang::Cpp),
+            None
+        );
+        let still_missing = vec![BuildErrorKind::MissingType {
+            name: "list".to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &still_missing,
+                &idx,
+                &BTreeSet::new(),
+                &real,
+                Lang::Cpp
+            ),
+            None
+        );
+        // Nor is a standard name the prelude left out (the build stopped
+        // before naming it, or the project declares a C++ type of that name):
+        // it is no external SDK's in a C++ harness.
+        let undeclared = vec![BuildErrorKind::MissingType {
+            name: "vector".to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &undeclared,
+                &idx,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Lang::Cpp
+            ),
+            None
+        );
+        // A fabricated stand-in keeps degrading as before.
+        let fabricated: BTreeSet<String> = ["CString".to_owned()].into_iter().collect();
+        let cstring = vec![BuildErrorKind::Other {
+            tail: "src/view.cpp:9:5: error: called object type 'CString' is not a function or \
+                   function pointer"
+                .to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(&cstring, &idx, &fabricated, &real, Lang::Cpp),
+            Some(vec!["CString".to_owned()])
         );
     }
 

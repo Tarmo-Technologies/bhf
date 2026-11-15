@@ -420,16 +420,20 @@ pub fn unqualified_std_names(stderr: &str) -> Vec<crate::UnqualifiedStdName> {
     });
     let lines: Vec<&str> = stderr.lines().collect();
     let mut found: Vec<crate::UnqualifiedStdName> = Vec::new();
-    let mut note = |name: &str, declared: bool| {
+    let mut note = |name: &str, declared: bool, as_template: bool| {
         let Some(header) = crate::std_library_header(name) else {
             return;
         };
         match found.iter_mut().find(|seen| seen.name == name) {
-            Some(seen) => seen.declared |= declared,
+            Some(seen) => {
+                seen.declared |= declared;
+                seen.as_template |= as_template;
+            }
             None => found.push(crate::UnqualifiedStdName {
                 name: name.to_owned(),
                 header,
                 declared,
+                as_template,
             }),
         }
     };
@@ -439,19 +443,20 @@ pub fn unqualified_std_names(stderr: &str) -> Vec<crate::UnqualifiedStdName> {
         if !line.contains("error:") || context.in_c {
             continue;
         }
-        let (name, type_position) = if let Some(caps) = type_position.captures(line) {
+        // clang's "no template named 'map'" says the source writes a template.
+        let (name, type_position, no_template) = if let Some(caps) = type_position.captures(line) {
             if caps.get(3).is_some() {
                 continue;
             }
             let Some(name) = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(4)) else {
                 continue;
             };
-            (name.as_str(), true)
+            (name.as_str(), true, caps.get(2).is_some())
         } else if let Some(caps) = expression.captures(line) {
             let Some(name) = caps.get(1).or_else(|| caps.get(2)) else {
                 continue;
             };
-            (name.as_str(), false)
+            (name.as_str(), false, false)
         } else {
             continue;
         };
@@ -470,12 +475,16 @@ pub fn unqualified_std_names(stderr: &str) -> Vec<crate::UnqualifiedStdName> {
         {
             continue;
         }
-        note(name, declared);
+        let as_template = no_template
+            || words
+                .iter()
+                .any(|(word, rest)| *word == name && written_as_template(word, rest));
+        note(name, declared, as_template);
         // clang reports only `string` for `map<string, int> fields;`, gcc only
         // `map`: the other names are on the source line it prints.
         for (word, rest) in &words {
             if !is_generic_std_word(word) || written_as_template_or_scope(word, rest) {
-                note(word, false);
+                note(word, false, written_as_template(word, rest));
             }
         }
     }
@@ -664,10 +673,17 @@ fn unqualified_identifiers(source: &str) -> Vec<(&str, &str)> {
 /// Whether `word`, followed by `rest` on its source line, is written as a
 /// standard template (`set<int>`) or as a scope (`ios::binary`).
 fn written_as_template_or_scope(word: &str, rest: &str) -> bool {
+    written_as_template(word, rest) || rest.trim_start().starts_with("::")
+}
+
+/// Whether `word`, followed by `rest` on its source line, is written as a
+/// standard template (`set<int>`, not `count << 2`).
+fn written_as_template(word: &str, rest: &str) -> bool {
     let rest = rest.trim_start();
-    let opens_template =
-        rest.starts_with('<') && !rest.starts_with("<<") && !rest.starts_with("<=");
-    (opens_template && is_std_template(word)) || rest.starts_with("::")
+    rest.starts_with('<')
+        && !rest.starts_with("<<")
+        && !rest.starts_with("<=")
+        && is_std_template(word)
 }
 
 /// clang: `f.h:136:18: error: extra qualification on member 'name'`; gcc:

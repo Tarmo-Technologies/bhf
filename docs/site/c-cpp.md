@@ -288,9 +288,9 @@ with their headers and `using std::` declarations
 (`<harness dir>/std_prelude.h`) and prints the `-include` command for it (see
 [Custom harnesses](custom-harness.md#headers-that-rely-on-using-namespace-std)).
 A later build adds the new names it reports to that file and keeps the other
-lines. `bhf auto` lists such names in `missing-deps.txt` as types the tree
-does not define; the same prelude, set through `AUTO_EXTRA_INCLUDES`, fixes
-its builds too.
+lines. `bhf auto` writes the same prelude itself when a harness build fails
+on such names, force-includes it into every translation unit of that
+harness, and builds again (see [auto](auto.md#repair-synthesis)).
 It suggests `-fms-extensions` (clang++) or `-fpermissive`
 (g++) for a member declared with an extra class qualification
 (`int Widget::name();` inside class `Widget`), which only MSVC accepts. Each

@@ -1117,9 +1117,16 @@
   keeps every other line in it. Errors in C code (`.c` sources and the
   headers they include) get no prelude. Before, the build failed with no
   hint. An unqualified stream object such as `cerr` still gets the
-  `-include iostream` hint unless that cannot help. `bhf auto` still reports
-  such names as missing types; the same prelude fixes it through
-  `AUTO_EXTRA_INCLUDES`.
+  `-include iostream` hint unless that cannot help.
+- `bhf auto` writes and force-includes the same std prelude itself when a C++
+  harness build fails on standard-library names used without `std::`, and
+  builds again, adding the names each rebuild reports past clang's error
+  limit, where the target used to end report-only on a made-up external-SDK
+  type. A C struct of the same name in C code does not keep a name out of
+  the prelude. The repair is recorded as a new `std_prelude` repair kind in
+  `run.json` (additive); if the build still fails, `missing-deps` names the
+  standard names and the prelude instead of asking for a header or listing
+  them as codegen errors.
 - A member declared with an extra class qualification (`int Widget::name();`
   inside class `Widget`) is classified as its own build error
   (`extra_qualification` in `run.json`) instead of an unrecognised one. `bhf

@@ -90,20 +90,31 @@ pub(crate) fn for_target(repairs: &[Repair], harness_dir: &Path) -> Option<Build
 
 /// The types a build's repairs resolved by including their real header
 /// instead of fabricating them, as `type NAME: real header included
-/// (<header>)` lines: listed beside the build's fidelity, never counted
+/// (<header>)` lines, and the std prelude for standard-library names used
+/// without `std::`: listed beside the build's fidelity, never counted
 /// against it.
 pub(crate) fn real_headers_included(repairs: &[Repair]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for repair in repairs {
-        if let Repair::TypePlaceholder {
-            type_name,
-            resolved_header: Some(header),
-        } = repair
-        {
-            let line = format!("type {type_name}: real header included ({header})");
-            if !lines.contains(&line) {
-                lines.push(line);
-            }
+        let line = match repair {
+            Repair::TypePlaceholder {
+                type_name,
+                resolved_header: Some(header),
+            } => format!("type {type_name}: real header included ({header})"),
+            Repair::StdPrelude {
+                path,
+                names,
+                headers,
+            } => format!(
+                "std prelude {} for {} used without `std::`: real headers included (<{}>)",
+                path.display(),
+                names.join(", "),
+                headers.join(">, <")
+            ),
+            _ => continue,
+        };
+        if !lines.contains(&line) {
+            lines.push(line);
         }
     }
     lines

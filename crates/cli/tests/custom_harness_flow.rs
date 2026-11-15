@@ -800,7 +800,8 @@ mod linux {
 
     /// A pre-standard library: `widget.h` writes `string`, `map`, `vector`,
     /// `list` and `pair` without `std::`, relying on the `using namespace std;`
-    /// that `widget.cpp` puts before including it.
+    /// that `widget.cpp` puts before including it. A `W!` record longer than
+    /// eight bytes overflows a heap buffer.
     fn write_pre_standard_library(root: &Path) -> PathBuf {
         let src = root.join("lib/src");
         fs::create_dir_all(&src).unwrap();
@@ -819,11 +820,19 @@ mod linux {
         .unwrap();
         fs::write(
             src.join("widget.cpp"),
-            "#include <list>\n#include <map>\n#include <string>\n#include <utility>\n#include <vector>\n\
+            "#include <cstring>\n#include <list>\n#include <map>\n#include <string>\n\
+             #include <utility>\n#include <vector>\n\
              using namespace std;\n\
              #include \"widget.h\"\n\
              int Widget::parse_record(const unsigned char *data, size_t size) {\n\
              \x20   string text(reinterpret_cast<const char *>(data), size);\n\
+             \x20   if (size > 8 && data[0] == 'W' && data[1] == '!') {\n\
+             \x20       char *slot = new char[8];\n\
+             \x20       memcpy(slot, data, size);\n\
+             \x20       int first = slot[0];\n\
+             \x20       delete[] slot;\n\
+             \x20       return first;\n\
+             \x20   }\n\
              \x20   fields[text] = static_cast<int>(size);\n\
              \x20   names.push_back(text);\n\
              \x20   sizes.push_back(static_cast<int>(size));\n\
@@ -839,12 +848,9 @@ mod linux {
     /// its build fails. The hint names the standard types, writes a prelude
     /// with their headers and `using std::` declarations, and the command it
     /// prints builds the harness, with clang++ and with g++.
-    #[test]
-    fn unqualified_std_types_get_a_prelude_whose_command_builds_the_harness() {
-        if !cpp_toolchain() {
-            eprintln!("skipping std prelude flow: clang++ or make unavailable");
-            return;
-        }
+    /// clang++ (bhf's default), and g++ through `CC`/`CXX` when it is
+    /// installed.
+    fn cpp_compilers(flow: &str) -> Vec<(&'static str, Vec<(&'static str, OsString)>)> {
         let gxx = Command::new("g++")
             .arg("--version")
             .stdout(Stdio::null())
@@ -855,9 +861,18 @@ mod linux {
         if gxx {
             compilers.push(("g++", vec![("CC", "gcc".into()), ("CXX", "g++".into())]));
         } else {
-            eprintln!("g++ unavailable: checking the std prelude flow with clang++ only");
+            eprintln!("g++ unavailable: checking the {flow} with clang++ only");
         }
-        for (compiler, compiler_env) in compilers {
+        compilers
+    }
+
+    #[test]
+    fn unqualified_std_types_get_a_prelude_whose_command_builds_the_harness() {
+        if !cpp_toolchain() {
+            eprintln!("skipping std prelude flow: clang++ or make unavailable");
+            return;
+        }
+        for (compiler, compiler_env) in cpp_compilers("std prelude flow") {
             let root = tempfile::tempdir().unwrap();
             let target = write_pre_standard_library(root.path());
             let work = root.path().join("bhf_work");
@@ -946,6 +961,281 @@ mod linux {
                 text(&built)
             );
             assert!(work.join("build").join(id).join("main").is_file());
+        }
+    }
+
+    /// `bhf auto` on the same library: its repair loop writes the prelude
+    /// `bhf build` writes, force-includes it into every translation unit,
+    /// records it, and the harness builds and fuzzes, with clang++ and g++.
+    /// The finding's capsule rebuilds with the prelude offline.
+    #[test]
+    fn auto_applies_the_std_prelude_and_fuzzes_the_harness() {
+        if !cpp_toolchain() {
+            eprintln!("skipping auto std prelude flow: clang++ or make unavailable");
+            return;
+        }
+        for (compiler, compiler_env) in cpp_compilers("auto std prelude flow") {
+            let root = tempfile::tempdir().unwrap();
+            write_pre_standard_library(root.path());
+            let seed = root.path().join("record.bin");
+            fs::write(&seed, b"W!overflowing").unwrap();
+            let work = root.path().join("bhf_auto");
+            let output = bhf(
+                &args(&[
+                    &"auto",
+                    &root.path().join("lib"),
+                    &"--work-dir",
+                    &work,
+                    &"--target",
+                    &"Widget::parse_record",
+                    &"--jobs",
+                    &"1",
+                    &"--per-target-time",
+                    &"3",
+                    &"--seed-file",
+                    &seed,
+                    &"--no-discovery-cache",
+                ]),
+                &compiler_env,
+                Duration::from_secs(600),
+            );
+            let output_text = text(&output);
+            assert!(output.status.success(), "{compiler}: {output_text}");
+            let run: serde_json::Value = serde_json::from_slice(
+                &fs::read(work.join("auto/run.json"))
+                    .unwrap_or_else(|error| panic!("{compiler}: run.json: {error}\n{output_text}")),
+            )
+            .unwrap();
+            let target = &run["targets"][0];
+            assert_eq!(
+                target["outcome"]["outcome"], "built_and_fuzzed",
+                "{compiler}: {target}\n{output_text}"
+            );
+            let repair = target["outcome"]["repairs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|repair| repair["kind"] == "std_prelude")
+                .unwrap_or_else(|| panic!("{compiler}: no std_prelude repair: {target}"));
+            let id = target["harness_id"].as_str().unwrap();
+            let prelude = work.join("harnesses").join(id).join("std_prelude.h");
+            assert_eq!(
+                repair["path"].as_str().map(PathBuf::from),
+                Some(fs::canonicalize(&prelude).unwrap()),
+                "{compiler}: {repair}"
+            );
+            let written = fs::read_to_string(&prelude)
+                .unwrap_or_else(|error| panic!("{compiler}: no prelude ({error}): {repair}"));
+            for (header, name) in [
+                ("string", "string"),
+                ("map", "map"),
+                ("vector", "vector"),
+                ("list", "list"),
+                ("utility", "pair"),
+            ] {
+                assert!(
+                    repair["names"]
+                        .as_array()
+                        .is_some_and(|names| names.iter().any(|entry| entry == name)),
+                    "{compiler}: {name}: {repair}"
+                );
+                assert!(
+                    written.contains(&format!("#include <{header}>\n"))
+                        && written.contains(&format!("using std::{name};\n")),
+                    "{compiler}: {written}"
+                );
+            }
+            // One note names the types and the prelude.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let notes: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.contains("without `std::`"))
+                .collect();
+            assert_eq!(notes.len(), 1, "{compiler}: {output_text}");
+            for name in ["string", "map", "vector", "list", "pair"] {
+                assert!(
+                    notes[0].split([' ', ',']).any(|word| word == name),
+                    "{compiler}: {name}: {}",
+                    notes[0]
+                );
+            }
+            assert!(
+                notes[0].contains(&prelude.file_name().unwrap().to_string_lossy().into_owned()),
+                "{compiler}: {}",
+                notes[0]
+            );
+            // Nothing reads as a dependency to acquire.
+            let missing =
+                fs::read_to_string(work.join("auto/missing-deps.txt")).unwrap_or_default();
+            assert!(!missing.contains("STILL BLOCKING"), "{compiler}: {missing}");
+            // The seed's overflow is found, and its capsule carries the prelude.
+            let finding = target["outcome"]["passes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|pass| pass["findings"].as_array().into_iter().flatten())
+                .find_map(|finding| finding.as_str().map(str::to_owned))
+                .unwrap_or_else(|| panic!("{compiler}: no finding: {target}"));
+            if compiler == "clang++" {
+                capsule_round_trip(&work, &root.path().join("lib"), &finding);
+            }
+        }
+    }
+
+    /// A pre-standard `Widget` whose header declares `members` (written
+    /// without `std::`, relying on `widget.cpp`'s `using namespace std;`)
+    /// and whose `parse_record` uses none of them.
+    fn write_widget_library(root: &Path, members: &str) {
+        let src = root.join("lib/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("widget.h"),
+            format!(
+                "#pragma once\n#include <cstddef>\n\
+                 class Widget {{\n\
+                 public:\n\
+                 \x20   int parse_record(const unsigned char *data, size_t size);\n\
+                 {members}\
+                 }};\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            src.join("widget.cpp"),
+            "#include <list>\n#include <map>\n#include <string>\n#include <vector>\n\
+             using namespace std;\n\
+             #include \"widget.h\"\n\
+             int Widget::parse_record(const unsigned char *data, size_t size) {\n\
+             \x20   return size > 0 && data[0] == 'W' ? 1 : 0;\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// `bhf auto --target Widget::parse_record` on the library under `root`
+    /// with bhf's default compiler: the run's single target, the prelude it
+    /// wrote, and bhf's output.
+    fn auto_widget(root: &Path) -> (serde_json::Value, String, String) {
+        let work = root.join("bhf_auto");
+        let output = bhf(
+            &args(&[
+                &"auto",
+                &root.join("lib"),
+                &"--work-dir",
+                &work,
+                &"--target",
+                &"Widget::parse_record",
+                &"--jobs",
+                &"1",
+                &"--per-target-time",
+                &"3",
+                &"--no-discovery-cache",
+            ]),
+            &[],
+            Duration::from_secs(600),
+        );
+        let output_text = text(&output);
+        let run: serde_json::Value = serde_json::from_slice(
+            &fs::read(work.join("auto/run.json"))
+                .unwrap_or_else(|error| panic!("run.json: {error}\n{output_text}")),
+        )
+        .unwrap();
+        let target = run["targets"][0].clone();
+        assert_eq!(
+            target["outcome"]["outcome"], "built_and_fuzzed",
+            "{target}\n{output_text}"
+        );
+        assert!(output.status.success(), "{output_text}");
+        let id = target["harness_id"].as_str().unwrap();
+        let prelude = fs::read_to_string(work.join("harnesses").join(id).join("std_prelude.h"))
+            .unwrap_or_else(|error| panic!("no prelude ({error}): {target}"));
+        (target, prelude, output_text)
+    }
+
+    fn std_prelude_names(target: &serde_json::Value) -> Vec<String> {
+        target["outcome"]["repairs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|repair| repair["kind"] == "std_prelude")
+            .and_then(|repair| repair["names"].as_array())
+            .unwrap_or_else(|| panic!("no std_prelude repair: {target}"))
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// clang++ stops after 20 errors. Ten `map<string, int>` members use them
+    /// all up, so the first build names only `string` and `map`; the build
+    /// with the prelude then reports `vector` and `list`, which join it, and
+    /// the harness builds and fuzzes.
+    #[test]
+    fn auto_std_prelude_gains_the_names_clang_reports_after_its_error_limit() {
+        if !cpp_toolchain() {
+            eprintln!("skipping auto std prelude error-limit flow: clang++ or make unavailable");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut members: String = (0..11)
+            .map(|index| format!("    map<string, int> table{index};\n"))
+            .collect();
+        members.push_str("    vector<int> sizes;\n    list<string> names;\n");
+        write_widget_library(root.path(), &members);
+        let (target, prelude, output_text) = auto_widget(root.path());
+        let names = std_prelude_names(&target);
+        for name in ["list", "map", "string", "vector"] {
+            assert!(names.iter().any(|entry| entry == name), "{name}: {names:?}");
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{name}: {prelude}"
+            );
+        }
+        let notes: Vec<&str> = output_text
+            .lines()
+            .filter(|line| line.starts_with("bhf auto: ") && line.contains("without `std::`"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{output_text}");
+        for name in ["string", "map", "vector", "list"] {
+            assert!(
+                notes[0].split([' ', ',']).any(|word| word == name),
+                "{name}: {}",
+                notes[0]
+            );
+        }
+    }
+
+    /// An unrelated C source with its own `struct list` does not make the
+    /// C++ header's `list<string>` the project's: the prelude still declares
+    /// `std::list`, and the harness builds and fuzzes.
+    #[test]
+    fn auto_std_prelude_is_not_blocked_by_a_c_struct_of_the_same_name() {
+        if !cpp_toolchain() {
+            eprintln!("skipping auto std prelude C-struct flow: clang++ or make unavailable");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        write_widget_library(
+            root.path(),
+            "    map<string, int> fields;\n    list<string> names;\n",
+        );
+        fs::write(
+            root.path().join("lib/src/queue.c"),
+            "struct list { struct list *next; int value; };\n\
+             int list_length(struct list *head) {\n\
+             \x20   int count = 0;\n\
+             \x20   for (; head; head = head->next) count++;\n\
+             \x20   return count;\n\
+             }\n",
+        )
+        .unwrap();
+        let (target, prelude, _) = auto_widget(root.path());
+        let names = std_prelude_names(&target);
+        for name in ["list", "map", "string"] {
+            assert!(names.iter().any(|entry| entry == name), "{name}: {names:?}");
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{name}: {prelude}"
+            );
         }
     }
 
