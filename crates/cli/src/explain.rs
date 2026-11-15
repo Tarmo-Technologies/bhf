@@ -3971,11 +3971,10 @@ mod tests {
         let harness_id = "H-C0001-0A0B0C0D";
         let dir = crate::auto::layout::harness_dir(work.path(), harness_id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            crate::auto::layout::harness_exe(&dir, "main"),
-            b"\x7fELF ... __afl_area_ptr ...",
-        )
-        .unwrap();
+        let main = crate::auto::layout::harness_exe(&dir, "main");
+        // `main.exe` on Windows.
+        let main_name = main.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(&main, b"\x7fELF ... __afl_area_ptr ...").unwrap();
         std::fs::write(
             dir.join(crate::repro_lane::GENERATION_METADATA),
             serde_json::json!({"language": "c",
@@ -3991,10 +3990,10 @@ mod tests {
         let out = explain_one(work.path(), &finding, &[], false);
         let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            words.contains(
-                "No comparison evidence recorded for testcase.bin: main has no bhf driver that \
-                 records comparisons, though this bhf generated its harness"
-            ),
+            words.contains(&format!(
+                "No comparison evidence recorded for testcase.bin: {main_name} has no bhf driver \
+                 that records comparisons, though this bhf generated its harness"
+            )),
             "{out}"
         );
         assert!(!out.contains("replayed through"), "{out}");
