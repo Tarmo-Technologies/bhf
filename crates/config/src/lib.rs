@@ -2,6 +2,13 @@
 
 use std::str::FromStr;
 
+pub mod toolchain;
+
+pub use toolchain::{
+    cross_config_from_file_text, AdaToolchainConfig, CrossConfig, CrossGuardConfig,
+    ToolchainConfig, ToolchainConfigError,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     StrictPermissive,

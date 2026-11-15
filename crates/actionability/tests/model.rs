@@ -123,6 +123,7 @@ fn serializes_actionability_record_in_spec_shape() {
             target: "Pkg.Parse".to_owned(),
             evidence: Vec::new(),
             attacker_reachable: None,
+            reachability_basis: None,
         }),
         fix_location: Some(FixLocation {
             path: "src/pkg.adb".to_owned(),
@@ -141,6 +142,7 @@ fn serializes_actionability_record_in_spec_shape() {
         prosthetics: Prosthetics::default(),
         patch_hints: Vec::new(),
         next_steps: Vec::new(),
+        verdict_reason: None,
     };
 
     let value = serde_json::to_value(record).unwrap();
@@ -220,9 +222,10 @@ fn cwe_mapping_covers_core_bug_classes() {
         case("signed-integer-overflow", "", "ubsan"),
         vec!["CWE-190".to_owned()]
     );
+    // A shift is its own weakness (CWE-1335), not "Incorrect Calculation".
     assert_eq!(
         case("shift-exponent", "shift exponent too large", "ubsan"),
-        vec!["CWE-682".to_owned()]
+        vec!["CWE-1335".to_owned()]
     );
     assert_eq!(
         case("timeout", "timeout after 60s", ""),
@@ -325,4 +328,671 @@ fn rust_index_out_of_bounds_panic_maps_to_oob_cwe() {
     );
     assert_eq!(write.cwe[0], "CWE-787");
     assert_eq!(write.cwe_name.as_deref(), Some("Out-of-bounds Write"));
+}
+
+/// A UBSan finding as the emitter writes it: the per-check exception name, the
+/// UBSan report line (location prefix included) and the check name.
+fn ubsan_finding(kind: &str, rule: &str, message: &str) -> serde_json::Value {
+    json!({
+        "rule_id": rule,
+        "harness_id": "H-C0001",
+        "paths": { "testcase": "testcase.bin" },
+        "exception": {
+            "name": format!("UBSAN_{}", kind.to_ascii_uppercase().replace('-', "_")),
+            "sanitizer": "ubsan",
+            "message": format!("/src/widget/w.cc:7:9: runtime error: {message}"),
+            "stack": [{ "function": "parse_record(unsigned char const*)", "file": "/src/widget/w.cc", "line": 7 }]
+        }
+    })
+}
+
+const UBSAN_KINDS: &[(&str, &str, &str, &[&str])] = &[
+    ("signed-integer-overflow", "BHF-205", "signed integer overflow: 2147483647 + 5 cannot be represented in type 'int'", &["CWE-190"]),
+    ("null-pointer-dereference", "BHF-206", "load of null pointer of type 'int'", &["CWE-476"]),
+    ("out-of-bounds-access", "BHF-220", "index 10 out of bounds for type 'int[4]'", &["CWE-129", "CWE-125", "CWE-787"]),
+    ("invalid-vla-bound", "BHF-220", "variable length array bound evaluates to non-positive value -1", &["CWE-129"]),
+    ("division-by-zero", "BHF-222", "division by zero", &["CWE-369"]),
+    ("invalid-shift", "BHF-215", "shift exponent 40 is too large for 32-bit type 'int'", &["CWE-1335"]),
+    ("missing-return", "BHF-214", "execution reached the end of a value-returning function without returning a value", &["CWE-758"]),
+    ("unreachable", "BHF-216", "execution reached an unreachable program point", &["CWE-758"]),
+    ("invalid-value-load", "BHF-217", "load of value 7, which is not a valid value for type 'bool'", &["CWE-758"]),
+    ("float-cast-overflow", "BHF-218", "1e+20 is outside the range of representable values of type 'int'", &["CWE-681"]),
+    ("implicit-conversion", "BHF-218", "implicit conversion from type 'long long' of value 1099511627776 (64-bit, signed) to type 'int' changed the value to 0 (32-bit, signed)", &["CWE-681", "CWE-197"]),
+    ("pointer-overflow", "BHF-219", "pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", &["CWE-823", "CWE-119"]),
+    ("misaligned-access", "BHF-213", "load of misaligned address 0x7c3938b00021 for type 'int', which requires 4 byte alignment", &["CWE-758"]),
+    ("insufficient-object-size", "BHF-201", "store to address 0x7ffc with insufficient space for an object of type 'int'", &["CWE-787"]),
+    ("type-mismatch", "BHF-221", "call to function parse_record through pointer to incorrect function type 'int (*)(void)'", &["CWE-843"]),
+    ("invalid-builtin-use", "BHF-213", "passing zero to __builtin_ctz(), which is not a valid argument", &["CWE-758"]),
+    ("undefined-behavior", "BHF-213", "a check this release does not name", &["CWE-758"]),
+];
+
+/// Each UBSan check kind gets its own CWE, explanation and fix hint; none of
+/// them is the arithmetic-overflow narrative except the overflow itself.
+#[test]
+fn every_ubsan_kind_gets_its_own_cwe_explanation_and_fix_hint() {
+    let mut explanations = std::collections::BTreeSet::new();
+    let mut hints = std::collections::BTreeSet::new();
+    for (kind, rule, message, cwes) in UBSAN_KINDS {
+        let raw = ubsan_finding(kind, rule, message);
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        let want: Vec<String> = cwes.iter().map(|c| (*c).to_owned()).collect();
+        assert_eq!(rec.cwe, want, "{kind}");
+        let name = rec.cwe_name.clone().unwrap_or_default();
+        assert!(
+            !name.is_empty() && name != "Uncategorized Weakness",
+            "{kind}: {name}"
+        );
+        assert_ne!(name, "Incorrect Calculation", "{kind}");
+        let explanation = rec.explanation.clone().unwrap();
+        if *kind != "signed-integer-overflow" {
+            assert!(!explanation.contains("overflows"), "{kind}: {explanation}");
+        }
+        let hint = rec
+            .patch_hints
+            .first()
+            .map(|h| h.guidance.clone())
+            .unwrap_or_default();
+        if ![
+            "signed-integer-overflow",
+            "null-pointer-dereference",
+            "division-by-zero",
+        ]
+        .contains(kind)
+        {
+            assert!(
+                !hint.contains("overflow before the arithmetic"),
+                "{kind}: {hint}"
+            );
+        }
+        explanations.insert(explanation.split(':').next().unwrap().to_owned());
+        hints.insert(hint);
+    }
+    assert_eq!(explanations.len(), UBSAN_KINDS.len(), "{explanations:#?}");
+    assert_eq!(hints.len(), UBSAN_KINDS.len(), "{hints:#?}");
+
+    let missing_return = backfill_actionability(
+        RunMode::Reporting,
+        &ubsan_finding("missing-return", "BHF-214", UBSAN_KINDS[6].2),
+        None,
+    );
+    assert_eq!(
+        missing_return.cwe_name.as_deref(),
+        Some("Reliance on Undefined, Unspecified, or Implementation-Defined Behavior")
+    );
+    assert!(missing_return.patch_hints[0].guidance.contains("return"));
+    let shift = backfill_actionability(
+        RunMode::Reporting,
+        &ubsan_finding("invalid-shift", "BHF-215", UBSAN_KINDS[5].2),
+        None,
+    );
+    assert_eq!(
+        shift.cwe_name.as_deref(),
+        Some("Incorrect Bitwise Shift of Integer")
+    );
+}
+
+/// Records written before the per-check kinds carry the generic
+/// `UBSAN_UNDEFINED_BEHAVIOR` name, or a NULL/index kind whose UBSan origin
+/// used to short-circuit to "Incorrect Calculation"; the report text after the
+/// location still names the check.
+#[test]
+fn older_ubsan_records_are_classified_from_their_report_text() {
+    let generic = json!({
+        "rule_id": "BHF-210",
+        "exception": {
+            "name": "UBSAN_UNDEFINED_BEHAVIOR",
+            "sanitizer": "ubsan",
+            "message": "/src/widget/classify.cc:3:5: runtime error: execution reached the end of a value-returning function without returning a value",
+            "stack": []
+        }
+    });
+    let rec = backfill_actionability(RunMode::Reporting, &generic, None);
+    assert_eq!(rec.cwe, vec!["CWE-758".to_owned()]);
+    assert!(rec.patch_hints[0].guidance.contains("return"));
+    for (name, rule, message, cwe) in [
+        (
+            "UBSAN_NULL_POINTER_DEREFERENCE",
+            "BHF-206",
+            "load of null pointer of type 'int'",
+            "CWE-476",
+        ),
+        (
+            "UBSAN_OUT_OF_BOUNDS_ACCESS",
+            "BHF-201",
+            "index 65 out of bounds for type 'int[4]'",
+            "CWE-129",
+        ),
+    ] {
+        let raw = json!({
+            "rule_id": rule,
+            "exception": {
+                "name": name,
+                "sanitizer": "ubsan",
+                "message": format!("/src/widget/two.cc:9:3: runtime error: {message}"),
+                "stack": [{ "function": "index_arr", "file": "/src/widget/two.cc", "line": 9 }]
+            }
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        assert_eq!(rec.cwe[0], cwe, "{name}");
+        assert_ne!(
+            rec.cwe_name.as_deref(),
+            Some("Incorrect Calculation"),
+            "{name}"
+        );
+    }
+}
+
+/// The source path a report starts with never decides the bug class: a path
+/// segment containing `oom`, `timeout` or `division_by_zero` is not an
+/// out-of-memory, hang or divide-by-zero finding.
+#[test]
+fn source_path_substrings_never_reclassify_a_finding() {
+    for path in [
+        "/src/zoomlib/Scale.cpp",
+        "/src/bloom/room.cc",
+        "/src/timeout/retry.c",
+        "/src/division_by_zero/math.c",
+        "/src/out_of_memory/alloc.c",
+    ] {
+        let raw = json!({
+            "rule_id": "BHF-205",
+            "exception": {
+                "name": "UBSAN_SIGNED_INTEGER_OVERFLOW",
+                "sanitizer": "ubsan",
+                "message": format!("{path}:5:24: runtime error: signed integer overflow: 1094795585 * 1094795585 cannot be represented in type 'int'"),
+                "stack": [{ "function": "zoom_scale", "file": path, "line": 5 }]
+            }
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        assert_eq!(rec.cwe, vec!["CWE-190".to_owned()], "{path}");
+        assert!(
+            rec.explanation.unwrap().contains("integer overflow"),
+            "{path}"
+        );
+    }
+    // GNAT's `file.adb:NN message` form (a line number followed by a space,
+    // not a colon): the unit's file name decides nothing either, so a unit
+    // named `timeout_ctl` or `oom_check` classifies like any other.
+    let gnat = |message: &str| {
+        let raw = json!({
+            "rule_id": "BHF-101",
+            "exception": {"name": "CONSTRAINT_ERROR", "message": message}
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        (rec.cwe, rec.cwe_name)
+    };
+    let control = gnat("parser.adb:17 range check failed");
+    for message in [
+        "timeout_ctl.adb:42 index check failed",
+        "oom_check.adb:17 range check failed",
+        "timeout_ctl.adb:42:7 index check failed",
+        "zoom_out_of_memory.ads:9 range check failed",
+    ] {
+        assert_eq!(gnat(message), control, "{message}");
+    }
+    // A real out-of-memory and a real timeout are still recognised.
+    let oom = json!({"rule_id": "BHF-209", "exception": {"name": "OUT_OF_MEMORY", "message": "harness exceeded the configured RSS limit (--rss-limit-mb)"}});
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &oom, None).cwe[0],
+        "CWE-789"
+    );
+    let leak_named_oom = json!({"exception": {"name": "LIBFUZZER_OOM", "message": "out-of-memory (malloc(2147483648))"}});
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &leak_named_oom, None).cwe[0],
+        "CWE-789"
+    );
+}
+
+fn segv_record(rule: &str, message: &str, access: Option<serde_json::Value>) -> serde_json::Value {
+    let mut raw = json!({
+        "rule_id": rule,
+        "exception": { "name": "ASAN_SEGV", "sanitizer": "asan", "message": message }
+    });
+    if let Some(access) = access {
+        raw["exception"]["access"] = access;
+    }
+    raw
+}
+
+/// SEGV direction is ASan's READ/WRITE token, not a substring of the message;
+/// no direction, or a non-canonical address whose READ is not a direction,
+/// maps to CWE-119 instead of defaulting to an out-of-bounds write.
+#[test]
+fn segv_direction_is_a_token_and_unknown_maps_to_cwe_119() {
+    let wild =
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 (pc 0x1 bp 0x2 sp 0x3 T0)";
+    let cwe = |raw: &serde_json::Value| backfill_actionability(RunMode::Reporting, raw, None).cwe;
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "read"}))
+        )),
+        ["CWE-125"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "write"}))
+        )),
+        ["CWE-787"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "unknown"}))
+        )),
+        ["CWE-119"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            "ERROR: AddressSanitizer: SEGV on unknown address (pc 0x1 bp 0x2 sp 0x3 T0) (READ memory access)",
+            Some(json!({"direction": "read", "address_hint": "high-value-address"}))
+        )),
+        ["CWE-119"]
+    );
+    // Older records: the direction folded into the message, or none at all.
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-206",
+            &format!("{wild} (READ memory access)"),
+            None
+        )),
+        ["CWE-125"]
+    );
+    assert_eq!(cwe(&segv_record("BHF-206", wild, None)), ["CWE-119"]);
+    // "thread" is not a READ.
+    let global = json!({
+        "rule_id": "BHF-201",
+        "exception": {
+            "name": "ASAN_GLOBAL_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "ERROR: AddressSanitizer: global-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (WRITE of size 4 at 0x1 thread T0)"
+        }
+    });
+    assert_eq!(cwe(&global), ["CWE-787"]);
+}
+
+/// A wild-address SEGV is its own rule and class, never a NULL dereference.
+#[test]
+fn wild_address_segv_is_not_a_null_dereference() {
+    let wild = segv_record(
+        "BHF-223",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x4141414141414141 (pc 0x1 bp 0x2 sp 0x3 T0)",
+        Some(json!({"direction": "write", "address": "0x4141414141414141"})),
+    );
+    let rec = backfill_actionability(RunMode::Reporting, &wild, None);
+    assert_ne!(rec.cwe[0], "CWE-476");
+    assert!(rec.explanation.unwrap().contains("invalid-memory access"));
+    let null = segv_record(
+        "BHF-206",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000010 (pc 0x1 bp 0x2 sp 0x3 T0)",
+        Some(
+            json!({"direction": "write", "address": "0x000000000010", "address_hint": "zero-page"}),
+        ),
+    );
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &null, None).cwe,
+        ["CWE-476"]
+    );
+    // A non-canonical dereference some compiler-rt releases print with a zero
+    // address: the high-value hint says it is wild, under any stored rule.
+    let message = "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x1 bp 0x2 \
+                   sp 0x3 T0) (READ memory access; high value address)";
+    let zeroed = segv_record(
+        "BHF-206",
+        message,
+        Some(json!({"direction": "unknown", "address": "0x000000000000",
+                    "address_hint": "high-value-address"})),
+    );
+    let rec = backfill_actionability(RunMode::Reporting, &zeroed, None);
+    assert_ne!(rec.cwe, ["CWE-476"]);
+    assert_eq!(rec.cwe, ["CWE-119"]);
+    // The same report text alone, from a record without the parsed access.
+    assert_eq!(
+        backfill_actionability(
+            RunMode::Reporting,
+            &segv_record("BHF-206", message, None),
+            None
+        )
+        .cwe,
+        ["CWE-119"]
+    );
+    // A zero-page hint keeps it a NULL dereference.
+    let zero_page = segv_record(
+        "BHF-206",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x1 bp 0x2 sp 0x3 \
+         T0) (READ memory access)",
+        Some(json!({"direction": "read", "address": "0x000000000000",
+                    "address_hint": "zero-page"})),
+    );
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &zero_page, None).cwe,
+        ["CWE-476"]
+    );
+}
+
+/// Windows ASan names a deadly memory-access signal by its exception
+/// (`access-violation`, `in-page-error`); each is classified like a SEGV.
+#[test]
+fn windows_access_faults_are_classified_like_a_segv() {
+    let fault = |rule: &str, name: &str, kind: &str, address: &str, access: serde_json::Value| {
+        let mut raw = segv_record(
+            rule,
+            &format!(
+                "ERROR: AddressSanitizer: {kind} on unknown address {address} (pc 0x1 bp 0x2 sp \
+                 0x3 T0) (READ memory access)"
+            ),
+            Some(access),
+        );
+        raw["exception"]["name"] = json!(name);
+        backfill_actionability(RunMode::Reporting, &raw, None)
+    };
+    for (name, kind) in [
+        ("ASAN_ACCESS_VIOLATION", "access-violation"),
+        ("ASAN_IN_PAGE_ERROR", "in-page-error"),
+    ] {
+        let wild = fault(
+            "BHF-223",
+            name,
+            kind,
+            "0x7f0000001000",
+            json!({"direction": "read", "address": "0x7f0000001000"}),
+        );
+        assert_eq!(wild.cwe, ["CWE-125"], "{kind}");
+        assert!(
+            wild.explanation
+                .as_deref()
+                .is_some_and(|text| text.contains("invalid-memory access")),
+            "{kind}: {:?}",
+            wild.explanation
+        );
+        let null = fault(
+            "BHF-206",
+            name,
+            kind,
+            "0x000000000000",
+            json!({"direction": "read", "address": "0x000000000000",
+                   "address_hint": "zero-page"}),
+        );
+        assert_eq!(null.cwe, ["CWE-476"], "{kind}");
+    }
+}
+
+/// The reachability of an event-driven entry says what the call-graph scan
+/// matched: the registrar a handler is passed to, or the channel a consumer
+/// reads, and that the match was not recorded for an older finding.
+#[test]
+fn channel_consumer_reachability_names_its_basis() {
+    let statement = |label: &str, basis: serde_json::Value| {
+        let raw = json!({
+            "harness_id": "H-C0001",
+            "actionability": { "verdict": "likely_reachable" },
+            "input_reachability": label,
+            "input_reachability_basis": basis,
+        });
+        actionability::reachability_statement(&raw, Some("poll_status"))
+    };
+    let mmio = statement(
+        "channel_consumer",
+        json!({"rule": "call_graph_provenance", "via": "volatile_pointer"}),
+    );
+    assert!(mmio.contains("volatile pointer"), "{mmio}");
+    assert!(!mmio.contains("registered"), "{mmio}");
+    assert!(mmio.contains("not proven"), "{mmio}");
+    let queue = statement(
+        "channel_consumer",
+        json!({"rule": "call_graph_provenance", "via": "mq_receive"}),
+    );
+    assert!(queue.contains("a message with `mq_receive`"), "{queue}");
+    assert!(!queue.contains("registered"), "{queue}");
+    let handler = statement(
+        "registered_entry_point",
+        json!({"rule": "call_graph_provenance", "via": "intConnect"}),
+    );
+    assert!(handler.contains("passed to `intConnect`"), "{handler}");
+    assert!(handler.contains("not proven"), "{handler}");
+    let older = statement("channel_consumer", json!({"rule": "call_graph_provenance"}));
+    assert!(
+        older.contains("the call it matched was not recorded"),
+        "{older}"
+    );
+    assert!(!older.contains("registered as a task"), "{older}");
+}
+
+/// A heap overflow of a decoded C string the generated harness allocated, on
+/// an entry whose signature takes a byte buffer.
+fn overflow_of_a_decoded_string() -> serde_json::Value {
+    json!({
+        "id": "F-0001-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0001",
+        "input_reachability": "attacker_reachable",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+            "message": "heap-buffer-overflow READ of size 4",
+            "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }],
+            "access": {
+                "direction": "read", "size": 4,
+                "region": { "kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0 },
+                "alloc_stack": [
+                    { "function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68 },
+                    { "function": "bhf_c_string", "file": "/w/harnesses/H-C0001/bhf_decode.h", "line": 195 },
+                    { "function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 106 }
+                ]
+            }
+        }
+    })
+}
+
+/// A `lab_only` verdict records why, beside the entry's own signature-based
+/// reachability, which can still say the entry takes input.
+#[test]
+fn lab_only_verdicts_name_their_reason() {
+    let raw = overflow_of_a_decoded_string();
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(
+        record.verdict_reason.as_deref(),
+        Some("harness_sized_buffer")
+    );
+    assert_eq!(
+        record
+            .entry_path
+            .as_ref()
+            .and_then(|entry| entry.attacker_reachable),
+        Some(true)
+    );
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["verdict_reason"],
+        "harness_sized_buffer"
+    );
+
+    let mut stubbed = raw.clone();
+    stubbed["build"] = json!({"deps": {"stubbed": ["read_sensor"]}});
+    let record = backfill_actionability(RunMode::Reporting, &stubbed, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(record.verdict_reason.as_deref(), Some("stubbed_value"));
+
+    let reachable = json!({
+        "id": "F-0002-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0002",
+        "input_reachability": "attacker_reachable",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+            "message": "heap-buffer-overflow READ of size 4",
+            "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }]
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &reachable, None);
+    assert_eq!(record.verdict, Verdict::LikelyReachable);
+    assert_eq!(record.verdict_reason, None);
+    assert!(serde_json::to_value(&record)
+        .unwrap()
+        .get("verdict_reason")
+        .is_none());
+
+    // A record stored before the reason was kept gets it filled in when the
+    // recomputed verdict is the stored one.
+    let mut stored = raw.clone();
+    let mut older =
+        serde_json::to_value(backfill_actionability(RunMode::Reporting, &raw, None)).unwrap();
+    older.as_object_mut().unwrap().remove("verdict_reason");
+    stored["actionability"] = older;
+    let record =
+        actionability::existing_actionability_or_backfill(RunMode::Reporting, &stored, None);
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(
+        record.verdict_reason.as_deref(),
+        Some("harness_sized_buffer")
+    );
+    // A stored verdict the record no longer supports gets no reason.
+    stored["actionability"]["verdict"] = json!("likely_reachable");
+    let record =
+        actionability::existing_actionability_or_backfill(RunMode::Reporting, &stored, None);
+    assert_eq!(record.verdict, Verdict::LikelyReachable);
+    assert_eq!(record.verdict_reason, None);
+    // The stub override of a stored record says why.
+    let mut stored_stubbed = stubbed.clone();
+    stored_stubbed["actionability"] = stored["actionability"].clone();
+    let record = actionability::existing_actionability_or_backfill(
+        RunMode::Reporting,
+        &stored_stubbed,
+        None,
+    );
+    assert_eq!(record.verdict, Verdict::LabOnly);
+    assert_eq!(record.verdict_reason.as_deref(), Some("stubbed_value"));
+}
+
+/// Every lab-only and blocked verdict has a reason code of its own: each code
+/// in `VERDICT_REASONS` is what a finding that only its rule demotes records.
+#[test]
+fn each_demoting_rule_has_its_own_reason_code() {
+    let mut stubbed = overflow_of_a_decoded_string();
+    stubbed["build"] = json!({"deps": {"stubbed": ["read_sensor"]}});
+    let cases: Vec<(&str, Verdict, serde_json::Value)> = vec![
+        ("stubbed_value", Verdict::LabOnly, stubbed),
+        (
+            "missing_resource",
+            Verdict::Blocked,
+            json!({
+                "id": "F-0010-0a0b0c0d", "rule_id": "BHF-304", "harness_id": "H-C0010",
+                "blocked_resources": [{ "kind": "file_missing", "path": "/etc/widget/widget.conf" }]
+            }),
+        ),
+        (
+            "allocator_only_leak",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0011-0a0b0c0d", "rule_id": "BHF-208", "harness_id": "H-R0011",
+                "exception": {
+                    "sanitizer": "lsan", "name": "memory-leak",
+                    "stack": [
+                        { "function": "malloc" },
+                        { "function": "<alloc::raw_vec::RawVecInner>::with_capacity_in" },
+                        { "function": "<alloc::vec::Vec<u8>>::with_capacity_in" }
+                    ]
+                }
+            }),
+        ),
+        (
+            "contract_assertion",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0012-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-R0012",
+                "exception": {
+                    "name": "panic",
+                    "message": "subset is out of bounds: self = (0x1, 10), subset = (0x2, 3)",
+                    "stack": [{ "function": "slice_ref", "file": "src/widget.rs", "line": 43 }]
+                }
+            }),
+        ),
+        (
+            "short_slice_precondition",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0013-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-R0013",
+                "exception": {
+                    "sanitizer": "asan", "name": "ASAN_RUST_PANIC_INDEX_OUT_OF_BOUNDS",
+                    "message": "Rust panic: range end index 8 out of range for slice of length 3",
+                    "stack": [{ "function": "<rust panic>", "file": "src/lib.rs", "line": 90 }]
+                }
+            }),
+        ),
+        (
+            "harness_cleanup",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0014-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0014",
+                "input_reachability": "attacker_reachable",
+                "exception": {
+                    "name": "ASAN_ATTEMPTING",
+                    "message": "ERROR: AddressSanitizer: attempting double-free on 0x502000000070 in thread T0:",
+                    "stack": [
+                        { "function": "free", "file": null, "line": null },
+                        { "function": "bhf_run_one", "file": "/w/auto/H-C0014/main.c", "line": 64 },
+                        { "function": "main", "file": "/w/auto/H-C0014/main.c", "line": 545 }
+                    ]
+                }
+            }),
+        ),
+        (
+            "must_panic",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0015-0a0b0c0d", "rule_id": "BHF-210", "harness_id": "H-G0015",
+                "input_reachability": "attacker_reachable",
+                "exception": {
+                    "name": "ASAN_GO_PANIC",
+                    "message": "Go panic: cannot decode widget: empty input",
+                    "stack": [{ "function": "example.com/widget.MustDecode", "file": "decode.go", "line": 60 }]
+                }
+            }),
+        ),
+        (
+            "enum_domain_precondition",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0016-0a0b0c0d", "rule_id": "BHF-415", "harness_id": "H-C0016",
+                "classification": "oracle_hit",
+                "oracle": {
+                    "name": "native-assertion-contract", "api": "__assert_fail",
+                    "evidence": [{ "key": "expression", "value": "kind == WidgetSmall || kind == WidgetLarge" }]
+                },
+                "exception": { "name": "oracle", "message": "native assertion contract failed" }
+            }),
+        ),
+        (
+            "harness_sized_buffer",
+            Verdict::LabOnly,
+            overflow_of_a_decoded_string(),
+        ),
+        (
+            "entry_not_input",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0003-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0003",
+                "input_reachability": "reachability_unproven",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+                    "message": "heap-buffer-overflow READ of size 4",
+                    "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }]
+                }
+            }),
+        ),
+    ];
+    for (code, verdict, raw) in &cases {
+        let record = backfill_actionability(RunMode::Reporting, raw, None);
+        assert_eq!(
+            (record.verdict, record.verdict_reason.as_deref()),
+            (*verdict, Some(*code)),
+            "{raw:#}"
+        );
+    }
+    let covered: std::collections::BTreeSet<&str> = cases.iter().map(|(code, ..)| *code).collect();
+    let listed: std::collections::BTreeSet<&str> = actionability::VERDICT_REASONS
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    assert_eq!(covered, listed, "a listed reason code no case demotes to");
 }

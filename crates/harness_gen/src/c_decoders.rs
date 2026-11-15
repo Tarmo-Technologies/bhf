@@ -208,9 +208,14 @@ pub fn select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
 /// `HANDLE`/`HWND`/`LPVOID` stay-opaque assertions in `type_model`). MFC *class*
 /// types like `CString` are also out of scope (constructing a class arg).
 fn normalize_win32_typedef(c_type: &str) -> Option<&'static str> {
+    // Byte-buffer pointers (`PBYTE`, `LPCBYTE`, ...) — driven from the fuzz
+    // input like the spelled byte pointers they stand for.
+    match type_model::win32_byte_pointer_typedef(c_type) {
+        Some(true) => return Some("const unsigned char *"),
+        Some(false) => return Some("unsigned char *"),
+        None => {}
+    }
     Some(match c_type.trim() {
-        // Byte-buffer pointers — driven from the fuzz `(Data, Size)` buffer.
-        "PUCHAR" | "PBYTE" | "LPBYTE" => "unsigned char *",
         // C-string pointers — driven from a NUL-terminated fuzz C string.
         "LPCSTR" | "LPCTSTR" | "PCSTR" => "const char *",
         "LPSTR" | "LPTSTR" | "PSTR" => "char *",
@@ -956,36 +961,24 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         "unsigned" | "unsigned int" => Some(scalar(
             name,
             "unsigned int",
-            "(unsigned int)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
+            &unsigned32_expr("unsigned int", name),
         )),
         "long" | "signed long" => Some(scalar(name, "long", "(long)bhf_i64(&Cur)")),
         "unsigned long" => Some(scalar(
             name,
             "unsigned long",
-            "(unsigned long)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            &unsigned64_expr("unsigned long", name),
         )),
         "uLong" | "uLongf" => Some(scalar(
             name,
             normalized.as_str(),
-            "(uLong)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            &unsigned64_expr("uLong", name),
         )),
-        "uInt" => Some(scalar(
-            name,
-            "uInt",
-            "(uInt)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
-        )),
-        "z_size_t" => Some(scalar(
-            name,
-            "z_size_t",
-            "(z_size_t)bhf_bounded_length(&Cur, 0, 65536)",
-        )),
-        "mz_ulong" => Some(scalar(
-            name,
-            "mz_ulong",
-            "(mz_ulong)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
-        )),
+        "uInt" => Some(scalar(name, "uInt", &unsigned32_expr("uInt", name))),
+        "z_size_t" => Some(scalar(name, "z_size_t", &size_expr("z_size_t", name))),
+        "mz_ulong" => Some(scalar(name, "mz_ulong", &unsigned64_expr("mz_ulong", name))),
         "long long" | "signed long long" => Some(scalar(name, "long long", "bhf_i64(&Cur)")),
-        "size_t" => Some(scalar(name, "size_t", "bhf_bounded_length(&Cur, 0, 65536)")),
+        "size_t" => Some(scalar(name, "size_t", &size_expr("size_t", name))),
         "uint8_t" | "unsigned char" => Some(scalar(name, "uint8_t", "bhf_u8(&Cur)")),
         "int8_t" | "signed char" | "char" => Some(scalar(name, "int8_t", "(int8_t)bhf_u8(&Cur)")),
         "uint16_t" => Some(scalar(
@@ -995,13 +988,9 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         )),
         "int16_t" => Some(scalar(name, "int16_t", "(int16_t)bhf_i32(&Cur)")),
         "int32_t" => Some(scalar(name, "int32_t", "bhf_i32(&Cur)")),
-        "uint32_t" => Some(scalar(
-            name,
-            "uint32_t",
-            "(uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
-        )),
+        "uint32_t" => Some(scalar(name, "uint32_t", &unsigned32_expr("uint32_t", name))),
         "int64_t" => Some(scalar(name, "int64_t", "bhf_i64(&Cur)")),
-        "uint64_t" => Some(scalar(name, "uint64_t", "(uint64_t)bhf_i64(&Cur)")),
+        "uint64_t" => Some(scalar(name, "uint64_t", &unsigned64_expr("uint64_t", name))),
         // MSVC fixed-width integer spellings (`__intN`). A header's
         // `#ifdef _MSC_VER typedef __int64 ssize_t` branch is parsed verbatim
         // (tree-sitter doesn't evaluate the #ifdef), so a typedef can resolve to
@@ -1011,13 +1000,13 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         "unsigned __int64" => Some(scalar(
             name,
             "unsigned __int64",
-            "(unsigned __int64)bhf_i64(&Cur)",
+            &unsigned64_expr("unsigned __int64", name),
         )),
         "__int32" | "signed __int32" => Some(scalar(name, "__int32", "bhf_i32(&Cur)")),
         "unsigned __int32" => Some(scalar(
             name,
             "unsigned __int32",
-            "(unsigned __int32)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
+            &unsigned32_expr("unsigned __int32", name),
         )),
         "__int16" | "signed __int16" => Some(scalar(name, "__int16", "(__int16)bhf_i32(&Cur)")),
         "unsigned __int16" => Some(scalar(
@@ -1093,9 +1082,8 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         // scalar scratch is not sufficient and lets the callee write out of
         // bounds. Give it bounded, writable headroom and seed the prefix from
         // the fuzz input so in/out buffers remain fuzz-driven.
-        "unsigned char *" | "uint8_t *" | "int8_t *" | "signed char *" => {
-            Some(mutable_byte_pointer(normalized.as_str(), name))
-        }
+        "unsigned char *" | "uint8_t *" | "int8_t *" | "signed char *" | "std::uint8_t *"
+        | "std::int8_t *" => Some(mutable_byte_pointer(normalized.as_str(), name)),
         "const void *" | "void const *" => Some(const_void_pointer(name)),
         "void *" => Some(mutable_void_pointer(name)),
         "FILE *" => Some(file_pointer("FILE *", name)),
@@ -1138,6 +1126,23 @@ struct DecodeContext<'a> {
     /// Configurable struct/array synthesis caps (§27.11); [`DecoderLimits::default`]
     /// reproduces the historical hardcoded behavior byte-for-byte.
     limits: DecoderLimits,
+    /// Set while the statements decode one element of a typed array inside
+    /// the loop over its elements: the loop's index and element count. A
+    /// pointer field's pointee then gets one slot per element in storage
+    /// allocated before the loop ([`Self::hoisted`]), because a local
+    /// declared in the loop body would not outlive it.
+    each_element: Option<(String, String)>,
+    /// Statements that run before the element loop, the cleanups of what
+    /// they allocate, and the allocations the loop runs only when they
+    /// succeeded.
+    hoisted: Vec<String>,
+    hoisted_cleanups: Vec<String>,
+    hoisted_guards: Vec<String>,
+    /// Set while the statements fill heap storage the harness allocated (the
+    /// elements of a typed array, and what they point to), in C: a `const`
+    /// member, which cannot be assigned, is then decoded into a local and
+    /// copied into place. Anywhere else a `const` member is left zero.
+    const_members_writable: bool,
 }
 
 impl<'a> DecodeContext<'a> {
@@ -1151,6 +1156,11 @@ impl<'a> DecodeContext<'a> {
             cpp,
             header_complete: None,
             limits,
+            each_element: None,
+            hoisted: Vec::new(),
+            hoisted_cleanups: Vec::new(),
+            hoisted_guards: Vec::new(),
+            const_members_writable: false,
         }
     }
 
@@ -1196,7 +1206,10 @@ fn emit_top_level_value(
 ) -> Result<String, CDecoderError> {
     match shape {
         TypeShape::Scalar(kind) => {
-            ctx.push(format!("{c_type} {name} = {}", scalar_expr(*kind, c_type)));
+            ctx.push(format!(
+                "{c_type} {name} = {}",
+                scalar_expr(*kind, c_type, name)
+            ));
             Ok(name.to_owned())
         }
         TypeShape::CString => {
@@ -1241,7 +1254,14 @@ fn emit_top_level_value(
                     "array parameter '{name}' of type '{c_type}' needs declarator support"
                 )));
             };
-            ctx.push(format!("{base} {name}[{len}]"));
+            // In C++ an array of a type with a `const` member must be
+            // initialized to be declared at all.
+            let init = if ctx.cpp && const_member_within(elem, false) {
+                "{}"
+            } else {
+                ""
+            };
+            ctx.push(format!("{base} {name}[{len}]{init}"));
             emit_array_decode(ctx, name, base, elem, *len, 0);
             Ok(name.to_owned())
         }
@@ -1289,6 +1309,16 @@ fn emit_top_level_pointer(
     lifecycle: &[CHandleLifecycle],
 ) -> Result<String, CDecoderError> {
     match inner {
+        TypeShape::Scalar(ScalarKind::U8 | ScalarKind::I8) if is_hidden_pointer(c_type) => {
+            // A byte pointer spelled through a typedef (`typedef const BYTE
+            // *cbytes_t`) is a buffer, like the spelled pointer it stands
+            // for, not a pointer to one byte of storage the callee reads
+            // past. The typedef hides whether the bytes are const, so it
+            // gets the read-only buffer's NUL-terminated copy, whose `(void
+            // *)` writes compile and whose size is the input's either way.
+            emit_nul_terminated_byte_copy(ctx, c_type, name);
+            Ok(name.to_owned())
+        }
         TypeShape::Scalar(kind) => {
             if is_const_byte_pointer(c_type, *kind) {
                 // A LONE const byte pointer (a `(buffer, length)` pair would have
@@ -1304,22 +1334,39 @@ fn emit_top_level_pointer(
                 // input. Zero the whole buffer first so the bytes past `Size` are
                 // defined (a fixed-width read sees zeros, not heap garbage), then copy
                 // the fuzz bytes and keep the C-string NUL terminator.
-                let cap = format!("_bhf_cap_{name}");
-                ctx.push(format!(
-                    "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
-                     {c_type} {name} = ({c_type})malloc({cap}); \
-                     if ({name}) {{ memset((void *){name}, 0, {cap}); \
-                     if (Size) memcpy((void *){name}, Data, Size); \
-                     ((char *){name})[Size] = '\\0'; }}"
-                ));
+                emit_nul_terminated_byte_copy(ctx, c_type, name);
+                return Ok(name.to_owned());
+            }
+            if is_writable_char_typedef_pointer(c_type, *kind, ctx.registry) {
+                // A writable pointer to a `char` typedef (Win32 `CHAR *`, a
+                // project `typedef char text_t`) is the writable string a
+                // spelled `char *` is: a fixed-capacity, NUL-terminated buffer,
+                // see `bhf_c_string_out`. One byte of scratch storage let a
+                // correct callee write past it. The typedef can hide a `const`
+                // the registry does not record, so the free goes through
+                // `(void *)`.
+                ctx.push(format!("{c_type} {name} = bhf_c_string_out(&Cur, 4096)"));
                 ctx.cleanups.push(format!("free((void *){name})"));
+                return Ok(name.to_owned());
+            }
+            if is_writable_byte_buffer(c_type, *kind, ctx.registry) {
+                // A writable byte pointer whose element type is spelled through
+                // a typedef (`octet_t *`, Win32 `BYTE *`) is the same
+                // caller-owned buffer as the spelled `unsigned char *`, and
+                // gets the same input copy plus headroom: one byte of scratch
+                // storage let a correct callee write past it. The typedef can
+                // hide a `const` the registry does not record, so the copy and
+                // the free go through `(void *)`.
+                let emission = byte_buffer_with_headroom(c_type, name, true);
+                ctx.push(emission.decl);
+                ctx.cleanups.extend(emission.free);
                 return Ok(name.to_owned());
             }
             let storage_type = output_pointer_storage_type(c_type, pointer_base_hint, name)?;
             let storage = format!("_bhf_out_{name}");
             ctx.push(format!(
                 "{storage_type} {storage} = {}",
-                scalar_expr(*kind, &storage_type)
+                scalar_expr(*kind, &storage_type, name)
             ));
             ctx.push(format!("{c_type} {name} = &{storage}"));
             Ok(name.to_owned())
@@ -1340,6 +1387,30 @@ fn emit_top_level_pointer(
                 )));
             };
             let storage_type = storage_c_type(&base);
+            // A `const` member can be decoded only into heap storage: give
+            // the pointee the storage of a one-element typed array.
+            if !ctx.cpp && has_const_member(inner) {
+                if let Some(element) = typed_array_element_decode(
+                    name,
+                    &storage_type,
+                    "1",
+                    ctx.registry,
+                    false,
+                    ctx.limits,
+                ) {
+                    ctx.push(format!(
+                        "{c_type} {name} = ({c_type})calloc(1, sizeof({storage_type}))"
+                    ));
+                    ctx.push(element.decl);
+                    ctx.support.extend(element.support);
+                    let free = format!("free((void *){name})");
+                    ctx.cleanups.push(match element.cleanup {
+                        Some(cleanup) => format!("{cleanup}; {free}"),
+                        None => free,
+                    });
+                    return Ok(name.to_owned());
+                }
+            }
             let storage = format!("_bhf_value_{name}");
             ctx.push(format!("{storage_type} {storage}{}", ctx.value_init_suffix()));
             emit_struct_init(ctx, &storage, struct_name, fields, 0);
@@ -1574,6 +1645,70 @@ fn is_const_pointee(c_type: &str) -> bool {
     }
 }
 
+/// A heap copy of the input for a lone read-only byte pointer `name` of type
+/// `c_type`, freed after the call. By default it is NUL-terminated, at least
+/// 8 bytes and zeroed past the input.
+///
+/// With the buffer-length dimension ([`crate::buffer_len_dimension_enabled`])
+/// the buffer's bytes are exactly its slice, so the copy is exactly that size
+/// (one zeroed byte when empty, so a read of byte 0 of an empty buffer is not
+/// reported), with no floor and no NUL: a read past it is a heap overflow.
+fn emit_nul_terminated_byte_copy(ctx: &mut DecodeContext<'_>, c_type: &str, name: &str) {
+    let cap = format!("_bhf_cap_{name}");
+    if crate::buffer_len_dimension_enabled() {
+        ctx.push(format!(
+            "size_t {cap} = (size_t)Size ? (size_t)Size : 1; \
+             {c_type} {name} = ({c_type})malloc({cap}); \
+             if ({name}) {{ memset((void *){name}, 0, {cap}); \
+             if (Size) memcpy((void *){name}, Data, Size); }}"
+        ));
+    } else {
+        ctx.push(format!(
+            "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
+             {c_type} {name} = ({c_type})malloc({cap}); \
+             if ({name}) {{ memset((void *){name}, 0, {cap}); \
+             if (Size) memcpy((void *){name}, Data, Size); \
+             ((char *){name})[Size] = '\\0'; }}"
+        ));
+    }
+    ctx.cleanups.push(format!("free((void *){name})"));
+}
+
+/// A pointer type spelled without a declarator (a typedef name such as
+/// `LPCBYTE` or `cbytes_t`), so its spelling hides the pointee.
+fn is_hidden_pointer(c_type: &str) -> bool {
+    !c_type.contains('*') && !c_type.contains('[') && !c_type.contains('(')
+}
+
+/// A spelled, non-const `T *` whose element `T` resolves to a byte scalar
+/// through the registry. A `T` that is a plain `char` is a string instead,
+/// see [`is_writable_char_typedef_pointer`].
+fn is_writable_byte_buffer(c_type: &str, kind: ScalarKind, registry: &TypeRegistry) -> bool {
+    matches!(kind, ScalarKind::U8 | ScalarKind::I8)
+        && !is_const_byte_pointer(c_type, kind)
+        && !pointee_is_plain_char(c_type, registry)
+}
+
+/// A spelled, non-const `T *` whose element `T` is a plain `char` through
+/// typedefs: a project `typedef char text_t` (or a chain of them), or Win32
+/// `CHAR`, which resolves without a typedef in the scanned tree.
+fn is_writable_char_typedef_pointer(
+    c_type: &str,
+    kind: ScalarKind,
+    registry: &TypeRegistry,
+) -> bool {
+    kind == ScalarKind::I8
+        && !is_const_byte_pointer(c_type, kind)
+        && pointee_is_plain_char(c_type, registry)
+}
+
+fn pointee_is_plain_char(c_type: &str, registry: &TypeRegistry) -> bool {
+    pointer_base_owned(c_type).is_some_and(|base| {
+        let target = registry.alias_target_spelling(&base).unwrap_or(base);
+        matches!(target.as_str(), "char" | "CHAR")
+    })
+}
+
 fn is_const_byte_pointer(c_type: &str, kind: ScalarKind) -> bool {
     if !matches!(kind, ScalarKind::U8 | ScalarKind::I8) {
         return false;
@@ -1624,6 +1759,15 @@ fn emit_struct_init(
         }
         let field_lvalue = format!("{lvalue}.{}", field.name);
         let before = ctx.clone();
+        if is_const_object_type(&field.c_type) {
+            if let Err(err) = emit_const_member(ctx, &field_lvalue, field, depth + 1) {
+                *ctx = before;
+                ctx.push(format!(
+                    "/* bhf: const field {field_lvalue} left zeroed: {err} */"
+                ));
+            }
+            continue;
+        }
         if let Err(err) =
             emit_lvalue_decode(ctx, &field_lvalue, &field.c_type, &field.shape, depth + 1)
         {
@@ -1656,15 +1800,18 @@ fn emit_union_init(
         }
         let mut attempt = ctx.clone();
         let field_lvalue = format!("{lvalue}.{}", field.name);
-        if emit_lvalue_decode(
-            &mut attempt,
-            &field_lvalue,
-            &field.c_type,
-            &field.shape,
-            depth + 1,
-        )
-        .is_ok()
-        {
+        let decoded = if is_const_object_type(&field.c_type) {
+            emit_const_member(&mut attempt, &field_lvalue, field, depth + 1)
+        } else {
+            emit_lvalue_decode(
+                &mut attempt,
+                &field_lvalue,
+                &field.c_type,
+                &field.shape,
+                depth + 1,
+            )
+        };
+        if decoded.is_ok() {
             *ctx = attempt;
             return Ok(());
         }
@@ -1677,6 +1824,148 @@ fn emit_union_init(
         "/* bhf: union {lvalue} left zeroed: no decodable member */"
     ));
     Ok(())
+}
+
+/// Decode the `const` member `field` at `lvalue`, which cannot be assigned:
+/// into a local of its unqualified type, then copied into place with
+/// `memcpy`. That is sound only where the member lives in heap storage the
+/// harness allocated, in C ([`DecodeContext::const_members_writable`]);
+/// anywhere else, and in C++, where writing a `const` subobject of a live
+/// object is undefined, it fails and the caller leaves the member zero.
+fn emit_const_member(
+    ctx: &mut DecodeContext<'_>,
+    lvalue: &str,
+    field: &Field,
+    depth: usize,
+) -> Result<(), CDecoderError> {
+    if ctx.cpp {
+        return Err(CDecoderError::new(
+            "a const member of a C++ object is not written",
+        ));
+    }
+    if !ctx.const_members_writable {
+        return Err(CDecoderError::new(
+            "a const member is written only into heap storage",
+        ));
+    }
+    let unqualified = storage_c_type(&field.c_type);
+    if unqualified.contains('(') {
+        return Err(CDecoderError::new(
+            "a const function pointer spelled inline cannot be copied through a local",
+        ));
+    }
+    if unqualified.split_whitespace().any(|token| token == ":") {
+        return Err(CDecoderError::new("a const bit-field has no address"));
+    }
+    let (base, suffix) = match unqualified.find('[') {
+        Some(open) => (unqualified[..open].trim(), &unqualified[open..]),
+        None => (unqualified.trim(), ""),
+    };
+    let local = format!("_bhf_cm_{}", sanitize_ident(lvalue));
+    ctx.push(format!("{base} {local}{suffix}"));
+    ctx.push(format!("memset(&{local}, 0, sizeof {local})"));
+    let cleanups = ctx.cleanups.len();
+    // The local is no heap storage: a `const` member inside it stays zero.
+    let writable = std::mem::replace(&mut ctx.const_members_writable, false);
+    let decoded = emit_lvalue_decode(ctx, &local, &unqualified, &field.shape, depth);
+    ctx.const_members_writable = writable;
+    decoded?;
+    // What the local owns is the member's once copied: free it through the
+    // member, which outlives the local.
+    for cleanup in &mut ctx.cleanups[cleanups..] {
+        *cleanup = replace_identifier(cleanup, &local, lvalue);
+    }
+    ctx.push(format!(
+        "memcpy((void *)&{lvalue}, &{local}, sizeof {local})"
+    ));
+    Ok(())
+}
+
+/// `text` with every identifier token equal to `from` replaced by `to`.
+fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(if word == from { to } else { word.as_str() });
+        word.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// Whether a value of `shape` holds a member that is itself `const`
+/// (`const int id;`, `char *const p;`), directly or in a nested aggregate,
+/// array or pointee its decoder fills.
+fn has_const_member(shape: &TypeShape) -> bool {
+    const_member_within(shape, true)
+}
+
+/// [`has_const_member`], through the pointees a decoder fills only when
+/// `through_pointers`; without it, whether the object itself has a `const`
+/// subobject.
+fn const_member_within(shape: &TypeShape, through_pointers: bool) -> bool {
+    match shape {
+        TypeShape::Struct { fields, .. } | TypeShape::Union { fields, .. } => {
+            fields.iter().any(|field| {
+                is_const_object_type(&field.c_type)
+                    || const_member_within(&field.shape, through_pointers)
+            })
+        }
+        TypeShape::Array { elem, .. } => const_member_within(elem, through_pointers),
+        TypeShape::Pointer(inner) if through_pointers => const_member_within(inner, true),
+        _ => false,
+    }
+}
+
+/// The initializer of C++ `new T[n]` storage of zeroed elements of `shape`:
+/// `()` value-initializes them, but a type with a `const` subobject has no
+/// default constructor, so it gets `{}`, which zeroes it as an aggregate
+/// (and which a class with an `explicit` default constructor would reject).
+pub(crate) fn cpp_new_array_init(shape: &TypeShape) -> &'static str {
+    if const_member_within(shape, false) {
+        "{}"
+    } else {
+        "()"
+    }
+}
+
+/// Whether an object of type `c_type` (a member's type as the C parser
+/// spells it) is itself `const`, `const int`, `char * const` or `void
+/// (*const)(int)`, not merely a pointer to `const` or a callback taking one.
+fn is_const_object_type(c_type: &str) -> bool {
+    // A template's arguments (`std::pair<const int, int>`) qualify other
+    // types.
+    let mut depth = 0usize;
+    let outer: String = c_type
+        .chars()
+        .filter(|&ch| match ch {
+            '<' => {
+                depth += 1;
+                false
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            _ => depth == 0,
+        })
+        .collect();
+    // A function pointer's own qualifiers sit inside its declarator group,
+    // `(*const)`; any other `const` qualifies its return or parameter types.
+    let own = match outer.find("(*") {
+        Some(open) => outer[open..].split(')').next().unwrap_or_default(),
+        None => outer.rsplit('*').next().unwrap_or_default(),
+    };
+    own.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == "const")
 }
 
 fn emit_lvalue_decode(
@@ -1693,7 +1982,7 @@ fn emit_lvalue_decode(
     }
     match shape {
         TypeShape::Scalar(kind) => {
-            ctx.push(format!("{lvalue} = {}", scalar_expr(*kind, c_type)));
+            ctx.push(format!("{lvalue} = {}", scalar_expr(*kind, c_type, lvalue)));
             Ok(())
         }
         TypeShape::CString => {
@@ -1797,11 +2086,22 @@ fn emit_pointer_field_storage(
     };
     let storage_type = storage_c_type(&base);
     let storage = format!("_bhf_pf_{}", sanitize_ident(lvalue));
+    if let Some((index, count)) = ctx.each_element.clone() {
+        return emit_element_pointee_storage(
+            ctx,
+            lvalue,
+            &storage_type,
+            &storage,
+            (&index, &count),
+            inner,
+            depth,
+        );
+    }
     match inner {
         TypeShape::Scalar(kind) => {
             ctx.push(format!(
                 "{storage_type} {storage} = {}",
-                scalar_expr(*kind, &storage_type)
+                scalar_expr(*kind, &storage_type, lvalue)
             ));
         }
         TypeShape::Enum { members, .. } => {
@@ -1829,6 +2129,135 @@ fn emit_pointer_field_storage(
     }
     ctx.push(format!("{lvalue} = &{storage}"));
     Ok(())
+}
+
+/// [`emit_pointer_field_storage`] for a field of a typed-array element
+/// decoded in the loop over the elements: the pointee of every element's
+/// field is a slot of one array allocated before the loop, `count` slots
+/// long, so each element's pointer outlives the loop. The array is freed with
+/// the elements; the loop runs only when it was allocated.
+fn emit_element_pointee_storage(
+    ctx: &mut DecodeContext<'_>,
+    lvalue: &str,
+    storage_type: &str,
+    storage: &str,
+    (index, count): (&str, &str),
+    inner: &TypeShape,
+    depth: usize,
+) -> Result<(), CDecoderError> {
+    if ctx.cpp {
+        ctx.hoisted.push(format!(
+            "{storage_type} *{storage} = new {storage_type}[{count} ? {count} : 1]{}",
+            cpp_new_array_init(inner)
+        ));
+        ctx.hoisted_cleanups.push(format!("delete[] {storage}"));
+    } else {
+        ctx.hoisted.push(format!(
+            "{storage_type} *{storage} = ({storage_type} *)calloc({count} ? {count} : 1, \
+             sizeof({storage_type}))"
+        ));
+        ctx.hoisted_cleanups
+            .push(format!("free((void *){storage})"));
+        ctx.hoisted_guards.push(storage.to_owned());
+    }
+    let slot = format!("{storage}[{index}]");
+    match inner {
+        TypeShape::Scalar(kind) => {
+            ctx.push(format!(
+                "{slot} = {}",
+                scalar_expr(*kind, storage_type, lvalue)
+            ));
+        }
+        TypeShape::Enum { members, .. } => {
+            emit_enum_decode(ctx, &slot, storage_type, members, false);
+        }
+        TypeShape::Struct { name, fields } => {
+            emit_struct_init(ctx, &slot, name, fields, depth);
+        }
+        TypeShape::Union { fields, .. } => {
+            emit_union_init(ctx, &slot, fields, depth)?;
+        }
+        _ => {
+            return Err(CDecoderError::new(format!(
+                "pointer field '{lvalue}' to '{storage_type}' needs declarator support"
+            )))
+        }
+    }
+    ctx.push(format!("{lvalue} = &{slot}"));
+    Ok(())
+}
+
+/// How [`typed_array_element_decode`] decodes a typed array's elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElementDecode {
+    /// Statements that run once the array is allocated.
+    pub decl: String,
+    /// Statements that run before the array is freed.
+    pub cleanup: Option<String>,
+    /// File-scope code the statements use (callback trampolines).
+    pub support: Option<String>,
+}
+
+/// The statements that decode each of the first `count` elements of the
+/// typed array `array` (of element type `elem_type`, unqualified) from the
+/// input, field by field, as the standalone decoder decodes a lone value of
+/// that type: one element after another, in a loop. `None` when an element
+/// cannot be decoded that way (an opaque element, or a body past
+/// [`DecoderLimits::decl_bytes`]); the elements then stay zeroed. Like the
+/// standalone decoder, it assigns every member it decodes.
+pub(crate) fn typed_array_element_decode(
+    array: &str,
+    elem_type: &str,
+    count: &str,
+    registry: &TypeRegistry,
+    cpp: bool,
+    limits: DecoderLimits,
+) -> Option<ElementDecode> {
+    let shape = registry.resolve(elem_type);
+    if !matches!(
+        shape,
+        TypeShape::Scalar(_)
+            | TypeShape::Enum { .. }
+            | TypeShape::Struct { .. }
+            | TypeShape::Union { .. }
+    ) {
+        return None;
+    }
+    let elems = format!("_bhf_elems_{array}");
+    let index = format!("_bhf_e_{array}");
+    let mut ctx = DecodeContext::new(registry, cpp, limits);
+    ctx.each_element = Some((index.clone(), count.to_owned()));
+    ctx.const_members_writable = !cpp;
+    emit_lvalue_decode(&mut ctx, &format!("{elems}[{index}]"), elem_type, &shape, 0).ok()?;
+    let condition: String = std::iter::once(&elems)
+        .chain(&ctx.hoisted_guards)
+        .map(|guard| format!("{guard} && "))
+        .collect::<String>()
+        + &format!("{index} < {count}");
+    let each = |statements: &[String]| {
+        format!(
+            "for ({index} = 0; {condition}; ++{index}) {{ {}; }}",
+            statements.join("; ")
+        )
+    };
+    let mut decl = vec![format!("{elem_type} *{elems} = ({elem_type} *){array}")];
+    decl.extend(ctx.hoisted.iter().cloned());
+    decl.push(format!("size_t {index}"));
+    decl.push(each(&ctx.statements));
+    let decl = decl.join("; ");
+    if decl.len() > limits.decl_bytes {
+        return None;
+    }
+    let mut cleanup = Vec::new();
+    if !ctx.cleanups.is_empty() {
+        cleanup.push(each(&ctx.cleanups));
+    }
+    cleanup.extend(ctx.hoisted_cleanups.iter().rev().cloned());
+    Some(ElementDecode {
+        decl,
+        cleanup: (!cleanup.is_empty()).then(|| cleanup.join("; ")),
+        support: (!ctx.support.is_empty()).then(|| ctx.support.join("\n")),
+    })
 }
 
 fn emit_array_decode(
@@ -1875,12 +2304,12 @@ fn emit_array_decode(
                 ));
                 ctx.push(format!(
                     "for ({idx} = 0; {idx} < {count}; ++{idx}) {{ {lvalue}[{idx}] = {}; }}",
-                    scalar_expr(*kind, elem_c_type)
+                    scalar_expr(*kind, elem_c_type, "")
                 ));
             } else {
                 ctx.push(format!(
                     "for ({idx} = 0; {idx} < {capped}; ++{idx}) {{ {lvalue}[{idx}] = {}; }}",
-                    scalar_expr(*kind, elem_c_type)
+                    scalar_expr(*kind, elem_c_type, "")
                 ));
             }
         }
@@ -1956,7 +2385,70 @@ fn strip_leading_const(c_type: &str) -> &str {
     }
 }
 
-fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
+/// Decode for an unsigned 32-bit scalar of type `c_type`.
+///
+/// The full `0..=0xffffffff` range, so a bit index, mask or wrap-around value
+/// with the top bit set is reachable. A length-, size- or count-named value
+/// stays within `0..=0x7fffffff`: such a value sizes an allocation or a loop,
+/// and a huge one only produces allocation failures and timeouts. Both forms
+/// consume the same four input bytes.
+fn unsigned32_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    if is_length_shaped_name(name) {
+        format!("({c_type})bhf_bounded_i32(&Cur, 0, 0x7fffffff)")
+    } else if matches!(c_type, "uint32_t" | "std::uint32_t") {
+        format!("({c_type})bhf_i32(&Cur)")
+    } else {
+        // Through `uint32_t`, so a wider alias (a 64-bit `unsigned long` behind
+        // a 32-bit typedef) is zero-extended rather than sign-extended.
+        format!("({c_type})(uint32_t)bhf_i32(&Cur)")
+    }
+}
+
+/// Decode for an unsigned 64-bit scalar of type `c_type`: the full range,
+/// except for a length-, size- or count-named value (see [`unsigned32_expr`]).
+/// Both forms consume the same eight input bytes.
+fn unsigned64_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    if is_length_shaped_name(name) {
+        format!("({c_type})bhf_bounded_length(&Cur, 0, 0x7fffffff)")
+    } else {
+        format!("({c_type})bhf_i64(&Cur)")
+    }
+}
+
+/// Decode for a `size_t`-spelled scalar (`size_t`, `z_size_t`): the full range,
+/// except that a length-, size- or count-named value keeps the `0..=65536`
+/// bound it has always had, since it usually sizes an allocation or a copy.
+/// Both forms consume the same eight input bytes.
+fn size_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    match (is_length_shaped_name(name), c_type) {
+        (true, "size_t") => "bhf_bounded_length(&Cur, 0, 65536)".to_owned(),
+        (true, _) => format!("({c_type})bhf_bounded_length(&Cur, 0, 65536)"),
+        (false, _) => format!("({c_type})bhf_i64(&Cur)"),
+    }
+}
+
+/// The variable name a decode target is known by: the last member of a field
+/// access (`cfg.inner.len` -> `len`, `p->lens[2]` -> `lens`), or the name with
+/// bhf's generated storage prefixes removed (`_bhf_out_len` -> `len`).
+fn decode_target_name(lvalue: &str) -> &str {
+    let leaf = lvalue.rsplit(['.', '>']).next().unwrap_or(lvalue);
+    let leaf = leaf.split('[').next().unwrap_or(leaf).trim();
+    ["_bhf_out_", "_bhf_pf_"]
+        .iter()
+        .find_map(|prefix| leaf.strip_prefix(prefix))
+        .unwrap_or(leaf)
+}
+
+fn is_length_shaped_name(name: &str) -> bool {
+    !name.is_empty() && crate::c_generate::looks_like_count_name(decode_target_name(name))
+}
+
+/// Decode expression for a scalar of `kind`, spelled `c_type`, stored in the
+/// variable or field `name` (empty for an anonymous array element).
+fn scalar_expr(kind: ScalarKind, c_type: &str, name: &str) -> String {
     match kind {
         ScalarKind::Bool => format!("({c_type})(bhf_u8(&Cur) & 1)"),
         ScalarKind::I8 => {
@@ -1982,7 +2474,7 @@ fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
                 format!("({c_type})bhf_i32(&Cur)")
             }
         }
-        ScalarKind::U32 => format!("({c_type})bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+        ScalarKind::U32 => unsigned32_expr(c_type, name),
         ScalarKind::I64 => {
             if matches!(c_type.trim(), "long long" | "int64_t") {
                 "bhf_i64(&Cur)".to_owned()
@@ -1990,7 +2482,7 @@ fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
                 format!("({c_type})bhf_i64(&Cur)")
             }
         }
-        ScalarKind::U64 => format!("({c_type})bhf_bounded_length(&Cur, 0, 0x7fffffff)"),
+        ScalarKind::U64 => unsigned64_expr(c_type, name),
         ScalarKind::F32 => format!("({c_type})bhf_i32(&Cur)"),
         ScalarKind::F64 => format!("({c_type})bhf_i64(&Cur)"),
     }
@@ -2399,19 +2891,32 @@ fn canonical_c_type_for_decoder(c_type: &str) -> String {
 }
 
 fn mutable_byte_pointer(c_type: &str, name: &str) -> CParamEmission {
+    byte_buffer_with_headroom(c_type, name, false)
+}
+
+/// A heap copy of the input with 64 KiB of headroom, for a writable byte
+/// buffer whose capacity the signature does not state. `via_void` writes the
+/// copy and the free through `(void *)`, for an element type whose constness
+/// is not known.
+fn byte_buffer_with_headroom(c_type: &str, name: &str, via_void: bool) -> CParamEmission {
     let cap = format!("_bhf_cap_{name}");
     let copy = format!("_bhf_copy_{name}");
+    let target = if via_void {
+        format!("(void *){name}")
+    } else {
+        name.to_owned()
+    };
     CParamEmission {
         support: None,
         decl: format!(
             "size_t {cap} = Size <= (1024 * 1024) ? (size_t)Size + 65536 : (1024 * 1024 + 65536); \
              {c_type} {name} = ({c_type})malloc({cap} ? {cap} : 1); \
              size_t {copy} = (size_t)Size < {cap} ? (size_t)Size : {cap}; \
-             if ({name} && {copy}) memcpy({name}, Data, {copy})"
+             if ({name} && {copy}) memcpy({target}, Data, {copy})"
         ),
         arg: name.to_owned(),
         c_type: c_type.to_owned(),
-        free: Some(format!("free({name})")),
+        free: Some(format!("free({target})")),
     }
 }
 
@@ -2595,32 +3100,35 @@ fn out_pointer_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
     if base.contains('*') {
         return None;
     }
-    let (decoder_expr, storage_init) = match base.as_str() {
-        "int" | "signed int" => ("bhf_i32(&Cur)", "0"),
-        "unsigned" | "unsigned int" => ("(unsigned int)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "long" | "signed long" => ("(long)bhf_i64(&Cur)", "0"),
-        "unsigned long" => (
-            "(unsigned long)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
-            "0",
-        ),
-        "uLong" | "uLongf" => ("(uLong)bhf_bounded_length(&Cur, 0, 0x7fffffff)", "0"),
-        "uInt" => ("(uInt)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "z_size_t" => ("(z_size_t)bhf_bounded_length(&Cur, 0, 65536)", "0"),
-        "mz_ulong" => ("(mz_ulong)bhf_bounded_length(&Cur, 0, 0x7fffffff)", "0"),
-        "long long" | "signed long long" => ("bhf_i64(&Cur)", "0"),
-        "size_t" => ("bhf_bounded_length(&Cur, 0, 65536)", "0"),
-        "uint8_t" | "unsigned char" => ("bhf_u8(&Cur)", "0"),
-        "int8_t" | "signed char" | "char" => ("(int8_t)bhf_u8(&Cur)", "0"),
-        "int32_t" => ("bhf_i32(&Cur)", "0"),
-        "uint32_t" => ("(uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "int64_t" => ("bhf_i64(&Cur)", "0"),
-        "uint64_t" => ("(uint64_t)bhf_i64(&Cur)", "0"),
+    let decoder_expr: String = match base.as_str() {
+        "int" | "signed int" => "bhf_i32(&Cur)".to_owned(),
+        "unsigned" | "unsigned int" => unsigned32_expr("unsigned int", name),
+        "long" | "signed long" => "(long)bhf_i64(&Cur)".to_owned(),
+        "unsigned long" => unsigned64_expr("unsigned long", name),
+        "uLong" | "uLongf" => unsigned64_expr("uLong", name),
+        "uInt" => unsigned32_expr("uInt", name),
+        "z_size_t" => size_expr("z_size_t", name),
+        "mz_ulong" => unsigned64_expr("mz_ulong", name),
+        "long long" | "signed long long" => "bhf_i64(&Cur)".to_owned(),
+        "size_t" => size_expr("size_t", name),
+        "uint8_t" | "unsigned char" => "bhf_u8(&Cur)".to_owned(),
+        "int8_t" | "signed char" | "char" => "(int8_t)bhf_u8(&Cur)".to_owned(),
+        "int32_t" => "bhf_i32(&Cur)".to_owned(),
+        "uint32_t" => unsigned32_expr("uint32_t", name),
+        "int64_t" => "bhf_i64(&Cur)".to_owned(),
+        "uint64_t" => unsigned64_expr("uint64_t", name),
         _ => return None,
     };
     let storage_name = format!("_bhf_out_{name}");
-    let _ = storage_init;
+    // Most expressions already carry the storage type's cast; add it only when
+    // they do not, so the decl reads `T x = (T)expr` rather than `(T)(T)expr`.
+    let cast = if decoder_expr.starts_with(&format!("({base})")) {
+        String::new()
+    } else {
+        format!("({base})")
+    };
     let decl =
-        format!("{base} {storage_name} = ({base}){decoder_expr}; {base} *{name} = &{storage_name}");
+        format!("{base} {storage_name} = {cast}{decoder_expr}; {base} *{name} = &{storage_name}");
     Some(CParamEmission {
         support: None,
         decl,
@@ -2767,13 +3275,13 @@ fn file_pointer(c_type: &str, name: &str) -> CParamEmission {
         "unsigned char *{buffer} = (unsigned char *)calloc(Size ? Size : 1, 1); \
          if ({buffer} && Size) memcpy({buffer}, Data, Size)"
     );
+    // `bhf_fmemopen` (c_runtime/bhf_decode.h) is fmemopen, or a deleted-on-close
+    // temporary file where the C runtime has no fmemopen (Windows).
     let decl = if c_type == "FILE *" {
-        format!(
-            r#"{setup}; FILE * {name} = {buffer} ? (Size ? fmemopen({buffer}, Size, "r+") : tmpfile()) : NULL"#
-        )
+        format!("{setup}; FILE * {name} = {buffer} ? bhf_fmemopen({buffer}, Size) : NULL")
     } else {
         format!(
-            r#"{setup}; {c_type} {name} = ({c_type})({buffer} ? (Size ? fmemopen({buffer}, Size, "r+") : tmpfile()) : NULL)"#
+            "{setup}; {c_type} {name} = ({c_type})({buffer} ? bhf_fmemopen({buffer}, Size) : NULL)"
         )
     };
     CParamEmission {
@@ -3606,6 +4114,201 @@ mod tests {
         );
     }
 
+    /// Unsigned 32- and 64-bit values with the top bit set (bit indexes, masks,
+    /// wrap-around sizes) must be reachable. A `% 2^31` decode made them
+    /// impossible. Only count/length-named values stay bounded, where a huge
+    /// value would just turn an allocation into resource-exhaustion noise.
+    #[test]
+    fn unsigned_scalars_decode_their_full_range_unless_named_like_a_length() {
+        let reg = TypeRegistry::default();
+        // The spelled-type table.
+        for (c_type, expected) in [
+            (
+                "unsigned int",
+                "unsigned int bit_index = (unsigned int)(uint32_t)bhf_i32(&Cur)",
+            ),
+            (
+                "unsigned",
+                "unsigned int bit_index = (unsigned int)(uint32_t)bhf_i32(&Cur)",
+            ),
+            ("uint32_t", "uint32_t bit_index = (uint32_t)bhf_i32(&Cur)"),
+            ("uInt", "uInt bit_index = (uInt)(uint32_t)bhf_i32(&Cur)"),
+            (
+                "unsigned __int32",
+                "unsigned __int32 bit_index = (unsigned __int32)(uint32_t)bhf_i32(&Cur)",
+            ),
+            (
+                "unsigned long",
+                "unsigned long bit_index = (unsigned long)bhf_i64(&Cur)",
+            ),
+            ("uLong", "uLong bit_index = (uLong)bhf_i64(&Cur)"),
+            ("mz_ulong", "mz_ulong bit_index = (mz_ulong)bhf_i64(&Cur)"),
+        ] {
+            let e = select_c_decoder(c_type, "bit_index").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The registry (typedef-resolved) table.
+        for (c_type, expected) in [
+            ("DWORD", "DWORD mask = (DWORD)(uint32_t)bhf_i32(&Cur)"),
+            ("UINT", "UINT mask = (UINT)(uint32_t)bhf_i32(&Cur)"),
+            ("ULONGLONG", "ULONGLONG mask = (ULONGLONG)bhf_i64(&Cur)"),
+            (
+                "std::uint32_t",
+                "std::uint32_t mask = (std::uint32_t)bhf_i32(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder_with_registry(c_type, "mask", &reg).expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The out-pointer table.
+        let out = select_c_decoder("unsigned int *", "width").expect("out pointer");
+        assert!(
+            out.decl
+                .contains("unsigned int _bhf_out_width = (unsigned int)(uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+        let out = select_c_decoder("uint32_t *", "width").expect("out pointer");
+        assert!(
+            out.decl
+                .contains("uint32_t _bhf_out_width = (uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+        // A pointer resolved through the registry.
+        let out = select_c_decoder_with_registry("DWORD *", "width", &reg).expect("out pointer");
+        assert!(
+            out.decl
+                .contains("DWORD _bhf_out_width = (DWORD)(uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+
+        // Length-named values keep the bounded decode in every table.
+        for (c_type, name) in [
+            ("unsigned int", "len"),
+            ("uint32_t", "size"),
+            ("unsigned long", "count"),
+            ("uLong", "sourceLen"),
+            ("uInt", "num_items"),
+        ] {
+            let e = select_c_decoder(c_type, name).expect("unsigned scalar");
+            assert!(
+                e.decl.contains("bhf_bounded_") && e.decl.contains("0x7fffffff"),
+                "{c_type} {name}: {}",
+                e.decl
+            );
+        }
+        let e = select_c_decoder_with_registry("DWORD", "cbData", &reg).expect("scalar");
+        assert!(
+            e.decl.contains("bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+        let e = select_c_decoder("unsigned int *", "len").expect("out pointer");
+        assert!(
+            e.decl.contains("bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+    }
+
+    /// `size_t`, `z_size_t` and the unsigned 64-bit spellings follow the same
+    /// rule as the other unsigned scalars: the full range unless the value is
+    /// named like a length. A length-named `size_t` keeps its 0..=65536 bound,
+    /// and a length-named 64-bit value stays within 0..=0x7fffffff.
+    #[test]
+    fn size_and_64_bit_unsigned_scalars_decode_their_full_range_unless_named_like_a_length() {
+        for (c_type, expected) in [
+            ("size_t", "size_t mask = (size_t)bhf_i64(&Cur)"),
+            ("z_size_t", "z_size_t mask = (z_size_t)bhf_i64(&Cur)"),
+            ("uint64_t", "uint64_t mask = (uint64_t)bhf_i64(&Cur)"),
+            (
+                "unsigned __int64",
+                "unsigned __int64 mask = (unsigned __int64)bhf_i64(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, "mask").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        for (c_type, expected) in [
+            ("size_t", "size_t len = bhf_bounded_length(&Cur, 0, 65536)"),
+            (
+                "z_size_t",
+                "z_size_t len = (z_size_t)bhf_bounded_length(&Cur, 0, 65536)",
+            ),
+            (
+                "uint64_t",
+                "uint64_t len = (uint64_t)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+            (
+                "unsigned __int64",
+                "unsigned __int64 len = (unsigned __int64)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, "len").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The out-pointer table.
+        for (c_type, name, storage) in [
+            (
+                "size_t *",
+                "mask",
+                "size_t _bhf_out_mask = (size_t)bhf_i64(&Cur)",
+            ),
+            (
+                "size_t *",
+                "len",
+                "size_t _bhf_out_len = (size_t)bhf_bounded_length(&Cur, 0, 65536)",
+            ),
+            (
+                "z_size_t *",
+                "seed",
+                "z_size_t _bhf_out_seed = (z_size_t)bhf_i64(&Cur)",
+            ),
+            (
+                "uint64_t *",
+                "count",
+                "uint64_t _bhf_out_count = (uint64_t)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+            (
+                "uint64_t *",
+                "hash",
+                "uint64_t _bhf_out_hash = (uint64_t)bhf_i64(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, name).expect("out pointer");
+            assert!(e.decl.contains(storage), "{c_type} {name}: {}", e.decl);
+        }
+    }
+
+    #[test]
+    fn unsigned_struct_fields_decode_their_full_range_unless_named_like_a_length() {
+        let defs = c_parser::parse_c_type_defs(
+            "#include <stdint.h>\n\
+             struct widget { uint32_t flags; uint32_t length; uint64_t mask; };\n",
+        )
+        .expect("defs");
+        let reg = TypeRegistry::from_defs(std::iter::once(&defs));
+        let e = select_c_decoder_with_registry("struct widget", "w", &reg).expect("struct");
+        assert!(
+            e.decl.contains("w.flags = (uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl.contains("w.mask = (uint64_t)bhf_i64(&Cur)"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl
+                .contains("w.length = (uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+    }
+
     #[test]
     fn select_c_decoder_handles_const_char_ptr_with_free() {
         let e = select_c_decoder("const char *", "name").expect("const char* is supported");
@@ -3800,10 +4503,7 @@ mod tests {
         assert!(e.decl.contains("FILE * stream = _bhf_file_buf_stream ?"));
         assert!(e.decl.contains("memcpy(_bhf_file_buf_stream, Data, Size)"));
         assert!(e.decl.contains("Size"));
-        assert!(e
-            .decl
-            .contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
-        assert!(e.decl.contains("tmpfile()"));
+        assert!(e.decl.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert_eq!(e.arg, "stream");
         assert_eq!(e.c_type, "FILE *");
         assert_eq!(
@@ -3862,7 +4562,7 @@ mod tests {
 
         assert!(e
             .decl
-            .contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? (Size ? fmemopen"));
+            .contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? bhf_fmemopen("));
         assert!(e.decl.contains("memcpy(_bhf_file_buf_stream, Data, Size)"));
         assert!(e.decl.contains("Size"));
         assert_eq!(e.arg, "stream");
@@ -4244,6 +4944,181 @@ mod tests {
         assert!(select_c_decoder_with_registry("int", "n", &reg).is_ok());
     }
 
+    /// A member that is itself `const` is decoded into a local and copied
+    /// into heap storage with `memcpy` (a lone pointee gets the heap storage
+    /// of a one-element array), what it owns is freed through the member, and
+    /// the other members are assigned as before. In a by-value local, and in
+    /// C++, it is left zero.
+    #[test]
+    fn const_members_are_copied_into_heap_storage_and_left_zero_elsewhere() {
+        let reg =
+            registry("typedef struct item_t { const int id; char *const tag; int a; } item_t;");
+        let lone = select_c_decoder_with_registry("const item_t *", "item", &reg).unwrap();
+        let slot = "_bhf_elems_item[_bhf_e_item]";
+        let local = "_bhf_cm__bhf_elems_item__bhf_e_item__id";
+        for part in [
+            "const item_t * item = (const item_t *)calloc(1, sizeof(item_t))".to_owned(),
+            format!("int {local}; memset(&{local}, 0, sizeof {local}); {local} = bhf_i32(&Cur)"),
+            format!("memcpy((void *)&{slot}.id, &{local}, sizeof {local})"),
+            format!("{slot}.a = bhf_i32(&Cur)"),
+        ] {
+            assert!(lone.decl.contains(&part), "{part}\n{}", lone.decl);
+        }
+        assert!(
+            !lone.decl.contains(&format!("{slot}.id =")),
+            "{}",
+            lone.decl
+        );
+        let free = lone.free.as_deref().unwrap();
+        assert!(
+            free.contains(&format!("free((void *){slot}.tag)"))
+                && free.ends_with("free((void *)item)"),
+            "{free}"
+        );
+
+        let by_value = select_c_decoder_with_registry("item_t", "item", &reg).unwrap();
+        assert!(
+            by_value
+                .decl
+                .contains("/* bhf: const field item.id left zeroed"),
+            "{}",
+            by_value.decl
+        );
+        assert!(!by_value.decl.contains("item.id ="), "{}", by_value.decl);
+        assert!(
+            by_value.decl.contains("item.a = bhf_i32(&Cur)"),
+            "{}",
+            by_value.decl
+        );
+
+        let cpp = select_c_decoder_with_registry_cpp("const item_t *", "item", &reg).unwrap();
+        assert!(
+            cpp.decl.contains("item_t _bhf_value_item{}"),
+            "{}",
+            cpp.decl
+        );
+        assert!(
+            cpp.decl
+                .contains("/* bhf: const field _bhf_value_item.id left zeroed"),
+            "{}",
+            cpp.decl
+        );
+        assert!(
+            cpp.decl.contains("_bhf_value_item.a = bhf_i32(&Cur)"),
+            "{}",
+            cpp.decl
+        );
+
+        // A struct without a `const` member keeps its stack storage.
+        let plain = registry("typedef struct plain_t { int id; int a; } plain_t;");
+        let lone = select_c_decoder_with_registry("plain_t *", "p", &plain).unwrap();
+        assert!(lone.decl.contains("plain_t _bhf_value_p"), "{}", lone.decl);
+        assert!(!lone.decl.contains("calloc"), "{}", lone.decl);
+    }
+
+    /// A `const` function pointer spelled inline and a `const` bit-field
+    /// cannot be copied into place (no local can be declared of the first,
+    /// the second has no address), so even in heap storage they stay zero.
+    /// A callback whose parameter is `const` is no `const` member: it still
+    /// gets its trampoline.
+    #[test]
+    fn const_function_pointers_and_bit_fields_stay_zero_in_heap_storage() {
+        let reg = registry(
+            "typedef struct edge_t { int a; void (*cb)(const int); \
+             void (*const hook)(int); void (*const table[2])(int); \
+             const unsigned flags : 3; } edge_t;",
+        );
+        let lone = select_c_decoder_with_registry("edge_t *", "e", &reg).unwrap();
+        let slot = "_bhf_elems_e[_bhf_e_e]";
+        assert!(
+            lone.decl.contains("calloc(1, sizeof(edge_t))"),
+            "{}",
+            lone.decl
+        );
+        assert!(
+            lone.decl.contains(&format!("{slot}.a = bhf_i32(&Cur)")),
+            "{}",
+            lone.decl
+        );
+        assert!(
+            lone.decl.contains(&format!("{slot}.cb = ")),
+            "{}",
+            lone.decl
+        );
+        for member in ["hook", "table", "flags"] {
+            assert!(
+                lone.decl
+                    .contains(&format!("/* bhf: const field {slot}.{member} left zeroed")),
+                "{member}: {}",
+                lone.decl
+            );
+            for write in [format!("{slot}.{member} ="), format!("&{slot}.{member},")] {
+                assert!(!lone.decl.contains(&write), "{write}: {}", lone.decl);
+            }
+        }
+        assert!(!lone.decl.contains("memcpy"), "{}", lone.decl);
+    }
+
+    /// Only a `const` that qualifies the member itself makes it a `const`
+    /// member.
+    #[test]
+    fn is_const_object_type_reads_the_members_own_qualifier() {
+        for (c_type, own) in [
+            ("const int", true),
+            ("const int[4]", true),
+            ("char * const", true),
+            ("unsigned char * const [2]", true),
+            ("void (*const)(int)", true),
+            ("void (*const)(int)[2]", true),
+            ("const unsigned : 3", true),
+            ("const std::pair<int, int>", true),
+            ("const char *", false),
+            ("char * const *", false),
+            ("void (*)(const int)", false),
+            ("const char *(*)(void)", false),
+            ("std::pair<const int, int>", false),
+            ("int", false),
+        ] {
+            assert_eq!(is_const_object_type(c_type), own, "{c_type}");
+        }
+    }
+
+    /// C++ storage of zeroed elements is value-initialized with `()`, which
+    /// a class with an `explicit` default constructor accepts; a type with
+    /// a `const` member has no default constructor, so its storage is
+    /// aggregate-initialized with `{}` instead.
+    #[test]
+    fn cpp_element_storage_braces_only_types_with_const_members() {
+        let reg = registry(
+            "typedef struct in_t { const int id; int v; } in_t; \
+             typedef struct out_t { in_t *in; int *n; } out_t;",
+        );
+        let elements = typed_array_element_decode(
+            "arr",
+            "out_t",
+            "_bhf_n_arr",
+            &reg,
+            true,
+            DecoderLimits::default(),
+        )
+        .unwrap();
+        for hoisted in [
+            "new in_t[_bhf_n_arr ? _bhf_n_arr : 1]{}",
+            "new int[_bhf_n_arr ? _bhf_n_arr : 1]()",
+        ] {
+            assert!(
+                elements.decl.contains(hoisted),
+                "{hoisted}: {}",
+                elements.decl
+            );
+        }
+        assert!(!elements.decl.contains(".id ="), "{}", elements.decl);
+        assert_eq!(cpp_new_array_init(&reg.resolve("in_t")), "{}");
+        // A pointer to such a type is no `const` subobject.
+        assert_eq!(cpp_new_array_init(&reg.resolve("out_t")), "()");
+        assert_eq!(cpp_new_array_init(&reg.resolve("int")), "()");
+    }
+
     #[test]
     fn select_c_decoder_with_registry_emits_callback_trampoline_for_typedef_param() {
         let reg = registry(
@@ -4562,7 +5437,7 @@ mod tests {
 
         assert!(e
             .decl
-            .contains("mz_uint32 _bhf_out_pIndex = (mz_uint32)bhf_bounded_i32"));
+            .contains("mz_uint32 _bhf_out_pIndex = (mz_uint32)(uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("mz_uint32 * pIndex = &_bhf_out_pIndex"));
         assert_eq!(e.arg, "pIndex");
         assert!(e.free.is_none());
@@ -4669,6 +5544,45 @@ mod tests {
             "{}",
             e.decl
         );
+    }
+
+    /// With the buffer-length dimension a lone read-only byte buffer is an
+    /// exact copy of its bytes (one byte when empty): no floor, no NUL.
+    #[test]
+    fn lone_const_byte_pointer_is_an_exact_copy_with_the_length_dimension() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let e = select_c_decoder_with_registry("const unsigned char *", "source", &registry(""))
+            .expect("const byte pointer is supported");
+        assert!(
+            e.decl
+                .contains("_bhf_cap_source = (size_t)Size ? (size_t)Size : 1"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl
+                .contains("if (Size) memcpy((void *)source, Data, Size)"),
+            "{}",
+            e.decl
+        );
+        assert!(!e.decl.contains("< 8)"), "{}", e.decl);
+        assert!(!e.decl.contains("'\\0'"), "{}", e.decl);
+        assert_eq!(e.free.as_deref(), Some("free((void *)source)"));
+        // A byte pointer behind a typedef gets the same exact copy.
+        let hidden = select_c_decoder_with_registry(
+            "cbytes_t",
+            "source",
+            &registry("typedef const unsigned char *cbytes_t;"),
+        )
+        .expect("byte-pointer typedef is supported");
+        assert!(
+            hidden
+                .decl
+                .contains("_bhf_cap_source = (size_t)Size ? (size_t)Size : 1"),
+            "{}",
+            hidden.decl
+        );
+        assert!(!hidden.decl.contains("< 8)"), "{}", hidden.decl);
     }
 
     #[test]

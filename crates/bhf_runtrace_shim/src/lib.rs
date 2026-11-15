@@ -36,6 +36,8 @@ pub mod reentrancy;
 #[cfg(target_os = "linux")]
 pub mod registry;
 pub mod sdk;
+#[cfg(target_os = "linux")]
+pub mod symbolizer;
 
 /// Re-export the manifest types so the existing test/code paths
 /// continue to work while the data itself lives in the cli-safe

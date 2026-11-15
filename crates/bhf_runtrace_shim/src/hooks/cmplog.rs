@@ -37,12 +37,8 @@ pub fn env_enabled() -> bool {
         return cached == 1;
     }
     let value = unsafe { libc::getenv(ENV_VAR.as_ptr() as *const libc::c_char) };
-    let enabled = if value.is_null() {
-        false
-    } else {
-        let s = unsafe { std::ffi::CStr::from_ptr(value) };
-        s.to_bytes() == b"1"
-    };
+    let enabled = !value.is_null()
+        && crate::reentrancy::bytes_eq(unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes(), b"1");
     CACHED.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
     enabled
 }
@@ -76,6 +72,14 @@ fn hex_into<'a>(input: &[u8], out: &'a mut [u8; MAX_OPERAND_BYTES * 2]) -> &'a [
     &out[..n * 2]
 }
 
+/// Whether a comparison reaching these hooks is the target's to record: one
+/// the shim makes itself, inside a hook or one of its own checks
+/// ([`crate::reentrancy::in_shim`]), is not. Thread-local state is read only
+/// once recording is on.
+fn records_comparison() -> bool {
+    env_enabled() && !crate::reentrancy::in_shim()
+}
+
 fn emit_cmp(kind: &[u8], a: &[u8], b_bytes: &[u8]) {
     if let Some(_g) = HookGuard::acquire() {
         let mut buf_a = [0u8; MAX_OPERAND_BYTES * 2];
@@ -100,7 +104,7 @@ pub unsafe extern "C" fn strcmp(a: *const libc::c_char, b: *const libc::c_char) 
     }
     let real: unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> i32 =
         std::mem::transmute(real);
-    if env_enabled() && !a.is_null() && !b.is_null() {
+    if records_comparison() && !a.is_null() && !b.is_null() {
         let len_a = libc::strlen(a).min(MAX_OPERAND_BYTES);
         let len_b = libc::strlen(b).min(MAX_OPERAND_BYTES);
         let slice_a = std::slice::from_raw_parts(a as *const u8, len_a);
@@ -122,7 +126,7 @@ pub unsafe extern "C" fn strncmp(
     }
     let real: unsafe extern "C" fn(*const libc::c_char, *const libc::c_char, libc::size_t) -> i32 =
         std::mem::transmute(real);
-    if env_enabled() && !a.is_null() && !b.is_null() {
+    if records_comparison() && !a.is_null() && !b.is_null() {
         let (slice_a, slice_b) = strncmp_safe_slices(a, b, n);
         emit_cmp(b"strncmp", slice_a, slice_b);
     }
@@ -170,7 +174,7 @@ pub unsafe extern "C" fn memcmp(
     }
     let real: unsafe extern "C" fn(*const libc::c_void, *const libc::c_void, libc::size_t) -> i32 =
         std::mem::transmute(real);
-    if env_enabled() && !a.is_null() && !b.is_null() {
+    if records_comparison() && !a.is_null() && !b.is_null() {
         let len = n.min(MAX_OPERAND_BYTES);
         let slice_a = std::slice::from_raw_parts(a as *const u8, len);
         let slice_b = std::slice::from_raw_parts(b as *const u8, len);

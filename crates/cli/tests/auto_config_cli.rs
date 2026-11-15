@@ -9,13 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 #[test]
@@ -68,4 +64,56 @@ fn auto_loaded_config_ignores_build_executing_keys_but_explicit_config_honors_th
     );
 
     let _ = std::fs::remove_dir_all(Path::new(&tmp));
+}
+
+/// A config `jobs` key sets the job count whatever the host's default is, and
+/// a `--jobs` the command line gives wins over it, even with that default's
+/// value.
+#[test]
+fn config_jobs_applies_whatever_the_host_default() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.c"),
+        "int process(const char *d, unsigned long n){ return n>0?d[0]:0; }\n",
+    )
+    .unwrap();
+    let cfg = tmp.path().join("jobs.toml");
+    std::fs::write(&cfg, "jobs = 1\n").unwrap();
+    let jobs_of = |extra: &[&str]| -> (u64, String) {
+        let work = tmp.path().join("w");
+        let _ = std::fs::remove_dir_all(&work);
+        let out = Command::new(&bin)
+            .arg("auto")
+            .arg(&src)
+            .arg("--work-dir")
+            .arg(&work)
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--dry-run")
+            .args(extra)
+            .env("BHF_DEFAULT_JOBS", "3")
+            .output()
+            .expect("run auto");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let context: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.join("auto/support-context.json"))
+                .unwrap_or_else(|error| panic!("no support context ({error}):\n{stderr}")),
+        )
+        .unwrap();
+        (context["jobs"].as_u64().expect("jobs"), stderr)
+    };
+    let (jobs, stderr) = jobs_of(&[]);
+    assert_eq!(jobs, 1, "the config's jobs must apply:\n{stderr}");
+    let (jobs, stderr) = jobs_of(&["--jobs", "3"]);
+    assert_eq!(
+        jobs, 3,
+        "an explicit --jobs wins over the config:\n{stderr}"
+    );
 }

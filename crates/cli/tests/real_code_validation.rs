@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The Python interpreter: Windows' installer provides `python`, not `python3`.
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -265,7 +268,7 @@ fn real_code_validation_runner_dry_run_lists_matrix() {
     let root = repo_root();
     let script = root.join("scripts/validation/real-code-matrix.py");
     let manifest = manifest_path();
-    let output = Command::new("python3")
+    let output = Command::new(PYTHON)
         .arg(&script)
         .arg("--manifest")
         .arg(&manifest)
@@ -332,7 +335,7 @@ fn real_code_validation_runner_writes_evidence_report_and_readiness_gate() {
     let manifest = manifest_path();
     let json_out = temp.join("matrix.json");
     let markdown_out = temp.join("matrix.md");
-    let output = Command::new("python3")
+    let output = Command::new(PYTHON)
         .arg(&script)
         .arg("--manifest")
         .arg(&manifest)
@@ -412,7 +415,7 @@ fn real_code_validation_ada_local_proves_offline_target_entry() {
             .unwrap()
             .as_nanos()
     ));
-    let output = Command::new("python3")
+    let output = Command::new(PYTHON)
         .arg(&script)
         .arg("--manifest")
         .arg(&manifest)

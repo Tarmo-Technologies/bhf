@@ -405,9 +405,10 @@ irm "$Base/bhf-installer.ps1" | iex
 irm "$Base/bhf-daemon-installer.ps1" | iex       # optional: RPC/MCP service
 ```
 
-Start a new **x64 Developer PowerShell for VS 2022** after tool installation.
-See the [Windows guide](docs/site/windows.md) for `winget`/w64devkit alternatives,
-Visual Studio environment initialization, and native-Windows lane limits.
+Start a new PowerShell after tool installation; bhf finds Visual Studio, the
+Windows SDK and clang itself, so no Developer shell is needed. See the
+[Windows guide](docs/site/windows.md) for `winget`/w64devkit alternatives,
+Visual Studio solutions, the `--cc cl` MSVC lane, and native-Windows lane limits.
 
 ### Selected language installations
 

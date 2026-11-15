@@ -58,6 +58,7 @@ const SUPPRESSED_VARS: &[&[u8]] = &[
 ];
 
 fn should_log(name: &[u8]) -> bool {
+    let _own = crate::reentrancy::OwnWork::enter();
     if name.is_empty() {
         return false;
     }

@@ -8,6 +8,20 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // Windows gives a process's main thread a 1 MiB stack, Linux 8 MiB. The
+    // CLI dispatcher (one match over every subcommand) needs more than 1 MiB in
+    // debug builds, so link the CLI binaries with the same 8 MiB on Windows.
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        let stack = if target.ends_with("-msvc") {
+            "/STACK:8388608"
+        } else {
+            "-Wl,--stack,8388608"
+        };
+        for bin in ["bhf", "cli"] {
+            println!("cargo:rustc-link-arg-bin={bin}={stack}");
+        }
+    }
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
     let target_dir = PathBuf::from(env::var("OUT_DIR").unwrap())
         .ancestors()

@@ -9,18 +9,37 @@ use std::path::{Path, PathBuf};
 
 use crate::probe_backend::{materialize_runtime_sources, ProbeBackend};
 
-/// Explicit C/C++ compiler + flag override for the harness `make` invocation.
-/// `bhf auto` passes this ONLY for a foreign-platform/arch candidate it is
-/// cross-compiling (see `auto::cross_target`); host-native builds pass `None`
-/// and keep the existing clang defaults. `cflags`/`cxxflags`, when non-empty,
-/// replace the Makefile's `CFLAGS ?=`/`CXXFLAGS ?=` defaults — the cross GCCs
-/// reject the clang `-fsanitize-coverage=trace-pc-guard` baked into them.
+/// The harness Makefile variables holding bhf's own flags for the `main`
+/// build (optimization, debug info, sanitizers, coverage). The operator's
+/// `CFLAGS`/`CXXFLAGS` are appended after them.
+pub(crate) const MAKE_BHF_CFLAGS: &str = "BHF_CFLAGS";
+/// The C++ counterpart of [`MAKE_BHF_CFLAGS`].
+pub(crate) const MAKE_BHF_CXXFLAGS: &str = "BHF_CXXFLAGS";
+
+/// Explicit C/C++ compiler + flag override for the harness `make` invocation:
+/// a cross build, the gcc retry, or an `auto --sanitizers` selection.
+/// `cflags`/`cxxflags`, when non-empty, replace the Makefile's own
+/// `BHF_CFLAGS ?=`/`BHF_CXXFLAGS ?=` defaults; an operator's
+/// `CFLAGS`/`CXXFLAGS` are still appended after them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CFamilyCompilerOverride {
     pub cc: String,
     pub cxx: String,
     pub cflags: Vec<String>,
     pub cxxflags: Vec<String>,
+    /// `Some`: the target-selection flags (`--sysroot=`, `--target=`) every
+    /// object and link of the build takes, bhf's driver object included,
+    /// rendered for a recipe; they replace the `[toolchain]`'s published
+    /// `BHF_TOOLCHAIN_TARGET_FLAGS`. `None` keeps those.
+    pub target_flags: Option<Vec<String>>,
+    /// Whether an operator's `CFLAGS` from the environment follows `cflags`.
+    /// Those flags are written for the operator's compiler (or the host's),
+    /// so a build with a C compiler bhf picked in its place leaves them out:
+    /// a platform guard's cross lane, or clang after the operator's compiler
+    /// could not run the `--sanitizers` runtime.
+    pub ambient_cflags: bool,
+    /// [`Self::ambient_cflags`] for `CXXFLAGS` and the C++ compiler.
+    pub ambient_cxxflags: bool,
 }
 
 /// Activate a coverage-capable Clang from the RHEL 7 LLVM Software Collection
@@ -128,16 +147,46 @@ pub(crate) fn activate_windows_clang_runtime() {
         }) {
             continue;
         }
-        let already_present = std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).any(|entry| entry == runtime))
-            .unwrap_or(false);
-        if !already_present {
-            prepend_process_path("PATH", &[runtime]);
+        let path: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        if let Ok(joined) = std::env::join_paths(with_dir_first(&path, &runtime)) {
+            std::env::set_var("PATH", joined);
         }
     }
 }
 
-#[cfg(any(unix, windows))]
+/// `path` with `dir` first, moved there when it is already listed. Windows
+/// loads the first DLL of a name it finds on PATH, and the Visual Studio
+/// environment puts MSVC's own `clang_rt.asan_dynamic` DLL (another LLVM
+/// version) ahead of an entry PATH already had. A clang-built harness that
+/// loads it dies before `main` with STATUS_ENTRYPOINT_NOT_FOUND.
+#[cfg(any(windows, test))]
+fn with_dir_first(path: &[PathBuf], dir: &Path) -> Vec<PathBuf> {
+    std::iter::once(dir.to_path_buf())
+        .chain(path.iter().filter(|entry| entry.as_path() != dir).cloned())
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn the_clang_asan_runtime_goes_first_on_path_even_when_already_listed() {
+    let (msvc, runtime, tools) = (
+        PathBuf::from("vs/msvc/bin"),
+        PathBuf::from("llvm/lib/windows"),
+        PathBuf::from("tools"),
+    );
+    assert_eq!(
+        with_dir_first(&[msvc.clone(), runtime.clone(), tools.clone()], &runtime),
+        [runtime.clone(), msvc.clone(), tools]
+    );
+    assert_eq!(
+        with_dir_first(std::slice::from_ref(&msvc), &runtime),
+        [runtime, msvc]
+    );
+}
+
+#[cfg(unix)]
 fn prepend_process_path(key: &str, prefixes: &[PathBuf]) {
     let mut paths = prefixes.to_vec();
     if let Some(existing) = std::env::var_os(key) {
@@ -150,7 +199,10 @@ fn prepend_process_path(key: &str, prefixes: &[PathBuf]) {
 
 #[derive(Debug, Clone, clap::Args, PartialEq)]
 pub struct BuildArgs {
-    /// Path to bhf_work directory containing src_instrumented and harnesses/generated_harnesses.
+    /// Path to the bhf_work directory: the parent of `harnesses/` or
+    /// `generated_harnesses/` (and of `src_instrumented/` for Ada). A C/C++
+    /// harness directory (`<work>/harnesses/<id>`) or `<work>/harnesses` itself
+    /// is also accepted and mapped onto its work directory.
     pub work_dir: PathBuf,
 
     /// Governing Ada project whose evaluated build semantics the generated
@@ -158,32 +210,101 @@ pub struct BuildArgs {
     #[arg(long)]
     pub source_project: Option<PathBuf>,
 
-    /// Harness id to build. Defaults to the only harness present (errors if multiple).
+    /// Harness id to build. Defaults to the only harness present; with several,
+    /// the error lists their ids.
     #[arg(long)]
     pub harness: Option<String>,
 
-    /// Target triple for cross-compilation project synthesis and default tool prefix.
-    #[arg(long)]
+    /// Target triple to build for. C/C++ harness: selects `<triple>-gcc` /
+    /// `<triple>-g++` unless --cc/--cxx name the compilers (a clang compiler
+    /// gets `--target=<triple>`). Ada harness: written as `for Target use`, and
+    /// the default tool prefix. Config key: `toolchain.target`.
+    #[arg(long, visible_alias = "target-triple")]
     pub target: Option<String>,
 
-    /// Ada runtime name to pass through the generated GPR project.
-    #[arg(long)]
+    /// Ada runtime name to pass through the generated GPR project. Ada
+    /// harnesses only; rejected for a C/C++ harness. Config key:
+    /// `toolchain.ada.runtime`.
+    #[arg(long, visible_alias = "ada-runtime")]
     pub runtime: Option<String>,
 
-    /// Toolchain executable prefix, e.g. aarch64-linux-gnu for aarch64-linux-gnu-gprbuild.
-    #[arg(long)]
+    /// Toolchain executable prefix. Ada harness: `<prefix>-gprbuild` /
+    /// `<prefix>-gnat`, and the Target when --target is not given (config key:
+    /// `toolchain.ada.prefix`). C/C++ harness: `<prefix>-gcc`/`<prefix>-g++`
+    /// unless --cc/--cxx are given; in a config file that choice is
+    /// `toolchain.target` or `toolchain.cc`/`toolchain.cxx`, because
+    /// `toolchain.ada.prefix` applies to Ada harnesses only.
+    #[arg(long, visible_alias = "ada-prefix")]
     pub toolchain: Option<String>,
 
-    /// AdaFuzz.Probe runtime backend to compile into the harness runtime.
+    /// AdaFuzz.Probe runtime backend to compile into the harness runtime. Ada
+    /// harnesses only. Config key: `toolchain.ada.probe-backend`.
     #[arg(long, value_enum, default_value = "host_file")]
     pub(crate) probe_backend: ProbeBackend,
+
+    #[command(flatten)]
+    pub(crate) toolchain_args: BuildToolchainArgs,
 
     /// For C/C++ harnesses: which Makefile target to build.
     /// `libfuzzer` (default) runs `make` which produces a libFuzzer binary
     /// driven by sanitizers; `afl++` runs `make afl` which produces a
-    /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`.
+    /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`;
+    /// `winafl` runs `make winafl` which produces `main_winafl`, the build
+    /// without sanitizers `bhf fuzz --engine winafl` runs beside `main`.
     #[arg(long, value_enum, default_value = "libfuzzer")]
     pub c_engine: CEngine,
+}
+
+/// The toolchain options of `bhf build` beyond the historical Ada flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct BuildToolchainArgs {
+    /// TOML file whose `[toolchain]` table sets the compiler, flags, target,
+    /// sysroot and Ada toolchain (the same table `bhf auto --config` reads).
+    /// Command-line flags override it key by key; relative paths in it
+    /// resolve against the file's directory.
+    #[arg(long = "config", value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub(crate) c: crate::toolchain::CToolchainArgs,
+
+    /// Program that runs a harness built for another target, such as
+    /// `qemu-aarch64`. A C/C++ build for a target this host cannot run, or
+    /// one whose compiler does not name its target, records it beside the
+    /// binary (`build/<id>/bhf_runner.json`) and the harness, as does an Ada
+    /// build for another target (`build/<id>/obj/`); `bhf replay`, `bhf
+    /// minimize`, `bhf fuzz`, `bhf decode-args` and the finding's `replay.py`
+    /// run the binary under it when no `--qemu-user` is given. A runner for a
+    /// build this host runs natively is an error. Config key:
+    /// `toolchain.runner`.
+    #[arg(long = "runner", value_name = "PROGRAM")]
+    pub(crate) runner: Option<String>,
+
+    /// Argument placed between the runner and the harness (repeatable).
+    /// Defaults to `-L <sysroot>` (or `-L /usr/<triple>`) for a qemu-user
+    /// runner. Config key: `toolchain.runner-args`.
+    #[arg(long = "runner-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub(crate) runner_args: Vec<String>,
+
+    /// `gprbuild` to run for an Ada harness (name or path). Config key:
+    /// `toolchain.ada.gprbuild`.
+    #[arg(long = "ada-gprbuild", value_name = "PROGRAM")]
+    pub(crate) ada_gprbuild: Option<String>,
+
+    /// `gnat` driver for an Ada harness (name or path). Config key:
+    /// `toolchain.ada.gnat`.
+    #[arg(long = "ada-gnat", value_name = "PROGRAM")]
+    pub(crate) ada_gnat: Option<String>,
+
+    /// Extra Ada compiler switch, appended to bhf's own (repeatable). Config
+    /// key: `toolchain.ada.switches`.
+    #[arg(long = "ada-switch", value_name = "SWITCH", allow_hyphen_values = true)]
+    pub(crate) ada_switches: Vec<String>,
+
+    /// The clap ids of the `bhf build` flags the command line gave, so a flag
+    /// given with its default value still wins over the config file.
+    #[arg(skip)]
+    pub(crate) given: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -193,16 +314,60 @@ pub enum CEngine {
     /// `make afl` target - AFL++ persistent-mode entrypoint.
     #[value(name = "afl++")]
     AflPlusPlus,
+    /// `make winafl` target - the uninstrumented WinAFL build (`main_winafl`,
+    /// native Windows), which `bhf fuzz --engine winafl` runs beside `main`.
+    Winafl,
 }
 
 pub fn run(args: BuildArgs) -> i32 {
+    let toolchain = match resolve_build_toolchain(&args) {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return 2;
+        }
+    };
+    if let Some(note) = args
+        .toolchain_args
+        .config
+        .as_deref()
+        .and_then(cross_tables_note)
+    {
+        bhfeprintln!("bhf build: note: {note}");
+    }
     // Try the C / C++ make-based build path first. The generated harness
     // ships its own Makefile (Slice A / B of #286); if it's present, the
     // Ada-specific prepare_layout below would fail on the missing
     // src_instrumented dir anyway.
-    if let Some(exit) = try_run_c_make_build(&args) {
+    if let Some(exit) = try_run_c_make_build(&args, &toolchain) {
         return exit;
     }
+
+    let given = args.toolchain_args.c.given_flag_names();
+    if !given.is_empty() {
+        bhfeprintln!(
+            "bhf build: note: {} set the C/C++ toolchain and do not apply to an Ada harness",
+            given.join(", ")
+        );
+    }
+    let runner = match ada_build_runner(&toolchain) {
+        Ok(runner) => runner,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return 2;
+        }
+    };
+    let runs_natively = crate::toolchain::AdaBuildSettings::from_config(&toolchain).runs_natively();
+    // A probe backend that keeps the events on the target (from the flag or
+    // the config file, merged into the toolchain), for a harness built for
+    // this host: nothing would read them.
+    if runs_natively {
+        if let Err(error) = crate::toolchain::check_host_probe_backend(&toolchain) {
+            bhfeprintln!("bhf build: {error}; for an on-target build pass --target <triple>");
+            return 2;
+        }
+    }
+    let args = with_ada_toolchain(args, &toolchain);
 
     let layout = match prepare_layout(&args) {
         Ok(layout) => layout,
@@ -212,7 +377,7 @@ pub fn run(args: BuildArgs) -> i32 {
         }
     };
 
-    let adapter = match CompilerAdapter::discover_for(toolchain_config(&args)) {
+    let adapter = match ada_compiler_adapter(&args) {
         Ok(adapter) => adapter,
         Err(error) => {
             bhfeprintln!("{error}");
@@ -236,15 +401,295 @@ pub fn run(args: BuildArgs) -> i32 {
     print!("{}", result.stdout);
     bhfeprint!("{}", result.stderr);
 
-    if result.exit_code == 0 {
-        0
-    } else {
-        1
+    if result.exit_code != 0 {
+        return 1;
     }
+    // The emulator an Ada harness built for another target runs under,
+    // recorded beside its binary and beside the harness, as for a C/C++
+    // build; a native rebuild forgets one an earlier build recorded.
+    if runner.is_some() || runs_natively {
+        if let Some(runner) = &runner {
+            bhfeprintln!(
+                "bhf build: the Ada harness runs under `{}`, recorded in bhf_runner.json",
+                std::iter::once(runner.program.display().to_string())
+                    .chain(runner.args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        for dir in [&layout.exec_dir, &layout.harness_dir] {
+            if let Err(error) = crate::gate_evidence::record_runner(dir, runner.as_ref()) {
+                bhfeprintln!(
+                    "bhf build: warning: could not record the runner in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    0
 }
 
 pub(crate) struct BuildLayout {
     pub(crate) project_path: PathBuf,
+    /// Where the harness executable is linked (`build/<id>/obj`).
+    pub(crate) exec_dir: PathBuf,
+    /// The generated harness directory.
+    pub(crate) harness_dir: PathBuf,
+}
+
+/// The toolchain of this `bhf build`: the `--config` file's `[toolchain]`
+/// table with the command-line flags laid over it, validated.
+fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, String> {
+    let file = match &args.toolchain_args.config {
+        Some(path) => crate::toolchain::load_config_file(path)?,
+        None => None,
+    };
+    let mut cli = args.toolchain_args.c.to_config();
+    cli.target = args.target.clone();
+    cli.runner = args.toolchain_args.runner.clone();
+    cli.runner_args = args.toolchain_args.runner_args.clone();
+    // `--toolchain <prefix>` names the C/C++ compilers too, unless --cc/--cxx do
+    // (a gprconfig compiler name such as `GNAT` is Ada-only).
+    if let Some(prefix) = args
+        .toolchain
+        .as_deref()
+        .filter(|toolchain| project_synth::gpr_toolchain_name(toolchain).is_none())
+    {
+        if cli.cc.is_none() && cli.cxx.is_none() {
+            let prefix = prefix.trim_end_matches('-');
+            cli.cc = Some(format!("{prefix}-gcc"));
+            cli.cxx = Some(format!("{prefix}-g++"));
+        }
+    }
+    cli.ada.prefix = args.toolchain.clone();
+    cli.ada.runtime = args.runtime.clone();
+    cli.ada.gprbuild = args.toolchain_args.ada_gprbuild.clone();
+    cli.ada.gnat = args.toolchain_args.ada_gnat.clone();
+    cli.ada.switches = args.toolchain_args.ada_switches.clone();
+    if probe_backend_given(args) {
+        cli.ada.probe_backend = Some(
+            clap::ValueEnum::to_possible_value(&args.probe_backend).map_or_else(
+                || "host_file".to_owned(),
+                |value| value.get_name().to_owned(),
+            ),
+        );
+    }
+    crate::toolchain::resolve(file, cli)
+}
+
+/// Whether `--probe-backend` chose the backend: given on the command line
+/// (its default `host_file` included), or set to another backend in code.
+fn probe_backend_given(args: &BuildArgs) -> bool {
+    args.probe_backend != ProbeBackend::HostFile
+        || args.toolchain_args.given.contains("probe_backend")
+}
+
+/// The note for a config file whose `[cross.<guard>]` tables `bhf build`
+/// does not use (they choose the toolchain of `bhf auto`'s guard-driven cross
+/// lanes), or `None` when it has none.
+fn cross_tables_note(config: &Path) -> Option<String> {
+    let text = fs::read_to_string(config).ok()?;
+    let tables = config::cross_config_from_file_text(&text).ok()?;
+    if tables.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = tables
+        .keys()
+        .map(|guard| format!("[cross.{guard}]"))
+        .collect();
+    Some(format!(
+        "{} in {} apply to bhf auto only; bhf build builds with the [toolchain] table \
+         (toolchain.target, toolchain.cc/cxx, toolchain.runner)",
+        names.join(", "),
+        config.display()
+    ))
+}
+
+/// The runner of a C/C++ build, checked against what the build produces
+/// (`built_for`, the triple the compiler builds for when it says): a build
+/// for a target this host cannot run, or for one the compiler would not name,
+/// records the runner `config` names; a runner for a build this host runs is
+/// refused, as `bhf auto` refuses it. `compiler` names the compiler for the
+/// message.
+fn build_runner(
+    config: &config::ToolchainConfig,
+    built_for: Option<&str>,
+    compiler: &str,
+) -> Result<Option<crate::gate_evidence::HarnessRunner>, String> {
+    let Some(runner) = config.runner.clone() else {
+        return Ok(None);
+    };
+    if !crate::toolchain::program_exists(&runner) {
+        return Err(format!(
+            "the toolchain's runner `{runner}` was not found; install it or fix toolchain.runner"
+        ));
+    }
+    let args = match built_for {
+        Some(triple) if crate::toolchain::triple_runs_natively(triple) => {
+            return Err(format!(
+                "toolchain.runner `{runner}` is set, but nothing this build produces targets \
+                 another platform: `{compiler}` builds for {triple} (this host); set \
+                 toolchain.target (--target) to cross-build the harness, or drop the runner"
+            ));
+        }
+        Some(triple) => {
+            crate::toolchain::runner_args(config, &runner, triple, config.sysroot.as_deref())
+        }
+        // A compiler that does not say what it builds for (a wrapper, some
+        // vendor toolchains): the runner is taken as given.
+        None => config.runner_args.clone(),
+    };
+    Ok(Some(crate::gate_evidence::HarnessRunner {
+        program: PathBuf::from(&runner),
+        args,
+    }))
+}
+
+/// The runner of an Ada harness, as [`build_runner`] gives one for a C/C++
+/// build: an Ada harness built for another target (its Ada target, else the
+/// tool prefix) records the runner `config` names; a runner for one this host
+/// runs is refused rather than dropped.
+fn ada_build_runner(
+    config: &config::ToolchainConfig,
+) -> Result<Option<crate::gate_evidence::HarnessRunner>, String> {
+    let Some(runner) = &config.runner else {
+        return Ok(None);
+    };
+    let settings = crate::toolchain::AdaBuildSettings::from_config(config);
+    match settings.effective_target() {
+        Some(triple) if !crate::toolchain::triple_runs_natively(&triple) => {
+            build_runner(config, Some(&triple), "gprbuild")
+        }
+        target => Err(format!(
+            "toolchain.runner `{runner}` is set, but the Ada harness builds for this host{}; \
+             set --target or --toolchain <prefix> (toolchain.ada.target or \
+             toolchain.ada.prefix) to cross-build it, or drop the runner",
+            target
+                .map(|triple| format!(" ({triple})"))
+                .unwrap_or_default()
+        )),
+    }
+}
+
+/// `args` with the Ada toolchain fields set from the resolved `[toolchain]`
+/// (command-line values already won in [`resolve_build_toolchain`]).
+fn with_ada_toolchain(mut args: BuildArgs, toolchain: &config::ToolchainConfig) -> BuildArgs {
+    args.target = toolchain.ada_target().map(str::to_owned);
+    args.runtime = toolchain.ada.runtime.clone();
+    args.toolchain = toolchain.ada.prefix.clone();
+    args.probe_backend = crate::toolchain::probe_backend(toolchain);
+    args.toolchain_args.ada_gprbuild = toolchain.ada.gprbuild.clone();
+    args.toolchain_args.ada_gnat = toolchain.ada.gnat.clone();
+    args.toolchain_args.ada_switches = toolchain.ada.switches.clone();
+    args
+}
+
+/// A config file's `toolchain.ada.prefix` does not choose a C/C++ harness's
+/// compilers (the `--toolchain` flag does). The note saying so, when nothing
+/// else chose them.
+fn ada_prefix_note(
+    toolchain: &config::ToolchainConfig,
+    toolchain_flag: Option<&str>,
+    harness_id: &str,
+) -> Option<String> {
+    let prefix = toolchain.ada.prefix.as_deref()?;
+    if toolchain_flag.is_some() || crate::toolchain::selected_compilers(toolchain) != (None, None) {
+        return None;
+    }
+    Some(format!(
+        "toolchain.ada.prefix `{prefix}` applies to Ada harnesses only; set toolchain.target \
+         or toolchain.cc/cxx (or pass --toolchain) to choose the compilers of the C/C++ \
+         harness '{harness_id}'"
+    ))
+}
+
+/// The Ada flags given to a C/C++ harness build, which cannot apply to it.
+fn ada_only_flags_given(args: &BuildArgs) -> Vec<&'static str> {
+    let mut given = Vec::new();
+    if args.runtime.is_some() {
+        given.push("--runtime");
+    }
+    if probe_backend_given(args) {
+        given.push("--probe-backend");
+    }
+    if args.toolchain_args.ada_gprbuild.is_some() {
+        given.push("--ada-gprbuild");
+    }
+    if args.toolchain_args.ada_gnat.is_some() {
+        given.push("--ada-gnat");
+    }
+    if !args.toolchain_args.ada_switches.is_empty() {
+        given.push("--ada-switch");
+    }
+    given
+}
+
+/// The compiler adapter for an Ada build: explicit `gprbuild`/`gnat` programs
+/// when the toolchain names them, else the (prefixed) tools on `PATH`.
+fn ada_compiler_adapter(args: &BuildArgs) -> Result<CompilerAdapter, String> {
+    let toolchain = toolchain_config(args);
+    let explicit_gprbuild = args.toolchain_args.ada_gprbuild.as_deref();
+    let explicit_gnat = args.toolchain_args.ada_gnat.as_deref();
+    let prefixed = |tool: &str| match toolchain.compiler_prefix() {
+        Some(prefix) => format!("{}-{tool}", prefix.trim_end_matches('-')),
+        None => tool.to_owned(),
+    };
+    if explicit_gprbuild.is_none() && explicit_gnat.is_none() {
+        return match CompilerAdapter::discover_for(toolchain.clone()) {
+            Ok(adapter) => Ok(adapter),
+            // A GNAT cross toolchain ships prefixed compiler drivers
+            // (`<prefix>-gnat`, `<prefix>-gcc`), while gprbuild is usually one
+            // multi-target program that takes the target from the project's
+            // `for Target use`. Use it when there is no prefixed gprbuild.
+            Err(error) => match (
+                toolchain.compiler_prefix(),
+                which::which("gprbuild"),
+                which::which(prefixed("gnat")),
+            ) {
+                (Some(_), Ok(gprbuild), Ok(gnat)) => Ok(CompilerAdapter::with_binaries(
+                    Some(gprbuild),
+                    which::which(prefixed("gnatmake")).ok(),
+                    Some(gnat),
+                    toolchain,
+                )),
+                _ => Err(error.to_string()),
+            },
+        };
+    }
+    let locate = |explicit: Option<&str>, tool: &str| -> Result<Option<PathBuf>, String> {
+        match explicit {
+            Some(program) => {
+                let found = if crate::toolchain::program_exists(program) {
+                    which::which(program)
+                        .ok()
+                        .or_else(|| Some(PathBuf::from(program)))
+                } else {
+                    None
+                };
+                found
+                    .map(Some)
+                    .ok_or_else(|| format!("the toolchain's {tool} `{program}` was not found"))
+            }
+            None => Ok(which::which(prefixed(tool)).ok()),
+        }
+    };
+    let gprbuild = locate(explicit_gprbuild, "gprbuild")?;
+    let gnat = locate(explicit_gnat, "gnat")?;
+    if gprbuild.is_none() {
+        return Err(format!(
+            "no `{}` found for the Ada build; set toolchain.ada.gprbuild (--ada-gprbuild)",
+            prefixed("gprbuild")
+        ));
+    }
+    // An explicitly named gnat is the compiler the operator wants probed; only
+    // without one does a prefixed gnatmake stand in for the canary.
+    let gnatmake = explicit_gnat
+        .is_none()
+        .then(|| which::which(prefixed("gnatmake")).ok())
+        .flatten();
+    Ok(CompilerAdapter::with_binaries(
+        gprbuild, gnatmake, gnat, toolchain,
+    ))
 }
 
 /// Whether `dir` directly contains at least one C source file (`.c`). Used to
@@ -385,7 +830,7 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
             language: "Ada".to_owned(),
         },
         SourceRoot {
-            path: harness_dir,
+            path: harness_dir.clone(),
             language: "Ada".to_owned(),
         },
     ];
@@ -469,6 +914,23 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     if extends_project.is_none() {
         with_clauses.extend(discover_user_gpr_with_clauses(&user_root));
     }
+    // The governing project's own `package Compiler` is extended, not
+    // replaced: its switches stay, and bhf's follow them.
+    let parent_compiler = extends_project
+        .as_deref()
+        .and_then(project_synth::parent_compiler_package);
+    if let Some(parent) = &parent_compiler {
+        bhfeprintln!(
+            "bhf build: note: the harness project extends {}'s package Compiler; bhf's \
+             switches follow its Default_Switches (\"Ada\"){}",
+            parent.project_name,
+            if parent.ada_switches.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", parent.ada_switches.join(" "))
+            }
+        );
+    }
 
     let project_path = build_dir.join("bhf_build.gpr");
     // A non-`main.adb` main (a child-subprogram harness) gets its executable
@@ -492,6 +954,11 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     // specification into a fuzzing oracle — code that ships with assertions disabled
     // still gets them exercised under the fuzzer, at no cost to production behavior.
     switches.default.push("-gnata".to_owned());
+    // Operator switches (`toolchain.ada.switches`, --ada-switch) come after
+    // bhf's own, so an operator setting wins where the two disagree.
+    switches
+        .default
+        .extend(args.toolchain_args.ada_switches.iter().cloned());
     if source_roots
         .iter()
         .any(|root| dir_contains_in_tree_ada_runtime_unit(&root.path))
@@ -523,9 +990,10 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     let spec = ProjectSpec {
         project_name: "Bhf_Build".to_owned(),
         extends_project,
+        parent_compiler,
         source_roots,
         object_dir: shared_obj_dir,
-        exec_dir: Some(obj_dir),
+        exec_dir: Some(obj_dir.clone()),
         main_adb: Some(main_file),
         ada_standard,
         target: args.target.clone(),
@@ -573,7 +1041,11 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
         let _ = fs::remove_file(&sentinel);
     }
 
-    Ok(BuildLayout { project_path })
+    Ok(BuildLayout {
+        project_path,
+        exec_dir: obj_dir,
+        harness_dir,
+    })
 }
 
 /// Walk `root` for top-level `.gpr` files and extract their
@@ -696,17 +1168,126 @@ fn normalize_path_lexical(path: &Path) -> PathBuf {
 /// Detect a C/C++ harness layout (generated by Slice A/B of #286) and run
 /// the harness's Makefile directly. Returns `Some(exit_code)` when the
 /// build was dispatched; `None` to fall through to the Ada path.
-fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
-    let work_dir = absolutize(&args.work_dir).ok()?;
-    let (harness_id, harness_dir) = select_harness(&work_dir, args.harness.as_deref()).ok()?;
-    let makefile = harness_dir.join("Makefile");
-    if !makefile.is_file() {
+fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -> Option<i32> {
+    let requested_dir = absolutize(&args.work_dir).ok()?;
+    let (work_dir, requested_harness) =
+        match resolve_c_family_work_dir(&requested_dir, args.harness.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                bhfeprintln!("{error}");
+                return Some(3);
+            }
+        };
+    if !work_dir.is_dir() {
         return None;
     }
-    let main_c = harness_dir.join("main.c");
-    let main_cpp = harness_dir.join("main.cpp");
-    if !main_c.is_file() && !main_cpp.is_file() {
+    let (harness_id, harness_dir) = match select_harness(&work_dir, requested_harness.as_deref()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // An Ada work dir reports through `prepare_layout`. Anything else —
+            // a C/C++ harness root, or no `src_instrumented` at all — gets the
+            // lookup error itself rather than a misleading Ada layout complaint.
+            if work_dir.join("src_instrumented").is_dir() && !has_c_family_harness(&work_dir) {
+                return None;
+            }
+            bhfeprintln!("{error}");
+            bhfeprintln!("{C_FAMILY_BUILD_LAYOUT_HINT}");
+            return Some(3);
+        }
+    };
+    if !is_c_family_harness_dir(&harness_dir) {
         return None;
+    }
+
+    // Ada flags given for a C/C++ harness would be silently meaningless; say so
+    // and point at the flags that do apply.
+    let ada_only = ada_only_flags_given(args);
+    if !ada_only.is_empty() {
+        bhfeprintln!(
+            "bhf build: {} appl{} only to Ada harnesses; '{harness_id}' is a C/C++ harness. \
+             Choose its toolchain with --cc/--cxx, --target, --toolchain <prefix>, --cflags, \
+             --sysroot, or a [toolchain] table in --config.",
+            ada_only.join(", "),
+            if ada_only.len() == 1 { "ies" } else { "y" }
+        );
+        return Some(2);
+    }
+    if let Some(note) = ada_prefix_note(toolchain, args.toolchain.as_deref(), &harness_id) {
+        bhfeprintln!("bhf build: note: {note}");
+    }
+    match crate::toolchain::publish(toolchain) {
+        Ok(published) => {
+            for note in published.notes {
+                bhfeprintln!("bhf build: {note}");
+            }
+            // A C++ compiler derived from the C compiler need exist only for
+            // a C++ harness.
+            if let Some(missing) = published
+                .missing_cxx
+                .filter(|_| harness_dir.join("main.cpp").is_file())
+            {
+                bhfeprintln!("bhf build: {missing}");
+                return Some(2);
+            }
+        }
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return Some(2);
+        }
+    }
+    // What the build produces: a binary for the toolchain's target, or for
+    // whatever the selected compiler builds for (a prefixed or cross --cc).
+    let compiler = {
+        let effective = crate::toolchain::effective_compilers();
+        if harness_dir.join("main.cpp").is_file() {
+            effective.cxx
+        } else {
+            effective.cc
+        }
+    };
+    let built_for = toolchain
+        .target
+        .clone()
+        .or_else(|| crate::toolchain::compiler_target_triple(&compiler));
+    let foreign = built_for
+        .as_deref()
+        .filter(|triple| !crate::toolchain::triple_runs_natively(triple));
+    let runner = match build_runner(toolchain, built_for.as_deref(), &compiler) {
+        Ok(runner) => runner,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return Some(2);
+        }
+    };
+    let runs_natively = built_for
+        .as_deref()
+        .is_some_and(crate::toolchain::triple_runs_natively);
+    if let (None, Some(runner)) = (foreign, &runner) {
+        bhfeprintln!(
+            "bhf build: `{compiler}` does not say which target it builds for; '{harness_id}' \
+             runs under `{}` as configured, recorded in bhf_runner.json",
+            std::iter::once(runner.program.display().to_string())
+                .chain(runner.args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    if let Some(triple) = foreign {
+        match &runner {
+            Some(runner) => bhfeprintln!(
+                "bhf build: building '{harness_id}' for {triple}; it runs under `{}`, recorded \
+                 in bhf_runner.json beside the binary",
+                std::iter::once(runner.program.display().to_string())
+                    .chain(runner.args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None => bhfeprintln!(
+                "bhf build: building '{harness_id}' for {triple}; run it under an emulator \
+                 (set toolchain.runner or --runner to record one, or run `bhf replay \
+                 --qemu-user <qemu> --qemu-arg=-L --qemu-arg=<sysroot>`)"
+            ),
+        }
     }
 
     // Mirror the Ada path's `build/<harness-id>/main` layout so `bhf fuzz`
@@ -720,6 +1301,7 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
     let (make_target, built_name, staged_name) = match args.c_engine {
         CEngine::Libfuzzer => (Some("main"), "main", "main"),
         CEngine::AflPlusPlus => (Some("afl"), "main_afl", "main_afl"),
+        CEngine::Winafl => (Some("winafl"), "main_winafl", "main_winafl"),
     };
     bhfeprintln!(
         "Building C/C++ harness '{}' via make{}",
@@ -734,16 +1316,22 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
     let force_includes = repair_force_includes(&harness_dir);
     apply_c_family_make_env(&mut cmd, &[], &[], &force_includes, None);
     // Bounded and process-grouped: an unbounded `status()` here let one spinning
-    // compile consume a whole campaign and outlive bhf entirely.
-    let status = crate::command_output::status_with_timeout(
+    // compile consume a whole campaign and outlive bhf entirely. The output is
+    // shown as it arrives and also kept, so a failed build can be explained.
+    let output = crate::command_output::output_with_timeout_teed(
         &mut cmd,
         std::time::Duration::from_secs(30 * 60),
     );
-    match status {
-        Ok(s) if s.success() => {
-            let built = harness_dir.join(built_name);
+    match output {
+        Ok((_, true)) => {
+            bhfeprintln!("invoke make: timed out");
+            Some(2)
+        }
+        Ok((out, false)) if out.status.success() => {
+            // `main.exe` on Windows: the Makefile names its binaries so.
+            let built = crate::auto::layout::harness_exe(&harness_dir, built_name);
             if built.is_file() {
-                let dest = build_dir.join(staged_name);
+                let dest = build_dir.join(crate::auto::layout::harness_exe_name(staged_name));
                 if let Err(error) = fs::copy(&built, &dest) {
                     bhfeprintln!(
                         "copy '{}' -> '{}': {error}",
@@ -753,6 +1341,33 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
                     return Some(2);
                 }
                 bhfeprintln!("built harness binary -> {}", dest.display());
+                // The emulator a foreign binary runs under, recorded beside it
+                // (and beside the harness) for the commands that run it. A
+                // native rebuild forgets one an earlier build recorded.
+                if runner.is_some() || runs_natively {
+                    for dir in [&build_dir, &harness_dir] {
+                        if let Err(error) =
+                            crate::gate_evidence::record_runner(dir, runner.as_ref())
+                        {
+                            bhfeprintln!(
+                                "bhf build: warning: could not record the runner in {}: {error}",
+                                dir.display()
+                            );
+                        }
+                    }
+                }
+                if cfg!(windows) {
+                    let path = std::env::var_os("PATH");
+                    stage_sanitizer_runtime(&work_dir, &harness_dir, path.as_deref());
+                    stage_sanitizer_runtime(&work_dir, &build_dir, path.as_deref());
+                }
+                // A foreign build (or one run under an emulator) is not
+                // rebuilt for this host from its recipe.
+                record_build_recipe(
+                    &work_dir,
+                    &harness_dir,
+                    foreign.is_none() && runner.is_none(),
+                );
             } else {
                 bhfeprintln!(
                     "make reported success but did not produce expected harness binary '{}'",
@@ -762,8 +1377,19 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
             }
             Some(0)
         }
-        Ok(s) => {
-            bhfeprintln!("make exited with status {:?}", s.code());
+        Ok((out, false)) => {
+            bhfeprintln!("make exited with status {:?}", out.status.code());
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let inherited = RebuildEnv::inherited();
+            for line in
+                c_build_failure_hints(&work_dir, &harness_id, &harness_dir, &text, &inherited)
+            {
+                bhfeprintln!("{line}");
+            }
             Some(1)
         }
         Err(error) => {
@@ -771,6 +1397,1162 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
             Some(2)
         }
     }
+}
+
+/// Record what this build took from the environment beside the harness
+/// (`coverage-build-recipe.json`), as `bhf auto` does for its builds:
+/// `AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES`, `AUTO_EXTRA_LDFLAGS`, the
+/// `CXX_STD`/`C_STD` standard and the `[toolchain]` flags reach `make` that
+/// way, not through the Makefile, so `bhf capsule` reads them from here.
+fn record_build_recipe(work_dir: &Path, harness_dir: &Path, native: bool) {
+    let cpp = harness_dir.join("main.cpp").is_file();
+    let standard = std::env::var(if cpp { "CXX_STD" } else { "C_STD" })
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let extra_sources: Vec<PathBuf> = std::env::var("AUTO_EXTRA_SOURCES")
+        .ok()
+        .map(|value| {
+            recipe_words(&value)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let compilers = crate::toolchain::effective_compilers();
+    let compiler = if cpp { compilers.cxx } else { compilers.cc };
+    crate::auto::coverage_replay::persist_build_recipe(
+        harness_dir,
+        &crate::auto::coverage_replay::RecipeBuild {
+            work_dir,
+            extra_sources: &extra_sources,
+            extra_includes: &[],
+            standard,
+            native,
+            cpp,
+            compiler_family: crate::toolchain::compiler_family(&compiler, cpp),
+            recorded_by: "build",
+        },
+    );
+}
+
+const C_FAMILY_BUILD_LAYOUT_HINT: &str = "hint: bhf build takes the work directory that holds \
+     the harness as harnesses/<id>/ or generated_harnesses/<id>/ (generate it with \
+     `bhf generate-harness <source> --target <name> --output <work>/harnesses`), then run \
+     `bhf build <work> --harness <id>`";
+
+/// Whether `dir` is a generated C/C++ harness directory (a Makefile beside
+/// `main.c` or `main.cpp`).
+fn is_c_family_harness_dir(dir: &Path) -> bool {
+    dir.join("Makefile").is_file()
+        && (dir.join("main.c").is_file() || dir.join("main.cpp").is_file())
+}
+
+/// Whether `root` directly holds at least one C/C++ harness directory.
+fn root_holds_c_family_harness(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().is_dir() && is_c_family_harness_dir(&entry.path()))
+    })
+}
+
+/// Whether either harness root of `work_dir` holds a C/C++ harness.
+fn has_c_family_harness(work_dir: &Path) -> bool {
+    harness_roots(work_dir)
+        .iter()
+        .any(|root| root_holds_c_family_harness(root))
+}
+
+fn is_harness_root_name(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| {
+        name == crate::auto::layout::HARNESSES_DIR
+            || name == crate::auto::layout::GENERATED_HARNESSES_DIR
+    })
+}
+
+/// Map the directory given to `bhf build` onto the work directory and harness
+/// id. Besides a work directory, it accepts a C/C++ harness directory itself
+/// (`<work>/harnesses/<id>`) and a harness root (`<work>/harnesses`, which is
+/// what `generate-harness --output` names), printing the equivalent canonical
+/// invocation. A harness directory that is not inside a work layout is an
+/// error naming the layout `bhf build` expects.
+fn resolve_c_family_work_dir(
+    dir: &Path,
+    harness: Option<&str>,
+) -> Result<(PathBuf, Option<String>), String> {
+    let unchanged = || Ok((dir.to_path_buf(), harness.map(str::to_owned)));
+    if !dir.is_dir() || dir.join("src_instrumented").is_dir() {
+        return unchanged();
+    }
+    if is_c_family_harness_dir(dir) {
+        let id = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(requested) = harness.filter(|requested| *requested != id) {
+            return Err(format!(
+                "{} is the harness directory of '{id}', but --harness asks for '{requested}'; \
+                 pass the work directory instead",
+                dir.display()
+            ));
+        }
+        let work = dir
+            .parent()
+            .filter(|root| is_harness_root_name(root))
+            .and_then(Path::parent);
+        let Some(work) = work else {
+            return Err(format!(
+                "{} is a harness directory, but bhf build expects the work directory that \
+                 holds it as harnesses/<id>/ (or generated_harnesses/<id>/); generate it there \
+                 with `bhf generate-harness ... --output <work>/harnesses`, then run \
+                 `bhf build <work> --harness {id}`",
+                dir.display()
+            ));
+        };
+        bhfeprintln!(
+            "note: {} is a harness directory; building it as `bhf build {} --harness {id}`",
+            dir.display(),
+            work.display()
+        );
+        return Ok((work.to_path_buf(), Some(id)));
+    }
+    if is_harness_root_name(dir)
+        && root_holds_c_family_harness(dir)
+        && !harness_roots(dir).iter().any(|root| root.is_dir())
+    {
+        if let Some(work) = dir.parent() {
+            bhfeprintln!(
+                "note: {} holds harness directories; using its parent {} as the work directory",
+                dir.display(),
+                work.display()
+            );
+            return Ok((work.to_path_buf(), harness.map(str::to_owned)));
+        }
+    }
+    unchanged()
+}
+
+/// The symbols a failed link reported as undefined, in first-seen order:
+/// GNU ld (`undefined reference to `sym'`) and lld (`undefined symbol: sym`).
+fn undefined_symbols_in(output: &str) -> Vec<String> {
+    const MAX_SYMBOLS: usize = 64;
+    let mut symbols: Vec<String> = Vec::new();
+    for line in output.lines() {
+        // link.exe / lld-link (`unresolved external symbol NAME`) first: the
+        // lld spelling below would otherwise keep the `>>>` decoration.
+        let msvc = build_classifier::gcc_clang::msvc_unresolved_symbol(line);
+        let symbol = msvc
+            .as_deref()
+            .or_else(|| {
+                line.split_once("undefined reference to `")
+                    .and_then(|(_, rest)| rest.rsplit_once('\''))
+                    .map(|(symbol, _)| symbol)
+            })
+            .or_else(|| {
+                line.split_once("undefined symbol: ")
+                    .map(|(_, rest)| rest.trim())
+            });
+        let Some(symbol) = symbol.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !symbols.iter().any(|known| known == symbol) {
+            symbols.push(symbol.to_owned());
+            if symbols.len() == MAX_SYMBOLS {
+                break;
+            }
+        }
+    }
+    symbols
+}
+
+/// Split a Makefile recipe or an `AUTO_EXTRA_SOURCES` value into words,
+/// honouring the double/single quotes generated recipes put around paths with
+/// spaces.
+fn recipe_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in text.chars() {
+        match (quote, ch) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Whether `line` heads a harness Makefile's `main` link rule: `main$(EXEEXT):`
+/// in a generated Makefile (the binary is `main.exe` on Windows), `main:` in
+/// an older or hand-written one.
+pub(crate) fn is_main_rule(line: &str) -> bool {
+    line.starts_with("main$(EXEEXT):") || line.starts_with("main:")
+}
+
+/// The target sources the harness Makefile compiles into `main` (the operands
+/// after `main.c`/`main.cpp` on the `main:` recipe), and the first `-iquote`
+/// include directory, which is the target's own directory.
+pub(crate) fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let Ok(text) = fs::read_to_string(harness_dir.join("Makefile")) else {
+        return (Vec::new(), None);
+    };
+    let mut sources = Vec::new();
+    let mut target_dir = None;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if let Some(includes) = line.strip_prefix("INCLUDES = ") {
+            let words = recipe_words(includes);
+            target_dir = words
+                .iter()
+                .position(|word| word == "-iquote")
+                .and_then(|index| words.get(index + 1))
+                .map(PathBuf::from);
+        } else if is_main_rule(line) {
+            let Some(recipe) = lines.next() else {
+                break;
+            };
+            let words = recipe_words(recipe);
+            if let Some(start) = words
+                .iter()
+                .position(|word| word == "main.c" || word == "main.cpp")
+            {
+                sources = words[start + 1..]
+                    .iter()
+                    .take_while(|word| !word.starts_with("$("))
+                    .map(PathBuf::from)
+                    .collect();
+            }
+        }
+    }
+    (sources, target_dir)
+}
+
+/// The include directories a harness Makefile searches for the target
+/// (`-iquote <dir>` in its `INCLUDES`), in order.
+fn makefile_include_dirs(harness_dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(harness_dir.join("Makefile")) else {
+        return Vec::new();
+    };
+    let Some(includes) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("INCLUDES = "))
+    else {
+        return Vec::new();
+    };
+    let words = recipe_words(includes);
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "-iquote")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .collect()
+}
+
+/// The `--extra-source` files, `--extra-include` dirs and `--source-root`s
+/// generation recorded in the harness's `generation-metadata.json`.
+fn recorded_build_inputs(harness_dir: &Path) -> Vec<PathBuf> {
+    let Ok(bytes) = fs::read(harness_dir.join("generation-metadata.json")) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    ["extra_sources", "extra_includes", "source_roots"]
+        .iter()
+        .filter_map(|key| metadata.get(*key).and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Every directory to look in for the definitions of a failed link's
+/// undefined symbols: [`definition_search_root`] around the target first,
+/// then the directories of the harness's other inputs — each source its
+/// Makefile compiles, each include dir it searches, and the extra sources,
+/// extra include dirs and source roots generation recorded — so a library
+/// kept beside the harness outside any checkout (`harness/` + `lib/`) is
+/// searched too. A directory inside one already listed, or inside the work
+/// dir, is left out, and so is one that would take the sources indexed in
+/// all past [`MAX_INDEXED_SOURCES`].
+fn definition_search_roots(target_dir: &Path, harness_dir: &Path, work_dir: &Path) -> Vec<PathBuf> {
+    // Resolved as the caller resolves the work dir and the linked sources,
+    // without Windows' `\\?\` prefix: the roots are shown in a hint.
+    let canonical = crate::workdir::plain_canonical;
+    let primary = canonical(&definition_search_root(target_dir));
+    let mut budget =
+        MAX_INDEXED_SOURCES.saturating_sub(c_family_source_count(&primary, MAX_INDEXED_SOURCES));
+    let (sources, _) = makefile_target_context(harness_dir);
+    let mut candidates: Vec<PathBuf> = sources
+        .iter()
+        .filter_map(|source| source.parent().map(Path::to_path_buf))
+        .collect();
+    candidates.extend(makefile_include_dirs(harness_dir));
+    for input in recorded_build_inputs(harness_dir) {
+        if input.is_file() {
+            candidates.extend(input.parent().map(Path::to_path_buf));
+        } else {
+            candidates.push(input);
+        }
+    }
+    // Shallowest first, so a directory is skipped when one containing it
+    // is already searched.
+    let mut candidates: Vec<PathBuf> = candidates.iter().map(|dir| canonical(dir)).collect();
+    candidates.sort_by_key(|dir| dir.components().count());
+    candidates.dedup();
+    let mut roots = vec![primary];
+    for dir in candidates {
+        if !dir.is_dir()
+            || dir.starts_with(work_dir)
+            || roots.iter().any(|root| dir.starts_with(root))
+        {
+            continue;
+        }
+        let count = c_family_source_count(&dir, budget + 1);
+        if count == 0 || count > budget {
+            continue;
+        }
+        budget -= count;
+        roots.push(dir);
+    }
+    roots
+}
+
+/// Where to look for the in-tree definitions of undefined symbols: the
+/// enclosing checkout when it is close by, the project directory around a
+/// conventional `src/`/`lib/` directory, or the target's own directory. A tree
+/// with too many sources to index quickly falls back to the target directory.
+/// The most C/C++ sources the undefined-symbol hint indexes, over every
+/// directory it searches.
+const MAX_INDEXED_SOURCES: usize = 5_000;
+
+fn definition_search_root(target_dir: &Path) -> PathBuf {
+    const MAX_ASCENT: usize = 3;
+    let mut candidate = None;
+    let mut current = Some(target_dir);
+    for _ in 0..=MAX_ASCENT {
+        let Some(dir) = current else {
+            break;
+        };
+        if dir.join(".git").exists() {
+            candidate = Some(dir.to_path_buf());
+            break;
+        }
+        current = dir.parent();
+    }
+    let candidate = candidate.unwrap_or_else(|| {
+        let conventional = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "src" | "source" | "sources" | "lib" | "libs"
+                )
+            });
+        match target_dir.parent() {
+            Some(parent) if conventional => parent.to_path_buf(),
+            _ => target_dir.to_path_buf(),
+        }
+    });
+    if candidate != target_dir
+        && c_family_source_count(&candidate, MAX_INDEXED_SOURCES + 1) > MAX_INDEXED_SOURCES
+    {
+        return target_dir.to_path_buf();
+    }
+    candidate
+}
+
+/// The number of C/C++ sources under `root`, counting at most `cap`. Symbolic
+/// links are not followed, so a link cycle cannot keep the walk going.
+fn c_family_source_count(root: &Path, cap: usize) -> usize {
+    const MAX_DIRS: usize = 50_000;
+    let mut count = 0;
+    let mut visited_dirs = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        visited_dirs += 1;
+        if visited_dirs > MAX_DIRS {
+            return cap;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !entry.file_name().to_string_lossy().starts_with('.') {
+                    stack.push(path);
+                }
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext,
+                            "c" | "cc" | "cpp" | "cxx" | "C" | "h" | "hh" | "hpp" | "hxx"
+                        )
+                    })
+            {
+                count += 1;
+                if count >= cap {
+                    return count;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// A path for a shell command line: single-quoted when it needs quoting.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The make variables an operator sets on `bhf build` to extend a harness
+/// build, in the order a suggested command spells them.
+const REBUILD_ENV_VARS: [&str; 5] = [
+    "AUTO_EXTRA_SOURCES",
+    "AUTO_EXTRA_INCLUDES",
+    "AUTO_EXTRA_LDFLAGS",
+    "CXX_STD",
+    "C_STD",
+];
+
+/// The build variables a suggested `bhf build` command sets. It starts from
+/// the operator's own values, so following one hint never drops another fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RebuildEnv {
+    vars: Vec<(&'static str, String)>,
+}
+
+impl RebuildEnv {
+    /// The values this `bhf build` was run with.
+    fn inherited() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let vars = REBUILD_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                let value = lookup(name)?;
+                let value = value.trim();
+                (!value.is_empty()).then(|| (*name, value.to_owned()))
+            })
+            .collect();
+        Self { vars }
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// A copy with each of `phrases` (a flag with its operand, or a path)
+    /// appended to `name`, unless the value already holds it.
+    fn with(&self, name: &'static str, phrases: &[String]) -> Self {
+        let mut value = self.get(name).unwrap_or_default().to_owned();
+        for phrase in phrases {
+            let held: Vec<String> = recipe_words(&value);
+            let wanted: Vec<String> = recipe_words(phrase);
+            if wanted.is_empty() || held.windows(wanted.len()).any(|window| window == wanted) {
+                continue;
+            }
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(phrase);
+        }
+        let mut next = self.clone();
+        next.vars.retain(|(key, _)| *key != name);
+        if !value.is_empty() {
+            next.vars.push((name, value));
+        }
+        next
+    }
+
+    /// `VAR=value ... <rebuild>`, with the variables in [`REBUILD_ENV_VARS`] order.
+    fn command(&self, rebuild: &str) -> String {
+        let mut parts: Vec<String> = REBUILD_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                self.get(name)
+                    .map(|value| format!("{name}={}", shell_text(value)))
+            })
+            .collect();
+        parts.push(rebuild.to_owned());
+        parts.join(" ")
+    }
+}
+
+/// `text` as one shell word: bare when it has no special characters, else
+/// single-quoted.
+fn shell_text(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The prelude header a failed C++ harness build writes into the harness
+/// directory for standard-library names the sources use without `std::`.
+/// `bhf build` writes it and prints the command that force-includes it;
+/// `bhf auto` writes the same file and force-includes it itself.
+pub(crate) const STD_PRELUDE_HEADER: &str = "std_prelude.h";
+
+/// A prelude header [`write_std_prelude`] wrote or extended.
+pub(crate) struct StdPrelude {
+    /// Resolved, as shown in the suggested command.
+    pub(crate) path: PathBuf,
+    /// The standard headers it includes, sorted.
+    pub(crate) headers: Vec<String>,
+    /// What this build did to the file.
+    pub(crate) change: PreludeChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreludeChange {
+    Created,
+    Extended,
+    Unchanged,
+}
+
+/// The prelude for `names` (each with its header): the headers, then a
+/// `using std::<name>;` for each name, both sorted. Including a header twice
+/// and repeating a using declaration are harmless, so a source that has its
+/// own `#include <string>` and `using namespace std;` still compiles with it.
+fn std_prelude_text(names: &[(String, &'static str)]) -> String {
+    let (headers, sorted) = std_prelude_lines(names);
+    let mut text = String::from(
+        "/* Written by bhf: standard-library names this project's sources use without\n \
+         * `std::`, relying on a `using namespace std;` that is not in effect\n \
+         * everywhere they are compiled. `bhf auto` force-includes it into every\n \
+         * translation unit of this harness; for `bhf build`, pass\n \
+         * AUTO_EXTRA_INCLUDES='-include <this file>'. A later failed build adds the\n \
+         * names it reports and keeps every other line. Delete a `using` line whose\n \
+         * name a project source declares itself. */\n\
+         #pragma once\n\
+         #ifdef __cplusplus\n",
+    );
+    for line in headers.iter().chain(&sorted) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.push_str("#endif\n");
+    text
+}
+
+/// The sorted `#include <header>` and `using std::<name>;` lines for `names`.
+fn std_prelude_lines(names: &[(String, &'static str)]) -> (Vec<String>, Vec<String>) {
+    let mut headers: Vec<&str> = names.iter().map(|(_, header)| *header).collect();
+    headers.sort_unstable();
+    headers.dedup();
+    let mut sorted: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    (
+        headers
+            .iter()
+            .map(|header| format!("#include <{header}>"))
+            .collect(),
+        sorted
+            .iter()
+            .map(|name| format!("using std::{name};"))
+            .collect(),
+    )
+}
+
+/// The keyword and the rest of a preprocessor directive line (`#  include
+/// <map>` gives `("include", "<map>")`).
+fn prelude_directive(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix('#')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    Some((&rest[..end], rest[end..].trim()))
+}
+
+/// The header of an `#include <header>` line.
+fn prelude_include(line: &str) -> Option<&str> {
+    match prelude_directive(line)? {
+        ("include", rest) => Some(rest.strip_prefix('<')?.split_once('>')?.0.trim()),
+        _ => None,
+    }
+}
+
+/// The name of a `using std::<name>;` line.
+fn prelude_using(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("using")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
+    let rest = rest.strip_prefix("std")?.trim_start().strip_prefix("::")?;
+    let (name, after) = rest.split_once(';')?;
+    let after = after.trim();
+    (after.is_empty() || after.starts_with("//")).then(|| name.trim())
+}
+
+/// The first and last line of the `#ifdef __cplusplus` section of `lines`
+/// (its `#endif`), unless it has an `#else` or `#elif` branch of its own.
+fn cplusplus_section(lines: &[&str]) -> Option<(usize, usize)> {
+    let open = lines.iter().position(|line| {
+        let Some((keyword, rest)) = prelude_directive(line) else {
+            return false;
+        };
+        let condition = rest.split('/').next().unwrap_or_default().trim();
+        matches!(
+            (keyword, condition),
+            ("ifdef", "__cplusplus") | ("if", "defined(__cplusplus)" | "defined __cplusplus")
+        )
+    })?;
+    let mut depth = 0usize;
+    for (index, line) in lines.iter().enumerate().skip(open) {
+        match prelude_directive(line) {
+            Some(("if" | "ifdef" | "ifndef", _)) => depth += 1,
+            Some(("else" | "elif" | "elifdef" | "elifndef", _)) if depth == 1 => return None,
+            Some(("endif", _)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `text`, an existing prelude, with the `#include` and `using` lines for
+/// `names` that it lacks: the includes after the last one directly in its
+/// `#ifdef __cplusplus` section (or after the `#ifdef`), the `using` lines
+/// before the section's `#endif`. Without such a section they come in a
+/// guarded block of their own at the end. Every other line stays as it is,
+/// including its line ending.
+fn extend_std_prelude(text: &str, names: &[(String, &'static str)]) -> String {
+    let segments: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines: Vec<&str> = segments
+        .iter()
+        .map(|segment| segment.trim_end_matches(['\n', '\r']))
+        .collect();
+    let missing: Vec<(String, &'static str)> = names
+        .iter()
+        .filter(|(name, _)| !lines.iter().any(|line| prelude_using(line) == Some(name)))
+        .cloned()
+        .collect();
+    let usings = std_prelude_lines(&missing).1;
+    let includes: Vec<String> = std_prelude_lines(names)
+        .0
+        .into_iter()
+        .filter(|include| {
+            let header = prelude_include(include);
+            !lines.iter().any(|line| prelude_include(line) == header)
+        })
+        .collect();
+    if includes.is_empty() && usings.is_empty() {
+        return text.to_owned();
+    }
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let block = |lines: &[String]| -> String {
+        lines
+            .iter()
+            .map(|line| format!("{line}{newline}"))
+            .collect()
+    };
+    let Some((open, close)) = cplusplus_section(&lines) else {
+        let mut extended = text.to_owned();
+        if !extended.is_empty() && !extended.ends_with('\n') {
+            extended.push_str(newline);
+        }
+        extended.push_str(&format!("#ifdef __cplusplus{newline}"));
+        extended.push_str(&block(&includes));
+        extended.push_str(&block(&usings));
+        extended.push_str(&format!("#endif{newline}"));
+        return extended;
+    };
+    // The last `#include` directly in the section, not in a nested condition.
+    let mut after = open;
+    let mut depth = 0usize;
+    for (index, line) in lines.iter().enumerate().take(close).skip(open + 1) {
+        match prelude_directive(line) {
+            Some(("if" | "ifdef" | "ifndef", _)) => depth += 1,
+            Some(("endif", _)) => depth = depth.saturating_sub(1),
+            _ if depth == 0 && prelude_include(line).is_some() => after = index,
+            _ => {}
+        }
+    }
+    let mut extended = String::with_capacity(text.len() + 64);
+    for (index, segment) in segments.iter().enumerate() {
+        if index == close {
+            extended.push_str(&block(&usings));
+        }
+        extended.push_str(segment);
+        if index == after {
+            extended.push_str(&block(&includes));
+        }
+    }
+    extended
+}
+
+/// Write `<harness_dir>/std_prelude.h` so it declares `names`, or add the
+/// ones it lacks to the file an earlier build wrote (and the operator may
+/// have edited), keeping every line it has. A file that cannot be read as
+/// text is never replaced.
+pub(crate) fn write_std_prelude(
+    harness_dir: &Path,
+    names: &[(String, &'static str)],
+) -> std::io::Result<StdPrelude> {
+    let file = harness_dir.join(STD_PRELUDE_HEADER);
+    let existing = match fs::read_to_string(&file) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let (text, change) = match &existing {
+        None => (std_prelude_text(names), PreludeChange::Created),
+        Some(existing) => {
+            let text = extend_std_prelude(existing, names);
+            let change = if &text == existing {
+                PreludeChange::Unchanged
+            } else {
+                PreludeChange::Extended
+            };
+            (text, change)
+        }
+    };
+    if change != PreludeChange::Unchanged {
+        fs::write(&file, &text)?;
+    }
+    let mut headers: Vec<String> = text
+        .lines()
+        .filter_map(prelude_include)
+        .map(str::to_owned)
+        .collect();
+    headers.sort_unstable();
+    headers.dedup();
+    Ok(StdPrelude {
+        path: crate::workdir::plain_canonical(&file),
+        headers,
+        change,
+    })
+}
+
+/// The standard-library names in `output`, a failed build of the harness in
+/// `harness_dir`, that belong in a std prelude
+/// ([`build_classifier::unqualified_std_names`]): none for a C harness, and
+/// none for diagnostics in C code, as the classifier decides, nor for a name
+/// `project_defines` says is the project's own (its own `list` type; it sees
+/// how the source uses the name, as a template or not). A name
+/// whose header `force_included` says the build already force-includes counts
+/// as declared. An unqualified stream object (`cerr`) whose declaration the
+/// compiler has not seen needs only its header when the source has `using
+/// namespace std;`, so stream objects alone are left out, unless the build
+/// already force-includes a prelude (`prelude_in_use`): every other name
+/// needs a `using` declaration as well, which only a force-included prelude
+/// can add, and once there is one the stream objects go into it too.
+/// `bhf build` and `bhf auto` decide with this the same way.
+pub(crate) fn std_prelude_names(
+    harness_dir: &Path,
+    output: &str,
+    force_included: &dyn Fn(&str) -> bool,
+    project_defines: &dyn Fn(&build_classifier::UnqualifiedStdName) -> bool,
+    prelude_in_use: bool,
+) -> Vec<build_classifier::UnqualifiedStdName> {
+    if !harness_dir.join("main.cpp").is_file() {
+        return Vec::new();
+    }
+    let mut unqualified = build_classifier::unqualified_std_names(output);
+    unqualified.retain(|name| !project_defines(name));
+    for name in &mut unqualified {
+        name.declared |= force_included(name.header);
+    }
+    if !prelude_in_use
+        && !unqualified
+            .iter()
+            .any(|name| name.declared || build_classifier::std_stream_header(&name.name).is_none())
+    {
+        unqualified.clear();
+    }
+    unqualified
+}
+
+/// What a failed C/C++ harness build was missing, with the exact command that
+/// adds it: in-tree sources that define the symbols the link could not
+/// resolve (`AUTO_EXTRA_SOURCES` or `--extra-source`), standard stream headers
+/// an old source never included (`AUTO_EXTRA_INCLUDES='-include iostream'`),
+/// a prelude header (written into the harness directory) for standard-library
+/// names a pre-standard C++ source uses without `std::`, system libraries
+/// (`AUTO_EXTRA_LDFLAGS`), and the MSVC-only extra member qualification.
+/// Every suggested command keeps the operator's own build variables
+/// (`inherited`); when several hints apply, a last line combines them.
+fn c_build_failure_hints(
+    work_dir: &Path,
+    harness_id: &str,
+    harness_dir: &Path,
+    output: &str,
+    inherited: &RebuildEnv,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    let rebuild = format!("bhf build {} --harness {harness_id}", shell_word(work_dir));
+    let classified = build_classifier::classify(output);
+    // Every suggestion, applied together.
+    let mut combined = inherited.clone();
+    let mut suggestions = 0usize;
+
+    // Standard-library names a pre-standard C++ source writes without `std::`
+    // (`string`, `map<string, int>`), relying on a `using namespace std;` its
+    // includer provides. A name still reported with its header force-included
+    // is declared but unqualified, as when the compiler says so.
+    let forced_includes: Vec<String> = inherited
+        .get("AUTO_EXTRA_INCLUDES")
+        .map(recipe_words)
+        .unwrap_or_default();
+    let force_included = |header: &str| {
+        forced_includes
+            .windows(2)
+            .any(|pair| pair[0] == "-include" && pair[1] == header)
+            || forced_includes
+                .iter()
+                .any(|word| word.strip_prefix("-include") == Some(header))
+    };
+    let prelude_file = harness_dir.join(STD_PRELUDE_HEADER);
+    let prelude_in_use = prelude_file.is_file()
+        && force_included(
+            &crate::workdir::plain_canonical(&prelude_file)
+                .display()
+                .to_string(),
+        );
+    let unqualified = std_prelude_names(
+        harness_dir,
+        output,
+        &force_included,
+        &|_| false,
+        prelude_in_use,
+    );
+    let in_prelude = |name: &str| unqualified.iter().any(|entry| entry.name == name);
+
+    // Standard stream headers a pre-standard source relied on getting
+    // transitively.
+    let mut stream_names: Vec<&str> = Vec::new();
+    let mut stream_headers: Vec<&str> = Vec::new();
+    for kind in &classified {
+        if let build_classifier::BuildErrorKind::MissingType { name } = kind {
+            if in_prelude(name) {
+                continue;
+            }
+            if let Some(header) = build_classifier::std_stream_header(name) {
+                if !stream_names.contains(&name.as_str()) {
+                    stream_names.push(name);
+                }
+                if !stream_headers.contains(&header) {
+                    stream_headers.push(header);
+                }
+            }
+        }
+    }
+    if !stream_headers.is_empty() {
+        let includes: Vec<String> = stream_headers
+            .iter()
+            .map(|header| format!("-include {header}"))
+            .collect();
+        hints.push(format!(
+            "hint: the sources use {} without including <{}>; force-include it into every \
+             translation unit: {}",
+            stream_names.join(", "),
+            stream_headers.join(">, <"),
+            inherited
+                .with("AUTO_EXTRA_INCLUDES", &includes)
+                .command(&rebuild)
+        ));
+        combined = combined.with("AUTO_EXTRA_INCLUDES", &includes);
+        suggestions += 1;
+    }
+    if !unqualified.is_empty() {
+        let names: Vec<(String, &'static str)> = unqualified
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.header))
+            .collect();
+        let shown = names
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let why = format!(
+            "hint: the sources use {shown} without `std::`, relying on a `using namespace std;` \
+             that is not in effect where they are compiled"
+        );
+        match write_std_prelude(harness_dir, &names) {
+            Ok(prelude) => {
+                let path = prelude.path.display().to_string();
+                let flags = [format!("-include {path}")];
+                let headers = prelude.headers.join(">, <");
+                let done = match prelude.change {
+                    PreludeChange::Created => format!(
+                        "wrote {path}, which includes <{headers}> and declares each name with \
+                         `using std::`"
+                    ),
+                    PreludeChange::Extended => format!(
+                        "added the missing lines to {path}, which now includes <{headers}> and \
+                         declares each name with `using std::`"
+                    ),
+                    PreludeChange::Unchanged => format!(
+                        "{path} already includes <{headers}> and declares each name with \
+                         `using std::`"
+                    ),
+                };
+                hints.push(format!(
+                    "{why}; {done}; force-include it into every translation unit: {}",
+                    inherited
+                        .with("AUTO_EXTRA_INCLUDES", &flags)
+                        .command(&rebuild)
+                ));
+                if path
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+                {
+                    hints.push(
+                        "  the Makefile splits AUTO_EXTRA_INCLUDES at whitespace: copy the \
+                         prelude to a path without spaces and force-include the copy"
+                            .to_owned(),
+                    );
+                }
+                combined = combined.with("AUTO_EXTRA_INCLUDES", &flags);
+                suggestions += 1;
+            }
+            Err(error) => {
+                hints.push(format!(
+                    "{why}; could not write {}: {error}; save these lines as a header (or \
+                     add them to that one) and force-include it into every translation unit \
+                     (AUTO_EXTRA_INCLUDES='-include <header>'):",
+                    harness_dir.join(STD_PRELUDE_HEADER).display()
+                ));
+                hints.extend(
+                    std_prelude_text(&names)
+                        .lines()
+                        .map(|line| format!("  {line}")),
+                );
+            }
+        }
+    }
+    let qualified: Vec<(&str, u32, &str)> = classified
+        .iter()
+        .filter_map(|kind| match kind {
+            build_classifier::BuildErrorKind::ExtraQualification { file, line, member } => {
+                Some((file.as_str(), *line, member.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some((file, line, member)) = qualified.first() {
+        // g++ tags the error with the flag that relaxes it; clang does not.
+        let (flag, other) = if output.contains("[-fpermissive]") {
+            ("-fpermissive", "with clang++, -fms-extensions")
+        } else {
+            ("-fms-extensions", "with g++, -fpermissive")
+        };
+        let more = match qualified.len() {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
+        let flags = [flag.to_owned()];
+        hints.push(format!(
+            "hint: {file}:{line} declares member '{member}' with an extra class qualification{more} \
+             (`int Widget::{member}();` inside class Widget), which only MSVC accepts; remove the \
+             qualification, or relax the check: {} ({other})",
+            inherited
+                .with("AUTO_EXTRA_INCLUDES", &flags)
+                .command(&rebuild)
+        ));
+        combined = combined.with("AUTO_EXTRA_INCLUDES", &flags);
+        suggestions += 1;
+    }
+
+    'link: {
+        let undefined = undefined_symbols_in(output);
+        if undefined.is_empty() {
+            break 'link;
+        }
+        let (target_sources, include_dir) = makefile_target_context(harness_dir);
+        let mut linked: Vec<PathBuf> = target_sources.clone();
+        let inherited_sources: Vec<String> = inherited
+            .get("AUTO_EXTRA_SOURCES")
+            .map(recipe_words)
+            .unwrap_or_default();
+        linked.extend(inherited_sources.iter().map(PathBuf::from));
+        // Resolved without Windows' `\\?\` prefix: the paths are shown in
+        // commands to run.
+        let canonical = crate::workdir::plain_canonical;
+        let linked: Vec<PathBuf> = linked.iter().map(|path| canonical(path)).collect();
+        let reference = target_sources.first().cloned();
+        let Some(target_dir) = reference
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or(include_dir)
+        else {
+            break 'link;
+        };
+        let reference = reference.unwrap_or_else(|| target_dir.join("main.cpp"));
+        let work_canonical = canonical(work_dir);
+        let roots = definition_search_roots(&target_dir, harness_dir, &work_canonical);
+        let Some((primary, extra)) = roots.split_first() else {
+            break 'link;
+        };
+        let mut index = match crate::auto::decl_index::DeclarationIndex::build(primary) {
+            Ok(index) => index,
+            Err(_) => break 'link,
+        };
+        // The other inputs' directories add their headers (so a definer that
+        // includes `widgets/table.h` from a sibling include dir still counts)
+        // and their definitions.
+        if index.add_header_search_roots(extra).is_err()
+            || index.add_definition_search_roots(extra).is_err()
+        {
+            break 'link;
+        }
+        let mut definers: Vec<(String, PathBuf)> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        let mut libraries: Vec<String> = Vec::new();
+        for symbol in &undefined {
+            let as_link_error = format!("undefined reference to `{symbol}'");
+            if let Some(build_classifier::BuildErrorKind::MissingSharedLib { name }) =
+                build_classifier::classify(&as_link_error)
+                    .into_iter()
+                    .next()
+            {
+                if !libraries.contains(&name) {
+                    libraries.push(name);
+                }
+                continue;
+            }
+            let definer = index
+                .lookup_definition_source_near(symbol, &reference)
+                .map(canonical)
+                .filter(|path| {
+                    !linked.contains(path)
+                        && !path.starts_with(&work_canonical)
+                        && !crate::generate_harness::source_defines_main(path)
+                });
+            match definer {
+                Some(path) => definers.push((symbol.clone(), path)),
+                None => unresolved.push(symbol.clone()),
+            }
+        }
+        if !definers.is_empty() {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for (_, path) in &definers {
+                if !files.contains(path) {
+                    files.push(path.clone());
+                }
+            }
+            hints.push(format!(
+                "hint: the link failed on {} symbol(s) defined in source files this harness does \
+                 not compile:",
+                definers.len()
+            ));
+            for (symbol, path) in definers.iter().take(10) {
+                hints.push(format!("  {symbol}  (defined in {})", path.display()));
+            }
+            if definers.len() > 10 {
+                hints.push(format!("  ... and {} more", definers.len() - 10));
+            }
+            let needs_quoting = |text: &str| {
+                text.chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+            };
+            // make splits AUTO_EXTRA_SOURCES on whitespace, so a path that needs
+            // quoting cannot travel through it.
+            let env_safe = !files
+                .iter()
+                .any(|path| needs_quoting(&path.display().to_string()))
+                && !inherited_sources.iter().any(|word| needs_quoting(word));
+            if env_safe {
+                let added: Vec<String> = files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                hints.push(format!(
+                    "  link them without regenerating: {}",
+                    inherited
+                        .with("AUTO_EXTRA_SOURCES", &added)
+                        .command(&rebuild)
+                ));
+                combined = combined.with("AUTO_EXTRA_SOURCES", &added);
+                suggestions += 1;
+            }
+            let flags: Vec<String> = files
+                .iter()
+                .map(|path| format!("--extra-source {}", shell_word(path)))
+                .collect();
+            hints.push(format!(
+                "  or regenerate the harness with them: add {} to the bhf generate-harness command",
+                flags.join(" ")
+            ));
+        }
+        if !libraries.is_empty() {
+            let flags: Vec<String> = libraries.iter().map(|lib| format!("-l{lib}")).collect();
+            hints.push(format!(
+                "hint: link the system libraries: {}",
+                inherited
+                    .with("AUTO_EXTRA_LDFLAGS", &flags)
+                    .command(&rebuild)
+            ));
+            combined = combined.with("AUTO_EXTRA_LDFLAGS", &flags);
+            suggestions += 1;
+        }
+        if !unresolved.is_empty() {
+            let shown: Vec<&str> = unresolved.iter().take(10).map(String::as_str).collect();
+            hints.push(format!(
+                "hint: no in-tree definition found under {} for: {}{}; link the library that \
+                 provides them (AUTO_EXTRA_LDFLAGS='-L<dir> -l<name>') or add the source with \
+                 --extra-source",
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                shown.join(", "),
+                if unresolved.len() > 10 { ", ..." } else { "" }
+            ));
+        }
+    }
+    if suggestions > 1 {
+        hints.push(format!(
+            "hint: every suggestion above at once: {}",
+            combined.command(&rebuild)
+        ));
+    }
+    hints
 }
 
 /// Core of the auto C/C++ make build, parameterized on the make target. With
@@ -859,8 +2641,269 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
     if let Some(extra_ldflags) = extra_ldflags.filter(|value| !value.trim().is_empty()) {
         append_command_env_flags(&mut cmd, "AUTO_EXTRA_LDFLAGS", extra_ldflags);
     }
-    crate::command_output::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30 * 60))
-        .expect("spawn make")
+    let output = crate::command_output::output_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .unwrap_or_else(|error| make_spawn_failure(&error));
+    if cfg!(windows) && output.status.success() {
+        stage_sanitizer_runtime(work_dir, &harness_dir, std::env::var_os("PATH").as_deref());
+    }
+    output
+}
+
+/// The result of a `make` that could not be started (not installed, or not
+/// on PATH): a failed build whose output says why, instead of a panic.
+fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
+    #[cfg(unix)]
+    let status = std::os::unix::process::ExitStatusExt::from_raw(127 << 8);
+    #[cfg(windows)]
+    let status = std::os::windows::process::ExitStatusExt::from_raw(1);
+    std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: format!("bhf: could not run make: {error}\n").into_bytes(),
+    }
+}
+
+/// Sidecar beside a harness binary naming the directories of the sanitizer
+/// runtime DLLs it needs, one per line. Windows finds a DLL only through PATH
+/// (or the binary's own directory): `bhf` puts them on its own PATH, and the
+/// finding's `replay.py` reads this file to do the same for a reproducer run
+/// from a plain shell.
+pub(crate) const RUNTIME_PATH_FILE: &str = "bhf-runtime-path.txt";
+
+/// The PATH entries holding a clang/MSVC AddressSanitizer runtime DLL
+/// (`clang_rt.asan_dynamic-x86_64.dll`, its debug variant), in PATH order.
+pub(crate) fn sanitizer_runtime_dirs(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let holds_runtime = entries.flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            name.starts_with("clang_rt.asan") && name.contains("dynamic") && name.ends_with(".dll")
+        });
+        if holds_runtime && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Give a Windows harness its sanitizer runtime: the DLLs of the first
+/// runtime directory on PATH (the one the build used: cl's own for the MSVC
+/// lane, clang's resource directory otherwise) are staged next to the binary,
+/// where the loader looks before PATH, so the harness starts from any shell
+/// and never picks up another toolchain's same-named DLL. The directories are
+/// also recorded in [`RUNTIME_PATH_FILE`].
+///
+/// Each DLL is copied once into `<work_dir>/.bhf-runtime/` and the harness
+/// dir gets a hard link to that copy (or a copy of it): never a link to the
+/// toolchain's own file, which would carry its directory's ACL (read and
+/// execute only under Program Files) and leave a work dir that cannot be
+/// deleted. A sweep stages hundreds of harness dirs, so the links cost no
+/// space per dir.
+fn stage_sanitizer_runtime(work_dir: &Path, harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
+    let dirs = sanitizer_runtime_dirs(path);
+    let sidecar = harness_dir.join(RUNTIME_PATH_FILE);
+    let Some(first) = dirs.first() else {
+        let _ = fs::remove_file(sidecar);
+        return;
+    };
+    let text = dirs
+        .iter()
+        .map(|dir| format!("{}\n", dir.display()))
+        .collect::<String>();
+    let _ = fs::write(sidecar, text);
+    let Ok(entries) = fs::read_dir(first) else {
+        return;
+    };
+    let cache_dir = work_dir.join(RUNTIME_CACHE_DIR);
+    // The concurrent candidates of a sweep stage into the same work-dir copy:
+    // one at a time, so each finds the copy complete and links to it.
+    let _staging = RUNTIME_STAGING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        if !(lower.starts_with("clang_rt.asan")
+            && lower.contains("dynamic")
+            && lower.ends_with(".dll"))
+        {
+            continue;
+        }
+        let source = entry.path();
+        let cache = cache_dir.join(&name);
+        let target = harness_dir.join(&name);
+        if refresh_runtime_copy(&source, &cache).is_err() {
+            // No work-dir copy of the current DLL: copy the toolchain's file
+            // itself (never link to it, nor to a stale copy).
+            if same_file(&target, &source) || !same_runtime_file(&target, &source) {
+                let _ = put_in_place(&target, |temp| copy_with_mtime(&source, temp));
+            }
+            continue;
+        }
+        // Only a link to the copy is kept: an equal length and modified time
+        // is also what a link to the toolchain's own file has.
+        if same_file(&target, &cache) {
+            continue;
+        }
+        let _ = put_in_place(&target, |temp| {
+            fs::hard_link(&cache, temp).or_else(|_| copy_with_mtime(&cache, temp))
+        });
+    }
+}
+
+/// Serializes [`stage_sanitizer_runtime`] within this process.
+static RUNTIME_STAGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A name beside `path` no other writer uses (this process's id and a
+/// counter), for a file written there and then renamed onto `path`.
+fn unique_partial(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.partial", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Write `path` through `write` into a [`unique_partial`] name and rename it
+/// into place, so `path` is never seen missing or half written.
+fn put_in_place(
+    path: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let partial = unique_partial(path);
+    let result = write(&partial).and_then(|()| fs::rename(&partial, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
+
+/// The work-dir directory holding bhf's copies of runtime files (the runtrace
+/// shim staging uses it too).
+const RUNTIME_CACHE_DIR: &str = ".bhf-runtime";
+
+/// Whether `copy` holds the same file as `source`, by length and modified
+/// time (a hard link, or a copy [`copy_with_mtime`] made).
+fn same_runtime_file(copy: &Path, source: &Path) -> bool {
+    let stamp = |path: &Path| {
+        fs::metadata(path)
+            .ok()
+            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)))
+    };
+    stamp(copy).is_some_and(|copy| Some(copy) == stamp(source))
+}
+
+/// Make `cache` a copy of `source` unless it already is one. The new copy is
+/// written beside it under a name of its own and renamed into place, so a
+/// harness dir linked to the old copy keeps its bytes until it is staged
+/// again, and another bhf process staging the same work dir never sees a
+/// partial copy. An error means `cache` is not a copy of `source`.
+fn refresh_runtime_copy(source: &Path, cache: &Path) -> std::io::Result<()> {
+    if same_runtime_file(cache, source) && !same_file(cache, source) {
+        return Ok(());
+    }
+    if let Some(dir) = cache.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    match put_in_place(cache, |partial| copy_with_mtime(source, partial)) {
+        // Another process may have put the same copy in place meanwhile (the
+        // rename onto a copy a running harness has loaded fails on Windows).
+        Err(_) if same_runtime_file(cache, source) && !same_file(cache, source) => Ok(()),
+        result => result,
+    }
+}
+
+/// `fs::copy` that keeps the source's modified time (Windows' `CopyFileW`
+/// does already; elsewhere it is set after the copy).
+fn copy_with_mtime(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::copy(source, target)?;
+    let modified = fs::metadata(source)?.modified()?;
+    fs::File::options()
+        .write(true)
+        .open(target)?
+        .set_modified(modified)
+}
+
+/// Which file `path` names: its device and inode, or on Windows its volume
+/// serial number and file index. Two paths with the same identity are hard
+/// links to one file. `None` when the file cannot be read.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// `GetFileInformationByHandle`'s volume serial number and 64-bit file index
+/// (the `MetadataExt` accessors for them are not stable).
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
+    // SAFETY: `file` owns a live handle for the duration of the call, and
+    // `info` points to writable memory of the structure's size.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so it filled the structure (which was
+    // zeroed, every field being a plain integer, beforehand anyway).
+    let info = unsafe { info.assume_init() };
+    Some((
+        u64::from(info.volume_serial_number),
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
+}
+
+/// Whether `a` and `b` name the same file (hard links to it).
+fn same_file(a: &Path, b: &Path) -> bool {
+    file_identity(a).is_some_and(|id| Some(id) == file_identity(b))
 }
 
 /// Append flags to an environment value already staged on a command.
@@ -889,6 +2932,26 @@ pub(crate) fn afl_make_target_and_artifact() -> (Option<&'static str>, &'static 
     (Some("afl"), "main_afl")
 }
 
+/// Build `main_winafl`, the WinAFL lane (`make winafl`: the harness's sources
+/// without sanitizers or SanitizerCoverage), for an auto-recovered C/C++
+/// harness with the same recovered extras as its `main` build.
+pub(crate) fn try_run_c_make_winafl_build_with_extras(
+    work_dir: &Path,
+    harness_id: &str,
+    extra_sources: &[PathBuf],
+    extra_includes: &[PathBuf],
+) -> std::process::Output {
+    try_run_c_make_build_with_target(
+        work_dir,
+        harness_id,
+        extra_sources,
+        extra_includes,
+        None,
+        Some("winafl"),
+        None,
+    )
+}
+
 /// Build the AFL-instrumented `main_afl` for an auto-recovered C/C++ harness,
 /// reusing the SAME recovered extras (`extra_sources` / `extra_includes` →
 /// `AUTO_EXTRA_*`) so the afl build sees the identical recovery context the `main`
@@ -915,19 +2978,17 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
 
 /// Synthesised repair headers that must be force-included into every TU of
 /// the harness compile so their content precedes the first use in `main` and
-/// in the target source: the collision-safe C++-stdlib `#include`s and the
-/// build-config macro `#define`s. Never `auto_types.h`, whose `void *`
-/// placeholders would clash with a real typedef in any target TU.
+/// in the target source: the std prelude `bhf auto` wrote, the collision-safe
+/// C++-stdlib `#include`s and the build-config macro `#define`s. Never
+/// `auto_types.h`, whose `void *` placeholders would clash with a real
+/// typedef in any target TU.
 fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
     let repairs = harness_dir.join("repairs");
-    [
-        crate::auto::repair::AUTO_CPP_INCLUDES_FILE,
-        crate::auto::repair::AUTO_DEFINES_FILE,
-    ]
-    .iter()
-    .map(|name| repairs.join(name))
-    .filter(|path| path.is_file())
-    .collect()
+    crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES
+        .iter()
+        .map(|name| repairs.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn apply_c_family_make_env(
@@ -941,24 +3002,70 @@ fn apply_c_family_make_env(
     // built-in CC/CXX defaults are usually cc/g++, which do not support
     // -fsanitize=fuzzer on common Linux hosts. Respect explicit caller
     // choices, but provide clang defaults when no compiler was selected.
-    if let Some(compiler) = compiler {
-        // Foreign-target cross build: force the cross CC/CXX (and replacement
-        // flags) unconditionally, overriding both the Makefile defaults and any
-        // ambient CC/CXX so the candidate compiles for its real platform/arch.
-        cmd.env("CC", &compiler.cc);
-        cmd.env("CXX", &compiler.cxx);
+    let (cc, cxx) = if let Some(compiler) = compiler {
+        // An explicit override (a cross build, the gcc retry, a sanitizer
+        // matrix): force its CC/CXX (and replacement flags), overriding both the
+        // Makefile defaults and the ambient CC/CXX. `$(CC)`/`$(CXX)` head each
+        // recipe line, so a toolchain installed under a spaced directory is
+        // double-quoted to stay one word. The flags replace bhf's own
+        // (BHF_CFLAGS/BHF_CXXFLAGS); an ambient CFLAGS/CXXFLAGS still follows
+        // them, unless the override's compiler is not the one they were
+        // written for.
+        cmd.env("CC", compiler_recipe_word(&compiler.cc));
+        cmd.env("CXX", compiler_recipe_word(&compiler.cxx));
         if !compiler.cflags.is_empty() {
-            cmd.env("CFLAGS", compiler.cflags.join(" "));
+            cmd.env(MAKE_BHF_CFLAGS, compiler.cflags.join(" "));
         }
         if !compiler.cxxflags.is_empty() {
-            cmd.env("CXXFLAGS", compiler.cxxflags.join(" "));
+            cmd.env(MAKE_BHF_CXXFLAGS, compiler.cxxflags.join(" "));
         }
+        // An empty value, not an unset one, so the Makefile's own empty
+        // `CFLAGS ?=` default stays and nothing from the environment
+        // reaches a compiler it was not written for.
+        if !compiler.ambient_cflags {
+            cmd.env("CFLAGS", "");
+        }
+        if !compiler.ambient_cxxflags {
+            cmd.env("CXXFLAGS", "");
+        }
+        // BHF_CFLAGS/BHF_CXXFLAGS miss bhf's driver object, whose rule takes
+        // the target flags: a sysroot an SDK compiler needs goes there.
+        if let Some(flags) = &compiler.target_flags {
+            cmd.env(crate::toolchain::ENV_TARGET_FLAGS, flags.join(" "));
+        }
+        (compiler.cc.clone(), compiler.cxx.clone())
     } else {
-        if std::env::var_os("CC").is_none() {
-            cmd.env("CC", "clang");
+        let effective = crate::toolchain::effective_compilers();
+        // `$(CC)`/`$(CXX)` head each recipe line, so a compiler from the
+        // environment (or a `[toolchain]`) installed under a directory with a
+        // space or ampersand is double-quoted to stay one word.
+        for (variable, default) in [("CC", "clang"), ("CXX", "clang++")] {
+            match std::env::var(variable) {
+                Err(_) => {
+                    cmd.env(variable, default);
+                }
+                Ok(value)
+                    if !value.starts_with('"')
+                        && compiler_recipe_word(&value) != value
+                        && crate::toolchain::program_exists(&value) =>
+                {
+                    cmd.env(variable, compiler_recipe_word(&value));
+                }
+                Ok(_) => {}
+            }
         }
-        if std::env::var_os("CXX").is_none() {
-            cmd.env("CXX", "clang++");
+        (effective.cc, effective.cxx)
+    };
+    // The Makefile picks its instrumentation flags from the compiler that
+    // runs. Probe each compiler once per process and hand make the answer, so
+    // the Makefile need not ask again; an unknown compiler leaves the
+    // Makefile's own probe in charge.
+    for (variable, compiler, cxx) in [
+        ("BHF_CC_FAMILY", &cc, false),
+        ("BHF_CXX_FAMILY", &cxx, true),
+    ] {
+        if let Some(family) = crate::toolchain::compiler_family(compiler, cxx) {
+            cmd.env(variable, family.make_value());
         }
     }
 
@@ -989,16 +3096,15 @@ fn c_family_make_env(
 ) -> Vec<(String, String)> {
     let mut env = Vec::new();
 
+    // Every path below reaches a recipe through a make variable, so it is
+    // double-quoted when it carries a space (or parenthesis/apostrophe), and
+    // dropped with a warning when no quoting could make it safe.
+    let extra_sources = recipe_paths_or_warn("extra source", extra_sources);
     if !extra_sources.is_empty() {
-        env.push((
-            "AUTO_EXTRA_SOURCES".to_owned(),
-            extra_sources
-                .iter()
-                .map(|p| harness_gen::build_safety::make_path(p))
-                .collect::<Vec<_>>()
-                .join(" "),
-        ));
+        env.push(("AUTO_EXTRA_SOURCES".to_owned(), extra_sources.join(" ")));
     }
+    let extra_includes = recipe_paths_or_warn("extra include dir", extra_includes);
+    let force_includes = recipe_paths_or_warn("force-include header", force_includes);
 
     let mut include_flags = inherited_extra_includes
         .filter(|value| !value.trim().is_empty())
@@ -1011,22 +3117,14 @@ fn c_family_make_env(
     // help — those dirs still precede the built-in system dirs. Detected
     // project `-I` flags below are left as-is so project-internal angle
     // includes still resolve.
-    include_flags.extend(
-        extra_includes
-            .iter()
-            .map(|p| format!("-iquote {}", harness_gen::build_safety::make_path(p))),
-    );
+    include_flags.extend(extra_includes.iter().map(|p| format!("-iquote {p}")));
     // Also search the same dirs AFTER the system dirs (`-idirafter`) so a
     // synthesized placeholder for a genuinely-missing ANGLED system header (a
     // stubbed `<vxWorks.h>`/`<sys/neutrino.h>` for RTOS code, or any `<...>`
     // header the host lacks) resolves. `-idirafter` is searched last, so a real
     // same-named system header still wins — #366's no-shadow guarantee holds; this
     // only adds a fallback for headers the host genuinely does not provide.
-    include_flags.extend(
-        extra_includes
-            .iter()
-            .map(|p| format!("-idirafter {}", harness_gen::build_safety::make_path(p))),
-    );
+    include_flags.extend(extra_includes.iter().map(|p| format!("-idirafter {p}")));
     include_flags.extend(detected_include_flags.iter().cloned());
     // Force-include synthesised repair headers (C++-stdlib includes, build-config
     // defines) into every TU so their content is seen by the harness `main` and
@@ -1037,10 +3135,7 @@ fn c_family_make_env(
     // eats Windows backslashes — `-include C:\...\auto_defines.h` would arrive as
     // `C:...auto_defines.h` and the repair header would never be found.
     for force in force_includes.iter().rev() {
-        include_flags.insert(
-            0,
-            format!("-include {}", harness_gen::build_safety::make_path(force)),
-        );
+        include_flags.insert(0, format!("-include {force}"));
     }
     if !include_flags.is_empty() {
         env.push(("AUTO_EXTRA_INCLUDES".to_owned(), include_flags.join(" ")));
@@ -1052,13 +3147,44 @@ fn c_family_make_env(
         .into_iter()
         .collect::<Vec<_>>();
     if let Some(extra) = detected_ld_search_path {
-        ldflags.push(format!("-L{extra}"));
+        if let Some(dir) = recipe_paths_or_warn("library search dir", &[PathBuf::from(extra)]).pop()
+        {
+            ldflags.push(format!("-L{dir}"));
+        }
     }
     if !ldflags.is_empty() {
         env.push(("AUTO_EXTRA_LDFLAGS".to_owned(), ldflags.join(" ")));
     }
 
     env
+}
+
+/// A compiler for `CC`/`CXX`: double-quoted when its path has a space. Any
+/// other value passes through unchanged, as before; overrides come from bhf's
+/// own toolchain selection, not from the scanned tree.
+fn compiler_recipe_word(compiler: &str) -> String {
+    if harness_gen::build_safety::is_compiler_token(compiler) {
+        harness_gen::build_safety::recipe_path(compiler)
+    } else {
+        compiler.to_owned()
+    }
+}
+
+/// Render paths for a recipe (see [`harness_gen::build_safety::recipe_path`]),
+/// leaving out, with a warning, any path that quoting cannot make safe.
+fn recipe_paths_or_warn(kind: &str, paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(
+            |path| match harness_gen::build_safety::checked_recipe_path(kind, path) {
+                Ok(rendered) => Some(rendered),
+                Err(error) => {
+                    bhfeprintln!("warning: {error}; leaving it out of the harness build");
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 fn detect_libstdcxx_include_flags() -> Vec<String> {
@@ -1257,8 +3383,7 @@ pub(crate) fn try_run_ada_check_capturing(args: &BuildArgs) -> Result<CapturedBu
 
 fn run_ada_project(args: &BuildArgs, mode: BuildMode) -> Result<CapturedBuild, String> {
     let layout = prepare_layout(args)?;
-    let adapter = CompilerAdapter::discover_for(toolchain_config(args))
-        .map_err(|error| format!("{error}"))?;
+    let adapter = ada_compiler_adapter(args)?;
     probe_compiler(&adapter).map_err(|error| format!("{error}"))?;
     let result = match mode {
         BuildMode::Full => adapter.build(&layout.project_path),
@@ -1276,7 +3401,12 @@ pub(crate) fn toolchain_config(args: &BuildArgs) -> ToolchainConfig {
     ToolchainConfig {
         target: args.target.clone(),
         runtime: args.runtime.clone(),
-        toolchain: args.toolchain.clone(),
+        // A gprconfig compiler name (`--toolchain GNAT`) names the project's
+        // Toolchain_Name, not a prefix of the tools to run.
+        toolchain: args
+            .toolchain
+            .clone()
+            .filter(|toolchain| project_synth::gpr_toolchain_name(toolchain).is_none()),
     }
 }
 
@@ -1417,13 +3547,19 @@ fn select_harness(work_dir: &Path, requested: Option<&str>) -> Result<(String, P
                 return Ok((harness_id.to_owned(), harness_dir));
             }
         }
+        let available = harness_ids_under(work_dir);
         return Err(format!(
-            "work dir malformed: harness '{}' not found under {} or {}",
+            "work dir malformed: harness '{}' not found under {} or {}{}",
             harness_id,
             work_dir
                 .join(crate::auto::layout::GENERATED_HARNESSES_DIR)
                 .display(),
-            crate::auto::layout::harness_root(work_dir).display()
+            crate::auto::layout::harness_root(work_dir).display(),
+            if available.is_empty() {
+                String::new()
+            } else {
+                format!(" (available: {})", available.join(", "))
+            }
         ));
     }
 
@@ -1470,10 +3606,28 @@ fn select_harness(work_dir: &Path, requested: Option<&str>) -> Result<(String, P
             let (id, dir) = harnesses.into_iter().next().expect("one harness");
             Ok((id, dir))
         }
-        count => Err(format!(
-            "work dir malformed: {count} harnesses found; pass --harness"
-        )),
+        count => {
+            let ids: Vec<String> = harnesses.into_keys().collect();
+            Err(format!(
+                "work dir malformed: {count} harnesses found ({}); pass --harness <id>",
+                ids.join(", ")
+            ))
+        }
     }
+}
+
+/// The harness ids under either harness root of `work_dir`, sorted.
+fn harness_ids_under(work_dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = harness_roots(work_dir)
+        .iter()
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn harness_roots(work_dir: &Path) -> [PathBuf; 2] {
@@ -1612,6 +3766,39 @@ fn absolutize(path: &Path) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// A runner applies to an Ada harness built for another target (the Ada
+    /// target, else the tool prefix), and is refused for one this host runs,
+    /// which would otherwise drop it silently.
+    #[test]
+    fn an_ada_harness_takes_a_runner_only_for_another_target() {
+        let runner = std::env::current_exe().unwrap().display().to_string();
+        let mut config = config::ToolchainConfig {
+            runner: Some(runner.clone()),
+            runner_args: vec!["--board".to_owned(), "b1".to_owned()],
+            ..Default::default()
+        };
+        let error = ada_build_runner(&config).unwrap_err();
+        assert!(
+            error.contains(&format!("toolchain.runner `{runner}` is set"))
+                && error.contains("builds for this host"),
+            "{error}"
+        );
+        let expected = Some(crate::gate_evidence::HarnessRunner {
+            program: PathBuf::from(&runner),
+            args: vec!["--board".to_owned(), "b1".to_owned()],
+        });
+        config.ada.target = Some("powerpc-linux-gnu".to_owned());
+        assert_eq!(ada_build_runner(&config).unwrap(), expected);
+        config.ada.target = None;
+        config.ada.prefix = Some("powerpc-linux-gnu-".to_owned());
+        assert_eq!(ada_build_runner(&config).unwrap(), expected);
+        // A gprconfig compiler name is not a target.
+        config.ada.prefix = Some("GNAT".to_owned());
+        assert!(ada_build_runner(&config).is_err());
+        config.runner = None;
+        assert_eq!(ada_build_runner(&config).unwrap(), None);
+    }
+
     #[test]
     fn detects_staged_in_tree_ada_runtime_unit() {
         let temp = tempfile::tempdir().unwrap();
@@ -1692,13 +3879,21 @@ mod tests {
         // provides it).
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        // An absolute path carries a drive on Windows.
+        let absolute_import = if cfg!(windows) {
+            "C:/opt/x.gpr"
+        } else {
+            "/opt/x.gpr"
+        };
         fs::write(
             root.join("foo.gpr"),
-            "with \"../sub/dep.gpr\";\n\
-             with \"/opt/x.gpr\";\n\
-             with \"../../whatever/adafuzz.gpr\";\n\
-             project Foo is\n\
-             end Foo;\n",
+            format!(
+                "with \"../sub/dep.gpr\";\n\
+                 with \"{absolute_import}\";\n\
+                 with \"../../whatever/adafuzz.gpr\";\n\
+                 project Foo is\n\
+                 end Foo;\n"
+            ),
         )
         .unwrap();
 
@@ -1716,7 +3911,7 @@ mod tests {
             "fixture root must be absolute for this assertion"
         );
         // Absolute import preserved verbatim.
-        let expected_abs = PathBuf::from("/opt/x.gpr");
+        let expected_abs = PathBuf::from(absolute_import);
         assert_eq!(
             clauses,
             vec![expected_dep, expected_abs],
@@ -1795,6 +3990,150 @@ mod tests {
         assert!(
             includes.contains("-I/proj/build"),
             "detected project -I flags must pass through untouched: {includes}"
+        );
+    }
+
+    /// `--extra-include`/`--extra-source` dirs and the work dir's own repair
+    /// headers can live under a path with spaces (`SDK 10/Include`, a user
+    /// profile). They reach the recipe through make variables, so each one must
+    /// arrive double-quoted or the shell splits it into two arguments.
+    #[test]
+    fn extra_paths_with_spaces_are_quoted_for_the_recipe() {
+        let env = c_family_make_env(
+            &[PathBuf::from("/work dir/repairs/auto_stubs.c")],
+            &[PathBuf::from("/opt/SDK 10/Include")],
+            None,
+            &[],
+            None,
+            Some("/opt/tool chain/lib".to_owned()),
+            &[PathBuf::from("/work dir/repairs/auto_defines.h")],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec![
+                "-include",
+                "/work dir/repairs/auto_defines.h",
+                "-iquote",
+                "/opt/SDK 10/Include",
+                "-idirafter",
+                "/opt/SDK 10/Include",
+            ]
+        );
+        assert_eq!(
+            value("AUTO_EXTRA_SOURCES"),
+            "\"/work dir/repairs/auto_stubs.c\""
+        );
+        assert_eq!(value("AUTO_EXTRA_LDFLAGS"), "-L\"/opt/tool chain/lib\"");
+    }
+
+    /// Windows SDK, Visual Studio and user-profile dirs live under paths such as
+    /// `C:/Program Files (x86)/...` and `C:/Users/<First Last>/OneDrive - Org`.
+    /// Rendered with forward slashes, they are quoted like any spaced path. This
+    /// runs on every platform; the Windows CI job selects it by name.
+    #[test]
+    fn windows_style_extra_paths_with_spaces_are_quoted_for_the_recipe() {
+        let sdk = "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/ucrt";
+        let helper = "C:/Users/Dana Smith/OneDrive - Org/proj/helpers.c";
+        let env = c_family_make_env(
+            &[PathBuf::from(helper)],
+            &[PathBuf::from(sdk)],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec!["-iquote", sdk, "-idirafter", sdk]
+        );
+        assert_eq!(value("AUTO_EXTRA_SOURCES"), format!("\"{helper}\""));
+    }
+
+    /// On Windows a native path is first rendered with forward slashes and
+    /// without the `\\?\` verbatim prefix, then quoted like any other; a
+    /// command-interpreter metacharacter (`%`) stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_paths_with_spaces_are_rendered_and_quoted() {
+        let env = c_family_make_env(
+            &[PathBuf::from(r"C:\Users\Dana Smith\proj\helpers.c")],
+            &[PathBuf::from(
+                r"\\?\C:\Program Files (x86)\Windows Kits\10\Include",
+            )],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        let sdk = "C:/Program Files (x86)/Windows Kits/10/Include";
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec!["-iquote", sdk, "-idirafter", sdk]
+        );
+        assert_eq!(
+            value("AUTO_EXTRA_SOURCES"),
+            "\"C:/Users/Dana Smith/proj/helpers.c\""
+        );
+        assert_eq!(
+            harness_gen::build_safety::checked_recipe_path(
+                "source path",
+                std::path::Path::new(r"C:\src\a.c")
+            )
+            .unwrap(),
+            "C:/src/a.c"
+        );
+        assert!(harness_gen::build_safety::checked_recipe_path(
+            "source path",
+            std::path::Path::new(r"C:\a%PATH%\b.c")
+        )
+        .is_err());
+    }
+
+    /// A path no quoting can make safe (`make` expands `$` before the shell runs)
+    /// never reaches the recipe.
+    #[test]
+    fn extra_paths_with_unquotable_characters_are_dropped() {
+        let env = c_family_make_env(
+            &[PathBuf::from("/tmp/$(id)/stub.c")],
+            &[
+                PathBuf::from("/tmp/a`id`/include"),
+                PathBuf::from("/usr/include/x"),
+            ],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        assert!(
+            env.iter()
+                .all(|(_, v)| !v.contains("$(id)") && !v.contains('`')),
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "AUTO_EXTRA_INCLUDES" && v.contains("-iquote /usr/include/x")),
+            "a safe dir beside a refused one is still passed: {env:?}"
         );
     }
 
@@ -1885,6 +4224,76 @@ mod tests {
         assert!(ldflags.contains("-L/usr/lib/gcc/x86_64-linux-gnu/13"));
     }
 
+    /// An override's target flags reach make as `BHF_TOOLCHAIN_TARGET_FLAGS`,
+    /// which every object rule takes (bhf's driver object included, which
+    /// CFLAGS does not reach); without them the published value stays.
+    #[test]
+    fn an_override_publishes_its_target_flags_to_every_object_rule() {
+        let staged = |target_flags: Option<Vec<String>>| {
+            let compiler = CFamilyCompilerOverride {
+                cc: "cc".to_owned(),
+                cxx: "c++".to_owned(),
+                cflags: vec!["-O1".to_owned()],
+                cxxflags: vec!["-O1".to_owned()],
+                target_flags,
+                ambient_cflags: true,
+                ambient_cxxflags: true,
+            };
+            let mut command = std::process::Command::new("make");
+            apply_c_family_make_env(&mut command, &[], &[], &[], Some(&compiler));
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(crate::toolchain::ENV_TARGET_FLAGS))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            staged(Some(vec![
+                "--sysroot=\"/opt/sdk root\"".to_owned(),
+                "--target=aarch64-linux-gnu".to_owned(),
+            ]))
+            .as_deref(),
+            Some("--sysroot=\"/opt/sdk root\" --target=aarch64-linux-gnu")
+        );
+        // An empty set still replaces a host toolchain's sysroot.
+        assert_eq!(staged(Some(Vec::new())).as_deref(), Some(""));
+        assert_eq!(staged(None), None);
+    }
+
+    /// An override whose compiler is not the one the environment's
+    /// CFLAGS/CXXFLAGS were written for (a platform guard's cross lane)
+    /// hands make empty ones, so a host-only `-march=native` never reaches
+    /// it; any other override leaves them to the environment, after bhf's.
+    #[test]
+    fn an_override_for_a_compiler_bhf_picked_leaves_the_ambient_flags_out() {
+        let staged = |ambient_cflags: bool, ambient_cxxflags: bool| {
+            let compiler = CFamilyCompilerOverride {
+                cc: "widget-gcc".to_owned(),
+                cxx: "widget-g++".to_owned(),
+                cflags: vec!["-O1".to_owned()],
+                cxxflags: vec!["-O1".to_owned()],
+                target_flags: None,
+                ambient_cflags,
+                ambient_cxxflags,
+            };
+            let mut command = std::process::Command::new("make");
+            apply_c_family_make_env(&mut command, &[], &[], &[], Some(&compiler));
+            let value = |variable: &str| {
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(variable))
+                    .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+            };
+            (value("CFLAGS"), value("CXXFLAGS"))
+        };
+        assert_eq!(
+            staged(false, false),
+            (Some(Some(String::new())), Some(Some(String::new())))
+        );
+        assert_eq!(staged(true, false), (None, Some(Some(String::new()))));
+        assert_eq!(staged(true, true), (None, None));
+    }
+
     #[test]
     fn appending_coverage_ldflags_preserves_command_local_recovery() {
         let mut command = std::process::Command::new("make");
@@ -1910,7 +4319,11 @@ mod tests {
         let work = tmp.path().join("bhf_work");
         let src = work.join("src_instrumented");
         let harness = work.join("generated_harnesses/H-A0001");
-        let repair_stubs = work.join("harnesses/H-A0001/repairs/ada_stubs");
+        let repair_stubs = work
+            .join("harnesses")
+            .join("H-A0001")
+            .join("repairs")
+            .join("ada_stubs");
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(&harness).unwrap();
         fs::create_dir_all(&repair_stubs).unwrap();
@@ -1938,6 +4351,7 @@ mod tests {
             runtime: None,
             toolchain: None,
             probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
             c_engine: CEngine::Libfuzzer,
         };
 
@@ -2052,6 +4466,7 @@ mod tests {
             runtime: None,
             toolchain: None,
             probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
             c_engine: CEngine::Libfuzzer,
         };
 
@@ -2099,6 +4514,7 @@ mod tests {
         let spec_with = |switches: Switches| ProjectSpec {
             project_name: "Bhf_Build".to_owned(),
             extends_project: None,
+            parent_compiler: None,
             source_roots: vec![SourceRoot {
                 path: PathBuf::from("/tmp/src"),
                 language: "Ada".to_owned(),
@@ -2129,6 +4545,965 @@ mod tests {
         assert!(
             !without.contains("-fsanitize-coverage"),
             "default Bhf_Build must carry no coverage flag:\n{without}"
+        );
+    }
+
+    fn c_build_args(work_dir: &Path, harness: Option<&str>) -> BuildArgs {
+        BuildArgs {
+            work_dir: work_dir.to_path_buf(),
+            source_project: None,
+            harness: harness.map(str::to_owned),
+            target: None,
+            runtime: None,
+            toolchain: None,
+            probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
+            c_engine: CEngine::Libfuzzer,
+        }
+    }
+
+    /// A C++ harness directory whose Makefile `main` goal just writes a file, so
+    /// the layout handling can be exercised without a compiler.
+    fn write_trivial_cpp_harness(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+        fs::write(dir.join("Makefile"), "main:\n\tprintf built > main\n").unwrap();
+    }
+
+    /// The C/C++ make path with no toolchain configured.
+    fn c_make_build(args: &BuildArgs) -> Option<i32> {
+        try_run_c_make_build(args, &config::ToolchainConfig::default())
+    }
+
+    /// `--toolchain GNAT` names the project's Toolchain_Name; only a prefix
+    /// (a triple) selects prefixed tools.
+    #[test]
+    fn a_gprconfig_compiler_name_is_not_a_tool_prefix() {
+        let mut args = c_build_args(Path::new("/w"), None);
+        args.toolchain = Some("GNAT".to_owned());
+        assert_eq!(toolchain_config(&args).toolchain, None);
+        args.toolchain = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(
+            toolchain_config(&args).toolchain.as_deref(),
+            Some("aarch64-linux-gnu")
+        );
+    }
+
+    /// A config file's Ada prefix chooses no C/C++ compilers, and a C/C++
+    /// harness build says so instead of quietly using the host compilers.
+    #[test]
+    fn a_config_ada_prefix_on_a_c_family_harness_gets_a_note() {
+        let mut toolchain = config::ToolchainConfig::default();
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+        toolchain.ada.prefix = Some("aarch64-linux-gnu".to_owned());
+        let note = ada_prefix_note(&toolchain, None, "H-ONE").expect("a note");
+        assert!(
+            note.contains("toolchain.ada.prefix") && note.contains("toolchain.target"),
+            "{note}"
+        );
+        // The --toolchain flag, a target or a compiler do choose them.
+        assert_eq!(
+            ada_prefix_note(&toolchain, Some("aarch64-linux-gnu"), "H-ONE"),
+            None
+        );
+        toolchain.target = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+        toolchain.target = None;
+        toolchain.cc = Some("gcc".to_owned());
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+    }
+
+    /// Ada-only flags on a C/C++ harness used to be accepted and ignored (exit
+    /// 0, a host binary). They are refused, naming the flags that do apply.
+    #[test]
+    fn ada_only_flags_are_refused_for_a_c_family_harness() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping: make not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-ONE"));
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.runtime = Some("light".to_owned());
+        assert_eq!(run(args), 2);
+        assert!(
+            !work.join("harnesses/H-ONE/main").exists(),
+            "a refused build must not run make"
+        );
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.probe_backend = ProbeBackend::MemoryBuffer;
+        assert_eq!(run(args), 2);
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.ada_switches = vec!["-O2".to_owned()];
+        assert_eq!(run(args), 2);
+        // The cross options that do apply still build.
+        assert_eq!(run(c_build_args(&work, Some("H-ONE"))), 0);
+    }
+
+    /// `--target` / `--toolchain` select the C/C++ compilers for a C/C++
+    /// harness (they used to reach only the Ada adapter), and `--config`'s
+    /// `[toolchain]` table does the same with paths relative to the file.
+    #[test]
+    fn target_and_toolchain_select_the_c_family_compilers() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+            || which::which("aarch64-linux-gnu-gcc").is_err()
+            || which::which("aarch64-linux-gnu-g++").is_err()
+        {
+            bhfeprintln!("skipping: make or the aarch64 cross gcc not on PATH");
+            return;
+        }
+        let saved: Vec<_> = ["CC", "CXX", crate::toolchain::ENV_CPPFLAGS]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            "main:\n\tprintf '%s|%s|%s' \"$(CXX)\" \"$(CC)\" \"$(BHF_TOOLCHAIN_CPPFLAGS)\" > main\n",
+        )
+        .unwrap();
+        let built = || fs::read_to_string(harness.join("main")).unwrap();
+
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.target = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(run(args), 0);
+        assert_eq!(built(), "aarch64-linux-gnu-g++|aarch64-linux-gnu-gcc|");
+
+        fs::remove_file(harness.join("main")).unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(run(args), 0);
+        assert!(built().starts_with("aarch64-linux-gnu-g++|"), "{}", built());
+
+        fs::remove_file(harness.join("main")).unwrap();
+        let config_dir = temp.path().join("cfg");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("bhf.toml"),
+            "[toolchain]\ncxx = \"aarch64-linux-gnu-g++\"\ndefines = [\"BOARD=2\"]\n\
+             include-dirs = [\"vendor\"]\n",
+        )
+        .unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.config = Some(config_dir.join("bhf.toml"));
+        assert_eq!(run(args), 0);
+        assert_eq!(
+            built(),
+            format!(
+                "aarch64-linux-gnu-g++|aarch64-linux-gnu-gcc|-DBOARD=2 -I{}",
+                config_dir.join("vendor").display()
+            )
+        );
+
+        // A compiler that is not installed is reported, not silently replaced.
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.c.cc = Some("/nonexistent/bin/gcc".to_owned());
+        assert_eq!(run(args), 2);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn c_build_reports_the_harness_lookup_error_instead_of_the_ada_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-ONE"));
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-TWO"));
+        // Two harnesses and no --harness, or an unknown id: the C/C++ lookup error
+        // is the answer (exit 3), not a fall-through to the Ada src_instrumented check.
+        assert_eq!(c_make_build(&c_build_args(&work, None)), Some(3));
+        assert_eq!(
+            c_make_build(&c_build_args(&work, Some("H-MISSING"))),
+            Some(3)
+        );
+        assert!(!work.join("build").exists(), "nothing may be built");
+    }
+
+    #[test]
+    fn c_build_accepts_a_harness_directory_or_harness_root_as_work_dir() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping harness-dir layout test: make not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        let main = crate::auto::layout::harness_exe_name("main");
+        fs::write(
+            harness.join("Makefile"),
+            format!("main:\n\tprintf built > {main}\n"),
+        )
+        .unwrap();
+        assert_eq!(c_make_build(&c_build_args(&harness, None)), Some(0));
+        let staged = work.join("build").join("H-ONE").join(&main);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "built");
+        fs::remove_file(&staged).unwrap();
+        assert_eq!(
+            c_make_build(&c_build_args(&work.join("harnesses"), Some("H-ONE"))),
+            Some(0)
+        );
+        assert!(staged.is_file());
+    }
+
+    /// `bhf build --c-engine winafl` runs `make winafl` and stages the WinAFL
+    /// build in `build/<id>/` under the name `bhf fuzz --engine winafl` looks
+    /// for beside `main` (`main_winafl.exe` on Windows).
+    #[test]
+    fn c_build_for_winafl_stages_main_winafl_where_bhf_fuzz_finds_it() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping winafl staging test: make not on PATH");
+            return;
+        }
+        assert_eq!(
+            <CEngine as clap::ValueEnum>::from_str("winafl", false),
+            Ok(CEngine::Winafl)
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        let exe = crate::auto::layout::harness_exe_name;
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main:\n\tprintf main > {}\nwinafl:\n\tprintf winafl > {}\n",
+                exe("main"),
+                exe("main_winafl")
+            ),
+        )
+        .unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.c_engine = CEngine::Winafl;
+        assert_eq!(c_make_build(&args), Some(0));
+        let build_dir = work.join("build").join("H-ONE");
+        let staged = crate::auto::layout::harness_exe(&build_dir, crate::fuzz::WINAFL_BINARY);
+        assert_eq!(staged, build_dir.join(exe("main_winafl")));
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "winafl");
+        assert!(
+            !build_dir.join(exe("main")).exists() && !harness.join(exe("main")).exists(),
+            "only `make winafl` ran"
+        );
+    }
+
+    #[test]
+    fn c_build_layout_rejects_a_conflicting_harness_id_for_a_harness_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("work").join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        let error = resolve_c_family_work_dir(&harness, Some("H-TWO")).unwrap_err();
+        assert!(
+            error.contains("H-ONE") && error.contains("H-TWO"),
+            "{error}"
+        );
+        // A harness directory outside a work layout gets the expected layout.
+        let loose = temp.path().join("loose");
+        write_trivial_cpp_harness(&loose);
+        let error = resolve_c_family_work_dir(&loose, None).unwrap_err();
+        assert!(error.contains("harnesses/<id>/"), "{error}");
+    }
+
+    #[test]
+    fn undefined_symbols_are_read_from_gnu_ld_and_lld_output() {
+        let output = "/usr/bin/ld: /tmp/codec.o: in function `widgets::Codec::decode(unsigned char const*, unsigned long)':\n\
+            codec.cpp:12: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+            ld.lld: error: undefined symbol: parse_record\n\
+            >>> referenced by codec.c:4\n\
+            codec.cpp:13: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+            /usr/bin/ld: undefined reference to `sqrt'\n\
+            main.obj : error LNK2019: unresolved external symbol widget_lookup referenced in function bhf_run_one\r\n\
+            lld-link: error: undefined symbol: widget_reset\n";
+        assert_eq!(
+            undefined_symbols_in(output),
+            vec![
+                "widgets::Table::store(unsigned char const*, unsigned long)".to_owned(),
+                "parse_record".to_owned(),
+                "sqrt".to_owned(),
+                "widget_lookup".to_owned(),
+                "widget_reset".to_owned(),
+            ],
+            "the MSVC linkers' spellings are read too"
+        );
+    }
+
+    /// A `make` that cannot be started is a failed build that says why, not a
+    /// panic. The harness directory does not exist, so starting `make` in it
+    /// fails the way a `make` missing from PATH does, without changing PATH
+    /// under the tests running beside this one.
+    #[test]
+    fn a_make_that_cannot_start_is_a_failed_build_with_its_reason() {
+        let work = tempfile::tempdir().unwrap();
+        let output = try_run_c_make_build_with_target_and_ldflags(
+            work.path(),
+            "no-such-harness",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("bhf: could not run make: "), "{stderr}");
+        assert!(
+            stderr.trim_end().len() > "bhf: could not run make:".len(),
+            "the reason follows: {stderr}"
+        );
+    }
+
+    #[test]
+    fn failed_link_hint_names_the_in_tree_definer_and_the_exact_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("lib").join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("table.h"),
+            "#pragma once\n#include <cstddef>\nnamespace widgets { struct Table { static int store(const unsigned char *d, size_t n); }; }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("table.cpp"),
+            "#include \"table.h\"\nnamespace widgets {\nint Table::store(const unsigned char *d, size_t n) { return n ? d[0] : 0; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("codec.cpp"),
+            "#include \"table.h\"\nint decode(const unsigned char *d, size_t n) { return widgets::Table::store(d, n); }\n",
+        )
+        .unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS)\n\t$(CXX) $(CXXFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp {} $(CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o\n",
+                harness_gen::build_safety::make_path(&src.join("codec.cpp"))
+            ),
+        )
+        .unwrap();
+        let output = "codec.cpp:2: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+                      codec.cpp:2: undefined reference to `vendor_checksum'\n";
+        let none = RebuildEnv::default();
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &none).join("\n");
+        // The definer is named by its resolved path (Windows short names
+        // expanded, no `\\?\` prefix).
+        let table_path = crate::workdir::plain_canonical(&src.join("table.cpp"));
+        let table = table_path.display().to_string();
+        assert!(
+            hints.contains(&format!("--extra-source {}", shell_word(&table_path))),
+            "{hints}"
+        );
+        assert!(!hints.contains(r"\\?\"), "{hints}");
+        assert!(
+            hints.contains(&format!(
+                "AUTO_EXTRA_SOURCES={} bhf build",
+                shell_text(&table)
+            )),
+            "{hints}"
+        );
+        assert!(hints.contains("vendor_checksum"), "{hints}");
+        assert!(
+            !hints.contains(&format!(
+                "--extra-source {}",
+                shell_word(&crate::workdir::plain_canonical(&src.join("codec.cpp")))
+            )),
+            "an already-linked source is never suggested: {hints}"
+        );
+        // The operator's own build variables are kept in the suggested command.
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_SOURCES" => Some("/opt/extra.cpp".to_owned()),
+            "AUTO_EXTRA_INCLUDES" => Some("-fms-extensions".to_owned()),
+            "CXX_STD" => Some("gnu++14".to_owned()),
+            _ => None,
+        });
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &inherited).join("\n");
+        assert!(
+            hints.contains(&format!(
+                "AUTO_EXTRA_SOURCES='/opt/extra.cpp {table}' AUTO_EXTRA_INCLUDES=-fms-extensions \
+                 CXX_STD=gnu++14 bhf build"
+            )),
+            "{hints}"
+        );
+    }
+
+    /// A custom harness kept beside its library outside any checkout
+    /// (`harness/` + `lib/`): the target's own directory holds no definer, so
+    /// the hint searches the directories of the harness's other inputs too —
+    /// the extra sources the Makefile compiles, its include dirs, and the
+    /// paths generation recorded — and names the file that defines the symbol.
+    #[test]
+    fn failed_link_hint_finds_the_definer_beside_the_harness_outside_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let proj = temp.path().join("proj");
+        let harness_src = proj.join("harness");
+        let lib_src = proj.join("lib").join("src");
+        let lib_inc = proj.join("lib").join("include").join("widgets");
+        for dir in [&harness_src, &lib_src, &lib_inc] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            lib_inc.join("table.h"),
+            "#pragma once\n#include <cstddef>\nnamespace widgets { struct Table { static int store(const unsigned char *d, std::size_t n); }; }\n",
+        )
+        .unwrap();
+        fs::write(
+            lib_src.join("table.cpp"),
+            "#include \"widgets/table.h\"\nnamespace widgets {\nint Table::store(const unsigned char *d, std::size_t n) { return n ? d[0] : 0; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lib_src.join("codec.cpp"),
+            "#include \"widgets/table.h\"\nint decode(const unsigned char *d, std::size_t n) { return widgets::Table::store(d, n); }\n",
+        )
+        .unwrap();
+        fs::write(
+            harness_src.join("drive_codec.cpp"),
+            "#include <cstddef>\n#include <cstdint>\nint decode(const unsigned char *d, std::size_t n);\n\
+             extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return decode(data, size); }\n",
+        )
+        .unwrap();
+        let output = "codec.cpp:2: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n";
+        // Named by its resolved path (Windows short names expanded, no
+        // `\\?\` prefix), one shell word.
+        let table = shell_word(&crate::workdir::plain_canonical(&lib_src.join("table.cpp")));
+        let none = RebuildEnv::default();
+
+        // The library's source dir is known from the extra source the
+        // Makefile compiles.
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-XCODEC");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "INCLUDES = -I . -I /opt/bhf/c_runtime -iquote {h} -idirafter {h} -iquote {i} -idirafter {i}\n\
+                 main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS)\n\t$(CXX) $(CXXFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp {t} {c} $(CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o\n",
+                h = harness_gen::build_safety::make_path(&harness_src),
+                i = harness_gen::build_safety::make_path(&proj.join("lib").join("include")),
+                t = harness_gen::build_safety::make_path(&harness_src.join("drive_codec.cpp")),
+                c = harness_gen::build_safety::make_path(&lib_src.join("codec.cpp")),
+            ),
+        )
+        .unwrap();
+        let hints = c_build_failure_hints(&work, "H-XCODEC", &harness, output, &none).join("\n");
+        assert!(
+            hints.contains(&format!("--extra-source {table}")),
+            "{hints}"
+        );
+        assert!(!hints.contains("no in-tree definition found"), "{hints}");
+
+        // Known only from the --extra-include dirs generation recorded.
+        let work = temp.path().join("work2");
+        let harness = work.join("harnesses").join("H-XCODEC");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main: main.cpp bhf_driver.o\n\t$(CXX) $(CXXFLAGS) -o $@ main.cpp {t} bhf_driver.o\n",
+                t = harness_gen::build_safety::make_path(&harness_src.join("drive_codec.cpp")),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            harness.join("generation-metadata.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "language": "cpp",
+                "extra_includes": [
+                    proj.join("lib").join("include").display().to_string(),
+                    lib_src.display().to_string(),
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hints = c_build_failure_hints(&work, "H-XCODEC", &harness, output, &none).join("\n");
+        assert!(
+            hints.contains(&format!("--extra-source {table}")),
+            "{hints}"
+        );
+    }
+
+    #[test]
+    fn failed_compile_hints_cover_std_streams_and_extra_qualification() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        let output = "src/parser.cpp:331:2: error: use of undeclared identifier 'cerr'\n\
+                      src/lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_istream<char>'\n\
+                      src/widget.h:136:18: error: extra qualification on member 'name'\n";
+        let none = RebuildEnv::default();
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, &none);
+        let text = hints.join("\n");
+        let line_with = |needle: &str| {
+            hints
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no hint with {needle}: {text}"))
+                .clone()
+        };
+        assert!(
+            line_with("without including")
+                .contains("AUTO_EXTRA_INCLUDES='-include iostream' bhf build"),
+            "{text}"
+        );
+        let qualification = line_with("extra class qualification");
+        assert!(qualification.contains("src/widget.h:136"), "{text}");
+        assert!(
+            qualification.contains("AUTO_EXTRA_INCLUDES=-fms-extensions bhf build"),
+            "{text}"
+        );
+        assert!(qualification.contains("-fpermissive"), "{text}");
+        // One command applies both fixes.
+        assert!(
+            line_with("at once")
+                .contains("AUTO_EXTRA_INCLUDES='-include iostream -fms-extensions' bhf build"),
+            "{text}"
+        );
+
+        // The operator's own variables travel into every suggested command, and a
+        // flag already set is not repeated.
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_SOURCES" => Some("/src/table.cpp".to_owned()),
+            "AUTO_EXTRA_INCLUDES" => Some("-fms-extensions".to_owned()),
+            "C_STD" => Some("gnu89".to_owned()),
+            _ => None,
+        });
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, &inherited);
+        let text = hints.join("\n");
+        let commands: Vec<&String> = hints
+            .iter()
+            .filter(|line| line.contains("bhf build"))
+            .collect();
+        assert!(!commands.is_empty(), "{text}");
+        for command in &commands {
+            assert!(
+                command.contains("AUTO_EXTRA_SOURCES=/src/table.cpp ")
+                    && command.contains(" C_STD=gnu89 bhf build"),
+                "{text}"
+            );
+            assert_eq!(command.matches("-fms-extensions").count(), 1, "{text}");
+        }
+        assert!(
+            text.contains("AUTO_EXTRA_INCLUDES='-fms-extensions -include iostream' C_STD=gnu89"),
+            "{text}"
+        );
+
+        // g++ names -fpermissive itself; that is the flag to suggest.
+        let gcc = "src/widget.h:136:12: error: extra qualification 'Widget::' on member 'name' [-fpermissive]\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, gcc, &none).join("\n");
+        assert!(
+            hints.contains("AUTO_EXTRA_INCLUDES=-fpermissive bhf build"),
+            "{hints}"
+        );
+        assert!(
+            !hints.contains("at once"),
+            "a single fix needs no combined line: {hints}"
+        );
+    }
+
+    /// clang++ and g++ output for a pre-standard header the harness includes
+    /// without the `using namespace std;` the project's own sources put
+    /// before it (`map<string, int> fields; vector<int> sizes; list<string>
+    /// names; pair<int, int> span;`).
+    const CLANG_UNQUALIFIED_STD: &str = "In file included from main.cpp:3:\n\
+./widget.h:6:9: error: use of undeclared identifier 'string'\n\
+    6 |     map<string, int> fields;\n\
+      |         ^\n\
+./widget.h:7:5: error: no template named 'vector'\n\
+    7 |     vector<int> sizes;\n\
+      |     ^\n\
+./widget.h:8:10: error: use of undeclared identifier 'string'\n\
+    8 |     list<string> names;\n\
+      |          ^\n\
+./widget.h:9:5: error: no template named 'pair'\n\
+    9 |     pair<int, int> span;\n\
+      |     ^\n\
+4 errors generated.\n";
+    const GCC_UNQUALIFIED_STD: &str = "In file included from main.cpp:3:\n\
+widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+    6 |     map<string, int> fields;\n\
+      |     ^~~\n\
+widget.h:7:5: error: \u{2018}vector\u{2019} does not name a type\n\
+    7 |     vector<int> sizes;\n\
+      |     ^~~~~~\n\
+widget.h:8:5: error: \u{2018}list\u{2019} does not name a type\n\
+    8 |     list<string> names;\n\
+      |     ^~~~\n\
+widget.h:9:5: error: \u{2018}pair\u{2019} does not name a type\n\
+    9 |     pair<int, int> span;\n\
+      |     ^~~~\n";
+
+    #[test]
+    fn unqualified_std_names_get_a_written_prelude_and_the_command_that_includes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        for output in [CLANG_UNQUALIFIED_STD, GCC_UNQUALIFIED_STD] {
+            let _ = fs::remove_file(&prelude_file);
+            let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &none);
+            let text = hints.join("\n");
+            let hint = hints
+                .iter()
+                .find(|line| line.contains("without `std::`"))
+                .unwrap_or_else(|| panic!("no hint for the unqualified names: {text}"));
+            for name in ["string", "map", "vector", "list", "pair"] {
+                assert!(hint.contains(name), "{name}: {text}");
+            }
+            let prelude = fs::read_to_string(&prelude_file)
+                .unwrap_or_else(|error| panic!("no prelude written ({error}): {text}"));
+            for header in ["list", "map", "string", "utility", "vector"] {
+                assert!(
+                    prelude.contains(&format!("#include <{header}>\n")),
+                    "{prelude}"
+                );
+            }
+            for name in ["list", "map", "pair", "string", "vector"] {
+                assert!(
+                    prelude.contains(&format!("using std::{name};\n")),
+                    "{prelude}"
+                );
+            }
+            let path = crate::workdir::plain_canonical(&prelude_file);
+            assert!(
+                hint.contains(&format!(
+                    "AUTO_EXTRA_INCLUDES={} bhf build {} --harness H-ONE",
+                    shell_text(&format!("-include {}", path.display())),
+                    shell_word(&work)
+                )),
+                "{text}"
+            );
+            // `-include <string>` alone would leave the names unqualified.
+            assert!(!text.contains("-include string"), "{text}");
+        }
+
+        // The next build, with the prelude force-included, reports a name the
+        // first one did not reach: the prelude keeps the earlier names, and the
+        // command does not repeat the include.
+        let path = crate::workdir::plain_canonical(&prelude_file);
+        let include = format!("-include {}", path.display());
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_INCLUDES" => Some(include.clone()),
+            "CXX_STD" => Some("gnu++98".to_owned()),
+            _ => None,
+        });
+        let later = "./widget.h:10:5: error: no template named 'deque'\n";
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, later, &inherited);
+        let text = hints.join("\n");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        for name in ["deque", "list", "map", "pair", "string", "vector"] {
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{prelude}"
+            );
+        }
+        assert!(prelude.contains("#include <deque>\n"), "{prelude}");
+        let command = hints
+            .iter()
+            .find(|line| line.contains("without `std::`"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(command.matches(&include).count(), 1, "{text}");
+        assert!(command.contains("CXX_STD=gnu++98 bhf build"), "{text}");
+        // With the prelude already in use, an unqualified stream object goes
+        // into it rather than into a second force-include.
+        let streams = "./widget.h:12:9: error: use of undeclared identifier 'cerr'\n";
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, streams, &inherited);
+        let text = hints.join("\n");
+        assert!(!text.contains("-include iostream"), "{text}");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        assert!(prelude.contains("using std::cerr;\n"), "{prelude}");
+        assert!(prelude.contains("#include <iostream>\n"), "{prelude}");
+
+        // When the prelude cannot be written, the hint prints it instead.
+        let blocked = work.join("harnesses").join("H-BLOCKED");
+        fs::create_dir_all(blocked.join("std_prelude.h")).unwrap();
+        fs::write(blocked.join("main.cpp"), "").unwrap();
+        let hints = c_build_failure_hints(&work, "H-BLOCKED", &blocked, GCC_UNQUALIFIED_STD, &none);
+        let text = hints.join("\n");
+        assert!(text.contains("could not write"), "{text}");
+        for line in [
+            "  #include <map>",
+            "  using std::map;",
+            "  using std::string;",
+        ] {
+            assert!(hints.iter().any(|hint| hint == line), "{line}: {text}");
+        }
+
+        // A C harness never gets one.
+        let c_harness = work.join("harnesses").join("H-C");
+        fs::create_dir_all(&c_harness).unwrap();
+        fs::write(c_harness.join("main.c"), "").unwrap();
+        let hints = c_build_failure_hints(&work, "H-C", &c_harness, CLANG_UNQUALIFIED_STD, &none);
+        assert!(!hints.join("\n").contains("without `std::`"), "{hints:?}");
+        assert!(!c_harness.join("std_prelude.h").exists());
+    }
+
+    #[test]
+    fn extending_the_std_prelude_keeps_the_lines_written_by_hand() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        let prelude_hint = |hints: &[String]| {
+            hints
+                .iter()
+                .find(|line| line.contains("without `std::`"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no prelude hint: {hints:?}"))
+        };
+        c_build_failure_hints(&work, "H-ONE", &harness, GCC_UNQUALIFIED_STD, &none);
+        let written = fs::read_to_string(&prelude_file).unwrap();
+
+        // Lines added by hand inside the guard (a header and a name the
+        // compiler never reported, one under a condition of its own) and
+        // after it.
+        let guard_end = written.rfind("#endif\n").unwrap();
+        let edited = format!(
+            "{}#include <algorithm>\n#if defined(WIDGET_EXTRA)\n#include <numeric>\n#endif\n\
+             using std::min;\n#endif\n// kept by hand\n",
+            &written[..guard_end]
+        );
+        fs::write(&prelude_file, &edited).unwrap();
+        let later = "./widget.h:10:5: error: no template named 'deque'\n";
+        let hint = prelude_hint(&c_build_failure_hints(
+            &work, "H-ONE", &harness, later, &none,
+        ));
+        assert!(hint.contains("; added the missing lines to "), "{hint}");
+        assert!(hint.contains("<algorithm>, <deque>, <list>"), "{hint}");
+        let extended = fs::read_to_string(&prelude_file).unwrap();
+        let lines: Vec<&str> = extended.lines().collect();
+        let added = ["#include <deque>", "using std::deque;"];
+        assert_eq!(
+            lines
+                .iter()
+                .copied()
+                .filter(|line| !added.contains(line))
+                .collect::<Vec<_>>(),
+            edited.lines().collect::<Vec<_>>(),
+            "every line written by hand stays, in order: {extended}"
+        );
+        let at = |line: &str| {
+            let found: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == line).collect();
+            assert_eq!(found.len(), 1, "{line}: {extended}");
+            found[0]
+        };
+        let (include, using) = (at("#include <deque>"), at("using std::deque;"));
+        let nested = at("#if defined(WIDGET_EXTRA)");
+        let guard_close = lines.iter().rposition(|line| *line == "#endif").unwrap();
+        assert!(at("#ifdef __cplusplus") < include, "{extended}");
+        assert!(include < using && using < guard_close, "{extended}");
+        // Not inside the hand-written condition.
+        assert!(include < nested || include > nested + 2, "{extended}");
+        assert!(using < nested || using > nested + 2, "{extended}");
+
+        // A name the file already declares changes nothing; a name whose
+        // header it already includes adds only its `using` line.
+        let hint = prelude_hint(&c_build_failure_hints(
+            &work, "H-ONE", &harness, later, &none,
+        ));
+        assert!(hint.contains(" already includes <"), "{hint}");
+        assert_eq!(fs::read_to_string(&prelude_file).unwrap(), extended);
+        let multimap = "./widget.h:11:5: error: no template named 'multimap'\n";
+        c_build_failure_hints(&work, "H-ONE", &harness, multimap, &none);
+        let again = fs::read_to_string(&prelude_file).unwrap();
+        assert_eq!(again.matches("#include <map>\n").count(), 1, "{again}");
+        assert_eq!(
+            again.replace("using std::multimap;\n", ""),
+            extended,
+            "{again}"
+        );
+
+        // A prelude written by hand, without the guard and with CRLF line
+        // ends: the new names come in a guarded block after it.
+        let by_hand = "// project prelude\r\n#include <string>\r\nusing std::string;\r\n";
+        fs::write(&prelude_file, by_hand).unwrap();
+        c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+        assert_eq!(
+            fs::read_to_string(&prelude_file).unwrap(),
+            format!(
+                "{by_hand}#ifdef __cplusplus\r\n#include <deque>\r\nusing std::deque;\r\n\
+                 #endif\r\n"
+            )
+        );
+
+        // A hand-written guard with a comment on it takes the new lines; one
+        // with an `#else` branch does not, so they never land in that branch.
+        for (by_hand, extended) in [
+            (
+                "#ifdef __cplusplus // C++ only\n#include <string>\n#endif\n",
+                "#ifdef __cplusplus // C++ only\n#include <string>\n#include <deque>\n\
+                 using std::deque;\n#endif\n",
+            ),
+            (
+                "#if defined(__cplusplus)\n#include <string>\nusing std::string;\n#else\n\
+                 typedef struct widget widget;\n#endif\n",
+                "#if defined(__cplusplus)\n#include <string>\nusing std::string;\n#else\n\
+                 typedef struct widget widget;\n#endif\n#ifdef __cplusplus\n#include <deque>\n\
+                 using std::deque;\n#endif\n",
+            ),
+        ] {
+            fs::write(&prelude_file, by_hand).unwrap();
+            c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+            assert_eq!(fs::read_to_string(&prelude_file).unwrap(), extended);
+        }
+
+        // A file that is not text is never replaced: the hint prints the lines
+        // to add instead.
+        fs::write(&prelude_file, b"// \xff\n#include <string>\n").unwrap();
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, later, &none);
+        assert_eq!(
+            fs::read(&prelude_file).unwrap(),
+            b"// \xff\n#include <string>\n"
+        );
+        assert!(
+            hints.iter().any(|line| line == "  using std::deque;"),
+            "{hints:?}"
+        );
+    }
+
+    #[test]
+    fn a_c_source_of_a_cpp_harness_gets_no_std_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        // An extra C source with its own `list` type that its header did not
+        // declare. The Makefile compiles it with $(CXX) (clang++ warns about
+        // that, g++ reports in C++ wording), where a prelude would make `list`
+        // the standard template: not a fix.
+        let clang = "clang++: warning: treating 'c' input as 'c++' when in C++ mode, this \
+                     behavior is deprecated [-Wdeprecated]\n\
+                     lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                     \x20   2 | int walk(void) { list *head = 0; return head != 0; }\n\
+                     \x20     |                  ^\n\
+                     1 error generated.\n";
+        let gcc = "lib/src/node.c:1:1: error: \u{2018}list\u{2019} does not name a type\n\
+                   \x20   1 | list *roots;\n\
+                   \x20     | ^~~~\n";
+        for output in [clang, gcc] {
+            let hints =
+                c_build_failure_hints(&work, "H-ONE", &harness, output, &RebuildEnv::default());
+            assert!(
+                !hints.iter().any(|line| line.contains("without `std::`")),
+                "{hints:?}"
+            );
+            assert!(!harness.join("std_prelude.h").exists(), "{hints:?}");
+        }
+    }
+
+    #[test]
+    fn unqualified_stream_names_join_the_prelude_when_an_include_cannot_help() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        let none = RebuildEnv::default();
+        let prelude_file = harness.join("std_prelude.h");
+        let stream_hint = |hints: &[String]| {
+            hints
+                .iter()
+                .find(|line| line.contains("without including"))
+                .cloned()
+        };
+
+        // `cerr` whose header is missing: a source with `using namespace std;`
+        // needs only the header.
+        let missing = "src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, missing, &none);
+        assert!(
+            stream_hint(&hints).is_some_and(|line| line.contains("'-include iostream'")),
+            "{hints:?}"
+        );
+        assert!(!prelude_file.exists(), "{hints:?}");
+
+        // Declared but unqualified (the header is in, `using namespace std;` is
+        // not), or still reported with <iostream> force-included: only a
+        // `using` declaration helps.
+        let declared =
+            "./log.h:4:18: error: use of undeclared identifier 'cerr'; did you mean 'std::cerr'?\n";
+        let gcc_after_include =
+            "log.h:4:15: error: \u{2018}ostream\u{2019} has not been declared\n";
+        let with_iostream = RebuildEnv::from_lookup(|name| {
+            (name == "AUTO_EXTRA_INCLUDES").then(|| "-include iostream".to_owned())
+        });
+        for (output, inherited, name) in [
+            (declared, &none, "cerr"),
+            (gcc_after_include, &with_iostream, "ostream"),
+        ] {
+            let _ = fs::remove_file(&prelude_file);
+            let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, inherited);
+            assert!(stream_hint(&hints).is_none(), "{hints:?}");
+            let prelude = fs::read_to_string(&prelude_file)
+                .unwrap_or_else(|error| panic!("no prelude ({error}): {hints:?}"));
+            assert!(prelude.contains("#include <iostream>\n"), "{prelude}");
+            assert!(
+                prelude.contains(&format!("using std::{name};\n")),
+                "{prelude}"
+            );
+        }
+
+        // With other names in a prelude, an unqualified stream object goes into
+        // it too; a qualified stream name still only needs its header, and the
+        // last line applies both.
+        let _ = fs::remove_file(&prelude_file);
+        let mixed = "./widget.h:4:28: error: unknown type name 'string'\n\
+                     src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n\
+                     src/lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_istream<char>'\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, mixed, &none);
+        let text = hints.join("\n");
+        let prelude = fs::read_to_string(&prelude_file).unwrap();
+        assert!(prelude.contains("using std::cerr;\n"), "{prelude}");
+        assert!(prelude.contains("using std::string;\n"), "{prelude}");
+        let streams = stream_hint(&hints).unwrap_or_else(|| panic!("{text}"));
+        assert!(streams.contains("std::istream"), "{text}");
+        assert!(!streams.contains("cerr"), "{text}");
+        let path = crate::workdir::plain_canonical(&prelude_file);
+        assert!(
+            hints
+                .iter()
+                .find(|line| line.contains("at once"))
+                .is_some_and(|line| line.contains(&shell_text(&format!(
+                    "-include iostream -include {}",
+                    path.display()
+                )))),
+            "{text}"
         );
     }
 
@@ -2163,5 +5538,219 @@ mod tests {
             !collisions.iter().any(|f| f == "other.c"),
             "a C file with no Ada twin must not be excluded: {collisions:?}"
         );
+    }
+
+    /// The sidecar a Windows harness build writes names exactly the PATH
+    /// directories that hold an AddressSanitizer runtime DLL, in PATH order,
+    /// and the first directory's DLL is staged beside the binary.
+    #[test]
+    fn sanitizer_runtime_dirs_are_the_path_entries_holding_the_dll() {
+        let temp = tempfile::tempdir().unwrap();
+        let llvm = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        let msvc = temp.path().join("MSVC/bin/Hostx64/x64");
+        let other = temp.path().join("tools");
+        for dir in [&llvm, &msvc, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(llvm.join("clang_rt.asan_dynamic-x86_64.dll"), b"").unwrap();
+        std::fs::write(msvc.join("clang_rt.asan_dbg_dynamic-x86_64.dll"), b"").unwrap();
+        std::fs::write(other.join("clang_rt.asan_static-x86_64.lib"), b"").unwrap();
+        let path =
+            std::env::join_paths([&other, &msvc, &llvm, &msvc, &temp.path().join("missing")])
+                .unwrap();
+        assert_eq!(
+            super::sanitizer_runtime_dirs(Some(&path)),
+            vec![msvc.clone(), llvm.clone()]
+        );
+        let harness = temp.path().join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        let work = temp.path().join("work");
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        assert_eq!(
+            std::fs::read_to_string(harness.join(super::RUNTIME_PATH_FILE)).unwrap(),
+            format!("{}\n{}\n", msvc.display(), llvm.display())
+        );
+        assert!(
+            harness
+                .join("clang_rt.asan_dbg_dynamic-x86_64.dll")
+                .is_file(),
+            "the first runtime directory's DLL sits beside the binary"
+        );
+        assert!(
+            !harness.join("clang_rt.asan_dynamic-x86_64.dll").exists(),
+            "another toolchain's runtime is not mixed in"
+        );
+        super::stage_sanitizer_runtime(&work, &harness, Some(other.as_os_str()));
+        assert!(
+            !harness.join(super::RUNTIME_PATH_FILE).exists(),
+            "a stale sidecar is removed"
+        );
+    }
+
+    /// The runtime DLL staged beside a harness is never the toolchain's own
+    /// file: a hard link to it would carry the toolchain directory's ACL (read
+    /// and execute only under Program Files), and the work dir could not be
+    /// deleted. It is copied once into the work dir and linked from there.
+    #[test]
+    fn a_staged_runtime_is_never_the_toolchains_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        std::fs::write(&source, b"v1").unwrap();
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses/H-ONE");
+        std::fs::create_dir_all(&harness).unwrap();
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        let cache = work.join(".bhf-runtime").join(name);
+        assert_eq!(std::fs::read(&cache).unwrap(), b"v1");
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+            assert_eq!(
+                ino(&harness.join(name)),
+                ino(&cache),
+                "linked from the cache"
+            );
+            assert_ne!(ino(&harness.join(name)), ino(&source));
+        }
+        // A link to the toolchain's file would read the new bytes.
+        std::fs::write(&source, b"v2-longer").unwrap();
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v2-longer");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"v2-longer");
+    }
+
+    /// Stage the runtime into every dir of `harnesses` at once, one thread per
+    /// dir, all released together (the concurrent candidates of a sweep).
+    fn stage_concurrently(work: &Path, harnesses: &[PathBuf], path: &std::ffi::OsStr) {
+        let start = std::sync::Barrier::new(harnesses.len());
+        std::thread::scope(|scope| {
+            for harness in harnesses {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    super::stage_sanitizer_runtime(work, harness, Some(path));
+                });
+            }
+        });
+    }
+
+    /// Candidates staging the runtime into one work dir at the same time each
+    /// get the whole DLL, every one a link to the single work-dir copy, both
+    /// on a fresh work dir and when the toolchain's DLL has changed since.
+    #[test]
+    fn concurrent_stagers_each_get_the_whole_runtime_from_one_copy() {
+        const STAGERS: usize = 16;
+        const ROUNDS: usize = 6;
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let first: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut second = first.clone();
+        second.extend_from_slice(b"a newer toolchain build");
+        second[0] ^= 0xff;
+        for round in 0..ROUNDS {
+            let work = temp.path().join(format!("work-{round}"));
+            let harnesses: Vec<PathBuf> = (0..STAGERS)
+                .map(|i| work.join(format!("harnesses/H-{i}")))
+                .collect();
+            for harness in &harnesses {
+                std::fs::create_dir_all(harness).unwrap();
+            }
+            for (stage, bytes) in [("fresh", &first), ("re-staged", &second)] {
+                std::fs::write(&source, bytes).unwrap();
+                stage_concurrently(&work, &harnesses, &path);
+                let cache = work.join(".bhf-runtime").join(name);
+                assert!(
+                    std::fs::read(&cache).unwrap() == *bytes,
+                    "round {round}, {stage}: the work-dir copy is the toolchain's DLL"
+                );
+                for harness in &harnesses {
+                    let staged = harness.join(name);
+                    let read = std::fs::read(&staged).unwrap();
+                    assert!(
+                        read == *bytes,
+                        "round {round}, {stage}: {} holds {} of {} bytes",
+                        staged.display(),
+                        read.len(),
+                        bytes.len()
+                    );
+                    assert!(
+                        super::same_file(&staged, &cache),
+                        "round {round}, {stage}: {} is a link to the work-dir copy",
+                        staged.display()
+                    );
+                }
+                let leftovers: Vec<_> = std::fs::read_dir(work.join(".bhf-runtime"))
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.file_name())
+                    .filter(|file| file != name)
+                    .collect();
+                assert!(
+                    leftovers.is_empty(),
+                    "round {round}, {stage}: {leftovers:?}"
+                );
+            }
+        }
+    }
+
+    /// A harness or build dir an earlier bhf staged as a hard link to the
+    /// toolchain's own DLL has its length and modified time, and those of the
+    /// work-dir copy too: it is still relinked to that copy.
+    #[test]
+    fn a_dir_linked_to_the_toolchains_file_is_relinked_to_the_work_dir_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let name = "clang_rt.asan_dynamic-x86_64.dll";
+        let source = runtime.join(name);
+        std::fs::write(&source, b"v1").unwrap();
+        let path = std::env::join_paths([&runtime]).unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("build/H-ONE");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::hard_link(&source, harness.join(name)).unwrap();
+        assert!(super::same_file(&harness.join(name), &source));
+
+        super::stage_sanitizer_runtime(&work, &harness, Some(&path));
+        let cache = work.join(".bhf-runtime").join(name);
+        assert!(
+            !super::same_file(&harness.join(name), &source),
+            "still the toolchain's file"
+        );
+        assert!(super::same_file(&harness.join(name), &cache));
+        std::fs::write(&source, b"v1 rebuilt").unwrap();
+        assert_eq!(std::fs::read(harness.join(name)).unwrap(), b"v1");
+    }
+
+    /// Two paths are the same file exactly when one is a hard link to the
+    /// other; an equal copy is a different file.
+    #[test]
+    fn file_identity_tells_a_link_from_a_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("a.dll");
+        std::fs::write(&original, b"bytes").unwrap();
+        let link = temp.path().join("b.dll");
+        std::fs::hard_link(&original, &link).unwrap();
+        let copy = temp.path().join("c.dll");
+        std::fs::copy(&original, &copy).unwrap();
+        assert!(super::same_file(&original, &link));
+        assert!(!super::same_file(&original, &copy));
+        assert!(!super::same_file(
+            &original,
+            &temp.path().join("missing.dll")
+        ));
     }
 }

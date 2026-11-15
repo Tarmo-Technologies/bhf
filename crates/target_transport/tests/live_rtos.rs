@@ -25,6 +25,9 @@
 //! BHF ships no RTOS image: the kernel is fetched at a pinned commit (bring your
 //! own source), not vendored. `BHF_RTOS_KERNEL=<path>` reuses an already-fetched
 //! kernel instead of cloning.
+//!
+//! The shared emulator helpers use Unix sockets: Unix hosts only.
+#![cfg(unix)]
 
 mod common;
 

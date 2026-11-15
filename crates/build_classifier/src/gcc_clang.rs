@@ -31,16 +31,40 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             });
             continue;
         }
-        if let Some(caps) = missing_header().captures(line) {
-            hits.push(BuildErrorKind::MissingHeader {
-                path: caps
-                    .get(1)
-                    .or_else(|| caps.get(2))
-                    .expect("missing-header regex has a path capture")
-                    .as_str()
-                    .to_owned(),
+        // A C++ source that uses the standard streams (`cerr << ...`,
+        // `std::istream &`) without including their header, which older standard
+        // libraries pulled in transitively. Reported as the missing standard name so
+        // repair force-includes the real header (`<iostream>`, `<fstream>`, ...).
+        // Ahead of the incomplete-type pattern, which `std::basic_istream<char>`
+        // would otherwise match.
+        if let Some(name) = missing_std_stream_name(line) {
+            hits.push(BuildErrorKind::MissingType { name });
+            continue;
+        }
+        // A member declared with its own class's qualification inside the class
+        // (`int Widget::name();`), which only MSVC accepts by default.
+        if let Some((file, error_line, member)) = extra_member_qualification(line) {
+            hits.push(BuildErrorKind::ExtraQualification {
+                file,
+                line: error_line,
+                member,
             });
             continue;
+        }
+        if let Some(caps) = missing_header().captures(line) {
+            let path = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .expect("missing-header regex has a path capture")
+                .as_str();
+            // gcc's driver reports a spec file it cannot read (a sanitizer
+            // runtime's) in the same words; no header repair can supply it.
+            if !path.starts_with("cannot read spec file") {
+                hits.push(BuildErrorKind::MissingHeader {
+                    path: path.to_owned(),
+                });
+                continue;
+            }
         }
         if let Some(caps) = incomplete_type().captures(line) {
             // A forward-declared-but-undefined type (pimpl idiom): "incomplete
@@ -172,8 +196,13 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             }
             continue;
         }
-        if let Some(caps) = undefined_reference().captures(line) {
-            let symbol = &caps[1];
+        let msvc_symbol = msvc_unresolved_symbol(line);
+        if let Some(symbol) = msvc_symbol.as_deref().or_else(|| {
+            undefined_reference()
+                .captures(line)
+                .and_then(|caps| caps.get(1))
+                .map(|m| m.as_str())
+        }) {
             // System-library symbols (math, pthread, dl, rt) are
             // really "you forgot to link -l<lib>". Classifying these
             // as `UndefinedSymbol` would route them through the C
@@ -197,6 +226,10 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             hits.push(BuildErrorKind::MissingSharedLib {
                 name: caps[1].to_owned(),
             });
+            continue;
+        }
+        if let Some(name) = msvc_missing_library(line) {
+            hits.push(BuildErrorKind::MissingSharedLib { name });
             continue;
         }
         if let Some(caps) = malformed_function_body().captures(line) {
@@ -238,6 +271,440 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             }
         }
     }
+}
+
+/// The stream objects a pre-standard source names WITHOUT `std::` (it relies on
+/// `using namespace std;`). Deliberately narrower than
+/// [`crate::std_stream_header`]: an unqualified `flush` or `ws` is as likely to
+/// be a project function as a manipulator.
+fn is_unqualified_std_stream_object(name: &str) -> bool {
+    matches!(
+        name,
+        "cin" | "cout" | "cerr" | "clog" | "wcin" | "wcout" | "wcerr" | "wclog" | "endl"
+    )
+}
+
+/// `std::basic_istream<char>` -> `std::istream`, `std::basic_ofstream<wchar_t>`
+/// -> `std::wofstream`; any other spelling is returned without its template
+/// arguments. Implementation namespaces (`std::__1::`, `std::__cxx11::`) are
+/// dropped.
+fn normalize_std_template_name(spelling: &str) -> String {
+    let spelling = spelling.trim();
+    let (head, args) = match spelling.split_once('<') {
+        Some((head, args)) => (head.trim(), args),
+        None => (spelling, ""),
+    };
+    let bare = head.strip_prefix("std::").unwrap_or(head);
+    let bare = bare
+        .strip_prefix("__1::")
+        .or_else(|| bare.strip_prefix("__cxx11::"))
+        .unwrap_or(bare);
+    let Some(stream) = bare.strip_prefix("basic_") else {
+        return format!("std::{bare}");
+    };
+    let wide = args.trim_start().starts_with("wchar_t");
+    format!("std::{}{stream}", if wide { "w" } else { "" })
+}
+
+fn missing_std_stream_name(line: &str) -> Option<String> {
+    static UNQUALIFIED: OnceLock<Regex> = OnceLock::new();
+    static QUALIFIED: OnceLock<Regex> = OnceLock::new();
+    static TEMPLATE: OnceLock<Regex> = OnceLock::new();
+    if !line.contains("error") {
+        return None;
+    }
+    // clang: use of undeclared identifier 'cerr'; gcc: 'cerr' was not declared
+    // in this scope (gcc quotes with U+2018/U+2019 in a UTF-8 locale).
+    let unqualified = UNQUALIFIED.get_or_init(|| {
+        Regex::new(
+            "error: (?:use of undeclared identifier ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}]\
+             |['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] was not declared in this scope)",
+        )
+        .expect("regex")
+    });
+    if let Some(caps) = unqualified.captures(line) {
+        let name = caps.get(1).or_else(|| caps.get(2))?.as_str();
+        return is_unqualified_std_stream_object(name).then(|| name.to_owned());
+    }
+    // clang: no member named 'cout' in namespace 'std'; gcc: 'cout' is not a
+    // member of 'std'.
+    let qualified = QUALIFIED.get_or_init(|| {
+        Regex::new(
+            "error: (?:no member named ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] in namespace ['\u{2018}]std['\u{2019}]\
+             |['\u{2018}](?:std::)?([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] is not a member of ['\u{2018}]std['\u{2019}])",
+        )
+        .expect("regex")
+    });
+    if let Some(caps) = qualified.captures(line) {
+        let name = format!("std::{}", caps.get(1).or_else(|| caps.get(2))?.as_str());
+        return crate::std_stream_header(&name).map(|_| name);
+    }
+    // clang: implicit instantiation of undefined template 'std::basic_istream<char>',
+    // or a stream type used by value while only <iosfwd> declared it.
+    let template = TEMPLATE.get_or_init(|| {
+        Regex::new(
+            "error: (?:implicit instantiation of undefined template|.*incomplete (?:return )?type) \
+             ['\u{2018}](?:class )?(std::[^'\u{2019}]+)['\u{2019}]",
+        )
+        .expect("regex")
+    });
+    let caps = template.captures(line)?;
+    let name = normalize_std_template_name(&caps[1]);
+    crate::std_stream_header(&name).map(|_| name)
+}
+
+/// Standard-library names that are also everyday words. As an undeclared
+/// identifier such a name is as likely a project variable or function as the
+/// `std::` one, so it counts only with more evidence.
+fn is_generic_std_word(name: &str) -> bool {
+    matches!(
+        name,
+        "map" | "set" | "list" | "queue" | "stack" | "pair" | "exception" | "ios"
+    )
+}
+
+/// Standard class and function templates: a source writes them with `<`.
+fn is_std_template(name: &str) -> bool {
+    matches!(
+        name,
+        "basic_string"
+            | "vector"
+            | "map"
+            | "multimap"
+            | "set"
+            | "multiset"
+            | "list"
+            | "deque"
+            | "queue"
+            | "priority_queue"
+            | "stack"
+            | "pair"
+            | "bitset"
+            | "unordered_map"
+            | "unordered_multimap"
+            | "unordered_set"
+            | "unordered_multiset"
+            | "unique_ptr"
+            | "shared_ptr"
+            | "weak_ptr"
+            | "make_unique"
+            | "make_shared"
+            | "numeric_limits"
+    )
+}
+
+/// See [`crate::unqualified_std_names`].
+pub fn unqualified_std_names(stderr: &str) -> Vec<crate::UnqualifiedStdName> {
+    static TYPE_POSITION: OnceLock<Regex> = OnceLock::new();
+    static EXPRESSION: OnceLock<Regex> = OnceLock::new();
+    // clang: unknown type name 'string' / no template named 'map'; gcc: 'map'
+    // does not name a type / 'string' has not been declared. The third group
+    // marks clang's qualified form ("no template named 'map' in namespace
+    // 'widgets'"), which is not an unqualified use.
+    let type_position = TYPE_POSITION.get_or_init(|| {
+        Regex::new(
+            "error: (?:unknown type name ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}]\
+             |no template named ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}]( in )?\
+             |['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] (?:does not name a type|has not been declared))",
+        )
+        .expect("regex")
+    });
+    // clang: use of undeclared identifier 'cerr'; gcc: 'list' was not declared
+    // in this scope.
+    let expression = EXPRESSION.get_or_init(|| {
+        Regex::new(
+            "error: (?:use of undeclared identifier ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}]\
+             |['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] was not declared in this scope)",
+        )
+        .expect("regex")
+    });
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut found: Vec<crate::UnqualifiedStdName> = Vec::new();
+    let mut note = |name: &str, declared: bool, as_template: bool| {
+        let Some(header) = crate::std_library_header(name) else {
+            return;
+        };
+        match found.iter_mut().find(|seen| seen.name == name) {
+            Some(seen) => {
+                seen.declared |= declared;
+                seen.as_template |= as_template;
+            }
+            None => found.push(crate::UnqualifiedStdName {
+                name: name.to_owned(),
+                header,
+                declared,
+                as_template,
+            }),
+        }
+    };
+    let mut context = SourceContext::default();
+    for (index, line) in lines.iter().enumerate() {
+        context.read(line);
+        if !line.contains("error:") || context.in_c {
+            continue;
+        }
+        // clang's "no template named 'map'" says the source writes a template.
+        let (name, type_position, no_template) = if let Some(caps) = type_position.captures(line) {
+            if caps.get(3).is_some() {
+                continue;
+            }
+            let Some(name) = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(4)) else {
+                continue;
+            };
+            (name.as_str(), true, caps.get(2).is_some())
+        } else if let Some(caps) = expression.captures(line) {
+            let Some(name) = caps.get(1).or_else(|| caps.get(2)) else {
+                continue;
+            };
+            (name.as_str(), false, false)
+        } else {
+            continue;
+        };
+        if crate::std_library_header(name).is_none() {
+            continue;
+        }
+        let declared = std_declaration_named(&lines, index, name);
+        let source = diagnostic_source_line(&lines, index);
+        let words = source.map(unqualified_identifiers).unwrap_or_default();
+        if !type_position
+            && !declared
+            && is_generic_std_word(name)
+            && !words
+                .iter()
+                .any(|(word, rest)| *word == name && written_as_template_or_scope(word, rest))
+        {
+            continue;
+        }
+        let as_template = no_template
+            || words
+                .iter()
+                .any(|(word, rest)| *word == name && written_as_template(word, rest));
+        note(name, declared, as_template);
+        // clang reports only `string` for `map<string, int> fields;`, gcc only
+        // `map`: the other names are on the source line it prints.
+        for (word, rest) in &words {
+            if !is_generic_std_word(word) || written_as_template_or_scope(word, rest) {
+                note(word, false, written_as_template(word, rest));
+            }
+        }
+    }
+    found
+}
+
+/// Whether the diagnostic being read is in C code: a `.c` file, or a header
+/// whose include chain (`In file included from node.c:1:`, and gcc's `from
+/// node.c:1:` continuation lines) passes through one. A C source's `list` or
+/// `stack` is its own type, often from a header the harness lacks: a C
+/// compile does not see a C++ prelude at all, and where the harness Makefile
+/// compiles the `.c` file with `$(CXX)`, a prelude would bind the name to the
+/// standard template instead (g++ then reports it in C++ wording). A header
+/// diagnostic with no chain above it is in the code of the diagnostic before
+/// it, because clang and gcc print a chain only when it changes.
+#[derive(Default)]
+struct SourceContext {
+    in_c: bool,
+    /// An include chain is printed above the next diagnostic.
+    chain: bool,
+    /// An entry of that chain is a `.c` file.
+    chain_through_c: bool,
+}
+
+impl SourceContext {
+    fn read(&mut self, line: &str) {
+        if let Some(file) = include_chain_entry(line, self.chain) {
+            self.chain = true;
+            self.chain_through_c |= source_language(file) == Some(SourceLanguage::C);
+            return;
+        }
+        let Some(file) = located_diagnostic_file(line) else {
+            return;
+        };
+        let language = source_language(file);
+        if std::mem::take(&mut self.chain) {
+            self.in_c =
+                std::mem::take(&mut self.chain_through_c) || language == Some(SourceLanguage::C);
+        } else if let Some(language) = language {
+            self.in_c = language == SourceLanguage::C;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourceLanguage {
+    C,
+    Cxx,
+}
+
+/// The language of the source file `path` from its extension; `None` for a
+/// header or anything else. `.C` is C++ to gcc and clang.
+fn source_language(path: &str) -> Option<SourceLanguage> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?;
+    match extension {
+        "c" => Some(SourceLanguage::C),
+        "cpp" | "cc" | "cxx" | "c++" | "cp" | "C" | "CPP" | "CXX" | "CC" | "ii" | "mm" => {
+            Some(SourceLanguage::Cxx)
+        }
+        _ => None,
+    }
+}
+
+/// The file of an include chain entry: `In file included from widget.h:4,`
+/// (gcc) or `In file included from main.cpp:3:` (clang), and, while
+/// `continuing` a chain, gcc's `                 from main.cpp:3:`.
+fn include_chain_entry(line: &str, continuing: bool) -> Option<&str> {
+    let entry = match line.strip_prefix("In file included from ") {
+        Some(entry) => entry,
+        None if continuing => line.trim_start().strip_prefix("from ")?,
+        None => return None,
+    };
+    let mut file = entry.trim_end().trim_end_matches([',', ':']);
+    // `path:line`, or `path:line:column`.
+    for _ in 0..2 {
+        match file.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                file = head;
+            }
+            _ => break,
+        }
+    }
+    Some(file)
+}
+
+/// The file of a located diagnostic: `path:12:5: error:` (also without the
+/// column, and for warnings and notes) or `path(12,5): error:`.
+fn located_diagnostic_file(line: &str) -> Option<&str> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"^(.+?)(?::\d+(?::\d+)?|\(\d+(?:,\d+)?\)) ?: (?:fatal error|error|warning|note)\b",
+        )
+        .expect("regex")
+    })
+    .captures(line)
+    .and_then(|captures| captures.get(1))
+    .map(|file| file.as_str())
+}
+
+/// Whether the diagnostic at `index` (or a note under it, before the next
+/// error) names the `std::` declaration of `name`: clang's and gcc's "did you
+/// mean 'std::string'?", clang's "'std::string' declared here", gcc's
+/// "suggested alternatives: 'std::__cxx11::list'". gcc's "'std::string' is
+/// defined in header '<string>'" says the header is missing, so it does not
+/// count.
+fn std_declaration_named(lines: &[&str], index: usize, name: &str) -> bool {
+    let names_it = |line: &str| {
+        ["", "__cxx11::", "__1::"].iter().any(|inline| {
+            line.contains(&format!("'std::{inline}{name}'"))
+                || line.contains(&format!("\u{2018}std::{inline}{name}\u{2019}"))
+        })
+    };
+    if names_it(lines[index]) {
+        return true;
+    }
+    lines
+        .iter()
+        .skip(index + 1)
+        .take(12)
+        .take_while(|line| !line.contains("error:"))
+        .any(|line| line.contains("note:") && names_it(line) && !line.contains("defined in header"))
+}
+
+/// The source line clang and gcc print under the diagnostic at `index`: the
+/// `  12 | text` form, or (older compilers) the raw line followed by a caret
+/// line.
+fn diagnostic_source_line<'a>(lines: &[&'a str], index: usize) -> Option<&'a str> {
+    let next = lines.get(index + 1)?;
+    if let Some((gutter, source)) = next.split_once('|') {
+        let gutter = gutter.trim();
+        if !gutter.is_empty() && gutter.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(source.strip_prefix(' ').unwrap_or(source));
+        }
+    }
+    let caret = lines.get(index + 2)?;
+    let is_caret_line = caret.contains('^')
+        && caret
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '^' | '~'));
+    (is_caret_line && !next.contains(": error:") && !next.contains(": note:")).then_some(*next)
+}
+
+/// Each identifier of the source line `source` with the text after it,
+/// leaving out one written qualified or as a member (`std::map`,
+/// `widgets::list`, `obj.set`, `ptr->stack`) and anything in a string or
+/// character literal or a `//` comment.
+fn unqualified_identifiers(source: &str) -> Vec<(&str, &str)> {
+    let bytes = source.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut identifiers = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'"' | b'\'') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => break,
+            byte if !is_ident(byte) => {
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let start = index;
+        while index < bytes.len() && is_ident(bytes[index]) {
+            index += 1;
+        }
+        // A number (`0x1f`, `12u`) is not an identifier.
+        if bytes[start].is_ascii_digit() {
+            continue;
+        }
+        let before = source[..start].trim_end();
+        if !(before.ends_with("::") || before.ends_with('.') || before.ends_with("->")) {
+            identifiers.push((&source[start..index], &source[index..]));
+        }
+    }
+    identifiers
+}
+
+/// Whether `word`, followed by `rest` on its source line, is written as a
+/// standard template (`set<int>`) or as a scope (`ios::binary`).
+fn written_as_template_or_scope(word: &str, rest: &str) -> bool {
+    written_as_template(word, rest) || rest.trim_start().starts_with("::")
+}
+
+/// Whether `word`, followed by `rest` on its source line, is written as a
+/// standard template (`set<int>`, not `count << 2`).
+fn written_as_template(word: &str, rest: &str) -> bool {
+    let rest = rest.trim_start();
+    rest.starts_with('<')
+        && !rest.starts_with("<<")
+        && !rest.starts_with("<=")
+        && is_std_template(word)
+}
+
+/// clang: `f.h:136:18: error: extra qualification on member 'name'`; gcc:
+/// `f.h:136:12: error: extra qualification 'Widget::' on member 'name'
+/// [-fpermissive]` (with U+2018/U+2019 quotes in a UTF-8 locale).
+fn extra_member_qualification(line: &str) -> Option<(String, u32, String)> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    if !line.contains("extra qualification") {
+        return None;
+    }
+    let caps = R
+        .get_or_init(|| {
+            Regex::new(
+                "error: extra qualification (?:['\u{2018}][^'\u{2019}]*['\u{2019}] )?on member \
+                 ['\u{2018}]([^'\u{2019}]+)['\u{2019}]",
+            )
+            .expect("regex")
+        })
+        .captures(line)?;
+    let (file, error_line) = diagnostic_location(line)?;
+    Some((file, error_line, caps[1].to_owned()))
 }
 
 fn identifier_at_column(line: &str, one_based_column: usize) -> Option<&str> {
@@ -313,6 +780,65 @@ fn incomplete_type() -> &'static Regex {
 fn unknown_type() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r#"error: unknown type name '(.+?)'"#).expect("regex"))
+}
+
+/// The symbol an MSVC-style linker reports unresolved: link.exe's
+/// `error LNK2019: unresolved external symbol NAME referenced in function F`
+/// (or `LNK2001`), and lld-link's `error: undefined symbol: NAME`. A C++
+/// symbol comes as `"int __cdecl ns::f(int)" (?f@ns@@YAHH@Z)` from link.exe
+/// and unquoted (`int __cdecl ns::f(int)`) from lld-link, which also prefixes
+/// an import with `__declspec(dllimport) `; it is named like GNU ld's
+/// demangled form, `ns::f(int)`, with `(void)` as `()`.
+pub fn msvc_unresolved_symbol(line: &str) -> Option<String> {
+    let line = line.trim_end_matches('\r');
+    let (rest, lld) = if let Some((_, rest)) = line.split_once("unresolved external symbol ") {
+        if !(line.contains("LNK2019") || line.contains("LNK2001")) {
+            return None;
+        }
+        (rest, false)
+    } else if let Some((head, rest)) = line.split_once("error: undefined symbol: ") {
+        if !head.contains("lld-link") {
+            return None;
+        }
+        (rest, true)
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    let without_import = |text: &str| -> String {
+        text.trim()
+            .strip_prefix("__declspec(dllimport) ")
+            .unwrap_or(text.trim())
+            .to_owned()
+    };
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let signature = quoted.split('"').next()?;
+        return Some(cpp_symbol_name(&without_import(signature)));
+    }
+    if lld {
+        // The rest of the line is the whole (demangled) symbol.
+        let symbol = without_import(rest);
+        return (!symbol.is_empty()).then(|| cpp_symbol_name(&symbol));
+    }
+    let symbol = rest.split_whitespace().next()?;
+    Some(symbol.to_owned())
+}
+
+/// `public: int __cdecl ns::Widget::size(void)const` -> `ns::Widget::size()`.
+fn cpp_symbol_name(signature: &str) -> String {
+    let Some(open) = signature.find('(') else {
+        return signature
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or(signature)
+            .to_owned();
+    };
+    let close = signature.rfind(')').unwrap_or(signature.len() - 1);
+    let head = &signature[..open];
+    let name = head.rsplit(char::is_whitespace).next().unwrap_or(head);
+    let params = signature[open + 1..close].trim();
+    let params = if params == "void" { "" } else { params };
+    format!("{name}({params})")
 }
 
 fn undefined_reference() -> &'static Regex {
@@ -476,6 +1002,23 @@ fn is_known_header_function(name: &str) -> bool {
 fn ld_cannot_find_lib() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"cannot find -l([^\s:]+)").expect("regex"))
+}
+
+/// The library an MSVC-style linker could not open, as the `<name>` of the
+/// `-l<name>` that asked for it: lld-link's `could not open '<dir>/<name>.lib':
+/// no such file or directory` and link.exe's `LNK1181: cannot open input file
+/// '<name>.lib'`. Any other file it could not open (an object) is no library.
+fn msvc_missing_library(line: &str) -> Option<String> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let caps = R
+        .get_or_init(|| {
+            Regex::new(r"(?:could not open|LNK1181: cannot open input file) '([^']+)'")
+                .expect("regex")
+        })
+        .captures(line)?;
+    let file = caps[1].rsplit(['/', '\\']).next()?;
+    let name = file.strip_suffix(".lib")?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Map a libc/system symbol back to the `-l<name>` that defines it.

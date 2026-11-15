@@ -9,6 +9,8 @@
 //!
 //! Gated on clang (self-skips on a toolchain-less lane), per repo convention.
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -135,7 +137,7 @@ fn peripheral_harness_reaches_branch_gated_on_third_register_read() {
         ],
     )
     .unwrap();
-    let hit_run = Command::new(&bin)
+    let hit_run = support::with_sanitizer_runtime(&mut Command::new(&bin))
         .arg(&hit)
         .output()
         .expect("run harness (hit)");
@@ -151,7 +153,7 @@ fn peripheral_harness_reaches_branch_gated_on_third_register_read() {
     // read SEQUENCE, not an unconditional fault in the harness.
     let miss = root.join("miss.bin");
     std::fs::write(&miss, [0u8; 12]).unwrap();
-    let miss_run = Command::new(&bin)
+    let miss_run = support::with_sanitizer_runtime(&mut Command::new(&bin))
         .arg(&miss)
         .output()
         .expect("run harness (miss)");

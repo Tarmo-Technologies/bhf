@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Nightly heavy integration suite: the ~110 bhf tests that each compile a
-# C/C++/Ada target and run a fuzz campaign. Together they are ~40min of work, too
-# heavy for every PR, so the per-PR `build-test` job runs only a language smoke
-# subset and the full suite runs here nightly, sharded so each leg stays under
-# 20min.
+# Nightly heavy integration suite: the bhf integration tests, most of which
+# compile a target and run a fuzz campaign. Together they are several hours of
+# runner time, too heavy for every PR, so the per-PR `build-test` job runs only
+# a language smoke subset and the full suite runs here nightly, sharded so each
+# leg is expected to stay under about 25min.
 name: Integration (nightly)
 
 on:
@@ -60,15 +60,21 @@ jobs:
     needs: gate
     if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    # Generous: the heavy compile+fuzz tests are slow on CI's shared vCPUs and the
-    # hash split balances test COUNT, not duration, so one shard can draw more of
-    # the slow tests. 6 shards keeps the makespan down; the timeout guarantees
-    # completion even for the heaviest shard. This is a non-blocking nightly.
-    timeout-minutes: 40
+    # The heavy compile+fuzz tests are slow on CI's shared vCPUs and the hash
+    # split balances test COUNT, not duration, so one shard can draw more of the
+    # slow tests. 12 hash shards keep each one's expected time under about 25min
+    # (the suite outgrew 6 shards, two of which hit this timeout), and the one
+    # test that alone takes most of a shard, build_recovery_scenarios (a dozen
+    # build-recovery fixtures in sequence), runs in a shard of its own. The
+    # timeout is the backstop. That shard builds only its own test binary, but
+    # the test took 16min on main's last passing nightly, measures about 1.3x
+    # that locally now, and builds a release bhf (about 5min), so it can pass
+    # 25min: that shard alone gets 55min. This is a non-blocking nightly.
+    timeout-minutes: ${{ matrix.shard == 'build-recovery-scenarios' && 55 || 40 }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, build-recovery-scenarios]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,9 +92,22 @@ jobs:
       # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
       # the heavy-bhf concurrency cap (.config/nextest.toml) limits concurrent
       # compile+fuzz tests so the C compiler doesn't thrash the runner.
-      # `--partition hash:N/6` splits the bhf integration tests across 6 shards.
-      # --no-fail-fast matches `cargo test`.
-      - name: Integration tests (shard ${{ matrix.shard }}/6)
+      # `--partition hash:N/HASH_SHARDS` splits every bhf integration test but
+      # the slowest across the numbered shards; the named shard builds and runs
+      # that one alone. --no-fail-fast matches `cargo test`.
+      - name: Integration tests (shard ${{ matrix.shard }})
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(bhf) & kind(test)' --partition hash:${{ matrix.shard }}/6
+          SHARD: ${{ matrix.shard }}
+          HASH_SHARDS: "12"
+        run: |
+          set -euo pipefail
+          slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
+          if [ "$SHARD" = build-recovery-scenarios ]; then
+            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast -E "$slow"
+          elif [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$HASH_SHARDS" ]; then
+            cargo nextest run --locked --workspace --no-fail-fast -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
+          else
+            echo "unknown shard: $SHARD" >&2
+            exit 1
+          fi

@@ -60,10 +60,7 @@ impl RuntimeOracles {
                     ));
                 }
                 let shim = shim_path::locate().ok_or_else(|| {
-                    anyhow!(
-                        "--runtime-oracles on: runtrace shim not found; build the workspace \
-                         (`cargo build`) or set BHF_RUNTRACE_SHIM to libbhf_runtrace.so"
-                    )
+                    anyhow!("--runtime-oracles on: {}", shim_path::unavailable_reason())
                 })?;
                 Self::for_shim(shim, mode_label).map(Some)
             }

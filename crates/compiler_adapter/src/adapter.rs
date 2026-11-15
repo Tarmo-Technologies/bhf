@@ -171,6 +171,12 @@ impl CompilerAdapter {
 
     pub(crate) fn canary_compiler(&self) -> Result<(CanaryCompilerKind, &Path), CompilerError> {
         if self.toolchain.compiler_prefix().is_some() {
+            // `<prefix>-gnatmake` takes the canary's compile switches as given;
+            // the `<prefix>-gnat` driver wants a subcommand first, so it is the
+            // fallback when no prefixed gnatmake is installed.
+            if let Some(gnatmake) = self.gnatmake.as_deref() {
+                return Ok((CanaryCompilerKind::Gnatmake, gnatmake));
+            }
             let gnat = self.gnat.as_deref().ok_or_else(|| {
                 self.toolchain
                     .missing_tool_error(self.toolchain.prefixed_tool_name("gnat"))
@@ -232,6 +238,16 @@ impl CompilerAdapter {
             // binds to — cc1 reads `-gnatc` as `-g natc` and fails the whole
             // compilation phase with "unrecognized debug output level".
             command.args(["-c", "-cargs:Ada", "-gnatc"]);
+        } else {
+            // A check compiles into the same object directories, and leaves an
+            // ALI without code beside the object an earlier full build made.
+            // GNAT time stamps have one-second resolution, so when the two were
+            // written in the same second gprbuild took the pair for a compiled
+            // unit and the bind failed ("must be recompiled", "no object
+            // specified"). `-s` recompiles a unit whose last compile had other
+            // switches, so the full build compiles what a check left (its ALI
+            // records `-gnatc`) and still skips a unit nothing changed.
+            command.arg("-s");
         }
 
         let output = run_bounded(&mut command)?;
@@ -430,6 +446,8 @@ mod tests {
         ));
     }
 
+    /// The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn check_with_gprbuild_passes_dash_gnatc_via_dash_cargs() {
         let temp = tempfile::TempDir::new().expect("temp dir is created");
@@ -439,6 +457,101 @@ mod tests {
         let result = adapter.check(Path::new("proj.gpr")).expect("check runs");
 
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    }
+
+    /// A check (`-gnatc`) recompiles a changed unit into the full build's
+    /// object directory: an ALI with no object beside the object an earlier
+    /// full build left. GNAT time stamps have one-second resolution, so when
+    /// both were written in the same second the next full build took the pair
+    /// for a compiled unit and failed to bind it ("must be recompiled", "no
+    /// object specified"). The mtimes are pinned here to make that second
+    /// deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_build_recompiles_a_unit_a_check_left_without_code_in_the_same_second() {
+        let Ok(gprbuild) = which_gprbuild() else {
+            eprintln!("skipping: gprbuild not available");
+            return;
+        };
+        let temp = tempfile::TempDir::new().expect("temp dir is created");
+        let root = temp.path();
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        };
+        let library_sources = [
+            ("lsrc/rt.ads", "package Rt is\n   procedure Hit (N : Integer);\nend Rt;\n"),
+            (
+                "lsrc/rt.adb",
+                "package body Rt is\n   procedure Hit (N : Integer) is begin null; end Hit;\nend Rt;\n",
+            ),
+        ];
+        write(
+            "rt.gpr",
+            "project Rt is\n   for Languages use (\"Ada\");\n   for Source_Dirs use (\"lsrc\");\n   \
+             for Object_Dir use \"rt_obj\";\n   for Library_Name use \"rt\";\n   \
+             for Library_Kind use \"static\";\n   for Library_Dir use \"rt_lib\";\nend Rt;\n",
+        );
+        write(
+            "app.gpr",
+            "with \"rt.gpr\";\nproject App is\n   for Source_Dirs use (\"src\");\n   \
+             for Object_Dir use \"obj\";\n   for Main use (\"main.adb\");\nend App;\n",
+        );
+        write(
+            "src/main.adb",
+            "with Rt;\nprocedure Main is begin Rt.Hit (1); end Main;\n",
+        );
+        let set_mtime = |relative: &str, secs: u64| {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(root.join(relative))
+                .unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        // bhf stages its runtime sources afresh for every round, so each round
+        // sees them with a new mtime.
+        let stage = |secs: u64| {
+            for (relative, contents) in library_sources {
+                write(relative, contents);
+                set_mtime(relative, secs);
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let adapter = CompilerAdapter::with_binary(CompilerKind::Gprbuild, gprbuild);
+        let project = root.join("app.gpr");
+
+        stage(now - 300);
+        let first = adapter.build(&project).expect("build runs");
+        assert_eq!(first.exit_code, 0, "{}", first.stderr);
+        stage(now - 200);
+        let check = adapter.check(&project).expect("check runs");
+        assert_eq!(check.exit_code, 0, "{}", check.stderr);
+        for written in ["rt_obj/rt.o", "rt_obj/rt.ali", "obj/main.o", "obj/main.ali"] {
+            set_mtime(written, now - 100);
+        }
+
+        let full = adapter.build(&project).expect("build runs");
+        assert_eq!(
+            full.exit_code, 0,
+            "a full build after a check must compile what the check left without code:\n{}{}",
+            full.stdout, full.stderr
+        );
+        assert!(root.join("obj/main").is_file());
+    }
+
+    #[cfg(unix)]
+    fn which_gprbuild() -> Result<PathBuf, ()> {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join("gprbuild"))
+            .find(|candidate| candidate.is_file())
+            .ok_or(())
     }
 
     fn write_strict_fake_gnatmake(dir: &Path) -> PathBuf {
@@ -452,6 +565,7 @@ exit 1
         )
     }
 
+    #[cfg(unix)]
     fn write_strict_fake_gprbuild_check(dir: &Path) -> PathBuf {
         write_executable(
             dir,

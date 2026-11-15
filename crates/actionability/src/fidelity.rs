@@ -120,6 +120,30 @@ impl Endianness {
             Self::Big => "big-endian",
         }
     }
+
+    /// The byte order a GNU target triple's architecture runs in
+    /// (`powerpc-linux-gnu` is big-endian, `powerpc64le-linux-gnu` little).
+    pub fn of_triple(triple: &str) -> Self {
+        let arch = triple
+            .split('-')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let big = arch.ends_with("_be")
+            || arch.ends_with("eb")
+            || arch == "s390x"
+            || arch.starts_with("sparc")
+            || matches!(
+                arch.as_str(),
+                "mips" | "mips64" | "mipsisa32r6" | "mipsisa64r6"
+            )
+            || (arch.starts_with("powerpc") || arch.starts_with("ppc")) && !arch.ends_with("le");
+        if big {
+            Self::Big
+        } else {
+            Self::Little
+        }
+    }
 }
 
 /// The facts a caller already knows about how a target was built and fuzzed, from
@@ -142,6 +166,13 @@ pub struct FidelityFacts {
     /// Whether a ThreadSanitizer pass actually ran (the only signal that
     /// concurrent access was exercised at all today).
     pub tsan_ran: bool,
+    /// The GNU target triple a cross-built harness was built for
+    /// (`aarch64-linux-gnu`), or `None` for a host build.
+    pub target_triple: Option<String>,
+    /// The emulator a cross-built harness ran under, in user mode
+    /// (`qemu-aarch64`), or `None` for one that ran natively. With a runner,
+    /// the target's ISA and byte order ran, emulated, instead of the host's.
+    pub runner: Option<String>,
 }
 
 impl FidelityFacts {
@@ -155,6 +186,8 @@ impl FidelityFacts {
             host_endianness: Endianness::host(),
             sanitizers: Vec::new(),
             tsan_ran: false,
+            target_triple: None,
+            runner: None,
         }
     }
 }
@@ -221,6 +254,34 @@ impl Fidelity {
                 concurrency,
                 sanitizers,
             },
+            // A cross-built target run under user-mode emulation: its own ISA
+            // and byte order ran (emulated), never the host's; a user-mode
+            // process has no RTOS or hardware of its own.
+            None if facts.runner.is_some() => {
+                let runner = facts.runner.as_deref().unwrap_or_default();
+                let triple = facts.target_triple.as_deref().unwrap_or("its target");
+                let endian = facts
+                    .target_triple
+                    .as_deref()
+                    .map_or(Endianness::Little, Endianness::of_triple);
+                Fidelity {
+                    arch: FidelityDimension::exercised(format!(
+                        "built for {triple} and run under {runner} user-mode emulation"
+                    )),
+                    endianness: FidelityDimension::exercised(format!(
+                        "{triple} target ran in {} under {runner}",
+                        endian.as_str()
+                    )),
+                    rtos_runtime: FidelityDimension::not_applicable(
+                        "user-mode emulated process target has no RTOS runtime",
+                    ),
+                    hardware_peripherals: FidelityDimension::not_applicable(
+                        "user-mode emulated process target has no hardware peripherals",
+                    ),
+                    concurrency,
+                    sanitizers,
+                }
+            }
             // Native host target: the host IS the target, so arch and byte order
             // were genuinely exercised; RTOS/hardware simply do not apply.
             None => Fidelity {
@@ -348,6 +409,59 @@ mod tests {
             host_endianness: Endianness::Little,
             sanitizers: vec!["asan".to_owned(), "ubsan".to_owned()],
             tsan_ran: false,
+            target_triple: None,
+            runner: None,
+        }
+    }
+
+    fn emulated(triple: &str, runner: &str, sanitizers: &[&str]) -> Fidelity {
+        let mut facts = FidelityFacts::host();
+        facts.target_triple = Some(triple.to_owned());
+        facts.runner = Some(runner.to_owned());
+        facts.sanitizers = sanitizers.iter().map(|s| (*s).to_owned()).collect();
+        Fidelity::from_facts(&facts)
+    }
+
+    /// A cross-built harness run under user-mode emulation ran the target's
+    /// ISA and byte order: the record names the triple and the emulator, never
+    /// the host, and the sanitizers armed in that build only.
+    #[test]
+    fn an_emulated_cross_target_names_its_triple_and_runner() {
+        let f = emulated("aarch64-linux-gnu", "qemu-aarch64", &[]);
+        assert_eq!(f.arch.status, FidelityStatus::Exercised);
+        let arch = f.arch.reason.as_deref().unwrap();
+        assert_eq!(
+            arch,
+            "built for aarch64-linux-gnu and run under qemu-aarch64 user-mode emulation"
+        );
+        assert!(!arch.contains("host"), "{arch}");
+        assert_eq!(f.endianness.status, FidelityStatus::Exercised);
+        let endianness = f.endianness.reason.as_deref().unwrap();
+        assert!(endianness.contains("little-endian"), "{endianness}");
+        assert!(endianness.contains("aarch64-linux-gnu"), "{endianness}");
+        assert!(!endianness.contains("host"), "{endianness}");
+        assert_eq!(f.sanitizers.status, FidelityStatus::NotExercised);
+        assert!(!f.is_reduced_fidelity());
+
+        let big = emulated("powerpc-linux-gnu", "qemu-ppc", &["ubsan"]);
+        assert!(big
+            .endianness
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("big-endian"));
+        assert_eq!(big.sanitizers.status, FidelityStatus::Exercised);
+        assert_eq!(big.sanitizers.reason.as_deref(), Some("ran under ubsan"));
+        for (triple, endian) in [
+            ("mips-linux-gnu", Endianness::Big),
+            ("mipsel-linux-gnu", Endianness::Little),
+            ("aarch64_be-linux-gnu", Endianness::Big),
+            ("armeb-linux-gnueabi", Endianness::Big),
+            ("arm-linux-gnueabihf", Endianness::Little),
+            ("powerpc64le-linux-gnu", Endianness::Little),
+            ("s390x-linux-gnu", Endianness::Big),
+        ] {
+            assert_eq!(Endianness::of_triple(triple), endian, "{triple}");
         }
     }
 

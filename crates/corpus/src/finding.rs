@@ -7,7 +7,7 @@ use crate::{
 use event_log::{HandlerEvent, Testcase};
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct FindingEmitter {
     root: PathBuf,
@@ -106,15 +106,17 @@ pub fn extension_signature(signature_inputs: &[String]) -> String {
 pub enum RunDedupeKey {
     /// `rule_id|oracle.name|oracle.api`: one finding per defect, not per input.
     Oracle(String),
-    /// `cluster_key_full`, or `rule:<rule_id>` for a fallback cluster.
+    /// `cluster_key_full`: the root-cause key, or the finding signature when
+    /// the crash had neither an informative frame nor a reported site
+    /// ([`sanitizer_dedupe_key`]).
     Cluster(String),
 }
 
 /// The fuzz run's dedupe key for a written `finding.json`, rebuilt from the
 /// record: what the run computed when it emitted the finding. Oracle keys are
 /// kept verbatim, empty parts included, as the run builds them; an empty
-/// cluster key or rule id yields nothing, since no run computes one and a
-/// shared empty key would make unrelated records one crash.
+/// cluster key yields nothing, since no run computes one and a shared empty
+/// key would make unrelated records one crash.
 pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
     let rule_id = record.get("rule_id").and_then(serde_json::Value::as_str);
     if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
@@ -125,20 +127,72 @@ pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
             return Some(RunDedupeKey::Oracle(format!("{rule_id}|{name}|{api}")));
         }
     }
-    let fallback = record
-        .get("cluster_fallback")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if fallback {
-        rule_id
-            .filter(|rule_id| !rule_id.is_empty())
-            .map(|rule_id| RunDedupeKey::Cluster(format!("rule:{rule_id}")))
+    // A fallback record's `cluster_key_full` is its signature, which is what
+    // the run keys such a crash on (`sanitizer_dedupe_key`). Older runs keyed
+    // every fallback crash of a rule as one `rule:<id>`, which hid later,
+    // different crashes of that rule for the rest of the run.
+    record
+        .get("cluster_key_full")
+        .and_then(serde_json::Value::as_str)
+        .filter(|full| !full.is_empty())
+        .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+}
+
+/// The signature of a sanitizer crash: sha256 over the rule, the crash kind,
+/// the sanitizer's check name, the reported site (for a UBSan report, or any
+/// report without a crash stack; for a crash with no sanitizer report, the
+/// faulting pc offset bhf's driver printed) and the crash-stack function
+/// names. The allocation and free stacks describe the object, not the crash,
+/// and are not hashed. Its first 8 hex digits are the finding ID suffix.
+pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(report.rule_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(report.kind.as_bytes());
+    if let Some(check) = &report.check {
+        hasher.update(b"|check=");
+        hasher.update(check.as_bytes());
+    }
+    let ubsan = report.sanitizer == Some(crate::sanitizer::Sanitizer::UndefinedBehaviorSanitizer);
+    if let Some(site) = report
+        .fault_site()
+        .filter(|_| ubsan || report.stack.is_empty())
+    {
+        hasher.update(b"|site=");
+        hasher.update(site.as_bytes());
+    }
+    for frame in &report.stack {
+        hasher.update(b"|");
+        hasher.update(frame.function.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The key a fuzz run dedupes a sanitizer crash on: its root-cause cluster key,
+/// or its signature when the crash has neither an informative frame nor a
+/// reported site. The same key is written as the finding's
+/// `cluster_key_full`, so [`run_dedupe_key`] rebuilds it from disk. Every site
+/// that dedupes sanitizer crashes (the builtin loop, AFL++ crash ingestion,
+/// the pre-seed from earlier passes) uses this one function.
+pub fn sanitizer_dedupe_key(report: &crate::sanitizer::SanitizerReport) -> String {
+    sanitizer_dedupe_key_scoped(report, "")
+}
+
+/// [`sanitizer_dedupe_key`] for a crash found in `scope`
+/// ([`crate::cluster::crash_scope`]): a crash with neither an informative
+/// frame nor a reported site keys on its scoped root-cause key
+/// ([`crate::cluster::cluster_for_sanitizer_scoped`]), which is what the
+/// emitter of that scope writes as `cluster_key_full`.
+pub fn sanitizer_dedupe_key_scoped(
+    report: &crate::sanitizer::SanitizerReport,
+    scope: &str,
+) -> String {
+    let cluster = crate::cluster::cluster_for_sanitizer_scoped(report, scope);
+    if cluster.is_placeholder() {
+        sanitizer_signature(report)
     } else {
-        record
-            .get("cluster_key_full")
-            .and_then(serde_json::Value::as_str)
-            .filter(|full| !full.is_empty())
-            .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+        cluster.full
     }
 }
 
@@ -213,6 +267,9 @@ impl FindingEmitter {
                 sandbox: None,
                 mode: actionability::RunMode::Reporting,
                 build_binary: None,
+                harness_format_version: None,
+                buffer_len_dimension: false,
+                crash_scope: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -234,6 +291,9 @@ impl FindingEmitter {
                 sandbox: Some(sandbox),
                 mode: actionability::RunMode::Reporting,
                 build_binary: None,
+                harness_format_version: None,
+                buffer_len_dimension: false,
+                crash_scope: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -249,6 +309,29 @@ impl FindingEmitter {
     /// emitter so a finding pins to the exact binary bytes that produced it.
     pub fn with_build_binary(mut self, identity: serde_json::Value) -> Self {
         self.metadata.build_binary = Some(identity);
+        self
+    }
+
+    /// Record the generated harness's input format version in every finding
+    /// this emitter writes (`harness_format_version`). `None` (a harness with
+    /// no generation metadata) records nothing.
+    pub fn with_harness_format_version(mut self, version: Option<u32>) -> Self {
+        self.metadata.harness_format_version = version;
+        self
+    }
+
+    /// Record that the generated harness was built with the explicit
+    /// buffer-length dimension (`buffer_len_dimension: true` in every finding
+    /// this emitter writes): it is part of the harness input format.
+    pub fn with_buffer_len_dimension(mut self, enabled: bool) -> Self {
+        self.metadata.buffer_len_dimension = enabled;
+        self
+    }
+
+    /// Group the frame-less crashes this emitter writes by `scope` (see
+    /// [`crate::cluster::crash_scope`]) instead of by the harness id alone.
+    pub fn with_crash_scope(mut self, scope: impl Into<String>) -> Self {
+        self.metadata.crash_scope = Some(scope.into());
         self
     }
 
@@ -272,25 +355,21 @@ impl FindingEmitter {
         report: &crate::sanitizer::SanitizerReport,
         log: Option<&[u8]>,
     ) -> Result<FindingId, CorpusError> {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(report.rule_id.as_bytes());
-        hasher.update(b"|");
-        hasher.update(report.kind.as_bytes());
-        for frame in &report.stack {
-            hasher.update(b"|");
-            hasher.update(frame.function.as_bytes());
-        }
-        let signature_hex = format!("{:x}", hasher.finalize());
-        let cluster = crate::cluster::cluster_for_sanitizer(report);
-        let (cluster_short, cluster_full, cluster_fallback) = if cluster.fallback {
+        let signature_hex = sanitizer_signature(report);
+        let cluster =
+            crate::cluster::cluster_for_sanitizer_scoped(report, &self.metadata.crash_scope());
+        let (cluster_short, cluster_full, cluster_fallback) = if cluster.is_placeholder() {
             (
                 signature_hex.chars().take(16).collect::<String>(),
                 signature_hex.clone(),
                 true,
             )
         } else {
-            (cluster.short.clone(), cluster.full.clone(), false)
+            (
+                cluster.short.clone(),
+                cluster.full.clone(),
+                cluster.fallback,
+            )
         };
         let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
@@ -325,7 +404,7 @@ impl FindingEmitter {
             "classification": "unhandled",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "exception": {
                 "name": exception_name,
                 "message": report.message,
@@ -345,6 +424,29 @@ impl FindingEmitter {
         // additive change — no schema-version bump).
         if let Some(sanitizer) = report.sanitizer {
             record["exception"]["sanitizer"] = json!(sanitizer.as_str());
+        }
+        // Additive structured evidence: the reported site, the sanitizer's own
+        // check name, and the memory access (direction, size, region, and the
+        // allocation / free stacks kept apart from the crash stack).
+        if let Some(location) = &report.location {
+            record["exception"]["location"] = json!(location);
+        }
+        if let Some(check) = &report.check {
+            record["exception"]["check"] = json!(check);
+        }
+        if let Some(access) = &report.access {
+            record["exception"]["access"] = json!(access);
+        }
+        // A fatal signal with no sanitizer report names its signal as its
+        // check; it is recorded as such too.
+        if report.sanitizer.is_none() && report.kind == "fatal-signal" {
+            if let Some(signal) = report.check.as_deref().filter(|c| c.starts_with("SIG")) {
+                record["exception"]["signal"] = json!(signal);
+            }
+        }
+        // A crash with no sanitizer report: where the driver saw it fault.
+        if let Some(offset) = report.pc_offset {
+            record["exception"]["pc_offset"] = json!(format!("{offset:#x}"));
         }
         if log_written.is_some() {
             record["paths"]["sanitizer_log"] = json!("sanitizer.log");
@@ -445,7 +547,7 @@ impl FindingEmitter {
             "confirmation": "runtime",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "oracle": {
                 "name": hit.oracle_name,
                 "category": hit.category,
@@ -548,7 +650,7 @@ impl FindingEmitter {
             "confirmation": "extension",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "extension": finding.provenance,
             "evidence": evidence,
             "exception": {
@@ -627,8 +729,10 @@ impl FindingEmitter {
             finding_dir.join("decoded.json"),
             serde_json::to_vec_pretty(&decoded_placeholder(input))?,
         )?;
+        let fixture_path = stored_fixture_path(&self.root, &self.metadata.fixture_path);
         let mut record = finding_record(
             &id.0,
+            &fixture_path,
             &signature_hex,
             classification,
             testcase,
@@ -691,8 +795,115 @@ impl FindingEmitter {
         let short: String = signature_hex.chars().take(8).collect();
         let mut allocator = crate::layout::FamilyAllocator::new(&findings_root, "F-")?;
         let (id, dir) = allocator.create_with_suffix(&short)?;
+        self.record_corpus_format();
         Ok((FindingId(id), dir))
     }
+
+    /// Record the harness's input format in its corpus's metadata
+    /// (`corpus/<harness_id>/metadata.json`), so inputs kept from a harness
+    /// of another format are recognised. Written with each finding and at
+    /// the end of each fuzz pass, whether or not it found anything.
+    /// Best-effort: a corpus dir that cannot be written never fails the
+    /// finding or the pass.
+    pub fn record_corpus_format(&self) {
+        self.write_corpus_format(true);
+    }
+
+    /// [`Self::record_corpus_format`] for a corpus this pass is about to
+    /// create: written only when `corpus/<harness_id>/` does not exist yet,
+    /// so the corpus carries its format from its first input on, while an
+    /// existing corpus keeps the format it was recorded with until the pass
+    /// has added to it.
+    pub fn start_corpus_format(&self) {
+        self.write_corpus_format(false);
+    }
+
+    fn write_corpus_format(&self, existing: bool) {
+        let Some(version) = self.metadata.harness_format_version else {
+            return;
+        };
+        let harness_id = self.metadata.harness_id.as_str();
+        if harness_id.is_empty()
+            || harness_id.contains(['/', '\\'])
+            || harness_id == "."
+            || harness_id == ".."
+        {
+            return;
+        }
+        let dir = self.root.join("corpus").join(harness_id);
+        if !existing && dir.exists() {
+            return;
+        }
+        let metadata = json!({
+            "schema_version": CORPUS_METADATA_SCHEMA,
+            "harness_id": harness_id,
+            "harness": {
+                "format_version": version,
+                "buffer_len_dimension": self.metadata.buffer_len_dimension,
+            },
+            "updated_at": now_rfc3339(),
+        });
+        if fs::create_dir_all(&dir).is_ok() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&metadata) {
+                let _ = fs::write(dir.join(CORPUS_METADATA_FILE), bytes);
+            }
+        }
+    }
+}
+
+/// The metadata file of a harness's corpus, `corpus/<harness_id>/metadata.json`.
+pub const CORPUS_METADATA_FILE: &str = "metadata.json";
+/// `schema_version` of the corpus metadata.
+pub const CORPUS_METADATA_SCHEMA: &str = "bhf.corpus-metadata.v1";
+
+/// A generated harness's input format: its version, and whether the explicit
+/// buffer-length dimension was on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessFormat {
+    pub version: u32,
+    pub buffer_len_dimension: bool,
+}
+
+/// The input format a finding records: `harness.format_version` (and
+/// `harness.buffer_len_dimension`) first, else the top-level
+/// `harness_format_version` / `buffer_len_dimension` findings written before
+/// `harness` existed carry. `None` when the finding records none.
+pub fn finding_harness_format(record: &serde_json::Value) -> Option<HarnessFormat> {
+    let version = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+    };
+    if let Some(version) = version(record.pointer("/harness/format_version")) {
+        return Some(HarnessFormat {
+            version,
+            buffer_len_dimension: record
+                .pointer("/harness/buffer_len_dimension")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Some(HarnessFormat {
+        version: version(record.get("harness_format_version"))?,
+        buffer_len_dimension: record
+            .get("buffer_len_dimension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// The input format recorded for the corpus of `harness_id` under
+/// `work_dir` (`corpus/<harness_id>/metadata.json`), when one is.
+pub fn recorded_corpus_format(work_dir: &Path, harness_id: &str) -> Option<HarnessFormat> {
+    let bytes = fs::read(
+        work_dir
+            .join("corpus")
+            .join(harness_id)
+            .join(CORPUS_METADATA_FILE),
+    )
+    .ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    finding_harness_format(&metadata)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,6 +920,24 @@ struct FindingMetadata {
     /// (`corpus` does not depend on `binary_analysis`): merged into
     /// `record["build"]["binary"]` by every emitter.
     build_binary: Option<serde_json::Value>,
+    /// The input format of the generated harness that produced the finding
+    /// (its `generation-metadata.json` `harness_format_version`), so a later
+    /// replay can tell when the harness has since been regenerated with a
+    /// format that decodes the testcase differently.
+    harness_format_version: Option<u32>,
+    /// The harness had the explicit buffer-length dimension on.
+    buffer_len_dimension: bool,
+    /// What frame-less crashes are grouped by ([`crate::cluster::crash_scope`]);
+    /// `None` groups them by the harness id.
+    crash_scope: Option<String>,
+}
+
+impl FindingMetadata {
+    fn crash_scope(&self) -> String {
+        self.crash_scope
+            .clone()
+            .unwrap_or_else(|| self.harness_id.clone())
+    }
 }
 
 impl Default for FindingMetadata {
@@ -720,8 +949,124 @@ impl Default for FindingMetadata {
             sandbox: None,
             mode: actionability::RunMode::Reporting,
             build_binary: None,
+            harness_format_version: None,
+            buffer_len_dimension: false,
+            crash_scope: None,
         }
     }
+}
+
+/// The directories under a work dir that hold harness `<id>/` directories.
+const HARNESS_ROOTS: [&str; 4] = ["build", "harnesses", "auto", "generated_harnesses"];
+
+/// The `fixture_path` recorded for a harness at `fixture`: relative to the work
+/// dir (with `/` separators) when the harness is inside it, so a copied or
+/// moved work dir resolves its own harness; unchanged otherwise.
+pub fn stored_fixture_path(work_dir: &std::path::Path, fixture: &str) -> String {
+    use std::path::{Component, Path};
+    if fixture.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(fixture);
+    let relative = path
+        .strip_prefix(work_dir)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let canonical = fs::canonicalize(path).ok()?;
+            let work = fs::canonicalize(work_dir).ok()?;
+            canonical.strip_prefix(&work).ok().map(Path::to_path_buf)
+        });
+    let Some(relative) = relative else {
+        return fixture.to_owned();
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return fixture.to_owned(),
+        }
+    }
+    if parts.is_empty() {
+        return fixture.to_owned();
+    }
+    parts.join("/")
+}
+
+/// Where a finding's recorded `fixture_path` may be found, most likely first,
+/// resolved against the work dir that holds `finding_dir`:
+///
+/// - a relative value (what bhf records now) is taken relative to that work
+///   dir, then by its `build|harnesses|auto|generated_harnesses/<id>/...`
+///   tail in it — never relative to the current directory, which would run
+///   whatever harness sits there;
+/// - an absolute value inside that work dir, or one with no harness-root tail
+///   (a harness outside any work dir), is taken as given;
+/// - an absolute value recorded in another work dir (by an earlier release,
+///   or in the original of a copied work dir) is mapped into this one by its
+///   tail. The path as recorded is that other work dir's harness: it is
+///   offered by [`fixture_path_fallback`], to try only after the harness dirs
+///   of this work dir.
+///
+/// A finding outside a work-dir layout takes the value as given.
+pub fn fixture_path_candidates(
+    finding_dir: &std::path::Path,
+    fixture: &str,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if fixture.is_empty() {
+        return Vec::new();
+    }
+    let path = PathBuf::from(fixture);
+    let Some(work) = crate::layout::work_dir_for_finding(finding_dir) else {
+        return vec![path];
+    };
+    let mut candidates = Vec::new();
+    let mut push = |candidate: PathBuf| {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+    if path.is_relative() {
+        push(work.join(&path));
+        if let Some(tail) = harness_tail(&path) {
+            push(work.join(tail));
+        }
+    } else if path.starts_with(&work) {
+        push(path);
+    } else if let Some(tail) = harness_tail(&path) {
+        push(work.join(tail));
+    } else {
+        push(path);
+    }
+    candidates
+}
+
+/// The recorded `fixture_path` as given, when [`fixture_path_candidates`]
+/// held it back: an absolute path into another work dir's harness dirs. A
+/// caller tries it only once this work dir's own harness dirs hold nothing
+/// for the finding's `harness_id`.
+pub fn fixture_path_fallback(
+    finding_dir: &std::path::Path,
+    fixture: &str,
+) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(fixture);
+    let work = crate::layout::work_dir_for_finding(finding_dir)?;
+    (path.is_absolute() && !path.starts_with(&work) && harness_tail(&path).is_some())
+        .then_some(path)
+}
+
+/// The `<root>/<id>/<leaf...>` tail of a harness path, from the last
+/// component naming a harness root (`build`, `harnesses`, `auto`,
+/// `generated_harnesses`) that is followed by at least an id and a file name.
+fn harness_tail(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parts: Vec<_> = path.components().collect();
+    let index = (0..parts.len().saturating_sub(2)).rev().find(|&i| {
+        matches!(parts[i], std::path::Component::Normal(name)
+            if HARNESS_ROOTS.iter().any(|root| name == std::ffi::OsStr::new(root)))
+    })?;
+    Some(parts[index..].iter().collect())
 }
 
 /// A later run reproduced this finding: stamp `last_seen` (and history).
@@ -761,6 +1106,18 @@ pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io:
 /// creating `build` as an object first if no sandbox metadata already put one
 /// there. No-op when `metadata` carries no build identity.
 fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
+    if let Some(version) = metadata.harness_format_version {
+        // `harness` is where readers look first; the top-level keys stay for
+        // readers that predate it.
+        record["harness"] = json!({
+            "format_version": version,
+            "buffer_len_dimension": metadata.buffer_len_dimension,
+        });
+        record["harness_format_version"] = json!(version);
+    }
+    if metadata.buffer_len_dimension {
+        record["buffer_len_dimension"] = json!(true);
+    }
     if let Some(binary) = &metadata.build_binary {
         let build = record
             .as_object_mut()
@@ -773,21 +1130,22 @@ fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata
     }
 }
 
+/// `decoded.json` before any argument trace: the input's size, preview and raw
+/// byte provenance. A C/C++ finding's trace rewrites it (see
+/// [`crate::decoded_args::record_trace`]).
 fn decoded_placeholder(input: &[u8]) -> serde_json::Value {
-    json!({
-        "input_size": input.len(),
-        "preview_hex": preview_hex(input),
-        "provenance": [{
-            "kind": "raw_bytes",
-            "source": "testcase.bin",
-            "byte_range": { "start": 0, "end": input.len() }
-        }]
-    })
+    crate::decoded_args::decoded_document(
+        input,
+        &crate::decoded_args::TraceOutcome::Unavailable(
+            "no argument trace was recorded for this finding".to_owned(),
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finding_record(
     id: &str,
+    fixture_path: &str,
     signature_hex: &str,
     classification: Classification,
     testcase: &Testcase,
@@ -818,7 +1176,7 @@ fn finding_record(
         "mocks": testcase.mocks,
         "harness_id": metadata.harness_id,
         "dialect": metadata.dialect,
-        "fixture_path": metadata.fixture_path,
+        "fixture_path": fixture_path,
         "exception": {
             "name": handler.exception_name,
             "message": handler.exception_message,
@@ -849,16 +1207,6 @@ fn classification_label(classification: Classification) -> &'static str {
     }
 }
 
-fn preview_hex(input: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(input.len().min(32) * 2);
-    for byte in input.iter().take(32) {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
-}
-
 fn oracle_exception_name(name: &str) -> String {
     let mut out = String::from("ORACLE_");
     for ch in name.chars() {
@@ -875,6 +1223,10 @@ fn oracle_exception_name(name: &str) -> String {
 mod tests {
     use super::FindingEmitter;
     use super::{append_history, finding_kind, stamp_v1};
+    use super::{
+        finding_harness_format, recorded_corpus_format, HarnessFormat, CORPUS_METADATA_FILE,
+        CORPUS_METADATA_SCHEMA,
+    };
     use crate::compute_signature;
     use event_log::{HandlerEvent, Testcase};
     use std::fs;
@@ -907,6 +1259,170 @@ mod tests {
             .unwrap(),
             b"\x00\x01bad"
         );
+    }
+
+    #[test]
+    fn findings_record_the_harness_format_they_were_found_with() {
+        let root = temp_dir("format-version");
+        let emitter = FindingEmitter::new(root.clone()).with_harness_format_version(Some(3));
+        let id = emitter.emit(b"abc", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["harness_format_version"], 3);
+        assert!(record.get("buffer_len_dimension").is_none());
+        assert_eq!(
+            record["harness"],
+            serde_json::json!({"format_version": 3, "buffer_len_dimension": false}),
+            "the format is also recorded under `harness`"
+        );
+
+        let sized = FindingEmitter::new(root.clone())
+            .with_harness_format_version(Some(3))
+            .with_buffer_len_dimension(true);
+        let id = sized.emit(b"abe", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["buffer_len_dimension"], true);
+        assert_eq!(record["harness"]["buffer_len_dimension"], true);
+
+        let unversioned = FindingEmitter::new(root.clone());
+        let id = unversioned.emit(b"abd", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(record.get("harness_format_version").is_none());
+        assert!(record.get("harness").is_none());
+    }
+
+    /// The corpus of the harness that found something records the harness's
+    /// input format, so inputs kept from another format are recognised.
+    #[test]
+    fn a_finding_records_the_harness_format_in_the_corpus_metadata() {
+        let root = temp_dir("corpus-format");
+        let emitter = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0001".to_owned(),
+            "c".to_owned(),
+            "harnesses/H-C0001/main".to_owned(),
+        )
+        .with_harness_format_version(Some(3));
+        emitter.emit(b"abc", &testcase(), 0).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("corpus/H-C0001").join(CORPUS_METADATA_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["schema_version"], CORPUS_METADATA_SCHEMA);
+        assert_eq!(metadata["harness_id"], "H-C0001");
+        assert_eq!(metadata["harness"]["format_version"], 3);
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0001"),
+            Some(HarnessFormat {
+                version: 3,
+                buffer_len_dimension: false
+            })
+        );
+        // An emitter that knows no format leaves the corpus metadata alone.
+        let unknown = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0002".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        );
+        unknown.emit(b"abd", &testcase(), 0).unwrap();
+        assert!(!root
+            .join("corpus/H-C0002")
+            .join(CORPUS_METADATA_FILE)
+            .exists());
+        assert_eq!(recorded_corpus_format(&root, "H-C0002"), None);
+    }
+
+    /// A fuzz pass stamps a corpus it creates when it starts, leaves an
+    /// existing corpus's stamp alone until it ends, and then stamps it with
+    /// its own format.
+    #[test]
+    fn a_pass_stamps_a_new_corpus_at_its_start_and_every_corpus_at_its_end() {
+        let root = temp_dir("corpus-pass-format");
+        let emitter = |version: u32| {
+            FindingEmitter::with_metadata(
+                root.clone(),
+                "H-C0003".to_owned(),
+                "c".to_owned(),
+                String::new(),
+            )
+            .with_harness_format_version(Some(version))
+        };
+        emitter(4).start_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(4)
+        );
+        emitter(5).start_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(4),
+            "an existing corpus keeps its stamp when a pass starts"
+        );
+        emitter(5).record_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(5)
+        );
+        // A corpus from before the stamp keeps having none until a pass ends.
+        let queue = root.join("corpus/H-C0004/queue");
+        fs::create_dir_all(&queue).unwrap();
+        let unstamped = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0004".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .with_harness_format_version(Some(4));
+        unstamped.start_corpus_format();
+        assert_eq!(recorded_corpus_format(&root, "H-C0004"), None);
+    }
+
+    #[test]
+    fn the_recorded_format_is_read_from_harness_first_then_the_legacy_key() {
+        let both = serde_json::json!({
+            "harness": {"format_version": 3, "buffer_len_dimension": true},
+            "harness_format_version": 2
+        });
+        assert_eq!(
+            finding_harness_format(&both),
+            Some(HarnessFormat {
+                version: 3,
+                buffer_len_dimension: true
+            })
+        );
+        let legacy = serde_json::json!({"harness_format_version": 2, "buffer_len_dimension": true});
+        assert_eq!(
+            finding_harness_format(&legacy),
+            Some(HarnessFormat {
+                version: 2,
+                buffer_len_dimension: true
+            })
+        );
+        assert_eq!(finding_harness_format(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -1232,6 +1748,7 @@ mod tests {
                 },
             ],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1268,6 +1785,7 @@ mod tests {
             stack: Vec::new(),
             message: "target transport reported a target CPU exception with no sanitizer report"
                 .to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1297,6 +1815,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let dir = crate::layout::finding_dir(&root, &id.0);
@@ -1327,6 +1846,7 @@ mod tests {
                 line: Some(27),
             }],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
 
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
@@ -1344,6 +1864,170 @@ mod tests {
             "src/packet.c"
         );
         assert_eq!(value["actionability"]["impact"], "critical");
+    }
+
+    fn fixture_recorded_for(root: &std::path::Path, fixture: &str) -> serde_json::Value {
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            message: "ERROR: AddressSanitizer: heap-buffer-overflow".to_owned(),
+            ..Default::default()
+        };
+        let emitter = super::FindingEmitter::with_metadata(
+            root.to_path_buf(),
+            "H-1".to_owned(),
+            "c".to_owned(),
+            fixture.to_owned(),
+        );
+        let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
+        serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A copied or moved work dir must run its own harness, so a harness
+    /// inside the work dir is recorded relative to it.
+    #[test]
+    fn a_harness_inside_the_work_dir_is_recorded_relative_to_it() {
+        let root = temp_dir("fixture-relative");
+        let harness = root.join("harnesses").join("H-1").join("main");
+        let value = fixture_recorded_for(&root, &harness.display().to_string());
+        assert_eq!(value["fixture_path"], "harnesses/H-1/main");
+    }
+
+    #[test]
+    fn a_harness_outside_the_work_dir_keeps_its_path() {
+        let root = temp_dir("fixture-outside");
+        let value = fixture_recorded_for(&root, "/opt/prebuilt/harness/main");
+        assert_eq!(value["fixture_path"], "/opt/prebuilt/harness/main");
+        let value = fixture_recorded_for(&root, "examples/widget/pkg.adb");
+        assert_eq!(value["fixture_path"], "examples/widget/pkg.adb");
+    }
+
+    /// A relative value resolves in the work dir holding the finding, never
+    /// relative to the current directory.
+    #[test]
+    fn a_relative_fixture_resolves_in_the_containing_work_dir_only() {
+        let finding = std::path::Path::new("/copy/results/findings/F-0001-aa");
+        assert_eq!(
+            super::fixture_path_candidates(finding, "harnesses/H-1/main"),
+            vec![PathBuf::from("/copy/harnesses/H-1/main")]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, "harnesses/H-1/main"),
+            None
+        );
+        // A value an earlier release recorded relative to its current
+        // directory is mapped by its harness-root tail.
+        assert_eq!(
+            super::fixture_path_candidates(finding, "old/work/build/H-1/main"),
+            vec![
+                PathBuf::from("/copy/old/work/build/H-1/main"),
+                PathBuf::from("/copy/build/H-1/main"),
+            ]
+        );
+        // Outside a work-dir layout there is nothing else to resolve against.
+        assert_eq!(
+            super::fixture_path_candidates(
+                std::path::Path::new("/loose/F-1"),
+                "harnesses/H-1/main"
+            ),
+            vec![PathBuf::from("harnesses/H-1/main")]
+        );
+    }
+
+    /// An absolute path recorded in another work dir is mapped into the work
+    /// dir holding the finding; the path as recorded is only a fallback.
+    #[test]
+    fn an_absolute_fixture_is_mapped_into_the_containing_work_dir() {
+        // An absolute path carries a drive on Windows.
+        let abs = |path: &str| {
+            if cfg!(windows) {
+                format!("C:{path}")
+            } else {
+                path.to_owned()
+            }
+        };
+        let finding_dir = abs("/copy/results/findings/F-0001-aa");
+        let finding = std::path::Path::new(&finding_dir);
+        assert_eq!(
+            super::fixture_path_candidates(finding, &abs("/orig/work/harnesses/H-1/main")),
+            vec![PathBuf::from(abs("/copy/harnesses/H-1/main"))]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, &abs("/orig/work/harnesses/H-1/main")),
+            Some(PathBuf::from(abs("/orig/work/harnesses/H-1/main")))
+        );
+        assert_eq!(
+            super::fixture_path_candidates(finding, &abs("/copy/build/H-1/obj/main")),
+            vec![PathBuf::from(abs("/copy/build/H-1/obj/main"))]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, &abs("/copy/build/H-1/obj/main")),
+            None
+        );
+        // A path with no harness-root tail is used as given.
+        assert_eq!(
+            super::fixture_path_candidates(finding, &abs("/opt/prebuilt/main")),
+            vec![PathBuf::from(abs("/opt/prebuilt/main"))]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, &abs("/opt/prebuilt/main")),
+            None
+        );
+        assert!(super::fixture_path_candidates(finding, "").is_empty());
+    }
+
+    #[test]
+    fn a_resource_leak_finding_is_named_for_the_oracle_of_its_harness() {
+        use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
+
+        let root = temp_dir("oracle-leak-names");
+        let leak = |oracle: &str| OracleHit {
+            oracle_name: oracle.to_owned(),
+            rule_id: "BHF-306".to_owned(),
+            category: "logic-bug".to_owned(),
+            api: "fopen".to_owned(),
+            message: "resource opened during fuzz execution was not released".to_owned(),
+            evidence: vec![OracleEvidence {
+                key: "resource".to_owned(),
+                value: "fd:4 path:/srv/widget.cfg".to_owned(),
+            }],
+        };
+        let exception_name = |harness: &str, language: &str, oracle: &str| {
+            let emitter = super::FindingEmitter::with_metadata(
+                root.clone(),
+                harness.to_owned(),
+                language.to_owned(),
+                format!("/tmp/{harness}/main"),
+            );
+            let id = emitter.emit_oracle_hit(b"widget", &leak(oracle)).unwrap();
+            let finding: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            finding["exception"]["name"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(
+            exception_name("H-C0001", "c", "resource-leak"),
+            "ORACLE_RESOURCE_LEAK"
+        );
+        assert_eq!(
+            exception_name("H-A0001", "ada", "resource-leak-ada"),
+            "ORACLE_RESOURCE_LEAK_ADA"
+        );
     }
 
     #[test]
@@ -1649,6 +2333,7 @@ mod tests {
                 line: None,
             }],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1675,6 +2360,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(
@@ -1725,11 +2411,13 @@ mod tests {
                 "BHF-405|path-traversal|open".to_owned()
             ))
         );
+        // A fallback record keys on its own `cluster_key_full` (its signature),
+        // not on one shared `rule:<id>` per rule.
         let fallback =
             json!({"rule_id": "BHF-210", "cluster_fallback": true, "cluster_key_full": "x"});
         assert_eq!(
             run_dedupe_key(&fallback),
-            Some(RunDedupeKey::Cluster("rule:BHF-210".to_owned()))
+            Some(RunDedupeKey::Cluster("x".to_owned()))
         );
         let clustered = json!({"rule_id": "BHF-201", "cluster_fallback": false, "cluster_key_full": "deadbeef"});
         assert_eq!(
@@ -1789,6 +2477,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter
             .emit_sanitizer_crash_with_log(b"in", &report, Some(b"full log"))
@@ -1812,6 +2501,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "m".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(
@@ -1877,5 +2567,254 @@ mod tests {
         );
         assert!(dedupe_keys(&json!({"id": "F-0000-x", "signature": ""})).is_empty());
         assert!(dedupe_keys(&json!("not an object")).is_empty());
+    }
+
+    fn emit_parsed(root: &std::path::Path, stderr: &str) -> serde_json::Value {
+        let report = crate::sanitizer::parse_sanitizer_report(stderr).expect("a report");
+        let emitter = super::FindingEmitter::with_metadata(
+            root.to_path_buf(),
+            "H-C0001".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        );
+        let id = emitter
+            .emit_sanitizer_crash_with_log(b"in", &report, Some(stderr.as_bytes()))
+            .unwrap();
+        serde_json::from_slice(
+            &fs::read(crate::layout::finding_dir(root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn frameless_missing_return(file: &str, line: u32) -> String {
+        format!(
+            "{file}:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return {file}:{line}:5 \n"
+        )
+    }
+
+    /// A UBSan report printed without a stack used to hash only `rule|kind`, so
+    /// every such finding in every project shared one ID suffix, one root-cause
+    /// group and one per-run dedupe key.
+    #[test]
+    fn frameless_ubsan_findings_at_distinct_sites_get_distinct_ids_and_keys() {
+        let root = temp_dir("frameless-sites");
+        let a = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 3));
+        let b = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 9));
+        let c = emit_parsed(&root, &frameless_missing_return("/src/widget/b.c", 3));
+        let suffix = |v: &serde_json::Value| v["id"].as_str().unwrap()[7..].to_owned();
+        for (x, y) in [(&a, &b), (&a, &c), (&b, &c)] {
+            assert_ne!(x["signature"], y["signature"]);
+            assert_ne!(
+                suffix(x),
+                suffix(y),
+                "distinct UB sites get distinct ID suffixes"
+            );
+            assert_ne!(x["cluster_key_full"], y["cluster_key_full"]);
+            assert_ne!(super::run_dedupe_key(x), super::run_dedupe_key(y));
+        }
+        assert_eq!(
+            a["cluster_fallback"], false,
+            "a reported site is an identity"
+        );
+        assert!(!format!("{:?}", super::run_dedupe_key(&a)).contains("rule:"));
+    }
+
+    /// Two files that share a name in different directories are different
+    /// sites, while the same file stays one site wherever the tree is checked
+    /// out and whether the compiler got a relative or an absolute path.
+    #[test]
+    fn same_named_files_in_different_directories_are_different_sites() {
+        let root = temp_dir("same-basename-sites");
+        let a = emit_parsed(&root, &frameless_missing_return("/src/a/util.c", 3));
+        let b = emit_parsed(&root, &frameless_missing_return("/src/b/util.c", 3));
+        assert_ne!(a["signature"], b["signature"]);
+        assert_ne!(a["cluster_key_full"], b["cluster_key_full"]);
+        assert_ne!(super::run_dedupe_key(&a), super::run_dedupe_key(&b));
+
+        for elsewhere in [
+            "/home/dev/checkout/src/a/util.c",
+            "src/a/util.c",
+            "./a/util.c",
+        ] {
+            let moved = emit_parsed(&root, &frameless_missing_return(elsewhere, 3));
+            assert_eq!(moved["signature"], a["signature"], "{elsewhere}");
+            assert_eq!(
+                moved["cluster_key_full"], a["cluster_key_full"],
+                "{elsewhere}"
+            );
+        }
+
+        // A bare file name (the compiler ran in the file's directory) takes the
+        // directory from the crash frame that names the same file.
+        let with_frame = |reported: &str, frame_file: &str| {
+            let stderr = format!(
+                "{reported}:3:5: runtime error: shift exponent 40 is too large for 32-bit type 'int'\n    \
+                 #0 0x1 in copy_at {frame_file}:3:5\n\n\
+                 SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent {reported}:3:5 \n"
+            );
+            let report = crate::sanitizer::parse_sanitizer_report(&stderr).unwrap();
+            (
+                super::sanitizer_signature(&report),
+                super::sanitizer_dedupe_key(&report),
+            )
+        };
+        let bare_a = with_frame("util.c", "/w/src/a/util.c");
+        let bare_b = with_frame("util.c", "/w/src/b/util.c");
+        assert_ne!(bare_a.0, bare_b.0);
+        assert_ne!(bare_a.1, bare_b.1);
+        assert_eq!(bare_a, with_frame("/w/src/a/util.c", "/w/src/a/util.c"));
+    }
+
+    /// The per-run dedupe key rebuilt from a written finding is exactly the key
+    /// the fuzz loop computes for the report, so a later pass that re-seeds its
+    /// dedup set from disk recognizes the same crash and only that crash.
+    #[test]
+    fn run_dedupe_key_of_the_record_matches_the_reports_runtime_key() {
+        let root = temp_dir("dedupe-roundtrip");
+        for stderr in [
+            frameless_missing_return("/src/widget/a.c", 3),
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+             READ of size 1 at 0x1 thread T0\n    #0 0x1 in copy_at /src/widget/copy.c:9:41\n"
+                .to_owned(),
+            "==1==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x1 bp 0x2 sp 0x3 T0)\n"
+                .to_owned(),
+        ] {
+            let report = crate::sanitizer::parse_sanitizer_report(&stderr).unwrap();
+            let record = emit_parsed(&root, &stderr);
+            // The fuzz loop keys a crash in the scope of the harness that
+            // found it, as the emitter does.
+            assert_eq!(
+                super::run_dedupe_key(&record),
+                Some(super::RunDedupeKey::Cluster(
+                    super::sanitizer_dedupe_key_scoped(&report, "H-C0001")
+                )),
+                "{stderr}"
+            );
+        }
+    }
+
+    /// A crash with no frames and no source position (a fatal signal without a
+    /// sanitizer report) is grouped per harness: two harnesses' crashes are two
+    /// root-cause groups, and a later pass of the same harness keys it the way
+    /// the fuzz loop does. The faulting pc offset the driver printed is
+    /// recorded and separates two crash sites of one harness.
+    #[test]
+    fn frameless_crashes_are_grouped_per_harness_and_per_pc() {
+        let root = temp_dir("frameless-scope");
+        let signal = |pc_offset: Option<u64>| crate::sanitizer::SanitizerReport {
+            sanitizer: None,
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            pc_offset,
+            ..Default::default()
+        };
+        let emit = |harness_id: &str, report: &crate::sanitizer::SanitizerReport| {
+            let emitter = FindingEmitter::with_metadata(
+                root.clone(),
+                harness_id.to_owned(),
+                "c".to_owned(),
+                format!("harnesses/{harness_id}/main"),
+            );
+            let id = emitter.emit_sanitizer_crash(b"x", report).unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(
+                &fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+            )
+            .unwrap();
+            raw
+        };
+        let parse = emit("H-PARSE", &signal(None));
+        let copy = emit("H-COPY", &signal(None));
+        assert_ne!(parse["cluster_key_full"], copy["cluster_key_full"]);
+        assert_eq!(parse["cluster_fallback"], true);
+        assert_eq!(
+            super::run_dedupe_key(&parse),
+            Some(super::RunDedupeKey::Cluster(
+                super::sanitizer_dedupe_key_scoped(&signal(None), "H-PARSE")
+            ))
+        );
+        let mut abort = signal(None);
+        abort.check = Some("SIGABRT".to_owned());
+        assert_eq!(emit("H-PARSE", &abort)["exception"]["signal"], "SIGABRT");
+        assert!(parse["exception"].get("signal").is_none());
+        let at = |pc| emit("H-PARSE", &signal(Some(pc)));
+        let (a, b) = (at(0x1b3c), at(0x2a10));
+        assert_eq!(a["exception"]["pc_offset"], "0x1b3c");
+        assert_ne!(a["cluster_key_full"], b["cluster_key_full"]);
+        assert_ne!(a["signature"], b["signature"]);
+        assert_ne!(a["cluster_key_full"], parse["cluster_key_full"]);
+    }
+
+    /// Only the crash stack identifies a crash: the allocation and free stacks
+    /// are evidence about the object, recorded separately and not hashed.
+    #[test]
+    fn allocation_and_free_frames_do_not_change_the_signature() {
+        let root = temp_dir("alloc-not-hashed");
+        let uaf = |freer: &str| {
+            format!(
+                "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x504000000054\n\
+                 READ of size 4 at 0x504000000054 thread T0\n    \
+                 #0 0x1 in Widget::parse_record() /src/widget/parser.cc:11:50\n\n\
+                 0x504000000054 is located 4 bytes inside of 40-byte region [0x504000000050,0x504000000078)\n\
+                 freed by thread T0 here:\n    #0 0x2 in free (/bin/h+0x2)\n    \
+                 #1 0x3 in {freer} /src/widget/parser.cc:30:3\n\n\
+                 previously allocated by thread T0 here:\n    #0 0x4 in malloc (/bin/h+0x4)\n    \
+                 #1 0x5 in Widget::Widget() /src/widget/parser.cc:22:14\n"
+            )
+        };
+        let a = emit_parsed(&root, &uaf("Widget::reset()"));
+        let b = emit_parsed(&root, &uaf("Widget::clear()"));
+        assert_eq!(a["signature"], b["signature"]);
+        let names = |v: &serde_json::Value, path: &str| -> Vec<String> {
+            v.pointer(path)
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|f| f["function"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(&a, "/exception/stack"),
+            vec!["Widget::parse_record()"]
+        );
+        assert_eq!(
+            names(&a, "/exception/access/free_stack"),
+            vec!["free", "Widget::reset()"]
+        );
+        assert_eq!(
+            names(&a, "/exception/access/alloc_stack"),
+            vec!["malloc", "Widget::Widget()"]
+        );
+    }
+
+    #[test]
+    fn finding_record_carries_structured_access_location_and_check() {
+        let root = temp_dir("structured-access");
+        let heap = emit_parsed(
+            &root,
+            "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000015 at pc 0x5 bp 0x6 sp 0x7\n\
+             READ of size 4 at 0x502000000015 thread T0\n    \
+             #0 0x1 in copy_at /src/widget/copy.c:9:41\n\n\
+             0x502000000015 is located 0 bytes after 1-byte region [0x502000000014,0x502000000015)\n\
+             allocated by thread T0 here:\n    #0 0x2 in malloc (/bin/h+0x2)\n    \
+             #1 0x3 in bhf_c_string /work/harnesses/H-1/bhf_decode.h:195:23\n\n\
+             SUMMARY: AddressSanitizer: heap-buffer-overflow /src/widget/copy.c:9:41 in copy_at\n",
+        );
+        let access = &heap["exception"]["access"];
+        assert_eq!(access["direction"], "read");
+        assert_eq!(access["size"], 4);
+        assert_eq!(access["region"]["kind"], "heap");
+        assert_eq!(access["region"]["size"], 1);
+        assert_eq!(access["region"]["offset"], 1);
+        assert_eq!(access["region"]["relation"], "after");
+        assert_eq!(access["alloc_stack"][1]["function"], "bhf_c_string");
+        assert_eq!(heap["exception"]["location"]["line"], 9);
+
+        let ub = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 3));
+        assert_eq!(ub["exception"]["check"], "missing-return");
+        assert_eq!(ub["exception"]["location"]["file"], "/src/widget/a.c");
+        assert_eq!(ub["exception"]["location"]["column"], 5);
+        assert!(ub["exception"].get("access").is_none());
     }
 }

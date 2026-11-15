@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* generated_harnesses/{{ harness_id }}/main.c */
+/* bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %} */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -24,6 +25,8 @@
 #ifdef getenv
 #undef getenv
 #endif
+/* BHF_TRACE_ARGS=1 prints each decoded argument to stderr (bhf_trace.h). */
+#include "bhf_trace.h"
 
 /* Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
  * must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
@@ -32,7 +35,16 @@
 #ifndef BHF_NOCOV
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(BHF_WINDOWS_CRT)
+/* On Windows AddressSanitizer's interceptors call the comparison hooks
+ * below before the program starts, while its shadow memory is still being
+ * set up, so an instrumented hook faulted there and the process died before
+ * main (a clean input exited with an access violation). They are not
+ * address-checked: they read only the bytes the compare read. */
+#define BHF_NOCOV __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOCOV __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)
@@ -159,6 +171,9 @@ static BHF_NOCOV void _bhf_callback_observe(void *context) {
 {%- endif %}
 
 {%- if emit_forward_declaration %}
+{%- for tag in forward_tags %}
+{{ tag }};
+{%- endfor %}
 {%- if init_step %}
 extern {{ init_step.return_type }} {{ init_step.name }}({% if not handle_is_pointer_value %}{{ handle_param_type }}{% if init_step.params | length > 0 %}, {% endif %}{% endif %}{% for p in init_step.params %}{{ p.c_type }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- endif %}
@@ -187,7 +202,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
  * fuzz-driven mode can route the current iteration's bytes into fake fds /
  * socket peers / dlopen stubs. Windows has no preload shim and must not emit a
  * COFF weak reference: multiple weak defaults conflict under link.exe. */
-#if defined(_WIN32)
+#if defined(BHF_WINDOWS_CRT)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));
@@ -311,8 +326,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if init_out_handle %}
     {{ init_step.return_type }} {{ init_step.result_name }} = {{ init_step.name }}({% for p in init_step.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- elif not init_returns_handle %}
-{%- for p in init_step.params %}
-    {{ p.decl }};
+{%- for d in init_step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if init_step.return_type_present %}{{ init_step.return_type }} {{ init_step.result_name }} = {% endif %}{{ init_step.name }}(&_bhf_handle{% for p in init_step.params %}, {{ p.arg }}{% endfor %});
 {%- else %}
@@ -323,6 +338,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     BHF_KEEP_RESULT({{ init_step.result_name }});
 {%- endif %}
 {%- endif %}
+{%- for d in init_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in init_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -348,8 +366,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * program only performs this by luck, and without it a reader supports no
      * formats and a parser has no handlers installed — so most executions never
      * reach the code the target exists to run. */
-{%- for p in step.params %}
-    {{ p.decl }};
+{%- for d in step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if step.return_type_present %}{{ step.return_type }} {{ step.result_name }} = {% endif %}{{ step.name }}({{ step.receiver }}{% for p in step.params %}, {% if step.callback_context_arg == loop.index0 %}{{ step.receiver }}{% else %}{{ p.arg }}{% endif %}{% endfor %});
 {%- if step.return_type_present %}
@@ -363,12 +381,15 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * reaches the format, filter, decompression, and payload paths. A random op
      * permutation almost never preserves those dependencies. */
     int _bhf_handle_live = 1;
-{%- for p in expert_stream_pump.open_step.params %}
-    {{ p.decl }};
+{%- for d in expert_stream_pump.open_step.decode %}
+    {{ d }};
 {%- endfor %}
     BHF_TARGET_ENTER();
     {{ expert_stream_pump.open_step.return_type }} {{ expert_stream_pump.open_step.result_name }} = {{ expert_stream_pump.open_step.name }}({{ expert_stream_pump.open_step.receiver }}{% for p in expert_stream_pump.open_step.params %}, {{ p.arg }}{% endfor %});
     BHF_KEEP_RESULT({{ expert_stream_pump.open_step.result_name }});
+{%- for d in expert_stream_pump.open_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in expert_stream_pump.open_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -388,11 +409,14 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endif %}
         unsigned char {{ expert_stream_pump.data_buffer_name }}[{{ expert_stream_pump.data_buffer_bytes }}];
         for (size_t _bhf_entry_index = 0; _bhf_entry_index < {{ expert_stream_pump.entry_cap }}; ++_bhf_entry_index) {
-{%- for p in expert_stream_pump.header_step.params %}
-            {{ p.decl }};
+{%- for d in expert_stream_pump.header_step.decode %}
+            {{ d }};
 {%- endfor %}
             {{ expert_stream_pump.header_step.return_type }} {{ expert_stream_pump.header_step.result_name }} = {{ expert_stream_pump.header_step.name }}({{ expert_stream_pump.header_step.receiver }}{% for p in expert_stream_pump.header_step.params %}, {{ p.arg }}{% endfor %});
             BHF_KEEP_RESULT({{ expert_stream_pump.header_step.result_name }});
+{%- for d in expert_stream_pump.header_step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in expert_stream_pump.header_step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -439,13 +463,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * and the bounded loop drains more than the first parser event. */
     int _bhf_handle_live = 1;
     for (size_t _bhf_drain_index = 0; _bhf_drain_index < {{ expert_output_drain.iteration_cap }}; ++_bhf_drain_index) {
-{%- for p in expert_output_drain.target_step.params %}
-        {{ p.decl }};
+{%- for d in expert_output_drain.target_step.decode %}
+        {{ d }};
 {%- endfor %}
         BHF_TARGET_ENTER();
         {{ expert_output_drain.target_step.return_type }} {{ expert_output_drain.target_step.result_name }} = {{ expert_output_drain.target_step.name }}({{ expert_output_drain.target_step.receiver }}{% for p in expert_output_drain.target_step.params %}, {{ p.arg }}{% endfor %});
         BHF_KEEP_RESULT({{ expert_output_drain.target_step.result_name }});
         if ({{ expert_output_drain.target_step.result_name }} {% if expert_output_drain.success_nonzero %}== 0{% else %}!= 0{% endif %}) {
+{%- for d in expert_output_drain.target_step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in expert_output_drain.target_step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -455,6 +482,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
         }
         int _bhf_drain_done = {{ expert_output_drain.output_value }}.{{ expert_output_drain.terminal_field }} == {{ expert_output_drain.terminal_value }};
         {{ expert_output_drain.cleanup_name }}({{ expert_output_drain.output_pointer }});
+{%- for d in expert_output_drain.target_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in expert_output_drain.target_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -469,10 +499,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * literals remain intact: for streaming parsers, feed(..., 0) followed by
      * feed(..., 1) is a state transition, not a duplicate operation. */
 {%- for step in mined_protocol_steps %}
-{%- for p in step.params %}
-{%- if p.decl %}
-    {{ p.decl }};
-{%- endif %}
+{%- for d in step.decode %}
+    {{ d }};
 {%- endfor %}
 {%- if step.condition and step.return_type_present %}
     {{ step.return_type }} {{ step.result_name }} = {0};
@@ -490,6 +518,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if step.condition %}
     }
 {%- endif %}
+{%- for d in step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -514,10 +545,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * constructor and every argument were checked against the discovered API;
      * drive the resulting independent/derived object through the same expert
      * protocol, then release it before continuing with the primary handle. */
-{%- for p in object.constructor.params %}
-{%- if p.decl %}
-    {{ p.decl }};
-{%- endif %}
+{%- for d in object.constructor.decode %}
+    {{ d }};
 {%- endfor %}
     {{ object.constructor.return_type }} {{ object.handle_name }} = {{ object.constructor.name }}({% if object.constructor_uses_parent %}{{ object.constructor.receiver }}{% if object.constructor.params | length > 0 %}, {% endif %}{% endif %}{% for p in object.constructor.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
     if ({{ object.handle_name }}) {
@@ -525,10 +554,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
         {{ step.name }}({{ object.handle_name }}{% for p in step.params %}, {% if step.callback_context_arg == loop.index0 %}{{ object.handle_name }}{% else %}{{ p.arg }}{% endif %}{% endfor %});
 {%- endfor %}
 {%- for step in object.protocol_steps %}
-{%- for p in step.params %}
-{%- if p.decl %}
-        {{ p.decl }};
-{%- endif %}
+{%- for d in step.decode %}
+        {{ d }};
 {%- endfor %}
 {%- if step.condition and step.return_type_present %}
         {{ step.return_type }} {{ step.result_name }} = {0};
@@ -546,6 +573,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if step.condition %}
         }
 {%- endif %}
+{%- for d in step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -553,15 +583,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endfor %}
 {%- endfor %}
 {%- if object.end_step %}
-{%- for p in object.end_step.params %}
-{%- if p.decl %}
-        {{ p.decl }};
-{%- endif %}
+{%- for d in object.end_step.decode %}
+        {{ d }};
 {%- endfor %}
         {% if object.end_step.return_type_present %}{{ object.end_step.return_type }} {{ object.end_step.result_name }} = {% endif %}{{ object.end_step.name }}({{ object.end_step.receiver }}{% for p in object.end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if object.end_step.return_type_present %}
         BHF_KEEP_RESULT({{ object.end_step.result_name }});
 {%- endif %}
+{%- for d in object.end_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in object.end_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -569,6 +600,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endfor %}
 {%- endif %}
     }
+{%- for d in object.constructor.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in object.constructor.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -653,8 +687,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
              * It must be torn down before another child is created. */
             if (_bhf_derived_live) { break; }
 {%- endif %}
-{%- for p in step.params %}
-            {{ p.decl }};
+{%- for d in step.decode %}
+            {{ d }};
 {%- endfor %}
 {%- if loop.first %}
             BHF_TARGET_ENTER();
@@ -696,6 +730,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
             _bhf_handle_live = 1;
 {%- endif %}
 {%- endif %}
+{%- for d in step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -721,13 +758,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * Leaving it would be a leak the HARNESS caused, and under LeakSanitizer
      * that reads as a finding in the target. */
     if (_bhf_derived_live) {
-{%- for p in end_step.params %}
-        {{ p.decl }};
+{%- for d in end_step.decode %}
+        {{ d }};
 {%- endfor %}
         {% if end_step.return_type_present %}{{ end_step.return_type }} _bhf_derived_end = {% endif %}{{ end_step.name }}(_bhf_derived{% for p in end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if end_step.return_type_present %}
         BHF_KEEP_RESULT(_bhf_derived_end);
 {%- endif %}
+{%- for d in end_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in end_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -740,13 +780,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * the loop above may already have released it, and closing twice is a
      * double-free the harness would be committing itself. */
     if (_bhf_handle_live) {
-{%- for p in end_step.params %}
-    {{ p.decl }};
+{%- for d in end_step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if end_step.return_type_present %}{{ end_step.return_type }} {{ end_step.result_name }} = {% endif %}{{ end_step.name }}({% if handle_is_pointer_value %}_bhf_handle{% else %}&_bhf_handle{% endif %}{% for p in end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if end_step.return_type_present %}
     BHF_KEEP_RESULT({{ end_step.result_name }});
 {%- endif %}
+{%- for d in end_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in end_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -786,9 +829,14 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 
 __AFL_FUZZ_INIT();
 
+/* AFL++ hands every input in one testcase buffer of its largest input size
+ * (MAX_FILE, 1 MiB by default): its shared memory under afl-fuzz, or the
+ * stand-in below when the lane runs on its own. */
+#define BHF_AFL_BUF_CAP ((size_t)1024 * 1024)
+
 #ifndef __AFL_FUZZ_TESTCASE_BUF
 #define __AFL_FUZZ_TESTCASE_BUF bhf_afl_buf
-static uint8_t bhf_afl_buf[1024 * 1024];
+static uint8_t bhf_afl_buf[BHF_AFL_BUF_CAP];
 #endif
 
 #ifndef __AFL_FUZZ_TESTCASE_LEN
@@ -817,6 +865,23 @@ static int bhf_afl_loop_remaining = 1;
 #define __AFL_INIT()
 #endif
 
+/* Under AddressSanitizer the bytes of the testcase buffer past the input are
+ * poisoned while the target runs, so a read one past a buffer that views the
+ * input is reported (as use-after-poison), as it is in the lanes that pass
+ * each input in a heap allocation of exactly its size. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define BHF_AFL_POISON_TAIL 1
+#endif
+#endif
+#if !defined(BHF_AFL_POISON_TAIL) && defined(__SANITIZE_ADDRESS__)
+#define BHF_AFL_POISON_TAIL 1
+#endif
+#if defined(BHF_AFL_POISON_TAIL)
+void __asan_poison_memory_region(void const volatile *addr, size_t size);
+void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
+#endif
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -824,8 +889,19 @@ int main(int argc, char **argv) {
     __AFL_INIT();
 #endif
     uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
+#if defined(BHF_AFL_POISON_TAIL)
+    size_t poisoned_from = BHF_AFL_BUF_CAP;
+#endif
     while (__AFL_LOOP(10000)) {
+#if defined(BHF_AFL_POISON_TAIL)
+        /* The next input is written into the whole buffer. */
+        __asan_unpoison_memory_region(buf + poisoned_from, BHF_AFL_BUF_CAP - poisoned_from);
+#endif
         size_t len = (size_t)__AFL_FUZZ_TESTCASE_LEN;
+#if defined(BHF_AFL_POISON_TAIL)
+        poisoned_from = len < BHF_AFL_BUF_CAP ? len : BHF_AFL_BUF_CAP;
+        __asan_poison_memory_region(buf + poisoned_from, BHF_AFL_BUF_CAP - poisoned_from);
+#endif
         bhf_run_one(buf, len);
     }
     return 0;
@@ -840,7 +916,7 @@ int main(int argc, char **argv) {
  * `-fsanitize-coverage=trace-pc-guard`. A crash still surfaces: ASan aborts the
  * process, the parent sees the closed pipe and re-isolates that input via a
  * fresh per-spawn run (argv path below). */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -873,7 +949,7 @@ int main(int argc, char **argv) {
  * MapViewOfFile, which writes through to the backing file so the engine reads the
  * same bytes (under wine the host sees the same file). */
 BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -897,12 +973,20 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 #endif
 }
 
-#ifdef _WIN32
-/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
- * immediate, distinctive exit so the engine detects a crash under wine instead
- * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+#ifdef BHF_WINDOWS_CRT
+/* Report only unhandled exceptions. First-chance exceptions can be handled by
+ * the target or by ASan (including its shadow-memory allocation), so treating
+ * them as crashes makes a valid sanitized harness reject every input. Chain
+ * the previous unhandled filter so ASan retains its diagnostics, then provide
+ * a distinctive exit instead of a debugger dialog for unsanitized builds
+ * (mingw under wine has no ASan; this is its crash signal). */
 #define BHF_WIN_CRASH_EXIT 0x39
-BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+static LPTOP_LEVEL_EXCEPTION_FILTER bhf_win_previous_filter;
+BHF_NOCOV static LONG WINAPI bhf_win_unhandled(EXCEPTION_POINTERS *info) {
+    if (bhf_win_previous_filter) {
+        LONG handled = bhf_win_previous_filter(info);
+        if (handled == EXCEPTION_CONTINUE_EXECUTION) return handled;
+    }
     DWORD code = info->ExceptionRecord->ExceptionCode;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -914,13 +998,13 @@ BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
         fflush(stderr);
         TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; /* unreachable */
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
 }
 BHF_NOCOV static void bhf_win_install_crash_handler(void) {
-    AddVectoredExceptionHandler(1, bhf_win_veh);
+    bhf_win_previous_filter = SetUnhandledExceptionFilter(bhf_win_unhandled);
 }
 #endif
 
@@ -1124,7 +1208,7 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
         bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
 }
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
 /* mingw-w64 gcc has no `trace-pc-guard`; the Windows build instruments with
  * `-fsanitize-coverage=trace-pc`, which calls this guard-less hook at each edge.
  * Hash the return address into the SAME bitmap the guard path fills so the
@@ -1151,7 +1235,10 @@ BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_cmp_
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
-BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
+/* gcc declares this builtin with a void* operand under ASan or
+ * SanitizerCoverage (a mismatch only warns in C, unless -Werror). */
+BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, void *cases_v) {
+    const uint64_t *cases = cases_v;
     uint64_t n = cases[0];
     unsigned width = (unsigned)(cases[1] / 8);
     uint64_t i;
@@ -1187,12 +1274,13 @@ static void bhf_run_file(const char *path) {
     long n = ftell(f);
     if (n < 0) n = 0;
     rewind(f);
-    /* +1 + NUL: a C-string-API harness (`(const char *)Data`) must not strlen
-     * past an exact-size replay buffer. */
-    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1) + 1);
+    /* Pass the input in a heap allocation of exactly its size, as libFuzzer
+     * passes it and as the framed loop does, so a read one past a buffer that
+     * views the input is reported on replay too. An empty input gets one byte
+     * (ASan's malloc(0) is one addressable byte as well). */
+    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1));
     if (!b) { fclose(f); return; }
     size_t r = fread(b, 1, (size_t)n, f);
-    b[r] = 0;
     fclose(f);
     bhf_run_one(b, r);
     free(b);
@@ -1211,7 +1299,7 @@ int main(int argc, char **argv) {
     /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
      * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
      * per input. */
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
     /* Install the crash handler before any target code runs so a fault in either
      * the framed loop or the argv re-isolation path becomes a detectable exit. */
     bhf_win_install_crash_handler();
@@ -1227,7 +1315,7 @@ int main(int argc, char **argv) {
         int bhf_devnull;
         unsigned char ready = 1;
         if (bhf_ctrl_fd < 0) return 1;
-#ifdef _WIN32
+#ifdef BHF_WINDOWS_CRT
         /* trace-pc has no guard-init to open the maps, so open them here; set
          * stdin + the control fd to binary so the framed {u32 len, bytes}
          * protocol is not CRLF/EOF-translated by the CRT. */
@@ -1245,20 +1333,22 @@ int main(int argc, char **argv) {
         }
         if (bhf_write(bhf_ctrl_fd, &ready, 1) != 1) return 1;
         size_t cap = 1u << 20;
-        /* +1 so the input is always NUL-terminable for C-string-API harnesses. */
-        uint8_t *buf = (uint8_t *)malloc(cap + 1);
-        if (!buf) return 1;
         for (;;) {
             uint32_t len;
             if (!bhf_read_n(0, &len, 4)) break;
             if ((size_t)len > cap) len = (uint32_t)cap;
-            if (len && !bhf_read_n(0, buf, len)) break;
-            buf[len] = 0;
-            bhf_run_one(buf, len);
+            /* Each input in a heap allocation of exactly its size, read straight
+             * into it, as libFuzzer passes it and as a file replay does: a read
+             * one past a buffer that views the input is reported here too. An
+             * empty input gets one byte (ASan's malloc(0) is one as well). */
+            uint8_t *input = (uint8_t *)malloc(len ? (size_t)len : 1);
+            if (!input) return 1;
+            if (len && !bhf_read_n(0, input, len)) { free(input); break; }
+            bhf_run_one(input, len);
+            free(input);
             unsigned char sync = 1;
             if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;
         }
-        free(buf);
         return 0;
     }
     if (argc < 2) return 0;

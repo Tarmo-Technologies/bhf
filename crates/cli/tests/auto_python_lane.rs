@@ -19,13 +19,9 @@ fn fixture() -> PathBuf {
         .expect("canonicalize python_lane fixture")
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn have_python() -> bool {

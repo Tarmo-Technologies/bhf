@@ -965,15 +965,29 @@ fn sarif_artifact_location(path: &str, root: Option<&Path>) -> Value {
     }
 }
 
-/// Render an absolute filesystem path as a `file://` URI. Anything already
-/// carrying a scheme (or not absolute) is returned unchanged.
+/// Render an absolute filesystem path as a `file://` URI (RFC 8089):
+/// `/abs` is `file:///abs`, a Windows drive path `C:\dir` is
+/// `file:///C:/dir` and a UNC path `\\server\share` is
+/// `file://server/share`, without the `\\?\` verbatim prefix. Paths that
+/// already carry a scheme, or are not absolute, are returned unchanged.
 fn file_uri(path: &str) -> String {
     if path.contains("://") {
-        path.to_owned()
-    } else if let Some(rest) = path.strip_prefix('/') {
-        format!("file:///{rest}")
-    } else {
-        path.to_owned()
+        return path.to_owned();
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        return format!("file:///{rest}");
+    }
+    let windows = match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    }
+    .replace('\\', "/");
+    if let Some(share) = windows.strip_prefix("//") {
+        return format!("file://{share}");
+    }
+    match windows.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => format!("file:///{windows}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -985,10 +999,10 @@ static MEMORY_SKIPPED_FILES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// A single source file larger than this is skipped before it is read (recorded
-/// as a gap). The default is 1/64 of the scan's dynamic memory ceiling, clamped
-/// to 16..256 MiB; this admits large generated translation units on a capable
-/// host without letting one parser allocation consume a constrained machine.
-/// `BHF_MAX_FILE_BYTES` is an exact override.
+/// as a gap). The default follows the memory ceiling the watchdog enforces
+/// ([`file_cap_bytes`]); this admits large generated translation units on a
+/// capable host without letting one parser allocation consume a constrained
+/// machine. `BHF_MAX_FILE_BYTES` is an exact override.
 fn max_file_bytes() -> u64 {
     if let Some(configured) = std::env::var("BHF_MAX_FILE_BYTES")
         .ok()
@@ -997,14 +1011,19 @@ fn max_file_bytes() -> u64 {
     {
         return configured;
     }
-    #[cfg(target_os = "linux")]
-    if let Some(ceiling_kb) = memory_ceiling_kb() {
-        return ceiling_kb
+    file_cap_bytes(enforced_ceiling_kb())
+}
+
+/// The per-file size cap for an enforced memory ceiling of `ceiling_kb`: 1/64
+/// of it, clamped to 16..256 MiB, and 64 MiB where no ceiling is enforced.
+fn file_cap_bytes(ceiling_kb: Option<u64>) -> u64 {
+    match ceiling_kb {
+        Some(ceiling_kb) => ceiling_kb
             .saturating_mul(1024)
             .saturating_div(64)
-            .clamp(16 * 1024 * 1024, 256 * 1024 * 1024);
+            .clamp(16 * 1024 * 1024, 256 * 1024 * 1024),
+        None => 64 * 1024 * 1024,
     }
-    64 * 1024 * 1024
 }
 
 /// SLOC counting does not build AST/function models, so it can safely admit
@@ -1059,15 +1078,127 @@ fn proc_kb(file: &str, key: &str) -> Option<u64> {
     None
 }
 
-/// The RSS ceiling in kB: `BHF_MAX_MEMORY_KB`, else 80% of `MemAvailable`, so
-/// the scan degrades gracefully (skips remaining files) well before an OOM kill.
-#[cfg(target_os = "linux")]
+/// The RSS ceiling in kB: `BHF_MAX_MEMORY_KB`, else the host's default (see
+/// [`default_memory_ceiling_kb`]), so the scan degrades gracefully (skips
+/// remaining files) well before an OOM kill.
 fn memory_ceiling_kb() -> Option<u64> {
     if let Ok(v) = std::env::var("BHF_MAX_MEMORY_KB") {
         if let Some(kb) = v.parse::<u64>().ok().filter(|kb| *kb > 0) {
             return Some(kb);
         }
     }
+    default_memory_ceiling_kb()
+}
+
+/// The memory ceiling the watchdog enforces: [`memory_ceiling_kb`] where
+/// resident memory can be measured (Linux, Windows), else `None`, so neither
+/// `BHF_MAX_MEMORY_KB` nor a default sizes anything where no watchdog runs.
+fn enforced_ceiling_kb() -> Option<u64> {
+    resident_kb().and(memory_ceiling_kb())
+}
+
+/// This process's resident memory in kB: `VmRSS` on Linux, the working set
+/// on Windows. `None` elsewhere, where the watchdog does not run.
+fn resident_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_kb("/proc/self/status", "VmRSS:")
+    }
+    #[cfg(windows)]
+    {
+        win_memory::working_set_kb()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+/// 80% of the physical memory Windows reports available.
+#[cfg(windows)]
+fn default_memory_ceiling_kb() -> Option<u64> {
+    win_memory::available_physical_kb().map(|avail| avail / 5 * 4)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn default_memory_ceiling_kb() -> Option<u64> {
+    None
+}
+
+/// Minimal `kernel32` FFI for the memory watchdog on native Windows, without
+/// an external crate: the process's working set (its resident memory) and
+/// the physical memory available.
+#[cfg(windows)]
+mod win_memory {
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+        fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+    }
+
+    /// The current process's working set in kB.
+    pub(super) fn working_set_kb() -> Option<u64> {
+        let mut counters = ProcessMemoryCounters {
+            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the pseudo-handle of the current process needs no closing,
+        // and `counters` is a writable PROCESS_MEMORY_COUNTERS of `cb` bytes.
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        (ok != 0).then_some(counters.working_set_size as u64 / 1024)
+    }
+
+    /// The physical memory available to processes, in kB. A 32-bit process
+    /// is also bounded by its address space (`ullAvailVirtual`), which this
+    /// leaves out: bhf is built for 64-bit Windows only.
+    pub(super) fn available_physical_kb() -> Option<u64> {
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `status` is a writable MEMORYSTATUSEX whose `dwLength` is set.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some(status.avail_phys / 1024)
+    }
+}
+
+/// 80% of `MemAvailable`, and at most 70% of this process's cgroup limit.
+#[cfg(target_os = "linux")]
+fn default_memory_ceiling_kb() -> Option<u64> {
     let host_ceiling = proc_kb("/proc/meminfo", "MemAvailable:").map(|avail| avail / 5 * 4);
     // `/proc/meminfo` describes the host on many containerized CI systems, not
     // this process's cgroup. Respect both cgroup v2 and legacy v1 limits and keep
@@ -1097,7 +1228,8 @@ fn cgroup_memory_limit_kb() -> Option<u64> {
 
 /// Spawn a background watchdog that samples this process's RSS ~2/s and raises
 /// [`MEMORY_PRESSURE`] when it crosses the ceiling. Returns a stop-flag to end the
-/// thread. No-op on non-Linux (no procfs) — the file-size cap still applies there.
+/// thread. No-op where resident memory cannot be measured (other than Linux and
+/// Windows) — the file-size cap still applies there.
 struct MemoryWatchdog {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -1127,22 +1259,18 @@ pub struct MemoryGuard {
 
 impl MemoryGuard {
     /// Start sampling this process's RSS against the same ceiling the static
-    /// scan uses (`BHF_MAX_MEMORY_KB`, else 80% of `MemAvailable` and 70% of
-    /// any cgroup limit, whichever is lower).
+    /// scan uses (`BHF_MAX_MEMORY_KB`, else on Linux 80% of `MemAvailable` and
+    /// 70% of any cgroup limit, whichever is lower, and on Windows 80% of the
+    /// available physical memory).
     pub fn start() -> Self {
         let watchdog = spawn_memory_watchdog();
         // Sample once synchronously. The background thread samples every 500ms,
         // which is fine for a long scan but leaves a window in which a walk that
         // is ALREADY over the ceiling at startup runs unguarded. Only tightens
         // the guard — it can never clear pressure.
-        #[cfg(target_os = "linux")]
-        {
-            if let (Some(rss), Some(ceiling)) =
-                (proc_kb("/proc/self/status", "VmRSS:"), memory_ceiling_kb())
-            {
-                if rss >= ceiling {
-                    MEMORY_PRESSURE.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+        if let (Some(rss), Some(ceiling)) = (resident_kb(), memory_ceiling_kb()) {
+            if rss >= ceiling {
+                MEMORY_PRESSURE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Self {
@@ -1158,16 +1286,10 @@ impl MemoryGuard {
     }
 
     /// The configured ceiling in kB, for diagnostics. `None` when no ceiling
-    /// could be determined (non-Linux, or unreadable `/proc`).
+    /// could be determined, or where resident memory cannot be measured (the
+    /// watchdog runs on Linux and Windows).
     pub fn ceiling_kb() -> Option<u64> {
-        #[cfg(target_os = "linux")]
-        {
-            memory_ceiling_kb()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
+        enforced_ceiling_kb()
     }
 }
 
@@ -1203,23 +1325,21 @@ fn spawn_memory_watchdog() -> MemoryWatchdog {
     MEMORY_PRESSURE.store(false, Ordering::Relaxed);
     MEMORY_SKIPPED_FILES.store(0, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut handle = None;
-    #[cfg(target_os = "linux")]
-    {
-        let stop_thread = Arc::clone(&stop);
-        if let Some(ceiling) = memory_ceiling_kb() {
-            handle = Some(std::thread::spawn(move || {
-                while !stop_thread.load(Ordering::Relaxed) {
-                    if let Some(rss) = proc_kb("/proc/self/status", "VmRSS:") {
-                        if rss >= ceiling {
-                            MEMORY_PRESSURE.store(true, Ordering::Relaxed);
-                        }
+    // The watchdog runs where resident memory can be measured: `/proc` on
+    // Linux, the working set on Windows.
+    let stop_thread = Arc::clone(&stop);
+    let handle = enforced_ceiling_kb().map(|ceiling| {
+        std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                if let Some(rss) = resident_kb() {
+                    if rss >= ceiling {
+                        MEMORY_PRESSURE.store(true, Ordering::Relaxed);
                     }
-                    std::thread::park_timeout(std::time::Duration::from_millis(500));
                 }
-            }));
-        }
-    }
+                std::thread::park_timeout(std::time::Duration::from_millis(500));
+            }
+        })
+    });
     MemoryWatchdog { stop, handle }
 }
 
@@ -29857,6 +29977,52 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The memory watchdog measures resident memory on Linux and on Windows
+    /// (the working set), so a memory ceiling degrades discovery there instead
+    /// of being ignored: 128 MiB allocated and touched shows in it. The default
+    /// ceiling is a share of the memory the host has available.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn resident_memory_and_a_default_ceiling_are_measured() {
+        const MIB: usize = 1024 * 1024;
+        let before = resident_kb().expect("resident memory is measurable here");
+        let block = std::hint::black_box(vec![0x5a_u8; 128 * MIB]);
+        let after = resident_kb().expect("resident memory is measurable here");
+        assert!(
+            after >= before + 96 * 1024,
+            "resident memory went from {before} kB to {after} kB after 128 MiB was touched"
+        );
+        drop(block);
+        let ceiling = default_memory_ceiling_kb().expect("a default ceiling");
+        #[cfg(target_os = "linux")]
+        let available = proc_kb("/proc/meminfo", "MemAvailable:").unwrap();
+        #[cfg(windows)]
+        let available = win_memory::available_physical_kb().unwrap();
+        assert!(
+            ceiling > 0 && ceiling <= available,
+            "ceiling {ceiling} kB, available {available} kB"
+        );
+    }
+
+    /// The per-file size cap is 1/64 of the memory ceiling, clamped to
+    /// 16..256 MiB, where the watchdog enforces a ceiling, and a fixed 64 MiB
+    /// where none is (a host whose resident memory bhf cannot measure).
+    #[test]
+    fn the_file_size_cap_follows_an_enforced_ceiling_only() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(file_cap_bytes(None), 64 * MIB);
+        assert_eq!(file_cap_bytes(Some(100 * 1024)), 16 * MIB);
+        assert_eq!(file_cap_bytes(Some(4 * 1024 * 1024)), 64 * MIB);
+        assert_eq!(file_cap_bytes(Some(8 * 1024 * 1024)), 128 * MIB);
+        assert_eq!(file_cap_bytes(Some(64 * 1024 * 1024)), 256 * MIB);
+        assert_eq!(
+            enforced_ceiling_kb().is_some(),
+            resident_kb().is_some() && memory_ceiling_kb().is_some()
+        );
+        #[cfg(not(any(target_os = "linux", windows)))]
+        assert_eq!(enforced_ceiling_kb(), None);
+    }
+
     #[test]
     fn remediation_is_self_contained_for_fuzz_confirmation_rules() {
         for rule_id in [
@@ -39175,18 +39341,55 @@ mod tests {
         let base = sarif["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"]
             .as_str()
             .unwrap();
-        assert_eq!(base, format!("file://{}/", root.display()));
+        // A Windows drive path is `file:///C:/...`.
+        let shown = root.display().to_string();
+        let expected = if cfg!(windows) {
+            format!("file:///{}/", shown.replace('\\', "/"))
+        } else {
+            format!("file://{shown}/")
+        };
+        assert_eq!(base, expected);
         assert!(base.starts_with("file:///") && base.ends_with('/'));
+    }
+
+    /// `file://` URIs follow RFC 8089 for Windows paths too: a drive path
+    /// gains a third slash, `\` becomes `/`, a UNC path names its host, and
+    /// the `\\?\` verbatim prefix is dropped.
+    #[test]
+    fn file_uris_spell_windows_paths_with_forward_slashes() {
+        assert_eq!(file_uri("/abs/x.c"), "file:///abs/x.c");
+        assert_eq!(file_uri(r"C:\src\proj\x.c"), "file:///C:/src/proj/x.c");
+        assert_eq!(file_uri("C:/src/x.c"), "file:///C:/src/x.c");
+        assert_eq!(file_uri(r"\\?\C:\src\x.c"), "file:///C:/src/x.c");
+        assert_eq!(file_uri(r"\\server\share\x.c"), "file://server/share/x.c");
+        assert_eq!(
+            file_uri(r"\\?\UNC\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        // Relative and drive-relative paths are not URIs; they pass through.
+        assert_eq!(file_uri("src/x.c"), "src/x.c");
+        assert_eq!(file_uri("C:x.c"), "C:x.c");
+        assert_eq!(file_uri("file:///abs/x.c"), "file:///abs/x.c");
     }
 
     #[test]
     fn sarif_keeps_absolute_uri_for_path_outside_root() {
-        let outside =
-            sarif_artifact_location("/usr/include/stdio.h", Some(Path::new("/scan/root")));
-        assert_eq!(outside["uri"], "file:///usr/include/stdio.h");
+        // An absolute path carries a drive on Windows.
+        let drive = if cfg!(windows) { "C:" } else { "" };
+        let root = format!("{drive}/scan/root");
+        let outside = sarif_artifact_location(
+            &format!("{drive}/usr/include/stdio.h"),
+            Some(Path::new(&root)),
+        );
+        let expected = if cfg!(windows) {
+            "file:///C:/usr/include/stdio.h"
+        } else {
+            "file:///usr/include/stdio.h"
+        };
+        assert_eq!(outside["uri"], expected);
         assert!(outside.get("uriBaseId").is_none());
 
-        let under = sarif_artifact_location("/scan/root/src/p.c", Some(Path::new("/scan/root")));
+        let under = sarif_artifact_location(&format!("{root}/src/p.c"), Some(Path::new(&root)));
         assert_eq!(under["uri"], "src/p.c");
         assert_eq!(under["uriBaseId"], "SRCROOT");
     }

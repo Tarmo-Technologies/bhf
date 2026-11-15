@@ -23,6 +23,9 @@ fn fixture_dir() -> PathBuf {
 
 fn options(src_root: &std::path::Path) -> AttemptOptions {
     AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
+        winafl: Default::default(),
         project: None,
         decoder_limits: Default::default(),
         force: false,
@@ -100,6 +103,7 @@ fn calling_convention_macro_funcptr_field_builds() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

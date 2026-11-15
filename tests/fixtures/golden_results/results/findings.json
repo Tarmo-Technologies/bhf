@@ -54,13 +54,15 @@
         "score": 1.0
       },
       "cwe": [
-        122
+        122,
+        125
       ],
       "confirmation": {
         "level": "sanitizer_crash",
         "detail": null
       },
       "verdict": "likely_reachable",
+      "verdict_reason": null,
       "location": {
         "file": "src/parse.c",
         "line": 42,
@@ -123,8 +125,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "a36cb214534ea62f8ca91f0b0b08a02be791e6af8584e1b1e67a154e044a0b3c",
-            "size": 862
+            "sha256": "6c6eb4bcfe4520251efbe01ddffdfe0ad018248168ddf42f423c9840100f708f",
+            "size": 3385
           },
           {
             "role": "testcase",
@@ -155,7 +157,104 @@
         "classification": "unhandled",
         "harness_id": "H-C-parse",
         "dialect": "c11",
-        "oracle": null
+        "oracle": null,
+        "access": {
+          "direction": "read",
+          "size": 4,
+          "address_hint": null,
+          "region": {
+            "kind": "heap",
+            "size": 4,
+            "offset": 4,
+            "relation": "after",
+            "distance": 0,
+            "variable": null,
+            "frame_offset": null
+          },
+          "alloc_stack": [
+            {
+              "function": "parse_header",
+              "file": "src/parse.c",
+              "line": 38
+            }
+          ],
+          "free_stack": [],
+          "parameter": {
+            "name": "data",
+            "offset": 4,
+            "basis": "region_start"
+          },
+          "allocated_by_harness": false
+        },
+        "input_to_state": [
+          {
+            "offset": 0,
+            "len": 1,
+            "operand_hex": "41",
+            "compared_with_hex": "41",
+            "cmp_kind": "cmp",
+            "site": "0x1a2b",
+            "site_location": {
+              "file": "src/parse.c",
+              "line": 40,
+              "column": null,
+              "function": "parse_header"
+            },
+            "relation": "equal",
+            "operands_equal": true
+          }
+        ],
+        "input_to_state_input": "min_testcase.bin",
+        "input_to_state_status": "recorded",
+        "input_to_state_reason": null,
+        "input_to_state_search": {
+          "state": "done",
+          "searched_bytes": 1,
+          "input_len": 1
+        },
+        "arguments": [
+          {
+            "name": "flags",
+            "type": "uint32_t",
+            "value": "7",
+            "len": null,
+            "span": [
+              0,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          },
+          {
+            "name": "data",
+            "type": "const uint8_t *",
+            "value": null,
+            "len": 0,
+            "span": [
+              4,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          }
+        ],
+        "sanitizer_second_opinion": {
+          "check": "object-size",
+          "used": "asan",
+          "reason": "UBSan's object-size check reported this access before ASan; with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink"
+        },
+        "lineage": {
+          "origin": "mined_seed",
+          "root_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "root_path": "tests/data/header.bin",
+          "layout_prefix": null,
+          "depth": 2,
+          "parent_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "donor_sha256": null,
+          "reason": null
+        }
       },
       "static": null,
       "sca": null,
@@ -188,6 +287,7 @@
         "detail": null
       },
       "verdict": "unknown",
+      "verdict_reason": null,
       "location": null,
       "fix_location": null,
       "stack": [],
@@ -275,6 +375,7 @@
         "detail": "static"
       },
       "verdict": "unknown",
+      "verdict_reason": null,
       "location": {
         "file": "lib/parse.c",
         "line": 6,
@@ -355,6 +456,7 @@
         "detail": null
       },
       "verdict": null,
+      "verdict_reason": null,
       "location": null,
       "fix_location": null,
       "stack": [],
@@ -435,6 +537,7 @@
         "detail": null
       },
       "verdict": "likely_reachable",
+      "verdict_reason": null,
       "location": null,
       "fix_location": null,
       "stack": [],
@@ -496,7 +599,16 @@
         "classification": "unhandled",
         "harness_id": "H-C-parse",
         "dialect": null,
-        "oracle": null
+        "oracle": null,
+        "access": null,
+        "input_to_state": null,
+        "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
+        "arguments": null,
+        "sanitizer_second_opinion": null,
+        "lineage": null
       },
       "static": null,
       "sca": null,
@@ -529,6 +641,7 @@
         "detail": null
       },
       "verdict": null,
+      "verdict_reason": null,
       "location": {
         "file": "weak.c",
         "line": 9,
@@ -601,6 +714,7 @@
         "detail": null
       },
       "verdict": "unknown",
+      "verdict_reason": null,
       "location": null,
       "fix_location": null,
       "stack": [],
@@ -656,7 +770,16 @@
         "classification": "divergence",
         "harness_id": null,
         "dialect": null,
-        "oracle": null
+        "oracle": null,
+        "access": null,
+        "input_to_state": null,
+        "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
+        "arguments": null,
+        "sanitizer_second_opinion": null,
+        "lineage": null
       },
       "static": null,
       "sca": null,

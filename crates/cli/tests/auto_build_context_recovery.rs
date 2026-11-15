@@ -46,6 +46,9 @@ fn toolchains_ready(prefix: &str) -> bool {
 
 fn options(source_root: &Path) -> AttemptOptions {
     AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
+        winafl: Default::default(),
         project: None,
         decoder_limits: Default::default(),
         force: false,
@@ -169,6 +172,7 @@ fn undefined_external_links_recovered_static_library() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&tree).unwrap();
@@ -256,6 +260,7 @@ fn generated_export_header_resolves_from_probe_dir() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&tree).unwrap();

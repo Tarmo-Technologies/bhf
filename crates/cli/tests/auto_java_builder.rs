@@ -18,13 +18,9 @@ fn fixture() -> PathBuf {
         .expect("canonicalize java_builder fixture")
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 /// A usable JDK (`javac` + `java`) — the native Java lane needs it; with none it
@@ -35,6 +31,10 @@ fn has_jdk() -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn java_builder_only_class_synthesises_receiver_and_finds_crash() {
     let bin = bhf_bin();
     if !bin.exists() {

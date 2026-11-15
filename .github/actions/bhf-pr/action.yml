@@ -243,13 +243,14 @@ runs:
         fi
         # No ci-json means bhf produced no fuzz RESULT. That is only a real failure
         # when something actually broke: a harness failed to build/link/run, an
-        # internal panic/codegen-bug, or a confirmed finding. When every discovered
+        # internal panic/codegen-bug, a sanitizer runtime that cannot start on the
+        # runner, or a confirmed finding. When every discovered
         # target was simply not auto-harnessable (an unsupported parameter type, a
         # &self method with no no-arg constructor, ...) there was nothing to fuzz —
         # a bhf capability gap, NOT a defect in this PR — so pass with a notice
         # rather than a red check. run.json's summary is the structured signal.
         if [[ -f "$run_json" ]]; then
-          hard=$(jq -r '[.summary.failed_build, .summary.unrecoverable_link, .summary.unrecoverable_runtime, .summary.findings, .summary.built_and_fuzzed] | map(. // 0) | add' "$run_json" 2>/dev/null || echo 1)
+          hard=$(jq -r '[.summary.failed_build, .summary.unrecoverable_link, .summary.unrecoverable_runtime, .summary.sanitizer_runtime_unavailable, .summary.findings, .summary.built_and_fuzzed] | map(. // 0) | add' "$run_json" 2>/dev/null || echo 1)
           panics=$(jq -r '[.issues[]? | select(.category == "panic" or .category == "codegen-bug")] | length' "$bug_json" 2>/dev/null || echo 0)
           discovered=$(jq -r '.summary.discovered // 0' "$run_json" 2>/dev/null || echo 0)
           if [[ "$hard" == "0" && "$panics" == "0" ]]; then

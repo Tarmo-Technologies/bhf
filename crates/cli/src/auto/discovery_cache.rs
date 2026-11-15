@@ -31,8 +31,13 @@ const CACHE_VERSION: u32 = 3;
 
 /// Bump whenever discovery/ranking semantics change without an on-disk schema
 /// change. This deliberately invalidates an otherwise byte-identical source-tree
-/// cache produced by older target-selection logic.
-pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 1;
+/// cache produced by older target-selection logic. v2: the cached list keeps
+/// project fuzz drivers that library targets shadow, so an explicit selection
+/// can still pick one; `auto` drops the rest after its filters. v3: ranking
+/// and input reachability read parameter types through the file's typedefs.
+/// v4: pointer typedefs to bytes (`LPCBYTE`, `typedef const octet_t *rbuf_t`)
+/// are byte buffers, and each C/C++ candidate records its reachability basis.
+pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 4;
 
 /// Filename written under the work dir.
 pub const CACHE_FILENAME: &str = "discovery-cache.json";
@@ -73,6 +78,9 @@ pub struct CandidateDto {
     pub foreign_guard: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_reachability: Option<String>,
+    /// What `input_reachability` was inferred from (C/C++).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reachability_basis: Option<target_rank::ReachabilityBasis>,
     /// M22: detected source dialect tag (`lang_profile::Dialect::as_str`).
     /// `None` for lanes where dialect detection is not yet wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +170,7 @@ impl CandidateDto {
             is_static: c.is_static,
             foreign_guard: c.foreign_guard.clone(),
             input_reachability: c.input_reachability.map(|r| reach_to_str(r).to_owned()),
+            input_reachability_basis: c.input_reachability_basis.clone(),
             dialect: c.dialect.map(|d| d.as_str().to_owned()),
         }
     }
@@ -182,6 +191,7 @@ impl CandidateDto {
             // An unknown reachability tag degrades to `None` (unproven-ish) rather
             // than failing the whole load — it only affects honesty labelling.
             input_reachability: self.input_reachability.as_deref().and_then(reach_from_str),
+            input_reachability_basis: self.input_reachability_basis.clone(),
             // An unknown dialect tag degrades to `None` rather than failing the
             // whole load — it only affects profile selection / report labelling.
             dialect: self
@@ -343,6 +353,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: reach,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -413,6 +424,23 @@ mod tests {
         assert!(load_if_valid(&file, Path::new("/src"), "fp").is_none());
         assert!(miss_reason(&file, Path::new("/src"), "fp").contains("discovery semantics"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Candidates ranked before parameter types were read through the file's
+    /// typedefs (semantics v2) carry other scores and reachability verdicts,
+    /// so a build that cannot tell itself apart by commit must not reuse them.
+    #[test]
+    fn a_cache_ranked_without_typedef_resolution_is_not_reused() {
+        let dir = std::env::temp_dir().join(format!("bhf-disccache-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = cache_path(&dir);
+        let cands = vec![candidate("parse", Lang::C, None)];
+        let mut cache = DiscoveryCache::build(Path::new("/src"), "fp".to_owned(), &cands);
+        cache.discovery_semantic_version = 2;
+        write(&file, &cache).unwrap();
+        assert!(load_if_valid(&file, Path::new("/src"), "fp").is_none());
+        assert!(miss_reason(&file, Path::new("/src"), "fp").contains("discovery semantics v2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

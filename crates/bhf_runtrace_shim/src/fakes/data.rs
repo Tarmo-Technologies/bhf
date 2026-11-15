@@ -14,6 +14,9 @@ use crate::fakes::mode::{current, Mode};
 /// "/etc/foo.conf" and "/var/run/bar.sock" produce different bytes
 /// even within the same pass.
 pub fn fill_bytes(resource_name: &[u8], out: &mut [u8]) -> usize {
+    // A recorded world is looked up by name, which compares bytes: the shim's
+    // own work (the record it writes still is written).
+    let _own = crate::reentrancy::OwnWork::enter();
     // env-capsule replay (#4): when a recorded world is pinned, serve the exact
     // bytes this resource was served during the recorded run, so a crash that
     // depended on the faked environment reproduces deterministically regardless of

@@ -44,6 +44,7 @@ PAGES = [
     Page("whitepaper-coverage", "whitepaper-coverage.md", "White Paper: Coverage"),
     Page("sink-oracles", "sink-oracles.md", "Sink Oracles"),
     Page("c-cpp", "c-cpp.md", "C and C++"),
+    Page("custom-harness", "custom-harness.md", "Custom C/C++ Harnesses"),
     Page("csharp", "csharp.md", "C#"),
     Page("javascript", "javascript.md", "JavaScript and TypeScript"),
     Page("cobol", "cobol.md", "COBOL"),

@@ -344,7 +344,8 @@ int main(void) {
         std::fs::remove_dir_all(root).expect("temp dir is removed");
     }
 
-    #[cfg(unix)]
+    // Only the Unix tests build with `cc`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn compile_c(source: &Path, output: &Path) {
         let status = std::process::Command::new("cc")
             .arg("-Wall")
@@ -364,6 +365,7 @@ int main(void) {
         );
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("bhf-afl-shim-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

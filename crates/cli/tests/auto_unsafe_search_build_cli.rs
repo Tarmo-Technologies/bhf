@@ -16,13 +16,9 @@ fn have_toolchain() -> bool {
         && Command::new("make").arg("--version").output().is_ok()
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn has_built_and_fuzzed(work: &Path) -> bool {
@@ -43,6 +39,11 @@ fn has_built_and_fuzzed(work: &Path) -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the tree's build is a POSIX shell script (build.sh), which native Windows \
+              cannot run; see docs/site/windows.md"
+)]
 fn unsafe_search_and_run_recovers_flags_from_build_sh() {
     let bin = bhf_bin();
     if !bin.exists() {

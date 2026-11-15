@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+//! The offline distribution's packager and installer are bash scripts for
+//! Linux hosts, so these run on Unix only.
+#![cfg(unix)]
 
 use std::fs;
 use std::io::Write;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -88,6 +90,71 @@ fn offline_dist_packager_generates_default_content_inputs_when_omitted() {
     assert!(stdout.contains("content-inputs/seeds"));
     assert!(!stdout.contains("missing --sbom-cve-db"));
     assert!(!stdout.contains("missing --binary-cve-db"));
+}
+
+/// The packaged `libbhf_runtrace.so` (the path `BHF_RUNTRACE_SHIM` installs
+/// name) is a copy of the current cargo shim when the artifact dir has one: a
+/// dist-named copy beside it can lag a shim rebuild.
+#[test]
+fn offline_dist_packager_ships_the_cargo_shim_under_both_names() {
+    let root = repo_root();
+    let work = temp_dir("dist-shim-names");
+    let artifacts = work.join("artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::write(artifacts.join("libbhf_runtrace.so"), b"old shim").unwrap();
+    let shipped = |out: &Path| {
+        let output = Command::new("bash")
+            .arg(root.join("scripts/package-offline-dist.sh"))
+            .arg("--artifact-dir")
+            .arg(&artifacts)
+            .arg("--out")
+            .arg(out)
+            .args([
+                "--dry-run",
+                "--skip-build",
+                "--legacy-integrity-only",
+                "--version",
+                "test",
+            ])
+            .output()
+            .expect("run packager dry-run");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{stdout}");
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("+ cp ") && line.contains("libbhf_runtrace"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let dist = artifacts.join("libbhf_runtrace.so").display().to_string();
+    let canonical = artifacts
+        .join("libbhf_runtrace_shim.so")
+        .display()
+        .to_string();
+
+    // Only the dist-named file: it ships as it is.
+    let copies = shipped(&work.join("out-dist"));
+    assert!(
+        copies
+            .iter()
+            .any(|line| line.contains(&dist) && line.ends_with("/tool/libbhf_runtrace.so")),
+        "{copies:?}"
+    );
+
+    fs::write(artifacts.join("libbhf_runtrace_shim.so"), b"current shim").unwrap();
+    let copies = shipped(&work.join("out-both"));
+    for name in ["libbhf_runtrace.so", "libbhf_runtrace_shim.so"] {
+        assert!(
+            copies
+                .iter()
+                .any(|line| line.contains(&canonical) && line.ends_with(&format!("/tool/{name}"))),
+            "{name} must be the cargo shim: {copies:?}"
+        );
+    }
+    assert!(
+        !copies.iter().any(|line| line.contains(&format!("{dist} "))),
+        "the dist-named copy must not ship: {copies:?}"
+    );
 }
 
 #[test]

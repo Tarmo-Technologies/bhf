@@ -25,6 +25,11 @@ fn auto_sweep_captures_runtime_resources() {
         eprintln!("skipping: clang+libfuzzer toolchain unavailable");
         return;
     }
+    // The getenv/open hooks are the LD_PRELOAD runtrace shim, which is Linux's.
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: the runtrace shim is Linux-only");
+        return;
+    }
 
     let root = tmpdir("root");
     let src = root.join("src");

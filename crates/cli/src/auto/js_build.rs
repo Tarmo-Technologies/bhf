@@ -22,8 +22,12 @@ const TOOL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 pub enum JsBuildResult {
     Built,
-    /// Not fuzzable here (no `node`, target no longer present) — skip cleanly.
+    /// Not fuzzable here (target no longer present, will not transpile or
+    /// load) — skip cleanly.
     Skip(String),
+    /// The lane's toolchain (`node`, or esbuild for TypeScript) is not
+    /// installed: nothing about the target could be tried.
+    MissingToolchain(String),
     /// A genuine failure (missing runtime, unwritable work dir).
     Failed(String),
 }
@@ -57,7 +61,7 @@ fn resolve_target(candidate: &Candidate) -> Result<JsFunction, String> {
 /// The single public entry point of the lane.
 pub fn build_js_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str) -> JsBuildResult {
     if !have_node() {
-        return JsBuildResult::Skip(
+        return JsBuildResult::MissingToolchain(
             "no `node` runtime found; install Node.js to fuzz JavaScript (the lane \
              skips cleanly, like a GNAT-less Ada skip)"
                 .to_owned(),
@@ -277,40 +281,86 @@ const NON_CODE_IMPORT_LOADERS: &[&str] = &[
     "--loader:.eot=dataurl",
 ];
 
-/// Resolve the TypeScript transpiler: `esbuild` on PATH (preferred — a single fast
-/// binary that strips types), else the local `npx esbuild`. Returns the argv prefix.
-fn locate_esbuild() -> Option<Vec<String>> {
-    if let Ok(paths) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if dir.join("esbuild").is_file() {
-                return Some(vec![dir.join("esbuild").to_string_lossy().into_owned()]);
-            }
-        }
-    }
-    // `npx --no-install esbuild` uses a project-local esbuild if present.
-    if Command::new("npx")
-        .arg("--version")
-        .output()
-        .ok()?
-        .status
-        .success()
-    {
-        return Some(vec![
-            "npx".to_owned(),
-            "--no-install".to_owned(),
-            "esbuild".to_owned(),
-        ]);
-    }
-    None
+/// The file names an installed esbuild has.
+const ESBUILD_NAMES: &[&str] = if cfg!(windows) {
+    &["esbuild.exe", "esbuild.cmd"]
+} else {
+    &["esbuild"]
+};
+
+/// Resolve the TypeScript transpiler: `esbuild` on `path` (a single fast binary
+/// that strips types), else the project's own `node_modules/.bin/esbuild` in a
+/// directory from the source's own up to and including `scan_root`, the
+/// nearest first.
+///
+/// Never above `scan_root`: a `node_modules` there is not the scanned
+/// project's, and in a directory any user can write (`/tmp`, a shared home)
+/// anyone could plant the esbuild bhf would run for every tree scanned below
+/// it. Without a scan root, or with a single file as the scan root, only
+/// `path` is searched.
+///
+/// Never `npx`: since npm 7 `npx --no-install esbuild` looks the package up in
+/// the registry and refuses to install it (or, at a terminal, asks to), so it
+/// reaches the network and fails where esbuild is missing, and adds nothing
+/// where the project has its own esbuild, which this finds directly.
+fn locate_esbuild_in(
+    path: Option<&std::ffi::OsStr>,
+    source: &Path,
+    scan_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let on_path = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .flat_map(|dir| ESBUILD_NAMES.iter().map(move |name| dir.join(name)));
+    let in_project = project_dirs(source, scan_root).into_iter().flat_map(|dir| {
+        ESBUILD_NAMES
+            .iter()
+            .map(move |name| dir.join("node_modules").join(".bin").join(name))
+    });
+    on_path
+        .chain(in_project)
+        .find(|candidate| candidate.is_file())
+}
+
+/// [`locate_esbuild_in`] on this process's `PATH`: the esbuild the TypeScript
+/// lane runs for `source`, which the run-start toolchain check also asks for.
+pub(crate) fn locate_esbuild(source: &Path, scan_root: Option<&Path>) -> Option<PathBuf> {
+    locate_esbuild_in(std::env::var_os("PATH").as_deref(), source, scan_root)
+}
+
+/// The directories from `source`'s own up to and including the scan root
+/// directory, nearest first. Empty without a scan root, when it is not a
+/// directory, or when `source` is not inside it.
+fn project_dirs(source: &Path, scan_root: Option<&Path>) -> Vec<PathBuf> {
+    let Some(root) = scan_root
+        .and_then(|root| root.canonicalize().ok())
+        .filter(|root| root.is_dir())
+    else {
+        return Vec::new();
+    };
+    let Ok(source) = source.canonicalize() else {
+        return Vec::new();
+    };
+    source
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(&root))
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// The TypeScript lane's build (M3.8). Transpile the `.ts` target to CommonJS `.js`
 /// with esbuild (bundling local imports, leaving `node_modules` external), then
 /// reuse the JS driver on the transpiled module. A missing node/esbuild, or a
 /// transpile/load failure, skips cleanly.
-pub fn build_ts_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str) -> JsBuildResult {
+pub fn build_ts_harness(
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+    scan_root: Option<&Path>,
+) -> JsBuildResult {
     if !have_node() {
-        return JsBuildResult::Skip(
+        return JsBuildResult::MissingToolchain(
             "no `node` runtime found; install Node.js to fuzz TypeScript (skips cleanly)"
                 .to_owned(),
         );
@@ -324,10 +374,10 @@ pub fn build_ts_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str
         Ok(f) => f,
         Err(reason) => return JsBuildResult::Skip(reason),
     };
-    let Some(esbuild) = locate_esbuild() else {
-        return JsBuildResult::Skip(
-            "no TypeScript transpiler found (install esbuild: `npm i -g esbuild`); the \
-             TS lane skips cleanly"
+    let Some(esbuild) = locate_esbuild(&candidate.source_path, scan_root) else {
+        return JsBuildResult::MissingToolchain(
+            "no TypeScript transpiler found (install esbuild: `npm i -g esbuild`, or add it \
+             to the scanned project's node_modules); the TS lane skips cleanly"
                 .to_owned(),
         );
     };
@@ -343,9 +393,8 @@ pub fn build_ts_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str
     let out_js = hdir.join("target.js");
 
     // Transpile: bundle local TS imports + strip types, keep node_modules external.
-    let mut cmd = Command::new(&esbuild[0]);
-    cmd.args(&esbuild[1..])
-        .arg(&src_abs)
+    let mut cmd = Command::new(&esbuild);
+    cmd.arg(&src_abs)
         .arg("--bundle")
         .arg("--packages=external")
         .arg("--format=cjs")
@@ -393,6 +442,52 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// esbuild is found on PATH, else in a `node_modules/.bin` between the
+    /// source and the scan root, the nearest first, and nowhere else: never
+    /// above the scan root (a directory another user may write, such as
+    /// `/tmp`), never without a scan root, and never through `npx`.
+    #[cfg(unix)]
+    #[test]
+    fn esbuild_comes_from_path_or_the_scanned_tree_and_never_from_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("npx"), "#!/bin/sh\nexit 0\n").unwrap();
+        let root = tmp.join("shared/project");
+        let source = root.join("src/lib/parser.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "export function f() {}\n").unwrap();
+        let path = std::env::join_paths([&bin]).unwrap();
+        let plant = |dir: &Path| {
+            let esbuild = dir.join("node_modules/.bin/esbuild");
+            std::fs::create_dir_all(esbuild.parent().unwrap()).unwrap();
+            std::fs::write(&esbuild, "").unwrap();
+            esbuild
+        };
+        let found = |root: Option<&Path>| locate_esbuild_in(Some(&path), &source, root);
+        assert_eq!(found(Some(&root)), None);
+
+        // Above the scan root: one level up and at the top of the tree.
+        plant(&tmp.join("shared"));
+        plant(&tmp);
+        assert_eq!(found(Some(&root)), None, "nothing above the scan root");
+        assert_eq!(found(None), None, "nothing without a scan root");
+        assert_eq!(found(Some(&source)), None, "a file root has no project dir");
+        assert_eq!(found(Some(&root.join("other"))), None, "not under the root");
+
+        // In the scanned tree: the scan root itself, then a nearer directory.
+        let at_root = plant(&root);
+        assert_eq!(found(Some(&root)), Some(at_root.clone()));
+        assert_eq!(locate_esbuild_in(None, &source, Some(&root)), Some(at_root));
+        let nearer = plant(&root.join("src"));
+        assert_eq!(found(Some(&root)), Some(nearer));
+
+        // PATH wins over the project.
+        std::fs::write(bin.join("esbuild"), "").unwrap();
+        assert_eq!(found(Some(&root)), Some(bin.join("esbuild")));
+    }
 
     #[test]
     fn bundled_driver_checkpoints_immediately_before_the_selected_export() {

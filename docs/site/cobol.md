@@ -21,6 +21,9 @@ A COBOL subprogram — a `PROGRAM-ID` with a `LINKAGE SECTION` driven by
 2. **Translates** it to C with `cobc -C -debug -fec=all` (GnuCOBOL). Free vs fixed
    source format is detected automatically, and every `.cpy` copybook directory in
    the project is added as a `cobc -I` search path so `COPY` statements resolve.
+   The project is the git checkout holding the program inside the tree you pass
+   to `bhf auto`, else that tree; the search never goes above it, and it stops
+   after a bounded number of directory entries.
 3. **Generates a driver** (`LLVMFuzzerTestOneInput`) that fills the primary
    `PIC X` / `PIC X ANY LENGTH` buffer from the fuzz bytes, sets a length operand
    to the byte count, and zeroes the rest — so a real multi-operand program
@@ -36,6 +39,9 @@ A COBOL subprogram — a `PROGRAM-ID` with a `LINKAGE SECTION` driven by
   `SIZE ERROR`, divide-by-zero, invalid numeric data. bhf surfaces these as
   crashes and **attributes each to the exact `.cob:line` and CWE** (out-of-bounds
   → CWE-125, zero-divide → CWE-369, size overflow → CWE-190, …).
+  `bhf replay`, `bhf minimize` and the `bhf auto` minimization pass read a
+  replayed crash's libcob error the same way, so such a finding replays as a
+  `MATCH` against the same error at the same `.cob` line and is minimized.
 
 ### Behavioral / taint oracles
 

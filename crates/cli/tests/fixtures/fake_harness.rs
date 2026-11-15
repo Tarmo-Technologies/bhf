@@ -10,6 +10,51 @@ fn main() -> Result<()> {
     push_begin(&mut bytes, 1);
     push_target(&mut bytes, 0x42);
     push_crumb(&mut bytes, 1);
+    // Exceptions that escape the target: an explicit raise with a message,
+    // and a failed runtime check GNAT locates in its message.
+    match input.as_str() {
+        "escaped" => {
+            push_raise(&mut bytes, "Program_Error", "widgets.adb", 6, 1);
+            push_top_level(&mut bytes, "PROGRAM_ERROR", "empty record");
+            push_end(&mut bytes, 0);
+            return std::fs::write(event_path, bytes);
+        }
+        "index" => {
+            push_top_level(
+                &mut bytes,
+                "CONSTRAINT_ERROR",
+                "widgets.adb:16 index check failed",
+            );
+            push_end(&mut bytes, 0);
+            return std::fs::write(event_path, bytes);
+        }
+        // A user exception raised and caught, then a failed check in the
+        // handler that escapes.
+        "handled-then-escaped" => {
+            push_crumb(&mut bytes, 4);
+            push_raise(&mut bytes, "Widget_Error", "widgets.adb", 17, 4);
+            push_handler(
+                &mut bytes,
+                HandlerFields {
+                    exception_name: "WIDGET_ERROR",
+                    exception_message: "bad widget",
+                    handler_file: "widgets.adb",
+                    handler_line: 21,
+                    last_breadcrumb: 4,
+                    target_id: 0x42,
+                    testcase_id: 1,
+                },
+            );
+            push_top_level(
+                &mut bytes,
+                "CONSTRAINT_ERROR",
+                "widgets.adb:22 index check failed",
+            );
+            push_end(&mut bytes, 0);
+            return std::fs::write(event_path, bytes);
+        }
+        _ => {}
+    }
     let handler_line = match input.as_str() {
         "match" => 9,
         "mismatch" => 10,
@@ -76,4 +121,21 @@ fn push_handler(bytes: &mut Vec<u8>, fields: HandlerFields<'_>) {
 fn push_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
     bytes.extend_from_slice(value.as_bytes());
+}
+
+fn push_raise(bytes: &mut Vec<u8>, name: &str, file: &str, line: u32, breadcrumb: u32) {
+    bytes.push(6);
+    push_string(bytes, name);
+    push_string(bytes, file);
+    bytes.extend_from_slice(&line.to_le_bytes());
+    bytes.extend_from_slice(&breadcrumb.to_le_bytes());
+}
+
+fn push_top_level(bytes: &mut Vec<u8>, name: &str, message: &str) {
+    bytes.push(8);
+    push_string(bytes, name);
+    push_string(bytes, message);
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&0x42_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
 }

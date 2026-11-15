@@ -19,6 +19,10 @@ pub struct CiArgs {
     /// Source root to sweep.
     pub path: PathBuf,
 
+    /// The clap ids of the flags the command line gave (filled by `run_from`).
+    #[arg(skip)]
+    pub(crate) given: std::collections::BTreeSet<String>,
+
     /// Work directory. Default ./bhf_work.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
@@ -206,6 +210,17 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         max_corpus_mb: 64,
         discovery_cache: None,
         config: None,
+        config_toolchain: None,
+        config_cross: None,
+        // The one flag `bhf ci` forwards that a config key can also set.
+        given: args
+            .given
+            .iter()
+            .filter(|id| *id == "per_target_time")
+            .cloned()
+            .collect(),
+        from_config: Default::default(),
+        toolchain: Default::default(),
         project: None,
         grammar_file: None,
         max_len: "auto".to_owned(),
@@ -243,10 +258,22 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         ada_deps: Vec::new(),
         seed_files: Vec::new(),
         seed_dirs: Vec::new(),
+        no_seed_mining: false,
+        reuse_legacy_corpus: false,
         mode: args.mode,
         engine: "builtin".to_owned(),
+        winafl_path: None,
+        dynamorio_path: None,
+        winafl_instrumentation: crate::fuzz::WinaflInstrumentation::Dynamorio,
+        winafl_iterations: None,
+        winafl_coverage_modules: Vec::new(),
+        winafl_page_heap: false,
         verbose: false,
         probe_build: false,
+        msbuild_solution: None,
+        msbuild_config: None,
+        no_msbuild_import: false,
+        msbuild_evaluate: false,
         deps_only: false,
         list_targets: false,
         exclude_dir: Vec::new(),
@@ -868,6 +895,36 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    /// A `--per-target-time` the `bhf ci` command line gives counts as given
+    /// to the sweep, so a tree's `.bhf.toml` cannot replace it, even when it
+    /// has the default value; one it leaves out the config may fill.
+    #[test]
+    fn a_per_target_time_given_to_ci_wins_over_the_tree_config() {
+        use clap::{CommandFactory, FromArgMatches, Parser};
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            ci: CiArgs,
+        }
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join(crate::auto::config::CONFIG_FILE_NAME),
+            "per-target-time = 10\n",
+        )
+        .unwrap();
+        let swept = |argv: &[&str]| {
+            let matches = TestCli::command().try_get_matches_from(argv).unwrap();
+            let mut cli = TestCli::from_arg_matches(&matches).unwrap();
+            cli.ci.given = crate::auto::cli::given_arg_ids(&matches);
+            let mut auto = auto_args_from_ci(&cli.ci, &[]);
+            crate::auto::config::apply(&mut auto, tree.path()).unwrap();
+            auto.per_target_time
+        };
+        assert_eq!(swept(&["bhf", "src", "--per-target-time", "60"]), 60);
+        assert_eq!(swept(&["bhf", "src", "--per-target-time", "5"]), 5);
+        assert_eq!(swept(&["bhf", "src"]), 10);
     }
 
     #[test]

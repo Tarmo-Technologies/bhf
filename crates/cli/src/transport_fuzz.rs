@@ -1274,6 +1274,7 @@ fn load_seeds(args: &FuzzArgs) -> Result<Vec<Vec<u8>>, String> {
         .iter()
         .map(|s| truncate(s.as_bytes().to_vec(), cap))
         .collect();
+    seeds.extend(args.seed_bytes.iter().map(|b| truncate(b.clone(), cap)));
     for path in &args.seed_files {
         let (bytes, _len) = crate::fuzz::read_seed_file_prefix(path, cap)
             .map_err(|error| format!("read seed file '{}': {error}", path.display()))?;

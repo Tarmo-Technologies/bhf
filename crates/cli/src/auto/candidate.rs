@@ -218,6 +218,10 @@ pub struct Candidate {
     /// demonstrably reachable from attacker input as fuzzed, so the report flags
     /// it rather than presenting it as a vulnerability.
     pub input_reachability: Option<target_rank::InputReachability>,
+    /// What `input_reachability` was inferred from (C/C++): the rule, the
+    /// parameter and its type as spelled and resolved. Stamped into each
+    /// finding's `input_reachability_basis`.
+    pub input_reachability_basis: Option<target_rank::ReachabilityBasis>,
     /// Detected source-language dialect/version (M22). `Some` for the lanes whose
     /// modern grammar would otherwise hide the version signal (C/C++/Python/Perl);
     /// `None` where dialect detection is not yet wired (Ada/Rust/Java/Go). Drives

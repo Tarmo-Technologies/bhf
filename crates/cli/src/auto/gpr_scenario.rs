@@ -669,7 +669,7 @@ mod tests {
                 p.strip_prefix(root.canonicalize().unwrap())
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect();
 

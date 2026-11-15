@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use c_parser::{push_located_token, LocatedToken};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CppParamDescriptor {
     pub name: String,
@@ -135,6 +137,9 @@ pub struct CppClassInfo {
     pub class_path: Vec<String>,
     pub complete: bool,
     pub is_abstract: bool,
+    /// Declared by a `template <...>` declaration (`template <class T> class
+    /// list;`): the name is a class template.
+    pub is_template: bool,
     pub constructors: Vec<CppConstructorInfo>,
 }
 
@@ -1475,15 +1480,25 @@ pub fn parse_cpp_class_info(source: &str) -> Result<Vec<CppClassInfo>, CppParseE
         .map_err(|_| CppParseError::Grammar)?;
     let tree = parser.parse(source, None).ok_or(CppParseError::Parse)?;
     let mut out = Vec::new();
-    collect_cpp_class_info(tree.root_node(), source.as_bytes(), &[], &[], &mut out);
+    collect_cpp_class_info(
+        tree.root_node(),
+        source.as_bytes(),
+        &[],
+        &[],
+        false,
+        &mut out,
+    );
     Ok(out)
 }
 
+/// `templated`: `node` is the declaration of a `template_declaration` (its
+/// direct child), so a class it declares is a class template.
 fn collect_cpp_class_info(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     namespace_stack: &[String],
     class_stack: &[String],
+    templated: bool,
     out: &mut Vec<CppClassInfo>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
@@ -1539,6 +1554,7 @@ fn collect_cpp_class_info(
                 class_path: next_classes.clone(),
                 complete: body.is_some(),
                 is_abstract: body.is_some_and(|body| class_body_has_pure_virtual(body, source)),
+                is_template: templated,
                 constructors,
             });
         }
@@ -1549,9 +1565,17 @@ fn collect_cpp_class_info(
     } else {
         class_stack
     };
+    let template = node.kind() == "template_declaration";
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_cpp_class_info(child, source, active_namespaces, active_classes, out);
+        collect_cpp_class_info(
+            child,
+            source,
+            active_namespaces,
+            active_classes,
+            template,
+            out,
+        );
     }
 }
 
@@ -1892,6 +1916,16 @@ fn class_body_has_pure_virtual(body: tree_sitter::Node<'_>, source: &[u8]) -> bo
 }
 
 pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppParseError> {
+    Ok(extract_cpp_dictionary_tokens_located(source)?
+        .into_iter()
+        .map(|token| token.value)
+        .collect())
+}
+
+/// [`extract_cpp_dictionary_tokens`], with the lines each token was found on.
+pub fn extract_cpp_dictionary_tokens_located(
+    source: &str,
+) -> Result<Vec<c_parser::LocatedToken>, CppParseError> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -1901,7 +1935,7 @@ pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppPar
 
     for enum_def in parse_cpp_type_defs(source)?.enums {
         for member in enum_def.members {
-            push_cpp_enum_dictionary_token(&mut tokens, member);
+            push_cpp_enum_dictionary_token(&mut tokens, member, enum_def.line);
         }
     }
     collect_cpp_string_dictionary_tokens(tree.root_node(), source.as_bytes(), &mut tokens);
@@ -1917,7 +1951,7 @@ pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppPar
 fn collect_cpp_comparison_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -1933,7 +1967,11 @@ fn collect_cpp_comparison_dictionary_tokens(
                                 "number_literal" | "char_literal" | "string_literal"
                             ) {
                                 if let Ok(text) = operand.utf8_text(source).map(str::trim) {
-                                    push_cpp_case_label_dictionary_token(text, tokens);
+                                    push_cpp_case_label_dictionary_token(
+                                        text,
+                                        node_line(operand),
+                                        tokens,
+                                    );
                                 }
                             }
                         }
@@ -1951,15 +1989,20 @@ fn collect_cpp_comparison_dictionary_tokens(
 fn collect_cpp_string_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
     };
-    if node.kind() == "string_literal" {
+    // The path of `#include "x.h"` parses as a string literal too, but it
+    // names a file; the target never compares its input against it.
+    let include_path = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "preproc_include");
+    if node.kind() == "string_literal" && !include_path {
         if let Ok(raw) = node.utf8_text(source) {
             if let Some(value) = cpp_string_literal_value(raw) {
-                push_dictionary_token(tokens, value);
+                push_located_token(tokens, value, node_line(node));
             }
         }
     }
@@ -1969,8 +2012,9 @@ fn collect_cpp_string_dictionary_tokens(
     }
 }
 
-fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) {
-    for line in source.lines() {
+fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<LocatedToken>) {
+    for (index, line) in source.lines().enumerate() {
+        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("#define") else {
             continue;
@@ -1992,9 +2036,9 @@ fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) 
             .trim();
         let first = value.split_whitespace().next().unwrap_or("");
         if let Some(value) = cpp_string_literal_value(first) {
-            push_dictionary_token(tokens, value);
+            push_located_token(tokens, value, line_number);
         } else if is_cpp_integer_literal(first) {
-            push_dictionary_token(tokens, first.to_owned());
+            push_located_token(tokens, first.to_owned(), line_number);
         }
     }
 }
@@ -2002,7 +2046,7 @@ fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) 
 fn collect_cpp_case_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -2010,7 +2054,7 @@ fn collect_cpp_case_dictionary_tokens(
     if node.kind() == "case_statement" {
         if let Some(label) = node.child_by_field_name("value") {
             if let Ok(label) = label.utf8_text(source).map(str::trim) {
-                push_cpp_case_label_dictionary_token(label, tokens);
+                push_cpp_case_label_dictionary_token(label, node_line(node), tokens);
             }
         }
     }
@@ -2020,16 +2064,16 @@ fn collect_cpp_case_dictionary_tokens(
     }
 }
 
-fn push_cpp_case_label_dictionary_token(label: &str, tokens: &mut Vec<String>) {
+fn push_cpp_case_label_dictionary_token(label: &str, line: u32, tokens: &mut Vec<LocatedToken>) {
     if label.is_empty() {
         return;
     }
     if let Some(value) = cpp_string_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if let Some(value) = cpp_char_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if is_cpp_integer_literal(label) || is_cpp_identifier(label) {
-        push_dictionary_token(tokens, label.to_owned());
+        push_located_token(tokens, label.to_owned(), line);
     }
 }
 
@@ -2102,23 +2146,22 @@ fn is_cpp_identifier(raw: &str) -> bool {
         && !is_cpp_keyword(raw)
 }
 
-fn push_dictionary_token(tokens: &mut Vec<String>, token: String) {
-    let token = token.trim().to_owned();
-    if token.is_empty() || token.len() > 256 || tokens.contains(&token) {
-        return;
-    }
-    tokens.push(token);
+/// The 1-based source line a node starts on.
+fn node_line(node: tree_sitter::Node<'_>) -> u32 {
+    u32::try_from(node.start_position().row)
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
 }
 
-fn push_cpp_enum_dictionary_token(tokens: &mut Vec<String>, member: String) {
+fn push_cpp_enum_dictionary_token(tokens: &mut Vec<LocatedToken>, member: String, line: u32) {
     if let Some((_, leaf)) = member.rsplit_once("::") {
-        push_dictionary_token(tokens, leaf.to_owned());
+        push_located_token(tokens, leaf.to_owned(), line);
     }
     let segments = member.split("::").collect::<Vec<_>>();
     if segments.len() > 2 {
-        push_dictionary_token(tokens, segments[segments.len() - 2..].join("::"));
+        push_located_token(tokens, segments[segments.len() - 2..].join("::"), line);
     }
-    push_dictionary_token(tokens, member);
+    push_located_token(tokens, member, line);
 }
 
 fn collect_type_defs(node: tree_sitter::Node<'_>, source: &[u8], defs: &mut c_parser::CTypeDefs) {
@@ -2284,7 +2327,10 @@ fn cpp_struct_fields(
         if !public {
             continue;
         }
-        if child.kind() != "field_declaration" || contains_kind(child, "function_declarator") {
+        if child.kind() != "field_declaration"
+            || contains_kind(child, "function_declarator")
+            || is_static_member(child, source)
+        {
             continue;
         }
         let Some(type_node) = child.child_by_field_name("type") else {
@@ -2297,14 +2343,50 @@ fn cpp_struct_fields(
         if base_type.is_empty() {
             continue;
         }
+        let leading_const = c_parser::has_const_qualifier(child, source);
+        let bit_width = c_parser::bit_field_width(child, source);
         let mut field_cursor = child.walk();
         for part in child.children(&mut field_cursor) {
-            if let Some(descriptor) = cpp_field_descriptor(part, source, &base_type) {
+            if let Some(mut descriptor) = cpp_field_descriptor(part, source, &base_type) {
+                if cpp_member_is_const(part, leading_const, source) {
+                    descriptor.c_type =
+                        c_parser::const_member_spelling(&descriptor.c_type, bit_width.as_deref());
+                }
                 fields.push(descriptor);
             }
         }
     }
     fields
+}
+
+/// A `static` data member: one object for the class, not a member of each.
+fn is_static_member(field_declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = field_declaration.walk();
+    let found = field_declaration.children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier"
+            && child.utf8_text(source).is_ok_and(|text| text == "static")
+    });
+    found
+}
+
+/// Whether the member a field declarator declares is itself `const` (the C
+/// parser's rule): `const int id;` and `const int tbl[4];` through
+/// `leading_const`, `char *const p;` through the `const` on its own `*`.
+fn cpp_member_is_const(
+    declarator: tree_sitter::Node<'_>,
+    leading_const: bool,
+    source: &[u8],
+) -> bool {
+    match declarator.kind() {
+        "field_identifier" | "identifier" | "array_declarator" => leading_const,
+        "pointer_declarator" => {
+            c_parser::has_const_qualifier(c_parser::own_pointer_declarator(declarator), source)
+        }
+        "init_declarator" => declarator
+            .child_by_field_name("declarator")
+            .is_some_and(|inner| cpp_member_is_const(inner, leading_const, source)),
+        _ => false,
+    }
 }
 
 /// C++ `using NAME = UNDERLYING;` alias. Modern C++ uses these instead of
@@ -5014,6 +5096,37 @@ struct MappedFile {
     }
 
     #[test]
+    fn class_info_marks_class_templates() {
+        let source = r#"
+            template <class T, class A = allocator<T> > class list {
+            public:
+                T *items;
+            };
+            template <typename K> struct table;
+            namespace one { template <class T> class stack; }
+            class Widget {
+                template <class U> struct Slot { U value; };
+                int size;
+            };
+            struct record { int value; };
+        "#;
+        let infos = parse_cpp_class_info(source).expect("class metadata parses");
+        let template = |qualified: &str| {
+            infos
+                .iter()
+                .find(|info| info.qualified_name == qualified)
+                .unwrap_or_else(|| panic!("missing {qualified}: {infos:?}"))
+                .is_template
+        };
+        assert!(template("list"));
+        assert!(template("table"));
+        assert!(template("one::stack"));
+        assert!(template("Widget::Slot"));
+        assert!(!template("Widget"));
+        assert!(!template("record"));
+    }
+
+    #[test]
     fn parse_cpp_declarations_preserves_const_return_qualifier() {
         let decls =
             parse_cpp_declarations("extern const std::string get_name();\n").expect("parses");
@@ -5105,6 +5218,47 @@ struct MappedFile {
         assert_eq!(
             callback.underlying,
             "int (*)(void *opaque, const char *name)"
+        );
+    }
+
+    /// A member that is itself `const` keeps the qualifier in its type, as
+    /// the C parser spells it, so a decoder never assigns it; a `const` on a
+    /// pointee is not the member's. A `static` data member is not part of
+    /// each object, so it is not a field.
+    #[test]
+    fn parse_cpp_type_defs_keeps_the_members_own_const_and_skips_statics() {
+        let defs = parse_cpp_type_defs(
+            "struct Item {\n\
+             \x20   const int id;\n\
+             \x20   const char *name;\n\
+             \x20   char *const tag;\n\
+             \x20   const int level = 7;\n\
+             \x20   const std::uint16_t tbl[2];\n\
+             \x20   const unsigned flags : 3;\n\
+             \x20   unsigned bits : 2;\n\
+             \x20   static int count;\n\
+             \x20   static const int limit = 4;\n\
+             \x20   static constexpr int depth = 2;\n\
+             \x20   int a;\n\
+             };\n",
+        )
+        .expect("C++ type definitions parse");
+        let item = defs.structs.iter().find(|def| def.name == "Item").unwrap();
+        assert_eq!(
+            item.fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.c_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id", "const int"),
+                ("name", "char *"),
+                ("tag", "char * const"),
+                ("level", "const int"),
+                ("tbl", "const std::uint16_t[2]"),
+                ("flags", "const unsigned : 3"),
+                ("bits", "unsigned"),
+                ("a", "int"),
+            ]
         );
     }
 
@@ -5208,6 +5362,60 @@ struct MappedFile {
                 "missing {expected} from {tokens:?}"
             );
         }
+    }
+
+    /// Each mined C++ token carries the lines it was found on, enum members
+    /// included, so the dictionary writer can say where it came from.
+    #[test]
+    fn cpp_dictionary_tokens_record_their_source_lines() {
+        let tokens = extract_cpp_dictionary_tokens_located(
+            "#include <string>\n\
+             #define WIDGET_TAG \"WGT1\"\n\
+             namespace widgets {\n\
+             enum class Mode { Fast, Safe };\n\
+             int parse_record(const std::string &s, int tag) {\n\
+                 switch (tag) { case 'Q': return 1; default: break; }\n\
+                 return s == \"WGT1\" ? 1 : 0;\n\
+             }\n\
+             }\n",
+        )
+        .expect("C++ parses");
+        let lines = |value: &str| {
+            let mut lines = tokens
+                .iter()
+                .find(|token| token.value == value)
+                .map(|token| token.lines.clone())
+                .unwrap_or_else(|| panic!("{value} not mined: {tokens:?}"));
+            lines.sort_unstable();
+            lines
+        };
+        assert_eq!(lines("WGT1"), vec![2, 7]);
+        assert_eq!(lines("Q"), vec![6]);
+        assert_eq!(lines("Safe"), vec![4]);
+        assert_eq!(
+            extract_cpp_dictionary_tokens("int f(int t) { return t == 9; }").expect("parses"),
+            vec!["9".to_owned()]
+        );
+    }
+
+    /// An `#include "..."` path is a file name, not a value the target compares
+    /// its input against; mining it made header names look like magic values.
+    #[test]
+    fn cpp_dictionary_skips_include_paths() {
+        let tokens = extract_cpp_dictionary_tokens(
+            r#"
+            #include "widget.h"
+            #include "include/widget_io.h"
+            #include <string>
+            int parse_record(const std::string &s) { return s == "WIDGET" ? 1 : 0; }
+            "#,
+        )
+        .expect("C++ dictionary tokens parse");
+        assert!(tokens.contains(&"WIDGET".to_owned()), "{tokens:?}");
+        assert!(
+            !tokens.iter().any(|token| token.ends_with(".h")),
+            "include paths are not tokens: {tokens:?}"
+        );
     }
 
     #[test]

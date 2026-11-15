@@ -23,13 +23,9 @@ fn fixture() -> PathBuf {
         .expect("canonicalize java_preview fixture")
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn has_jdk() -> bool {
@@ -58,6 +54,10 @@ fn javac_major() -> Option<u32> {
 /// nothing to prove — it still must PASS there, just without exercising the
 /// retry, so assert the outcome rather than the flag.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn a_preview_language_feature_is_compiled_and_run_with_the_flag_it_asks_for() {
     let bin = bhf_bin();
     if !bin.exists() {

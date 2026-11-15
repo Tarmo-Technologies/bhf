@@ -119,3 +119,82 @@ fn c_runtime_decoder_compiles_under_c89_project_flags() {
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+/// A program reading back a FILE * parameter's stream (`bhf_fmemopen`).
+const FILE_STREAM_PROBE: &str = "\
+#include <stdio.h>
+#include <string.h>
+#include \"bhf_decode.h\"
+int main(void) {
+    static const unsigned char data[] = \"stream bytes\";
+    char back[32] = {0};
+    FILE *stream = bhf_fmemopen(data, sizeof(data) - 1);
+    if (!stream) return 2;
+    if (fread(back, 1, sizeof(back) - 1, stream) != sizeof(data) - 1) return 3;
+    fclose(stream);
+    return strcmp(back, (const char *)data) == 0 ? 0 : 4;
+}
+";
+
+/// bhf's Windows platform stub, as it reaches a harness TU: the host's own C
+/// headers, a stand-in `_MSC_VER` for version ladders, and `_WIN32` defined.
+const WINDOWS_PLATFORM_STUB: &str = "\
+#include <stdio.h>
+#include <string.h>
+#ifndef _MSC_VER
+#define _MSC_VER 1900
+#endif
+#define _WIN32 1
+";
+
+/// A FILE * parameter's stream comes from the C library the harness is built
+/// against: fmemopen from a POSIX one, a deleted-on-close temporary file from
+/// the Windows C runtime. `_WIN32` alone does not pick it: bhf's Windows
+/// platform stub defines it over glibc (with a stand-in `_MSC_VER`), and the
+/// Windows branch's `_tempnam`/`fopen_s` do not exist there, so a stubbed
+/// target's harness failed to build.
+#[test]
+fn a_file_stream_comes_from_the_c_library_the_harness_builds_against() {
+    if which::which("clang").is_err() {
+        eprintln!("skipping: clang not on PATH");
+        return;
+    }
+    let c_runtime = workspace_root().join("c_runtime");
+    let out_dir = tmpdir("file-stream");
+    let src = out_dir.join("probe.c");
+    let stub = out_dir.join("windows_stub.h");
+    std::fs::write(&src, FILE_STREAM_PROBE).unwrap();
+    std::fs::write(&stub, WINDOWS_PLATFORM_STUB).unwrap();
+    // The platform stub is only ever applied on a non-Windows host.
+    let builds: &[(&str, bool)] = if cfg!(windows) {
+        &[("native", false)]
+    } else {
+        &[("native", false), ("windows-stub", true)]
+    };
+    for &(name, stubbed) in builds {
+        let bin = out_dir.join(format!("probe-{name}{}", std::env::consts::EXE_SUFFIX));
+        let mut cmd = Command::new("clang");
+        cmd.args(["-D_GNU_SOURCE", "-I"]).arg(&c_runtime);
+        if stubbed {
+            cmd.arg("-include").arg(&stub);
+        }
+        let output = cmd
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .output()
+            .expect("spawn clang");
+        assert!(
+            output.status.success(),
+            "{name}: the FILE * stream shim must build\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let run = Command::new(&bin).output().expect("run the probe");
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "{name}: the stream did not read back its bytes\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

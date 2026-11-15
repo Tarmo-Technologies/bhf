@@ -6,11 +6,11 @@
 //!
 //! 1. **Live buffer** — the generated harness calls
 //!    [`bhf_shim_set_fuzz_input`] at the top of
-//!    `LLVMFuzzerTestOneInput` with `(Data, Size)`. The shim caches
-//!    those bytes in a `Mutex<Option<Vec<u8>>>` and serves them on
-//!    subsequent [`read_into`] calls. This is the per-iteration
-//!    channel — `read_into` reflects the EXACT bytes libFuzzer is
-//!    about to feed to the target.
+//!    `LLVMFuzzerTestOneInput` with `(Data, Size)`. The shim copies
+//!    those bytes into a private anonymous mapping of its own (see
+//!    [`InputCopy`]) and serves them on subsequent [`read_into`]
+//!    calls. This is the per-iteration channel — `read_into` reflects
+//!    the EXACT bytes libFuzzer is about to feed to the target.
 //!
 //! 2. **Shared memfd fallback** — `BHF_FUZZ_INPUT_FD` +
 //!    `BHF_FUZZ_INPUT_LEN` env vars point at a parent-owned
@@ -43,11 +43,117 @@ unsafe impl Sync for Shared {}
 static SHARED: OnceLock<Option<Shared>> = OnceLock::new();
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-struct LiveInput {
-    bytes: Vec<u8>,
+/// The shim's copy of the input the harness published last.
+///
+/// The copy lives in a private anonymous mapping, never on the heap: in a
+/// sanitized target `malloc` is the sanitizer's, and the driver allocates
+/// each input with exactly its size just before publishing it, so a heap copy
+/// sat in the very next chunk. A read past the input beyond its redzone then
+/// landed in the shim's chunk: AddressSanitizer named the shim's allocation,
+/// called a read of the copy the next publication had freed a
+/// heap-use-after-free, and did not report a read of the live copy at all.
+/// Mapped memory is not part of the sanitizer's heap, so the target's heap
+/// looks the same with and without the shim.
+///
+/// The mapping is reused while the input fits and replaced (`munmap`, then
+/// `mmap`) by a larger one when it does not, so a persistent run maps
+/// about as much as its largest input and makes no system call for most
+/// publications.
+struct InputCopy {
+    /// Whether the harness has published an input (an empty one counts).
+    published: bool,
+    /// The mapping's start, or null before the first non-empty input.
+    ptr: *mut u8,
+    /// The mapping's length, a multiple of the page size.
+    capacity: usize,
+    /// The current input's length.
+    len: usize,
 }
 
-static LIVE_INPUT: Mutex<Option<LiveInput>> = Mutex::new(None);
+// The mapping is private to this process and owned by the copy, which only
+// the `LIVE_INPUT` mutex hands out.
+unsafe impl Send for InputCopy {}
+
+impl InputCopy {
+    const NONE: Self = Self {
+        published: false,
+        ptr: std::ptr::null_mut(),
+        capacity: 0,
+        len: 0,
+    };
+
+    /// The current input: `None` before any publication, empty after an
+    /// empty one.
+    fn current(&self) -> Option<&[u8]> {
+        if !self.published {
+            return None;
+        }
+        if self.len == 0 {
+            return Some(&[]);
+        }
+        // SAFETY: `ptr` maps `capacity >= len` readable bytes, of which the
+        // first `len` were copied from the published input.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
+    }
+
+    /// Make `input` the current input. When no mapping can hold it the
+    /// current input is empty, as for an empty publication: no fake resource
+    /// gets bytes of an earlier input.
+    fn store(&mut self, input: &[u8]) {
+        self.published = true;
+        self.len = 0;
+        if input.is_empty() {
+            return;
+        }
+        if input.len() > self.capacity && !self.grow(input.len()) {
+            return;
+        }
+        // SAFETY: the mapping holds at least `input.len()` writable bytes and
+        // cannot overlap the caller's buffer.
+        unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), self.ptr, input.len()) };
+        self.len = input.len();
+    }
+
+    /// Replace the mapping with one of at least `needed` bytes.
+    fn grow(&mut self, needed: usize) -> bool {
+        let page = page_size();
+        let Some(capacity) = needed.checked_next_multiple_of(page) else {
+            return false;
+        };
+        // SAFETY: a fresh private anonymous mapping; nothing else refers to
+        // the old one, which only this copy owns.
+        unsafe {
+            let mapped = libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if mapped == libc::MAP_FAILED {
+                return false;
+            }
+            if !self.ptr.is_null() {
+                libc::munmap(self.ptr.cast(), self.capacity);
+            }
+            self.ptr = mapped.cast();
+        }
+        self.capacity = capacity;
+        true
+    }
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page)
+        .ok()
+        .filter(|&p| p > 0)
+        .unwrap_or(4096)
+}
+
+static LIVE_INPUT: Mutex<InputCopy> = Mutex::new(InputCopy::NONE);
 
 fn load() -> Option<&'static Shared> {
     SHARED
@@ -94,9 +200,10 @@ fn load() -> Option<&'static Shared> {
 /// # Safety
 ///
 /// `data` must point to at least `size` bytes valid for read for
-/// the duration of this call. The shim copies the bytes into an
-/// owned buffer before returning, so the caller's buffer does not
-/// need to remain valid after `bhf_shim_set_fuzz_input` returns.
+/// the duration of this call. The shim copies the bytes into a mapping
+/// of its own (not the heap, see [`InputCopy`]) before returning, so the
+/// caller's buffer does not need to remain valid after
+/// `bhf_shim_set_fuzz_input` returns.
 #[no_mangle]
 pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::size_t) {
     if size == 0 {
@@ -111,7 +218,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         // by the previous testcase. No-op unless BHF_SCHED is active.
         crate::hooks::sched::reset_for_input();
         if let Ok(mut guard) = LIVE_INPUT.lock() {
-            *guard = Some(LiveInput { bytes: Vec::new() });
+            guard.store(&[]);
         }
         CURSOR.store(0, Ordering::Relaxed);
         return;
@@ -129,9 +236,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         Ok(g) => g,
         Err(_) => return,
     };
-    *guard = Some(LiveInput {
-        bytes: slice.to_vec(),
-    });
+    guard.store(slice);
     CURSOR.store(0, Ordering::Relaxed);
 }
 
@@ -144,16 +249,16 @@ pub fn read_into(out: &mut [u8]) -> usize {
     // setter (or another reader) mid-critical-section; a blocking lock would
     // self-deadlock. On contention, fall through to the mmap'd shared buffer.
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
-            if live.bytes.is_empty() {
+        if let Some(live) = guard.current() {
+            if live.is_empty() {
                 // Some(empty) is an explicit current testcase, not "no live
                 // publication". Never fall through to a stale shared buffer.
                 return 0;
             }
             let cursor = CURSOR.fetch_add(out.len(), Ordering::Relaxed);
-            let len = live.bytes.len();
+            let len = live.len();
             for (i, slot) in out.iter_mut().enumerate() {
-                *slot = live.bytes[(cursor + i) % len];
+                *slot = live[(cursor + i) % len];
             }
             return out.len();
         }
@@ -194,14 +299,14 @@ pub fn read_keyed(key: u64, out: &mut [u8]) -> usize {
     // try_lock, not lock: reachable from a signal handler; fall through to the
     // mmap on contention rather than deadlocking (see read_into).
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
-            if live.bytes.is_empty() {
+        if let Some(live) = guard.current() {
+            if live.is_empty() {
                 return 0;
             }
-            let len = live.bytes.len();
+            let len = live.len();
             let base = (key as usize) % len;
             for (i, slot) in out.iter_mut().enumerate() {
-                *slot = live.bytes[(base + i) % len];
+                *slot = live[(base + i) % len];
             }
             return out.len();
         }
@@ -260,12 +365,81 @@ pub unsafe extern "C" fn bhf_shim_fuzz_stub_value(symbol: *const libc::c_char) -
     u64::from_le_bytes(buf)
 }
 
-pub fn contains_bytes(needle: &[u8]) -> bool {
-    taint_span(needle, needle.len()).is_some()
+/// The shortest format string that can count as fuzz-controlled.
+pub const FORMAT_TAINT_MIN_LEN: usize = 4;
+
+/// Whether a printf-family `format` came from the fuzz input: the whole
+/// format, at least [`FORMAT_TAINT_MIN_LEN`] bytes long, occurs verbatim in
+/// the current input ([`taint_span`]), and it does not lie in a loaded
+/// object's read-only data. A format only part of which matches the input is
+/// not controlled. `format` must be the program's own format bytes (not a
+/// copy), since its address is checked.
+///
+/// The address check removes string literals, which live in `.rodata`
+/// whatever their length, although the mined dictionary puts a constant
+/// format such as `"%s"` into the input. The floor removes short writable
+/// copies of literals (a `std::string` holding `"%s"`). The content check
+/// runs first, so the program-header walk runs only for a format that
+/// matched.
+pub fn format_is_input_controlled(format: &[u8]) -> bool {
+    taint_span(format, FORMAT_TAINT_MIN_LEN).is_some()
+        && !points_into_read_only_image(format.as_ptr())
 }
 
-/// Byte-origin taint check (#422): does `needle` occur verbatim in the
-/// current fuzz input as a run of at least `min_len` bytes? Returns the
+/// Whether `addr` lies in read-only memory of an object the process has
+/// loaded: a `PT_LOAD` segment that is not writable, or a `PT_GNU_RELRO`
+/// range. String literals live there; memory built at run time (heap, stack,
+/// writable `.data`) does not. Walks the link map in place (no allocation)
+/// and returns false when no object holds `addr`.
+pub fn points_into_read_only_image(addr: *const u8) -> bool {
+    struct Probe {
+        addr: usize,
+        found: bool,
+    }
+    unsafe extern "C" fn visit(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        let probe = &mut *(data as *mut Probe);
+        let info = &*info;
+        if info.dlpi_phdr.is_null() {
+            return 0;
+        }
+        let headers = std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum));
+        for header in headers {
+            let read_only = match header.p_type {
+                libc::PT_LOAD => header.p_flags & libc::PF_W == 0,
+                libc::PT_GNU_RELRO => true,
+                _ => false,
+            };
+            if !read_only {
+                continue;
+            }
+            let start = (info.dlpi_addr as usize).wrapping_add(header.p_vaddr as usize);
+            let end = start.wrapping_add(header.p_memsz as usize);
+            if (start..end).contains(&probe.addr) {
+                probe.found = true;
+                return 1;
+            }
+        }
+        0
+    }
+    if addr.is_null() {
+        return false;
+    }
+    let mut probe = Probe {
+        addr: addr as usize,
+        found: false,
+    };
+    unsafe {
+        libc::dl_iterate_phdr(Some(visit), (&mut probe as *mut Probe).cast());
+    }
+    probe.found
+}
+
+/// Byte-origin taint check (#422): does the whole of `needle`, at least
+/// `min_len` bytes long, occur verbatim in the current fuzz input? Returns the
 /// `(offset, len)` of the first such occurrence, which is the *source*
 /// end of a fuzz-input→sink taint path the oracles confirm.
 ///
@@ -280,20 +454,22 @@ pub fn contains_bytes(needle: &[u8]) -> bool {
 /// appears in almost any input by chance, so callers pass a floor (the
 /// shim uses 4) below which a match is not treated as taint. A
 /// `needle` shorter than `min_len`, an empty needle, or a needle longer
-/// than the input all return `None`.
+/// than the input all return `None`. A format string is checked through
+/// [`format_is_input_controlled`], which also excludes literals in the
+/// program's read-only data.
 pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
+    let _own = crate::reentrancy::OwnWork::enter();
     if needle.is_empty() || needle.len() < min_len {
         return None;
     }
     // try_lock, not lock: sink hooks call this and may fire from a signal
     // handler; on contention skip the taint tag (None) rather than deadlock.
     let guard = LIVE_INPUT.try_lock().ok()?;
-    let live = guard.as_ref()?;
-    if needle.len() > live.bytes.len() {
+    let live = guard.current()?;
+    if needle.len() > live.len() {
         return None;
     }
-    live.bytes
-        .windows(needle.len())
+    live.windows(needle.len())
         .position(|window| window == needle)
         .map(|offset| (offset, needle.len()))
 }
@@ -312,6 +488,7 @@ pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
 /// occasional coincidental run on one input is harmless because the CLI-side
 /// correlator suppresses any command also executed *without* taint.
 pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usize)> {
+    let _own = crate::reentrancy::OwnWork::enter();
     if min_len == 0 || haystack.len() < min_len {
         return None;
     }
@@ -319,13 +496,13 @@ pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usiz
     // a cooperating harness publishes). try_lock, not lock: reachable from sink
     // hooks in a signal handler; skip rather than deadlock (see taint_span).
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
+        if let Some(live) = guard.current() {
             // Some(empty) is an explicit empty current input, not "no publication":
             // never fall through to a stale shared buffer (mirrors `read_into`).
-            if live.bytes.is_empty() {
+            if live.is_empty() {
                 return None;
             }
-            return input_run_in(haystack, &live.bytes, min_len);
+            return input_run_in(haystack, live, min_len);
         }
     }
     // Fallback: the mmap'd shared memfd (`BHF_FUZZ_INPUT_FD`). A black-box target
@@ -371,7 +548,8 @@ mod tests {
     /// Reset module state so tests are independent of each other.
     fn reset() {
         if let Ok(mut g) = LIVE_INPUT.lock() {
-            *g = None;
+            g.published = false;
+            g.len = 0;
         }
         CURSOR.store(0, Ordering::Relaxed);
     }
@@ -390,6 +568,53 @@ mod tests {
         // First five bytes are HELLO; next five wrap to HELLO again.
         assert_eq!(&out[..5], b"HELLO");
         assert_eq!(&out[5..], b"HELLO");
+        reset();
+    }
+
+    #[test]
+    fn each_publication_replaces_the_last_whatever_its_size() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        // Larger than a page, so the next publication reuses a mapping that
+        // still holds this input's bytes past its own end.
+        let mut long = b"OLDTOKEN".repeat(1024);
+        long.extend_from_slice(b"TAIL");
+        unsafe {
+            bhf_shim_set_fuzz_input(long.as_ptr(), long.len());
+        }
+        let mut out = vec![0u8; long.len()];
+        assert_eq!(read_into(&mut out), long.len());
+        assert_eq!(out, long);
+        assert_eq!(taint_span(b"OLDTOKENOLDTOKEN", 4), Some((0, 16)));
+
+        // The caller's buffer can go away once the call returns.
+        let mut short = b"new-record".to_vec();
+        unsafe {
+            bhf_shim_set_fuzz_input(short.as_ptr(), short.len());
+        }
+        short.fill(0);
+        drop(short);
+        let mut out = [0u8; 25];
+        assert_eq!(read_into(&mut out), out.len());
+        assert_eq!(&out, b"new-recordnew-recordnew-r");
+        let mut keyed = [0u8; 12];
+        read_keyed(4, &mut keyed);
+        assert_eq!(&keyed, b"recordnew-re");
+        // Nothing of the earlier, longer input is visible.
+        assert_eq!(taint_span(b"OLDTOKEN", 4), None);
+        assert_eq!(taint_span(b"TAIL", 4), None);
+        assert_eq!(input_derived_run(b"cat OLDTOKEN", 4), None);
+        assert_eq!(input_derived_run(b"cat new-record;", 4), Some((0, 10)));
+
+        // A larger input than the mapping holds gets a larger mapping.
+        let large: Vec<u8> = (0..3 * 4096 + 7).map(|i| (i % 251) as u8).collect();
+        unsafe {
+            bhf_shim_set_fuzz_input(large.as_ptr(), large.len());
+        }
+        let mut out = vec![0u8; large.len() + 3];
+        assert_eq!(read_into(&mut out), out.len());
+        assert_eq!(&out[..large.len()], &large[..]);
+        assert_eq!(&out[large.len()..], &large[..3]);
         reset();
     }
 
@@ -474,16 +699,44 @@ mod tests {
     }
 
     #[test]
-    fn contains_bytes_matches_live_input_substrings() {
+    fn read_only_images_hold_literals_not_heap_or_writable_data() {
+        static mut WRITABLE: [u8; 8] = *b"%x%x%x\0\0";
+        let literal: &'static str = "a literal format %d";
+        assert!(points_into_read_only_image(literal.as_ptr()));
+        let heap = literal.as_bytes().to_vec();
+        assert!(!points_into_read_only_image(heap.as_ptr()));
+        let writable = (&raw const WRITABLE).cast::<u8>();
+        assert!(!points_into_read_only_image(writable));
+        let on_stack = [b'%'; 8];
+        assert!(!points_into_read_only_image(on_stack.as_ptr()));
+        assert!(!points_into_read_only_image(std::ptr::null()));
+    }
+
+    #[test]
+    fn only_formats_outside_read_only_data_that_match_the_input_are_controlled() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        let payload = b"AA%x%nZZ";
+        let payload = b"A%s%x%x%x";
         unsafe {
             bhf_shim_set_fuzz_input(payload.as_ptr(), payload.len());
         }
-
-        assert!(contains_bytes(b"%x%n"));
-        assert!(!contains_bytes(b"%p%n"));
+        // A format copied out of the input into memory the program owns.
+        let copied: Vec<u8> = b"%x%x%x".to_vec();
+        assert!(format_is_input_controlled(&copied));
+        let copied_tail: Vec<u8> = payload[3..].to_vec();
+        assert!(format_is_input_controlled(&copied_tail));
+        // Too short to tell a copy of the input from a copy of a literal.
+        let short: Vec<u8> = b"%s".to_vec();
+        assert!(!format_is_input_controlled(&short));
+        // Not in the input at all.
+        let absent: Vec<u8> = b"%p%n%p".to_vec();
+        assert!(!format_is_input_controlled(&absent));
+        // Only part of the format occurs in the input: the whole format must.
+        let partly: Vec<u8> = b"name=%x%x%x and more text".to_vec();
+        assert!(!format_is_input_controlled(&partly));
+        // A literal in the program's read-only data, though its bytes also
+        // occur in the input (a dictionary token put them there).
+        assert!(!format_is_input_controlled(b"%x%x"));
         reset();
     }
 

@@ -17,6 +17,8 @@
 //! A non-rubber-stamp test: identical program, the bridge is the only difference,
 //! and it flips a missed bug into a finding.
 
+mod support;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -118,7 +120,7 @@ fn run(dir: &std::path::Path, bin: &str) -> (Option<i32>, String) {
     // the timeout loop waits for it.
     let stderr_path = dir.join(format!("{bin}.stderr"));
     let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr capture");
-    let mut child = Command::new(dir.join(bin))
+    let mut child = support::with_sanitizer_runtime(&mut Command::new(dir.join(bin)))
         .env("ASAN_OPTIONS", "abort_on_error=0:detect_leaks=0")
         .env("DEBUGINFOD_URLS", "")
         .stdout(Stdio::null())

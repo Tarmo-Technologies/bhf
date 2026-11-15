@@ -78,3 +78,55 @@ fn decode_runtime_compiles_strict_c89() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The argument-trace header the generated harnesses include is held to the
+/// same strict-C89 bar as the decode runtime, with and without the address
+/// sanitizer interface it uses for allocation sizes.
+#[test]
+fn trace_runtime_compiles_strict_c89() {
+    if !have_clang() {
+        eprintln!("clang absent; skipping strict-C89 trace runtime check");
+        return;
+    }
+    let rt = c_runtime_dir();
+    let dir = std::env::temp_dir().join(format!("bhf-c89-trace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tu = dir.join("c89_trace.c");
+    std::fs::write(
+        &tu,
+        "#include \"bhf_trace.h\"\n\
+         int main(void) {\n\
+         \x20   unsigned char b[8];\n\
+         \x20   int v = 3;\n\
+         \x20   if (bhf_trace_on()) {\n\
+         \x20       bhf_tl_begin(\"{\\\"name\\\":\\\"v\\\"\");\n\
+         \x20       bhf_tl_span(0, 4);\n\
+         \x20       bhf_tr_i64((int64_t)v);\n\
+         \x20       bhf_tr_ptr((const void *)b, b, sizeof b, 4, 0);\n\
+         \x20       bhf_tr_str(\"x\", b, sizeof b, BHF_TRACE_NO_LEN, BHF_TRACE_NUL);\n\
+         \x20       bhf_tr_f64(1.5);\n\
+         \x20       bhf_tl_end();\n\
+         \x20   }\n\
+         \x20   return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    for extra in [&[][..], &["-fsanitize=address"][..]] {
+        let out = Command::new("clang")
+            .args(["-std=c89", "-ansi", "-pedantic-errors"])
+            .args(extra)
+            .arg(format!("-I{}", rt.display()))
+            .arg("-c")
+            .arg(&tu)
+            .arg("-o")
+            .arg(dir.join("c89_trace.o"))
+            .output()
+            .expect("run clang");
+        assert!(
+            out.status.success(),
+            "bhf_trace.h must compile strict-C89 ({extra:?}):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

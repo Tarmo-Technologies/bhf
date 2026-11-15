@@ -53,6 +53,14 @@ impl Mode {
 static CURRENT: OnceLock<Mode> = OnceLock::new();
 
 pub fn current() -> Mode {
+    // Parsing the mode compares bytes: the shim's own work, which hooks ask
+    // for before they hold a hook guard.
+    let _own = crate::reentrancy::OwnWork::enter();
+    // Once a sanitizer is reporting, nothing is faked: the mode an unset
+    // BHF_RUNTRACE_MODE selects, which only observes (see `reporting`).
+    if crate::fakes::reporting::sanitizer_is_reporting() {
+        return Mode::from_env_byte_str(b"");
+    }
     *CURRENT.get_or_init(|| {
         std::env::var_os("BHF_RUNTRACE_MODE")
             .map(|v| Mode::from_env_byte_str(v.as_encoded_bytes()))

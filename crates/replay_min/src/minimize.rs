@@ -205,7 +205,15 @@ pub fn load_decoded_typed_spans(finding_dir: &Path) -> Result<Vec<TypedSpan>, Mi
         return Ok(Vec::new());
     }
 
-    let decoded: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let bytes = std::fs::read(&path).map_err(|source| crate::ReplayError::IoAt {
+        path: path.clone(),
+        source,
+    })?;
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| crate::ReplayError::JsonAt {
+            path: path.clone(),
+            source,
+        })?;
     let Some(spans) = decoded.get("typed_spans") else {
         return Ok(Vec::new());
     };
@@ -248,7 +256,9 @@ fn load_reproducing_input_with_runner(
     finding_dir: &Path,
     runner: &HarnessRunner,
 ) -> Result<(Signature, Vec<u8>), MinimizeError> {
-    let ReplayInput { recorded, input } = load_finding(finding_dir)?;
+    let ReplayInput {
+        recorded, input, ..
+    } = load_finding(finding_dir)?;
     let original = signatures_for_input_with_runner(runner, &input)?;
     if !original.contains(&recorded) {
         return Err(MinimizeError::OriginalMismatch {

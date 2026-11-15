@@ -13,7 +13,9 @@
 //!   AFL++, and honggfuzz;
 //! - a `bhf_libfuzzer.c` shim (for the lanes that gain a libFuzzer binary) that
 //!   adapts bhf's stable `bhf_run_one(data, size)` entry to libFuzzer's
-//!   `LLVMFuzzerTestOneInput`.
+//!   `LLVMFuzzerTestOneInput`. A passthrough harness, which wraps the project's
+//!   own `LLVMFuzzerTestOneInput`, gets no shim: libFuzzer drives the project's
+//!   entry point directly.
 //!
 //! The artifacts are inert: they change nothing about how bhf's own engine
 //! drives the harness. They only let a *different* fuzzer consume the same
@@ -120,6 +122,11 @@ pub struct PortabilitySpec {
     /// Name of the AFL++ persistent binary a user can build, if any
     /// (`main_afl`). `None` suppresses the AFL sections.
     pub afl_binary: Option<String>,
+    /// The harness wraps the project's own `LLVMFuzzerTestOneInput` (a
+    /// passthrough target). Its libFuzzer and honggfuzz builds link the
+    /// project's sources directly; the `bhf_libfuzzer.c` shim, which would
+    /// define a second `LLVMFuzzerTestOneInput`, is not written.
+    pub passthrough_entrypoint: bool,
     /// When true, the generated `cmd` is prefixed with
     /// `env BHF_CRASH_ON_FINDING=1` so a reported finding aborts the process and
     /// an external crash-keying engine detects it (Ada caught-exception case).
@@ -225,10 +232,18 @@ process when a finding is reported:\n\n",
     // libFuzzer.
     if let Some(lf) = &spec.libfuzzer_binary {
         s.push_str("## libFuzzer (and Mayhem coverage-guided)\n\n");
-        s.push_str(&format!(
-            "`LLVMFuzzerTestOneInput` is provided by the generated `{LIBFUZZER_SHIM_NAME}` shim \
+        if spec.passthrough_entrypoint {
+            s.push_str(
+                "This harness wraps the project's own `LLVMFuzzerTestOneInput`, so the libFuzzer \
+build links the project's sources straight against libFuzzer: there is no shim, and \
+`main.c`/`main.cpp` (bhf's driver around the same entry point) is left out.\n\n",
+            );
+        } else {
+            s.push_str(&format!(
+                "`LLVMFuzzerTestOneInput` is provided by the generated `{LIBFUZZER_SHIM_NAME}` shim \
 (it forwards to bhf's `bhf_run_one`).\n\n"
-        ));
+            ));
+        }
         match spec.lane {
             Lane::C | Lane::Cpp => {
                 s.push_str(&format!(
@@ -261,10 +276,32 @@ staticlib and links it into `./{lf}`:\n\n```sh\n./build-libfuzzer.sh    # -> ./{
 
     // honggfuzz (only where a libFuzzer-style entry exists).
     if spec.libfuzzer_binary.is_some() && matches!(spec.lane, Lane::C | Lane::Cpp) {
+        let (compiler, main_source) = match spec.lane {
+            Lane::Cpp => ("hfuzz-clang++", "main.cpp"),
+            _ => ("hfuzz-cc", "main.c"),
+        };
         s.push_str("## honggfuzz\n\n");
         s.push_str(&format!(
-            "honggfuzz consumes the same `LLVMFuzzerTestOneInput` entry via `hfuzz-cc`:\n\n```sh\nhfuzz-cc -fsanitize=address,undefined {LIBFUZZER_SHIM_NAME} main.c <target-sources> -o {bin}.hfuzz\nhonggfuzz -i seeds -- ./{bin}.hfuzz\n```\n\n"
+            "honggfuzz consumes the same `LLVMFuzzerTestOneInput` entry via `{compiler}`. \
+`<include-flags>` and `<target-sources>` are the include flags and sources on the Makefile's \
+`main_libfuzzer` recipe.\n\n```sh\n"
         ));
+        if spec.passthrough_entrypoint {
+            s.push_str(&format!(
+                "{compiler} -fsanitize=address,undefined <include-flags> <target-sources> -o {bin}.hfuzz\n"
+            ));
+        } else if spec.lane == Lane::Cpp {
+            // The shim is C: compile it as C so its symbols keep C linkage.
+            s.push_str(&format!(
+                "hfuzz-clang -fsanitize=address,undefined -c {LIBFUZZER_SHIM_NAME} -o bhf_libfuzzer.hfuzz.o\n\
+{compiler} -fsanitize=address,undefined -DBHF_EXTERNAL_DRIVER <include-flags> {main_source} bhf_libfuzzer.hfuzz.o <target-sources> -o {bin}.hfuzz\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "{compiler} -fsanitize=address,undefined -DBHF_EXTERNAL_DRIVER <include-flags> {main_source} {LIBFUZZER_SHIM_NAME} <target-sources> -o {bin}.hfuzz\n"
+            ));
+        }
+        s.push_str(&format!("honggfuzz -i seeds -- ./{bin}.hfuzz\n```\n\n"));
     }
 
     s.push_str("---\n");
@@ -281,8 +318,13 @@ for triage — it executes the target exactly once per input.\n",
 pub fn write_artifacts(dir: &Path, spec: &PortabilitySpec) -> io::Result<()> {
     fs::write(dir.join(MAYHEMFILE_NAME), mayhemfile(spec))?;
     fs::write(dir.join(PORTABILITY_DOC_NAME), portability_md(spec))?;
-    if spec.libfuzzer_binary.is_some() {
-        fs::write(dir.join(LIBFUZZER_SHIM_NAME), LIBFUZZER_SHIM_C)?;
+    let shim = dir.join(LIBFUZZER_SHIM_NAME);
+    if spec.libfuzzer_binary.is_some() && !spec.passthrough_entrypoint {
+        fs::write(shim, LIBFUZZER_SHIM_C)?;
+    } else if spec.passthrough_entrypoint && shim.is_file() {
+        // A shim left by an earlier, non-passthrough generation into this
+        // directory would define a second `LLVMFuzzerTestOneInput`.
+        fs::remove_file(shim)?;
     }
     Ok(())
 }
@@ -301,6 +343,7 @@ mod tests {
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: Some("main_afl".to_owned()),
             crash_on_finding_env: false,
+            passthrough_entrypoint: false,
         }
     }
 
@@ -314,6 +357,7 @@ mod tests {
             libfuzzer_binary: None,
             afl_binary: None,
             crash_on_finding_env: true,
+            passthrough_entrypoint: false,
         }
     }
 
@@ -388,6 +432,7 @@ mod tests {
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: None,
             crash_on_finding_env: false,
+            passthrough_entrypoint: false,
         };
         let d = portability_md(&spec);
         // Rust's libFuzzer binary comes from a fresh instrumented build script.
@@ -396,6 +441,55 @@ mod tests {
         assert!(!d.contains("make libfuzzer"), "{d}");
         // No AFL section when the lane offers no AFL binary.
         assert!(!d.contains("## AFL++"), "{d}");
+    }
+
+    #[test]
+    fn cpp_honggfuzz_recipe_builds_main_cpp_with_the_cpp_driver() {
+        let spec = PortabilitySpec {
+            lane: Lane::Cpp,
+            ..c_spec()
+        };
+        let d = portability_md(&spec);
+        assert!(d.contains("hfuzz-clang++ "), "{d}");
+        assert!(d.contains(" main.cpp bhf_libfuzzer.hfuzz.o "), "{d}");
+        assert!(d.contains("-DBHF_EXTERNAL_DRIVER"), "{d}");
+        assert!(!d.contains(" main.c "), "{d}");
+        // The C recipe keeps hfuzz-cc and main.c, built for the external driver.
+        let c = portability_md(&c_spec());
+        assert!(
+            c.contains("hfuzz-cc -fsanitize=address,undefined -DBHF_EXTERNAL_DRIVER"),
+            "{c}"
+        );
+        assert!(c.contains(" main.c bhf_libfuzzer.c "), "{c}");
+    }
+
+    #[test]
+    fn passthrough_harness_gets_no_shim_and_links_the_project_entry_point() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bhf-portability-passthrough-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        // A shim from an earlier generation into the same directory is removed.
+        fs::write(tmp.join(LIBFUZZER_SHIM_NAME), LIBFUZZER_SHIM_C).unwrap();
+        let spec = PortabilitySpec {
+            lane: Lane::Cpp,
+            passthrough_entrypoint: true,
+            ..c_spec()
+        };
+        write_artifacts(&tmp, &spec).unwrap();
+        assert!(!tmp.join(LIBFUZZER_SHIM_NAME).exists());
+        let d = fs::read_to_string(tmp.join(PORTABILITY_DOC_NAME)).unwrap();
+        assert!(d.contains("make libfuzzer"), "{d}");
+        assert!(d.contains("project's own `LLVMFuzzerTestOneInput`"), "{d}");
+        assert!(!d.contains(LIBFUZZER_SHIM_NAME), "{d}");
+        assert!(
+            d.contains(
+                "hfuzz-clang++ -fsanitize=address,undefined <include-flags> <target-sources> -o main.hfuzz"
+            ),
+            "{d}"
+        );
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

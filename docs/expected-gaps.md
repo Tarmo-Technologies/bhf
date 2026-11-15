@@ -134,9 +134,9 @@ Same shape as C-1's "definition is in a non-included source", in C++.
 
 ### C++-6. `compile flag contains a shell/make metacharacter` — 6 — **[FIXED]**
 
-A flag that is safe once single-quoted is now quoted rather than refused; `$`, a
-single quote and a newline are still refused, and paths/include names stay
-strict.
+A flag that is safe once single-quoted is now quoted rather than refused (an
+apostrophe in it is written `'\''`); `$`, `#` and a newline are still refused,
+and paths/include names stay strict.
 
 ### C++-7. `linker command failed` — 10 — **GAP or DEPENDENCY**, unsplit
 

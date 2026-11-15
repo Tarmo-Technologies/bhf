@@ -159,6 +159,10 @@ fn apt_package_for(kind: DepKind, name: &str) -> Option<String> {
 
 /// Whether `program` is an executable on `$PATH`.
 pub fn on_path(program: &str) -> bool {
+    if cfg!(windows) {
+        // `which` also tries Windows' executable extensions (`winget.exe`).
+        return which::which(program).is_ok();
+    }
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -261,7 +265,9 @@ mod tests {
 
     #[test]
     fn on_path_finds_a_real_program_and_misses_a_fake_one() {
-        assert!(on_path("sh"), "sh should be on PATH");
+        // `cmd` is `cmd.exe` on disk: found through Windows' extensions.
+        let present = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(on_path(present), "{present} should be on PATH");
         assert!(!on_path("definitely-not-a-real-program-xyzzy"));
     }
 }

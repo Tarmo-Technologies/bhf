@@ -25,19 +25,25 @@ The generated `bhf_build.gpr` includes:
 ```gpr
 for Target use "aarch64-linux-gnu";
 for Runtime ("Ada") use "ravenscar-full";
-for Toolchain_Name ("Ada") use "aarch64-linux-gnu";
 ```
 
-`--toolchain` is the executable prefix used on `PATH`. With the example above,
-bhf looks for `aarch64-linux-gnu-gprbuild` for project builds and
-`aarch64-linux-gnu-gnat` for the capability canary. If `--toolchain` is omitted
-but `--target` is present, the target triple is used as the prefix.
+`--toolchain` is the executable prefix used on `PATH`, never a
+`Toolchain_Name` (that attribute takes a gprconfig compiler name such as
+`GNAT`, which `--toolchain GNAT` writes). With the example above, bhf runs
+`aarch64-linux-gnu-gprbuild` for project builds, or the multi-target `gprbuild`
+when there is no prefixed one, and `aarch64-linux-gnu-gnatmake` (else
+`aarch64-linux-gnu-gnat`) for the capability canary. If `--toolchain` is omitted
+but `--target` is present, the target triple is used as the prefix; if
+`--target` is omitted, the prefix is the target.
 
 Before building, the capability probe compiles a tiny canary with:
 
 ```sh
-<prefix>-gnat -c -gnatc <dialect> canary.adb
+<prefix>-gnatmake -c -gnatc <dialect> canary.adb
 ```
+
+(`<prefix>-gnat` with the same switches when no prefixed gnatmake is
+installed.)
 
 If a required prefixed tool is missing, the command exits with code `2` and a
 message of the form:

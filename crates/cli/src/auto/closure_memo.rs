@@ -149,6 +149,7 @@ fn project_fingerprint(work_dir: &Path, force: bool) -> String {
     for relative in [
         crate::auto::attempt::ADA_EXTERNAL_MODEL,
         "c_compat.mk",
+        crate::auto::attempt::CXX_COMPAT_FILE,
         "cxx_dialect.txt",
     ] {
         let path = work_dir.join(relative);

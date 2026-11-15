@@ -159,7 +159,12 @@ fn temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-minimize-{name}-{nonce}"));
+    // A counter as well as the time: on Windows the clock's 100 ns tick is
+    // coarse enough for two tests on parallel threads to read the same value,
+    // and two tests sharing a dir overwrite each other's finding.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("bhf-minimize-{name}-{nonce}-{next}"));
     fs::create_dir_all(&dir).unwrap();
     dir
 }

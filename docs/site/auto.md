@@ -68,7 +68,8 @@ their own interpreters with in-process edge coverage.
 | `--work-dir <DIR>` | `./bhf_work/` | Output root |
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
-| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it. Keys are the flag names in kebab-case (`per-target-time = 30`, `cxx-std = "gnu++14"`, `extra-include = ["deps/inc"]`). Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the build-EXECUTING keys (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`) are ignored unless the config is passed explicitly with `--config` |
+| `--reuse-legacy-corpus` | off | In a work dir from an earlier release (migrated from the 0.2.x layout, or run by an earlier `bhf auto`), keep reseeding its old corpus instead of moving it to `corpus-legacy/` on the first run |
+| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate`, `winafl-path`, `dynamorio-path`, and the whole `[toolchain]` and `[cross.<guard>]` tables) are ignored, with a note, unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
 | `--per-target-finding-count <N>` | unset (collect all) | Stop a target as soon as it has produced N **distinct** findings (crash signatures), or when its `--per-target-time` is spent — whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash |
@@ -86,21 +87,33 @@ their own interpreters with in-process edge coverage.
 | `--discovery-cache <PATH>` | `<work>/discovery-cache.json` | Put the default-on cache at an explicit path, useful when work directories change or the cache belongs on a known volume |
 | `--fresh-discovery` | off | Force a fresh discovery this run (ignore any cache), then overwrite the cache with the new result |
 | `--no-discovery-cache` | off | Disable the discovery cache entirely (never read or write it) |
-| `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results |
+| `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results. A target whose lane's toolchain was missing (`missing_toolchain`), or whose sanitizer runtime could not start (`sanitizer_runtime_unavailable`), is always tried again, since the host may have been fixed since |
 | `--reuse-discovery` | — | Deprecated no-op (caching is now the default); accepted for back-compat |
 | `--sanitizers <asan,ubsan,msan,tsan,lsan \| none>` | none | Arm the named matrix for native C/C++ builds (the other lanes own their instrumentation). `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
 | `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++ only; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
-| `--differential <A:B>` | unset | Two-compiler differential fuzzing (C/C++), e.g. `clang:gcc`: after the normal run, rebuild each C/C++ harness under both compilers and replay the corpus through both, flagging any input whose exit/crash behavior diverges (a codegen- or UB-dependent bug) as a BHF-301 finding |
-| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus; repeatable |
-| `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file); repeatable |
-| `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; repeatable |
+| `--differential <A:B>` | unset | Two-compiler differential fuzzing (C/C++), e.g. `clang:gcc`: after the normal run, rebuild each C/C++ harness under both compilers and replay the corpus through both, flagging any input whose exit/crash behavior diverges (a codegen- or UB-dependent bug) as a BHF-301 finding. Either side may be a compiler path; paths with spaces are quoted |
+| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus, used byte for byte (binary formats included); repeatable. Any explicit seed input turns tree seed mining off, even one that loads nothing (a missing file, an empty dir) |
+| `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file, in name order); repeatable |
+| `--no-seed-mining` | off | Do not seed targets from the tree's own test-data files (see [Seeds](#seeds)). Config key: `seed-mining = false` |
+| `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; paths with spaces are quoted; repeatable |
+| `--cc <PROGRAM>` / `--cxx <PROGRAM>` | `clang` / `clang++` | C/C++ compiler for every harness build (a name on `PATH` or a path), replacing `CC`/`CXX`. The Makefile picks matching instrumentation (gcc, a cross-prefixed gcc, or clang), so no flag spelling has to be adapted. A C++ compiler derived from `--cc` or `--target-triple` (`g++` next to `gcc`) must exist only when the sweep has a C++ candidate. The choice is announced; config keys `toolchain.cc` / `toolchain.cxx` |
+| `--cflags <FLAGS>` / `--cxxflags <FLAGS>` / `--ldflags <FLAGS>` | none | Extra compile / link flags, APPENDED to bhf's coverage and sanitizer flags (whitespace-separated; repeatable). Their preprocessor words (`-D`, `-U`, `-I`, `-isystem`, `-include`) and the library operands of `ldflags` (`-L`, `-l`, archives, objects, linker options `-Wl,...`/`-Xlinker ...`, `-pthread`, in their order, with the linker choice `-fuse-ld=`/`--ld-path=` they are written for) reach every build lane (coverage, AFL++, libFuzzer, MSan, TSan, differential); the rest apply to the lanes built with `$(CC)`/`$(CXX)`. A `CFLAGS`/`CXXFLAGS` in the environment is appended to the `main` build as well, after bhf's flags, except in a build whose compiler bhf picked in place of the operator's (a platform guard's cross lane, the `--sanitizers` clang fallback). A lane that still fails to build is reported (`run.json` `targets[].lanes`, with the time each lane was recorded in `recorded_at`, `summary.txt`, `run.md`; a lane of a target `--resume` reloaded is marked as recorded by an earlier run); config keys `toolchain.cflags` / `toolchain.cxxflags` / `toolchain.ldflags` |
+| `--define <NAME[=VALUE]>` / `--toolchain-include <DIR>` | none | Preprocessor definitions and `-I` directories for every harness compile and every lane, bhf's driver object included (repeatable); config keys `toolchain.defines` / `toolchain.include-dirs` |
+| `--sysroot <DIR>` | unset | Handed to the compiler as `--sysroot=`, and to a qemu-user runner as `-L <DIR>` when `--runner-arg` is not given; config key `toolchain.sysroot` |
+| `--target-triple <TRIPLE>` | host | Build every C/C++ candidate for this triple, with `<triple>-gcc`/`<triple>-g++` unless `--cc`/`--cxx` name the compilers (a clang gets `--target=`). A triple the host cannot run needs `--runner`; config key `toolchain.target` |
+| `--runner <PROGRAM>` / `--runner-arg <ARG>` | unset | Whole-sweep cross mode: every C/C++ candidate is built for the target WITH coverage and fuzzed under this emulator (`qemu-aarch64`). Arguments go between the runner and the harness; see [Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets). Config keys `toolchain.runner` / `toolchain.runner-args` |
+| `--ada-prefix`, `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`, `--ada-switch`, `--probe-backend` | host GNAT, `host_file` | The Ada toolchain of every Ada harness build: tool prefix (`<prefix>-gnat`), `for Target use`, `for Runtime ("Ada") use`, explicit `gprbuild`/`gnat` programs, extra compiler switches appended to bhf's, and the AdaFuzz probe backend. `--ada-target` defaults to `--target-triple`. When the tree has Ada candidates, the toolchain must be installed: a `<prefix>-gprbuild` (or `gprbuild` with `<prefix>-gnat`), or the explicit programs, else the run (and `--dry-run`) stops with exit 2 naming the key. A probe backend other than `host_file` needs an on-target transport, so without a runner it is refused the same way: a host sweep reads events only through `host_file`; `bhf build` refuses it too for an Ada harness built for this host (no foreign `--target`), whether it comes from the flag or the config. The choice is announced. Config keys `toolchain.ada.prefix`, `toolchain.ada.target`, `toolchain.ada.runtime`, `toolchain.ada.gprbuild`, `toolchain.ada.gnat`, `toolchain.ada.switches`, `toolchain.ada.probe-backend` |
 | `--ada-deps <DIR>` | none | Local Ada dependency-source dirs put on the build path (offline: never fetched); repeatable. Locally-cached Alire deps are picked up automatically |
 | `--probe-build` | off | Run the project's own build offline to recover real compile flags and generated headers. Detects + drives CMake, Meson, Visual Studio, Make/autotools (compiler-interposing wrapper), Ninja, and — under interception — Bazel/SCons. EXECUTES untrusted build scripts (sandboxed when bwrap/firejail is present) |
-| `--build-command <CMD>` | unset | Recover flags from any CUSTOM build (a `build.sh`, Waf, a vendor RTOS build) by running `<CMD>` under (1) a front-of-`PATH` compiler shim for `cc`/`gcc`/`clang` + named vendor compilers (Diab, Green Hills, QNX, Keil/IAR, TI) + cross-prefixed toolchains invoked by name, and (2) an `LD_PRELOAD` exec-interposer for compilers invoked by absolute path or `posix_spawn`. The universal escape hatch; takes precedence over the auto-detected tier. Accepts either a script (`--build-command ./build.sh`) or a full command (`--build-command "make -C src lib"`), run via `sh -c`. EXECUTES the command (sandboxed when available). When builds fail and a custom build script is present, `auto` prints a ready-to-run hint with this flag |
+| `--msbuild-solution <PATH>` | shallowest `.sln`/`.slnx` | The Visual Studio solution the default project import reads (a tree with a solution or `.vcxproj` and no compile database or CMake/Meson build; off Windows, only when the solution is the tree's only build description, unless this flag names it). A relative PATH is resolved against the scanned tree, a solution outside the tree is imported too, and a missing file is an error. The import runs nothing: it evaluates the projects' property sheets and `Condition=`s for one configuration and writes `<work>/auto/msbuild/compile_commands.json`. See [c-cpp.md](c-cpp.md) |
+| `--msbuild-config <CONFIG\|PLATFORM>` | first listed for x64 | The configuration the project import applies (`Release\|x64`) |
+| `--no-msbuild-import` | off | Do not import a Visual Studio solution by default |
+| `--msbuild-evaluate` | off | Let an installed MSBuild evaluate the imported projects (`msbuild -getItem:ClCompile`), with the static reading as the fallback. Runs the projects' property functions and imported `.props`/`.targets`, code from the scanned tree, so it is opt-in (see [windows.md](windows.md)); `--probe-build` and `--run-untrusted` imply it |
+| `--build-command <CMD>` | unset | Recover flags from any CUSTOM build (a `build.sh`, Waf, a vendor RTOS build) by running `<CMD>` under (1) a front-of-`PATH` compiler shim for `cc`/`gcc`/`clang` + named vendor compilers (Diab, Green Hills, QNX, Keil/IAR, TI) + cross-prefixed toolchains invoked by name, and (2) an `LD_PRELOAD` exec-interposer for compilers invoked by absolute path or `posix_spawn`. The universal escape hatch; takes precedence over the auto-detected tier. Accepts either a script (`--build-command ./build.sh`) or a full command (`--build-command "make -C src lib"`), run via `sh -c` (on Windows via `cmd.exe`, with executable shims and an MSBuild build captured through its CL task; see [windows.md](windows.md)). EXECUTES the command (sandboxed when available). When builds fail and a custom build script is present, `auto` prints a ready-to-run hint with this flag |
 | `--cxx-std <STD>` | auto | Pin the C++ standard for every harness build (`gnu++14`, `c++03`, …) for legacy C++. By default `auto` builds C++ at the modern standard and, on a dialect failure, automatically retries successively older standards (`gnu++17`→`gnu++14`→…→`gnu++98`) until one builds — the chosen standard is cached per project, so no flag is needed for old code unless you want to override the search |
 | `--grammar <PATH>` | unset | JSON grammar describing the target's input format for structure-aware generation (a Nautilus-style grammar mutator), applied to every fuzzed target. Each rule maps a non-terminal to production strings where `{NAME}` references another rule; the start symbol is `START` or the first rule. Validated up front (a bad grammar fails the run fast) |
-| `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap |
+| `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap. Seeds are kept whole up to this cap for both engines; with `--engine afl++` a fixed cap below AFL++'s 1 MiB default is also passed to afl-fuzz as `-G` when it has that option (AFL++ 4.00c or newer; an older afl-fuzz gets only the capped seeds, and a note on stderr) |
 | `--timeout <DUR>` | `10s` | Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a hang/timeout |
 | `--run-untrusted` | off | Consent umbrella for `--probe-build`, Ada (`alr build` / `gprbuild`) build probes, and Java Maven/Gradle project builds. Java project builds use Maven offline mode or Gradle `--offline`; stage target dependencies first. Bare Java source can still use `javac` without this flag. Implies `--probe-build`. EXECUTES untrusted scripts |
 | `--unsafe-search-and-run-build-commands` | off | UNSAFE convenience: search the tree for its own build entry point and EXECUTE it to recover flags, instead of you passing `--build-command`. Finds a custom build (build.sh, autotools bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the compiler-intercepting shim, and enables the `--probe-build` tiers (CMake/Meson/Make) + the Ada build probe. Runs sandboxed when available, but it executes UNTRUSTED code from the scanned tree — use only on sources you trust. An explicit `--build-command` overrides the search |
@@ -112,7 +125,7 @@ their own interpreters with in-process edge coverage.
 | `--install-deps` | off | After the sweep, fetch still-blocking deps from the manifest (apt-get / `alr get`). Opt-in and the only ONLINE part of `auto`; nothing is fatal |
 | `--list-fakes` | — | Print the fake-resource plugin inventory and exit |
 | `--languages <LIST>` (alias `--lang`) | all languages found | Restrict the sweep to a comma-separated subset of source languages. Accepts any of the sixteen fuzzable languages: `ada`, `c`, `cpp`, `rust`, `java`, `python`, `perl`, `go`, `cobol`, `fortran`, `csharp`, `javascript`, `typescript`, `ruby`, `lua`, `php`. Candidates in any other language are dropped **after** discovery (so one discovery cache serves every language subset) and **before** `--list-targets` and `--max-targets`, so the ranked list and the top-N both reflect the filter. Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust, `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive. The SBOM/SCA pass is unaffected — it always scans the whole tree across all ecosystems regardless of this fuzzing-lane filter |
-| `--target <NAME>` | all discovered targets | Exact target-name filter; repeat to run a small named subset |
+| `--target <NAME>` | all discovered targets | Target-name filter: the full discovered name, the bare name, or a qualified suffix (`Class::method`), optionally with the parameter list. An exact spelling wins; the suffix match applies only when no target has exactly that name. Repeat to run a small named subset. A miss prints the closest names. Selects a project fuzz driver (`LLVMFuzzerTestOneInput`) that other targets would otherwise shadow |
 | `--target-file <PATH>` | all discovered source files | Exact source-file filter; accepts absolute paths or paths relative to the sweep root |
 | `--harness-id <ID>` | all discovered harness ids | Exact stable harness-id filter from a prior auto report |
 | `--exclude-path <TEXT>` | none | Drop targets whose normalized relative source path contains `TEXT`; repeatable |
@@ -120,6 +133,115 @@ their own interpreters with in-process edge coverage.
 | `--no-stubs` | off | Skip build-time auto-stubbing (diagnostics only) |
 | `--mode reporting\|attacking` | `reporting` | Actionability profile and, in attacking mode, target scheduling |
 | `--verbose` / `-v` | off | Per-target outcome detail: skip/fail reason, repairs applied, per-pass exec/finding counts |
+
+## Config file
+
+`--config <PATH>` (or a `.bhf.toml` auto-loaded from the scanned tree root)
+holds run options as TOML. A key fills a flag the command line did not give
+(a flag given with its default value still wins); relative paths resolve against the config file's directory, so the
+file means the same thing from any working directory. Only these keys exist,
+each spelled like its flag:
+
+- Run budget and limits: `per-target-time`, `max-targets`, `jobs`,
+  `rss-limit-mb`, `max-work-dir-mb`, `max-corpus-mb`, `max-len`, `timeout`.
+- Build inputs: `cxx-std`, `grammar`, `extra-include`, `extra-source`,
+  `exclude-path`, `project`, `ada-deps`.
+- Seeds and selection: `seed-file`, `seed-dir`, `seed-mining = false` (the
+  `--no-seed-mining` flag), `sanitizers`, `engine`, `languages`, `passes`,
+  `force`.
+- Explicit `--config` only, because they execute something: `build-command`,
+  `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`,
+  `msbuild-evaluate`, `winafl-path` and `dynamorio-path` (the WinAFL and
+  DynamoRIO installs `--engine winafl` runs), the `[toolchain]` table and the
+  `[cross.<guard>]` tables.
+
+The other flags (target selection, `--resume`, `--dry-run`, output and
+diagnostic switches) have no key; a unit test keeps this list and the flag set
+in step.
+
+The `[toolchain]` table is shared with `bhf build --config`:
+
+```toml
+[toolchain]
+cc = "aarch64-linux-gnu-gcc"     # program on PATH, or a path
+cxx = "aarch64-linux-gnu-g++"
+cflags = ["-O1"]                 # appended to bhf's instrumentation
+cxxflags = []
+ldflags = []
+defines = ["BOARD=3"]            # NAME or NAME=VALUE
+include-dirs = ["vendor/include"]
+target = "aarch64-linux-gnu"     # without cc/cxx: <target>-gcc / <target>-g++
+sysroot = "/opt/sdk/sysroot"
+runner = "qemu-aarch64"          # runs whatever is built for another target
+runner-args = ["-L", "/usr/aarch64-linux-gnu"]
+
+[toolchain.ada]
+prefix = "aarch64-linux-gnu"     # <prefix>-gnat; also the Target by default (Ada only)
+gprbuild = "/opt/gnat/bin/gprbuild"
+gnat = "/opt/gnat/bin/aarch64-linux-gnu-gnat"
+target = "aarch64-linux-gnu"     # defaults to [toolchain] target
+runtime = "light"
+switches = ["-O1"]
+probe-backend = "memory_buffer"
+```
+
+Every value is validated before the sweep starts: an unknown key, a define
+that is not `NAME[=VALUE]`, a target that is not a triple, `runner-args`
+without a `runner`, a compiler or runner that is not installed, a target (C/C++
+or Ada) or a C/C++ compiler (including `CC`/`CXX` from the environment) that
+builds for a platform the host cannot run without a runner, and a runner with
+nothing foreign to run are all errors naming the key.
+
+The C/C++ candidates become a cross sweep only when the C/C++ side builds for
+another target (`target`, or a cross `cc`); a runner set for a foreign
+`[toolchain.ada] target` alone runs just the Ada harnesses, and the C/C++
+candidates keep their native sanitizer builds. In a cross sweep, the archives
+`probe-build`/`build-command`/`run-untrusted` build for this host (in the probe
+directory, or in the tree for a plain Makefile) are rebuilt for the target from
+the captured compile commands and linked in their place; an archive that cannot
+be rebuilt is named with the reason. In a native sweep
+with a GCC toolchain, the build probe builds its archives with that GCC and
+GCC-spelled instrumentation. See
+[Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets).
+
+`[cross.<guard>]` tables override the toolchain and emulator of one
+guard-driven cross lane, the one candidates guarded for that platform take:
+
+```toml
+[cross.aarch64]                  # lanes: mingw, aarch64, armhf, ppc64le, ppc64, ppc, mipsel, mips, sparc64
+cc = "/opt/arm/bin/aarch64-none-linux-gnu-gcc"   # cxx follows (g++), or set cxx
+target = "aarch64-linux-gnu"     # without cc/cxx: <target>-gcc / <target>-g++
+sysroot = "/opt/arm/sysroot"     # --sysroot= for every compile and link, bhf's driver included
+runner = "qemu-aarch64"          # program that runs the harness
+runner-args = ["-L", "/opt/arm/sysroot"]
+```
+
+A key left out keeps bhf's built-in choice for the lane, and a clang `cc` gets
+`--target=<triple>`. See
+[Cross-Compilation](../cross-compilation/#overriding-a-lanes-toolchain).
+
+An Ada harness's project extends the governing project and its `package
+Compiler`: bhf's switches follow the parent's `Default_Switches ("Ada")`, so a
+switch the sources need (`-O1`, a `-gnateD` symbol) stays; add further ones
+with `switches`.
+
+`toolchain.cflags` reach bhf's driver object as well as the target's
+translation units (without `-std=` and `-Werror`), so an ABI-selecting flag
+(`-m32`, `-mabi=...`) applies to the whole link. In a C++ harness the driver,
+which is C compiled by the C++ compiler, takes only the `cxxflags` that select
+the ABI or target (`-m*`, `--target=`, `-fPIC`, `-fshort-wchar`, ...) and
+`-D`/`-U`/`-I`/`-isystem`, so a C++-only flag such as `-include iostream` or
+`-fno-rtti` reaches the target and not the driver.
+
+Every sanitized lane, the gcc probe build and a capsule's `build.sh` end
+their compiles with `-U_FORTIFY_SOURCE -Wp,-U_FORTIFY_SOURCE
+-Wp,-D_FORTIFY_SOURCE=0`, after the build context's and the toolchain's
+flags: glibc's fortification, on by default in Ubuntu's gcc and in many
+distributions' build flags, would otherwise abort an overflow in a fortified
+call (`*** buffer overflow detected ***`) before AddressSanitizer reports it.
+The `-Wp,` words win over a `-Wp,-D_FORTIFY_SOURCE=N` in the build flags
+(Fedora's, RHEL's and Arch's spelling), which the compiler applies after
+every plain `-D` and `-U`.
 
 ## Outputs and disk cleanup
 
@@ -318,7 +440,9 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 | Ada | `./main < input` (stdin) | — | — |
 
 The libFuzzer binaries use a generated `bhf_libfuzzer.c` shim that forwards
-libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. For Rust it is a
+libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. A harness that
+wraps the project's own `LLVMFuzzerTestOneInput` has no shim: `make libfuzzer`
+links the project's sources directly. For Rust it is a
 separate instrumented build (`build-libfuzzer.sh`), because modern libFuzzer
 cannot consume bhf's default `trace-pc-guard` staticlib.
 
@@ -402,8 +526,9 @@ C / C++ (`crates/c_stub_gen`):
 |---|---|
 | `MissingHeader{path}` | Synthesised placeholder header under `<harness>/repairs/auto_includes/<path>`, added to `-I` |
 | `MissingType{name}` | `typedef void *T;` appended to `<harness>/repairs/auto_types.h` |
-| `UndefinedSymbol{name}` | Looked up in the declaration index. Match → declared stub. No match → blind `void(void)` stub. Appended to `<harness>/repairs/auto_stubs.c` |
+| `UndefinedSymbol{name}` | Looked up in the declaration index. Match → declared stub. No match → blind `void(void)` stub. Appended to `<harness>/repairs/auto_stubs.c`. A name of a compiler or sanitizer runtime (`__asan_*`, `__llvm_profile_*`, `__cxa_*`, `__stack_chk_fail`) is never stubbed, nor, on a link against the Windows C runtime, a name of that runtime or MinGW's (`_dup`, `__mingw_fprintf`, `__main`, `__chkstk`): only the tree's own definition of it is linked, otherwise the build fails with the linker's error, since such a reference means a runtime library is missing or objects of two toolchains were mixed. Off Windows, `_write` and `_read` (a newlib port's syscall hooks) are ordinary symbols |
 | `MissingSharedLib{name}` | Not auto-repaired. Flows to `needed_for_build.missing_libraries` and the `missing-deps` manifest; the target is marked `unrecoverable_link` |
+| Standard-library names used without `std::` (`unknown type name 'string'`, `no template named 'map'`, g++'s `'map' does not name a type`) | The std prelude `bhf build` writes, `<harness>/std_prelude.h`, force-included into every translation unit; see below |
 | `ConfigGuardError{file,line}` | A `#error` a build-config guard reached (libssh's `#error "no strtoull function found"`). The conditional owning the `#error` is read and the macro it tests is `#define`d into `auto_defines.h`, with the value the guard requires (`#if (DEPTH != 8)` → `8`, a plain feature test → `1`). An undecidable guard — a comparison, a compound condition, or an error that fires *because* a macro is defined — is refused rather than guessed |
 
 Ada (`crates/stub_gen`):
@@ -415,6 +540,38 @@ Ada (`crates/stub_gen`):
 | `"X.Y" is not visible` | `Visibility` stub |
 | `missing body for unit "X"` | Empty `PackageBody` |
 | `cannot find "X.gpr"` | Not auto-repaired; flows to `needed_for_build.missing_gpr_imports` |
+
+A pre-standard C++ header often writes `string`, `map<string, int>` or
+`list<T>` without `std::`, relying on a `using namespace std;` that the
+project's own sources put before including it; the generated harness has
+none. When a C++ harness build fails on such names, before the other retries
+(the dialect ladder, the other compiler) the build writes the prelude
+`bhf build` writes, `<harness>/std_prelude.h` (each name's standard header
+and a `using std::` declaration for it; an existing file only gains the
+lines it lacks), force-includes it into every translation unit of the
+harness through `<harness>/repairs/auto_std_prelude.h`, and builds again.
+clang++ stops after 20 errors, so a long header can hide names behind the
+first ones: while a rebuild reports names the prelude lacks, they are added
+and the harness is rebuilt. Each pass adds at least one standard name, so
+this ends. The build prints one note naming the types (``bhf auto: <id>: the
+sources use string, map, ... without `std::` ...``), and a later round that
+reports more names adds them to the same file. The rules are `bhf build`'s
+(see [Custom harnesses](custom-harness.md#headers-that-rely-on-using-namespace-std)):
+diagnostics in C code get no prelude, and a stream object alone (`cerr`)
+keeps the stream-header repair. A name the scanned tree declares as a C++
+type of its own is never declared from `std`: a class, struct, enum or
+typedef in a C++ source or header, or in a `.h` header that C++ code
+includes. Where the source writes the name as a template (`list<string>`,
+`no template named 'list'`), only a class template of the tree's own counts.
+A C struct of the same name, in a `.c` source or in a header only C sources
+include, never does. The repair is recorded among the target's repairs as
+`std_prelude` (`path`, `names`, `headers`) in `run.json`, and
+`targets[].real_headers_included` and `run.md` list it; every lane's build
+and the target's capsule force-include it too. If the build still fails on
+standard names used without `std::`, whether the prelude declares them or
+not, their `missing-deps` entries say so and name the prelude (or, when the
+build wrote none, the declarations to force-include), and they are not
+listed as harness/codegen errors.
 
 The declaration index is built once per `auto` run before the attempt loop
 and held in memory across all targets.
@@ -451,6 +608,7 @@ configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracl
 ├── auto/
 │   ├── run.md                                  # human report
 │   ├── run.json                                # machine report
+│   ├── seeds.json                              # every seed the run used, with provenance
 │   ├── missing-deps.json                       # missing-dependency manifest (#418)
 │   └── missing-deps.txt                        # same, human-readable
 ├── harnesses/<harness-id>/
@@ -465,6 +623,7 @@ configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracl
 │       └── runtrace.jsonl                      # per-target shim events
 ├── build/<harness-id>/
 ├── corpus/<harness-id>/queue/                  # persisted coverage-minimal corpus (#401)
+├── corpus/<harness-id>/lineage.jsonl           # what each queue entry was mutated from
 ├── findings/F-0001-…/
 └── fuzz_runs/<harness-id>-latest.json
 ```
@@ -493,11 +652,21 @@ The machine report. Each `built_and_fuzzed` target carries, under
 - `per_pass_budget_secs` / `total_wall_budget_secs` — the per-pass and effective
   total fuzz wall budgets (#402).
 - `passes[]` — one entry per pass, each with `executions`, `coverage_edges`,
+  `coverage_instrumentation` (the instrumentation that fed the edge map, read
+  from the harness binary: `sancov-trace-pc-guard` for clang's guard section,
+  `sancov-trace-pc` when GCC's debug information records a translation unit
+  compiled with `-fsanitize-coverage=trace-pc`, `go-cover`, or `edge-bitmap`
+  when the binary shows neither, as for a build without coverage),
   `elapsed_secs` (measured, not budget), `executions_per_sec`, and `findings`.
 
 The top-level `summary` carries `fuzz_confirmed` — how many static findings a
 fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 [Fuzz-confirmation](#fuzz-confirmation).
+
+The top-level `seeds` block records where the run's seeds came from:
+`source` (`user`, `mined` or `none`), `count`, `mining` (`ran`,
+`skipped_user_seeds` or `disabled`) and `manifest`, the path of the per-seed
+list (`auto/seeds.json`, see [Seeds](#seeds)).
 
 ### `stub_execution` (false-clean guard)
 
@@ -581,6 +750,137 @@ are never evicted by it. Every pass after the first reseeds from a bounded subse
 of this queue, so deep code reached once stays reachable instead of each pass
 restarting from the tiny built-in seeds.
 
+### Seeds
+
+Each target's corpus starts from a few built-in inputs plus the run's seeds:
+the `--seed-file`/`--seed-dir` files when any are given, otherwise files mined
+from the tree's own test data (regular files directly inside `test/`, `tests/`,
+`examples/`, `samples/`, … and inside `data/`, `testdata/`, `fixtures/`,
+`corpus/`, … directories below them). Mining skips source and prose files and
+build/IDE artifacts (`.vcxproj`, `.sln`, `.filters`, `.user`, `.suo`, `.props`,
+`.pdb`, `.dll`, `.lib`, `.obj`, `.ilk`, `.exp`, …), files over 256 KiB, and
+stops at 64 files. Turn it off with `--no-seed-mining` or `seed-mining = false`.
+An explicit `--seed-file`/`--seed-dir` (or config `seed-file`/`seed-dir`)
+turns it off too, even when it loads no seed (a missing file, an empty dir):
+the run says so, and `seeds.json` records `skipped_user_seeds` with a
+`reason`.
+
+Seeds reach the engine byte for byte, as do the corpus entries a later pass or
+the AFL++ stage reseeds from `corpus/<harness-id>/queue/`. `auto/seeds.json`
+lists every seed the run used: its `path`, `source` (`user` or `mined`), file
+`size`, `bytes_used`, and the `sha256` of the bytes used (when the seed adds
+coverage it is kept as `corpus/<harness-id>/queue/<sha256>.bin`, and a crashing
+seed becomes a finding's testcase), plus whether mining `ran`, was
+`skipped_user_seeds`, or was `disabled`. `run.json` carries the same summary
+under `seeds`, and `-v` prints the list. A run that stops before it resolves
+seeds (one that finds no fuzzable target, for example) removes a list an
+earlier run left in the work dir, and its `run.json` has no `seeds` block.
+
+A seed is a sample of the target's input format, but a C/C++ harness decodes
+its fixed-width scalar parameters from the first input bytes and gives its
+buffer the bytes after them (see [C and C++](c-cpp.md#decoding-layout)), so a
+seed given as is starts in the scalars. When a target's `arg-layout.json`
+gives K such bytes before the buffer (every parameter before it of a fixed
+width, and 4 for the length of each other buffer's slice before it, which a
+zero leaves empty), each seed is also given behind K zero bytes, so the
+buffer starts with the seed; the seed itself is still given as is.
+`auto/seeds.json` lists these under `layout_variants`, one entry per target
+with its `harness_id`, `layout_prefix` (K) and the `sha256` of each prefixed
+seed. `bhf fuzz` does the same for its `--seed-file` and `--seed-input`
+seeds, once per campaign however many workers it runs; the seeds it is
+handed otherwise (its built-in seeds, a shared queue's inputs) are not
+prefixed.
+
+### Seed lineage
+
+The built-in engine records what each input it keeps was mutated from, so a
+finding can name the seed it grew out of. `corpus/<harness-id>/lineage.jsonl`
+sits beside the queue, one JSON line per entry, keyed by the `sha256` of the
+entry's bytes: `parent`, the entry its mutation started from (and `donor`,
+the entry a splice took its second part from), or for a root its `origin`:
+`seed` (with `source` and `path` when `auto/seeds.json` or the `bhf fuzz`
+command line names it, and `layout_prefix` and `seed_sha256` for a seed given
+behind its layout prefix), `corpus` (a reseeded queue entry with no line of
+its own: saved before lineage was kept, or dropped by the record cap below;
+an entry by its bytes, whatever its file is named, such as a crash input
+named by its signature or a file the multi-worker merge renamed
+`worker-N-<name>`) or `generated` (no seed: the empty or built-in start inputs, or an input a
+structured or `--grammar` generator or the random-byte fallback built). An
+input the run was handed as a seed is a root again, whatever made it before.
+A later pass or `--resume` that reseeds from the queue continues the chains
+it finds there. Each worker of a multi-worker `bhf fuzz` starts from the
+campaign's `lineage.jsonl` and `auto/seeds.json`; the shared queue's entries
+and the files the campaign writes for its workers (a seed's layout-prefixed
+variant, a programmatic seed) are bhf's copies, not seeds given to the
+worker, so a worker's finding names the seed they came from, never the copy.
+The campaign merges each worker's lines into its own.
+
+The first line recorded for an input's bytes stays: the same bytes reached
+again, by another mutation, pass or worker, keep it. The chain a finding
+reports is therefore one real derivation of those bytes, not necessarily
+the one this run took. Every writer (a pass, and the merge of a multi-worker
+campaign) reads the whole file, up to 524288 lines, and writes back at most
+twice the queue's entry limit (`BHF_MAX_CORPUS_ENTRIES` when set) or twice
+the files the queue holds, whichever is more, and never more than 524288
+lines. The merge takes the union of the workers' queues, so the shared
+queue can hold more files than the limit, and each of them keeps its line.
+First come the lines its pool's entries need (for the merge, the shared
+queue's), they and their ancestors, then, for a pass over the cap, those
+its queue's entries need, then the rest in sha256 order. An entry whose line was dropped is reported as having no lineage
+record, saved before lineage was kept or dropped by the record cap.
+
+When a finding is saved, its input's chain is followed back to the root
+through each entry's `parent` (a splice's donor is named, not followed) and
+written into `finding.json` as `lineage`: `origin` (`mined_seed`,
+`user_seed`, `seed`, `corpus`, `generated` or `unknown`), `root_sha256` (a
+seed's own, as `auto/seeds.json` lists it), `root_path`, `layout_prefix`,
+`depth` (mutation generations from the root; `0` when the input is the root
+itself), `parent_sha256`, `donor_sha256` and, when the lineage stops short
+of a seed or is unknown, `reason`. The lineage is `unknown`, with a reason,
+when the chain names an entry with no record (a corpus saved before lineage
+was kept, or one the record cap dropped), loops, or runs past 100000
+generations, and for a crash AFL++ found, through `bhf fuzz --engine afl++`
+or `bhf binary-fuzz --engine afl-qemu`: AFL++ schedules its own queue, so
+bhf does not see what that input was mutated from (the AFL++ crash file name
+is in the reason). bhf does not guess. A harness run one input per process
+(a `-fsanitize=fuzzer` binary) still gets its lineage: bhf's own engine
+picks every input it runs. The lineage is of `testcase.bin`, the input the
+fuzzer saved; minimization does not change it.
+
+Lanes that replay inputs bhf already knows record their lineage too. The
+corpus replays (the MSan and TSan replays, the memory profile and the
+`--differential` post-pass) look up the queue entry they ran in
+`lineage.jsonl`, as a pass does; an entry with no line there is a `corpus`
+root. An MSan or TSan finding saves no testcase, so its lineage is that of
+the queue entry that first showed the site, which its oracle evidence names
+by `input_sha256` (left out, with the reason in the lineage, when the entry
+could not be read back), and `bhf explain` prints that lineage under the
+entry's sha256. The capability profile folds what the whole corpus
+reached into one finding, so its lineage is `unknown` and the reason says
+so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
+the operator's inputs as they are: `user_seed`, depth `0`, with the file's
+path (`generated` for the empty input `bhf binary-fuzz` runs when it is given
+no seed). Findings saved before lineage was kept, and those of lanes that
+keep none (the target-transport and protocol-session lanes, `bhf
+relational`, the JVM sink oracle and the campaign-wide collector view, which
+observe a whole run rather than one input, and extensions), have no
+`lineage`.
+
+A work directory written by an earlier release can hold corpus entries in
+which every byte that was not valid UTF-8 was replaced by `EF BF BD`. In a work
+dir from an earlier release (one migrated from the 0.2.x layout, or one with
+state an earlier `bhf auto` left, `auto/run.json` or `auto/work-state.json`,
+and no `auto/legacy-corpus.json`), the first `bhf auto` run moves `corpus/` to
+`corpus-legacy/` (kept, not reseeded) and records that in
+`auto/legacy-corpus.json`; pass `--reuse-legacy-corpus` to keep reseeding it.
+Every run writes that record before anything else, so a new work dir is
+recorded as `fresh` and its corpus is never set aside. A plan-only run
+(`--dry-run`, `--list-targets`) leaves an earlier release's corpus to the
+first run that fuzzes. `results/INDEX.md`, `bhf report` and the end of each
+run warn when a work dir from an earlier release holds testcases or corpus
+entries with several `EF BF BD` sequences.
+See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/finding-report-fields.md#upgrading-a-02x-work-dir).
+
 ## Limitations
 
 - **Targets bhf can't drive are skipped, not errors.** A candidate whose input
@@ -589,7 +889,20 @@ restarting from the tiny built-in seeds.
   generated harness does not compile, or whose own build fails is logged and
   skipped while the sweep continues. Run with `--debug` to capture these in
   `<work>/auto/bug-report.json` — `issue_count` plus a per-issue `category`
-  (`unsupported-type`, `codegen-defect`, `failed-build`, `target-not-reached`, …).
+  (`unsupported-type`, `codegen-defect`, `failed-build`, `target-not-reached`,
+  `unsafe-build-path`, …). An `unsafe-build-path` row (outcome
+  `unsafe_build_path` in `run.json`) is a target refused because a source path,
+  include dir or compile flag holds a character no quoting makes safe in a
+  build recipe (`$`, `#`, a backtick, a shell operator): an environment problem,
+  fixed by renaming or moving the path, not a bhf gap. A JavaScript or
+  TypeScript target whose lane's toolchain is not installed (no `node`, no
+  esbuild) has the outcome `missing_toolchain` (`summary.missing_toolchain`,
+  terminal label "skipped: toolchain not installed"): install the tool the
+  reason names; it is not filed in the bug report and `--force` cannot help.
+  A C/C++ target whose harness built but whose sanitizer runtime cannot start
+  on the host has the outcome `sanitizer_runtime_unavailable`
+  (`summary.sanitizer_runtime_unavailable`; see [Sanitizers](sanitizers.md)),
+  also an environment problem that is not filed in the bug report.
   A non-zero `issue_count` is **informational**: it counts candidates bhf could
   not fully drive, not a run failure. `--debug` also sets `RUST_BACKTRACE` and
   keeps going past a file that would otherwise crash bhf itself, enriching the

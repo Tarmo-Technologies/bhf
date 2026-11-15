@@ -490,9 +490,10 @@ fn export_bundle_materializes_artifacts_for_air_gapped_handoff() {
 
     let manifest = read_json(&out);
     assert_eq!(manifest["bundle"]["materialized"], true);
+    // Manifests spell paths with `/` on every host.
     assert_eq!(
         manifest["bundle"]["path"].as_str().unwrap(),
-        bundle_dir.to_string_lossy()
+        bundle_dir.to_string_lossy().replace('\\', "/")
     );
     let report = artifact(&manifest, "report_json", "results/report/run-last.json").unwrap();
     let replay = artifact(

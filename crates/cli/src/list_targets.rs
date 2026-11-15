@@ -197,7 +197,22 @@ fn ranked_targets(args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>>
                         warn_if_parser_recovered(&path, functions.is_empty(), || {
                             c_parser::count_parse_errors(&source)
                         });
-                        for target in target_rank::rank_c_targets(&functions) {
+                        let registry = crate::generate_harness::ranking_type_registry(
+                            &path,
+                            &source,
+                            false,
+                            functions.iter().map(|f| {
+                                f.params
+                                    .iter()
+                                    .map(|p| (p.name.as_str(), p.c_type.as_str()))
+                                    .collect()
+                            }),
+                        );
+                        for target in target_rank::rank_c_targets_with_types(
+                            &functions,
+                            &std::collections::BTreeMap::new(),
+                            &registry,
+                        ) {
                             out.push((
                                 path.clone(),
                                 c_family_listed_target(&path, target, SourceLanguage::C, None),
@@ -231,7 +246,24 @@ fn ranked_targets(args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>>
                                 .entry((cpp_listed_target_name(function), function.line))
                                 .or_insert(function);
                         }
-                        for target in target_rank::rank_cpp_targets(&functions) {
+                        let required_params: Vec<Vec<cpp_parser::CppParamDescriptor>> = functions
+                            .iter()
+                            .map(|function| function.effective_required_params())
+                            .collect();
+                        let registry = crate::generate_harness::ranking_type_registry(
+                            &path,
+                            &source,
+                            true,
+                            required_params.iter().map(|params| {
+                                params
+                                    .iter()
+                                    .map(|p| (p.name.as_str(), p.cpp_type.as_str()))
+                                    .collect()
+                            }),
+                        );
+                        for target in
+                            target_rank::rank_cpp_targets_with_types(&functions, &registry)
+                        {
                             let metadata = by_identity
                                 .get(&(target.name.clone(), target.line))
                                 .and_then(|function| serde_json::to_value(&function.api).ok());

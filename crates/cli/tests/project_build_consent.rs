@@ -20,6 +20,7 @@ fn project_builds_are_denied_before_generating_or_executing_without_consent() {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let result = attempt(&candidate, root.path(), &index, AttemptOptions::default()).unwrap();

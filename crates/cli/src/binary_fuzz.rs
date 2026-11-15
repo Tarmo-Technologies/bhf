@@ -309,6 +309,9 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     } else {
         seeds
     };
+    // What each seed is, in order, for the lineage of a finding the
+    // seed-replay engine saves: it runs them as they are.
+    let lineages = seed_lineages(&args, &seeds);
     let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
@@ -382,7 +385,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
 
     let mut finding_ids = Vec::new();
     let mut executions = 0usize;
-    for seed in seeds.iter().cycle().take(args.iterations.min(seeds.len())) {
+    for (seed, lineage) in seeds
+        .iter()
+        .zip(&lineages)
+        .cycle()
+        .take(args.iterations.min(seeds.len()))
+    {
         executions += 1;
         // #55: prepare a fresh fixture directory and run the setup hook before the
         // target, so filesystem/process state does not leak across testcases.
@@ -469,9 +477,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                         fs::write(dir.join("testcase.bin"), seed).with_context(|| {
                             format!("write {}", dir.join("testcase.bin").display())
                         })?;
-                        let finding = render_postcondition_finding(
+                        let mut finding = render_postcondition_finding(
                             &id, &args, seed, &env, &signature, &detail, &run,
                         )?;
+                        crate::fuzz_lineage::insert(&mut finding, lineage);
                         fs::write(
                             dir.join("finding.json"),
                             serde_json::to_vec_pretty(&finding)?,
@@ -492,6 +501,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, &args, seed, &env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
+            crate::fuzz_lineage::insert(&mut finding, lineage);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -524,7 +534,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), input)
                 .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-            let finding = render_semantic_finding(
+            let mut finding = render_semantic_finding(
                 &id,
                 &args,
                 input,
@@ -533,6 +543,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 &signature,
                 oracles.as_ref(),
             )?;
+            crate::fuzz_lineage::insert(&mut finding, &lineage_of_seed(&seeds, &lineages, input));
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -665,6 +676,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                     &representative,
                     observation,
                 )?;
+                // The replayed input is the first seed.
+                corpus::lineage::record_in_finding(
+                    &dir,
+                    &lineage_of_seed(&seeds, &lineages, &representative),
+                )
+                .with_context(|| format!("record the lineage of {id}"))?;
                 finding_ids.push(id);
             }
             let mut provenance = outcome.run_provenance;
@@ -910,6 +927,20 @@ fn parse_duration_secs(value: &str) -> Option<u64> {
         .map(|n| n.saturating_mul(mult))
 }
 
+/// The lineage of a crash AFL++ QEMU mode found: unknown, since AFL++
+/// schedules its own queue and bhf does not see what the input was mutated
+/// from. Nothing is guessed; the reason names the crash file.
+fn afl_qemu_lineage(crash: &Path) -> corpus::lineage::FindingLineage {
+    let name = crash
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    corpus::lineage::FindingLineage::unknown(format!(
+        "found by AFL++ QEMU mode, which schedules its own queue; bhf does not see which \
+         input this one was mutated from (AFL++ crash file {name})"
+    ))
+}
+
 /// Drive AFL++ in QEMU mode (`afl-fuzz -Q`) against a binary-only target: qemu's
 /// DBT injects edge coverage so a foreign-arch / no-source binary gets
 /// coverage-guided mutation. Harvest `out/default/crashes/` and confirm+record
@@ -1031,6 +1062,7 @@ fn run_afl_qemu(
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, args, &input, env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
+            crate::fuzz_lineage::insert(&mut finding, &afl_qemu_lineage(&crash));
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -1061,22 +1093,83 @@ pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
         .is_some_and(|kind| kind == "binary_crash")
 }
 
+/// `bhf replay` of a binary finding with the default output.
+#[cfg(all(test, unix))]
 pub(crate) fn replay_binary_finding(finding_dir: &Path, binary: &Path) -> i32 {
-    match replay_binary_finding_inner(finding_dir, binary) {
-        Ok(true) => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
-            println!("MATCH");
-            0
-        }
-        Ok(false) => {
-            bhfeprintln!("MISMATCH binary crash signature changed");
-            3
-        }
-        Err(error) => {
-            bhfeprintln!("error: {error:#}");
-            1
-        }
+    crate::replay::finish_lane(
+        finding_dir,
+        replay_binary_outcome(finding_dir, binary),
+        crate::replay::OutputMode::default(),
+    )
+}
+
+/// Re-run a binary finding's testcase against `binary` and compare the
+/// signature it records (crash, runtime oracle or postcondition).
+pub(crate) fn replay_binary_outcome(
+    finding_dir: &Path,
+    binary: &Path,
+) -> Result<crate::replay::LaneReplay, String> {
+    let replayed =
+        replay_binary_finding_inner(finding_dir, binary).map_err(|error| format!("{error:#}"))?;
+    let run = &replayed.run;
+    let exit = crate::replay::ExitSummary::process(
+        run.exit_code,
+        run.signal,
+        run.timeout.then_some(replayed.timeout),
+        replayed.duration,
+    );
+    let mut differences = Vec::new();
+    if !replayed.matched {
+        differences.push(match &replayed.actual {
+            Some(actual) => format!(
+                "{}: recorded {}, replayed {actual}",
+                replayed.compared, replayed.recorded
+            ),
+            None => format!(
+                "{}: recorded {}, not reproduced",
+                replayed.compared, replayed.recorded
+            ),
+        });
     }
+    Ok(crate::replay::LaneReplay {
+        lane: "binary",
+        matched: replayed.matched,
+        status_line: if replayed.matched {
+            "MATCH".to_owned()
+        } else {
+            format!("MISMATCH binary {} changed", replayed.compared)
+        },
+        compared: format!("{} {}", replayed.compared, short(&replayed.recorded)),
+        differences,
+        details: Vec::new(),
+        exit: Some(exit),
+        output: Some((Vec::new(), run.stderr.clone().into_bytes())),
+        binary: Some((binary.to_path_buf(), replayed.mode.as_str().to_owned())),
+        history: "replay",
+    })
+}
+
+/// A recorded signature, shortened for the summary line.
+fn short(signature: &str) -> String {
+    match signature.char_indices().nth(16) {
+        Some((index, _)) => format!("{}...", &signature[..index]),
+        None => signature.to_owned(),
+    }
+}
+
+/// One replay of a binary finding.
+struct BinaryReplay {
+    matched: bool,
+    /// What was compared: `crash signature`, `runtime oracle signature` or
+    /// `postcondition signature`.
+    compared: &'static str,
+    recorded: String,
+    /// The replayed run's signature, when it produced one of that kind.
+    actual: Option<String>,
+    run: BinaryRun,
+    mode: BinaryInputMode,
+    timeout: Duration,
+    duration: Duration,
 }
 
 pub(crate) fn minimize_binary_finding(
@@ -1192,7 +1285,7 @@ pub(crate) fn minimize_binary_finding(
     })
 }
 
-fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Result<bool> {
+fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Result<BinaryReplay> {
     let finding = read_finding(finding_dir)?;
     let input = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
@@ -1202,8 +1295,9 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);
+    let started = Instant::now();
 
-    let matched = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
+    let replayed = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
         // #59: a semantic finding is reproduced by re-running under the runtime
         // oracles and confirming the SAME oracle signature fires — not a crash.
         let want = finding
@@ -1228,9 +1322,15 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
             &tmp_dir,
             Some((&oracles, log.as_path())),
         )?;
-        replay_oracle_signatures(&run.oracle_events, &input)
-            .iter()
-            .any(|s| s == want)
+        let signatures = replay_oracle_signatures(&run.oracle_events, &input);
+        let matched = signatures.iter().any(|s| s == want);
+        (
+            matched,
+            "runtime oracle signature",
+            want.to_owned(),
+            signatures.first().cloned(),
+            run,
+        )
     } else if finding.get("kind").and_then(Value::as_str) == Some("binary_postcondition") {
         // #55: reproduce by re-running setup -> target -> oracle and confirming
         // the same postcondition signature fires.
@@ -1259,13 +1359,37 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
         let run = run_binary_once(&invocation, mode, &input, &run_env, timeout, &tmp_dir, None)?;
         let verdict = pc.evaluate(&case_dir, &testcase_path, &run);
         pc.run_reset(&case_dir, &testcase_path);
-        matches!(verdict, PostconditionVerdict::Finding { ref signature, .. } if signature == want)
+        let actual = match &verdict {
+            PostconditionVerdict::Finding { signature, .. } => Some(signature.clone()),
+            _ => None,
+        };
+        (
+            actual.as_deref() == Some(want),
+            "postcondition signature",
+            want.to_owned(),
+            actual,
+            run,
+        )
     } else {
         let run = run_binary_once(&invocation, mode, &input, &env, timeout, &tmp_dir, None)?;
-        signature_matches(&run, &finding_signature(&finding)?)
+        let want = finding_signature(&finding)?;
+        let matched = signature_matches(&run, &want);
+        let actual = run.crashed().then(|| run.signature.clone());
+        (matched, "crash signature", want, actual, run)
     };
+    let duration = started.elapsed();
     let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(matched)
+    let (matched, compared, recorded, actual, run) = replayed;
+    Ok(BinaryReplay {
+        matched,
+        compared,
+        recorded,
+        actual,
+        run,
+        mode,
+        timeout,
+        duration,
+    })
 }
 
 /// Whether a replayed run reproduces a stored crash signature, in its
@@ -1430,11 +1554,11 @@ fn run_binary_once(
         close_fd(fd);
     }
     let mut child = spawned.with_context(|| format!("spawn {}", program.display()))?;
-    if mode == BinaryInputMode::Stdin {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input);
-        }
-    }
+    // Written on a thread, so a target that never reads an input larger than
+    // the pipe buffer cannot block the deadline below.
+    let writer = (mode == BinaryInputMode::Stdin)
+        .then(|| replay_min::process::feed_stdin(&mut child, input.to_vec()))
+        .flatten();
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     loop {
@@ -1449,6 +1573,11 @@ fn run_binary_once(
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+    // A target that exits before reading all of its input closes the pipe;
+    // its exit status, not the write, is the result.
+    if let Some(writer) = writer {
+        let _ = replay_min::process::join_bounded(writer, replay_min::process::DRAIN_GRACE);
     }
     let output = child.wait_with_output()?;
     let input_path = input_file
@@ -1929,6 +2058,46 @@ fn render_postcondition_finding(
     }))
 }
 
+/// The lineage of each of `seeds` (as [`run_inner`] collects them), for the
+/// seed-replay engine, which runs them as they are: the operator's
+/// `--seed-input`s, then `--seed-file`s named by their path, each 0
+/// generations down; or, when given none, the empty input bhf made itself.
+fn seed_lineages(args: &BinaryFuzzArgs, seeds: &[Vec<u8>]) -> Vec<corpus::lineage::FindingLineage> {
+    if args.seed_inputs.is_empty() && args.seed_files.is_empty() {
+        return seeds
+            .iter()
+            .map(|seed| crate::fuzz_lineage::of_generated_input(seed))
+            .collect();
+    }
+    let paths = args
+        .seed_inputs
+        .iter()
+        .map(|_| None)
+        .chain(args.seed_files.iter().map(|path| Some(path.as_path())));
+    seeds
+        .iter()
+        .zip(paths)
+        .map(|(seed, path)| crate::fuzz_lineage::of_operator_input(seed, path))
+        .collect()
+}
+
+/// The lineage of `input`, one of the run's `seeds`: the first seed with its
+/// bytes.
+fn lineage_of_seed(
+    seeds: &[Vec<u8>],
+    lineages: &[corpus::lineage::FindingLineage],
+    input: &[u8],
+) -> corpus::lineage::FindingLineage {
+    seeds
+        .iter()
+        .zip(lineages)
+        .find(|(seed, _)| seed.as_slice() == input)
+        .map(|(_, lineage)| lineage.clone())
+        .unwrap_or_else(|| {
+            corpus::lineage::FindingLineage::unknown("the input is not one of the run's seeds")
+        })
+}
+
 fn collect_seeds(seed_inputs: &[String], seed_files: &[PathBuf]) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut seeds = seed_inputs
         .iter()
@@ -2395,6 +2564,42 @@ mod tests {
             run.signature.starts_with("signal:11:"),
             "signature distinguishes the signal, got {}",
             run.signature
+        );
+    }
+
+    /// A stdin target that never reads an input larger than the pipe buffer
+    /// is still stopped at the time limit.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_target_that_ignores_its_input_still_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("sleeper.sh");
+        fs::write(&script, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TargetInvocation {
+            binary: script,
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+        };
+        let started = Instant::now();
+        let run = run_binary_once(
+            &invocation,
+            BinaryInputMode::Stdin,
+            &vec![0u8; 1 << 20],
+            &BTreeMap::new(),
+            Duration::from_millis(300),
+            dir.path(),
+            None,
+        )
+        .expect("run the target");
+        assert!(run.timeout, "the run is a timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
         );
     }
 

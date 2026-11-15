@@ -60,6 +60,132 @@ class SchemaFilesTest(unittest.TestCase):
         bad = {**doc, "finding_kind": "nope"}
         self.assertNotEqual(_errors(validator, bad), [])
 
+    def test_build_fidelity_validates_in_both_documents(self):
+        fidelity = {
+            "level": "reduced",
+            "context": "none",
+            "fabricated": [
+                {"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"},
+                {"kind": "header", "name": "tables.h"},
+            ],
+        }
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["reproduce"]["build"]["fidelity"] = fidelity
+        findings = _validator("bhf.findings.v1.schema.json")
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["reproduce"]["build"]["fidelity"]["fabricated"][0]["kind"] = "guess"
+        self.assertNotEqual(_errors(findings, bad), [])
+
+        envelope = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "build": {"binary": {"sha256": "0" * 64}, "fidelity": fidelity},
+        }
+        self.assertEqual(_errors(_validator("bhf.finding.v1.schema.json"), envelope), [])
+
+    def test_verdict_reason_is_an_optional_known_code(self):
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["verdict"] = "lab_only"
+        doc["findings"][0]["verdict_reason"] = "harness_sized_buffer"
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["verdict_reason"] = "because"
+        self.assertNotEqual(_errors(findings, bad), [])
+        older = json.loads(json.dumps(doc))
+        for finding in older["findings"]:
+            finding.pop("verdict_reason", None)
+        self.assertEqual(_errors(findings, older), [])
+
+    def test_allocated_by_harness_is_an_optional_flag(self):
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["access"]["allocated_by_harness"] = True
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["fuzz"]["access"]["allocated_by_harness"] = "yes"
+        self.assertNotEqual(_errors(findings, bad), [])
+        older = json.loads(json.dumps(doc))
+        older["findings"][0]["fuzz"]["access"].pop("allocated_by_harness")
+        self.assertEqual(_errors(findings, older), [])
+
+    def test_sanitizer_second_opinion_validates_in_both_documents(self):
+        opinion = {
+            "check": "object-size",
+            "used": "asan",
+            "reason": "with the check suppressed, AddressSanitizer reported heap-buffer-overflow at the same sink",
+        }
+        envelope = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "sanitizer_second_opinion": {**opinion, "replaced_cluster_key": "c0ffee00c0ffee00"},
+        }
+        finding = _validator("bhf.finding.v1.schema.json")
+        self.assertEqual(_errors(finding, envelope), [])
+        stands = {"check": "object-size", "used": "ubsan", "reason": "the re-run reported no error"}
+        self.assertEqual(_errors(finding, {**envelope, "sanitizer_second_opinion": stands}), [])
+        for bad in ({**opinion, "used": "msan"}, {**opinion, "check": "alignment"}, {"check": "object-size", "used": "asan"}):
+            with self.subTest(bad=bad):
+                self.assertNotEqual(_errors(finding, {**envelope, "sanitizer_second_opinion": bad}), [])
+
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["sanitizer_second_opinion"] = opinion
+        self.assertEqual(_errors(findings, doc), [])
+        # A document written before the field existed omits the key.
+        del doc["findings"][0]["fuzz"]["sanitizer_second_opinion"]
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["fuzz"]["sanitizer_second_opinion"] = {**opinion, "replaced_cluster_key": "c0ffee"}
+        self.assertNotEqual(_errors(findings, bad), [])
+
+    def test_seed_lineage_validates_in_both_documents_and_is_optional(self):
+        lineage = {
+            "origin": "mined_seed",
+            "root_sha256": "ab" * 32,
+            "root_path": "tests/data/x.bin",
+            "layout_prefix": None,
+            "depth": 7,
+            "parent_sha256": "cd" * 32,
+            "donor_sha256": None,
+            "reason": None,
+        }
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["fuzz"]["lineage"] = lineage
+        self.assertEqual(_errors(findings, doc), [])
+        unknown = {**lineage, "origin": "unknown", "root_sha256": None, "root_path": None,
+                   "depth": None, "parent_sha256": None, "reason": "found by AFL++"}
+        doc["findings"][0]["fuzz"]["lineage"] = unknown
+        self.assertEqual(_errors(findings, doc), [])
+        for bad in ({**lineage, "origin": "guessed"}, {**lineage, "root_sha256": "XYZ"},
+                    {**lineage, "depth": -1}, {k: v for k, v in lineage.items() if k != "reason"}):
+            doc["findings"][0]["fuzz"]["lineage"] = bad
+            self.assertNotEqual(_errors(findings, doc), [], bad)
+        # A document written before the key existed still validates.
+        del doc["findings"][0]["fuzz"]["lineage"]
+        self.assertEqual(_errors(findings, doc), [])
+
+        envelope = _validator("bhf.finding.v1.schema.json")
+        record = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "lineage": {"origin": "user_seed", "root_sha256": "ab" * 32,
+                        "root_path": "/seeds/x.bin", "depth": 0},
+        }
+        self.assertEqual(_errors(envelope, record), [])
+        record["lineage"] = {"origin": "unknown", "reason": "found by AFL++"}
+        self.assertEqual(_errors(envelope, record), [])
+        record["lineage"] = {"origin": "guessed"}
+        self.assertNotEqual(_errors(envelope, record), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

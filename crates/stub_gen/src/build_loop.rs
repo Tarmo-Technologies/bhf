@@ -440,6 +440,7 @@ mod tests {
         ProjectSpec {
             project_name: "Bhf_Build".to_owned(),
             extends_project: None,
+            parent_compiler: None,
             source_roots: vec![
                 SourceRoot {
                     path: root.join("src_instrumented"),

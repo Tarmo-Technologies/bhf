@@ -106,6 +106,12 @@ fn should_audit_path_inner(path: &[u8], owned_dir: Option<&[u8]>) -> bool {
     if path.starts_with(b"/usr/lib/debug/") || path_contains_segment(path, b".build-id") {
         return false;
     }
+    // The same symbolizers open the vDSO by its link-map name, separate debug
+    // files beside an object and loaded objects by name; faking one breaks the
+    // report (GCC's libasan aborts its own), so they pass through untouched.
+    if crate::symbolizer::is_symbolizer_path(path) {
+        return false;
+    }
     // BHF's own synthetic fixtures. setenv injection points env
     // vars at /tmp/bhf/fake_env/<NAME>, and Slice C's fake_fs
     // lives at /tmp/bhf/fake_fs/...; both are BHF-owned and

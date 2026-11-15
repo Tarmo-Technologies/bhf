@@ -241,6 +241,28 @@ pub struct AttemptOptions {
     /// that would normally be pre-skipped instead falls through to the build+repair
     /// path. Default `false` leaves every non-force path byte-for-byte unchanged.
     pub force: bool,
+    /// Whole-sweep cross target (`[toolchain] runner`, `--runner`): every C/C++
+    /// candidate is built for it with coverage and fuzzed under its runner,
+    /// whatever its `foreign_guard`. `None` keeps the host build and the
+    /// guard-driven foreign lane.
+    pub cross_sweep: Option<CrossSweep>,
+    /// The Ada toolchain (`[toolchain.ada]`, `--ada-*`, `--probe-backend`)
+    /// every Ada harness build uses.
+    pub ada_toolchain: crate::toolchain::AdaBuildSettings,
+    /// `--engine winafl` settings: the WinAFL and DynamoRIO locations and the
+    /// instrumentation, iteration and coverage-module choices.
+    pub winafl: crate::fuzz::WinaflSettings,
+}
+
+/// A whole-sweep cross target and what the run prepared for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossSweep {
+    pub target: CrossTarget,
+    /// The build probe's archives rebuilt for `target`
+    /// ([`crate::auto::build_probe::rebuild_probe_archives`]), and those it
+    /// built for `target` already, which its harnesses link in place of the
+    /// probe's host archives.
+    pub probe_archives: Vec<PathBuf>,
 }
 
 impl Default for AttemptOptions {
@@ -269,6 +291,9 @@ impl Default for AttemptOptions {
             ada_main_sources: HashMap::new(),
             decoder_limits: crate::generate_harness::DecoderLimitArgs::default(),
             force: false,
+            cross_sweep: None,
+            ada_toolchain: crate::toolchain::AdaBuildSettings::default(),
+            winafl: crate::fuzz::WinaflSettings::default(),
         }
     }
 }
@@ -313,6 +338,170 @@ pub(crate) fn append_cmplog_records(runtrace_log: &std::path::Path, snapshot: &s
     {
         let _ = file.write_all(records.as_bytes());
     }
+}
+
+/// After a fuzz pass: add its cmplog records to `<harness_dir>/cmplog.jsonl`
+/// (which the next pass loads) and rewrite the learned dictionary from it
+/// (which later runs load; see [`crate::fuzz::write_learned_dictionary`]).
+pub(crate) fn harvest_pass_cmplog(harness_dir: &std::path::Path) {
+    append_cmplog_records(
+        &harness_dir.join("runtrace.jsonl"),
+        &harness_dir.join("cmplog.jsonl"),
+    );
+    if let Err(error) = crate::fuzz::write_learned_dictionary(harness_dir) {
+        bhfeprintln!(
+            "bhf auto: warning: could not write {}: {error}",
+            harness_dir
+                .join(crate::fuzz::LEARNED_DICTIONARY_FILE)
+                .display()
+        );
+    }
+}
+
+/// Where `bhf auto` sets aside the corpus of a work dir from an earlier
+/// release: kept, but outside `corpus/`, which every pass reseeds from.
+pub(crate) const LEGACY_CORPUS_DIR: &str = results::migrate::LEGACY_CORPUS_DIR;
+/// The one-time record of what `bhf auto` found in a work dir.
+const LEGACY_CORPUS_DECISION: &str = results::migrate::CORPUS_DECISION_RECORD;
+
+/// What [`set_aside_legacy_corpus`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LegacyCorpus {
+    /// The work dir holds nothing from an earlier release; recorded as such.
+    Fresh,
+    /// An earlier run already decided (set aside, reused, none, or fresh).
+    Decided,
+    /// A plan-only run on a work dir from an earlier release: the decision is
+    /// left to the first run that fuzzes.
+    Pending,
+    /// The work dir from an earlier release had no corpus.
+    Absent,
+    /// The corpus was moved to this directory and is no longer reseeded.
+    SetAside(PathBuf),
+    /// The operator asked to keep reseeding it.
+    Reused,
+}
+
+/// A work dir from an earlier release (migrated from the 0.2.x layout, or run
+/// by an earlier `bhf auto`; see [`results::migrate::from_an_earlier_release`],
+/// which the caller evaluates before this run writes any auto state) keeps
+/// that release's corpus queue, whose entries can be seeds the earlier seed
+/// encoding damaged (every invalid UTF-8 byte replaced by `EF BF BD`). Every
+/// pass, the AFL++ stage and the replay passes read `corpus/<id>/queue/`, so
+/// on the first `bhf auto` run of this release the whole `corpus/` dir is
+/// moved to [`LEGACY_CORPUS_DIR`] (kept, not reseeded) unless `reuse` asks to
+/// keep it. The decision is recorded once; later runs leave the new corpus
+/// alone. A work dir with nothing from an earlier release is recorded as
+/// fresh, even by a `plan_only` run, so it is never mistaken for one later.
+pub(crate) fn set_aside_legacy_corpus(
+    work_dir: &Path,
+    from_an_earlier_release: bool,
+    reuse: bool,
+    plan_only: bool,
+) -> std::io::Result<LegacyCorpus> {
+    let decision_path = work_dir.join(LEGACY_CORPUS_DECISION);
+    if decision_path.exists() {
+        return Ok(LegacyCorpus::Decided);
+    }
+    let record = |decision: &str| -> std::io::Result<()> {
+        if let Some(parent) = decision_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "decision": decision,
+            "at": corpus::finding::now_rfc3339(),
+            "set_aside_to": (decision == "set_aside").then_some(LEGACY_CORPUS_DIR),
+        });
+        std::fs::write(
+            &decision_path,
+            serde_json::to_vec_pretty(&body).map_err(std::io::Error::other)?,
+        )
+    };
+    if !from_an_earlier_release {
+        record(results::migrate::CORPUS_FRESH)?;
+        return Ok(LegacyCorpus::Fresh);
+    }
+    if plan_only {
+        return Ok(LegacyCorpus::Pending);
+    }
+    let corpus = work_dir.join("corpus");
+    let is_dir = std::fs::symlink_metadata(&corpus).is_ok_and(|meta| meta.is_dir());
+    if !is_dir {
+        record("none")?;
+        return Ok(LegacyCorpus::Absent);
+    }
+    if reuse {
+        record("reused")?;
+        return Ok(LegacyCorpus::Reused);
+    }
+    let dest = work_dir.join(LEGACY_CORPUS_DIR);
+    if dest.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "cannot set the legacy corpus aside: {} already exists; move it away, or pass \
+                 --reuse-legacy-corpus to keep reseeding {}",
+                dest.display(),
+                corpus.display()
+            ),
+        ));
+    }
+    std::fs::rename(&corpus, &dest)?;
+    record("set_aside")?;
+    Ok(LegacyCorpus::SetAside(dest))
+}
+
+/// A warning when the persisted corpus of `harness_id` was recorded against
+/// another harness input format than the harness in `harness_dir` decodes
+/// (`corpus/<id>/metadata.json`, written by every fuzz pass and finding): its
+/// inputs decode into other argument values here. A corpus with inputs but
+/// no metadata predates the stamp, so it holds format 2 or earlier inputs
+/// (a corpus an earlier release left, kept with `--reuse-legacy-corpus`).
+/// `None` when the formats agree, or the harness or an empty corpus records
+/// none.
+pub(crate) fn corpus_format_note(
+    work_dir: &std::path::Path,
+    harness_id: &str,
+    harness_dir: &std::path::Path,
+) -> Option<String> {
+    let harness = crate::generate_harness::recorded_harness_format(harness_dir)?;
+    let Some(corpus) = corpus::finding::recorded_corpus_format(work_dir, harness_id) else {
+        let queue = work_dir.join("corpus").join(harness_id).join("queue");
+        let holds_inputs =
+            std::fs::read_dir(&queue).is_ok_and(|mut entries| entries.any(|entry| entry.is_ok()));
+        if !holds_inputs || harness.version < 3 {
+            return None;
+        }
+        return Some(format!(
+            "the corpus of {harness_id} was recorded before harness formats were stamped \
+             (format 2 or earlier), and this harness decodes format {}: its inputs decode \
+             into other argument values here. They are still used as seeds; findings re-found \
+             now record the new format",
+            harness.version
+        ));
+    };
+    if corpus.version == harness.version
+        && corpus.buffer_len_dimension == harness.buffer_len_dimension
+    {
+        return None;
+    }
+    let with = |on: bool| {
+        if on {
+            " with the explicit buffer-length dimension"
+        } else {
+            ""
+        }
+    };
+    Some(format!(
+        "the corpus of {harness_id} was recorded against harness input format {}{}, and this \
+         harness decodes format {}{}: its inputs decode into other argument values here. They \
+         are still used as seeds; findings re-found now record the new format",
+        corpus.version,
+        with(corpus.buffer_len_dimension),
+        harness.version,
+        with(harness.buffer_len_dimension),
+    ))
 }
 
 /// Cap on inputs reseeded from the persisted corpus into a later pass (#383),
@@ -378,6 +567,11 @@ pub struct PassRun {
     /// driver harnesses carry one today).
     #[serde(default)]
     pub coverage_edges: usize,
+    /// The instrumentation that fed the edge map, from the harness binary
+    /// (`sancov-trace-pc-guard` for clang, `sancov-trace-pc` for GCC, ...).
+    /// Absent when the pass ran without an edge map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_instrumentation: Option<String>,
     /// #405: actual wall-clock seconds the engine spent fuzzing this pass — the
     /// measured run time, NOT the budget (`per_pass_budget_secs`); a pass can
     /// finish early or lose time to setup. 0.0 only when no time was measured.
@@ -599,6 +793,35 @@ pub enum Outcome {
     UnsupportedParams {
         reason: String,
     },
+    /// The target was refused before generation because a source path,
+    /// include dir or compile flag holds a character no quoting makes safe in
+    /// a build recipe (`$`, `#`, a backtick, a shell operator, a control
+    /// character). An environment problem with one remedy, renaming or moving
+    /// the path; `--force` cannot help. Before it had its own outcome such a
+    /// refusal was recorded as `unsupported_params`.
+    UnsafeBuildPath {
+        reason: String,
+    },
+    /// The target's lane cannot build anything on this host because its
+    /// toolchain is not installed (no `node` for JavaScript, no esbuild for
+    /// TypeScript); the reason names the tool. An environment problem with one
+    /// remedy, installing it; `--force` cannot help. Before it had its own
+    /// outcome such a target was recorded as `unsupported_params`.
+    MissingToolchain {
+        reason: String,
+    },
+    /// The harness built, but its sanitizer runtime cannot start on this
+    /// host: it dies before reaching the target on every input (`FATAL:
+    /// ThreadSanitizer: unexpected memory mapping`, an AddressSanitizer
+    /// shadow mapping failure), so the target was not fuzzed. An environment
+    /// problem, not a finding and not a bhf defect; the reason names the
+    /// runtime's line and the compiler. The remedy is a compiler whose
+    /// runtime starts here, or other sanitizers. The passes stop at the
+    /// first that reports it.
+    SanitizerRuntimeUnavailable {
+        repairs: Vec<Repair>,
+        reason: String,
+    },
     UnrecoverableLink {
         repairs: Vec<Repair>,
         missing: Vec<String>,
@@ -768,6 +991,39 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::UnsafeBuildPath { reason } => AttemptTrace {
+                terminal_stage: "generation".to_owned(),
+                fallback_chain: vec!["unsafe_build_path".to_owned()],
+                reason_category: Some("unsafe_build_path".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
+            Outcome::MissingToolchain { reason } => AttemptTrace {
+                terminal_stage: "toolchain".to_owned(),
+                fallback_chain: vec!["missing_toolchain".to_owned()],
+                reason_category: Some("missing_toolchain".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
+            Outcome::SanitizerRuntimeUnavailable { repairs, reason } => AttemptTrace {
+                terminal_stage: "runtime".to_owned(),
+                fallback_chain: vec![
+                    "built".to_owned(),
+                    "sanitizer_runtime_unavailable".to_owned(),
+                ],
+                reason_category: Some("sanitizer_runtime_unavailable".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: !repairs.is_empty(),
+                repair_count: repairs.len(),
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::UnrecoverableLink { repairs, missing } => AttemptTrace {
                 terminal_stage: "link".to_owned(),
                 fallback_chain: vec!["build_repair".to_owned(), "link_unrecoverable".to_owned()],
@@ -806,6 +1062,20 @@ impl Outcome {
         }
     }
 
+    /// An `unsupported_params` skip whose reason is a build-safety refusal (a
+    /// path or flag no quoting makes safe) as its own `unsafe_build_path`
+    /// outcome; every other outcome as it is.
+    pub(crate) fn with_path_refusal_classified(self) -> Self {
+        match self {
+            Outcome::UnsupportedParams { reason }
+                if harness_gen::build_safety::is_unsafe_build_input_reason(&reason) =>
+            {
+                Outcome::UnsafeBuildPath { reason }
+            }
+            other => other,
+        }
+    }
+
     /// #417: per-target stub-vs-real execution summary derived from the repair
     /// ledger, or `None` for outcomes that never fuzzed (only `BuiltAndFuzzed`
     /// carries a fuzz result). Recomputed from `repairs` on demand — see
@@ -833,8 +1103,12 @@ impl Outcome {
             | Outcome::Built { repairs, .. }
             | Outcome::FailedBuild { repairs, .. }
             | Outcome::UnrecoverableLink { repairs, .. }
-            | Outcome::UnrecoverableRuntime { repairs, .. } => repairs.as_slice(),
-            Outcome::UnsupportedParams { .. } | Outcome::ReportOnly { .. } => return None,
+            | Outcome::UnrecoverableRuntime { repairs, .. }
+            | Outcome::SanitizerRuntimeUnavailable { repairs, .. } => repairs.as_slice(),
+            Outcome::UnsupportedParams { .. }
+            | Outcome::UnsafeBuildPath { .. }
+            | Outcome::MissingToolchain { .. }
+            | Outcome::ReportOnly { .. } => return None,
         };
         repairs.iter().find_map(|r| match r {
             Repair::PlatformStub { platform } => Some(platform.clone()),
@@ -979,34 +1253,40 @@ fn cpp_owner_class(name: &str) -> Option<&str> {
 /// `dictionary.txt` for the interpreted/managed lanes (Rust/Go/Java/Python/Perl),
 /// so the builtin engine can splice constants past `==`/match guards. C/C++/Ada
 /// already write their own dictionary at harness-gen, so they're skipped here.
-/// Best-effort: a parse error is ignored, and an existing dictionary is not
-/// clobbered (a lane's own harness-gen wins if it wrote one).
+/// Each token is preceded by a `# from <file>:<line>` comment naming where in
+/// `source_path` it was found. Best-effort: a parse error is ignored, and an
+/// existing dictionary is not clobbered (a lane's own harness-gen wins if it
+/// wrote one).
 fn write_source_dictionary(
     harness_dir: &Path,
     source: Option<&str>,
+    source_path: &Path,
     lang: crate::auto::candidate::Lang,
 ) {
     use crate::auto::candidate::Lang;
     let Some(source) = source else {
         return;
     };
-    let tokens = match lang {
-        Lang::Rust => rust_parser::extract_rust_dictionary_tokens(source).ok(),
-        Lang::Go => go_parser::extract_go_dictionary_tokens(source).ok(),
-        Lang::Java => java_parser::extract_java_dictionary_tokens(source).ok(),
-        Lang::Python => python_parser::extract_python_dictionary_tokens(source).ok(),
-        Lang::Perl => perl_parser::extract_perl_dictionary_tokens(source).ok(),
+    let located: Option<Vec<(String, Vec<u32>)>> = match lang {
+        Lang::Rust => rust_parser::extract_rust_dictionary_tokens_located(source).ok(),
+        Lang::Go => go_parser::extract_go_dictionary_tokens_located(source).ok(),
+        Lang::Java => java_parser::extract_java_dictionary_tokens_located(source).ok(),
+        Lang::Python => python_parser::extract_python_dictionary_tokens_located(source).ok(),
+        Lang::Perl => perl_parser::extract_perl_dictionary_tokens_located(source).ok(),
         // C#/JS carry no CmpLog in the managed/interpreted driver, so a source-mined
         // dictionary is the lever past a single multi-byte comparison gate (the same
         // reason the other managed lanes mine one). Scan the source's string/number
         // literals (JS also allows backtick template literals).
-        Lang::CSharp => Some(crate::auto::lit_scan::scan_literal_tokens(source, false)),
+        Lang::CSharp => Some(crate::auto::lit_scan::scan_literal_tokens_located(
+            source, false,
+        )),
         Lang::Js | Lang::Ts => {
-            let mut toks = crate::auto::lit_scan::scan_literal_tokens(source, true);
+            let mut toks = crate::auto::lit_scan::scan_literal_tokens_located(source, true);
             // Seed the prototype-pollution vectors + complete JSON payloads so the
             // fuzzer can reach an unsafe merge/set path (the BHF-509 detector then
             // confirms the pollution). The full-payload tokens let a JSON.parse-based
             // merge — the common vulnerable shape — be reached by splicing one token.
+            // They are bhf's own, so they name no source line.
             for v in [
                 "__proto__",
                 "constructor",
@@ -1015,26 +1295,35 @@ fn write_source_dictionary(
                 "{\"constructor\":{\"prototype\":{\"bhfpp\":1}}}",
                 "__proto__.bhfpp",
             ] {
-                if !toks.iter().any(|t| t == v) {
-                    toks.push(v.to_owned());
+                if !toks.iter().any(|(t, _)| t == v) {
+                    toks.push((v.to_owned(), Vec::new()));
                 }
             }
             Some(toks)
         }
         // Ruby carries no CmpLog in the interpreted driver, so a source-mined
         // dictionary is the lever past a multi-byte comparison gate.
-        Lang::Ruby => Some(crate::auto::ruby::extract_ruby_dictionary_tokens(source)),
-        Lang::Lua => Some(crate::auto::lua::extract_lua_dictionary_tokens(source)),
-        Lang::Php => Some(crate::auto::php::extract_php_dictionary_tokens(source)),
+        Lang::Ruby => Some(crate::auto::ruby::extract_ruby_dictionary_tokens_located(
+            source,
+        )),
+        Lang::Lua => Some(crate::auto::lua::extract_lua_dictionary_tokens_located(
+            source,
+        )),
+        Lang::Php => Some(crate::auto::php::extract_php_dictionary_tokens_located(
+            source,
+        )),
         // COBOL/Fortran are fuzzed through the generated C; the dictionary comes from that C.
         Lang::Ada | Lang::C | Lang::Cpp | Lang::Cobol | Lang::Fortran => None,
     };
-    let Some(tokens) = tokens else {
+    let Some(located) = located else {
         return;
     };
-    if tokens.is_empty() || harness_dir.join("dictionary.txt").exists() {
+    if located.is_empty() || harness_dir.join("dictionary.txt").exists() {
         return;
     }
+    let file = crate::generate_harness::dictionary_source_label(source_path, source_path.parent());
+    let mut tokens = Vec::new();
+    crate::generate_harness::push_located_tokens(&mut tokens, &file, located);
     let _ = crate::generate_harness::write_harness_dictionary(harness_dir, &tokens);
 }
 
@@ -1134,7 +1423,7 @@ pub(crate) fn applicable_engines(
         .copied()
         .filter(|engine| match engine {
             FuzzEngine::Builtin => true,
-            FuzzEngine::AflPlusPlus => is_c_family,
+            FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
         })
         .collect();
     if out.is_empty() {
@@ -1201,6 +1490,22 @@ pub fn attempt(
     )
 }
 
+/// `candidate` discovered and statically analyzed but not fuzzed, for `reason`.
+fn report_only_attempt(
+    candidate: &Candidate,
+    work_dir: &Path,
+    reason: String,
+) -> Result<AttemptResult> {
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, &candidate.harness_id);
+    std::fs::create_dir_all(&harness_dir)?;
+    let outcome = crate::auto::report_only::emit_report_only(candidate, reason, work_dir);
+    Ok(AttemptResult {
+        candidate: candidate.clone(),
+        outcome,
+        harness_dir,
+    })
+}
+
 pub fn attempt_with_progress(
     candidate: &Candidate,
     work_dir: &Path,
@@ -1208,6 +1513,25 @@ pub fn attempt_with_progress(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
+    let mut result = attempt_unclassified(candidate, work_dir, decl_index, options, progress)?;
+    result.outcome = result.outcome.with_path_refusal_classified();
+    Ok(result)
+}
+
+fn attempt_unclassified(
+    candidate: &Candidate,
+    work_dir: &Path,
+    decl_index: &DeclarationIndex,
+    options: AttemptOptions,
+    progress: &dyn crate::auto::progress::ProgressSink,
+) -> Result<AttemptResult> {
+    // A lane that does not run on native Windows (it runs under WSL there) is
+    // refused up front with that reason, rather than failing later in its build
+    // or its launcher in words that read like a missing module or a compile
+    // error.
+    if let Some(reason) = crate::auto::preflight::native_windows_refusal(candidate.lang) {
+        return report_only_attempt(candidate, work_dir, reason);
+    }
     if !options.run_untrusted
         && matches!(
             candidate.lang,
@@ -1272,6 +1596,10 @@ pub fn attempt_with_progress(
         Some(outcome) => {
             let harness_dir = crate::auto::layout::harness_dir(work_dir, &candidate.harness_id);
             std::fs::create_dir_all(&harness_dir)?;
+            // Nothing is built for this target, so it has no build lanes: any
+            // record in its dir is an earlier attempt's (an interrupted run a
+            // `--resume` continues), not this one's.
+            crate::auto::lanes::clear(&harness_dir);
             AttemptResult {
                 candidate: candidate.clone(),
                 outcome,
@@ -1379,7 +1707,7 @@ pub fn attempt_with_progress(
             let synthesized: BTreeSet<String> = repairs
                 .iter()
                 .filter_map(|r| match r {
-                    Repair::TypePlaceholder { type_name } => Some(type_name.clone()),
+                    Repair::TypePlaceholder { type_name, .. } => Some(type_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1387,6 +1715,7 @@ pub fn attempt_with_progress(
                 last_errors,
                 decl_index,
                 &synthesized,
+                &declared_from_real_headers(repairs),
                 result.candidate.lang,
             ) {
                 let reason = format!(
@@ -1434,7 +1763,7 @@ pub fn attempt_with_progress(
             let synthesized: BTreeSet<String> = repairs
                 .iter()
                 .filter_map(|r| match r {
-                    Repair::TypePlaceholder { type_name } => Some(type_name.clone()),
+                    Repair::TypePlaceholder { type_name, .. } => Some(type_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1442,6 +1771,7 @@ pub fn attempt_with_progress(
                 last_errors,
                 decl_index,
                 &synthesized,
+                &declared_from_real_headers(repairs),
                 result.candidate.lang,
             );
             let evidence = match &unresolved_types {
@@ -1503,7 +1833,7 @@ fn retain_sequence_failure(sequence: &Outcome, direct: &mut Outcome) {
 
 #[cfg(test)]
 mod sequence_fallback_tests {
-    use super::{retain_sequence_failure, Outcome};
+    use super::{retain_sequence_failure, Outcome, Repair};
     use build_classifier::BuildErrorKind;
 
     fn sequence_failure() -> Outcome {
@@ -1554,6 +1884,98 @@ mod sequence_fallback_tests {
         ));
     }
 
+    /// A refusal because a path or flag cannot be quoted safely is its own
+    /// outcome, with its own trace category; a parameter refusal is not.
+    #[test]
+    fn an_unquotable_build_path_refusal_has_its_own_outcome() {
+        let reason = harness_gen::build_safety::ensure_build_path_safe(
+            "include dir",
+            "/srv/build$tmp/include",
+        )
+        .unwrap_err()
+        .to_string();
+        let outcome = Outcome::UnsupportedParams {
+            reason: reason.clone(),
+        }
+        .with_path_refusal_classified();
+        assert!(
+            matches!(&outcome, Outcome::UnsafeBuildPath { reason: kept } if *kept == reason),
+            "{outcome:?}"
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "unsafe_build_path");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Outcome::UnsafeBuildPath { .. }));
+        let trace = outcome.attempt_trace();
+        assert_eq!(trace.terminal_stage, "generation");
+        assert_eq!(trace.reason_category.as_deref(), Some("unsafe_build_path"));
+        assert_eq!(trace.fallback_chain, ["unsafe_build_path"]);
+        let other = Outcome::UnsupportedParams {
+            reason: "opaque type 'widget_t' for parameter 'w' needs lifecycle support".to_owned(),
+        }
+        .with_path_refusal_classified();
+        assert!(matches!(other, Outcome::UnsupportedParams { .. }));
+    }
+
+    /// A lane whose toolchain is not installed is its own outcome, with its
+    /// own trace category, and carries no repairs.
+    #[test]
+    fn a_missing_toolchain_has_its_own_outcome() {
+        let reason = "no TypeScript transpiler found (install esbuild)".to_owned();
+        let outcome = Outcome::MissingToolchain {
+            reason: reason.clone(),
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "missing_toolchain");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&back, Outcome::MissingToolchain { reason: kept } if *kept == reason),
+            "{back:?}"
+        );
+        let trace = outcome.attempt_trace();
+        assert_eq!(trace.terminal_stage, "toolchain");
+        assert_eq!(trace.reason_category.as_deref(), Some("missing_toolchain"));
+        assert_eq!(trace.fallback_chain, ["missing_toolchain"]);
+        assert!(!trace.repairs_attempted);
+        assert_eq!(outcome.platform_stub(), None);
+    }
+
+    /// A harness whose sanitizer runtime cannot start on the host has its
+    /// own outcome, an environment problem, instead of the safety rail's
+    /// `unrecoverable_runtime` for a faulty harness; its repairs are kept.
+    #[test]
+    fn a_sanitizer_runtime_that_cannot_start_has_its_own_outcome() {
+        let reason = "sanitizer runtime could not start: 'main' printed \"FATAL\"".to_owned();
+        let outcome = Outcome::SanitizerRuntimeUnavailable {
+            repairs: vec![Repair::PlatformStub {
+                platform: "windows".to_owned(),
+            }],
+            reason: reason.clone(),
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "sanitizer_runtime_unavailable");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&back, Outcome::SanitizerRuntimeUnavailable { reason: kept, .. } if *kept == reason),
+            "{back:?}"
+        );
+        let trace = outcome.attempt_trace();
+        assert_eq!(
+            trace.reason_category.as_deref(),
+            Some("sanitizer_runtime_unavailable")
+        );
+        assert_eq!(trace.terminal_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(outcome.platform_stub().as_deref(), Some("windows"));
+        assert_eq!(
+            crate::auto::run_status::outcome_bucket(&outcome),
+            "skipped",
+            "counted with the other environment problems"
+        );
+    }
+
     #[test]
     fn unsupported_trace_is_structured_and_never_implies_missing_repairs() {
         let outcome = Outcome::UnsupportedParams {
@@ -1597,14 +2019,41 @@ fn undefined_external_types(
         last_errors,
         decl_index,
         synthesized,
+        &BTreeSet::new(),
         crate::auto::candidate::Lang::Cpp,
     )
 }
 
+/// The names `repairs` declared from their real headers rather than
+/// fabricating them: a type placeholder that resolved to a header, and every
+/// name of the std prelude.
+fn declared_from_real_headers(repairs: &[Repair]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for repair in repairs {
+        match repair {
+            Repair::TypePlaceholder {
+                type_name,
+                resolved_header: Some(_),
+            } => {
+                names.insert(type_name.clone());
+            }
+            Repair::StdPrelude {
+                names: declared, ..
+            } => names.extend(declared.iter().cloned()),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// As [`undefined_external_types`]; `real` holds the names the repairs
+/// declared from their real headers ([`declared_from_real_headers`]), which
+/// are never an external SDK's.
 fn undefined_external_types_for_lang(
     last_errors: &[BuildErrorKind],
     decl_index: &DeclarationIndex,
     synthesized: &BTreeSet<String>,
+    real: &BTreeSet<String>,
     lang: crate::auto::candidate::Lang,
 ) -> Option<Vec<String>> {
     if last_errors.is_empty() {
@@ -1622,9 +2071,12 @@ fn undefined_external_types_for_lang(
     // report-only scan. An in-tree synthesizable gap (a config typedef the tree
     // really is missing) is NOT in this set — it keeps its `failed_build` so the
     // `synthesized_types` manifest is preserved.
+    // A type resolved to its real header (`string` from <string>, or the std
+    // prelude's `using std::string;`) is no stand-in, so a diagnostic about
+    // its use is not a stand-in's residue either.
     let external_placeholders: Vec<&String> = synthesized
         .iter()
-        .filter(|name| !decl_index.type_defined_in_compiled_source(name))
+        .filter(|name| !decl_index.type_defined_in_compiled_source(name) && !real.contains(*name))
         .collect();
     let mut names: Vec<String> = Vec::new();
     let mut saw_placeholder_class_misuse = false;
@@ -1634,6 +2086,17 @@ fn undefined_external_types_for_lang(
             // actionable synthesized gap, not an unsynthesizable external type —
             // skip it so the attempt keeps its `synthesized_types` manifest.
             BuildErrorKind::MissingType { name } if synthesized.contains(name) => {}
+            // A standard-library name the std prelude declares that still fails
+            // is no external SDK type, nor is any C++ standard-library name
+            // used without `std::`: keep the failed build, whose missing-deps
+            // entry explains it.
+            BuildErrorKind::MissingType { name }
+                if real.contains(name)
+                    || (matches!(lang, crate::auto::candidate::Lang::Cpp)
+                        && build_classifier::std_library_header(name).is_some()) =>
+            {
+                return None
+            }
             BuildErrorKind::MissingType { name } if c_stub_gen::c_std_header(name).is_some() => {
                 // Standard/POSIX names are provided by the host SDK. A retained
                 // sequence attempt may not carry the direct fallback's header
@@ -1829,6 +2292,8 @@ fn run_attempt(
     // from an earlier attempt if this attempt later fails or chooses a different
     // generation path. Coverage without a fresh recipe is honestly unavailable.
     crate::auto::coverage_replay::clear_build_recipe(&harness_dir);
+    // Nor the build lanes it recorded: this run reports its own.
+    crate::auto::lanes::clear(&harness_dir);
     let mut manifest = RepairManifest::default();
     // Seed user-supplied `--extra-source` files so a multi-file library's real
     // translation units are compiled+linked on the first build attempt — the
@@ -1854,7 +2319,12 @@ fn run_attempt(
     // their string+integer literals into the same AFL dictionary the builtin engine
     // loads (with LE/BE byte encodings of numeric constants). Best-effort — a parse
     // failure never fails the attempt, and we never clobber a dict already written.
-    write_source_dictionary(&harness_dir, target_source.as_deref(), candidate.lang);
+    write_source_dictionary(
+        &harness_dir,
+        target_source.as_deref(),
+        &candidate.source_path,
+        candidate.lang,
+    );
 
     // #402 budget plan. `--per-target-time` is the TOTAL per-target fuzz wall,
     // split evenly across the passes under one shared deadline; `--total-time`
@@ -2193,10 +2663,17 @@ fn run_attempt(
     // with no fuzzable LINKAGE surface skips cleanly.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Cobol) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
+        // The copybook search stays inside the tree `bhf auto` scans.
+        let source_root = options
+            .source_root
+            .clone()
+            .or_else(|| candidate.source_path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| work_dir.to_path_buf());
         match crate::auto::cobol_build::build_cobol_harness(
             candidate,
             work_dir,
             &candidate.harness_id,
+            &source_root,
         ) {
             crate::auto::cobol_build::CobolBuildResult::Built => {}
             crate::auto::cobol_build::CobolBuildResult::Skip(reason) => {
@@ -2314,6 +2791,13 @@ fn run_attempt(
                     harness_dir,
                 });
             }
+            crate::auto::js_build::JsBuildResult::MissingToolchain(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::MissingToolchain { reason },
+                    harness_dir,
+                });
+            }
             crate::auto::js_build::JsBuildResult::Failed(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2332,12 +2816,24 @@ fn run_attempt(
     // esbuild, then drive it with the same Node framed driver as the JS lane.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Ts) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
-        match crate::auto::js_build::build_ts_harness(candidate, work_dir, &candidate.harness_id) {
+        match crate::auto::js_build::build_ts_harness(
+            candidate,
+            work_dir,
+            &candidate.harness_id,
+            options.source_root.as_deref(),
+        ) {
             crate::auto::js_build::JsBuildResult::Built => {}
             crate::auto::js_build::JsBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
                     outcome: Outcome::UnsupportedParams { reason },
+                    harness_dir,
+                });
+            }
+            crate::auto::js_build::JsBuildResult::MissingToolchain(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::MissingToolchain { reason },
                     harness_dir,
                 });
             }
@@ -2574,10 +3070,29 @@ fn run_attempt(
     //     real host ASan/coverage; findings are reduced-fidelity (#c).
     //   - else → skip with an actionable reason naming what's missing.
     // `Native` (no foreign_guard) is byte-identical to before.
+    let candidate_is_c_family = matches!(
+        candidate.lang,
+        crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
+    );
+    let candidate_is_ada = matches!(candidate.lang, crate::auto::candidate::Lang::Ada);
     let strategy: ForeignStrategy = match &candidate.foreign_guard {
         // A prebuilt (Rust/Java) harness is always the Native path — cargo
         // resolves `#[cfg]` and the JVM is host-native, so no cross/stub applies.
         _ if is_prebuilt => ForeignStrategy::Native,
+        // A whole-sweep cross target: the operator chose the platform, so every
+        // C/C++ candidate is built for it, guarded or not.
+        _ if candidate_is_c_family && options.cross_sweep.is_some() => ForeignStrategy::Cross(
+            options
+                .cross_sweep
+                .as_ref()
+                .map(|sweep| sweep.target.clone())
+                .expect("checked above"),
+        ),
+        // An Ada toolchain the operator configured for a target decides the
+        // platform for Ada candidates too; the guard no longer skips them.
+        Some(_) if candidate_is_ada && options.ada_toolchain.effective_target().is_some() => {
+            ForeignStrategy::Native
+        }
         Some(guard) => match resolve_foreign_strategy(candidate, guard) {
             Ok(strategy) => strategy,
             Err(reason) => {
@@ -2590,12 +3105,66 @@ fn run_attempt(
         },
         None => ForeignStrategy::Native,
     };
+    // The link is against the Windows C runtime on Windows itself and in a
+    // MinGW cross build; the repair loop never stubs that runtime's names
+    // there (elsewhere they are ordinary symbols, such as a newlib port's
+    // `_write`).
+    manifest.windows_abi_link =
+        cfg!(windows) || matches!(&strategy, ForeignStrategy::Cross(target) if target.is_windows());
     let cross_compiler = match &strategy {
-        ForeignStrategy::Cross(target) => Some(cross_compiler_override(target)),
+        ForeignStrategy::Cross(target) => {
+            // A guard-driven cross build replaces the operator's own compilers
+            // for this target; say so rather than silently.
+            let effective = crate::toolchain::effective_compilers();
+            if options.cross_sweep.is_none() && effective.explicit && effective.cc != target.cc {
+                announce_once(&format!(
+                    "{}: built with the {} cross toolchain ({}) for its platform guard \
+                     instead of CC={}",
+                    candidate.harness_id, target.triple, target.cc, effective.cc
+                ));
+            }
+            let cross = cross_compiler_override(target);
+            if let Some(dropped) = ambient_flags_left_out(&cross) {
+                announce_once(&format!(
+                    "{dropped} from the environment, written for the host's compiler, are left \
+                     out of the {} cross builds",
+                    target.triple
+                ));
+            }
+            Some(cross)
+        }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
+    // GCC has no sanitizer runtime on Windows, so a native C or C++ build with
+    // it fails at the link (`cannot read spec file 'libsanitizer.spec'`), which
+    // the build classifier would read as a missing header. Refuse it, naming
+    // the compiler, unless the operator asked for no sanitizers.
+    if cfg!(windows)
+        && candidate_is_c_family
+        && cross_compiler.is_none()
+        && !matches!(options.sanitizers, multicore_fuzz::SanitizerSelection::None)
+    {
+        let cxx = matches!(candidate.lang, crate::auto::candidate::Lang::Cpp);
+        let compilers = crate::toolchain::effective_compilers();
+        let (env_var, compiler) = if cxx {
+            ("CXX", &compilers.cxx)
+        } else {
+            ("CC", &compilers.cc)
+        };
+        if crate::toolchain::compiler_family(compiler, cxx)
+            == Some(harness_gen::compiler_family::CompilerFamily::Gcc)
+        {
+            let reason = crate::auto::preflight::windows_gcc_refusal(env_var, compiler);
+            return report_only_attempt(candidate, work_dir, reason);
+        }
+    }
     let cross_runner = match &strategy {
         ForeignStrategy::Cross(target) => Some(cross_harness_wrapper(target)),
+        // An Ada harness built for a target this host cannot run goes through
+        // the toolchain's runner (validated up front: such a target has one).
+        ForeignStrategy::Native if candidate_is_ada => {
+            options.ada_toolchain.runner.as_ref().map(runner_wrapper)
+        }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
 
@@ -2606,7 +3175,10 @@ fn run_attempt(
     // cross-compiled, fall back to the builtin (emulated) cascade so the target is
     // still fuzzed rather than silently left unfuzzed.
     let run_afl = target_engines.contains(&FuzzEngine::AflPlusPlus) && cross_runner.is_none();
-    let run_builtin = target_engines.contains(&FuzzEngine::Builtin) || !run_afl;
+    // WinAFL likewise runs only a native harness: DynamoRIO instruments the
+    // host process, never an emulated one.
+    let run_winafl = target_engines.contains(&FuzzEngine::Winafl) && cross_runner.is_none();
+    let run_builtin = target_engines.contains(&FuzzEngine::Builtin) || !(run_afl || run_winafl);
 
     // Resolve probe archives before generation. If one compiled under this
     // exact sanitizer contract exports the target, it must be the sole target
@@ -2621,17 +3193,49 @@ fn run_attempt(
         candidate.lang,
         crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
     );
+    // A cross build links only archives built for its own target. A build
+    // probe's archives are built for this host; a cross sweep links the ones
+    // rebuilt for its target instead, and a project's own archives are kept
+    // only when their objects are for the target's architecture, so none fails
+    // the link "in wrong format".
+    let cross_triple = match &strategy {
+        ForeignStrategy::Cross(target) => Some(target.triple.as_str()),
+        ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
+    };
     let library_archives: Vec<PathBuf> = if is_c_family {
-        crate::auto::build_probe::discover_static_libraries(&tree_root)
+        let mut archives = crate::auto::build_probe::discover_static_libraries(&tree_root);
+        if let Some(triple) = cross_triple {
+            archives.retain(|archive| {
+                crate::auto::cross_target::archive_matches_target(archive, triple) != Some(false)
+            });
+        }
+        archives
     } else {
         Vec::new()
     };
     let library_archive_symbols =
         crate::auto::build_probe::index_static_library_symbols(&library_archives);
-    let compatible_probe_archives = if is_c_family {
-        crate::auto::build_probe::compatible_probe_static_libraries(&tree_root, &options.sanitizers)
-    } else {
-        Vec::new()
+    let compatible_probe_archives = match &strategy {
+        _ if !is_c_family => Vec::new(),
+        ForeignStrategy::Cross(target)
+            if options
+                .cross_sweep
+                .as_ref()
+                .is_some_and(|sweep| sweep.target == *target) =>
+        {
+            options
+                .cross_sweep
+                .as_ref()
+                .map(|sweep| sweep.probe_archives.clone())
+                .unwrap_or_default()
+        }
+        ForeignStrategy::Cross(_) => Vec::new(),
+        ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => {
+            crate::auto::build_probe::compatible_probe_static_libraries(
+                &tree_root,
+                &options.sanitizers,
+            )
+        }
     };
     let compatible_probe_index =
         crate::auto::build_probe::index_static_library_symbols(&compatible_probe_archives);
@@ -2830,6 +3434,9 @@ fn run_attempt(
     // dead; from then on every round is a full build, because for this target the
     // check has demonstrably said something the compiler would not.
     let mut distrust_semantic_check = false;
+    // The std prelude the C++ builds write once the sources show
+    // standard-library names used without `std::`.
+    let mut std_prelude = StdPreludeState::default();
     for retry in 0..=max_repair_rounds {
         // A repair round is a full rebuild. Once the run's budget is gone, more
         // rounds cannot produce a fuzzed target — they only push the run past the
@@ -2862,7 +3469,8 @@ fn run_attempt(
         // Round 0 always builds outright, so a target that compiles as-is never
         // pays for a check it did not need.
         let round = if distrust_semantic_check { 0 } else { retry };
-        match try_build(
+        let mut built_standard = None;
+        let built = try_build(
             candidate,
             &harness_dir,
             &extra_sources,
@@ -2873,33 +3481,77 @@ fn run_attempt(
             &options.sanitizers,
             &options.dir_filter,
             options.project.as_deref(),
+            &options.ada_toolchain,
             round,
-        ) {
+            &mut built_standard,
+            decl_index,
+            &mut std_prelude,
+        );
+        record_std_prelude(&mut manifest, &std_prelude);
+        match built {
             BuildOutcome::Success => {
+                // Record the emulator this harness runs under beside it (or
+                // forget a stale one), so the replays after fuzzing, such as the
+                // comparison-evidence capture, run it the way the fuzzer did.
+                if let Err(error) = crate::gate_evidence::record_runner(
+                    &harness_dir,
+                    cross_runner.as_ref().map(harness_runner_record).as_ref(),
+                ) {
+                    bhfeprintln!(
+                        "bhf auto: warning: {}: could not record its emulator: {error}",
+                        candidate.harness_id
+                    );
+                }
                 if matches!(
                     candidate.lang,
                     crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
                 ) {
                     let is_cpp = candidate.lang == crate::auto::candidate::Lang::Cpp;
-                    let explicit_standard = is_cpp
-                        .then(|| std::env::var("BHF_CXX_STD").ok())
-                        .flatten()
-                        .map(|value| value.trim().to_owned())
-                        .filter(|value| !value.is_empty());
-                    let cached_standard = std::fs::read_to_string(cxx_dialect_cache_path(
-                        work_dir,
-                        &candidate.harness_id,
-                    ))
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty());
+                    // The standard the successful build used, as the build
+                    // reported it: re-reading the dialect cache here could
+                    // look up a key the build's own log has changed since.
+                    let compiler_family =
+                        if std::fs::read_to_string(c_compiler_cache_path(work_dir))
+                            .is_ok_and(|cached| cached.trim() == "gcc")
+                        {
+                            Some(harness_gen::compiler_family::CompilerFamily::Gcc)
+                        } else {
+                            let compilers = crate::toolchain::effective_compilers();
+                            let compiler = match &cross_compiler {
+                                Some(cross) if is_cpp => cross.cxx.clone(),
+                                Some(cross) => cross.cc.clone(),
+                                None if is_cpp => compilers.cxx,
+                                None => compilers.cc,
+                            };
+                            crate::toolchain::compiler_family(&compiler, is_cpp)
+                        };
                     crate::auto::coverage_replay::persist_build_recipe(
                         &harness_dir,
-                        &extra_sources,
-                        &extra_includes,
-                        explicit_standard.or(cached_standard),
-                        cross_compiler.is_none(),
+                        &crate::auto::coverage_replay::RecipeBuild {
+                            work_dir,
+                            extra_sources: &extra_sources,
+                            extra_includes: &extra_includes,
+                            standard: built_standard.clone(),
+                            native: cross_compiler.is_none(),
+                            cpp: is_cpp,
+                            compiler_family,
+                            recorded_by: "auto",
+                        },
                     );
+                    // The work dir's C++ compatibility fragment reached this
+                    // build: say so where the target's repairs are recorded.
+                    let compat =
+                        crate::auto::coverage_replay::work_dir_compat_flags(work_dir, true);
+                    if is_cpp
+                        && !(compat.clang.is_empty() && compat.gcc.is_empty())
+                        && !manifest.already_attempted("compiler-compat")
+                    {
+                        manifest.repairs.push(Repair::CompilerCompat {
+                            clang: compat.clang,
+                            gcc: compat.gcc,
+                            reason: CXX_COMPAT_REASON.to_owned(),
+                        });
+                    }
                 }
                 // Drive a cascade of fuzz passes against the freshly
                 // built harness. Three tiny seeds + 1024 iterations is
@@ -2916,8 +3568,34 @@ fn run_attempt(
                 // Built-in tiny seeds, plus any user `--seed-file`/`--seed-dir`
                 // inputs so parser/decompressor targets start from valid
                 // examples rather than only empty/`A` bytes.
-                let mut seeds = vec![b"".to_vec(), b"A".to_vec(), b"AAAAAAAA".to_vec()];
+                let mut seeds: Vec<Vec<u8>> =
+                    BOOTSTRAP_SEEDS.iter().map(|seed| seed.to_vec()).collect();
                 seeds.extend(options.user_seeds.iter().cloned());
+                // A mined or user seed is a sample of the input format. Where
+                // the harness decodes fixed-width parameters before its buffer,
+                // it is also given behind that many zero bytes, so the buffer
+                // starts with it (the seed itself stays as it is).
+                if let Some(prefix) = crate::fuzz::layout_seed_prefix(
+                    &crate::auto::layout::harness_exe(&harness_dir, "main"),
+                    work_dir,
+                    &candidate.harness_id,
+                ) {
+                    let variants = crate::fuzz::layout_prefixed_seeds(&options.user_seeds, prefix);
+                    if !variants.is_empty() {
+                        if let Err(error) = crate::auto::seed_manifest::record_layout_variant(
+                            work_dir,
+                            &candidate.harness_id,
+                            prefix,
+                            &variants,
+                        ) {
+                            bhfeprintln!(
+                                "bhf auto: warning: could not list {}'s prefixed seeds: {error}",
+                                candidate.harness_id
+                            );
+                        }
+                        seeds.extend(variants);
+                    }
+                }
                 seeds.extend(
                     crate::auto::go_build::load_structured_seed_inputs(&harness_dir)
                         .map_err(anyhow::Error::msg)?,
@@ -2936,6 +3614,11 @@ fn run_attempt(
                 // pass 1 is spliced in pass 2). Start fresh per target.
                 let cmplog_snapshot = harness_dir.join("cmplog.jsonl");
                 let _ = std::fs::remove_file(&cmplog_snapshot);
+                if let Some(note) =
+                    corpus_format_note(work_dir, &candidate.harness_id, &harness_dir)
+                {
+                    bhfeprintln!("bhf auto: note: {note}");
+                }
                 let mut pass_runs: Vec<PassRun> = Vec::new();
                 let mut events: Vec<crate::auto::runtrace::RuntraceEvent> = Vec::new();
                 let mut env_injected: Vec<(String, String)> = Vec::new();
@@ -3080,6 +3763,20 @@ fn run_attempt(
                                 "bhf auto: fuzz pass `{pass_label}` failed for {}: {error}",
                                 candidate.harness_id
                             );
+                            // The harness dies before reaching the target on
+                            // every input: another pass would fail the same
+                            // way, and the target is an environment problem,
+                            // not a runtime error of the harness.
+                            if crate::fuzz::is_runtime_start_failure(&error) {
+                                return Ok(AttemptResult {
+                                    candidate: candidate.clone(),
+                                    outcome: Outcome::SanitizerRuntimeUnavailable {
+                                        repairs: manifest.repairs.clone(),
+                                        reason: error,
+                                    },
+                                    harness_dir,
+                                });
+                            }
                             // Crash-rate kill-switch: a shim regression
                             // that always crashes (eg. void/void dlsym
                             // stub jumping to garbage memory) would
@@ -3106,8 +3803,9 @@ fn run_attempt(
                     };
                     // #378: harvest this pass's cmplog operands (from the
                     // runtrace log it just wrote) into the snapshot so the next
-                    // pass's mutator splices the magic bytes this pass observed.
-                    append_cmplog_records(&harness_dir.join("runtrace.jsonl"), &cmplog_snapshot);
+                    // pass's mutator splices the magic bytes this pass observed,
+                    // and into the learned dictionary later runs load.
+                    harvest_pass_cmplog(&harness_dir);
                     // Flush the pass's final counters. Live ticks are throttled
                     // and a sub-throttle pass emits none, so this is what makes a
                     // working run show real execs instead of the execs=0 start.
@@ -3126,6 +3824,7 @@ fn run_attempt(
                         executions: summary.executions,
                         target_entry_observed: summary.target_entry_observed,
                         coverage_edges: summary.coverage.edges,
+                        coverage_instrumentation: summary.coverage.instrumentation(),
                         // #405: the engine's own measured fuzz wall (excludes
                         // build/repair/reseed), carried up so run.json and
                         // fuzz_runs/<hid>-*.json report the same throughput.
@@ -3145,12 +3844,19 @@ fn run_attempt(
                         candidate.input_reachability,
                         ipc_channel_observed,
                     );
+                    let reach_basis = reachability_basis_for(candidate, reach_label);
+                    let shim_armed = fuzz_pass_shim_armed(&harness_dir, cross_runner.is_some());
                     for fid in &summary.findings {
                         let finding_path =
                             corpus::layout::finding_dir(work_dir, fid).join("finding.json");
-                        if let Err(error) =
-                            stamp_runtime_mode(&finding_path, *pass, &env_injected, reach_label)
-                        {
+                        if let Err(error) = stamp_runtime_mode(
+                            &finding_path,
+                            *pass,
+                            &env_injected,
+                            reach_label,
+                            reach_basis,
+                            shim_armed,
+                        ) {
                             bhfeprintln!("bhf auto: warning: stamp {fid} runtime_mode: {error}");
                         }
                     }
@@ -3190,21 +3896,37 @@ fn run_attempt(
                 // target or discards the builtin results.
                 if run_afl {
                     progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "afl++" }));
-                    let afl_built = crate::build::try_run_c_make_afl_build_with_extras(
+                    let afl_build = crate::build::try_run_c_make_afl_build_with_extras(
                         work_dir,
                         &candidate.harness_id,
                         &extra_sources,
                         &extra_includes,
-                    )
-                    .status
-                    .success();
+                    );
+                    let afl_built = afl_build.status.success();
+                    let afl_lane = if afl_built {
+                        crate::auto::lanes::LaneStatus::built()
+                    } else {
+                        crate::auto::lanes::LaneStatus::failed(
+                            "main_afl",
+                            &format!(
+                                "{}\n{}",
+                                String::from_utf8_lossy(&afl_build.stderr),
+                                String::from_utf8_lossy(&afl_build.stdout)
+                            ),
+                        )
+                    };
                     if !afl_built {
                         bhfeprintln!(
-                            "bhf auto: warning: `make afl` failed for {} — AFL skipped, \
-                             builtin results kept",
-                            candidate.harness_id
+                            "bhf auto: warning: {}",
+                            afl_skipped_message(
+                                &candidate.harness_id,
+                                pass_runs.iter().any(|run| run.executions > 0),
+                                afl_lane.reason.as_deref().unwrap_or("make main_afl failed"),
+                            )
                         );
-                    } else {
+                    }
+                    crate::auto::lanes::record(&harness_dir, crate::auto::lanes::AFL, afl_lane);
+                    if afl_built {
                         // Seed AFL from the corpus the builtin passes grew (deep inputs
                         // reached once stay reachable), plus the base/user seeds.
                         let mut afl_seeds = seeds.clone();
@@ -3229,14 +3951,18 @@ fn run_attempt(
                                     candidate.input_reachability,
                                     ipc_channel_observed,
                                 );
+                                let reach_basis = reachability_basis_for(candidate, reach_label);
                                 for fid in &summary.findings {
                                     let finding_path = corpus::layout::finding_dir(work_dir, fid)
                                         .join("finding.json");
+                                    // The AFL++ child runs without the runtrace shim.
                                     if let Err(error) = stamp_runtime_mode(
                                         &finding_path,
                                         crate::auto::pass::Pass::FuzzDriven,
                                         &env_injected,
                                         reach_label,
+                                        reach_basis,
+                                        false,
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -3249,6 +3975,7 @@ fn run_attempt(
                                     executions: summary.executions,
                                     target_entry_observed: summary.target_entry_observed,
                                     coverage_edges: summary.coverage.edges,
+                                    coverage_instrumentation: summary.coverage.instrumentation(),
                                     elapsed_secs: summary.elapsed_secs,
                                     executions_per_sec: summary.executions_per_sec,
                                     findings: summary.findings.clone(),
@@ -3256,6 +3983,110 @@ fn run_attempt(
                             }
                             Err(error) => bhfeprintln!(
                                 "bhf auto: warning: AFL run failed for {}: {error}",
+                                candidate.harness_id
+                            ),
+                        }
+                    }
+                }
+
+                // WinAFL engine stage (`auto --engine winafl`, native Windows):
+                // build `main_winafl` (the same sources without sanitizers) with
+                // the recovered extras the `main` build used, then run WinAFL for
+                // this engine's budget slice. Each crash and hang it saves is
+                // replayed through the sanitized `main`, so its findings fold into
+                // the shared pipeline. A failure is logged and skipped like AFL's.
+                if run_winafl {
+                    progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "winafl" }));
+                    let winafl_build = crate::build::try_run_c_make_winafl_build_with_extras(
+                        work_dir,
+                        &candidate.harness_id,
+                        &extra_sources,
+                        &extra_includes,
+                    );
+                    let winafl_built = winafl_build.status.success();
+                    let winafl_lane = if winafl_built {
+                        crate::auto::lanes::LaneStatus::built()
+                    } else {
+                        crate::auto::lanes::LaneStatus::failed(
+                            crate::fuzz::WINAFL_BINARY,
+                            &format!(
+                                "{}\n{}",
+                                String::from_utf8_lossy(&winafl_build.stderr),
+                                String::from_utf8_lossy(&winafl_build.stdout)
+                            ),
+                        )
+                    };
+                    if !winafl_built {
+                        bhfeprintln!(
+                            "bhf auto: warning: WinAFL skipped for {}: {}",
+                            candidate.harness_id,
+                            winafl_lane
+                                .reason
+                                .as_deref()
+                                .unwrap_or("make main_winafl failed"),
+                        );
+                    }
+                    crate::auto::lanes::record(
+                        &harness_dir,
+                        crate::auto::lanes::WINAFL,
+                        winafl_lane,
+                    );
+                    if winafl_built {
+                        let mut winafl_seeds = seeds.clone();
+                        reseed_from_corpus_queue(
+                            work_dir,
+                            &candidate.harness_id,
+                            &mut winafl_seeds,
+                            CORPUS_RESEED_CAP,
+                        );
+                        match crate::fuzz::run_winafl_programmatic(
+                            work_dir,
+                            &candidate.harness_id,
+                            winafl_seeds,
+                            Some(engine_budget),
+                            &env_injected,
+                            options.mode,
+                            options.rss_limit_mb,
+                            options.sanitizers.runtime_set(),
+                            &options.winafl,
+                        ) {
+                            Ok(summary) => {
+                                let reach_label = effective_reachability_label(
+                                    candidate.input_reachability,
+                                    ipc_channel_observed,
+                                );
+                                let reach_basis = reachability_basis_for(candidate, reach_label);
+                                for fid in &summary.findings {
+                                    let finding_path = corpus::layout::finding_dir(work_dir, fid)
+                                        .join("finding.json");
+                                    // The WinAFL target runs without the runtrace shim.
+                                    if let Err(error) = stamp_runtime_mode(
+                                        &finding_path,
+                                        crate::auto::pass::Pass::FuzzDriven,
+                                        &env_injected,
+                                        reach_label,
+                                        reach_basis,
+                                        false,
+                                    ) {
+                                        bhfeprintln!(
+                                            "bhf auto: warning: stamp {fid} runtime_mode: {error}"
+                                        );
+                                    }
+                                }
+                                pass_runs.push(PassRun {
+                                    pass: crate::auto::pass::Pass::FuzzDriven,
+                                    engine: "winafl".to_owned(),
+                                    executions: summary.executions,
+                                    target_entry_observed: summary.target_entry_observed,
+                                    coverage_edges: summary.coverage.edges,
+                                    coverage_instrumentation: summary.coverage.instrumentation(),
+                                    elapsed_secs: summary.elapsed_secs,
+                                    executions_per_sec: summary.executions_per_sec,
+                                    findings: summary.findings.clone(),
+                                });
+                            }
+                            Err(error) => bhfeprintln!(
+                                "bhf auto: warning: WinAFL run failed for {}: {error}",
                                 candidate.harness_id
                             ),
                         }
@@ -3513,11 +4344,19 @@ fn run_attempt(
                 let c_build_output =
                     std::fs::read_to_string(harness_dir.join("repairs").join(C_BUILD_OUTPUT_LOG))
                         .unwrap_or_default();
-                if let Some(ejected) = eject_unbuildable_added_source(
-                    &c_build_output,
-                    &mut extra_sources,
-                    &options.extra_sources,
-                ) {
+                // A recovered unit that only lacks a standard stream header (`cerr`
+                // used without `<iostream>`) is repairable: force-include the header
+                // this round, and eject the unit only if it still fails afterwards.
+                let ejected = if std_stream_include_pending(&errors, &manifest) {
+                    None
+                } else {
+                    eject_unbuildable_added_source(
+                        &c_build_output,
+                        &mut extra_sources,
+                        &options.extra_sources,
+                    )
+                };
+                if let Some(ejected) = ejected {
                     bhfeprintln!(
                         "bhf auto: {}: recovered source {} does not compile in \
                          isolation; dropping it and stubbing the symbols it \
@@ -3682,6 +4521,9 @@ fn run_attempt(
                 // skip honestly instead of looping to an opaque `failed_build`.
                 let mut unavailable_target_blocker = false;
                 for err in &errors {
+                    if error_names_std_prelude_name(err, &std_prelude) {
+                        continue;
+                    }
                     // Several undefined symbols often live in one implementation
                     // source (XZ check.c defines init/update/finish). Once that
                     // source is added in this round, let the next build resolve all
@@ -3799,6 +4641,14 @@ fn run_attempt(
                                     if !extra_includes.contains(&i) {
                                         extra_includes.push(i);
                                     }
+                                }
+                                // Which form a type repair took: the real
+                                // header it included, or a fabricated stand-in.
+                                if let Repair::TypePlaceholder {
+                                    resolved_header, ..
+                                } = &mut repair
+                                {
+                                    *resolved_header = outcome.resolved_header;
                                 }
                                 manifest.repairs.push(repair);
                                 applied_any = true;
@@ -3974,9 +4824,9 @@ fn repair_key(repair: &Repair) -> String {
         Repair::HeaderPlaceholder { virtual_path } => virtual_path.clone(),
         Repair::HeaderForward { virtual_path, .. } => format!("forward-h:{virtual_path}"),
         Repair::ConfigHeaderSynth { virtual_path } => format!("config-h:{virtual_path}"),
-        Repair::AddIncludeDir { dir } => dir.display().to_string(),
+        Repair::AddIncludeDir { dir, .. } => dir.display().to_string(),
         Repair::IncludeTypeHeader { type_name, .. } => format!("type-header:{type_name}"),
-        Repair::TypePlaceholder { type_name } => type_name.clone(),
+        Repair::TypePlaceholder { type_name, .. } => type_name.clone(),
         Repair::TypeAlias { type_name, .. } => type_name.clone(),
         Repair::ConfigTypeAlias { type_name, .. } => format!("config-alias:{type_name}"),
         Repair::MacroDefine { name, .. } | Repair::ConfigGuardDefine { name, .. } => {
@@ -3995,6 +4845,8 @@ fn repair_key(repair: &Repair) -> String {
         Repair::PlatformStub { platform } => format!("platform-stub:{platform}"),
         Repair::ForcedSyntheticParams { .. } => "forced-synthetic-params".to_owned(),
         Repair::Win32Pack => "win32-pack".to_owned(),
+        Repair::CompilerCompat { .. } => "compiler-compat".to_owned(),
+        Repair::StdPrelude { .. } => "std-prelude".to_owned(),
     }
 }
 
@@ -4133,6 +4985,8 @@ fn repair_replaces_candidate_target(repair: &Repair, candidate: &Candidate) -> b
         | Repair::StubGprImport { .. }
         | Repair::PlatformStub { .. }
         | Repair::ForcedSyntheticParams { .. }
+        | Repair::CompilerCompat { .. }
+        | Repair::StdPrelude { .. }
         | Repair::Win32Pack => false,
     }
 }
@@ -4148,6 +5002,56 @@ fn dependency_fallback_after_refused_source(
         error, decl_index, manifest, force, false,
     )?;
     (!repair_replaces_candidate_target(&fallback, candidate)).then_some(fallback)
+}
+
+/// An interpreter/VM launcher harness (`main` is a launcher script), whose
+/// language-aware driver owns coverage and finding classification, so the
+/// native runtrace shim is not preloaded into it.
+fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(harness_dir.join("main"))
+        .map(|s| {
+            s.contains("BHF_JVM_LAUNCHER")
+                || s.contains("BHF_CS_LAUNCHER")
+                || s.contains("BHF_JS_LAUNCHER")
+                || s.contains("BHF_PY_LAUNCHER")
+                || s.contains("BHF_PL_LAUNCHER")
+                || s.contains("BHF_RB_LAUNCHER")
+                || s.contains("BHF_LUA_LAUNCHER")
+                || s.contains("BHF_PHP_LAUNCHER")
+        })
+        .unwrap_or(false)
+}
+
+/// The warning for a failed `make afl`: the builtin engine's results stand
+/// when it fuzzed the target, and otherwise the target was not fuzzed at all.
+fn afl_skipped_message(harness_id: &str, builtin_fuzzed: bool, failure: &str) -> String {
+    if builtin_fuzzed {
+        format!(
+            "`make afl` failed for {harness_id} — AFL skipped, builtin results kept ({failure})"
+        )
+    } else {
+        format!("AFL skipped; {harness_id} was not fuzzed ({failure})")
+    }
+}
+
+/// The starting inputs every builtin fuzz pass gets besides the mined and
+/// user seeds. `bhf explain` names a crash found on one of them.
+pub(crate) const BOOTSTRAP_SEEDS: [&[u8]; 3] = [b"", b"A", b"AAAAAAAA"];
+
+/// Whether the builtin fuzz pass of this harness that just ran had the
+/// runtrace shim loaded: a native (not emulated) harness without its own
+/// launcher whose runtrace log holds the line the shim writes when it first
+/// opens the log. The log is removed before each pass, and the fuzz driver
+/// creates it for its comparison records with or without the shim, so only
+/// that marker counts: a shim the dynamic loader did not preload (a path
+/// `LD_PRELOAD` splits, a file it refuses to load) or no shim at all counts as
+/// not armed.
+/// Recorded in each finding's `runtime_mode.shim_armed`, so a report can tell
+/// "no environment use observed" from "not observed".
+fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
+    !cross
+        && !harness_owns_runtime_instrumentation(harness_dir)
+        && crate::auto::runtrace::log_shows_shim_loaded(&harness_dir.join("runtrace.jsonl"))
 }
 
 /// One-shot warning latch so we don't print "shim not found" once
@@ -4191,8 +5095,11 @@ fn run_fuzz_with_runtrace(
     String,
 > {
     let runtrace_log = harness_dir.join("runtrace.jsonl");
-    // Truncate any prior log so this pass's events stand alone.
-    let _ = std::fs::write(&runtrace_log, "");
+    // Remove any prior log so this pass's events stand alone. The shim writes
+    // a marker line when it first opens the log, so that line afterwards shows
+    // that the pass ran with the shim preloaded ([`fuzz_pass_shim_armed`]); the
+    // log's existence does not, since the driver opens it for comparisons.
+    let _ = std::fs::remove_file(&runtrace_log);
 
     let mut child_env: Vec<(String, String)> = vec![
         (
@@ -4299,18 +5206,7 @@ fn run_fuzz_with_runtrace(
     // comparisons). Besides false behavioral events, CPython can emit megabytes of
     // startup cmplog and miss a short campaign's handshake entirely. Native lanes
     // retain the shim; managed/scripting lanes use their language-aware drivers.
-    let owns_runtime_instrumentation = std::fs::read_to_string(harness_dir.join("main"))
-        .map(|s| {
-            s.contains("BHF_JVM_LAUNCHER")
-                || s.contains("BHF_CS_LAUNCHER")
-                || s.contains("BHF_JS_LAUNCHER")
-                || s.contains("BHF_PY_LAUNCHER")
-                || s.contains("BHF_PL_LAUNCHER")
-                || s.contains("BHF_RB_LAUNCHER")
-                || s.contains("BHF_LUA_LAUNCHER")
-                || s.contains("BHF_PHP_LAUNCHER")
-        })
-        .unwrap_or(false);
+    let owns_runtime_instrumentation = harness_owns_runtime_instrumentation(harness_dir);
     if cross_wrapper.is_some() || owns_runtime_instrumentation {
         // no shim for emulated targets or interpreter/VM lanes
     } else if let Some(shim) = crate::auto::shim_path::locate() {
@@ -4321,9 +5217,8 @@ fn run_fuzz_with_runtrace(
         child_env.push(("LD_PRELOAD".to_owned(), ld_preload));
     } else if SHIM_MISSING_WARNED.set(()).is_ok() {
         bhfeprintln!(
-            "bhf auto: libbhf_runtrace.so not found beside bhf or in a \
-             sibling bhf_runtrace_shim archive directory; \
-             running fuzz without runtime audit"
+            "bhf auto: {}; running fuzz without the runtrace shim",
+            crate::auto::shim_path::unavailable_reason()
         );
     }
     for (k, v) in extra_env {
@@ -4799,6 +5694,7 @@ mod generation_outcome_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
 
@@ -4827,6 +5723,7 @@ mod hdf6_environment_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: reach,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -5183,6 +6080,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5219,6 +6117,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5255,6 +6154,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5291,6 +6191,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5320,6 +6221,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(!c_auto_sequence_candidate(&candidate, None, &[]));
@@ -5353,6 +6255,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: true,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let lifecycle = vec![CHandleLifecycle {
@@ -5590,7 +6493,11 @@ fn try_build(
     sanitizers: &multicore_fuzz::SanitizerSelection,
     dir_filter: &crate::auto::discovery::DirFilter,
     project_override: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
+    built_standard: &mut Option<String>,
+    decl_index: &DeclarationIndex,
+    std_prelude: &mut StdPreludeState,
 ) -> BuildOutcome {
     use crate::auto::candidate::Lang;
     let work_dir = dir
@@ -5610,6 +6517,9 @@ fn try_build(
             cross_compiler,
             sanitizers,
             round,
+            built_standard,
+            decl_index,
+            std_prelude,
         ),
         Lang::Ada => try_build_ada(
             work_dir,
@@ -5620,6 +6530,7 @@ fn try_build(
             ada_dep_dirs,
             dir_filter,
             project_override,
+            ada_toolchain,
             round,
         ),
         // The Rust lane builds its harness in `run_attempt` Step 0a (the
@@ -5688,7 +6599,10 @@ fn try_build(
         // The Go lane compiled its harness binary (`harnesses/<id>/main`) in Step 0;
         // pass-through reports Success iff that binary exists.
         Lang::Go => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
+            let main_bin = crate::auto::layout::harness_exe(
+                &crate::auto::layout::harness_dir(work_dir, harness_id),
+                "main",
+            );
             if main_bin.is_file() {
                 BuildOutcome::Success
             } else {
@@ -5799,6 +6713,13 @@ fn try_build(
     }
 }
 
+/// Build a C/C++ harness. On success `built_standard` holds the language
+/// standard the build that succeeded used (`None`: the Makefile's default),
+/// which the build recipe records. A C++ build that fails on standard-library
+/// names used without `std::` writes or extends the std prelude
+/// (`std_prelude`) and builds again with it, as long as each rebuild reports
+/// names the prelude lacks.
+#[allow(clippy::too_many_arguments)]
 fn try_build_c(
     work_dir: &Path,
     harness_id: &str,
@@ -5807,21 +6728,29 @@ fn try_build_c(
     cross_compiler: Option<&crate::build::CFamilyCompilerOverride>,
     sanitizers: &multicore_fuzz::SanitizerSelection,
     round: usize,
+    built_standard: &mut Option<String>,
+    decl_index: &DeclarationIndex,
+    std_prelude: &mut StdPreludeState,
 ) -> BuildOutcome {
     use multicore_fuzz::SanitizerSelection;
     // `auto --sanitizers` arms an explicit `-fsanitize=` set for the native build.
     // A cross build already carries its own flag override (which deliberately drops
     // sanitizers — they don't survive qemu-user), so sanitizers only apply on the
-    // host path. `Default` leaves the Makefile's `address,undefined` CFLAGS/CXXFLAGS
+    // host path. `Default` leaves the Makefile's `address,undefined` BHF_CFLAGS/BHF_CXXFLAGS
     // intact (byte-identical to before); `None` builds coverage-only (no
     // `-fsanitize=`); `Set` swaps in exactly the requested matrix.
     let sanitizer_override;
     let fallback_override;
     // A previous target already proved this project needs the other compiler.
     // Honour that before anything else so one probe serves the whole run — but
-    // never over an explicit cross build or an operator's `--sanitizers`, both of
-    // which carry their own compiler and flags on purpose.
+    // never over an explicit cross build, an operator's `--sanitizers`, or the
+    // operator's own CC/CXX (`[toolchain]`), all of which choose the compiler on
+    // purpose.
+    let operator_compilers = crate::toolchain::effective_compilers().explicit;
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    let is_cpp = harness_dir.join("main.cpp").is_file();
     let cached_alternate = cross_compiler.is_none()
+        && !operator_compilers
         && matches!(sanitizers, SanitizerSelection::Default)
         && std::fs::read_to_string(c_compiler_cache_path(work_dir))
             .is_ok_and(|cached| cached.trim() == "gcc");
@@ -5838,13 +6767,11 @@ fn try_build_c(
                 Some(&sanitizer_override)
             }
             SanitizerSelection::Set(set) => {
-                sanitizer_override = sanitizer_compiler_override(set);
+                sanitizer_override = sanitizer_compiler_override(set, is_cpp);
                 Some(&sanitizer_override)
             }
         },
     };
-    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
-    let is_cpp = harness_dir.join("main.cpp").is_file();
     // C++ dialect selection: an explicit `--cxx-std` (BHF_CXX_STD) wins; else a
     // standard the ladder already proved for this exact target/build context is
     // reused; else the baked default may be overridden on a failure. A project-wide
@@ -5873,6 +6800,8 @@ fn try_build_c(
     // (nothing is linked), so the real build always runs before a target is
     // called built, and the dialect ladder and -fcommon retry below stay on the
     // real build where their evidence lives.
+    // What the std prelude steps below did, for the one note they print.
+    let mut prelude_note = StdPreludeNote::default();
     if round > 0 {
         let check = crate::build::try_run_c_make_build_with_target(
             work_dir,
@@ -5887,24 +6816,65 @@ fn try_build_c(
             let raw = combined_build_output(&check);
             let errors = build_classifier::classify(&raw);
             if !errors.is_empty() {
-                return BuildOutcome::Failed { errors };
+                // A check that shows standard-library names used without
+                // `std::` gets the prelude, and the build below runs with it.
+                if !(is_cpp
+                    && apply_std_prelude(
+                        work_dir,
+                        harness_id,
+                        &raw,
+                        decl_index,
+                        std_prelude,
+                        &mut prelude_note,
+                    ))
+                {
+                    return BuildOutcome::Failed { errors };
+                }
             }
         }
     }
-    let mut output = crate::build::try_run_c_make_build_with_target(
-        work_dir,
-        harness_id,
-        extra_sources,
-        extra_includes,
-        compiler,
-        None,
-        chosen_std.as_deref(),
-    );
-    if build_succeeded(&output) {
-        return BuildOutcome::Success;
+    // A pre-standard header that writes `string` or `map<string, int>` without
+    // `std::`, relying on a `using namespace std;` that the project's own
+    // sources put before including it: write the prelude `bhf build` writes
+    // and build again with it, before the compatibility retries, the dialect
+    // ladder and the other compiler, none of which can declare the names.
+    // clang++ stops after 20 errors, so the names of a long header come a
+    // build at a time: keep adding while a rebuild reports names the prelude
+    // lacks. Each pass adds at least one of the finite standard names
+    // `build_classifier::std_library_header` knows, so this ends.
+    let mut output;
+    let mut raw_output;
+    loop {
+        output = crate::build::try_run_c_make_build_with_target(
+            work_dir,
+            harness_id,
+            extra_sources,
+            extra_includes,
+            compiler,
+            None,
+            chosen_std.as_deref(),
+        );
+        if build_succeeded(&output) {
+            announce_std_prelude(harness_id, std_prelude, &prelude_note);
+            *built_standard = chosen_std.clone();
+            return BuildOutcome::Success;
+        }
+        raw_output = combined_build_output(&output);
+        persist_c_build_output(work_dir, harness_id, &raw_output);
+        if !(is_cpp
+            && apply_std_prelude(
+                work_dir,
+                harness_id,
+                &raw_output,
+                decl_index,
+                std_prelude,
+                &mut prelude_note,
+            ))
+        {
+            break;
+        }
     }
-    let mut raw_output = combined_build_output(&output);
-    persist_c_build_output(work_dir, harness_id, &raw_output);
+    announce_std_prelude(harness_id, std_prelude, &prelude_note);
     let mut errors = build_classifier::classify(&raw_output);
 
     // GCC 10 and Clang 11 changed C's default from -fcommon to -fno-common.
@@ -5916,6 +6886,46 @@ fn try_build_c(
     // the retry removes that class of error. Every C Makefile lane includes the
     // same fragment, so AFL/MSan/TSan/coverage/differential replay stay aligned.
     let c_compat_path = work_dir.join("c_compat.mk");
+    // The C++ counterpart: a member declared with its own class's
+    // qualification (`int Widget::size();` inside `class Widget`), which only
+    // MSVC accepts by default. clang accepts it under `-fms-extensions`, gcc
+    // under `-fpermissive`; the fragment carries both, and each Makefile lane
+    // takes the one for its compiler. Kept only when the retry removes that
+    // error class, like `-fcommon` below.
+    let cxx_compat_path = work_dir.join(CXX_COMPAT_FILE);
+    if is_cpp
+        && !cxx_compat_path.is_file()
+        && output_has_extra_qualification(&errors)
+        && std::fs::write(&cxx_compat_path, CXX_COMPAT_EXTRA_QUALIFICATION).is_ok()
+    {
+        let compat_output = crate::build::try_run_c_make_build_with_target(
+            work_dir,
+            harness_id,
+            extra_sources,
+            extra_includes,
+            compiler,
+            None,
+            chosen_std.as_deref(),
+        );
+        if build_succeeded(&compat_output) {
+            announce_cxx_compat(harness_id);
+            *built_standard = chosen_std.clone();
+            return BuildOutcome::Success;
+        }
+        let compat_raw = combined_build_output(&compat_output);
+        let compat_errors = build_classifier::classify(&compat_raw);
+        if !output_has_extra_qualification(&compat_errors) {
+            // The class is gone; whatever remains is the next thing to repair.
+            announce_cxx_compat(harness_id);
+            raw_output = compat_raw;
+            persist_c_build_output(work_dir, harness_id, &raw_output);
+            errors = compat_errors;
+        } else {
+            // The flag did not remove the error class (a compiler that accepts
+            // neither spelling); do not weaken later targets for nothing.
+            let _ = std::fs::remove_file(&cxx_compat_path);
+        }
+    }
     if !is_cpp
         && !c_compat_path.is_file()
         && output_may_require_fcommon(&raw_output)
@@ -5931,6 +6941,7 @@ fn try_build_c(
             None,
         );
         if build_succeeded(&compat_output) {
+            *built_standard = None;
             return BuildOutcome::Success;
         }
         let compat_raw = combined_build_output(&compat_output);
@@ -5972,6 +6983,7 @@ fn try_build_c(
             None,
         );
         if build_succeeded(&output) {
+            *built_standard = None;
             return BuildOutcome::Success;
         }
         raw_output = combined_build_output(&output);
@@ -6029,6 +7041,7 @@ fn try_build_c(
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&cache_path, std);
+                *built_standard = Some(std.to_owned());
                 return BuildOutcome::Success;
             }
             let raw = combined_build_output(&out);
@@ -6058,9 +7071,12 @@ fn try_build_c(
     // cannot conjure a symbol that is genuinely undefined.
     if !is_pure_link_failure
         && !cached_alternate
+        && !operator_compilers
         && cross_compiler.is_none()
         && matches!(sanitizers, SanitizerSelection::Default)
         && !c_compiler_cache_path(work_dir).exists()
+        // GCC links no sanitizer runtime on Windows: it cannot build this.
+        && !cfg!(windows)
         && which::which("gcc").is_ok()
     {
         let alternate = gcc_fallback_override();
@@ -6079,6 +7095,7 @@ fn try_build_c(
                 "bhf auto: {harness_id}: clang rejected this target and gcc \
                  accepted it; using gcc for the rest of the run"
             );
+            *built_standard = chosen_std.clone();
             return BuildOutcome::Success;
         }
     }
@@ -6099,6 +7116,36 @@ fn try_build_c(
         }
     }
     BuildOutcome::Failed { errors }
+}
+
+/// The work-dir C++ compatibility fragment every C++ harness Makefile
+/// includes as `../../cxx_compat.mk`.
+pub(crate) const CXX_COMPAT_FILE: &str = "cxx_compat.mk";
+
+/// [`CXX_COMPAT_FILE`] for a member declared with its own class's
+/// qualification: clang's spelling and gcc's, chosen per lane by the Makefile.
+const CXX_COMPAT_EXTRA_QUALIFICATION: &str =
+    "# Written by bhf auto: members declared with their own class's qualification.\n\
+CXX_COMPAT_FLAGS_CLANG := -fms-extensions\n\
+CXX_COMPAT_FLAGS_GCC := -fpermissive\n";
+
+/// Why bhf adds [`CXX_COMPAT_EXTRA_QUALIFICATION`]'s flags, as the run says it.
+const CXX_COMPAT_REASON: &str = "a member declared with an extra class qualification";
+
+/// Say that a target builds with the C++ compatibility flags, once, when the
+/// build adopts them.
+fn announce_cxx_compat(harness_id: &str) {
+    bhfeprintln!(
+        "bhf auto: {harness_id}: building with -fms-extensions (clang) / -fpermissive (gcc) \
+         for {CXX_COMPAT_REASON}"
+    );
+}
+
+/// Whether a classified build failure includes an extra member qualification.
+fn output_has_extra_qualification(errors: &[BuildErrorKind]) -> bool {
+    errors
+        .iter()
+        .any(|error| matches!(error, BuildErrorKind::ExtraQualification { .. }))
 }
 
 /// Whether the C-family build produced the harness executable that the fuzz
@@ -6128,10 +7175,12 @@ fn cxx_dialect_cache_path(work_dir: &Path, harness_id: &str) -> PathBuf {
     }
     let repairs = harness_dir.join("repairs");
     if let Ok(entries) = std::fs::read_dir(&repairs) {
+        // Only the build's inputs: the output log of a failed build (written
+        // after the ladder caches its rung) would make the next lookup miss.
         let mut files = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.is_file())
+            .filter(|path| path.is_file() && !path.extension().is_some_and(|ext| ext == "log"))
             .collect::<Vec<_>>();
         files.sort();
         for file in files {
@@ -6307,6 +7356,18 @@ mod cxx_dialect_output_tests {
             before, after,
             "a repair-induced include graph change must invalidate the dialect choice"
         );
+        // The build's own output log is not an input: writing it after the
+        // ladder cached its rung must not hide that rung from the next lookup.
+        fs::write(
+            first.join("repairs").join(super::C_BUILD_OUTPUT_LOG),
+            "error: ISO C++17 does not allow dynamic exception specifications\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cxx_dialect_cache_path(temp.path(), "H-X1"),
+            after,
+            "the build log must not change the dialect cache key"
+        );
     }
 }
 
@@ -6417,7 +7478,8 @@ fn resolve_foreign_candidate_target(
     if matches!(candidate.lang, crate::auto::candidate::Lang::Ada) {
         return Err(format!(
             "foreign-platform Ada target (guard `{guard}`) needs a matching GNAT cross \
-             toolchain; bhf auto currently cross-compiles only C/C++ (would target {})",
+             toolchain (would target {}); configure it with [toolchain.ada] prefix/target \
+             and a [toolchain] runner (--ada-prefix/--ada-target, --runner)",
             target.toolchain_hint()
         ));
     }
@@ -6487,22 +7549,59 @@ fn apply_platform_stub(
 
 /// Cross compiler + replacement flags for a foreign build. The native harness
 /// Makefile bakes clang's `-fsanitize-coverage=trace-pc-guard,trace-cmp` and
-/// `-fsanitize=address,undefined` into `CFLAGS`/`CXXFLAGS`. The cross GCCs reject
-/// `trace-pc-guard` outright, so an arch (qemu-user) build drops coverage + ASan
-/// entirely and compiles plain `-O1 -g` — the harness still runs and hard crashes
-/// (SIGSEGV / SIGABRT) are still caught, just without coverage or ASan.
+/// `-fsanitize=address,undefined` into `BHF_CFLAGS`/`BHF_CXXFLAGS`, which a cross build
+/// replaces: ASan does not survive qemu-user and mingw has no runtime for it,
+/// so the build is `-O1 -g` plus the coverage the cross compiler accepts. The
+/// harness still runs and hard crashes (SIGSEGV / SIGABRT) are still caught.
 ///
-/// A Windows (mingw + wine) build does better: mingw-w64 gcc DOES accept
-/// `trace-pc` + `trace-cmp` (just not the guard variant), so we arm them — the
-/// Windows driver implements the guard-less `__sanitizer_cov_trace_pc` hook and
-/// the cmplog operand hooks, giving real coverage-guided, input-to-state fuzzing
-/// under wine. ASan still has no mingw runtime, so memory bugs surface via the
-/// driver's vectored exception handler (a fault → distinctive crash exit) rather
-/// than ASan shadow checks.
+/// A Windows (mingw + wine) build arms `trace-pc` + `trace-cmp` (mingw-w64 gcc
+/// has no guard variant): the Windows driver implements the guard-less
+/// `__sanitizer_cov_trace_pc` hook and the cmplog operand hooks, giving real
+/// coverage-guided, input-to-state fuzzing under wine. Memory bugs surface via
+/// the driver's vectored exception handler (a fault -> distinctive crash exit)
+/// rather than ASan shadow checks.
 fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompilerOverride {
+    cross_compiler_override_with(
+        target,
+        cached_compiler_accepts_flag,
+        compiler_links_with_flags,
+    )
+}
+
+/// [`cross_compiler_override`] with the flag probes injected: `accepts`
+/// compiles with a flag, `links` links a program with a set of flags.
+///
+/// An emulated Linux build (qemu-user, or an operator's runner) arms coverage
+/// too when the cross compiler accepts it: GCC's `trace-pc` + `trace-cmp`
+/// (clang's `trace-pc-guard` for a clang cross build), whose callbacks the
+/// driver implements, so the emulated harness is fuzzed coverage-guided with
+/// input-to-state comparison hooks instead of blind. With no sanitizer runtime
+/// to intercept `strcmp`/`memcmp`, the harness is also linked with the driver's
+/// comparison wrappers ([`crate::gate_evidence::COMPARISON_WRAP_LDFLAGS`]), so
+/// string and buffer gates reach the same hooks: the fuzzer's comparison log
+/// and a finding's comparison evidence.
+///
+/// A guard-driven lane selects its target in every compile and link, bhf's
+/// driver object included, through the override's target flags: its
+/// `[cross.<guard>]` sysroot, and `--target=<triple>` for a clang compiler.
+fn cross_compiler_override_with(
+    target: &CrossTarget,
+    accepts: impl Fn(&str, &str) -> bool,
+    links: impl Fn(&str, &[String]) -> bool,
+) -> crate::build::CFamilyCompilerOverride {
+    use harness_gen::compiler_family::CompilerFamily;
     let mut cflags = vec!["-O1".to_owned(), "-g".to_owned()];
     let mut cxxflags = vec!["-O1".to_owned(), "-g".to_owned(), "-std=gnu++17".to_owned()];
-    if matches!(target.runner, CrossRunner::Wine { .. }) {
+    let family = crate::toolchain::compiler_family(&target.cc, false);
+    let clang = family == Some(CompilerFamily::Clang);
+    // Rendered for the Makefile recipe the flags land in; the probes below
+    // run the compiler directly and take the path as it is.
+    let target_flags = target.guard_lane.then(|| {
+        use harness_gen::build_safety::{make_path, recipe_path};
+        target.target_args(clang, |path| recipe_path(&make_path(path)))
+    });
+    let target_args = target.target_args(clang, |path| path.display().to_string());
+    if target.is_windows() {
         let coverage = "-fsanitize-coverage=trace-pc,trace-cmp".to_owned();
         cflags.push(coverage.clone());
         cxxflags.push(coverage);
@@ -6512,6 +7611,26 @@ fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompile
         // start under wine with STATUS_DLL_NOT_FOUND and never fuzzes.
         cflags.push("-static".to_owned());
         cxxflags.push("-static".to_owned());
+    } else {
+        let coverage = family.unwrap_or(CompilerFamily::Gcc).coverage_flag();
+        if accepts(&target.cc, coverage) {
+            cflags.push(coverage.to_owned());
+            cxxflags.push(coverage.to_owned());
+            // clang links its sanitizer runtime for coverage alone, and none
+            // is installed for a foreign target; the driver defines the hooks.
+            let no_runtime = "-fno-sanitize-link-runtime";
+            if clang && accepts(&target.cc, no_runtime) {
+                cflags.push(no_runtime.to_owned());
+                cxxflags.push(no_runtime.to_owned());
+            }
+        }
+        let wrap = crate::gate_evidence::COMPARISON_WRAP_LDFLAGS.to_owned();
+        let mut probe = target_args.clone();
+        probe.push(wrap.clone());
+        if links(&target.cc, &probe) {
+            cflags.push(wrap.clone());
+            cxxflags.push(wrap);
+        }
     }
     // HDF-2: opt-in compiler-assisted guards for a cross/embedded build where the
     // full ASan runtime cannot cross-compile/link. Each guard is trap-based, so a
@@ -6522,16 +7641,69 @@ fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompile
     // toolchain still builds.
     if cross_guards_opt_in() {
         let cc = target.cc.clone();
-        let guards = cross_guard_flags(&target.triple, |flag| compiler_accepts_flag(&cc, flag));
+        let guards = cross_guard_flags(&target.triple, |flag| accepts(&cc, flag));
         cflags.extend(guards.iter().cloned());
         cxxflags.extend(guards);
     }
 
+    // A platform guard's lane runs a cross compiler bhf picked, not the
+    // operator's: the environment's CFLAGS/CXXFLAGS were written for the
+    // operator's (or the host's) compiler, and a host-only flag such as
+    // `-march=native` would fail the cross build. A whole-sweep target is the
+    // operator's own toolchain, and takes them.
+    let ambient = !target.guard_lane;
     crate::build::CFamilyCompilerOverride {
         cc: target.cc.clone(),
         cxx: target.cxx.clone(),
         cflags,
         cxxflags,
+        target_flags,
+        ambient_cflags: ambient,
+        ambient_cxxflags: ambient,
+    }
+}
+
+/// The toolchain a cross sweep rebuilds the build probe's archives with: the
+/// target's compilers, the code-generation flags of its harness builds
+/// (coverage, opt-in guards, sysroot), the toolchain's own compile flags, and
+/// none of the link-only ones.
+pub(crate) fn cross_archive_toolchain(
+    target: &CrossTarget,
+    toolchain: &config::ToolchainConfig,
+) -> crate::auto::build_probe::ArchiveToolchain {
+    let harness = cross_compiler_override(target);
+    let codegen = |flags: &[String]| -> Vec<String> {
+        flags
+            .iter()
+            .filter(|flag| {
+                !matches!(
+                    flag.as_str(),
+                    "-O1" | "-g" | "-static" | "-fno-sanitize-link-runtime"
+                ) && !flag.starts_with("-std=")
+                    && !flag.starts_with("-Wl,")
+            })
+            .cloned()
+            .collect()
+    };
+    let family = crate::toolchain::compiler_family(&target.cc, false);
+    let clang = family == Some(harness_gen::compiler_family::CompilerFamily::Clang);
+    let flags_for = |cpp: bool, harness_flags: &[String]| {
+        let mut flags: Vec<String> = ["-O1", "-g", "-ffunction-sections", "-fdata-sections"]
+            .map(str::to_owned)
+            .to_vec();
+        flags.extend(target.target_args(clang, |path| path.display().to_string()));
+        flags.extend(codegen(harness_flags));
+        flags.extend(crate::toolchain::compile_args(toolchain, family, cpp));
+        // The project's own -Werror must not fail bhf's rebuild.
+        flags.push("-Wno-error".to_owned());
+        flags
+    };
+    crate::auto::build_probe::ArchiveToolchain {
+        triple: target.triple.clone(),
+        cc: target.cc.clone(),
+        cxx: target.cxx.clone(),
+        c_flags: flags_for(false, &harness.cflags),
+        cxx_flags: flags_for(true, &harness.cxxflags),
     }
 }
 
@@ -6598,6 +7770,24 @@ pub(crate) fn cross_guard_flags(triple: &str, supports: impl Fn(&str) -> bool) -
     flags
 }
 
+/// [`compiler_accepts_flag`], remembered per compiler and flag for the run: a
+/// sweep asks the same question of the same cross compiler for every target.
+fn cached_compiler_accepts_flag(cc: &str, flag: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), bool>>> = OnceLock::new();
+    let key = (cc.to_owned(), flag.to_owned());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().expect("flag probe cache").get(&key) {
+        return known;
+    }
+    let accepted = compiler_accepts_flag(cc, flag);
+    cache
+        .lock()
+        .expect("flag probe cache")
+        .insert(key, accepted);
+    accepted
+}
+
 /// Whether `cc` accepts `flag`: compile a trivial translation unit from stdin
 /// with the flag and no output; success means the flag is understood. Any spawn
 /// failure (compiler absent) degrades to "unsupported" rather than an error, so a
@@ -6634,23 +7824,31 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
     }
 }
 
-/// Native clang compile flags for `auto --sanitizers`. Replicates the harness
-/// Makefile's default CFLAGS/CXXFLAGS structure — `-O1 -g`, the engine's
-/// `-fsanitize-coverage=trace-pc-guard,trace-cmp` (edge coverage #385 + cmplog
-/// #398/#400), and the UBSan check subtractions OSS-Fuzz also drops — but swaps the
-/// baked-in `-fsanitize=address,undefined` for EXACTLY the requested set, so a user
-/// can build an MSan/TSan harness (or pin ASan-only) instead of the default. Only the
+/// Native compile flags for `auto --sanitizers`. Replicates the harness
+/// Makefile's default BHF_CFLAGS/BHF_CXXFLAGS structure — `-O1 -g`, the engine's
+/// SanitizerCoverage (edge coverage #385 + cmplog #398/#400), and the UBSan check
+/// subtractions OSS-Fuzz also drops — but swaps the baked-in
+/// `-fsanitize=address,undefined` for EXACTLY the requested set, so a user can
+/// build an MSan/TSan harness (or pin ASan-only) instead of the default. Only the
 /// `-fsanitize=` group is replaced; COMPILE_DB_FLAGS / INCLUDES / AUTO_EXTRA_* are
 /// separate make variables and stay intact. C++ uses `gnu++17` (matching the cross
-/// override) since overriding CXXFLAGS drops the template's detected standard.
+/// override) since overriding BHF_CXXFLAGS drops the template's detected standard.
+///
+/// The compilers are the ones the build would use anyway — the operator's
+/// CC/CXX or `[toolchain]` compilers, else clang — with flags spelled for their
+/// family. Only when the operator's compiler cannot build the requested
+/// sanitizers (gcc has no MemorySanitizer), or builds them with a runtime that
+/// cannot start here, does it switch to clang, and it says so once. CC is
+/// checked for every harness, and CXX for a C++ harness (`builds_cpp`).
 ///
 /// Sanitizers that conflict (e.g. `asan` + `msan`, or `msan` + `tsan`) will fail to
-/// compile — clang rejects the combination — which surfaces as a normal build error;
-/// `address,undefined,leak` are the compatible set. MSan/TSan are best-effort: without
-/// a fully-instrumented libc they can report false positives, but the harness still
-/// builds and runs.
+/// compile — the compiler rejects the combination — which surfaces as a normal
+/// build error; `address,undefined,leak` are the compatible set. MSan/TSan are
+/// best-effort: without a fully-instrumented libc they can report false
+/// positives, but the harness still builds and runs.
 fn sanitizer_compiler_override(
     sanitizers: &[multicore_fuzz::Sanitizer],
+    builds_cpp: bool,
 ) -> crate::build::CFamilyCompilerOverride {
     let fsanitize = format!(
         "-fsanitize={}",
@@ -6661,31 +7859,393 @@ fn sanitizer_compiler_override(
             .join(",")
     );
     let has_ubsan = sanitizers.contains(&multicore_fuzz::Sanitizer::Ubsan);
-    native_coverage_override(Some(fsanitize), has_ubsan)
+    let (selected, note) = native_override_for(
+        &crate::toolchain::effective_compilers(),
+        Some(fsanitize),
+        has_ubsan,
+        builds_cpp,
+        crate::toolchain::compiler_family,
+        probe_sanitizer_runtime,
+    );
+    if let Some(mut note) = note {
+        if let Some(dropped) = ambient_flags_left_out(&selected) {
+            note.push_str(&format!(
+                " ({dropped} from the environment, written for the operator's compiler, are left \
+                 out of those builds)"
+            ));
+        }
+        announce_once(&note);
+    }
+    selected
 }
 
-/// Native clang compile flags for `auto --sanitizers none` (#434): the same
-/// `-O1 -g` + engine coverage (`-fsanitize-coverage=trace-pc-guard,trace-cmp`)
-/// structure as [`sanitizer_compiler_override`], but with NO `-fsanitize=` group.
-/// The harness gets coverage-guided, crash-only fuzzing (SIGSEGV/SIGABRT still
-/// caught) with zero ASan/UBSan false positives — the escape hatch for code that
-/// FP-storms under ASan (shared memory, custom allocators, RTOS). Replaces the
-/// Makefile's baked-in `-fsanitize=address,undefined`.
+/// The environment's `CFLAGS`/`CXXFLAGS` that `compiler` leaves out of its
+/// builds ([`crate::build::CFamilyCompilerOverride::ambient_cflags`]), named
+/// for a note; `None` when it leaves out none that is set.
+fn ambient_flags_left_out(compiler: &crate::build::CFamilyCompilerOverride) -> Option<String> {
+    let dropped: Vec<&str> = [
+        ("CFLAGS", compiler.ambient_cflags),
+        ("CXXFLAGS", compiler.ambient_cxxflags),
+    ]
+    .into_iter()
+    .filter(|(variable, kept)| {
+        !kept && std::env::var(variable).is_ok_and(|value| !value.trim().is_empty())
+    })
+    .map(|(variable, _)| variable)
+    .collect();
+    (!dropped.is_empty()).then(|| dropped.join("/"))
+}
+
+/// Native compile flags for `auto --sanitizers none` (#434): the same
+/// `-O1 -g` + engine coverage structure as [`sanitizer_compiler_override`], but
+/// with NO `-fsanitize=` group. The harness gets coverage-guided, crash-only
+/// fuzzing (SIGSEGV/SIGABRT still caught) with zero ASan/UBSan false positives —
+/// the escape hatch for code that FP-storms under ASan (shared memory, custom
+/// allocators, RTOS). Replaces the Makefile's baked-in
+/// `-fsanitize=address,undefined`, and keeps the operator's compilers.
 fn coverage_only_compiler_override() -> crate::build::CFamilyCompilerOverride {
-    native_coverage_override(None, false)
+    native_override_for(
+        &crate::toolchain::effective_compilers(),
+        None,
+        false,
+        false,
+        crate::toolchain::compiler_family,
+        probe_sanitizer_runtime,
+    )
+    .0
 }
 
-/// Shared builder for the native override: `-O1 -g`, an optional `-fsanitize=`
-/// group, the UBSan check subtractions (only when UBSan is present and a
-/// `-fsanitize=` group is set), then the engine's coverage flags last. Only the
-/// `-fsanitize=` group differs across callers; COMPILE_DB_FLAGS / INCLUDES /
-/// AUTO_EXTRA_* are separate make variables and stay intact. C++ uses `gnu++17`
-/// (matching the cross override) since overriding CXXFLAGS drops the template's
-/// detected standard.
-///
-/// Conflicting sanitizers (e.g. `asan`+`msan`) make clang reject the build — a
-/// normal build error; `address,undefined,leak` are the compatible set. MSan/TSan
-/// are best-effort without an instrumented libc but still build and run.
+/// Print `note` once per run, however many targets reach the same decision.
+fn announce_once(note: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    if seen
+        .lock()
+        .expect("announcement set")
+        .insert(note.to_owned())
+    {
+        bhfeprintln!("bhf auto: {note}");
+    }
+}
+
+/// Whether `compiler` compiles AND links a trivial program with `flags`
+/// given together (a sanitizer needs its runtime library, which only the
+/// link proves). Remembered per compiler and flags for the run.
+pub(crate) fn compiler_links_with_flags(compiler: &str, flags: &[String]) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    type LinkCache = Mutex<HashMap<(String, Vec<String>), bool>>;
+    static CACHE: OnceLock<LinkCache> = OnceLock::new();
+    let key = (compiler.to_owned(), flags.to_vec());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().expect("link probe cache").get(&key) {
+        return known;
+    }
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let linked = link_probe_program(compiler, false, flags, &dir.path().join("probe"));
+    cache.lock().expect("link probe cache").insert(key, linked);
+    linked
+}
+
+/// Compile and link `int main(void) { return 0; }` with `compiler` and
+/// `flags` into `output`, as C++ when `cpp` (a C++ compiler links the C++
+/// runtime and the sanitizer's C++ parts), else as C.
+fn link_probe_program(compiler: &str, cpp: bool, flags: &[String], output: &Path) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    Command::new(compiler)
+        .args(flags)
+        .args(["-x", if cpp { "c++" } else { "c" }, "-", "-o"])
+        .arg(output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"int main(void) { return 0; }\n");
+            }
+            child.wait().ok()
+        })
+        .is_some_and(|status| status.success())
+}
+
+/// What a compiler made of a trivial program built with a sanitizer's flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SanitizerProbe {
+    /// It linked, and the program ran to a clean exit. A program this host
+    /// cannot run at all (a cross compiler's) counts too: that says nothing
+    /// about its runtime.
+    Runs,
+    /// It did not compile and link: the compiler has no runtime for the
+    /// sanitizer.
+    DoesNotLink,
+    /// It linked, but the program died before `main` returned, so the
+    /// sanitizer's runtime cannot start on this host (GCC's ThreadSanitizer
+    /// under a kernel's high-entropy ASLR). Holds what the program printed,
+    /// or how it ended.
+    FailsAtStartup(String),
+}
+
+/// How often the probe program runs. A runtime that fails on most address
+/// space layouts can start by luck once, and a harness whose runtime starts
+/// only sometimes is no more usable than one that never does.
+const SANITIZER_PROBE_RUNS: usize = 3;
+
+/// How long one run of the probe program may take.
+const SANITIZER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `compiler` links a trivial program with `flags` AND the program
+/// starts: a sanitizer runtime that links can still abort before `main` on
+/// this host, and every harness built with it would then die the same way
+/// on every input. `cpp` builds the program as C++, for a C++ compiler.
+/// Remembered per compiler, language and flags for the run.
+pub(crate) fn probe_sanitizer_runtime(
+    compiler: &str,
+    cpp: bool,
+    flags: &[String],
+) -> SanitizerProbe {
+    use std::sync::{Mutex, OnceLock};
+    type ProbeCache = Mutex<HashMap<(String, bool, Vec<String>), SanitizerProbe>>;
+    static CACHE: OnceLock<ProbeCache> = OnceLock::new();
+    let key = (compiler.to_owned(), cpp, flags.to_vec());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().expect("runtime probe cache").get(&key) {
+        return known.clone();
+    }
+    let result = run_sanitizer_probe(compiler, cpp, flags);
+    cache
+        .lock()
+        .expect("runtime probe cache")
+        .insert(key, result.clone());
+    result
+}
+
+fn run_sanitizer_probe(compiler: &str, cpp: bool, flags: &[String]) -> SanitizerProbe {
+    let Ok(dir) = tempfile::tempdir() else {
+        return SanitizerProbe::DoesNotLink;
+    };
+    let program = dir
+        .path()
+        .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
+    if !link_probe_program(compiler, cpp, flags, &program) {
+        return SanitizerProbe::DoesNotLink;
+    }
+    // A program for another target says nothing about its runtime here
+    // (and an emulator binfmt would start it under qemu).
+    if !crate::toolchain::compiler_builds_for_host(compiler) {
+        return SanitizerProbe::Runs;
+    }
+    let log = dir.path().join("probe.stderr");
+    for _ in 0..SANITIZER_PROBE_RUNS {
+        if let Some(failure) = probe_program_failure(&program, &log) {
+            return SanitizerProbe::FailsAtStartup(failure);
+        }
+    }
+    SanitizerProbe::Runs
+}
+
+/// Run `program` once, its stderr going to `log`: `None` when it exits
+/// cleanly or cannot be started here at all, else what it printed (the
+/// runtime's own diagnostic line when there is one) or how it ended.
+fn probe_program_failure(program: &Path, log: &Path) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let stderr = std::fs::File::create(log).ok()?;
+    let mut child = Command::new(program)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .ok()?;
+    let status = match replay_min::process::wait_exit_within(&mut child, SANITIZER_PROBE_TIMEOUT) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Some(format!(
+                "it did not exit within {}s",
+                SANITIZER_PROBE_TIMEOUT.as_secs()
+            ));
+        }
+        Err(_) => return None,
+    };
+    if status.success() {
+        return None;
+    }
+    let printed = std::fs::read(log).unwrap_or_default();
+    let printed = String::from_utf8_lossy(&printed);
+    Some(
+        crate::fatal_signal::sanitizer_runtime_start_failure(&printed)
+            .or_else(|| {
+                printed
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|line| line.chars().take(200).collect())
+            })
+            .unwrap_or_else(|| format!("it ended with {status}")),
+    )
+}
+
+/// The flags the startup probe links with for `fsanitize` on a compiler of
+/// `family`: the sanitizer and, for gcc, the static runtimes the harness
+/// links, so the probe runs the runtime the harness would.
+fn sanitizer_probe_flags(
+    family: harness_gen::compiler_family::CompilerFamily,
+    fsanitize: &str,
+) -> Vec<String> {
+    let mut flags = vec![fsanitize.to_owned()];
+    if family == harness_gen::compiler_family::CompilerFamily::Gcc {
+        flags.extend(gcc_static_sanitizer_runtimes(fsanitize));
+    }
+    flags
+}
+
+/// Whether `compiler` (a C++ compiler when `cpp`) builds a program with the
+/// `-fsanitize=` flags among `flags` whose runtime starts on this host (see
+/// [`probe_sanitizer_runtime`]).
+pub(crate) fn sanitizer_runtime_starts(compiler: &str, cpp: bool, flags: &[String]) -> bool {
+    let family = crate::toolchain::compiler_family(compiler, cpp)
+        .unwrap_or(harness_gen::compiler_family::CompilerFamily::Clang);
+    let mut probe_flags = Vec::new();
+    for flag in flags {
+        probe_flags.extend(sanitizer_probe_flags(family, flag));
+    }
+    probe_sanitizer_runtime(compiler, cpp, &probe_flags) == SanitizerProbe::Runs
+}
+
+/// GCC's sanitizer runtimes are shared libraries by default, and a shared
+/// libasan aborts at startup unless it comes first in the library list, which
+/// the runtrace `LD_PRELOAD` shim prevents. Link each requested runtime
+/// statically, as clang does.
+fn gcc_static_sanitizer_runtimes(fsanitize: &str) -> Vec<String> {
+    let set = fsanitize.strip_prefix("-fsanitize=").unwrap_or(fsanitize);
+    set.split(',')
+        .filter_map(|name| match name {
+            "address" => Some("-static-libasan"),
+            "undefined" => Some("-static-libubsan"),
+            "thread" => Some("-static-libtsan"),
+            "leak" => Some("-static-liblsan"),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The native override for an explicit sanitizer selection (or none, for
+/// coverage only), built on `effective` — the compilers the build would use
+/// without an override. `probe` says whether an operator's compiler (a C++
+/// one when its second argument is true) builds a program with the
+/// sanitizer flags whose runtime starts here ([`probe_sanitizer_runtime`]).
+/// The C++ compiler is probed only for a C++ harness (`builds_cpp`), so a
+/// C-only toolchain whose C++ compiler cannot build the sanitizers keeps
+/// building the C harnesses. Returns the override and, when it had to leave
+/// the operator's compilers, a note saying which it used and why. A build
+/// with a compiler bhf picked in place of the operator's leaves out the
+/// environment's flags written for that compiler (`CFLAGS` for CC,
+/// `CXXFLAGS` for CXX).
+fn native_override_for(
+    effective: &crate::toolchain::EffectiveCompilers,
+    fsanitize: Option<String>,
+    has_ubsan: bool,
+    builds_cpp: bool,
+    family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
+    probe: impl Fn(&str, bool, &[String]) -> SanitizerProbe,
+) -> (crate::build::CFamilyCompilerOverride, Option<String>) {
+    use harness_gen::compiler_family::CompilerFamily;
+    const CLANG: &str = "clang";
+    const CLANGXX: &str = "clang++";
+    let mut cc = effective.cc.clone();
+    let mut cxx = effective.cxx.clone();
+    let mut ambient_cflags = true;
+    let mut ambient_cxxflags = true;
+    let mut note = None;
+    if let (Some(fsanitize), true) = (&fsanitize, effective.explicit) {
+        // Why `compiler` (the operator's `variable`) cannot be kept, if it
+        // cannot. bhf's own clang is what a failure falls back to, so it is
+        // not probed.
+        let unusable = |variable: &str, compiler: &str, cpp: bool| {
+            if compiler == if cpp { CLANGXX } else { CLANG } {
+                return None;
+            }
+            let family = family_of(compiler, cpp).unwrap_or(CompilerFamily::Clang);
+            match probe(compiler, cpp, &sanitizer_probe_flags(family, fsanitize)) {
+                SanitizerProbe::Runs => None,
+                SanitizerProbe::DoesNotLink => Some(format!(
+                    "{variable}={compiler} cannot build with {fsanitize}"
+                )),
+                SanitizerProbe::FailsAtStartup(failure) => Some(format!(
+                    "{variable}={compiler} builds with {fsanitize}, but its sanitizer runtime \
+                     does not start on this host ({failure})"
+                )),
+            }
+        };
+        if let Some(why) = unusable("CC", &cc, false) {
+            note = Some(format!(
+                "--sanitizers: {why}; building the C/C++ harnesses with clang/clang++ instead"
+            ));
+            cc = CLANG.to_owned();
+            cxx = CLANGXX.to_owned();
+            ambient_cflags = false;
+            ambient_cxxflags = false;
+        } else if builds_cpp {
+            if let Some(why) = unusable("CXX", &cxx, true) {
+                note = Some(format!(
+                    "--sanitizers: {why}; building the C++ harnesses with clang++ instead"
+                ));
+                cxx = CLANGXX.to_owned();
+                ambient_cxxflags = false;
+            }
+        }
+    }
+    let c_family = family_of(&cc, false).unwrap_or(CompilerFamily::Clang);
+    let cxx_family = family_of(&cxx, true).unwrap_or(c_family);
+    let flags_for = |family: CompilerFamily, cpp: bool| {
+        let mut flags = vec!["-O1".to_owned(), "-g".to_owned()];
+        if cpp {
+            flags.push("-std=gnu++17".to_owned());
+            if family == CompilerFamily::Clang {
+                // Keep the generated C++ Makefile's compatibility suppression
+                // when --sanitizers replaces BHF_CXXFLAGS. Clang 18 otherwise rejects
+                // the pre-C++11 `"%" PRId64`/`"text"MACRO` idiom as a hard error.
+                flags.push("-Wno-reserved-user-defined-literal".to_owned());
+            }
+        }
+        if let Some(fsanitize) = &fsanitize {
+            flags.push(fsanitize.clone());
+            if family == CompilerFamily::Gcc {
+                flags.extend(gcc_static_sanitizer_runtimes(fsanitize));
+            }
+            // The `function`/`vptr`/`alignment` checks fire on pervasive
+            // harmless patterns; subtract them only when UBSan is in the set (the
+            // subtraction must follow `-fsanitize=undefined`), mirroring the
+            // Makefile default, in the spelling this family accepts. gcc's
+            // object-size check stays, next to ASan too: it sees overflows of
+            // objects ASan does not track (a pool allocator's chunks).
+            if has_ubsan && family.supports_ubsan() {
+                flags.push(family.ubsan_subtraction().to_owned());
+            }
+        }
+        flags.push(family.coverage_flag().to_owned());
+        flags
+    };
+    (
+        crate::build::CFamilyCompilerOverride {
+            cflags: flags_for(c_family, false),
+            cxxflags: flags_for(cxx_family, true),
+            cc,
+            cxx,
+            target_flags: None,
+            ambient_cflags,
+            ambient_cxxflags,
+        },
+        note,
+    )
+}
+
 /// File under a target's `repairs/` holding the last C/C++ build's raw combined
 /// output, mirroring the Ada lane's log. The classified errors are not enough on
 /// their own: most kinds carry a name and no location (`IncompleteType` is just a
@@ -6701,6 +8261,694 @@ fn persist_c_build_output(work_dir: &Path, harness_id: &str, raw: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(log, raw);
+}
+
+/// The std prelude a C++ harness build of this attempt wrote and
+/// force-includes ([`apply_std_prelude`]), carried across its repair rounds.
+#[derive(Debug, Default)]
+struct StdPreludeState {
+    /// The prelude, `<harness>/std_prelude.h`, once a build wrote it.
+    path: Option<PathBuf>,
+    /// The standard-library names it declares for this attempt, sorted, each
+    /// with its header.
+    names: Vec<(String, &'static str)>,
+    /// Writing it failed: no later build tries again.
+    failed: bool,
+}
+
+impl StdPreludeState {
+    fn declares(&self, name: &str) -> bool {
+        self.names.iter().any(|(declared, _)| declared == name)
+    }
+
+    /// The ledger entry for the prelude, once there is one.
+    fn repair(&self) -> Option<Repair> {
+        let path = self.path.clone()?;
+        let mut headers: Vec<String> = self
+            .names
+            .iter()
+            .map(|(_, header)| (*header).to_owned())
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
+        Some(Repair::StdPrelude {
+            path,
+            names: self.names.iter().map(|(name, _)| name.clone()).collect(),
+            headers,
+        })
+    }
+}
+
+/// The standard-library names that `output`, a failed build of the C++
+/// harness in `harness_dir`, shows the sources using without `std::` and that
+/// the prelude does not declare yet, each with its header, in first-seen
+/// order. `bhf build`'s rules decide ([`crate::build::std_prelude_names`] over
+/// [`build_classifier::unqualified_std_names`]): nothing for a C harness or
+/// for diagnostics in C code, and unqualified stream objects alone are left
+/// to the stream-header repair. A name the scanned tree declares as a C++
+/// type of its own (its own `list` class, per
+/// [`DeclarationIndex::declares_cpp_type_named`]) is the project's, not the
+/// standard one, so it never gets a `using std::` declaration; where the
+/// source writes it as a template (`list<string>`), only a template of the
+/// project's own counts. A C struct of that name in C code is never one.
+fn std_prelude_additions(
+    harness_dir: &Path,
+    output: &str,
+    decl_index: &DeclarationIndex,
+    prelude: &StdPreludeState,
+) -> Vec<(String, &'static str)> {
+    crate::build::std_prelude_names(
+        harness_dir,
+        output,
+        &|_| false,
+        &|name| decl_index.declares_cpp_type_named(&name.name, name.as_template),
+        prelude.path.is_some(),
+    )
+    .into_iter()
+    .filter(|name| !prelude.declares(&name.name))
+    .map(|name| (name.name, name.header))
+    .collect()
+}
+
+/// What the std prelude steps of one build did, for the one note
+/// [`announce_std_prelude`] prints about them.
+#[derive(Debug, Default)]
+struct StdPreludeNote {
+    /// The names they added, in the order found.
+    names: Vec<String>,
+    /// They created the file, rather than adding to an existing one.
+    created: bool,
+    /// They changed the file.
+    changed: bool,
+    /// The standard headers the file includes after the last of them.
+    headers: Vec<String>,
+}
+
+/// Give the C++ sources of the harness the declarations of the
+/// standard-library names `output` shows them using without `std::` (see
+/// [`std_prelude_additions`]): write the prelude `bhf build` writes,
+/// `<harness>/std_prelude.h`, or add the names to it, and force-include it
+/// into every translation unit through `repairs/auto_std_prelude.h`. `note`
+/// collects what it did for [`announce_std_prelude`]. Returns whether the
+/// next build sees declarations the failed one did not; each time it does,
+/// the prelude declares at least one more name.
+fn apply_std_prelude(
+    work_dir: &Path,
+    harness_id: &str,
+    output: &str,
+    decl_index: &DeclarationIndex,
+    prelude: &mut StdPreludeState,
+    note: &mut StdPreludeNote,
+) -> bool {
+    if prelude.failed {
+        return false;
+    }
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    let added = std_prelude_additions(&harness_dir, output, decl_index, prelude);
+    if added.is_empty() {
+        return false;
+    }
+    let shown = added
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut names = prelude.names.clone();
+    names.extend(added.iter().cloned());
+    names.sort_unstable();
+    names.dedup();
+    let written = crate::build::write_std_prelude(&harness_dir, &names).and_then(|written| {
+        crate::auto::repair::write_std_prelude_include(
+            &harness_dir.join("repairs"),
+            &written.path,
+        )?;
+        Ok(written)
+    });
+    let written = match written {
+        Ok(written) => written,
+        Err(error) => {
+            bhfeprintln!(
+                "bhf auto: warning: {harness_id}: the sources use {shown} without `std::`, \
+                 but the std prelude {} could not be written: {error}",
+                harness_dir.join(crate::build::STD_PRELUDE_HEADER).display()
+            );
+            prelude.failed = true;
+            return false;
+        }
+    };
+    // A file that already declared every name does not help a build that
+    // already force-included it.
+    let progress =
+        prelude.path.is_none() || written.change != crate::build::PreludeChange::Unchanged;
+    for (name, _) in &added {
+        if !note.names.contains(name) {
+            note.names.push(name.clone());
+        }
+    }
+    note.created |=
+        prelude.path.is_none() && written.change == crate::build::PreludeChange::Created;
+    note.changed |= written.change != crate::build::PreludeChange::Unchanged;
+    note.headers = written.headers;
+    prelude.path = Some(written.path);
+    prelude.names = names;
+    progress
+}
+
+/// Print the one note naming the types the std prelude steps of a build
+/// declared (`note`), if they declared any.
+fn announce_std_prelude(harness_id: &str, prelude: &StdPreludeState, note: &StdPreludeNote) {
+    if let Some(line) = std_prelude_note_line(harness_id, prelude, note) {
+        bhfeprintln!("{line}");
+    }
+}
+
+fn std_prelude_note_line(
+    harness_id: &str,
+    prelude: &StdPreludeState,
+    note: &StdPreludeNote,
+) -> Option<String> {
+    if note.names.is_empty() {
+        return None;
+    }
+    let path = prelude.path.as_deref()?.display();
+    let done = if note.created {
+        format!(
+            "wrote {path} (<{}> and a `using std::` declaration for each)",
+            note.headers.join(">, <")
+        )
+    } else if note.changed {
+        format!("added them to {path}")
+    } else {
+        format!("{path} declares them")
+    };
+    Some(format!(
+        "bhf auto: {harness_id}: the sources use {} without `std::`, relying on a \
+         `using namespace std;` that is not in effect where they are compiled; {done}, \
+         force-included into every translation unit",
+        note.names.join(", ")
+    ))
+}
+
+/// Record the prelude [`apply_std_prelude`] wrote in the repair ledger, as one
+/// entry naming every standard-library name it declares for this attempt.
+fn record_std_prelude(manifest: &mut RepairManifest, prelude: &StdPreludeState) {
+    let Some(repair) = prelude.repair() else {
+        return;
+    };
+    match manifest
+        .repairs
+        .iter_mut()
+        .find(|entry| matches!(entry, Repair::StdPrelude { .. }))
+    {
+        Some(entry) => *entry = repair,
+        None => manifest.repairs.push(repair),
+    }
+}
+
+/// Whether `error` names a standard-library name the std prelude declares.
+/// The planner leaves such an error alone: any stand-in it would fabricate
+/// (`typedef void *list;`, `#define make_pair(...) 0`) collides with the
+/// prelude's `using std::` declaration of the real one.
+fn error_names_std_prelude_name(error: &BuildErrorKind, prelude: &StdPreludeState) -> bool {
+    match error {
+        BuildErrorKind::MissingType { name }
+        | BuildErrorKind::MissingMacro { name, .. }
+        | BuildErrorKind::UndeclaredFunction { name, .. } => prelude.declares(name),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod std_prelude_tests {
+    use super::*;
+
+    /// clang++ building a harness for a method of a header that declares
+    /// `map<string, int>`, `vector<int>`, `list<string>` and `pair<int, int>`
+    /// members without `std::` (the project's own source puts `using
+    /// namespace std;` before including it). The generated `main.cpp`
+    /// includes `<string>`, `<vector>` and `<utility>`, so clang names some
+    /// of the `std::` declarations.
+    const CLANG: &str = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:9: error: unknown type name 'string'; did you mean 'std::string'?\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |         ^~~~~~\n\
+\x20     |         std::string\n\
+/usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/c++/14/bits/stringfwd.h:77:33: note: 'std::string' declared here\n\
+\x20  77 |   typedef basic_string<char>    string;\n\
+\x20     |                                 ^\n\
+In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:5: error: no template named 'map'\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |     ^\n\
+/src/lib/src/widget.h:7:5: error: no template named 'vector'; did you mean 'std::vector'?\n\
+\x20   7 |     vector<int> sizes;\n\
+\x20     |     ^~~~~~\n\
+\x20     |     std::vector\n\
+/usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/c++/14/bits/stl_vector.h:428:11: note: 'std::vector' declared here\n\
+\x20 428 |     class vector : protected _Vector_base<_Tp, _Alloc>\n\
+\x20     |           ^\n\
+In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:8:5: error: no template named 'list'\n\
+\x20   8 |     list<string> names;\n\
+\x20     |     ^\n\
+/src/lib/src/widget.h:9:5: error: no template named 'pair'; did you mean 'std::pair'?\n\
+\x20   9 |     pair<int, int> span;\n\
+\x20     |     ^~~~\n\
+\x20     |     std::pair\n\
+6 errors generated.\n\
+make: *** [Makefile:327: main] Error 1\n";
+
+    /// g++ on the same harness, in a UTF-8 locale.
+    const GCC: &str = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:6:9: error: \u{2018}string\u{2019} was not declared in this scope\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |         ^~~~~~\n\
+/src/lib/src/widget.h:6:9: note: suggested alternatives:\n\
+In file included from /usr/include/c++/13/string:41,\n\
+\x20                from main.cpp:21:\n\
+/usr/include/c++/13/bits/stringfwd.h:77:33: note:   \u{2018}std::string\u{2019}\n\
+\x20  77 |   typedef basic_string<char>    string;\n\
+\x20     |                                 ^~~~~~\n\
+/src/lib/src/widget.h:6:5: error: \u{2018}map\u{2019} does not name a type\n\
+\x20   6 |     map<string, int> fields;\n\
+\x20     |     ^~~\n\
+/src/lib/src/widget.h:7:5: error: \u{2018}vector\u{2019} does not name a type\n\
+\x20   7 |     vector<int> sizes;\n\
+\x20     |     ^~~~~~\n\
+/src/lib/src/widget.h:8:5: error: \u{2018}list\u{2019} does not name a type\n\
+\x20   8 |     list<string> names;\n\
+\x20     |     ^~~~\n\
+/src/lib/src/widget.h:9:5: error: \u{2018}pair\u{2019} does not name a type\n\
+\x20   9 |     pair<int, int> span;\n\
+\x20     |     ^~~~\n\
+make: *** [Makefile:327: main] Error 1\n";
+
+    /// `<work>/harnesses/<id>` with a generated C++ (or C) driver.
+    fn harness(work: &Path, id: &str, driver: &str) -> PathBuf {
+        let dir = crate::auto::layout::harness_dir(work, id);
+        std::fs::create_dir_all(dir.join("repairs")).unwrap();
+        std::fs::write(dir.join(driver), "").unwrap();
+        dir
+    }
+
+    fn sorted_names(additions: &[(String, &'static str)]) -> Vec<String> {
+        let mut names: Vec<String> = additions.iter().map(|(name, _)| name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn captured_clang_and_gcc_output_needs_the_prelude_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(temp.path(), "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        for output in [CLANG, GCC] {
+            let mut prelude = StdPreludeState::default();
+            let added = std_prelude_additions(&dir, output, &index, &prelude);
+            assert_eq!(
+                sorted_names(&added),
+                ["list", "map", "pair", "string", "vector"],
+                "{output}"
+            );
+            assert!(added.contains(&("pair".to_owned(), "utility")), "{added:?}");
+            // Once the prelude declares them, the same diagnostics ask for
+            // nothing more, so no build is retried for them.
+            prelude.path = Some(dir.join("std_prelude.h"));
+            prelude.names = added;
+            assert_eq!(
+                std_prelude_additions(&dir, output, &index, &prelude),
+                Vec::new()
+            );
+        }
+    }
+
+    /// A tree with its own `list` template and `string` class in C++ code:
+    /// those are the project's. Its non-template C++ `map` cannot stand for
+    /// `map<string, int>`, and a C struct `pair` in a `.c` source or `vector`
+    /// in a header only C sources include is no C++ type at all, so those
+    /// still get the prelude.
+    #[test]
+    fn project_names_c_code_and_stream_objects_alone_get_no_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(&temp.path().join("work"), "H-ONE", "main.cpp");
+        let tree = temp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for (file, text) in [
+            (
+                "list.h",
+                "#pragma once\ntemplate <class T> class list {\npublic:\n    T *items;\n    int size;\n};\n",
+            ),
+            (
+                "list.cpp",
+                "#include \"list.h\"\nint list_size(list<int> *items) { return items->size; }\n",
+            ),
+            (
+                "text.h",
+                "#pragma once\nclass string {\npublic:\n    char *chars;\n};\n",
+            ),
+            ("text.cpp", "#include \"text.h\"\n"),
+            ("table.hpp", "#pragma once\nstruct map { int size; };\n"),
+            (
+                "pair.c",
+                "struct pair { int first; int second; };\nint pair_sum(struct pair *p) { return p->first + p->second; }\n",
+            ),
+            ("vec.h", "#pragma once\nstruct vector { int *items; int count; };\n"),
+            ("vec.c", "#include \"vec.h\"\n"),
+        ] {
+            std::fs::write(tree.join(file), text).unwrap();
+        }
+        let index = DeclarationIndex::build(&tree).unwrap();
+        let none = StdPreludeState::default();
+        for output in [CLANG, GCC] {
+            assert_eq!(
+                sorted_names(&std_prelude_additions(&dir, output, &index, &none)),
+                ["map", "pair", "vector"],
+                "{output}"
+            );
+        }
+
+        let empty = DeclarationIndex::default();
+        // A C source's `list`, compiled as C++ by the harness Makefile.
+        let c_code = "lib/src/node.c:2:18: error: unknown type name 'list'\n\
+                      \x20   2 | int walk(void) { list *head = 0; return head != 0; }\n\
+                      \x20     |                  ^\n";
+        assert_eq!(
+            std_prelude_additions(&dir, c_code, &empty, &none),
+            Vec::new()
+        );
+        // A C harness never gets one.
+        let c_dir = harness(&temp.path().join("work"), "H-C", "main.c");
+        assert_eq!(
+            std_prelude_additions(&c_dir, CLANG, &empty, &none),
+            Vec::new()
+        );
+        // `cerr` without its header is the stream repair's, until a prelude
+        // is in use.
+        let streams = "src/log.cpp:3:40: error: use of undeclared identifier 'cerr'\n";
+        assert_eq!(
+            std_prelude_additions(&dir, streams, &empty, &none),
+            Vec::new()
+        );
+        let in_use = StdPreludeState {
+            path: Some(dir.join("std_prelude.h")),
+            names: vec![("string".to_owned(), "string")],
+            failed: false,
+        };
+        assert_eq!(
+            std_prelude_additions(&dir, streams, &empty, &in_use),
+            vec![("cerr".to_owned(), "iostream")]
+        );
+    }
+
+    #[test]
+    fn the_prelude_is_written_force_included_recorded_and_extended_for_new_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let file = dir.join(crate::build::STD_PRELUDE_HEADER);
+        let written = std::fs::read_to_string(&file).unwrap();
+        for (header, name) in [
+            ("list", "list"),
+            ("map", "map"),
+            ("utility", "pair"),
+            ("string", "string"),
+            ("vector", "vector"),
+        ] {
+            assert!(
+                written.contains(&format!("#include <{header}>\n"))
+                    && written.contains(&format!("using std::{name};\n")),
+                "{written}"
+            );
+        }
+        // Force-included ahead of every other repair header, by its path.
+        assert_eq!(
+            crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES[0],
+            crate::auto::repair::AUTO_STD_PRELUDE_FILE
+        );
+        let include = std::fs::read_to_string(
+            dir.join("repairs")
+                .join(crate::auto::repair::AUTO_STD_PRELUDE_FILE),
+        )
+        .unwrap();
+        let canonical = crate::workdir::plain_canonical(&file);
+        assert!(
+            include.contains(&format!(
+                "#include \"{}\"\n",
+                crate::auto::repair::include_spelling(&canonical)
+            )),
+            "{include}"
+        );
+
+        // The same diagnostics again: nothing new, no rebuild.
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            GCC,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+
+        // One ledger entry, however often it is recorded.
+        let mut manifest = crate::auto::repair::RepairManifest::default();
+        record_std_prelude(&mut manifest, &prelude);
+        record_std_prelude(&mut manifest, &prelude);
+        assert_eq!(manifest.repairs.len(), 1, "{:?}", manifest.repairs);
+        assert!(manifest.already_attempted("std-prelude"));
+
+        // A later build reports one more: it joins the same file and entry.
+        let later = "/src/lib/src/widget.h:10:5: error: no template named 'deque'\n";
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            later,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let extended = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            extended.contains("#include <deque>\n") && extended.contains("using std::deque;\n"),
+            "{extended}"
+        );
+        assert!(extended.contains("using std::list;\n"), "{extended}");
+        record_std_prelude(&mut manifest, &prelude);
+        assert_eq!(manifest.repairs.len(), 1, "{:?}", manifest.repairs);
+        match &manifest.repairs[0] {
+            Repair::StdPrelude {
+                path,
+                names,
+                headers,
+            } => {
+                assert_eq!(path, &canonical);
+                assert_eq!(names, &["deque", "list", "map", "pair", "string", "vector"]);
+                assert_eq!(
+                    headers,
+                    &["deque", "list", "map", "string", "utility", "vector"]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let json = serde_json::to_value(&manifest.repairs[0]).unwrap();
+        assert_eq!(json["kind"], "std_prelude", "{json}");
+
+        // The planner leaves the declared names alone, and only them.
+        for error in [
+            BuildErrorKind::MissingType {
+                name: "list".to_owned(),
+            },
+            BuildErrorKind::MissingMacro {
+                name: "pair".to_owned(),
+                as_value: true,
+            },
+        ] {
+            assert!(error_names_std_prelude_name(&error, &prelude), "{error:?}");
+        }
+        for error in [
+            BuildErrorKind::MissingType {
+                name: "Widget".to_owned(),
+            },
+            BuildErrorKind::MissingType {
+                name: "set".to_owned(),
+            },
+            BuildErrorKind::UndefinedSymbol {
+                name: "list".to_owned(),
+            },
+        ] {
+            assert!(!error_names_std_prelude_name(&error, &prelude), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_prelude_that_cannot_be_written_is_not_retried_or_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        std::fs::create_dir_all(dir.join(crate::build::STD_PRELUDE_HEADER)).unwrap();
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            CLANG,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(prelude.failed);
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            GCC,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(prelude.repair().is_none());
+        assert!(!dir
+            .join("repairs")
+            .join(crate::auto::repair::AUTO_STD_PRELUDE_FILE)
+            .exists());
+        assert_eq!(std_prelude_note_line("H-ONE", &prelude, &note), None);
+    }
+
+    /// A mixed C/C++ tree whose unrelated `.c` source has its own `struct
+    /// list`: the C++ header's `list<string>` still means `std::list`.
+    #[test]
+    fn a_c_struct_named_like_a_std_template_still_gets_the_prelude() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = harness(&temp.path().join("work"), "H-ONE", "main.cpp");
+        let tree = temp.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join("queue.c"),
+            "struct list { struct list *next; int value; };\n\
+             int list_length(struct list *head) {\n\
+             \x20   int count = 0;\n\
+             \x20   for (; head; head = head->next) count++;\n\
+             \x20   return count;\n\
+             }\n",
+        )
+        .unwrap();
+        let index = DeclarationIndex::build(&tree).unwrap();
+        for output in [CLANG, GCC] {
+            assert_eq!(
+                sorted_names(&std_prelude_additions(
+                    &dir,
+                    output,
+                    &index,
+                    &StdPreludeState::default()
+                )),
+                ["list", "map", "pair", "string", "vector"],
+                "{output}"
+            );
+        }
+    }
+
+    /// clang++ stops after 20 errors: a header with ten `map<string, int>`
+    /// members reports only `string` and `map`, and the names after them
+    /// (`vector`, `list`) appear once the prelude declares those. Each build's
+    /// names join the same prelude, and the build prints one note for all.
+    #[test]
+    fn names_behind_the_error_limit_join_the_prelude_and_one_note() {
+        let mut first = String::from("In file included from main.cpp:27:\n");
+        for line in 5..15 {
+            first.push_str(&format!(
+                "/src/lib/src/widget.h:{line}:9: error: unknown type name 'string'; did you mean 'std::string'?\n\
+                 \x20  {line} |     map<string, int> table{line};\n\
+                 /src/lib/src/widget.h:{line}:5: error: no template named 'map'; did you mean 'std::map'?\n"
+            ));
+        }
+        first.push_str(
+            "fatal error: too many errors emitted, stopping now [-ferror-limit=]\n\
+             20 errors generated.\n",
+        );
+        let second = "In file included from main.cpp:27:\n\
+/src/lib/src/widget.h:16:5: error: no template named 'vector'; did you mean 'std::vector'?\n\
+\x20  16 |     vector<int> sizes;\n\
+/src/lib/src/widget.h:17:5: error: no template named 'list'; did you mean 'std::list'?\n\
+\x20  17 |     list<string> names;\n\
+2 errors generated.\n";
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let dir = harness(&work, "H-ONE", "main.cpp");
+        let index = DeclarationIndex::default();
+        let mut prelude = StdPreludeState::default();
+        let mut note = StdPreludeNote::default();
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            &first,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        assert!(apply_std_prelude(
+            &work,
+            "H-ONE",
+            second,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        // Nothing more to add: the build loop stops here.
+        assert!(!apply_std_prelude(
+            &work,
+            "H-ONE",
+            second,
+            &index,
+            &mut prelude,
+            &mut note
+        ));
+        let written = std::fs::read_to_string(dir.join(crate::build::STD_PRELUDE_HEADER)).unwrap();
+        for name in ["list", "map", "string", "vector"] {
+            assert!(
+                written.contains(&format!("using std::{name};\n")),
+                "{written}"
+            );
+        }
+        let line = std_prelude_note_line("H-ONE", &prelude, &note).unwrap();
+        assert!(
+            line.contains("the sources use string, map, vector, list without `std::`")
+                && line.contains("wrote ")
+                && line.contains("<list>, <map>, <string>, <vector>"),
+            "{line}"
+        );
+    }
+}
+
+/// Whether `errors` name a standard stream object or class (`cerr`,
+/// `std::istream`) whose header has not been force-included yet. Such a build
+/// failure is one repair away from compiling, so no source is ejected for it.
+fn std_stream_include_pending(
+    errors: &[BuildErrorKind],
+    manifest: &crate::auto::repair::RepairManifest,
+) -> bool {
+    errors.iter().any(|error| {
+        matches!(error, BuildErrorKind::MissingType { name }
+            if build_classifier::std_stream_header(name).is_some()
+                && !manifest.already_attempted(name))
+    })
 }
 
 /// Drop one auto-added translation unit that the compiler is complaining ABOUT,
@@ -6786,29 +9034,24 @@ fn eject_unbuildable_added_source(
 /// different built-in expectations. A target that only one of them can compile
 /// was simply lost, because bhf always used the same one.
 ///
-/// The coverage flag differs between them and is not interchangeable: GCC has no
-/// `trace-pc-guard`, and asking for it fails the build outright, so the fallback
-/// carries GCC's `trace-pc` — the same flag the generated Makefile emits when it
-/// detects a GCC toolchain.
+/// Only the compilers change: the generated Makefile chooses its flags from the
+/// compiler that runs, so gcc gets GCC's `trace-pc` coverage and sanitizer
+/// spelling without bhf replacing BHF_CFLAGS/BHF_CXXFLAGS (and the C++ dialect ladder's
+/// `CXX_STD` keeps applying). The toolchain stamp rebuilds every object the
+/// previous compiler left behind.
+///
+/// The retry runs only when the operator chose no compilers, and the host's
+/// gcc builds for the same target as bhf's default clang, so the
+/// environment's CFLAGS/CXXFLAGS still follow bhf's flags.
 fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
-    let coverage = "-fsanitize-coverage=trace-pc".to_owned();
-    let sanitizers = "-fsanitize=address,undefined".to_owned();
-    let no_sanitize = "-fno-sanitize=alignment".to_owned();
-    let base = |extra: &str| {
-        let mut flags = vec!["-O1".to_owned(), "-g".to_owned()];
-        if !extra.is_empty() {
-            flags.push(extra.to_owned());
-        }
-        flags.push(sanitizers.clone());
-        flags.push(no_sanitize.clone());
-        flags.push(coverage.clone());
-        flags
-    };
     crate::build::CFamilyCompilerOverride {
         cc: "gcc".to_owned(),
         cxx: "g++".to_owned(),
-        cflags: base(""),
-        cxxflags: base("-std=gnu++17"),
+        cflags: Vec::new(),
+        cxxflags: Vec::new(),
+        target_flags: None,
+        ambient_cflags: true,
+        ambient_cxxflags: true,
     }
 }
 
@@ -6816,43 +9059,6 @@ fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
 /// whole run instead of every target rediscovering it.
 fn c_compiler_cache_path(work_dir: &Path) -> PathBuf {
     work_dir.join("c_compiler.txt")
-}
-
-fn native_coverage_override(
-    fsanitize: Option<String>,
-    has_ubsan: bool,
-) -> crate::build::CFamilyCompilerOverride {
-    let coverage = "-fsanitize-coverage=trace-pc-guard,trace-cmp".to_owned();
-    let mut cflags = vec!["-O1".to_owned(), "-g".to_owned()];
-    let mut cxxflags = vec![
-        "-O1".to_owned(),
-        "-g".to_owned(),
-        "-std=gnu++17".to_owned(),
-        // Keep the generated C++ Makefile's compatibility suppression when
-        // --sanitizers replaces CXXFLAGS. Clang 18 otherwise rejects the
-        // pre-C++11 `"%" PRId64`/`"text"MACRO` idiom as a hard error.
-        "-Wno-reserved-user-defined-literal".to_owned(),
-    ];
-    if let Some(fsanitize) = fsanitize {
-        cflags.push(fsanitize.clone());
-        cxxflags.push(fsanitize);
-        // The `function`/`vptr`/`alignment` checks fire on pervasive harmless
-        // patterns; subtract them only when UBSan is in the set (the subtraction
-        // must follow `-fsanitize=undefined`), mirroring the Makefile default.
-        if has_ubsan {
-            let no_sanitize = "-fno-sanitize=function,vptr,alignment".to_owned();
-            cflags.push(no_sanitize.clone());
-            cxxflags.push(no_sanitize);
-        }
-    }
-    cflags.push(coverage.clone());
-    cxxflags.push(coverage);
-    crate::build::CFamilyCompilerOverride {
-        cc: "clang".to_owned(),
-        cxx: "clang++".to_owned(),
-        cflags,
-        cxxflags,
-    }
 }
 
 /// Build the emulation wrapper that launches a cross-built harness: qemu-user
@@ -6866,6 +9072,47 @@ fn cross_harness_wrapper(target: &CrossTarget) -> crate::runner::HarnessWrapper 
         },
         CrossRunner::Wine { exe } => crate::runner::HarnessWrapper::Wine {
             exe: PathBuf::from(exe),
+        },
+        // An operator runner prefixes the harness exactly like qemu-user does.
+        CrossRunner::Configured { exe, args } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: args.clone(),
+        },
+    }
+}
+
+/// The emulator a wrapper launches a harness under, as recorded beside it.
+fn harness_runner_record(
+    wrapper: &crate::runner::HarnessWrapper,
+) -> crate::gate_evidence::HarnessRunner {
+    match wrapper {
+        crate::runner::HarnessWrapper::QemuUser { exe, args } => {
+            crate::gate_evidence::HarnessRunner {
+                program: exe.clone(),
+                args: args.clone(),
+            }
+        }
+        crate::runner::HarnessWrapper::Wine { exe } => crate::gate_evidence::HarnessRunner {
+            program: exe.clone(),
+            args: Vec::new(),
+        },
+    }
+}
+
+/// The wrapper for a runner on its own (an Ada harness's): qemu-user and an
+/// operator runner prefix the harness with their arguments, wine with none.
+fn runner_wrapper(runner: &CrossRunner) -> crate::runner::HarnessWrapper {
+    match runner {
+        CrossRunner::QemuUser { exe } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: Vec::new(),
+        },
+        CrossRunner::Wine { exe } => crate::runner::HarnessWrapper::Wine {
+            exe: PathBuf::from(exe),
+        },
+        CrossRunner::Configured { exe, args } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: args.clone(),
         },
     }
 }
@@ -6927,6 +9174,7 @@ fn try_build_ada(
     ada_dep_dirs: &[PathBuf],
     dir_filter: &crate::auto::discovery::DirFilter,
     project_override: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
 ) -> BuildOutcome {
     // The Ada build pipeline (prepare_layout in crate::build) requires
@@ -6982,7 +9230,13 @@ fn try_build_ada(
     }
 
     // #91: build against the SAME governing project used for staging/exclusions.
-    run_ada_build_once(work_dir, harness_id, governing_gpr.as_deref(), round)
+    run_ada_build_once(
+        work_dir,
+        harness_id,
+        governing_gpr.as_deref(),
+        ada_toolchain,
+        round,
+    )
 }
 
 /// The generic repair loop records selected real C definitions and generated C
@@ -7039,16 +9293,16 @@ fn stage_ada_c_repair_sources(
     Ok(())
 }
 
-/// Run the Ada build pipeline once for `harness_id` and classify the result.
-/// `BuildArgs` defaults mirror clap's value-enum defaults for the build
-/// subcommand (host_file probe, libfuzzer engine — the latter irrelevant here).
-fn run_ada_build_once(
+/// The `bhf build` arguments of an auto Ada harness build: the sweep's Ada
+/// toolchain (target, runtime, prefix or explicit tools, switches, probe
+/// backend), and clap's defaults for the rest.
+fn ada_build_args(
     work_dir: &Path,
     harness_id: &str,
     source_project: Option<&Path>,
-    round: usize,
-) -> BuildOutcome {
-    let build_args = crate::build::BuildArgs {
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
+) -> crate::build::BuildArgs {
+    let mut args = crate::build::BuildArgs {
         work_dir: work_dir.to_path_buf(),
         source_project: source_project.map(Path::to_path_buf),
         harness: Some(harness_id.to_owned()),
@@ -7056,8 +9310,24 @@ fn run_ada_build_once(
         runtime: None,
         toolchain: None,
         probe_backend: crate::probe_backend::ProbeBackend::HostFile,
+        toolchain_args: crate::build::BuildToolchainArgs::default(),
         c_engine: crate::build::CEngine::Libfuzzer,
     };
+    ada_toolchain.apply_to(&mut args);
+    args
+}
+
+/// Run the Ada build pipeline once for `harness_id` and classify the result.
+/// `BuildArgs` defaults mirror clap's value-enum defaults for the build
+/// subcommand (host_file probe, libfuzzer engine — the latter irrelevant here).
+fn run_ada_build_once(
+    work_dir: &Path,
+    harness_id: &str,
+    source_project: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
+    round: usize,
+) -> BuildOutcome {
+    let build_args = ada_build_args(work_dir, harness_id, source_project, ada_toolchain);
     // Persist the raw combined output so the force-fuzz external-stub refiner
     // (which needs GNAT's `expected/found` type pairs, not just the classified
     // errors) can read it in the repair loop.
@@ -8752,11 +11022,24 @@ fn candidate_with_ipc_reachability(candidate: &Candidate, ipc_channel_observed: 
     upgraded
 }
 
+/// The candidate's reachability basis when `label` is the candidate's own
+/// static verdict (not one a run upgraded, such as an IPC channel's).
+fn reachability_basis_for<'a>(
+    candidate: &'a Candidate,
+    label: Option<&str>,
+) -> Option<&'a target_rank::ReachabilityBasis> {
+    (label.is_some() && label == reachability_label(candidate.input_reachability))
+        .then_some(candidate.input_reachability_basis.as_ref())
+        .flatten()
+}
+
 fn stamp_runtime_mode(
     finding_path: &std::path::Path,
     pass: crate::auto::pass::Pass,
     env_injected: &[(String, String)],
     input_reachability: Option<&str>,
+    input_reachability_basis: Option<&target_rank::ReachabilityBasis>,
+    shim_armed: bool,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(finding_path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -8783,6 +11066,8 @@ fn stamp_runtime_mode(
             serde_json::json!({
                 "pass": pass.as_str(),
                 "env_injected": env_map,
+                // Whether the runtrace shim watched this run's environment use.
+                "shim_armed": shim_armed,
             }),
         );
         // Persist the fuzzed entry's attacker-reachability so the recomputed
@@ -8793,6 +11078,16 @@ fn stamp_runtime_mode(
                 "input_reachability".to_owned(),
                 serde_json::Value::String(label.to_owned()),
             );
+            // What the label was inferred from, when it is the entry's own
+            // signature verdict; a label without one carries none.
+            match input_reachability_basis.and_then(|basis| serde_json::to_value(basis).ok()) {
+                Some(basis) => {
+                    obj.insert("input_reachability_basis".to_owned(), basis);
+                }
+                None => {
+                    obj.remove("input_reachability_basis");
+                }
+            }
         }
         obj.remove("actionability");
     }
@@ -8807,7 +11102,12 @@ fn stamp_runtime_mode(
     corpus::finding::append_history(
         &mut value,
         "auto",
-        &["runtime_mode", "input_reachability", "actionability"],
+        &[
+            "runtime_mode",
+            "input_reachability",
+            "input_reachability_basis",
+            "actionability",
+        ],
     );
     let pretty = serde_json::to_vec_pretty(&value)?;
     std::fs::write(finding_path, pretty)
@@ -8843,11 +11143,15 @@ mod env_injection_tests {
 
 #[cfg(test)]
 mod undefined_external_types_tests {
-    use super::{undefined_external_types, undefined_external_types_for_lang};
+    use super::{
+        declared_from_real_headers, undefined_external_types, undefined_external_types_for_lang,
+    };
     use crate::auto::candidate::Lang;
     use crate::auto::decl_index::DeclarationIndex;
+    use crate::auto::repair::Repair;
     use build_classifier::BuildErrorKind;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     #[test]
     fn placeholder_synthesized_type_is_not_an_external_type() {
@@ -8928,9 +11232,104 @@ mod undefined_external_types_tests {
             name: "inflate_state".to_owned(),
         }];
         assert_eq!(
-            undefined_external_types_for_lang(&errors, &idx, &BTreeSet::new(), Lang::C),
+            undefined_external_types_for_lang(
+                &errors,
+                &idx,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Lang::C
+            ),
             None,
             "an in-tree C type is a recoverable include/source problem, not an external SDK"
+        );
+    }
+
+    /// A standard-library name bhf declared from its real header (a type
+    /// resolved to `<string>`, or the std prelude's `using std::list;`) is
+    /// never an external SDK type, so a build that still fails on one, or
+    /// on diagnostics in the project's header that uses it, keeps its
+    /// failed build instead of a report-only "external SDK" reason.
+    #[test]
+    fn standard_names_declared_from_real_headers_are_not_external_types() {
+        let idx = DeclarationIndex::default();
+        let repairs = vec![
+            Repair::TypePlaceholder {
+                type_name: "string".to_owned(),
+                resolved_header: Some("<string>".to_owned()),
+            },
+            Repair::StdPrelude {
+                path: PathBuf::from("/w/harnesses/H-ONE/std_prelude.h"),
+                names: vec!["list".to_owned(), "map".to_owned()],
+                headers: vec!["list".to_owned(), "map".to_owned()],
+            },
+            Repair::TypePlaceholder {
+                type_name: "CString".to_owned(),
+                resolved_header: None,
+            },
+        ];
+        let real = declared_from_real_headers(&repairs);
+        assert_eq!(
+            real.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["list", "map", "string"]
+        );
+        let string_only: BTreeSet<String> = ["string".to_owned()].into_iter().collect();
+        let residue = vec![BuildErrorKind::Other {
+            tail: "/src/lib/src/widget.h:6:5: error: no template named 'map'\n".to_owned(),
+        }];
+        // Without that knowledge the `string` type reads as an external SDK's.
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &residue,
+                &idx,
+                &string_only,
+                &BTreeSet::new(),
+                Lang::Cpp
+            ),
+            Some(vec!["string".to_owned()])
+        );
+        assert_eq!(
+            undefined_external_types_for_lang(&residue, &idx, &string_only, &real, Lang::Cpp),
+            None
+        );
+        let still_missing = vec![BuildErrorKind::MissingType {
+            name: "list".to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &still_missing,
+                &idx,
+                &BTreeSet::new(),
+                &real,
+                Lang::Cpp
+            ),
+            None
+        );
+        // Nor is a standard name the prelude left out (the build stopped
+        // before naming it, or the project declares a C++ type of that name):
+        // it is no external SDK's in a C++ harness.
+        let undeclared = vec![BuildErrorKind::MissingType {
+            name: "vector".to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(
+                &undeclared,
+                &idx,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Lang::Cpp
+            ),
+            None
+        );
+        // A fabricated stand-in keeps degrading as before.
+        let fabricated: BTreeSet<String> = ["CString".to_owned()].into_iter().collect();
+        let cstring = vec![BuildErrorKind::Other {
+            tail: "src/view.cpp:9:5: error: called object type 'CString' is not a function or \
+                   function pointer"
+                .to_owned(),
+        }];
+        assert_eq!(
+            undefined_external_types_for_lang(&cstring, &idx, &fabricated, &real, Lang::Cpp),
+            Some(vec!["CString".to_owned()])
         );
     }
 
@@ -9223,11 +11622,28 @@ mod ipc_reachability_tests {
 
 #[cfg(test)]
 mod sanitizer_override_tests {
-    use super::{coverage_only_compiler_override, sanitizer_compiler_override};
-    use multicore_fuzz::Sanitizer;
+    use super::{native_override_for, SanitizerProbe};
+    use crate::toolchain::EffectiveCompilers;
+    use harness_gen::compiler_family::{family_from_name, CompilerFamily};
 
     fn has_flag(flags: &[String], needle: &str) -> bool {
         flags.iter().any(|f| f.contains(needle))
+    }
+
+    fn by_name(compiler: &str, _cxx: bool) -> Option<CompilerFamily> {
+        family_from_name(compiler)
+    }
+
+    fn compilers(cc: &str, cxx: &str, explicit: bool) -> EffectiveCompilers {
+        EffectiveCompilers {
+            cc: cc.to_owned(),
+            cxx: cxx.to_owned(),
+            explicit,
+        }
+    }
+
+    fn clang_default() -> EffectiveCompilers {
+        compilers("clang", "clang++", false)
     }
 
     #[test]
@@ -9235,7 +11651,11 @@ mod sanitizer_override_tests {
         // `--sanitizers none` (#434): native crash-only + coverage. The build must
         // carry the engine's coverage instrumentation but NO `-fsanitize=` group,
         // so ASan/UBSan never run and cannot false-positive.
-        let ov = coverage_only_compiler_override();
+        let (ov, note) =
+            native_override_for(&clang_default(), None, false, false, by_name, |_, _, _| {
+                SanitizerProbe::Runs
+            });
+        assert_eq!(note, None);
         for flags in [&ov.cflags, &ov.cxxflags] {
             assert!(
                 has_flag(flags, "-fsanitize-coverage=trace-pc-guard,trace-cmp"),
@@ -9261,7 +11681,14 @@ mod sanitizer_override_tests {
     fn set_override_keeps_fsanitize_and_coverage() {
         // `--sanitizers asan,ubsan` still bakes the exact -fsanitize= set plus
         // coverage, and subtracts the noisy UBSan checks.
-        let ov = sanitizer_compiler_override(&[Sanitizer::Asan, Sanitizer::Ubsan]);
+        let (ov, _) = native_override_for(
+            &clang_default(),
+            Some("-fsanitize=address,undefined".to_owned()),
+            true,
+            false,
+            by_name,
+            |_, _, _| SanitizerProbe::Runs,
+        );
         assert!(
             ov.cxxflags
                 .iter()
@@ -9284,8 +11711,333 @@ mod sanitizer_override_tests {
 
     #[test]
     fn set_override_without_ubsan_does_not_subtract_checks() {
-        let ov = sanitizer_compiler_override(&[Sanitizer::Asan]);
+        let (ov, _) = native_override_for(
+            &clang_default(),
+            Some("-fsanitize=address".to_owned()),
+            false,
+            false,
+            by_name,
+            |_, _, _| SanitizerProbe::Runs,
+        );
         assert!(!has_flag(&ov.cflags, "-fno-sanitize="), "{:?}", ov.cflags);
+    }
+
+    /// `--sanitizers` used to replace an operator's CC/CXX with clang without
+    /// a word. It keeps them when they can build the sanitizers, in their own
+    /// flag spelling.
+    #[test]
+    fn an_operator_gcc_is_kept_with_gcc_spelled_flags() {
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=address,undefined".to_owned()),
+            true,
+            false,
+            by_name,
+            |_, _, _| SanitizerProbe::Runs,
+        );
+        assert_eq!(note, None);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "g++"));
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(has_flag(flags, "-fsanitize=address,undefined"), "{flags:?}");
+            assert!(
+                has_flag(flags, "-fsanitize-coverage=trace-pc,trace-cmp"),
+                "{flags:?}"
+            );
+            assert!(!has_flag(flags, "trace-pc-guard"), "{flags:?}");
+            assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
+            // The object-size check stays next to ASan: it sees overflows of
+            // objects ASan does not track.
+            assert!(!has_flag(flags, "object-size"), "{flags:?}");
+            assert!(!has_flag(flags, "function"), "{flags:?}");
+            // A shared libasan aborts under the runtrace LD_PRELOAD shim.
+            assert!(
+                has_flag(flags, "-static-libasan") && has_flag(flags, "-static-libubsan"),
+                "{flags:?}"
+            );
+            assert!(!has_flag(flags, "-Wno-reserved-user-defined-literal"));
+        }
+        // UBSan without ASan keeps the object-size check too.
+        let (ov, _) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=undefined".to_owned()),
+            true,
+            false,
+            by_name,
+            |_, _, _| SanitizerProbe::Runs,
+        );
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
+            assert!(!has_flag(flags, "object-size"), "{flags:?}");
+        }
+        // Coverage only keeps the operator's compiler too.
+        let (ov, _) = native_override_for(
+            &compilers("gcc", "g++", true),
+            None,
+            false,
+            false,
+            by_name,
+            |_, _, _| unreachable!("nothing to probe without a sanitizer"),
+        );
+        assert_eq!(ov.cc, "gcc");
+        assert!(has_flag(&ov.cflags, "trace-pc,trace-cmp"));
+    }
+
+    /// The gcc retry swaps only the compilers: the Makefile picks GCC's flags
+    /// itself, so the retry keeps `trace-cmp` and the dialect ladder's standard.
+    #[test]
+    fn the_gcc_retry_changes_only_the_compilers() {
+        let ov = super::gcc_fallback_override();
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "g++"));
+        assert!(ov.cflags.is_empty() && ov.cxxflags.is_empty(), "{ov:?}");
+    }
+
+    /// An auto Ada build carries the sweep's Ada toolchain into `bhf build`.
+    #[test]
+    fn ada_builds_carry_the_configured_toolchain() {
+        let settings = crate::toolchain::AdaBuildSettings {
+            target: Some("aarch64-linux-gnu".to_owned()),
+            runtime: Some("light".to_owned()),
+            prefix: Some("aarch64-linux-gnu".to_owned()),
+            gprbuild: None,
+            gnat: Some("/opt/gnat/bin/aarch64-linux-gnu-gnat".to_owned()),
+            switches: vec!["-O1".to_owned()],
+            probe_backend: crate::probe_backend::ProbeBackend::MemoryBuffer,
+            runner: None,
+        };
+        let args = super::ada_build_args(std::path::Path::new("/w"), "H-A0001", None, &settings);
+        assert_eq!(args.target.as_deref(), Some("aarch64-linux-gnu"));
+        assert_eq!(args.runtime.as_deref(), Some("light"));
+        assert_eq!(args.toolchain.as_deref(), Some("aarch64-linux-gnu"));
+        assert_eq!(
+            args.toolchain_args.ada_gnat.as_deref(),
+            Some("/opt/gnat/bin/aarch64-linux-gnu-gnat")
+        );
+        assert_eq!(args.toolchain_args.ada_switches, ["-O1"]);
+        assert_eq!(
+            args.probe_backend,
+            crate::probe_backend::ProbeBackend::MemoryBuffer
+        );
+        let default = super::ada_build_args(
+            std::path::Path::new("/w"),
+            "H-A0001",
+            None,
+            &crate::toolchain::AdaBuildSettings::default(),
+        );
+        assert_eq!(default.target, None);
+        assert_eq!(
+            default.probe_backend,
+            crate::probe_backend::ProbeBackend::HostFile
+        );
+    }
+
+    /// A sanitizer the operator's compiler cannot build (gcc has no
+    /// MemorySanitizer) switches to clang, and says so.
+    #[test]
+    fn an_unsupported_sanitizer_switches_to_clang_with_a_note() {
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=memory".to_owned()),
+            false,
+            false,
+            by_name,
+            |compiler, _, flags| {
+                if compiler == "gcc" && flags.iter().any(|flag| flag == "-fsanitize=memory") {
+                    SanitizerProbe::DoesNotLink
+                } else {
+                    SanitizerProbe::Runs
+                }
+            },
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CC=gcc") && note.contains("-fsanitize=memory") && note.contains("clang"),
+            "{note}"
+        );
+        assert!(has_flag(&ov.cflags, "trace-pc-guard"), "{:?}", ov.cflags);
+    }
+
+    /// A runtime that links but cannot start here (GCC's ThreadSanitizer
+    /// under a kernel's high-entropy ASLR) is not kept: clang builds the
+    /// harnesses, and the note names the compiler and what its runtime
+    /// printed. The probe links with the static runtime gcc's harness links.
+    #[test]
+    fn a_runtime_that_cannot_start_switches_to_clang_with_a_note() {
+        const FATAL: &str = "FATAL: ThreadSanitizer: unexpected memory mapping 0x1000-0x2000";
+        let probed = std::cell::RefCell::new(Vec::new());
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=thread".to_owned()),
+            false,
+            true,
+            by_name,
+            |compiler, _, flags| {
+                probed
+                    .borrow_mut()
+                    .push((compiler.to_owned(), flags.to_vec()));
+                if compiler == "gcc" {
+                    SanitizerProbe::FailsAtStartup(FATAL.to_owned())
+                } else {
+                    SanitizerProbe::Runs
+                }
+            },
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CC=gcc") && note.contains(FATAL) && note.contains("clang/clang++"),
+            "{note}"
+        );
+        assert_eq!(
+            probed.into_inner(),
+            vec![(
+                "gcc".to_owned(),
+                vec!["-fsanitize=thread".to_owned(), "-static-libtsan".to_owned()]
+            )]
+        );
+        assert!(has_flag(&ov.cflags, "-fsanitize=thread"), "{:?}", ov.cflags);
+        assert!(has_flag(&ov.cflags, "trace-pc-guard"), "{:?}", ov.cflags);
+        assert!(!has_flag(&ov.cflags, "-static-libtsan"), "{:?}", ov.cflags);
+        // The environment's flags were written for gcc/g++.
+        assert!(!ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+    }
+
+    /// The operator's C++ compiler is checked too, for a C++ harness: with
+    /// only CXX chosen (CC is bhf's clang), a g++ whose ThreadSanitizer
+    /// runtime cannot start used to be kept, and every C++ harness died at
+    /// startup. Now CXX switches to clang++, the note names CXX and the
+    /// runtime's line, and the environment's CXXFLAGS (written for g++) stay
+    /// out. A C harness never probes CXX, so a C-only toolchain keeps its
+    /// compilers whatever its C++ compiler does.
+    #[test]
+    fn a_cpp_compiler_whose_runtime_cannot_start_switches_the_cpp_harnesses() {
+        const FATAL: &str = "FATAL: ThreadSanitizer: unexpected memory mapping 0x1000-0x2000";
+        let fsanitize = || Some("-fsanitize=thread".to_owned());
+        let probed = std::cell::RefCell::new(Vec::new());
+        let probe = |compiler: &str, cpp: bool, flags: &[String]| {
+            probed
+                .borrow_mut()
+                .push((compiler.to_owned(), cpp, flags.to_vec()));
+            if compiler == "g++" {
+                SanitizerProbe::FailsAtStartup(FATAL.to_owned())
+            } else {
+                SanitizerProbe::Runs
+            }
+        };
+        let only_cxx = compilers("clang", "g++", true);
+        let (ov, note) = native_override_for(&only_cxx, fsanitize(), false, true, by_name, probe);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CXX=g++") && note.contains(FATAL) && note.contains("clang++ instead"),
+            "{note}"
+        );
+        assert_eq!(
+            probed.take(),
+            vec![(
+                "g++".to_owned(),
+                true,
+                vec!["-fsanitize=thread".to_owned(), "-static-libtsan".to_owned()]
+            )],
+            "bhf's own clang is not probed, and g++ is probed as C++"
+        );
+        assert!(
+            has_flag(&ov.cxxflags, "trace-pc-guard"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(
+            !has_flag(&ov.cxxflags, "-static-libtsan"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+
+        // A C harness keeps the operator's compilers and never runs g++.
+        let (ov, note) = native_override_for(&only_cxx, fsanitize(), false, false, by_name, probe);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "g++"));
+        assert_eq!(note, None);
+        assert!(probed.take().is_empty());
+        assert!(ov.ambient_cflags && ov.ambient_cxxflags, "{ov:?}");
+
+        // A gcc whose runtime starts keeps building the C units of the C++
+        // harness, as with CC=gcc and no CXX.
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            fsanitize(),
+            false,
+            true,
+            by_name,
+            probe,
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "clang++"));
+        assert!(note.is_some_and(|note| note.contains("CXX=g++")));
+        assert!(has_flag(&ov.cflags, "-static-libtsan"), "{:?}", ov.cflags);
+        assert!(
+            has_flag(&ov.cxxflags, "trace-pc-guard"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+    }
+
+    /// An executable shell script standing in for a compiler: it writes
+    /// `program` (a shell script too) to the file named after `-o`.
+    #[cfg(unix)]
+    fn fake_compiler(dir: &std::path::Path, program: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let body = dir.join("program.sh");
+        std::fs::write(&body, program).unwrap();
+        let compiler = dir.join("widget-cc");
+        std::fs::write(
+            &compiler,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -o ]; then \
+                 cp '{}' \"$2\" && chmod 755 \"$2\" && exit 0; fi\n  shift\ndone\nexit 1\n",
+                body.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        compiler.display().to_string()
+    }
+
+    /// The probe runs the program it linked: one whose runtime aborts at
+    /// startup is caught with the runtime's own line, one that exits
+    /// cleanly runs, and a compiler that cannot link it does not link.
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_probe_runs_the_program_it_linked() {
+        use super::probe_sanitizer_runtime;
+        let flags = ["-fsanitize=thread".to_owned()];
+        let failing = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(
+            failing.path(),
+            "#!/bin/sh\necho 'warning: something unrelated' >&2\n\
+             echo 'FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20' >&2\nkill -ABRT $$\n",
+        );
+        assert_eq!(
+            probe_sanitizer_runtime(&compiler, false, &flags),
+            SanitizerProbe::FailsAtStartup(
+                "FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20".to_owned()
+            )
+        );
+        let quiet = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(quiet.path(), "#!/bin/sh\nkill -SEGV $$\n");
+        match probe_sanitizer_runtime(&compiler, true, &flags) {
+            SanitizerProbe::FailsAtStartup(how) => assert!(how.contains("11"), "{how}"),
+            other => panic!("a program killed at startup must fail the probe: {other:?}"),
+        }
+        let clean = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(clean.path(), "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            probe_sanitizer_runtime(&compiler, false, &flags),
+            SanitizerProbe::Runs
+        );
+        assert_eq!(
+            probe_sanitizer_runtime("/nonexistent/bhf-no-such-cc", false, &flags),
+            SanitizerProbe::DoesNotLink
+        );
     }
 }
 
@@ -9293,6 +12045,101 @@ mod sanitizer_override_tests {
 mod corpus_reseed_tests {
     use super::{reseed_from_corpus_queue, CORPUS_RESEED_CAP};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A work dir from an earlier release keeps its corpus but does not
+    /// reseed it, once; a work dir with nothing from an earlier release is
+    /// recorded as fresh and its corpus left alone.
+    #[test]
+    fn an_earlier_release_corpus_is_set_aside_once() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"legacy-entry").unwrap();
+        // A plan-only run leaves an earlier release's corpus for later.
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, true).unwrap(),
+            LegacyCorpus::Pending
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(!w.join("auto/legacy-corpus.json").exists());
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::SetAside(w.join("corpus-legacy"))
+        );
+        let mut seeds = Vec::new();
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            0
+        );
+        assert_eq!(
+            std::fs::read(w.join("corpus-legacy/H-1/queue/a.bin")).unwrap(),
+            b"legacy-entry"
+        );
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("b.bin"), b"new-entry").unwrap();
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        assert_eq!(
+            results::migrate::corpus_decision(w).as_deref(),
+            Some("set_aside")
+        );
+    }
+
+    #[test]
+    fn a_fresh_work_dirs_corpus_is_kept_and_recorded_as_fresh() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"entry").unwrap();
+        // Even a plan-only run records it, so a later run is not mistaken
+        // for one on an earlier release's work dir.
+        assert_eq!(
+            set_aside_legacy_corpus(w, false, false, true).unwrap(),
+            LegacyCorpus::Fresh
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(!results::migrate::from_an_earlier_release(w));
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert!(queue.join("a.bin").is_file());
+    }
+
+    #[test]
+    fn an_earlier_release_corpus_is_reused_on_request() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"legacy-entry").unwrap();
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, true, false).unwrap(),
+            LegacyCorpus::Reused
+        );
+        let mut seeds = Vec::new();
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(results::migrate::from_an_earlier_release(w));
+    }
 
     #[test]
     fn reseed_from_corpus_queue_loads_deduped_capped_inputs() {
@@ -9328,6 +12175,78 @@ mod corpus_reseed_tests {
         // The cap bounds how many are taken.
         let mut capped = Vec::new();
         assert_eq!(reseed_from_corpus_queue(&work, "H-RS", &mut capped, 1), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reseeded_queue_entry_reaches_the_engine_unchanged() {
+        // A later cascade pass (and the AFL++ stage) reseeds from the queue the
+        // earlier passes persisted. A queue entry that is not valid UTF-8 must be
+        // run exactly as stored, not rewritten on its way back into the engine.
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bhf-reseed-bytes-{nonce}"));
+        let work = root.join("bhf_work");
+        let mut entry: Vec<u8> = vec![0xab, 0xcd, 0xef, 0x99, 0x00, 0x80, 0xff];
+        entry.extend((0x80..=0xffu8).rev());
+        let queue = work.join("corpus").join("H-RQ").join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("entry.bin"), &entry).unwrap();
+        let expected = root.join("expected.bin");
+        std::fs::write(&expected, &entry).unwrap();
+        // Crashes only on the byte-exact queue entry.
+        let build = work.join("build").join("H-RQ");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("main.c"), "// marker for libFuzzer detection\n").unwrap();
+        let harness = build.join("main");
+        std::fs::write(
+            &harness,
+            format!(
+                "#!/bin/sh\n\
+                 if cmp -s \"$1\" '{}'; then\n\
+                   >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x701 at pc 0x444'\n\
+                   >&2 echo '    #0 0x444 in parse_record /src/record.c:21'\n\
+                   >&2 echo '    #1 0x445 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+                   exit 1\n\
+                 fi\n\
+                 exit 0\n",
+                expected.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut seeds = vec![b"".to_vec(), b"A".to_vec()];
+        assert_eq!(
+            reseed_from_corpus_queue(&work, "H-RQ", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        let summary = crate::fuzz::run_one_target_programmatic(
+            &work,
+            "H-RQ",
+            seeds,
+            4,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(summary.findings.len(), 1, "{:?}", summary.findings);
+        let testcase = std::fs::read(
+            corpus::layout::finding_dir(&work, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(testcase, entry, "the reseeded entry must run byte for byte");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -9443,6 +12362,7 @@ mod throughput_tests {
             executions: 10,
             target_entry_observed: false,
             coverage_edges: 0,
+            coverage_instrumentation: None,
             elapsed_secs: 1.0,
             executions_per_sec: 10.0,
             findings: vec![],
@@ -9458,6 +12378,7 @@ mod throughput_tests {
             executions,
             target_entry_observed: false,
             coverage_edges: 0,
+            coverage_instrumentation: None,
             elapsed_secs,
             executions_per_sec: if elapsed_secs > 0.0 {
                 executions as f64 / elapsed_secs
@@ -9617,9 +12538,154 @@ mod throughput_tests {
 }
 
 #[cfg(test)]
-mod cmplog_accumulate_tests {
-    use super::append_cmplog_records;
+mod corpus_format_tests {
+    use super::corpus_format_note;
+
+    #[test]
+    fn a_corpus_of_another_harness_format_is_noted() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses/H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":3,"language":"c"}"#,
+        )
+        .unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0001", &harness), None);
+        let corpus = work.path().join("corpus/H-C0001");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let metadata = |version: u32| {
+            format!(
+                r#"{{"schema_version":"bhf.corpus-metadata.v1","harness_id":"H-C0001",
+                    "harness":{{"format_version":{version},"buffer_len_dimension":false}}}}"#
+            )
+        };
+        std::fs::write(corpus.join("metadata.json"), metadata(3)).unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0001", &harness), None);
+        std::fs::write(corpus.join("metadata.json"), metadata(2)).unwrap();
+        let note = corpus_format_note(work.path(), "H-C0001", &harness).expect("noted");
+        assert!(note.contains("input format 2"), "{note}");
+        assert!(note.contains("decodes format 3"), "{note}");
+    }
+
+    /// A corpus with inputs but no metadata was recorded before harness
+    /// formats were stamped: format 2 or earlier, noted against a format 3
+    /// or later harness. An empty one is not noted.
+    #[test]
+    fn an_unstamped_corpus_is_noted_as_an_older_format() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses/H-C0002");
+        std::fs::create_dir_all(&harness).unwrap();
+        let metadata = |version: u32| {
+            std::fs::write(
+                harness.join("generation-metadata.json"),
+                format!(
+                    r#"{{"schema_version":1,"harness_format_version":{version},"language":"c"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        metadata(4);
+        let queue = work.path().join("corpus/H-C0002/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0002", &harness), None);
+        std::fs::write(queue.join("input.bin"), b"AAAA").unwrap();
+        let note = corpus_format_note(work.path(), "H-C0002", &harness).expect("noted");
+        assert!(
+            note.contains("recorded before harness formats were stamped (format 2 or earlier)")
+                && note.contains("decodes format 4"),
+            "{note}"
+        );
+        // A harness that decodes format 2 reads such a corpus as it was.
+        metadata(2);
+        assert_eq!(corpus_format_note(work.path(), "H-C0002", &harness), None);
+    }
+}
+
+#[cfg(test)]
+mod source_dictionary_tests {
+    use super::write_source_dictionary;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A managed lane's mined dictionary names the line of the target source
+    /// each token came from; tokens bhf adds itself carry no location.
+    #[test]
+    fn source_dictionary_names_the_line_of_each_token() {
+        use crate::auto::candidate::Lang;
+        let root = std::env::temp_dir().join(format!(
+            "bhf-source-dictionary-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let harness_dir = root.join("H-PY");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        // The sources exist, as a harness's target source always does: the
+        // label is relative to the resolved (canonical) directory.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source_path = root.join("src").join("widget.py");
+        let source = "def parse_record(s):\n    return s == \"WGT1\"\nTAG = \"WGT1\"\n";
+        std::fs::write(&source_path, source).unwrap();
+        write_source_dictionary(&harness_dir, Some(source), &source_path, Lang::Python);
+        let dictionary = std::fs::read_to_string(harness_dir.join("dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.py:2, widget.py:3\n\"WGT1\"\n"),
+            "{dictionary}"
+        );
+
+        let js_dir = root.join("H-JS");
+        std::fs::create_dir_all(&js_dir).unwrap();
+        let js_source = "// widget\nfunction parseRecord(s) {\n  return s === 'WGT2';\n}\n";
+        std::fs::write(root.join("widget.js"), js_source).unwrap();
+        write_source_dictionary(&js_dir, Some(js_source), &root.join("widget.js"), Lang::Js);
+        let dictionary = std::fs::read_to_string(js_dir.join("dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.js:3\n\"WGT2\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("\n\"__proto__\"\n") && !dictionary.contains(":0\n"),
+            "built-in tokens have no source line:\n{dictionary}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod cmplog_accumulate_tests {
+    use super::{append_cmplog_records, harvest_pass_cmplog};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// After a pass, its runtrace cmplog records reach cmplog.jsonl and the
+    /// learned dictionary the next pass and later runs load.
+    #[test]
+    fn a_pass_harvest_writes_the_learned_dictionary() {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-learned-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("runtrace.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"strcmp\",\"s\":\"00000010.00000020\",\"a\":\"41\",\"b\":\"5747543100\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"strcmp\",\"s\":\"00000010.00000020\",\"a\":\"42\",\"b\":\"5747543100\"}\n",
+        )
+        .unwrap();
+        harvest_pass_cmplog(&dir);
+        let learned = std::fs::read_to_string(dir.join("learned_dictionary.txt")).unwrap();
+        assert!(learned.contains("\"WGT1\\x00\"\n"), "{learned}");
+        assert!(
+            !learned.contains("\"A\"\n"),
+            "the inputs compared with the constant are not tokens: {learned}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn append_cmplog_records_accumulates_only_cmplog_lines() {
@@ -9769,9 +12835,9 @@ mod ada_source_tests {
 mod stamp_tests {
     use super::{
         ada_subunit_parent, ada_unit_key_from_filename, ada_variant_dest_basename,
-        build_ada_unit_file_map, c_file_is_simd_backend, compute_ada_build_closure,
-        ensure_ada_src_instrumented, env_injections_from_events,
-        mirror_harness_into_generated_harnesses, reset_repairs_dir,
+        afl_skipped_message, build_ada_unit_file_map, c_file_is_simd_backend,
+        compute_ada_build_closure, ensure_ada_src_instrumented, env_injections_from_events,
+        fuzz_pass_shim_armed, mirror_harness_into_generated_harnesses, reset_repairs_dir,
         rewrite_legacy_gnat_calendar_c_time, stage_ada_c_repair_sources, stamp_runtime_mode,
         walk_to_common_src_root,
     };
@@ -9878,10 +12944,13 @@ mod stamp_tests {
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
             None,
+            None,
+            true,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "rng");
+        assert_eq!(parsed["runtime_mode"]["shim_armed"], true);
         assert_eq!(
             parsed["runtime_mode"]["env_injected"]["ACME_HOME"],
             "/tmp/bhf/fake_env/ACME_HOME"
@@ -9894,12 +12963,110 @@ mod stamp_tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// A finding of an entry whose reachability was inferred from its
+    /// signature records what it was inferred from, and its actionability
+    /// entry path carries it; a label without a basis drops a stale one.
+    #[test]
+    fn the_reachability_basis_is_stamped_with_its_label() {
+        let path = tmp_finding();
+        fs::write(
+            &path,
+            r#"{"id":"F-0001-abc","harness_id":"H-C0001","exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW"}}"#,
+        )
+        .unwrap();
+        let basis = target_rank::ReachabilityBasis {
+            rule: "const_byte_buffer".to_owned(),
+            param: Some("buf".to_owned()),
+            spelled_type: Some("const u8_t *".to_owned()),
+            resolved_type: Some("const uint8_t *".to_owned()),
+            typedefs_resolved: true,
+            via: None,
+        };
+        stamp_runtime_mode(
+            &path,
+            Pass::Empty,
+            &[],
+            Some("attacker_reachable"),
+            Some(&basis),
+            false,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["input_reachability"], "attacker_reachable");
+        assert_eq!(parsed["input_reachability_basis"]["param"], "buf");
+        assert_eq!(
+            parsed["input_reachability_basis"]["resolved_type"],
+            "const uint8_t *"
+        );
+        assert_eq!(
+            parsed["actionability"]["entry_path"]["reachability_basis"]["spelled_type"],
+            "const u8_t *"
+        );
+        stamp_runtime_mode(
+            &path,
+            Pass::Empty,
+            &[],
+            Some("ipc_channel_reachable"),
+            None,
+            false,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(parsed.get("input_reachability_basis").is_none(), "{parsed}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_afl_build_keeps_builtin_results_only_when_the_builtin_engine_fuzzed() {
+        let failure = "make main_afl failed: afl-clang-fast: not found";
+        assert_eq!(
+            afl_skipped_message("H-C0001", true, failure),
+            "`make afl` failed for H-C0001 — AFL skipped, builtin results kept \
+             (make main_afl failed: afl-clang-fast: not found)"
+        );
+        let afl_only = afl_skipped_message("H-C0001", false, failure);
+        assert_eq!(
+            afl_only,
+            "AFL skipped; H-C0001 was not fuzzed (make main_afl failed: afl-clang-fast: not found)"
+        );
+        assert!(!afl_only.contains("builtin results kept"));
+    }
+
+    #[test]
+    fn a_pass_counts_as_shim_armed_only_when_the_shim_marked_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        let log = dir.path().join("runtrace.jsonl");
+        // LD_PRELOAD was set but the shim never loaded (a path ld.so split): no log.
+        assert!(!fuzz_pass_shim_armed(dir.path(), false));
+        // The fuzz driver opens the log for its comparison records on its own.
+        fs::write(&log, "").unwrap();
+        assert!(!fuzz_pass_shim_armed(dir.path(), false), "an empty log");
+        fs::write(&log, "{\"e\":\"cmplog\",\"a\":\"41\",\"b\":\"42\"}\n").unwrap();
+        assert!(
+            !fuzz_pass_shim_armed(dir.path(), false),
+            "a log holding only driver records"
+        );
+        fs::write(
+            &log,
+            "{\"e\":\"shim_loaded\"}\n{\"e\":\"cmplog\",\"a\":\"41\",\"b\":\"42\"}\n",
+        )
+        .unwrap();
+        assert!(fuzz_pass_shim_armed(dir.path(), false));
+        // An emulated pass never runs the host shim.
+        assert!(!fuzz_pass_shim_armed(dir.path(), true));
+    }
+
     #[test]
     fn empty_env_injected_stamps_empty_object() {
         let path = tmp_finding();
-        stamp_runtime_mode(&path, Pass::Empty, &[], None).unwrap();
+        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
+        assert_eq!(
+            parsed["runtime_mode"]["shim_armed"], false,
+            "a run without the shim says so"
+        );
         assert!(parsed["runtime_mode"]["env_injected"]
             .as_object()
             .unwrap()
@@ -9941,6 +13108,8 @@ mod stamp_tests {
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
             None,
+            None,
+            true,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -10676,10 +13845,15 @@ mod stamp_tests {
             Some("widget")
         );
         assert_eq!(ada_unit_key_from_filename("shim.c"), None);
-        // A host platform variant maps to the base unit (unix is host on
-        // linux/macos CI); the suffix is stripped.
+        // A host platform variant maps to the base unit; the suffix is
+        // stripped.
+        let host_variant = if cfg!(windows) {
+            "gnatcoll-os-stat-fstat__windows.adb"
+        } else {
+            "gnatcoll-os-stat-fstat__unix.adb"
+        };
         assert_eq!(
-            ada_unit_key_from_filename("gnatcoll-os-stat-fstat__unix.adb").as_deref(),
+            ada_unit_key_from_filename(host_variant).as_deref(),
             Some("gnatcoll.os.stat.fstat")
         );
     }
@@ -10915,6 +14089,7 @@ mod foreign_cross_target_tests {
             is_static: false,
             foreign_guard: Some(guard.to_owned()),
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -11074,6 +14249,7 @@ mod platform_stub_tests {
             is_static: false,
             foreign_guard: Some(guard.to_owned()),
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -11149,17 +14325,159 @@ mod platform_stub_tests {
     }
 
     #[test]
-    fn aarch64_cross_override_stays_coverage_blind() {
-        // The qemu-user arch path is unchanged: plain `-O1 -g` (ASan/coverage do
-        // not survive qemu-user today). Guards against accidentally arming it.
+    fn an_emulated_cross_build_arms_coverage_when_the_compiler_accepts_it() {
+        // The qemu-user arch path used to build plain `-O1 -g`, fuzzing blind,
+        // although the cross GCCs accept `trace-pc` + `trace-cmp` and the driver
+        // implements both callbacks. ASan stays off: it does not survive qemu-user.
         let target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
-        let ov = cross_compiler_override(&target);
-        let cflags = ov.cflags.join(" ");
-        assert!(
-            !cflags.contains("fsanitize-coverage"),
-            "aarch64 cross stays coverage-blind, got: {cflags}"
+        let ov = super::cross_compiler_override_with(&target, |_, _| true, |_, _| true);
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            let joined = flags.join(" ");
+            assert!(
+                joined.contains("-fsanitize-coverage=trace-pc,trace-cmp"),
+                "aarch64 cross build must be coverage-guided, got: {joined}"
+            );
+            assert!(!joined.contains("trace-pc-guard"), "{joined}");
+            assert!(!joined.contains("-fsanitize=address"), "{joined}");
+        }
+        // A toolchain that rejects the flag degrades to the plain build.
+        let ov = super::cross_compiler_override_with(&target, |_, _| false, |_, _| true);
+        assert!(!ov.cflags.join(" ").contains("fsanitize-coverage"));
+
+        // An operator's runner is an emulated build too.
+        let configured = CrossTarget {
+            runner: CrossRunner::Configured {
+                exe: "qemu-aarch64".to_owned(),
+                args: vec!["-L".to_owned(), "/usr/aarch64-linux-gnu".to_owned()],
+            },
+            ..target
+        };
+        let ov = super::cross_compiler_override_with(&configured, |_, _| true, |_, _| true);
+        assert!(ov.cflags.join(" ").contains("trace-pc,trace-cmp"));
+        assert!(matches!(
+            super::cross_harness_wrapper(&configured),
+            crate::runner::HarnessWrapper::QemuUser { ref args, .. } if args.len() == 2
+        ));
+    }
+
+    /// With no sanitizer runtime to intercept them, an emulated build routes
+    /// the program's `strcmp`/`memcmp` calls through the driver's wrappers, so
+    /// string gates feed the comparison log and a finding's evidence; a
+    /// `[cross.<guard>]` sysroot reaches the link probe and, as a target flag,
+    /// every object of the build (the driver's included).
+    #[test]
+    fn an_emulated_cross_build_links_the_comparison_wrappers_and_its_sysroot() {
+        let wrap = crate::gate_evidence::COMPARISON_WRAP_LDFLAGS;
+        let mut target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        target.sysroot = Some(PathBuf::from("/opt/arm sdk/sysroot"));
+        let probed = std::cell::RefCell::new(Vec::new());
+        let ov = super::cross_compiler_override_with(
+            &target,
+            |_, _| true,
+            |cc, flags| {
+                probed.borrow_mut().push((cc.to_owned(), flags.to_vec()));
+                true
+            },
         );
-        assert!(!cflags.contains("-fsanitize=address"));
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(flags.iter().any(|flag| flag == wrap), "{flags:?}");
+        }
+        assert_eq!(
+            ov.target_flags,
+            Some(vec!["--sysroot=\"/opt/arm sdk/sysroot\"".to_owned()])
+        );
+        let probed = probed.into_inner();
+        assert_eq!(probed.len(), 1);
+        assert_eq!(probed[0].0, "aarch64-linux-gnu-gcc");
+        assert!(
+            probed[0]
+                .1
+                .iter()
+                .any(|flag| flag == "--sysroot=/opt/arm sdk/sysroot"),
+            "{probed:?}"
+        );
+
+        // A linker that cannot wrap leaves the flags out.
+        let ov = super::cross_compiler_override_with(&target, |_, _| true, |_, _| false);
+        assert!(!ov.cflags.iter().any(|flag| flag == wrap));
+
+        // A Windows PE never gets them: the wrappers are ELF-only.
+        let windows = crate::auto::cross_target::resolve_cross_target("_WIN32").unwrap();
+        let ov = super::cross_compiler_override_with(&windows, |_, _| true, |_, _| true);
+        assert!(!ov.cflags.iter().any(|flag| flag == wrap));
+        assert!(ov.cflags.iter().any(|flag| flag == "-static"));
+    }
+
+    /// A clang lane compiler gets `--target=<triple>` in every compile, link
+    /// and probe, or it would build for this host. A whole-sweep target keeps
+    /// the `[toolchain]`'s published target flags instead of replacing them.
+    #[test]
+    fn a_clang_lane_builds_for_its_target_and_a_sweep_keeps_the_toolchain_flags() {
+        if which::which("clang").is_err() {
+            eprintln!("skip: clang unavailable");
+            return;
+        }
+        let mut target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        target.cc = "clang".to_owned();
+        target.cxx = "clang++".to_owned();
+        let probed = std::cell::RefCell::new(Vec::new());
+        let ov = super::cross_compiler_override_with(
+            &target,
+            |_, _| true,
+            |_, flags| {
+                probed.borrow_mut().push(flags.to_vec());
+                true
+            },
+        );
+        assert_eq!(
+            ov.target_flags,
+            Some(vec!["--target=aarch64-linux-gnu".to_owned()])
+        );
+        for flag in [
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-fno-sanitize-link-runtime",
+        ] {
+            assert!(
+                ov.cflags.iter().any(|f| f == flag),
+                "{flag}: {:?}",
+                ov.cflags
+            );
+        }
+        assert!(
+            probed.borrow().iter().all(|flags| flags
+                .iter()
+                .any(|flag| flag == "--target=aarch64-linux-gnu")),
+            "{probed:?}"
+        );
+        // A gcc lane without a sysroot still replaces a host sysroot.
+        let gcc = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        let ov = super::cross_compiler_override_with(&gcc, |_, _| true, |_, _| true);
+        assert_eq!(ov.target_flags, Some(Vec::new()));
+        // A whole-sweep target is the toolchain's own.
+        let sweep = CrossTarget {
+            guard_lane: false,
+            ..target
+        };
+        let ov = super::cross_compiler_override_with(&sweep, |_, _| true, |_, _| true);
+        assert_eq!(ov.target_flags, None);
+    }
+
+    /// The environment's CFLAGS/CXXFLAGS were written for the operator's
+    /// compiler: a platform guard's lane, whose cross compiler bhf picked,
+    /// leaves them out (a host-only `-march=native` failed its build), and a
+    /// whole-sweep target, the operator's own toolchain, takes them.
+    #[test]
+    fn a_guard_lane_leaves_the_ambient_flags_out_and_a_sweep_takes_them() {
+        let lane = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        assert!(lane.guard_lane);
+        let ov = super::cross_compiler_override_with(&lane, |_, _| true, |_, _| true);
+        assert!(!ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+        let sweep = CrossTarget {
+            guard_lane: false,
+            ..lane
+        };
+        let ov = super::cross_compiler_override_with(&sweep, |_, _| true, |_, _| true);
+        assert!(ov.ambient_cflags && ov.ambient_cxxflags, "{ov:?}");
     }
 
     #[test]
@@ -11450,6 +14768,7 @@ mod refused_repair_tracking_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -11625,6 +14944,7 @@ mod refused_repair_tracking_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let error = BuildErrorKind::UndefinedSymbol {
@@ -11685,6 +15005,30 @@ mod eject_unbuildable_added_source_tests {
     //! error kinds carry a name and no location (`IncompleteType` is just a type
     //! name), so the classified list cannot say which file failed.
     use super::*;
+
+    #[test]
+    fn a_pending_std_stream_include_defers_ejection_once() {
+        use crate::auto::repair::{Repair, RepairManifest};
+        let cerr = vec![BuildErrorKind::MissingType {
+            name: "cerr".to_owned(),
+        }];
+        let mut manifest = RepairManifest::default();
+        assert!(std_stream_include_pending(&cerr, &manifest));
+        // Once the header was force-included, a source that still fails can go.
+        manifest.repairs.push(Repair::TypePlaceholder {
+            type_name: "cerr".to_owned(),
+            resolved_header: None,
+        });
+        assert!(!std_stream_include_pending(&cerr, &manifest));
+        // Any other missing name is not a pending stream include.
+        let other = vec![BuildErrorKind::MissingType {
+            name: "widget_t".to_owned(),
+        }];
+        assert!(!std_stream_include_pending(
+            &other,
+            &RepairManifest::default()
+        ));
+    }
 
     #[test]
     fn the_blamed_source_is_the_one_dropped() {

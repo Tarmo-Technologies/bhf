@@ -356,7 +356,8 @@ fn fork_server_state_masked_crash_is_caught_by_fresh_reverify() {
     let findings_dir = root.join("bhf_work/results/findings");
     let mut crash_inputs: Vec<Vec<u8>> = Vec::new();
     for entry in fs::read_dir(&findings_dir).expect("findings dir exists once a crash is found") {
-        let tc = entry.unwrap().path().join("testcase.bin");
+        let dir = entry.unwrap().path();
+        let tc = dir.join("testcase.bin");
         if let Ok(bytes) = fs::read(&tc) {
             assert!(
                 !bytes.is_empty(),
@@ -364,6 +365,17 @@ fn fork_server_state_masked_crash_is_caught_by_fresh_reverify() {
                 tc.display()
             );
             crash_inputs.push(bytes);
+            // The fresh re-run's stderr is the finding's full sanitizer report:
+            // a crash the fork-server masked still gets its `sanitizer.log`.
+            let log = fs::read_to_string(dir.join("sanitizer.log"))
+                .unwrap_or_else(|error| panic!("{} has no sanitizer.log: {error}", dir.display()));
+            assert!(log.contains("AddressSanitizer"), "{log}");
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+            assert_eq!(
+                record["paths"]["sanitizer_log"], "sanitizer.log",
+                "{record}"
+            );
         }
     }
     assert!(

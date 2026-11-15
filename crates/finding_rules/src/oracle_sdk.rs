@@ -188,6 +188,9 @@ pub enum OracleRuntimeEvent {
     ResourceLeak {
         api: String,
         resource: String,
+        /// The language of the harness the leak was observed in (`ada`, `c`,
+        /// `cpp`, ...; empty when unknown), which names the oracle.
+        language: String,
         evidence: Vec<(String, String)>,
     },
     Differential {

@@ -26,6 +26,7 @@ fn record(
         prosthetics: Prosthetics::default(),
         patch_hints: Vec::new(),
         next_steps: Vec::new(),
+        verdict_reason: None,
     }
 }
 

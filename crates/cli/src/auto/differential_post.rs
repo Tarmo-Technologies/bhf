@@ -171,6 +171,10 @@ fn differential_one(
     }
 
     let mut written = 0usize;
+    if divergences.is_empty() {
+        return written;
+    }
+    let queue = crate::fuzz_lineage::ReplayedQueue::open(work_dir, harness_id);
     for ((exit_a, to_a, exit_b, to_b), input) in divergences {
         let (id, dir) = match ids.create() {
             Ok(created) => created,
@@ -181,8 +185,9 @@ fn differential_one(
         };
         let side_a = if is_cpp { &spec.cxx_a } else { &spec.cc_a };
         let side_b = if is_cpp { &spec.cxx_b } else { &spec.cc_b };
+        let replayed = queue.entry(&input).lineage;
         if write_finding(
-            &dir, &id, harness_id, side_a, side_b, exit_a, to_a, exit_b, to_b, &input,
+            &dir, &id, harness_id, side_a, side_b, exit_a, to_a, exit_b, to_b, &input, &replayed,
         ) {
             written += 1;
         }
@@ -196,9 +201,9 @@ fn build_side(hdir: &Path, is_cpp: bool, cc: &str, cxx: &str, tag: &str) -> Opti
     let mut cmd = Command::new("make");
     cmd.arg("-B").arg("diff").current_dir(hdir);
     if is_cpp {
-        cmd.arg(format!("DIFF_CXX={cxx}"));
+        cmd.arg(format!("DIFF_CXX={}", diff_compiler_word(cxx)));
     } else {
-        cmd.arg(format!("DIFF_CC={cc}"));
+        cmd.arg(format!("DIFF_CC={}", diff_compiler_word(cc)));
     }
     let ok = crate::command_output::output_with_timeout(
         &mut cmd,
@@ -206,15 +211,28 @@ fn build_side(hdir: &Path, is_cpp: bool, cc: &str, cxx: &str, tag: &str) -> Opti
     )
     .map(|o| o.status.success())
     .unwrap_or(false);
-    let produced = hdir.join("main_diff");
+    let produced = crate::auto::layout::harness_exe(hdir, "main_diff");
     if !ok || !produced.is_file() {
         return None;
     }
-    let tagged = hdir.join(format!("main_diff.{tag}"));
+    let tagged = hdir.join(format!("main_diff.{tag}{}", std::env::consts::EXE_SUFFIX));
     if std::fs::copy(&produced, &tagged).is_err() {
         return None;
     }
     Some(tagged)
+}
+
+/// A `--differential` compiler for the `DIFF_CC=`/`DIFF_CXX=` make argument,
+/// which heads the diff recipe as `$(DIFF_CC)`. A path to an installed compiler
+/// under a directory with spaces is double-quoted so the recipe shell keeps it
+/// one word. Anything else (a bare name, a multi-word command such as
+/// `ccache clang`) passes through as given.
+fn diff_compiler_word(compiler: &str) -> String {
+    if Path::new(compiler).is_file() && harness_gen::build_safety::is_compiler_token(compiler) {
+        harness_gen::build_safety::recipe_path(compiler)
+    } else {
+        compiler.to_owned()
+    }
 }
 
 struct Run {
@@ -299,6 +317,7 @@ fn write_finding(
     exit_b: i32,
     to_b: bool,
     input: &Path,
+    lineage: &corpus::lineage::FindingLineage,
 ) -> bool {
     // Preserve the reproducing input alongside the finding.
     if let Ok(bytes) = std::fs::read(input) {
@@ -336,6 +355,9 @@ fn write_finding(
         "analysis": { "engine": "bhf.dynamic.differential.replay" },
         "actionability": { "cwe": ["CWE-758"], "verdict": "likely_reachable", "confidence": "medium" },
     });
+    // The testcase is the queue entry both builds ran, so its lineage is that
+    // entry's.
+    crate::fuzz_lineage::insert(&mut record, lineage);
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     std::fs::write(
         dir.join("finding.json"),
@@ -353,6 +375,7 @@ fn describe(exit: i32, timed_out: bool) -> String {
         139 => "SIGSEGV".to_owned(),
         134 => "SIGABRT".to_owned(),
         132 => "SIGILL".to_owned(),
+        133 => "SIGTRAP".to_owned(),
         136 => "SIGFPE".to_owned(),
         c if c > 128 => format!("signal {}", c - 128),
         c => format!("exit {c}"),
@@ -381,6 +404,19 @@ mod tests {
     }
 
     #[test]
+    fn a_spaced_compiler_path_stays_one_recipe_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("my tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let compiler = tools.join("gcc");
+        std::fs::write(&compiler, b"").unwrap();
+        let compiler = compiler.display().to_string();
+        assert_eq!(diff_compiler_word(&compiler), format!("\"{compiler}\""));
+        assert_eq!(diff_compiler_word("clang"), "clang");
+        assert_eq!(diff_compiler_word("ccache clang"), "ccache clang");
+    }
+
+    #[test]
     fn parse_spec_rejects_malformed_and_identical() {
         assert!(parse_spec("clang").is_err());
         assert!(parse_spec("clang:").is_err());
@@ -406,5 +442,52 @@ mod tests {
         assert_eq!(describe(134, false), "SIGABRT");
         assert_eq!(describe(3, false), "exit 3");
         assert_eq!(describe(0, true), "hung (timeout)");
+    }
+
+    /// A divergence's testcase is the queue entry both builds were run on,
+    /// and its lineage is that entry's, from the record beside the queue.
+    #[test]
+    #[cfg(unix)]
+    fn a_divergence_carries_the_lineage_of_the_queue_entry_it_replayed() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let hdir = work.join("harnesses").join("H-C0001");
+        let queue = work.join("corpus").join("H-C0001").join("queue");
+        std::fs::create_dir_all(&hdir).unwrap();
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("child.bin"), b"CHILD").unwrap();
+        crate::fuzz_lineage::record_child_of_user_seed(
+            work,
+            "H-C0001",
+            b"SEED",
+            b"CHILD",
+            "/seeds/seed.bin",
+        );
+        std::fs::write(hdir.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        // The gcc side exits 3, the clang side 0: every input diverges.
+        std::fs::write(
+            hdir.join("Makefile"),
+            "diff:\n\
+             \tprintf '#!/bin/sh\\nexit %s\\n' \"$$( [ '$(DIFF_CC)' = gcc ] && echo 3 || echo 0 )\" > main_diff\n\
+             \tchmod +x main_diff\n",
+        )
+        .unwrap();
+
+        let spec = parse_spec("clang:gcc").unwrap();
+        assert_eq!(run_differential(work, &spec), 1);
+        let findings = corpus::layout::findings_dir(work);
+        let dir = std::fs::read_dir(&findings)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(dir.join("testcase.bin")).unwrap(), b"CHILD");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        let lineage = &record["lineage"];
+        assert_eq!(lineage["origin"], "user_seed", "{record}");
+        assert_eq!(lineage["root_path"], "/seeds/seed.bin");
+        assert_eq!(lineage["depth"], 1);
     }
 }

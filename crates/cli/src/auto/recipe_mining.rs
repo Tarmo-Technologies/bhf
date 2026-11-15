@@ -2594,6 +2594,47 @@ const NON_SEED_EXTENSIONS: &[&str] = &[
     "am", "ac", "in", "sh", "bat", "mk", "o", "a", "so", "exe",
 ];
 
+/// Build outputs and IDE/project files. None of them is an input a target
+/// parses; they are what a build or an IDE left next to the test data (Visual
+/// Studio keeps project files, symbol files and import libraries right there).
+/// A project whose target really parses one of these formats passes them
+/// explicitly with `--seed-dir`.
+const BUILD_ARTIFACT_EXTENSIONS: &[&str] = &[
+    // MSBuild / Visual Studio project, solution and per-user state files.
+    "vcxproj",
+    "vcproj",
+    "filters",
+    "user",
+    "sln",
+    "suo",
+    "props",
+    "targets",
+    "csproj",
+    "vbproj",
+    "fsproj",
+    "sdf",
+    "opensdf",
+    "ncb",
+    "aps",
+    // Objects, libraries, debug symbols and linker/compiler byproducts.
+    "obj",
+    "lib",
+    "dll",
+    "pdb",
+    "ilk",
+    "exp",
+    "idb",
+    "pch",
+    "ipch",
+    "tlog",
+    "lastbuildstate",
+    "dylib",
+    "lo",
+    "la",
+    "gcno",
+    "gcda",
+];
+
 /// Largest seed to lift out of a tree, and how many. A seed corpus is a
 /// nice-to-have; it must never turn discovery into a whole-repository copy.
 const MAX_SEED_BYTES: u64 = 256 * 1024;
@@ -2708,8 +2749,9 @@ fn is_seed_candidate(path: &Path) -> bool {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     // An extensionless file in a data directory is usually a fixture; a known
-    // SOURCE extension never is.
+    // SOURCE extension, or a build/IDE artifact, never is.
     !NON_SEED_EXTENSIONS.contains(&extension.as_str())
+        && !BUILD_ARTIFACT_EXTENSIONS.contains(&extension.as_str())
 }
 
 #[cfg(test)]
@@ -3471,6 +3513,46 @@ mod tests {
         assert!(!names.contains(&"helper.c".to_owned()), "{names:?}");
         assert!(!names.contains(&"README.md".to_owned()), "{names:?}");
         assert!(!names.contains(&"lib.c".to_owned()), "{names:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_and_ide_artifacts_are_not_mined_as_seeds() {
+        // Windows build trees keep project files and build outputs right next to
+        // the test data. None of them is an input the target parses.
+        let root = std::env::temp_dir().join(format!("bhf-seedide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("tests/data");
+        std::fs::create_dir_all(&data).unwrap();
+        let artifacts = [
+            "Widget.vcxproj",
+            "Widget.vcxproj.filters",
+            "Widget.vcxproj.user",
+            "Widget.sln",
+            "Widget.suo",
+            "Widget.pdb",
+            "Widget.dll",
+            "Widget.lib",
+            "Widget.obj",
+            "Widget.ilk",
+            "Widget.exp",
+            "Widget.idb",
+            "Widget.pch",
+            "Widget.csproj",
+            "Directory.Build.props",
+            "Widget.targets",
+        ];
+        for name in artifacts {
+            std::fs::write(data.join(name), b"\x4d\x5a\x90\x00 artifact").unwrap();
+        }
+        std::fs::write(data.join("record.bin"), b"\x01\x02\xff").unwrap();
+
+        let names: Vec<String> = mine_seed_corpus(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["record.bin".to_owned()], "{names:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use corpus::{classify, compute_signature, resolve_handler, Signature};
+use crate::raised::{closest_to, raised_exceptions, RaisedException};
+use corpus::{classify, compute_signature, resolve_handler, Signature, SourceLineMaps};
 use event_log::{group_into_testcases, EventReader};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long one harness run may take before it is killed, with every process
+/// it started.
+pub const HARNESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn replay(finding_dir: &Path, harness_path: &Path) -> Result<ReplayResult, ReplayError> {
     let runner = HarnessRunner::direct(harness_path);
@@ -20,20 +24,78 @@ pub fn replay_with_runner(
     finding_dir: &Path,
     runner: &HarnessRunner,
 ) -> Result<ReplayResult, ReplayError> {
-    let ReplayInput { recorded, input } = load_finding(finding_dir)?;
-    let computed = signatures_for_input_with_runner(runner, &input)?;
+    replay_report_with_runner(finding_dir, runner, &SourceLineMaps::default())
+        .map(|report| report.result)
+}
 
-    if computed.contains(&recorded) {
-        Ok(ReplayResult::Match)
-    } else {
-        let actual = computed.first().copied();
-        Ok(ReplayResult::Mismatch { recorded, actual })
+/// A replay's verdict with what it compared: the exception the finding
+/// records and every exception the replayed testcase raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayReport {
+    pub result: ReplayResult,
+    /// The signature the finding records.
+    pub recorded_signature: Signature,
+    /// What the finding records it raised; `None` for a finding.json that
+    /// holds only a signature.
+    pub recorded: Option<RaisedException>,
+    /// What the replayed testcase raised, in event-log order: the signatures
+    /// the verdict compared.
+    pub replayed: Vec<RaisedException>,
+}
+
+impl ReplayReport {
+    /// The replayed exception the verdict rests on: the one with the recorded
+    /// signature on a match; otherwise the one closest to the recorded
+    /// exception ([`closest_to`]), whose signature is the `actual` one.
+    pub fn deciding(&self) -> Option<&RaisedException> {
+        match &self.result {
+            ReplayResult::Match => self
+                .replayed
+                .iter()
+                .find(|raised| raised.signature == self.recorded_signature),
+            ReplayResult::Mismatch { .. } => closest_to(self.recorded.as_ref(), &self.replayed),
+        }
     }
+}
+
+/// Replay a finding and describe what both runs raised. `line_maps` maps the
+/// instrumented lines in the replayed messages back to the source, as the
+/// finding's messages were when it was recorded.
+pub fn replay_report_with_runner(
+    finding_dir: &Path,
+    runner: &HarnessRunner,
+    line_maps: &SourceLineMaps,
+) -> Result<ReplayReport, ReplayError> {
+    let ReplayInput {
+        recorded,
+        input,
+        finding,
+    } = load_finding(finding_dir)?;
+    let testcases = testcases_for_input_with_runner(runner, &input)?;
+    let replayed = raised_exceptions(&testcases, line_maps);
+    let mut described = RaisedException::from_finding(&finding);
+    // A description whose signature is not the recorded one describes
+    // something else.
+    described.take_if(|raised| raised.signature != recorded);
+    let result = if replayed.iter().any(|raised| raised.signature == recorded) {
+        ReplayResult::Match
+    } else {
+        let actual = closest_to(described.as_ref(), &replayed).map(|raised| raised.signature);
+        ReplayResult::Mismatch { recorded, actual }
+    };
+    Ok(ReplayReport {
+        result,
+        recorded_signature: recorded,
+        recorded: described,
+        replayed,
+    })
 }
 
 pub(crate) struct ReplayInput {
     pub recorded: Signature,
     pub input: Vec<u8>,
+    /// The finding.json it was read from.
+    pub finding: Value,
 }
 
 pub(crate) fn load_finding(finding_dir: &Path) -> Result<ReplayInput, ReplayError> {
@@ -48,15 +110,36 @@ pub(crate) fn load_finding(finding_dir: &Path) -> Result<ReplayInput, ReplayErro
         });
     }
 
-    let finding: Value = serde_json::from_slice(&fs::read(&finding_path)?)?;
-    let recorded = finding
-        .get("signature")
-        .cloned()
-        .ok_or(ReplayError::MissingFinding { path: finding_path })?;
-    let recorded: Signature = serde_json::from_value(recorded)?;
-    let input = fs::read(&testcase_path)?;
+    let bytes = fs::read(&finding_path).map_err(|source| ReplayError::IoAt {
+        path: finding_path.clone(),
+        source,
+    })?;
+    let finding: Value = serde_json::from_slice(&bytes).map_err(|source| ReplayError::JsonAt {
+        path: finding_path.clone(),
+        source,
+    })?;
+    let recorded =
+        finding
+            .get("signature")
+            .cloned()
+            .ok_or_else(|| ReplayError::MissingFinding {
+                path: finding_path.clone(),
+            })?;
+    let recorded: Signature =
+        serde_json::from_value(recorded).map_err(|source| ReplayError::JsonAt {
+            path: finding_path,
+            source,
+        })?;
+    let input = fs::read(&testcase_path).map_err(|source| ReplayError::IoAt {
+        path: testcase_path,
+        source,
+    })?;
 
-    Ok(ReplayInput { recorded, input })
+    Ok(ReplayInput {
+        recorded,
+        input,
+        finding,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +156,8 @@ pub struct HarnessRunner {
     /// runtrace log the harness writes from inside the sandbox). No effect when
     /// the sandbox is `None`.
     extra_rw_binds: Vec<PathBuf>,
+    /// How long one run of the harness may take ([`HARNESS_TIMEOUT`]).
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +196,7 @@ impl HarnessRunner {
             sandbox: SandboxConfig::none(),
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
+            timeout: HARNESS_TIMEOUT,
         }
     }
 
@@ -128,6 +214,7 @@ impl HarnessRunner {
             sandbox: SandboxConfig::none(),
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
+            timeout: HARNESS_TIMEOUT,
         }
     }
 
@@ -147,6 +234,13 @@ impl HarnessRunner {
     /// of a runtrace log the harness writes). Ignored when not sandboxed.
     pub fn with_rw_binds(mut self, binds: impl IntoIterator<Item = PathBuf>) -> Self {
         self.extra_rw_binds.extend(binds);
+        self
+    }
+
+    /// Kill a harness run, with every process it started, after `timeout`
+    /// instead of [`HARNESS_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -196,7 +290,7 @@ impl HarnessRunner {
     pub fn command_wrapped(&self, io_file: &Path) -> Result<Command, ReplayError> {
         let sandbox = self.sandbox.resolve()?;
         if let Some(qemu_user) = &self.qemu_user {
-            Ok(wrap_command(
+            let mut command = wrap_command(
                 sandbox,
                 &qemu_user.program,
                 qemu_user.args.iter().map(String::as_str),
@@ -204,7 +298,11 @@ impl HarnessRunner {
                 io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
-            ))
+            );
+            // A crash under the emulator must not make it dump its own
+            // address space.
+            crate::process::disable_core_dumps(&mut command);
+            Ok(command)
         } else {
             Ok(wrap_command(
                 sandbox,
@@ -640,6 +738,15 @@ pub(crate) fn signatures_for_input_with_runner(
     runner: &HarnessRunner,
     input: &[u8],
 ) -> Result<Vec<Signature>, ReplayError> {
+    testcases_for_input_with_runner(runner, input).map(|testcases| computed_signatures(&testcases))
+}
+
+/// Run the harness on `input` and read back the testcases its event log
+/// reports.
+fn testcases_for_input_with_runner(
+    runner: &HarnessRunner,
+    input: &[u8],
+) -> Result<Vec<event_log::Testcase>, ReplayError> {
     let events_path = TempEventFile::new();
     let mut command = runner.command_for_events(events_path.path())?;
     command
@@ -647,51 +754,83 @@ pub(crate) fn signatures_for_input_with_runner(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // Its own process group, so the timeout below kills whatever it started.
+    crate::process::isolate_process_group(&mut command);
+    let harness = runner.executable_path().to_path_buf();
     let mut child =
         spawn_harness(&mut command).map_err(|source| ReplayError::HarnessFailedToStart {
-            path: runner.executable_path().to_path_buf(),
+            path: harness.clone(),
             source,
         })?;
+    // An interrupted bhf kills what the harness started, too.
+    let mut group = crate::process::guard_process_group(&child);
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| crate::process::drain(pipe, MAX_HARNESS_STDERR));
 
-    {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            ReplayError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "child stdin not piped",
-            ))
-        })?;
-        // A harness that exits before consuming the whole input closes the pipe,
-        // so write_all/flush return BrokenPipe — not an error here (the process
-        // ran; its exit + stderr are evaluated below). Only a genuine I/O error
-        // propagates.
-        for r in [stdin.write_all(input), stdin.flush()] {
-            if let Err(error) = r {
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(ReplayError::Io(error));
-                }
-            }
-        }
-        drop(stdin);
+    // The input is written on a thread so the timeout runs while it is: a
+    // harness that never reads an input larger than the pipe buffer would
+    // block the write. A harness that exits before reading it all is not an
+    // error (its exit and stderr are evaluated below); only a genuine I/O
+    // error is.
+    let writer = crate::process::feed_stdin(&mut child, input.to_vec());
+
+    // The wait kills whatever the harness left running, before the harness
+    // is reaped.
+    let (status, timed_out) =
+        group
+            .wait_then_kill(&mut child, runner.timeout)
+            .map_err(|source| ReplayError::IoAt {
+                path: harness.clone(),
+                source,
+            })?;
+    let written =
+        writer.and_then(|handle| crate::process::join_bounded(handle, crate::process::DRAIN_GRACE));
+    let stderr = stderr
+        .and_then(|handle| crate::process::join_bounded(handle, crate::process::DRAIN_GRACE))
+        .unwrap_or_default();
+    if timed_out {
+        return Err(ReplayError::HarnessTimedOut {
+            path: harness,
+            timeout: runner.timeout,
+        });
     }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    if let Some(Err(source)) = written {
+        return Err(ReplayError::IoAt {
+            path: harness,
+            source,
+        });
+    }
+    if !status.is_some_and(|status| status.success()) {
         return Err(ReplayError::HarnessNonZeroExit {
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: status.and_then(|status| status.code()),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         });
     }
 
-    let event_bytes = fs::read(events_path.path())?;
-    let testcases = group_into_testcases(EventReader::new(event_bytes.as_slice()))?;
-    Ok(computed_signatures(&testcases))
+    let event_bytes = fs::read(events_path.path()).map_err(|source| ReplayError::IoAt {
+        path: events_path.path().to_path_buf(),
+        source,
+    })?;
+    group_into_testcases(EventReader::new(event_bytes.as_slice())).map_err(|source| {
+        ReplayError::EventLogAt {
+            path: events_path.path().to_path_buf(),
+            source,
+        }
+    })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Most bytes of a harness's stderr kept for an error message.
+const MAX_HARNESS_STDERR: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayResult {
     Match,
     Mismatch {
         recorded: Signature,
+        /// The signature of the replayed exception closest to the recorded
+        /// one ([`closest_to`]); `None` when the replay raised none.
         actual: Option<Signature>,
     },
 }
@@ -700,10 +839,36 @@ pub enum ReplayResult {
 pub enum ReplayError {
     #[error("I/O error during replay")]
     Io(#[from] std::io::Error),
+    /// An I/O error on a file the replay reads or writes, or on the harness
+    /// it runs, naming that path.
+    #[error("I/O error during replay on {}: {source}", path.display())]
+    IoAt {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("JSON error during replay")]
     Json(#[from] serde_json::Error),
+    #[error("JSON error during replay in {}: {source}", path.display())]
+    JsonAt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("event log read error during replay")]
     EventLog(#[from] event_log::EventReadError),
+    #[error("event log read error during replay in {}: {source}", path.display())]
+    EventLogAt {
+        path: PathBuf,
+        #[source]
+        source: event_log::EventReadError,
+    },
+    #[error(
+        "harness {} did not finish within {:.1}s and was killed with every process it started",
+        path.display(),
+        timeout.as_secs_f64()
+    )]
+    HarnessTimedOut { path: PathBuf, timeout: Duration },
     #[error("missing finding.json at {}", path.display())]
     MissingFinding { path: PathBuf },
     #[error("missing testcase.bin at {}", path.display())]
@@ -994,6 +1159,8 @@ mod tests {
         ));
     }
 
+    // bubblewrap is Linux's: the sandbox probe runs the host's `true` inside.
+    #[cfg(unix)]
     #[test]
     fn bubblewrap_drops_unshare_net_when_netns_denied() {
         // Regression: when only the network namespace is denied (loopback
@@ -1358,6 +1525,85 @@ fn main() -> std::io::Result<()> {
         let dir = std::env::temp_dir().join(format!("bhf-replay-unit-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("harness.sh");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// An error reading a file names that file: an unparsable finding.json,
+    /// and the event log a harness that exited without writing it left.
+    #[cfg(unix)]
+    #[test]
+    fn replay_errors_name_the_file_they_failed_on() {
+        let dir = temp_dir("io-at");
+        let finding = dir.join("finding");
+        fs::create_dir_all(&finding).unwrap();
+        fs::write(finding.join("finding.json"), b"{not json").unwrap();
+        fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let harness = script(&dir, "cat >/dev/null\nexit 0");
+        let error = replay(&finding, &harness).unwrap_err().to_string();
+        assert!(
+            error.contains(&finding.join("finding.json").display().to_string()),
+            "{error}"
+        );
+
+        let _guard = replay_event_file_lock();
+        let error = signatures_for_input(&harness, b"x").unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, ReplayError::IoAt { .. }), "{error:?}");
+        assert!(text.contains("bhf-replay-events-"), "{text}");
+        assert!(text.contains(".bin"), "{text}");
+    }
+
+    /// A harness that does not finish is killed after the runner's timeout,
+    /// with every process it started.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_run_is_killed_after_the_timeout() {
+        let dir = temp_dir("timeout");
+        let harness = script(&dir, "sleep 30 & sleep 30");
+        let runner =
+            HarnessRunner::direct(&harness).with_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let error = signatures_for_input_with_runner(&runner, b"x").unwrap_err();
+        assert!(
+            matches!(error, ReplayError::HarnessTimedOut { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(&harness.display().to_string()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A harness that never reads its input is still killed after the
+    /// timeout when the input is larger than the pipe buffer.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_that_ignores_a_large_input_is_killed_after_the_timeout() {
+        let dir = temp_dir("timeout-large-input");
+        let harness = script(&dir, "exec sleep 30");
+        let runner =
+            HarnessRunner::direct(&harness).with_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let error = signatures_for_input_with_runner(&runner, &vec![0u8; 1 << 20]).unwrap_err();
+        assert!(
+            matches!(error, ReplayError::HarnessTimedOut { .. }),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     fn handler_testcase() -> Testcase {

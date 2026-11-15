@@ -18,15 +18,9 @@ fn fixture() -> PathBuf {
         .expect("canonicalize rust_discovery fixture")
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    // The integration-test binary lives in target/<profile>/deps; the CLI binary
-    // is two levels up at target/<profile>/bhf.
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 #[test]
@@ -135,6 +129,11 @@ fn has_cargo_nightly() -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
     let bin = bhf_bin();
     if !bin.exists() {

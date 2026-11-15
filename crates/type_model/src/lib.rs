@@ -462,6 +462,13 @@ impl TypeRegistry {
         self.resolve_inner(raw, 0, &mut memo)
     }
 
+    /// The aliased type of typedef `name` as it was recorded, qualifiers
+    /// included (`const octet_t *` for `typedef const octet_t *rbuf_t` when
+    /// the definitions kept them), one hop, no lookup through scopes.
+    pub fn typedef_text(&self, name: &str) -> Option<&str> {
+        self.typedefs.get(name.trim()).map(String::as_str)
+    }
+
     /// Return the raw pointee spelling for direct pointers or typedefs to
     /// pointers. Used by codegen to allocate stack storage for pointer aliases
     /// such as `typedef mz_stream *mz_streamp`.
@@ -809,6 +816,46 @@ impl TypeRegistry {
     }
 }
 
+/// Win32 pointer typedefs to bytes or characters (windef.h/winnt.h), with the
+/// C spelling each stands for. Like the Win32 integer spellings in
+/// [`SCALAR_SPELLINGS`] they are known without a definition in the scanned
+/// tree: a parameter spelled `LPCBYTE` is a read-only byte buffer, `LPBYTE` a
+/// mutable one. One table, so every lane that reads parameter types agrees on
+/// them. Handle types (`HANDLE`, `LPVOID`, ...) are deliberately absent.
+pub const BYTE_POINTER_TYPEDEFS: &[(&str, &str)] = &[
+    ("LPCBYTE", "const unsigned char *"),
+    ("PCBYTE", "const unsigned char *"),
+    ("PCUCHAR", "const unsigned char *"),
+    ("LPBYTE", "unsigned char *"),
+    ("PBYTE", "unsigned char *"),
+    ("PUCHAR", "unsigned char *"),
+    ("LPCSTR", "const char *"),
+    ("PCSTR", "const char *"),
+];
+
+/// The C spelling of a Win32 byte or character pointer typedef
+/// ([`BYTE_POINTER_TYPEDEFS`]), e.g. `const unsigned char *` for `LPCBYTE`.
+pub fn byte_pointer_typedef_spelling(name: &str) -> Option<&'static str> {
+    BYTE_POINTER_TYPEDEFS
+        .iter()
+        .find(|(typedef, _)| *typedef == name.trim())
+        .map(|(_, spelling)| *spelling)
+}
+
+/// Whether `spelling` (surrounding whitespace ignored) is one of the byte
+/// pointer typedefs of [`BYTE_POINTER_TYPEDEFS`]: `Some(true)` for a pointer
+/// to `const` bytes (`LPCBYTE`), `Some(false)` for a writable one (`PBYTE`),
+/// `None` for any other spelling, the character ones (`LPCSTR`) included:
+/// those are C strings. The harness decoders read these as byte buffers from
+/// the same table the target ranking does.
+pub fn win32_byte_pointer_typedef(spelling: &str) -> Option<bool> {
+    match byte_pointer_typedef_spelling(spelling)? {
+        "const unsigned char *" => Some(true),
+        "unsigned char *" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn scalar_kind(normalized: &str) -> Option<ScalarKind> {
     SCALAR_SPELLINGS
         .iter()
@@ -975,6 +1022,37 @@ fn split_array(normalized: &str) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win32_byte_pointer_typedefs_carry_their_constness() {
+        for name in ["LPCBYTE", "PCBYTE", "PCUCHAR", " LPCBYTE "] {
+            assert_eq!(win32_byte_pointer_typedef(name), Some(true), "{name:?}");
+        }
+        for name in ["PBYTE", "LPBYTE", "PUCHAR"] {
+            assert_eq!(win32_byte_pointer_typedef(name), Some(false), "{name:?}");
+        }
+        for name in ["BYTE", "LPCSTR", "LPVOID", "lpcbyte"] {
+            assert_eq!(win32_byte_pointer_typedef(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn byte_pointer_typedefs_have_one_spelling_each() {
+        assert_eq!(
+            byte_pointer_typedef_spelling("LPCBYTE"),
+            Some("const unsigned char *")
+        );
+        assert_eq!(
+            byte_pointer_typedef_spelling("PBYTE"),
+            Some("unsigned char *")
+        );
+        assert_eq!(byte_pointer_typedef_spelling("PCSTR"), Some("const char *"));
+        assert_eq!(byte_pointer_typedef_spelling("HANDLE"), None);
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, _) in BYTE_POINTER_TYPEDEFS {
+            assert!(seen.insert(*name), "{name} listed twice");
+        }
+    }
 
     #[test]
     fn cxx_character_types_resolve_to_integer_scalars() {

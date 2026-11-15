@@ -10,7 +10,12 @@ fn docs_cli_flow_uses_current_command_flags() {
     assert!(docs.contains("bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented"));
     assert!(docs.contains("bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --output bhf_work/generated_harnesses"));
     assert!(docs.contains("bhf report --findings findings --out reports"));
-    assert!(!docs.contains("--output bhf_work/harnesses"));
+    // Manual C/C++ harnesses go where `bhf auto` puts its own, so every triage
+    // command finds them; the Ada example above keeps generated_harnesses.
+    assert!(docs.contains(
+        "bhf generate-harness src/parser.cpp --target Parser::parse --output bhf_work/harnesses"
+    ));
+    assert!(!docs.contains("src/parser.cpp --target parse --output bhf_work/generated_harnesses"));
     assert!(!docs.contains("generate-harness path/to/project --target Pkg.Parse --out"));
     assert!(!docs.contains("instrument bhf_work --out"));
     assert!(!docs.contains("report findings --format markdown"));

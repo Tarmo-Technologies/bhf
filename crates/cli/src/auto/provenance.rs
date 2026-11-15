@@ -113,6 +113,15 @@ fn provenance_one(
     if !hdir.join("Makefile").is_file() {
         return stats;
     }
+    // A harness built for another platform runs under its recorded runner: a
+    // `make prov` here would build a foreign `main_prov` that cannot run, with
+    // the host's default flags, and rewrite the toolchain stamp of its `main`.
+    // (A harness the gcc retry built is rebuilt here with the Makefile's
+    // defaults; passing that attempt's compiler override to `make prov` is a
+    // separate follow-up.)
+    if crate::gate_evidence::recorded_runner(&hdir.join("main")).is_some() {
+        return stats;
+    }
     // Only the C lane's weak-stub file is handled today (C++ stub poisoning is a
     // follow-up). No stub file -> nothing was fabricated -> nothing to attribute.
     let stub_src = hdir.join("repairs").join("auto_stubs.c");
@@ -137,8 +146,8 @@ fn provenance_one(
     if !build_prov(hdir, &prov_src) {
         return stats; // couldn't reconstruct the build -> stay honest, skip.
     }
-    let prov_bin = hdir.join("main_prov");
-    let real_bin = hdir.join("main");
+    let prov_bin = crate::auto::layout::harness_exe(hdir, "main_prov");
+    let real_bin = crate::auto::layout::harness_exe(hdir, "main");
     if !prov_bin.is_file() || !real_bin.is_file() {
         return stats;
     }
@@ -175,7 +184,7 @@ fn classify(prov_bin: &Path, input: &Path, poisoned_names: &[String]) -> Provena
         input.file_name().and_then(|n| n.to_str()).unwrap_or("x")
     ));
     let _ = std::fs::remove_file(&trace);
-    let Ok(out) = crate::command_output::output_with_timeout(
+    let Ok((out, cut_off)) = crate::command_output::bounded_replay_output(
         replay_command(prov_bin)
             .arg(input)
             .env("BHF_STUB_TRACE", &trace)
@@ -190,8 +199,12 @@ fn classify(prov_bin: &Path, input: &Path, poisoned_names: &[String]) -> Provena
     };
     let fired = read_fired_stubs(&trace, poisoned_names);
     let _ = std::fs::remove_file(&trace);
-    if !fired.is_empty() || out.status.code() == Some(STUB_FIRED_EXIT) {
+    if !fired.is_empty() || (!cut_off && out.status.code() == Some(STUB_FIRED_EXIT)) {
         return Provenance::StubArtifact(fired);
+    }
+    // A run killed at its bound died of the kill, not of a sanitizer report.
+    if cut_off {
+        return Provenance::Inconclusive;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if is_sanitizer_crash(&stderr, &out.status) {
@@ -239,28 +252,24 @@ fn is_sanitizer_crash(stderr: &str, status: &std::process::ExitStatus) -> bool {
 
 /// Does the real ASan build crash on this input in a fresh process?
 fn reproduces_crash(bin: &Path, input: &Path) -> bool {
-    let Ok(out) = crate::command_output::output_with_timeout(
+    let Ok((out, false)) = crate::command_output::bounded_replay_output(
         replay_command(bin)
             .arg(input)
             .env("ASAN_OPTIONS", "abort_on_error=1:symbolize=0"),
         std::time::Duration::from_secs(15),
     ) else {
+        // Not run, or killed at its bound: a kill is no reproduced crash.
         return false;
     };
     let stderr = String::from_utf8_lossy(&out.stderr);
     is_sanitizer_crash(&stderr, &out.status)
 }
 
-/// Build a replay command wrapped in `timeout` when available so a pathological
-/// input can never wedge the provenance pass.
+/// Build a replay command killed after 10 s
+/// ([`crate::command_output::killed_after`]) so a pathological input can never
+/// wedge the provenance pass.
 fn replay_command(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        cmd
-    } else {
-        Command::new(bin)
-    }
+    crate::command_output::killed_after(bin, 10)
 }
 
 /// Build the `main_prov` provenance variant: `make prov` with the poisoned stub as
@@ -270,6 +279,13 @@ fn build_prov(hdir: &Path, prov_src: &Path) -> bool {
     // Match the auto build's default C/C++ compiler when the caller's env doesn't
     // already pin one (the generated Makefile's CC default is plain `clang`, which
     // is correct here — the ASan flags are baked into CFLAGS).
+    // The recipe expands `$(AUTO_PROV_SOURCES)` through the shell, so a work
+    // dir with spaces must arrive quoted.
+    let Ok(prov_src) =
+        harness_gen::build_safety::checked_recipe_path("provenance stub source", prov_src)
+    else {
+        return false;
+    };
     let mut cmd = Command::new("make");
     cmd.arg("prov").current_dir(hdir);
     cmd.env("AUTO_PROV_SOURCES", prov_src);
@@ -483,6 +499,44 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
     return 0;
 }
 ";
+
+    /// A harness built for another platform (it has a recorded runner) is not
+    /// rebuilt for provenance: its `main_prov` would be a foreign build that
+    /// cannot run here, and `make prov` would rewrite the toolchain stamp of
+    /// its `main` with the host defaults.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_with_a_recorded_runner_is_not_rebuilt_for_provenance() {
+        let work = tempfile::tempdir().unwrap();
+        let hdir = work.path().join("harnesses/H-X");
+        std::fs::create_dir_all(hdir.join("repairs")).unwrap();
+        std::fs::write(hdir.join("Makefile"), "prov:\n\ttouch prov-ran\n").unwrap();
+        std::fs::write(hdir.join("repairs/auto_stubs.c"), STUBS).unwrap();
+        let finding = corpus::layout::findings_dir(work.path()).join("F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            r#"{"classification":"unhandled","harness_id":"H-X"}"#,
+        )
+        .unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+
+        // Without a runner the provenance build runs (the fixture is real).
+        provenance_one(work.path(), &hdir, "H-X", RunMode::Reporting);
+        assert!(hdir.join("prov-ran").is_file());
+        std::fs::remove_file(hdir.join("prov-ran")).unwrap();
+
+        let runner = crate::gate_evidence::HarnessRunner {
+            program: std::path::PathBuf::from("qemu-aarch64"),
+            args: Vec::new(),
+        };
+        crate::gate_evidence::record_runner(&hdir, Some(&runner)).unwrap();
+        provenance_one(work.path(), &hdir, "H-X", RunMode::Reporting);
+        assert!(
+            !hdir.join("prov-ran").exists(),
+            "a foreign harness must not be rebuilt"
+        );
+    }
 
     #[test]
     fn parses_weak_stub_openings() {

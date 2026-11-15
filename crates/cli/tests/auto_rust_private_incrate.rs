@@ -23,13 +23,9 @@ fn fixture(name: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("canonicalize fixture {name}: {e}"))
 }
 
+/// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test exe path");
-    dir.pop(); // deps/
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    dir.join("bhf")
+    PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn has_cargo_nightly() -> bool {
@@ -135,6 +131,11 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
 fn private_path_opener_builds_fuzzes_and_finds_planted_crash_in_crate() {
     let bin = bhf_bin();
     if !bin.exists() {

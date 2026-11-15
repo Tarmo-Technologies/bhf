@@ -26,9 +26,12 @@ fn tempdir(prefix: &str) -> PathBuf {
 fn corpus_import_afl_dir_writes_bhf_dir() {
     let src = tempdir("import-afl-src");
     let dst = tempdir("import-afl-dst");
-    fs::write(src.join("id:000000,orig:a"), b"hello").unwrap();
-    fs::write(src.join("id:000001,orig:b"), b"world").unwrap();
-    fs::write(src.join("id:000002,orig:c"), b"hello").unwrap(); // duplicate
+    // AFL's queue names, in the spelling the host can store (Windows allows
+    // no `:` in a file name).
+    let sep = if cfg!(windows) { '_' } else { ':' };
+    fs::write(src.join(format!("id{sep}000000,orig{sep}a")), b"hello").unwrap();
+    fs::write(src.join(format!("id{sep}000001,orig{sep}b")), b"world").unwrap();
+    fs::write(src.join(format!("id{sep}000002,orig{sep}c")), b"hello").unwrap(); // duplicate
 
     let out = Command::new(bhf_bin())
         .args([
