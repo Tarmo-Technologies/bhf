@@ -9,12 +9,18 @@ use std::path::{Path, PathBuf};
 
 use crate::probe_backend::{materialize_runtime_sources, ProbeBackend};
 
-/// Explicit C/C++ compiler + flag override for the harness `make` invocation.
-/// `bhf auto` passes this ONLY for a foreign-platform/arch candidate it is
-/// cross-compiling (see `auto::cross_target`); host-native builds pass `None`
-/// and keep the existing clang defaults. `cflags`/`cxxflags`, when non-empty,
-/// replace the Makefile's `CFLAGS ?=`/`CXXFLAGS ?=` defaults — the cross GCCs
-/// reject the clang `-fsanitize-coverage=trace-pc-guard` baked into them.
+/// The harness Makefile variables holding bhf's own flags for the `main`
+/// build (optimization, debug info, sanitizers, coverage). The operator's
+/// `CFLAGS`/`CXXFLAGS` are appended after them.
+pub(crate) const MAKE_BHF_CFLAGS: &str = "BHF_CFLAGS";
+/// The C++ counterpart of [`MAKE_BHF_CFLAGS`].
+pub(crate) const MAKE_BHF_CXXFLAGS: &str = "BHF_CXXFLAGS";
+
+/// Explicit C/C++ compiler + flag override for the harness `make` invocation:
+/// a cross build, the gcc retry, or an `auto --sanitizers` selection.
+/// `cflags`/`cxxflags`, when non-empty, replace the Makefile's own
+/// `BHF_CFLAGS ?=`/`BHF_CXXFLAGS ?=` defaults; an operator's
+/// `CFLAGS`/`CXXFLAGS` are still appended after them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CFamilyCompilerOverride {
     pub cc: String,
@@ -26,6 +32,14 @@ pub struct CFamilyCompilerOverride {
     /// rendered for a recipe; they replace the `[toolchain]`'s published
     /// `BHF_TOOLCHAIN_TARGET_FLAGS`. `None` keeps those.
     pub target_flags: Option<Vec<String>>,
+    /// Whether an operator's `CFLAGS` from the environment follows `cflags`.
+    /// Those flags are written for the operator's compiler (or the host's),
+    /// so a build with a C compiler bhf picked in its place leaves them out:
+    /// a platform guard's cross lane, or clang after the operator's compiler
+    /// could not run the `--sanitizers` runtime.
+    pub ambient_cflags: bool,
+    /// [`Self::ambient_cflags`] for `CXXFLAGS` and the C++ compiler.
+    pub ambient_cxxflags: bool,
 }
 
 /// Activate a coverage-capable Clang from the RHEL 7 LLVM Software Collection
@@ -2608,17 +2622,29 @@ fn apply_c_family_make_env(
         // matrix): force its CC/CXX (and replacement flags), overriding both the
         // Makefile defaults and the ambient CC/CXX. `$(CC)`/`$(CXX)` head each
         // recipe line, so a toolchain installed under a spaced directory is
-        // double-quoted to stay one word.
+        // double-quoted to stay one word. The flags replace bhf's own
+        // (BHF_CFLAGS/BHF_CXXFLAGS); an ambient CFLAGS/CXXFLAGS still follows
+        // them, unless the override's compiler is not the one they were
+        // written for.
         cmd.env("CC", compiler_recipe_word(&compiler.cc));
         cmd.env("CXX", compiler_recipe_word(&compiler.cxx));
         if !compiler.cflags.is_empty() {
-            cmd.env("CFLAGS", compiler.cflags.join(" "));
+            cmd.env(MAKE_BHF_CFLAGS, compiler.cflags.join(" "));
         }
         if !compiler.cxxflags.is_empty() {
-            cmd.env("CXXFLAGS", compiler.cxxflags.join(" "));
+            cmd.env(MAKE_BHF_CXXFLAGS, compiler.cxxflags.join(" "));
         }
-        // CFLAGS/CXXFLAGS miss bhf's driver object, whose rule takes the
-        // target flags: a sysroot an SDK compiler needs goes there.
+        // An empty value, not an unset one, so the Makefile's own empty
+        // `CFLAGS ?=` default stays and nothing from the environment
+        // reaches a compiler it was not written for.
+        if !compiler.ambient_cflags {
+            cmd.env("CFLAGS", "");
+        }
+        if !compiler.ambient_cxxflags {
+            cmd.env("CXXFLAGS", "");
+        }
+        // BHF_CFLAGS/BHF_CXXFLAGS miss bhf's driver object, whose rule takes
+        // the target flags: a sysroot an SDK compiler needs goes there.
         if let Some(flags) = &compiler.target_flags {
             cmd.env(crate::toolchain::ENV_TARGET_FLAGS, flags.join(" "));
         }
@@ -3825,6 +3851,8 @@ mod tests {
                 cflags: vec!["-O1".to_owned()],
                 cxxflags: vec!["-O1".to_owned()],
                 target_flags,
+                ambient_cflags: true,
+                ambient_cxxflags: true,
             };
             let mut command = std::process::Command::new("make");
             apply_c_family_make_env(&mut command, &[], &[], &[], Some(&compiler));
@@ -3845,6 +3873,40 @@ mod tests {
         // An empty set still replaces a host toolchain's sysroot.
         assert_eq!(staged(Some(Vec::new())).as_deref(), Some(""));
         assert_eq!(staged(None), None);
+    }
+
+    /// An override whose compiler is not the one the environment's
+    /// CFLAGS/CXXFLAGS were written for (a platform guard's cross lane)
+    /// hands make empty ones, so a host-only `-march=native` never reaches
+    /// it; any other override leaves them to the environment, after bhf's.
+    #[test]
+    fn an_override_for_a_compiler_bhf_picked_leaves_the_ambient_flags_out() {
+        let staged = |ambient_cflags: bool, ambient_cxxflags: bool| {
+            let compiler = CFamilyCompilerOverride {
+                cc: "widget-gcc".to_owned(),
+                cxx: "widget-g++".to_owned(),
+                cflags: vec!["-O1".to_owned()],
+                cxxflags: vec!["-O1".to_owned()],
+                target_flags: None,
+                ambient_cflags,
+                ambient_cxxflags,
+            };
+            let mut command = std::process::Command::new("make");
+            apply_c_family_make_env(&mut command, &[], &[], &[], Some(&compiler));
+            let value = |variable: &str| {
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(variable))
+                    .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+            };
+            (value("CFLAGS"), value("CXXFLAGS"))
+        };
+        assert_eq!(
+            staged(false, false),
+            (Some(Some(String::new())), Some(Some(String::new())))
+        );
+        assert_eq!(staged(true, false), (None, Some(Some(String::new()))));
+        assert_eq!(staged(true, true), (None, None));
     }
 
     #[test]

@@ -29,6 +29,30 @@
   shim's own comparisons (its checks of the paths, device names and
   environment variables a target uses, such as `/dev/i2c-`), in any pass mode
   and for sanitized and unsanitized harnesses alike.
+- A `CFLAGS`/`CXXFLAGS` in the environment (a dev shell or an SDK's setup
+  script) no longer replaces bhf's sanitizer and coverage flags, which built
+  the harness without ASan/UBSan and coverage and fuzzed it blind with no word
+  about why. The generated Makefiles keep bhf's flags in `BHF_CFLAGS`/
+  `BHF_CXXFLAGS` and append the operator's `CFLAGS`/`CXXFLAGS` after them in
+  every recipe that took them; `make BHF_CFLAGS=...` replaces bhf's flags.
+  They stay out of a build whose compiler bhf picked in place of the
+  operator's (a platform guard's cross lane, the `--sanitizers` clang
+  fallback), with a note, so a host-only flag such as `-march=native` no
+  longer fails a guarded aarch64 target.
+- `bhf auto --sanitizers` now runs the program its compiler probe links, with
+  `CC` and, for a C++ harness, with `CXX`, so an operator's compiler whose
+  sanitizer runtime links but cannot start on the host (GCC's ThreadSanitizer
+  under high-entropy ASLR) is no longer kept: clang (clang++ for a failing
+  `CXX`) builds the harnesses, and so does the build probe, and the note names
+  the variable, the compiler and the runtime's message. A run whose sanitizer
+  runtime could not start (`FATAL: ThreadSanitizer: unexpected memory
+  mapping`, an AddressSanitizer shadow mapping failure) is no longer a HIGH
+  "reachable crash" finding or a runtime error filed in the bug report: the
+  first pass that sees it ends the target with the new outcome
+  `sanitizer_runtime_unavailable` (additive in `run.json`, with
+  `summary.sanitizer_runtime_unavailable`), whose reason names the line and
+  the compiler; `--resume` tries such a target again, and the PR action counts
+  it as a result.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

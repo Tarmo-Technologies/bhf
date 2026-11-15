@@ -79,11 +79,13 @@ impl ProbeInstrumentation {
                 explicit: false,
             };
         }
+        // The harnesses leave a compiler whose sanitizer runtime links but
+        // cannot start here, so the project's archives leave it too.
         Self::for_selection_with(
             selection,
             &effective,
             crate::toolchain::compiler_family,
-            crate::auto::attempt::compiler_links_with_flags,
+            crate::auto::attempt::sanitizer_runtime_starts,
         )
     }
 
@@ -102,11 +104,16 @@ impl ProbeInstrumentation {
     /// `trace-pc` coverage flags, so its archives link into the GCC-built
     /// harnesses; when the chosen compilers cannot build an explicit sanitizer
     /// set, the harnesses fall back to clang, and so does the probe.
+    /// `starts_with(compiler, cpp, flags)` says whether a compiler (a C++ one
+    /// when `cpp`) builds a program with the flags whose runtime starts here.
+    /// When the operator's C++ compiler fails that check, the project's C++
+    /// units build with clang++, as the C++ harnesses do, and its C units stay
+    /// with CC.
     fn for_selection_with(
         selection: &multicore_fuzz::SanitizerSelection,
         effective: &crate::toolchain::EffectiveCompilers,
         family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
-        links_with: impl Fn(&str, &[String]) -> bool,
+        starts_with: impl Fn(&str, bool, &[String]) -> bool,
     ) -> Self {
         use harness_gen::compiler_family::CompilerFamily;
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
@@ -119,13 +126,17 @@ impl ProbeInstrumentation {
             .iter()
             .find(|flag| flag.starts_with("-fsanitize=") && !flag.starts_with("-fsanitize-"))
             .cloned();
+        let mut cxx = effective.cxx.clone();
         if let (SanitizerSelection::Set(_), Some(flag)) = (selection, &sanitize_flag) {
-            if !links_with(&effective.cc, std::slice::from_ref(flag)) {
+            if !starts_with(&effective.cc, false, std::slice::from_ref(flag)) {
                 return instrumentation;
+            }
+            if cxx != instrumentation.cxx && !starts_with(&cxx, true, std::slice::from_ref(flag)) {
+                cxx = instrumentation.cxx.clone();
             }
         }
         let family = family_of(&effective.cc, false).unwrap_or(CompilerFamily::Clang);
-        let cxx_family = family_of(&effective.cxx, true).unwrap_or(family);
+        let cxx_family = family_of(&cxx, true).unwrap_or(family);
         let has_ubsan = match selection {
             SanitizerSelection::Default => true,
             SanitizerSelection::None => false,
@@ -168,13 +179,12 @@ impl ProbeInstrumentation {
             flags
         };
         instrumentation.cc = effective.cc.clone();
-        instrumentation.cxx = effective.cxx.clone();
         instrumentation.c_flags = flags_for(family, false);
         let mut cxx_flags = flags_for(cxx_family, true);
         cxx_flags.extend(crate::build::detect_cpp_stdlib_include_flags_for(
-            &effective.cxx,
-            &cxx_flags,
+            &cxx, &cxx_flags,
         ));
+        instrumentation.cxx = cxx;
         instrumentation.cxx_flags = cxx_flags;
         if family == CompilerFamily::Gcc {
             // The clang-only libstdc++ search-path repair does not apply.
@@ -4142,7 +4152,7 @@ mod tests {
             &multicore_fuzz::SanitizerSelection::Default,
             &gcc,
             |_, _| Some(harness_gen::compiler_family::CompilerFamily::Gcc),
-            |_, _| true,
+            |_, _, _| true,
         );
         let root = tmpdir();
         for probe in [
@@ -4189,7 +4199,7 @@ mod tests {
             &SanitizerSelection::Default,
             &gcc,
             family,
-            |_, _| true,
+            |_, _, _| true,
         );
         assert_eq!(
             (probe.cc.as_str(), probe.cxx.as_str()),
@@ -4241,7 +4251,7 @@ mod tests {
             &SanitizerSelection::None,
             &gcc,
             family,
-            |_, _| true,
+            |_, _, _| true,
         );
         assert!(
             !plain.c_flags.iter().any(|f| f.contains("_FORTIFY_SOURCE")),
@@ -4253,7 +4263,7 @@ mod tests {
             &SanitizerSelection::Set(vec![Sanitizer::Msan]),
             &gcc,
             family,
-            |_, _| false,
+            |_, _, _| false,
         );
         assert_eq!(msan.cc, "clang");
         // bhf's own clang default keeps the historical contract.
@@ -4267,10 +4277,66 @@ mod tests {
                 &SanitizerSelection::None,
                 &default,
                 family,
-                |_, _| true
+                |_, _, _| true
             ),
             ProbeInstrumentation::clang_for_selection(&SanitizerSelection::None)
         );
+    }
+
+    /// The probe's C++ units follow the C++ harnesses: an operator's C++
+    /// compiler whose sanitizer runtime does not start here (only CXX=g++
+    /// chosen) is replaced by clang++ with clang's spellings, and the C units
+    /// stay with CC. It used to probe only CC, so g++ built the archives with
+    /// a runtime the harnesses had left.
+    #[test]
+    fn a_cpp_compiler_whose_runtime_cannot_start_leaves_the_probe_too() {
+        use harness_gen::compiler_family::{family_from_name, CompilerFamily};
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+        let by_name = |compiler: &str, _: bool| family_from_name(compiler);
+        let tsan = SanitizerSelection::Set(vec![Sanitizer::Tsan]);
+        let probed = std::cell::RefCell::new(Vec::new());
+        let starts = |compiler: &str, cpp: bool, _: &[String]| {
+            probed.borrow_mut().push((compiler.to_owned(), cpp));
+            compiler != "g++"
+        };
+        let only_cxx = crate::toolchain::EffectiveCompilers {
+            cc: "clang".to_owned(),
+            cxx: "g++".to_owned(),
+            explicit: true,
+        };
+        let probe = ProbeInstrumentation::for_selection_with(&tsan, &only_cxx, by_name, starts);
+        assert_eq!(
+            (probe.cc.as_str(), probe.cxx.as_str()),
+            ("clang", "clang++")
+        );
+        assert!(
+            probed.take().contains(&("g++".to_owned(), true)),
+            "g++ is probed as C++"
+        );
+        assert!(
+            probe
+                .cxx_flags
+                .iter()
+                .any(|flag| flag == CompilerFamily::Clang.coverage_flag()),
+            "{probe:?}"
+        );
+        let gcc = crate::toolchain::EffectiveCompilers {
+            cc: "gcc".to_owned(),
+            cxx: "g++".to_owned(),
+            explicit: true,
+        };
+        let probe = ProbeInstrumentation::for_selection_with(&tsan, &gcc, by_name, starts);
+        assert_eq!((probe.cc.as_str(), probe.cxx.as_str()), ("gcc", "clang++"));
+        assert!(
+            probe
+                .c_flags
+                .iter()
+                .any(|flag| flag == CompilerFamily::Gcc.coverage_flag()),
+            "{probe:?}"
+        );
+        // A C++ compiler whose runtime starts is kept.
+        let probe = ProbeInstrumentation::for_selection_with(&tsan, &gcc, by_name, |_, _, _| true);
+        assert_eq!((probe.cc.as_str(), probe.cxx.as_str()), ("gcc", "g++"));
     }
 
     #[test]

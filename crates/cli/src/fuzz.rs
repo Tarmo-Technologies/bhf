@@ -1316,6 +1316,52 @@ fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
     crate::fatal_signal::classify(status, stderr).is_none()
 }
 
+/// How the error of a pass whose harness's sanitizer runtime could not start
+/// begins ([`runtime_start_failure_error`]), so `bhf auto` can tell that
+/// environment error from a pass that failed for another reason
+/// ([`is_runtime_start_failure`]).
+const RUNTIME_START_FAILURE: &str = "sanitizer runtime could not start: ";
+
+/// Whether a fuzz pass `error` says the harness's sanitizer runtime could
+/// not start on this host: every input dies that way before reaching the
+/// target, so another pass would only fail the same way. A caller that
+/// prefixes the error with its own context keeps it recognisable.
+pub(crate) fn is_runtime_start_failure(error: &str) -> bool {
+    error.contains(RUNTIME_START_FAILURE)
+}
+
+/// The compiler the harness in `dir` was last built with, as its toolchain
+/// stamp records it (`bhf_toolchain.stamp` begins with the compiler).
+fn recorded_harness_compiler(dir: &Path) -> Option<String> {
+    let stamp = fs::read_to_string(dir.join("bhf_toolchain.stamp")).ok()?;
+    let compilers = stamp.lines().next()?.split(" | ").next()?;
+    crate::generate_harness::split_compile_command(compilers)
+        .into_iter()
+        .next()
+}
+
+/// The error a run whose sanitizer runtime could not start ends the pass
+/// with: the harness dies that way before `main` on every input, which says
+/// nothing about the target, so it is an environment error and never a
+/// finding. It names the runtime's line and the compiler the harness was
+/// built with.
+fn runtime_start_failure_error(runner: &replay_min::HarnessRunner, stderr: &str) -> Option<String> {
+    let line = crate::fatal_signal::sanitizer_runtime_start_failure(stderr)?;
+    let harness = runner.harness_path();
+    let built_with = harness
+        .parent()
+        .and_then(recorded_harness_compiler)
+        .map(|compiler| format!(" (built with {compiler})"))
+        .unwrap_or_default();
+    Some(format!(
+        "{RUNTIME_START_FAILURE}'{}'{built_with} printed \"{line}\" before reaching the target. \
+         That is an environment problem on this host, not a finding: build the harness with a \
+         compiler whose sanitizer runtime starts here (CC=clang CXX=clang++), or choose the \
+         sanitizers with --sanitizers, which checks that the compilers' runtimes start",
+        harness.display()
+    ))
+}
+
 /// Synthesize the BHF-210 "reachable crash (fatal signal, no sanitizer report)"
 /// finding for a non-rejection crash on an input.
 pub(crate) fn fatal_signal_report(
@@ -6153,6 +6199,9 @@ fn run_c_libfuzzer_single_input_in(
         }
     }
     if !output.status.success() {
+        if let Some(error) = runtime_start_failure_error(runner, &stderr) {
+            return Err(error);
+        }
         if let Some(report) = corpus::parse_sanitizer_report(&stderr) {
             return Ok(HarnessRun {
                 events: Vec::new(),
@@ -7539,6 +7588,10 @@ fn run_harness_with_protocol(
     };
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
+        if let Some(error) = runtime_start_failure_error(runner, &stderr) {
+            let _ = fs::remove_file(&events_path);
+            return Err(error);
+        }
         // C / C++ libFuzzer + AFL++ harnesses do not write an Ada event log -
         // they exit with a non-zero status and a sanitizer report in stderr.
         // Surface that as a structured HarnessRun instead of a hard error so
@@ -11552,6 +11605,56 @@ mod auto_path_tests {
         assert!(run.sanitizer.is_none(), "rejection must not be a finding");
         assert!(run.testcases.is_empty());
         assert!(run.rejected, "flagged rejected for the all-reject signal");
+    }
+
+    /// A harness whose sanitizer runtime cannot start dies the same way on
+    /// every input, before `main`: an environment error that names the
+    /// runtime's line and ends the pass, never a finding. An abort with that
+    /// line used to be a HIGH BHF-210 "reachable crash".
+    #[test]
+    #[cfg(unix)]
+    fn a_sanitizer_runtime_start_failure_is_an_error_not_a_finding() {
+        let work = tmpdir();
+        let h = write_script(
+            &work,
+            "runtime_start.sh",
+            "#!/bin/sh\n>&2 echo 'FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20'\n\
+             kill -ABRT $$\n",
+        );
+        // The harness's toolchain stamp names the compiler it was built with.
+        std::fs::write(
+            h.with_file_name("bhf_toolchain.stamp"),
+            "widget-g++ gcc widget-gcc | -O1 -g -fsanitize=thread | \n",
+        )
+        .unwrap();
+        let Err(error) = run_c_libfuzzer_single_input(
+            &replay_min::HarnessRunner::direct(h),
+            &work,
+            b"x",
+            &[],
+            Duration::from_secs(5),
+            0,
+            None,
+        ) else {
+            panic!("a runtime that cannot start is an environment error, not a run");
+        };
+        assert!(
+            error.contains("FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20")
+                && error.contains("could not start")
+                && error.contains("runtime_start.sh")
+                && error.contains("built with widget-g++"),
+            "{error}"
+        );
+        // bhf auto tells it from any other pass error, and the advice does
+        // not claim a compiler switch that never happened.
+        assert!(super::is_runtime_start_failure(&error), "{error}");
+        assert!(super::is_runtime_start_failure(&format!(
+            "pass `empty`: {error}"
+        )));
+        assert!(!error.contains("picks clang"), "{error}");
+        assert!(!super::is_runtime_start_failure(
+            "harness exited with status 1"
+        ));
     }
 
     #[test]

@@ -271,6 +271,9 @@ pub(crate) fn blocker_for(result: &AttemptResult) -> Option<BlockerKey> {
         Outcome::UnsupportedParams { reason } => ("unsupported_params", normalize_detail(reason)),
         Outcome::UnsafeBuildPath { reason } => ("unsafe_build_path", normalize_detail(reason)),
         Outcome::MissingToolchain { reason } => ("missing_toolchain", normalize_detail(reason)),
+        Outcome::SanitizerRuntimeUnavailable { reason, .. } => {
+            ("sanitizer_runtime_unavailable", normalize_detail(reason))
+        }
         Outcome::ReportOnly {
             reason, dialect, ..
         } => {

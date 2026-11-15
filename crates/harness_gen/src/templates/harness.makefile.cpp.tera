@@ -53,26 +53,36 @@ CXX_STD ?= {{ cxx_standard }}
 # reserved-user-defined-literal error in every C++11+ mode. It is valid legacy
 # source, and the generated harness itself needs C++11 headers, so falling back
 # to gnu++03 cannot solve it. Suppress only that compatibility diagnostic.
+# bhf's own flags for the `main` build (optimization, debug info, the
+# standard, the sanitizers and the coverage the engine reads), in
+# BHF_CXXFLAGS. CXXFLAGS is the operator's: one set in the environment (a dev
+# shell, an SDK's setup script) or on make's command line comes AFTER bhf's
+# flags in every recipe that takes them, so it adds flags (a later -O2 wins
+# over -O1) and never drops coverage or the sanitizers. `bhf auto
+# --sanitizers` and bhf's other compiler overrides set BHF_CXXFLAGS; a
+# hand-run `make BHF_CXXFLAGS=...` replaces bhf's flags.
 # GCC links its sanitizer runtimes as shared libraries by default, and a
 # shared libasan must come first in the process's library list: under the
 # runtrace LD_PRELOAD shim it aborts at startup before the target is ever
 # reached. Link them statically, as clang does.
 ifeq ($(BHF_CXX_FAMILY),gcc)
-CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
+BHF_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
 else ifeq ($(BHF_CXX_FAMILY),msvc)
 # MSVC: AddressSanitizer plus cl's SanitizerCoverage subset (inline 8-bit edge
 # counters, comparison and division hooks); cl has no UBSan.
-CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
+BHF_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
 else
-CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
+BHF_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
 endif
+CXXFLAGS ?=
 # A C translation unit of the compile database is compiled with $(CC), so its
 # instrumentation follows $(CC)'s family. `bhf build`/`bhf auto` pass
 # BHF_CC_FAMILY; a hand-run `make` asks $(CC), once and only when a C unit is
-# built. When $(CC) and $(CXX) are the same family, a C unit gets the C++
-# instrumentation (CXXFLAGS, so an override of it applies too) without the C++
-# `-std=`, which a C compile rejects. Otherwise it gets CFLAGS when given, else
-# the defaults spelled for $(CC).
+# built. When $(CC) and $(CXX) are the same family, a C unit gets bhf's C++
+# instrumentation (BHF_CXXFLAGS, so an override of it applies too) without the
+# C++ `-std=`, which a C compile rejects. Otherwise it gets BHF_CFLAGS when
+# given, else the defaults spelled for $(CC). The operator's CFLAGS follow
+# either.
 ifndef BHF_CC_FAMILY
 ifneq ($(filter bhf-cl bhf-cl.exe,$(notdir $(subst ",,$(CC)))),)
 BHF_CC_FAMILY := msvc
@@ -83,7 +93,7 @@ endif
 BHF_CONTEXT_C_FLAGS_GCC = -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
 BHF_CONTEXT_C_FLAGS_CLANG = -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
 BHF_CONTEXT_C_FLAGS_MSVC = -O1 -g -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
-BHF_CONTEXT_C_FLAGS = $(if $(filter $(BHF_CXX_FAMILY),$(BHF_CC_FAMILY)),$(filter-out -std=%,$(CXXFLAGS)),$(if $(filter environment command,$(firstword $(origin CFLAGS))),$(CFLAGS),$(if $(filter gcc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_GCC),$(if $(filter msvc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_MSVC),$(BHF_CONTEXT_C_FLAGS_CLANG)))))
+BHF_CONTEXT_C_FLAGS = $(if $(filter $(BHF_CXX_FAMILY),$(BHF_CC_FAMILY)),$(filter-out -std=%,$(BHF_CXXFLAGS)),$(if $(filter environment command,$(firstword $(origin BHF_CFLAGS))),$(BHF_CFLAGS),$(if $(filter gcc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_GCC),$(if $(filter msvc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_MSVC),$(BHF_CONTEXT_C_FLAGS_CLANG))))) $(CFLAGS)
 # Toolchain additions from a `[toolchain]` config table or the --cxxflags /
 # --define / --sysroot ... flags. They are APPENDED, so they never drop bhf's
 # coverage or sanitizers. Every lane takes BHF_TOOLCHAIN_CPPFLAGS (defines,
@@ -236,7 +246,7 @@ BUILD_CONTEXT_LDFLAGS = {% for flag in link_flags %}{{ flag }}{% if not loop.las
 # the previous compiler produced. It describes the `main` build only; the lanes
 # built with their own compiler have their own stamp, so a later `make
 # cov`/`make diff` with other flags leaves it alone.
-BHF_TOOLCHAIN_ID = $(CXX) $(BHF_CXX_FAMILY) $(CC) | $(CXXFLAGS) | $(CXX_COMPAT_FLAGS) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CXXFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_CXX_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CXXFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS) | $(BHF_TOOLCHAIN_LIBS)
+BHF_TOOLCHAIN_ID = $(CXX) $(BHF_CXX_FAMILY) $(CC) | $(strip $(BHF_CXXFLAGS) $(CXXFLAGS)) | $(CXX_COMPAT_FLAGS) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CXXFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_CXX_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CXXFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS) | $(BHF_TOOLCHAIN_LIBS)
 # Lane stamp: the source coverage and differential binaries depend on it, and
 # it holds what their link recipes read, so a lane relinks when its compiler,
 # its flags (the dialect among them), a compatibility flag or a toolchain
@@ -314,7 +324,7 @@ bhf_driver_winafl.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} b
 	$(CXX) -x c $(BHF_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_DRIVER_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS) $(FEATURE_TEST_FLAGS) -DBHF_WINAFL -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main$(EXEEXT): main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+	$(CXX) $(BHF_CXXFLAGS) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(BHF_CXXFLAGS) $(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 # Semantic check only: the same translation units under the same flags as
 # `main`, minus code generation and the link. The repair loop reads compiler
@@ -325,7 +335,7 @@ main$(EXEEXT): main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS)
 # this mode — they are found by the real build, which still runs before any
 # target is called successful.
 syntaxcheck: main.cpp
-	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
+	$(CXX) $(BHF_CXXFLAGS) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(BHF_CXXFLAGS) $(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
 
 winafl: main_winafl$(EXEEXT)
 

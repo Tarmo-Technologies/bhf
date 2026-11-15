@@ -246,8 +246,10 @@ from a harness directory bhf generated.
   coverage guidance; the coverage-guided driver is the generated `main`.
   `make libfuzzer` in the harness directory builds a separate libFuzzer binary
   for other fuzzers; see the harness's `PORTABILITY.md`.
-- Do not set `CXXFLAGS` or `CFLAGS` to add flags. They replace the
-  Makefile's sanitizer and coverage flags. Use `AUTO_EXTRA_INCLUDES`.
+- `CXXFLAGS` and `CFLAGS` add flags to the `main` build, after the
+  Makefile's own sanitizer and coverage flags (`BHF_CXXFLAGS`/`BHF_CFLAGS`,
+  which a `make BHF_CFLAGS=...` replaces). `AUTO_EXTRA_INCLUDES` adds them to
+  every lane.
 - `CC`/`CXX` choose the compiler. clang is the default; gcc and a
   cross-prefixed gcc work too, because the Makefile picks its flags from the
   compiler that runs (see the compiler contract in [C and C++](c-cpp.md)).

@@ -22,13 +22,50 @@ fn has_abort_rejection_diagnostic(stderr: &str) -> bool {
         || lower.contains("panic:")
 }
 
+/// What sanitizer runtimes print when they cannot start on this host: the
+/// process dies before `main`, whatever the input. Each is a problem of the
+/// host or the build, never of the target.
+const RUNTIME_START_FAILURES: &[&str] = &[
+    // ThreadSanitizer's shadow layout against the kernel's address space
+    // layout (GCC's libtsan under high-entropy ASLR), and a non-PIE binary.
+    "ThreadSanitizer: unexpected memory mapping",
+    "ThreadSanitizer: failed to mmap",
+    "is out of application range. Non-PIE build?",
+    "Make sure to compile with -fPIE and to link with -pie",
+    // MemorySanitizer's shadow.
+    "MemorySanitizer can not mmap the shadow memory",
+    // AddressSanitizer's shadow and its interceptors.
+    "Shadow memory range interleaves with an existing memory mapping",
+    "ReserveShadowMemoryRange failed while trying to map",
+    "ASan runtime does not come first in initial library list",
+    "Interceptors are not working. This may be because AddressSanitizer is loaded too late",
+];
+
+/// The line in `stderr` where a sanitizer runtime says it cannot start on
+/// this host (`FATAL: ThreadSanitizer: unexpected memory mapping ...`), if
+/// there is one. Such an exit is an environment error: it is never a
+/// finding, whatever signal ended the process.
+pub(crate) fn sanitizer_runtime_start_failure(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .find(|line| {
+            RUNTIME_START_FAILURES
+                .iter()
+                .any(|marker| line.contains(marker))
+        })
+        .map(|line| line.trim().chars().take(240).collect())
+}
+
 /// Classify an undiagnosed fatal-signal exit. Plain non-zero exits, external
-/// termination signals, SIGPIPE, and diagnosed assertion/panic aborts are not
-/// crashes for this purpose.
+/// termination signals, SIGPIPE, diagnosed assertion/panic aborts and a
+/// sanitizer runtime that could not start are not crashes for this purpose.
 #[cfg(unix)]
 pub(crate) fn classify(status: &std::process::ExitStatus, stderr: &str) -> Option<FatalSignal> {
     use std::os::unix::process::ExitStatusExt;
 
+    if sanitizer_runtime_start_failure(stderr).is_some() {
+        return None;
+    }
     if status.code() == Some(BHF_WIN_CRASH_EXIT) {
         return Some(FatalSignal {
             name: "Windows exception (access violation / fault, via wine)".to_owned(),
@@ -54,10 +91,11 @@ pub(crate) fn classify(status: &std::process::ExitStatus, stderr: &str) -> Optio
 }
 
 #[cfg(not(unix))]
-pub(crate) fn classify(status: &std::process::ExitStatus, _stderr: &str) -> Option<FatalSignal> {
-    (status.code() == Some(BHF_WIN_CRASH_EXIT)).then(|| FatalSignal {
-        name: "Windows exception (access violation / fault)".to_owned(),
-    })
+pub(crate) fn classify(status: &std::process::ExitStatus, stderr: &str) -> Option<FatalSignal> {
+    (status.code() == Some(BHF_WIN_CRASH_EXIT) && sanitizer_runtime_start_failure(stderr).is_none())
+        .then(|| FatalSignal {
+            name: "Windows exception (access violation / fault)".to_owned(),
+        })
 }
 
 #[cfg(all(test, unix))]
@@ -124,5 +162,33 @@ mod tests {
             assert_eq!(classify(&by_signal(signal), ""), None);
         }
         assert_eq!(classify(&ExitStatus::from_raw(2 << 8), ""), None);
+    }
+
+    /// A sanitizer runtime that cannot start (GCC's ThreadSanitizer under
+    /// high-entropy ASLR) aborts every run before `main`: never a crash, and
+    /// its own line is what the run reports.
+    #[test]
+    fn a_sanitizer_runtime_that_cannot_start_is_not_a_crash() {
+        use super::sanitizer_runtime_start_failure;
+        let tsan =
+            "FATAL: ThreadSanitizer: unexpected memory mapping 0x5a34d0219000-0x5a34d0222000\n";
+        assert_eq!(classify(&by_signal(6), tsan), None);
+        assert_eq!(classify(&by_signal(11), tsan), None);
+        assert_eq!(
+            sanitizer_runtime_start_failure(tsan).as_deref(),
+            Some("FATAL: ThreadSanitizer: unexpected memory mapping 0x5a34d0219000-0x5a34d0222000")
+        );
+        let asan = "==12==Shadow memory range interleaves with an existing memory mapping. \
+                    ASan cannot proceed correctly. ABORTING.\n";
+        assert_eq!(classify(&by_signal(6), asan), None);
+        assert!(sanitizer_runtime_start_failure(
+            "==7==ASan runtime does not come first in initial library list; you should either \
+             link runtime to your application or manually preload it with LD_PRELOAD.\n"
+        )
+        .is_some());
+        // A report from a runtime that started is not one.
+        let report = "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6020\n";
+        assert_eq!(sanitizer_runtime_start_failure(report), None);
+        assert!(classify(&by_signal(6), report).is_some());
     }
 }

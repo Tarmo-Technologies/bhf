@@ -810,6 +810,18 @@ pub enum Outcome {
     MissingToolchain {
         reason: String,
     },
+    /// The harness built, but its sanitizer runtime cannot start on this
+    /// host: it dies before reaching the target on every input (`FATAL:
+    /// ThreadSanitizer: unexpected memory mapping`, an AddressSanitizer
+    /// shadow mapping failure), so the target was not fuzzed. An environment
+    /// problem, not a finding and not a bhf defect; the reason names the
+    /// runtime's line and the compiler. The remedy is a compiler whose
+    /// runtime starts here, or other sanitizers. The passes stop at the
+    /// first that reports it.
+    SanitizerRuntimeUnavailable {
+        repairs: Vec<Repair>,
+        reason: String,
+    },
     UnrecoverableLink {
         repairs: Vec<Repair>,
         missing: Vec<String>,
@@ -999,6 +1011,19 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::SanitizerRuntimeUnavailable { repairs, reason } => AttemptTrace {
+                terminal_stage: "runtime".to_owned(),
+                fallback_chain: vec![
+                    "built".to_owned(),
+                    "sanitizer_runtime_unavailable".to_owned(),
+                ],
+                reason_category: Some("sanitizer_runtime_unavailable".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: !repairs.is_empty(),
+                repair_count: repairs.len(),
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::UnrecoverableLink { repairs, missing } => AttemptTrace {
                 terminal_stage: "link".to_owned(),
                 fallback_chain: vec!["build_repair".to_owned(), "link_unrecoverable".to_owned()],
@@ -1078,7 +1103,8 @@ impl Outcome {
             | Outcome::Built { repairs, .. }
             | Outcome::FailedBuild { repairs, .. }
             | Outcome::UnrecoverableLink { repairs, .. }
-            | Outcome::UnrecoverableRuntime { repairs, .. } => repairs.as_slice(),
+            | Outcome::UnrecoverableRuntime { repairs, .. }
+            | Outcome::SanitizerRuntimeUnavailable { repairs, .. } => repairs.as_slice(),
             Outcome::UnsupportedParams { .. }
             | Outcome::UnsafeBuildPath { .. }
             | Outcome::MissingToolchain { .. }
@@ -1805,7 +1831,7 @@ fn retain_sequence_failure(sequence: &Outcome, direct: &mut Outcome) {
 
 #[cfg(test)]
 mod sequence_fallback_tests {
-    use super::{retain_sequence_failure, Outcome};
+    use super::{retain_sequence_failure, Outcome, Repair};
     use build_classifier::BuildErrorKind;
 
     fn sequence_failure() -> Outcome {
@@ -1912,6 +1938,40 @@ mod sequence_fallback_tests {
         assert_eq!(trace.fallback_chain, ["missing_toolchain"]);
         assert!(!trace.repairs_attempted);
         assert_eq!(outcome.platform_stub(), None);
+    }
+
+    /// A harness whose sanitizer runtime cannot start on the host has its
+    /// own outcome, an environment problem, instead of the safety rail's
+    /// `unrecoverable_runtime` for a faulty harness; its repairs are kept.
+    #[test]
+    fn a_sanitizer_runtime_that_cannot_start_has_its_own_outcome() {
+        let reason = "sanitizer runtime could not start: 'main' printed \"FATAL\"".to_owned();
+        let outcome = Outcome::SanitizerRuntimeUnavailable {
+            repairs: vec![Repair::PlatformStub {
+                platform: "windows".to_owned(),
+            }],
+            reason: reason.clone(),
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "sanitizer_runtime_unavailable");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&back, Outcome::SanitizerRuntimeUnavailable { reason: kept, .. } if *kept == reason),
+            "{back:?}"
+        );
+        let trace = outcome.attempt_trace();
+        assert_eq!(
+            trace.reason_category.as_deref(),
+            Some("sanitizer_runtime_unavailable")
+        );
+        assert_eq!(trace.terminal_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(outcome.platform_stub().as_deref(), Some("windows"));
+        assert_eq!(
+            crate::auto::run_status::outcome_bucket(&outcome),
+            "skipped",
+            "counted with the other environment problems"
+        );
     }
 
     #[test]
@@ -3020,7 +3080,15 @@ fn run_attempt(
                     candidate.harness_id, target.triple, target.cc, effective.cc
                 ));
             }
-            Some(cross_compiler_override(target))
+            let cross = cross_compiler_override(target);
+            if let Some(dropped) = ambient_flags_left_out(&cross) {
+                announce_once(&format!(
+                    "{dropped} from the environment, written for the host's compiler, are left \
+                     out of the {} cross builds",
+                    target.triple
+                ));
+            }
+            Some(cross)
         }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
@@ -3645,6 +3713,20 @@ fn run_attempt(
                                 "bhf auto: fuzz pass `{pass_label}` failed for {}: {error}",
                                 candidate.harness_id
                             );
+                            // The harness dies before reaching the target on
+                            // every input: another pass would fail the same
+                            // way, and the target is an environment problem,
+                            // not a runtime error of the harness.
+                            if crate::fuzz::is_runtime_start_failure(&error) {
+                                return Ok(AttemptResult {
+                                    candidate: candidate.clone(),
+                                    outcome: Outcome::SanitizerRuntimeUnavailable {
+                                        repairs: manifest.repairs.clone(),
+                                        reason: error,
+                                    },
+                                    harness_dir,
+                                });
+                            }
                             // Crash-rate kill-switch: a shim regression
                             // that always crashes (eg. void/void dlsym
                             // stub jumping to garbage memory) would
@@ -6590,7 +6672,7 @@ fn try_build_c(
     // `auto --sanitizers` arms an explicit `-fsanitize=` set for the native build.
     // A cross build already carries its own flag override (which deliberately drops
     // sanitizers — they don't survive qemu-user), so sanitizers only apply on the
-    // host path. `Default` leaves the Makefile's `address,undefined` CFLAGS/CXXFLAGS
+    // host path. `Default` leaves the Makefile's `address,undefined` BHF_CFLAGS/BHF_CXXFLAGS
     // intact (byte-identical to before); `None` builds coverage-only (no
     // `-fsanitize=`); `Set` swaps in exactly the requested matrix.
     let sanitizer_override;
@@ -6601,6 +6683,8 @@ fn try_build_c(
     // operator's own CC/CXX (`[toolchain]`), all of which choose the compiler on
     // purpose.
     let operator_compilers = crate::toolchain::effective_compilers().explicit;
+    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    let is_cpp = harness_dir.join("main.cpp").is_file();
     let cached_alternate = cross_compiler.is_none()
         && !operator_compilers
         && matches!(sanitizers, SanitizerSelection::Default)
@@ -6619,13 +6703,11 @@ fn try_build_c(
                 Some(&sanitizer_override)
             }
             SanitizerSelection::Set(set) => {
-                sanitizer_override = sanitizer_compiler_override(set);
+                sanitizer_override = sanitizer_compiler_override(set, is_cpp);
                 Some(&sanitizer_override)
             }
         },
     };
-    let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
-    let is_cpp = harness_dir.join("main.cpp").is_file();
     // C++ dialect selection: an explicit `--cxx-std` (BHF_CXX_STD) wins; else a
     // standard the ladder already proved for this exact target/build context is
     // reused; else the baked default may be overridden on a failure. A project-wide
@@ -7361,7 +7443,7 @@ fn apply_platform_stub(
 
 /// Cross compiler + replacement flags for a foreign build. The native harness
 /// Makefile bakes clang's `-fsanitize-coverage=trace-pc-guard,trace-cmp` and
-/// `-fsanitize=address,undefined` into `CFLAGS`/`CXXFLAGS`, which a cross build
+/// `-fsanitize=address,undefined` into `BHF_CFLAGS`/`BHF_CXXFLAGS`, which a cross build
 /// replaces: ASan does not survive qemu-user and mingw has no runtime for it,
 /// so the build is `-O1 -g` plus the coverage the cross compiler accepts. The
 /// harness still runs and hard crashes (SIGSEGV / SIGABRT) are still caught.
@@ -7458,12 +7540,20 @@ fn cross_compiler_override_with(
         cxxflags.extend(guards);
     }
 
+    // A platform guard's lane runs a cross compiler bhf picked, not the
+    // operator's: the environment's CFLAGS/CXXFLAGS were written for the
+    // operator's (or the host's) compiler, and a host-only flag such as
+    // `-march=native` would fail the cross build. A whole-sweep target is the
+    // operator's own toolchain, and takes them.
+    let ambient = !target.guard_lane;
     crate::build::CFamilyCompilerOverride {
         cc: target.cc.clone(),
         cxx: target.cxx.clone(),
         cflags,
         cxxflags,
         target_flags,
+        ambient_cflags: ambient,
+        ambient_cxxflags: ambient,
     }
 }
 
@@ -7629,20 +7719,21 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
 }
 
 /// Native compile flags for `auto --sanitizers`. Replicates the harness
-/// Makefile's default CFLAGS/CXXFLAGS structure — `-O1 -g`, the engine's
+/// Makefile's default BHF_CFLAGS/BHF_CXXFLAGS structure — `-O1 -g`, the engine's
 /// SanitizerCoverage (edge coverage #385 + cmplog #398/#400), and the UBSan check
 /// subtractions OSS-Fuzz also drops — but swaps the baked-in
 /// `-fsanitize=address,undefined` for EXACTLY the requested set, so a user can
 /// build an MSan/TSan harness (or pin ASan-only) instead of the default. Only the
 /// `-fsanitize=` group is replaced; COMPILE_DB_FLAGS / INCLUDES / AUTO_EXTRA_* are
 /// separate make variables and stay intact. C++ uses `gnu++17` (matching the cross
-/// override) since overriding CXXFLAGS drops the template's detected standard.
+/// override) since overriding BHF_CXXFLAGS drops the template's detected standard.
 ///
 /// The compilers are the ones the build would use anyway — the operator's
 /// CC/CXX or `[toolchain]` compilers, else clang — with flags spelled for their
 /// family. Only when the operator's compiler cannot build the requested
-/// sanitizers (gcc has no MemorySanitizer) does it switch to clang, and it says
-/// so once.
+/// sanitizers (gcc has no MemorySanitizer), or builds them with a runtime that
+/// cannot start here, does it switch to clang, and it says so once. CC is
+/// checked for every harness, and CXX for a C++ harness (`builds_cpp`).
 ///
 /// Sanitizers that conflict (e.g. `asan` + `msan`, or `msan` + `tsan`) will fail to
 /// compile — the compiler rejects the combination — which surfaces as a normal
@@ -7651,6 +7742,7 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
 /// positives, but the harness still builds and runs.
 fn sanitizer_compiler_override(
     sanitizers: &[multicore_fuzz::Sanitizer],
+    builds_cpp: bool,
 ) -> crate::build::CFamilyCompilerOverride {
     let fsanitize = format!(
         "-fsanitize={}",
@@ -7665,13 +7757,37 @@ fn sanitizer_compiler_override(
         &crate::toolchain::effective_compilers(),
         Some(fsanitize),
         has_ubsan,
+        builds_cpp,
         crate::toolchain::compiler_family,
-        compiler_links_with_flag,
+        probe_sanitizer_runtime,
     );
-    if let Some(note) = note {
+    if let Some(mut note) = note {
+        if let Some(dropped) = ambient_flags_left_out(&selected) {
+            note.push_str(&format!(
+                " ({dropped} from the environment, written for the operator's compiler, are left \
+                 out of those builds)"
+            ));
+        }
         announce_once(&note);
     }
     selected
+}
+
+/// The environment's `CFLAGS`/`CXXFLAGS` that `compiler` leaves out of its
+/// builds ([`crate::build::CFamilyCompilerOverride::ambient_cflags`]), named
+/// for a note; `None` when it leaves out none that is set.
+fn ambient_flags_left_out(compiler: &crate::build::CFamilyCompilerOverride) -> Option<String> {
+    let dropped: Vec<&str> = [
+        ("CFLAGS", compiler.ambient_cflags),
+        ("CXXFLAGS", compiler.ambient_cxxflags),
+    ]
+    .into_iter()
+    .filter(|(variable, kept)| {
+        !kept && std::env::var(variable).is_ok_and(|value| !value.trim().is_empty())
+    })
+    .map(|(variable, _)| variable)
+    .collect();
+    (!dropped.is_empty()).then(|| dropped.join("/"))
 }
 
 /// Native compile flags for `auto --sanitizers none` (#434): the same
@@ -7686,8 +7802,9 @@ fn coverage_only_compiler_override() -> crate::build::CFamilyCompilerOverride {
         &crate::toolchain::effective_compilers(),
         None,
         false,
+        false,
         crate::toolchain::compiler_family,
-        compiler_links_with_flag,
+        probe_sanitizer_runtime,
     )
     .0
 }
@@ -7706,17 +7823,10 @@ fn announce_once(note: &str) {
     }
 }
 
-/// Whether `compiler` compiles AND links a trivial program with `flag` (a
-/// sanitizer needs its runtime library, which only the link proves).
-/// Remembered per compiler and flag for the run.
-fn compiler_links_with_flag(compiler: &str, flag: &str) -> bool {
-    compiler_links_with_flags(compiler, &[flag.to_owned()])
-}
-
-/// [`compiler_links_with_flag`] for a set of flags given together.
+/// Whether `compiler` compiles AND links a trivial program with `flags`
+/// given together (a sanitizer needs its runtime library, which only the
+/// link proves). Remembered per compiler and flags for the run.
 pub(crate) fn compiler_links_with_flags(compiler: &str, flags: &[String]) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     use std::sync::{Mutex, OnceLock};
     type LinkCache = Mutex<HashMap<(String, Vec<String>), bool>>;
     static CACHE: OnceLock<LinkCache> = OnceLock::new();
@@ -7728,11 +7838,21 @@ pub(crate) fn compiler_links_with_flags(compiler: &str, flags: &[String]) -> boo
     let Ok(dir) = tempfile::tempdir() else {
         return false;
     };
-    let output = dir.path().join("probe");
-    let linked = Command::new(compiler)
+    let linked = link_probe_program(compiler, false, flags, &dir.path().join("probe"));
+    cache.lock().expect("link probe cache").insert(key, linked);
+    linked
+}
+
+/// Compile and link `int main(void) { return 0; }` with `compiler` and
+/// `flags` into `output`, as C++ when `cpp` (a C++ compiler links the C++
+/// runtime and the sanitizer's C++ parts), else as C.
+fn link_probe_program(compiler: &str, cpp: bool, flags: &[String], output: &Path) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    Command::new(compiler)
         .args(flags)
-        .args(["-x", "c", "-", "-o"])
-        .arg(&output)
+        .args(["-x", if cpp { "c++" } else { "c" }, "-", "-o"])
+        .arg(output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -7744,9 +7864,151 @@ pub(crate) fn compiler_links_with_flags(compiler: &str, flags: &[String]) -> boo
             }
             child.wait().ok()
         })
-        .is_some_and(|status| status.success());
-    cache.lock().expect("link probe cache").insert(key, linked);
-    linked
+        .is_some_and(|status| status.success())
+}
+
+/// What a compiler made of a trivial program built with a sanitizer's flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SanitizerProbe {
+    /// It linked, and the program ran to a clean exit. A program this host
+    /// cannot run at all (a cross compiler's) counts too: that says nothing
+    /// about its runtime.
+    Runs,
+    /// It did not compile and link: the compiler has no runtime for the
+    /// sanitizer.
+    DoesNotLink,
+    /// It linked, but the program died before `main` returned, so the
+    /// sanitizer's runtime cannot start on this host (GCC's ThreadSanitizer
+    /// under a kernel's high-entropy ASLR). Holds what the program printed,
+    /// or how it ended.
+    FailsAtStartup(String),
+}
+
+/// How often the probe program runs. A runtime that fails on most address
+/// space layouts can start by luck once, and a harness whose runtime starts
+/// only sometimes is no more usable than one that never does.
+const SANITIZER_PROBE_RUNS: usize = 3;
+
+/// How long one run of the probe program may take.
+const SANITIZER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `compiler` links a trivial program with `flags` AND the program
+/// starts: a sanitizer runtime that links can still abort before `main` on
+/// this host, and every harness built with it would then die the same way
+/// on every input. `cpp` builds the program as C++, for a C++ compiler.
+/// Remembered per compiler, language and flags for the run.
+pub(crate) fn probe_sanitizer_runtime(
+    compiler: &str,
+    cpp: bool,
+    flags: &[String],
+) -> SanitizerProbe {
+    use std::sync::{Mutex, OnceLock};
+    type ProbeCache = Mutex<HashMap<(String, bool, Vec<String>), SanitizerProbe>>;
+    static CACHE: OnceLock<ProbeCache> = OnceLock::new();
+    let key = (compiler.to_owned(), cpp, flags.to_vec());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().expect("runtime probe cache").get(&key) {
+        return known.clone();
+    }
+    let result = run_sanitizer_probe(compiler, cpp, flags);
+    cache
+        .lock()
+        .expect("runtime probe cache")
+        .insert(key, result.clone());
+    result
+}
+
+fn run_sanitizer_probe(compiler: &str, cpp: bool, flags: &[String]) -> SanitizerProbe {
+    let Ok(dir) = tempfile::tempdir() else {
+        return SanitizerProbe::DoesNotLink;
+    };
+    let program = dir
+        .path()
+        .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
+    if !link_probe_program(compiler, cpp, flags, &program) {
+        return SanitizerProbe::DoesNotLink;
+    }
+    // A program for another target says nothing about its runtime here
+    // (and an emulator binfmt would start it under qemu).
+    if !crate::toolchain::compiler_builds_for_host(compiler) {
+        return SanitizerProbe::Runs;
+    }
+    let log = dir.path().join("probe.stderr");
+    for _ in 0..SANITIZER_PROBE_RUNS {
+        if let Some(failure) = probe_program_failure(&program, &log) {
+            return SanitizerProbe::FailsAtStartup(failure);
+        }
+    }
+    SanitizerProbe::Runs
+}
+
+/// Run `program` once, its stderr going to `log`: `None` when it exits
+/// cleanly or cannot be started here at all, else what it printed (the
+/// runtime's own diagnostic line when there is one) or how it ended.
+fn probe_program_failure(program: &Path, log: &Path) -> Option<String> {
+    use std::process::{Command, Stdio};
+    let stderr = std::fs::File::create(log).ok()?;
+    let mut child = Command::new(program)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .ok()?;
+    let status = match replay_min::process::wait_exit_within(&mut child, SANITIZER_PROBE_TIMEOUT) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Some(format!(
+                "it did not exit within {}s",
+                SANITIZER_PROBE_TIMEOUT.as_secs()
+            ));
+        }
+        Err(_) => return None,
+    };
+    if status.success() {
+        return None;
+    }
+    let printed = std::fs::read(log).unwrap_or_default();
+    let printed = String::from_utf8_lossy(&printed);
+    Some(
+        crate::fatal_signal::sanitizer_runtime_start_failure(&printed)
+            .or_else(|| {
+                printed
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|line| line.chars().take(200).collect())
+            })
+            .unwrap_or_else(|| format!("it ended with {status}")),
+    )
+}
+
+/// The flags the startup probe links with for `fsanitize` on a compiler of
+/// `family`: the sanitizer and, for gcc, the static runtimes the harness
+/// links, so the probe runs the runtime the harness would.
+fn sanitizer_probe_flags(
+    family: harness_gen::compiler_family::CompilerFamily,
+    fsanitize: &str,
+) -> Vec<String> {
+    let mut flags = vec![fsanitize.to_owned()];
+    if family == harness_gen::compiler_family::CompilerFamily::Gcc {
+        flags.extend(gcc_static_sanitizer_runtimes(fsanitize));
+    }
+    flags
+}
+
+/// Whether `compiler` (a C++ compiler when `cpp`) builds a program with the
+/// `-fsanitize=` flags among `flags` whose runtime starts on this host (see
+/// [`probe_sanitizer_runtime`]).
+pub(crate) fn sanitizer_runtime_starts(compiler: &str, cpp: bool, flags: &[String]) -> bool {
+    let family = crate::toolchain::compiler_family(compiler, cpp)
+        .unwrap_or(harness_gen::compiler_family::CompilerFamily::Clang);
+    let mut probe_flags = Vec::new();
+    for flag in flags {
+        probe_flags.extend(sanitizer_probe_flags(family, flag));
+    }
+    probe_sanitizer_runtime(compiler, cpp, &probe_flags) == SanitizerProbe::Runs
 }
 
 /// GCC's sanitizer runtimes are shared libraries by default, and a shared
@@ -7769,27 +8031,68 @@ fn gcc_static_sanitizer_runtimes(fsanitize: &str) -> Vec<String> {
 
 /// The native override for an explicit sanitizer selection (or none, for
 /// coverage only), built on `effective` — the compilers the build would use
-/// without an override. Returns the override and, when it had to leave the
-/// operator's compilers, a note saying which it used and why.
+/// without an override. `probe` says whether an operator's compiler (a C++
+/// one when its second argument is true) builds a program with the
+/// sanitizer flags whose runtime starts here ([`probe_sanitizer_runtime`]).
+/// The C++ compiler is probed only for a C++ harness (`builds_cpp`), so a
+/// C-only toolchain whose C++ compiler cannot build the sanitizers keeps
+/// building the C harnesses. Returns the override and, when it had to leave
+/// the operator's compilers, a note saying which it used and why. A build
+/// with a compiler bhf picked in place of the operator's leaves out the
+/// environment's flags written for that compiler (`CFLAGS` for CC,
+/// `CXXFLAGS` for CXX).
 fn native_override_for(
     effective: &crate::toolchain::EffectiveCompilers,
     fsanitize: Option<String>,
     has_ubsan: bool,
+    builds_cpp: bool,
     family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
-    links_with: impl Fn(&str, &str) -> bool,
+    probe: impl Fn(&str, bool, &[String]) -> SanitizerProbe,
 ) -> (crate::build::CFamilyCompilerOverride, Option<String>) {
     use harness_gen::compiler_family::CompilerFamily;
+    const CLANG: &str = "clang";
+    const CLANGXX: &str = "clang++";
     let mut cc = effective.cc.clone();
     let mut cxx = effective.cxx.clone();
+    let mut ambient_cflags = true;
+    let mut ambient_cxxflags = true;
     let mut note = None;
     if let (Some(fsanitize), true) = (&fsanitize, effective.explicit) {
-        if !links_with(&cc, fsanitize) {
+        // Why `compiler` (the operator's `variable`) cannot be kept, if it
+        // cannot. bhf's own clang is what a failure falls back to, so it is
+        // not probed.
+        let unusable = |variable: &str, compiler: &str, cpp: bool| {
+            if compiler == if cpp { CLANGXX } else { CLANG } {
+                return None;
+            }
+            let family = family_of(compiler, cpp).unwrap_or(CompilerFamily::Clang);
+            match probe(compiler, cpp, &sanitizer_probe_flags(family, fsanitize)) {
+                SanitizerProbe::Runs => None,
+                SanitizerProbe::DoesNotLink => Some(format!(
+                    "{variable}={compiler} cannot build with {fsanitize}"
+                )),
+                SanitizerProbe::FailsAtStartup(failure) => Some(format!(
+                    "{variable}={compiler} builds with {fsanitize}, but its sanitizer runtime \
+                     does not start on this host ({failure})"
+                )),
+            }
+        };
+        if let Some(why) = unusable("CC", &cc, false) {
             note = Some(format!(
-                "--sanitizers: CC={cc} cannot build with {fsanitize}; building the C/C++ \
-                 harnesses with clang/clang++ instead"
+                "--sanitizers: {why}; building the C/C++ harnesses with clang/clang++ instead"
             ));
-            cc = "clang".to_owned();
-            cxx = "clang++".to_owned();
+            cc = CLANG.to_owned();
+            cxx = CLANGXX.to_owned();
+            ambient_cflags = false;
+            ambient_cxxflags = false;
+        } else if builds_cpp {
+            if let Some(why) = unusable("CXX", &cxx, true) {
+                note = Some(format!(
+                    "--sanitizers: {why}; building the C++ harnesses with clang++ instead"
+                ));
+                cxx = CLANGXX.to_owned();
+                ambient_cxxflags = false;
+            }
         }
     }
     let c_family = family_of(&cc, false).unwrap_or(CompilerFamily::Clang);
@@ -7800,7 +8103,7 @@ fn native_override_for(
             flags.push("-std=gnu++17".to_owned());
             if family == CompilerFamily::Clang {
                 // Keep the generated C++ Makefile's compatibility suppression
-                // when --sanitizers replaces CXXFLAGS. Clang 18 otherwise rejects
+                // when --sanitizers replaces BHF_CXXFLAGS. Clang 18 otherwise rejects
                 // the pre-C++11 `"%" PRId64`/`"text"MACRO` idiom as a hard error.
                 flags.push("-Wno-reserved-user-defined-literal".to_owned());
             }
@@ -7830,6 +8133,8 @@ fn native_override_for(
             cc,
             cxx,
             target_flags: None,
+            ambient_cflags,
+            ambient_cxxflags,
         },
         note,
     )
@@ -7951,9 +8256,13 @@ fn eject_unbuildable_added_source(
 ///
 /// Only the compilers change: the generated Makefile chooses its flags from the
 /// compiler that runs, so gcc gets GCC's `trace-pc` coverage and sanitizer
-/// spelling without bhf replacing CFLAGS/CXXFLAGS (and the C++ dialect ladder's
+/// spelling without bhf replacing BHF_CFLAGS/BHF_CXXFLAGS (and the C++ dialect ladder's
 /// `CXX_STD` keeps applying). The toolchain stamp rebuilds every object the
 /// previous compiler left behind.
+///
+/// The retry runs only when the operator chose no compilers, and the host's
+/// gcc builds for the same target as bhf's default clang, so the
+/// environment's CFLAGS/CXXFLAGS still follow bhf's flags.
 fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
     crate::build::CFamilyCompilerOverride {
         cc: "gcc".to_owned(),
@@ -7961,6 +8270,8 @@ fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
         cflags: Vec::new(),
         cxxflags: Vec::new(),
         target_flags: None,
+        ambient_cflags: true,
+        ambient_cxxflags: true,
     }
 }
 
@@ -10432,7 +10743,7 @@ mod ipc_reachability_tests {
 
 #[cfg(test)]
 mod sanitizer_override_tests {
-    use super::native_override_for;
+    use super::{native_override_for, SanitizerProbe};
     use crate::toolchain::EffectiveCompilers;
     use harness_gen::compiler_family::{family_from_name, CompilerFamily};
 
@@ -10461,7 +10772,10 @@ mod sanitizer_override_tests {
         // `--sanitizers none` (#434): native crash-only + coverage. The build must
         // carry the engine's coverage instrumentation but NO `-fsanitize=` group,
         // so ASan/UBSan never run and cannot false-positive.
-        let (ov, note) = native_override_for(&clang_default(), None, false, by_name, |_, _| true);
+        let (ov, note) =
+            native_override_for(&clang_default(), None, false, false, by_name, |_, _, _| {
+                SanitizerProbe::Runs
+            });
         assert_eq!(note, None);
         for flags in [&ov.cflags, &ov.cxxflags] {
             assert!(
@@ -10492,8 +10806,9 @@ mod sanitizer_override_tests {
             &clang_default(),
             Some("-fsanitize=address,undefined".to_owned()),
             true,
+            false,
             by_name,
-            |_, _| true,
+            |_, _, _| SanitizerProbe::Runs,
         );
         assert!(
             ov.cxxflags
@@ -10521,8 +10836,9 @@ mod sanitizer_override_tests {
             &clang_default(),
             Some("-fsanitize=address".to_owned()),
             false,
+            false,
             by_name,
-            |_, _| true,
+            |_, _, _| SanitizerProbe::Runs,
         );
         assert!(!has_flag(&ov.cflags, "-fno-sanitize="), "{:?}", ov.cflags);
     }
@@ -10536,8 +10852,9 @@ mod sanitizer_override_tests {
             &compilers("gcc", "g++", true),
             Some("-fsanitize=address,undefined".to_owned()),
             true,
+            false,
             by_name,
-            |_, _| true,
+            |_, _, _| SanitizerProbe::Runs,
         );
         assert_eq!(note, None);
         assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "g++"));
@@ -10565,8 +10882,9 @@ mod sanitizer_override_tests {
             &compilers("gcc", "g++", true),
             Some("-fsanitize=undefined".to_owned()),
             true,
+            false,
             by_name,
-            |_, _| true,
+            |_, _, _| SanitizerProbe::Runs,
         );
         for flags in [&ov.cflags, &ov.cxxflags] {
             assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
@@ -10577,8 +10895,9 @@ mod sanitizer_override_tests {
             &compilers("gcc", "g++", true),
             None,
             false,
+            false,
             by_name,
-            |_, _| unreachable!("nothing to probe without a sanitizer"),
+            |_, _, _| unreachable!("nothing to probe without a sanitizer"),
         );
         assert_eq!(ov.cc, "gcc");
         assert!(has_flag(&ov.cflags, "trace-pc,trace-cmp"));
@@ -10640,8 +10959,15 @@ mod sanitizer_override_tests {
             &compilers("gcc", "g++", true),
             Some("-fsanitize=memory".to_owned()),
             false,
+            false,
             by_name,
-            |compiler, flag| compiler != "gcc" || flag != "-fsanitize=memory",
+            |compiler, _, flags| {
+                if compiler == "gcc" && flags.iter().any(|flag| flag == "-fsanitize=memory") {
+                    SanitizerProbe::DoesNotLink
+                } else {
+                    SanitizerProbe::Runs
+                }
+            },
         );
         assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
         let note = note.expect("the switch is announced");
@@ -10650,6 +10976,189 @@ mod sanitizer_override_tests {
             "{note}"
         );
         assert!(has_flag(&ov.cflags, "trace-pc-guard"), "{:?}", ov.cflags);
+    }
+
+    /// A runtime that links but cannot start here (GCC's ThreadSanitizer
+    /// under a kernel's high-entropy ASLR) is not kept: clang builds the
+    /// harnesses, and the note names the compiler and what its runtime
+    /// printed. The probe links with the static runtime gcc's harness links.
+    #[test]
+    fn a_runtime_that_cannot_start_switches_to_clang_with_a_note() {
+        const FATAL: &str = "FATAL: ThreadSanitizer: unexpected memory mapping 0x1000-0x2000";
+        let probed = std::cell::RefCell::new(Vec::new());
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=thread".to_owned()),
+            false,
+            true,
+            by_name,
+            |compiler, _, flags| {
+                probed
+                    .borrow_mut()
+                    .push((compiler.to_owned(), flags.to_vec()));
+                if compiler == "gcc" {
+                    SanitizerProbe::FailsAtStartup(FATAL.to_owned())
+                } else {
+                    SanitizerProbe::Runs
+                }
+            },
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CC=gcc") && note.contains(FATAL) && note.contains("clang/clang++"),
+            "{note}"
+        );
+        assert_eq!(
+            probed.into_inner(),
+            vec![(
+                "gcc".to_owned(),
+                vec!["-fsanitize=thread".to_owned(), "-static-libtsan".to_owned()]
+            )]
+        );
+        assert!(has_flag(&ov.cflags, "-fsanitize=thread"), "{:?}", ov.cflags);
+        assert!(has_flag(&ov.cflags, "trace-pc-guard"), "{:?}", ov.cflags);
+        assert!(!has_flag(&ov.cflags, "-static-libtsan"), "{:?}", ov.cflags);
+        // The environment's flags were written for gcc/g++.
+        assert!(!ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+    }
+
+    /// The operator's C++ compiler is checked too, for a C++ harness: with
+    /// only CXX chosen (CC is bhf's clang), a g++ whose ThreadSanitizer
+    /// runtime cannot start used to be kept, and every C++ harness died at
+    /// startup. Now CXX switches to clang++, the note names CXX and the
+    /// runtime's line, and the environment's CXXFLAGS (written for g++) stay
+    /// out. A C harness never probes CXX, so a C-only toolchain keeps its
+    /// compilers whatever its C++ compiler does.
+    #[test]
+    fn a_cpp_compiler_whose_runtime_cannot_start_switches_the_cpp_harnesses() {
+        const FATAL: &str = "FATAL: ThreadSanitizer: unexpected memory mapping 0x1000-0x2000";
+        let fsanitize = || Some("-fsanitize=thread".to_owned());
+        let probed = std::cell::RefCell::new(Vec::new());
+        let probe = |compiler: &str, cpp: bool, flags: &[String]| {
+            probed
+                .borrow_mut()
+                .push((compiler.to_owned(), cpp, flags.to_vec()));
+            if compiler == "g++" {
+                SanitizerProbe::FailsAtStartup(FATAL.to_owned())
+            } else {
+                SanitizerProbe::Runs
+            }
+        };
+        let only_cxx = compilers("clang", "g++", true);
+        let (ov, note) = native_override_for(&only_cxx, fsanitize(), false, true, by_name, probe);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CXX=g++") && note.contains(FATAL) && note.contains("clang++ instead"),
+            "{note}"
+        );
+        assert_eq!(
+            probed.take(),
+            vec![(
+                "g++".to_owned(),
+                true,
+                vec!["-fsanitize=thread".to_owned(), "-static-libtsan".to_owned()]
+            )],
+            "bhf's own clang is not probed, and g++ is probed as C++"
+        );
+        assert!(
+            has_flag(&ov.cxxflags, "trace-pc-guard"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(
+            !has_flag(&ov.cxxflags, "-static-libtsan"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+
+        // A C harness keeps the operator's compilers and never runs g++.
+        let (ov, note) = native_override_for(&only_cxx, fsanitize(), false, false, by_name, probe);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "g++"));
+        assert_eq!(note, None);
+        assert!(probed.take().is_empty());
+        assert!(ov.ambient_cflags && ov.ambient_cxxflags, "{ov:?}");
+
+        // A gcc whose runtime starts keeps building the C units of the C++
+        // harness, as with CC=gcc and no CXX.
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            fsanitize(),
+            false,
+            true,
+            by_name,
+            probe,
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "clang++"));
+        assert!(note.is_some_and(|note| note.contains("CXX=g++")));
+        assert!(has_flag(&ov.cflags, "-static-libtsan"), "{:?}", ov.cflags);
+        assert!(
+            has_flag(&ov.cxxflags, "trace-pc-guard"),
+            "{:?}",
+            ov.cxxflags
+        );
+        assert!(ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+    }
+
+    /// An executable shell script standing in for a compiler: it writes
+    /// `program` (a shell script too) to the file named after `-o`.
+    #[cfg(unix)]
+    fn fake_compiler(dir: &std::path::Path, program: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let body = dir.join("program.sh");
+        std::fs::write(&body, program).unwrap();
+        let compiler = dir.join("widget-cc");
+        std::fs::write(
+            &compiler,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -o ]; then \
+                 cp '{}' \"$2\" && chmod 755 \"$2\" && exit 0; fi\n  shift\ndone\nexit 1\n",
+                body.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        compiler.display().to_string()
+    }
+
+    /// The probe runs the program it linked: one whose runtime aborts at
+    /// startup is caught with the runtime's own line, one that exits
+    /// cleanly runs, and a compiler that cannot link it does not link.
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_probe_runs_the_program_it_linked() {
+        use super::probe_sanitizer_runtime;
+        let flags = ["-fsanitize=thread".to_owned()];
+        let failing = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(
+            failing.path(),
+            "#!/bin/sh\necho 'warning: something unrelated' >&2\n\
+             echo 'FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20' >&2\nkill -ABRT $$\n",
+        );
+        assert_eq!(
+            probe_sanitizer_runtime(&compiler, false, &flags),
+            SanitizerProbe::FailsAtStartup(
+                "FATAL: ThreadSanitizer: unexpected memory mapping 0x10-0x20".to_owned()
+            )
+        );
+        let quiet = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(quiet.path(), "#!/bin/sh\nkill -SEGV $$\n");
+        match probe_sanitizer_runtime(&compiler, true, &flags) {
+            SanitizerProbe::FailsAtStartup(how) => assert!(how.contains("11"), "{how}"),
+            other => panic!("a program killed at startup must fail the probe: {other:?}"),
+        }
+        let clean = tempfile::tempdir().unwrap();
+        let compiler = fake_compiler(clean.path(), "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            probe_sanitizer_runtime(&compiler, false, &flags),
+            SanitizerProbe::Runs
+        );
+        assert_eq!(
+            probe_sanitizer_runtime("/nonexistent/bhf-no-such-cc", false, &flags),
+            SanitizerProbe::DoesNotLink
+        );
     }
 }
 
@@ -13072,6 +13581,24 @@ mod platform_stub_tests {
         };
         let ov = super::cross_compiler_override_with(&sweep, |_, _| true, |_, _| true);
         assert_eq!(ov.target_flags, None);
+    }
+
+    /// The environment's CFLAGS/CXXFLAGS were written for the operator's
+    /// compiler: a platform guard's lane, whose cross compiler bhf picked,
+    /// leaves them out (a host-only `-march=native` failed its build), and a
+    /// whole-sweep target, the operator's own toolchain, takes them.
+    #[test]
+    fn a_guard_lane_leaves_the_ambient_flags_out_and_a_sweep_takes_them() {
+        let lane = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        assert!(lane.guard_lane);
+        let ov = super::cross_compiler_override_with(&lane, |_, _| true, |_, _| true);
+        assert!(!ov.ambient_cflags && !ov.ambient_cxxflags, "{ov:?}");
+        let sweep = CrossTarget {
+            guard_lane: false,
+            ..lane
+        };
+        let ov = super::cross_compiler_override_with(&sweep, |_, _| true, |_, _| true);
+        assert!(ov.ambient_cflags && ov.ambient_cxxflags, "{ov:?}");
     }
 
     #[test]

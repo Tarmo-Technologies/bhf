@@ -2791,8 +2791,8 @@ mod tests {
         // only in the dedicated LIBFUZZER_CXXFLAGS/main_libfuzzer target.
         let cxxflags_line = mk
             .lines()
-            .find(|l| l.trim_start().starts_with("CXXFLAGS ?="))
-            .unwrap_or("");
+            .find(|l| l.trim_start().starts_with("BHF_CXXFLAGS ?="))
+            .expect("the default build's BHF_CXXFLAGS line");
         assert!(
             !cxxflags_line.contains("fuzzer"),
             "C++ default recipe must not link libFuzzer's main:\n{mk}"
@@ -9064,8 +9064,8 @@ mod tests {
         // target for external drivers, so `-fsanitize=fuzzer` is only in it.
         let cxxflags_line = makefile
             .lines()
-            .find(|l| l.trim_start().starts_with("CXXFLAGS ?="))
-            .unwrap_or("");
+            .find(|l| l.trim_start().starts_with("BHF_CXXFLAGS ?="))
+            .expect("the default build's BHF_CXXFLAGS line");
         assert!(
             !cxxflags_line.contains("fuzzer"),
             "passthrough makefile default recipe must drop libFuzzer's main: {makefile}"

@@ -10232,8 +10232,8 @@ mod tests {
         // (Mayhem/libFuzzer/honggfuzz), so `-fsanitize=fuzzer` appears only there.
         let cflags_line = mk
             .lines()
-            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
-            .unwrap_or("");
+            .find(|l| l.trim_start().starts_with("BHF_CFLAGS ?="))
+            .expect("the default build's BHF_CFLAGS line");
         assert!(
             !cflags_line.contains("fuzzer"),
             "default CFLAGS must not enable libFuzzer:\n{mk}"
@@ -10515,8 +10515,8 @@ mod tests {
         // own driver); libFuzzer is a separate opt-in target for external drivers.
         let cflags_line = makefile
             .lines()
-            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
-            .unwrap_or("");
+            .find(|l| l.trim_start().starts_with("BHF_CFLAGS ?="))
+            .expect("the default build's BHF_CFLAGS line");
         assert!(
             !cflags_line.contains("fuzzer"),
             "default CFLAGS must not enable libFuzzer: {makefile}"

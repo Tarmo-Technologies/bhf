@@ -31,9 +31,33 @@ the C/C++ `--sanitizers` matrix.
   RTOS builds — without paying the qemu-user cross-compile tax. `none` is
   standalone; combining it with a real sanitizer is rejected.
 
+With an operator's compiler (`CC`/`CXX`, `--cc`/`--cxx`, `[toolchain]`),
+`--sanitizers` first links a trivial program with the requested sanitizers and
+runs it: with `CC` for every harness, and with `CXX` (as C++) for a C++
+harness. A compiler that cannot link it (gcc has no MemorySanitizer), or whose
+runtime links but aborts before `main` on this host (GCC's ThreadSanitizer
+under a kernel with high-entropy ASLR prints `FATAL: ThreadSanitizer:
+unexpected memory mapping`), is not kept, and bhf says so, naming the variable,
+the compiler and the runtime's message. A failing `CC` sends the C and C++
+harnesses to clang/clang++; a failing `CXX` sends the C++ harnesses to clang++
+and leaves `CC` building their C units. A C-only sweep never runs `CXX`. The
+environment's `CFLAGS` (for `CC`) and `CXXFLAGS` (for `CXX`) are written for
+the compiler bhf left, so they stay out of the clang builds, and the note says
+so when they are set.
+
 A SIGABRT accompanied by a recognizable assertion or panic diagnostic remains an
 input rejection. A silent SIGABRT is saved as a crash because there is no evidence
-that the target intentionally rejected the input.
+that the target intentionally rejected the input. A run whose sanitizer runtime
+could not start (that `FATAL` line, an AddressSanitizer shadow-mapping failure,
+a runtime that is not first in the library list) is never a finding. The first
+fuzz pass that sees it ends the target with an error naming the line and the
+compiler the harness was built with, and no further pass runs. The target's
+outcome is `sanitizer_runtime_unavailable` (`summary.sanitizer_runtime_unavailable`
+in `run.json`, "not fuzzed (sanitizer runtime cannot start on this host)" in the
+summary): an environment problem, which is not filed in the bug report and is
+tried again by `--resume`. Build with a compiler whose runtime starts on the
+host (clang), or pick the sanitizers with `--sanitizers`, which runs the check
+above first.
 
 `--sanitizers` is inert on every lane except native C/C++. Ada uses source
 instrumentation; Rust always applies ASan + sancov through lane-owned

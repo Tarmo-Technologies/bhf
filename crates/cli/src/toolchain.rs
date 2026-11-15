@@ -67,15 +67,19 @@ pub struct CToolchainArgs {
     /// Extra C compiler flags, APPENDED to bhf's coverage and sanitizer flags
     /// (whitespace-separated; repeatable). Their preprocessor words (-D, -U,
     /// -I, -isystem, -include) reach every build lane of a C harness; the
-    /// rest only the lanes built with this toolchain's compiler. Config key:
+    /// rest only the lanes built with this toolchain's compiler. A CFLAGS in
+    /// the environment is appended to the main build too, unless bhf builds
+    /// it with a compiler it picked in place of the operator's (a platform
+    /// guard's cross lane, the --sanitizers clang fallback). Config key:
     /// `toolchain.cflags`.
     #[arg(long = "cflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub cflags: Vec<String>,
 
     /// Extra C++ compiler flags, appended like --cflags (to every lane of a
     /// C++ harness for their preprocessor words). bhf's C driver object takes
-    /// only those that select the ABI or target, -D, -U and -I. Config key:
-    /// `toolchain.cxxflags`.
+    /// only those that select the ABI or target, -D, -U and -I. A CXXFLAGS in
+    /// the environment is appended to the main build too, under the same rule
+    /// as CFLAGS. Config key: `toolchain.cxxflags`.
     #[arg(long = "cxxflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub cxxflags: Vec<String>,
 

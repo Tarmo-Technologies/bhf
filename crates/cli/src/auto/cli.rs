@@ -700,6 +700,12 @@ pub struct AutoArgs {
     /// language lane owns its coverage/error instrumentation, and cross-compiled
     /// qemu-user/wine paths omit host sanitizers.
     ///
+    /// With an operator's compiler (CC/CXX, --cc/--cxx, `[toolchain]`), bhf first
+    /// links and runs a trivial program with the requested sanitizers: with CC
+    /// for every harness and with CXX for a C++ harness. A compiler that cannot
+    /// link it, or whose runtime cannot start on this host, is replaced by
+    /// clang (clang++ for CXX) with a note naming it and the runtime's message.
+    ///
     /// To tame (rather than disable) the FP storm, export the sanitizer's own
     /// options before running — bhf MERGES your inherited `<SAN>_OPTIONS` and
     /// keeps its required keys last, e.g.
@@ -2356,13 +2362,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 return true;
             }
             match crate::auto::report::load_resumed_result(&work, &c.harness_id) {
-                // A missing toolchain is a fact about the host, not the target:
-                // it may be installed by now, so the target is tried again
-                // (unforced; forcing cannot stand in for a toolchain).
+                // A missing toolchain, or a sanitizer runtime that could not
+                // start, is a fact about the host, not the target: it may be
+                // fixed by now, so the target is tried again (unforced;
+                // forcing cannot stand in for a toolchain).
                 Some((prior, _))
                     if matches!(
                         prior.outcome,
                         crate::auto::attempt::Outcome::MissingToolchain { .. }
+                            | crate::auto::attempt::Outcome::SanitizerRuntimeUnavailable { .. }
                     ) =>
                 {
                     true
@@ -4298,6 +4306,10 @@ struct AutoSummary {
     failed_build: usize,
     link_errors: usize,
     runtime_errors: usize,
+    /// Targets whose harness built but whose sanitizer runtime cannot start
+    /// on this host: an environment problem, counted apart from the runtime
+    /// errors of a harness.
+    sanitizer_runtime_unavailable: usize,
     /// M22: targets discovered + statically analyzed but not fuzzed.
     report_only: usize,
     findings: usize,
@@ -4357,6 +4369,7 @@ impl AutoSummary {
         let mut failed_build = 0;
         let mut link_errors = 0;
         let mut runtime_errors = 0;
+        let mut sanitizer_runtime_unavailable = 0;
         let mut report_only = 0;
         let mut findings = 0;
         // Report-only findings are file-level: collect their ids so the
@@ -4451,6 +4464,7 @@ impl AutoSummary {
                 FailedBuild { .. } => failed_build += 1,
                 UnrecoverableLink { .. } => link_errors += 1,
                 UnrecoverableRuntime { .. } => runtime_errors += 1,
+                SanitizerRuntimeUnavailable { .. } => sanitizer_runtime_unavailable += 1,
                 ReportOnly { finding_ids, .. } => {
                     report_only += 1;
                     // M22 (campaign fix): report-only static findings are real
@@ -4530,6 +4544,7 @@ impl AutoSummary {
             failed_build,
             link_errors,
             runtime_errors,
+            sanitizer_runtime_unavailable,
             report_only,
             findings,
             files_fuzzed: files_fuzzed.len(),
@@ -4603,6 +4618,12 @@ impl AutoSummary {
         }
         if self.runtime_errors > 0 {
             outcomes.push(format!("{} runtime error", self.runtime_errors));
+        }
+        if self.sanitizer_runtime_unavailable > 0 {
+            outcomes.push(format!(
+                "{} not fuzzed (sanitizer runtime cannot start on this host)",
+                self.sanitizer_runtime_unavailable
+            ));
         }
         if self.report_only > 0 {
             outcomes.push(format!("{} static-only", self.report_only));
@@ -5260,6 +5281,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         MissingToolchain { .. } => "skipped: toolchain not installed",
         UnrecoverableLink { .. } => "unrecoverable_link",
         UnrecoverableRuntime { .. } => "unrecoverable_runtime",
+        // Not a harness failure: the host cannot start the sanitizer runtime.
+        SanitizerRuntimeUnavailable { .. } => "not fuzzed: sanitizer runtime cannot start here",
         // M22: discovered + statically analyzed, not fuzzed.
         ReportOnly { .. } => "static-only (not fuzzed)",
     }
@@ -5325,6 +5348,7 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
         } => lines.push(format!(
             "{reason} (after {consecutive_crashes} consecutive crash(es))"
         )),
+        SanitizerRuntimeUnavailable { reason, .. } => lines.push(reason.clone()),
         ReportOnly {
             reason,
             dialect,
@@ -7491,6 +7515,7 @@ mod tests {
             failed_build: 8,
             link_errors: 0,
             runtime_errors: 0,
+            sanitizer_runtime_unavailable: 0,
             report_only: 0,
             findings: 112,
             executions: 9876,
@@ -7548,6 +7573,7 @@ mod tests {
             failed_build: 0,
             link_errors: 0,
             runtime_errors: 0,
+            sanitizer_runtime_unavailable: 0,
             report_only: 0,
             findings: 0,
             executions: 0,
@@ -7588,6 +7614,7 @@ mod tests {
             failed_build: 0,
             link_errors: 0,
             runtime_errors: 0,
+            sanitizer_runtime_unavailable: 0,
             report_only: 0,
             findings: 0,
             executions: 0,
@@ -7629,6 +7656,7 @@ mod tests {
             failed_build: 0,
             link_errors: 0,
             runtime_errors: 0,
+            sanitizer_runtime_unavailable: 0,
             report_only: 0,
             findings: 0,
             executions: 0,

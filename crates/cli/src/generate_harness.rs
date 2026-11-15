@@ -8205,18 +8205,18 @@ fn write_c_per_tu_context(output_dir: &Path, contexts: &[PerTuCompileContext]) -
 type ContextVariant = (&'static str, &'static str, &'static str, bool, bool);
 
 const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
-    ("MAIN", "$(CC)", "$(CFLAGS)", true, true),
+    ("MAIN", "$(CC)", "$(BHF_CFLAGS) $(CFLAGS)", true, true),
     ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false, false),
     ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true, false),
     ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true, false),
     ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
     ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
-    ("PROV", "$(CC)", "$(CFLAGS)", true, true),
+    ("PROV", "$(CC)", "$(BHF_CFLAGS) $(CFLAGS)", true, true),
     ("WINAFL", "$(CC)", "$(WINAFL_CFLAGS)", true, true),
 ];
 
 const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
-    ("MAIN", "$(CXX)", "$(CXXFLAGS)", true, true),
+    ("MAIN", "$(CXX)", "$(BHF_CXXFLAGS) $(CXXFLAGS)", true, true),
     ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
@@ -20487,7 +20487,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     }
 
     /// Run `make main` in `dir` with exactly `vars` as compiler settings (the
-    /// ambient CC/CXX/CFLAGS/CXXFLAGS and bhf's family hints are cleared).
+    /// ambient CC/CXX/CFLAGS/CXXFLAGS, bhf's own flags and its family hints
+    /// are cleared).
     fn make_main(dir: &Path, vars: &[(&str, &str)]) -> std::process::Output {
         let mut command = std::process::Command::new("make");
         command.arg("-C").arg(dir).arg("main");
@@ -20496,6 +20497,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "CXX",
             "CFLAGS",
             "CXXFLAGS",
+            "BHF_CFLAGS",
+            "BHF_CXXFLAGS",
             "BHF_CC_FAMILY",
             "BHF_CXX_FAMILY",
         ] {
@@ -20564,6 +20567,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "CXX",
             "CFLAGS",
             "CXXFLAGS",
+            "BHF_CFLAGS",
+            "BHF_CXXFLAGS",
             "BHF_CC_FAMILY",
             "BHF_CXX_FAMILY",
             "BHF_TOOLCHAIN_CFLAGS",
@@ -20912,7 +20917,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             );
         }
         // A build without a sanitizer keeps the platform's fortification.
-        let plain = make_dry_run(&c_dir, &[("BHF_CC_FAMILY", "gcc"), ("CFLAGS", "-O1 -g")]);
+        let plain = make_dry_run(
+            &c_dir,
+            &[("BHF_CC_FAMILY", "gcc"), ("BHF_CFLAGS", "-O1 -g")],
+        );
         assert!(!recipe_for(&plain, MAIN_LINK).contains(&off), "{plain}");
         fs::remove_dir_all(&root).ok();
     }
@@ -21054,6 +21062,105 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         fs::remove_dir_all(&root).ok();
     }
 
+    /// An operator's CFLAGS/CXXFLAGS (from the environment or make's command
+    /// line) follow bhf's own flags in `main`'s recipes instead of replacing
+    /// them, so the sanitizers and coverage stay; BHF_CFLAGS/BHF_CXXFLAGS
+    /// replace bhf's flags. The toolchain stamp records both, bhf's first.
+    #[test]
+    fn operator_cflags_follow_bhfs_own_flags() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-operator-cflags");
+        let c_source = root.join("parse.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_source = root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-OPFLAGS", &root);
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-OPFLAGSX", &root);
+        for (dir, variable, own) in [
+            (&c_dir, "CFLAGS", "BHF_CFLAGS"),
+            (&cpp_dir, "CXXFLAGS", "BHF_CXXFLAGS"),
+        ] {
+            for family in ["clang", "gcc"] {
+                let dry_run = make_dry_run(
+                    dir,
+                    &[
+                        ("BHF_CC_FAMILY", family),
+                        ("BHF_CXX_FAMILY", family),
+                        (variable, "-O2 -DWIDGET_AMBIENT=1"),
+                    ],
+                );
+                let main = recipe_for(&dry_run, MAIN_LINK);
+                let at = |word: &str| main.find(word).unwrap_or_else(|| panic!("{word}: {main}"));
+                assert!(
+                    at("-fsanitize=address") < at("-DWIDGET_AMBIENT=1")
+                        && at("-fsanitize-coverage=") < at("-DWIDGET_AMBIENT=1"),
+                    "{family} {variable}: {main}"
+                );
+                let stamp = recipe_for_stamp(
+                    dir,
+                    &[
+                        ("BHF_CC_FAMILY", family),
+                        ("BHF_CXX_FAMILY", family),
+                        (variable, "-O2 -DWIDGET_AMBIENT=1"),
+                    ],
+                );
+                let flags = stamp.split(" | ").nth(1).unwrap_or_default();
+                assert!(
+                    flags.contains("-fsanitize=address")
+                        && flags.ends_with("-O2 -DWIDGET_AMBIENT=1"),
+                    "{family} {variable}: {stamp}"
+                );
+            }
+            // bhf's own variable replaces its flags.
+            let dry_run = make_dry_run(dir, &[(own, "-O0 -g"), (variable, "-DWIDGET_AMBIENT=1")]);
+            let main = recipe_for(&dry_run, MAIN_LINK);
+            assert!(
+                !main.contains("-fsanitize=address") && main.contains("-O0 -g -DWIDGET_AMBIENT=1"),
+                "{own}: {main}"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `bhf_toolchain.stamp` `make bhf_toolchain.stamp` writes in `dir`
+    /// with exactly `vars` as compiler settings.
+    fn recipe_for_stamp(dir: &Path, vars: &[(&str, &str)]) -> String {
+        let _ = fs::remove_file(dir.join("bhf_toolchain.stamp"));
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).arg("bhf_toolchain.stamp");
+        for key in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
+            "BHF_CFLAGS",
+            "BHF_CXXFLAGS",
+            "BHF_CC_FAMILY",
+            "BHF_CXX_FAMILY",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        fs::read_to_string(dir.join("bhf_toolchain.stamp")).unwrap()
+    }
+
     /// A C unit of a C++ harness is compiled with $(CC), so it takes flags for
     /// $(CC)'s family even when $(CXX) is another family (CC=gcc beside
     /// clang++ used to get clang's `-fno-sanitize=function` and
@@ -21090,24 +21197,46 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             !c_unit.contains("trace-pc-guard") && !c_unit.contains("function,vptr"),
             "{c_unit}"
         );
-        // An explicit CFLAGS is what a C unit of another family gets.
+        // bhf's own C flags from an override (BHF_CFLAGS) are what a C unit
+        // of another family gets, and the operator's CFLAGS follow them.
         let dry_run = make_dry_run(
             &dir,
             &[
                 ("CC", "gcc"),
                 ("CXX", "clang++"),
-                ("CFLAGS", "-O0 -DWIDGET_OWN=1"),
+                ("BHF_CFLAGS", "-O0 -DWIDGET_OWN=1"),
+                ("CFLAGS", "-DWIDGET_AMBIENT=1"),
             ],
         );
-        assert!(
-            recipe_for(&dry_run, "context_objs/main_0.o").contains("-DWIDGET_OWN=1"),
-            "{dry_run}"
-        );
-        // The same family keeps the C++ instrumentation (minus its -std=).
-        let dry_run = make_dry_run(&dir, &[("CC", "clang"), ("CXX", "clang++")]);
         let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
-        assert!(c_unit.contains("trace-pc-guard,trace-cmp"), "{c_unit}");
+        assert!(!c_unit.contains("trace-pc,trace-cmp"), "{c_unit}");
+        let at = |word: &str| {
+            c_unit
+                .find(word)
+                .unwrap_or_else(|| panic!("{word}: {c_unit}"))
+        };
+        assert!(at("-DWIDGET_OWN=1") < at("-DWIDGET_AMBIENT=1"), "{c_unit}");
+        // The same family keeps the C++ instrumentation (minus its -std=),
+        // and CFLAGS follows it.
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CC", "clang"),
+                ("CXX", "clang++"),
+                ("CFLAGS", "-DWIDGET_AMBIENT=1"),
+            ],
+        );
+        let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
         assert!(!c_unit.contains("-std=gnu++"), "{c_unit}");
+        let at = |word: &str| {
+            c_unit
+                .find(word)
+                .unwrap_or_else(|| panic!("{word}: {c_unit}"))
+        };
+        assert!(
+            at("trace-pc-guard,trace-cmp") < at("-DWIDGET_AMBIENT=1"),
+            "{c_unit}"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -23272,8 +23401,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(makefile.contains("-fsanitize-coverage=trace-pc-guard"));
         let cflags_line = makefile
             .lines()
-            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
-            .unwrap_or("");
+            .find(|l| l.trim_start().starts_with("BHF_CFLAGS ?="))
+            .expect("the default build's BHF_CFLAGS line");
         assert!(
             !cflags_line.contains("fuzzer"),
             "default CFLAGS must not enable libFuzzer:\n{makefile}"

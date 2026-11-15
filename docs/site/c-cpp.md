@@ -65,9 +65,21 @@ or `[toolchain] cc`/`cxx` in a config file) choose another compiler, and the
 Makefile picks its instrumentation from the compiler that actually runs: clang
 gets `trace-pc-guard,trace-cmp` coverage and the `function`/`vptr` UBSan
 subtractions, gcc (native or cross-prefixed, `.exe` included) gets
-`trace-pc,trace-cmp` and statically linked sanitizer runtimes. Setting
-`CFLAGS`/`CXXFLAGS` still replaces bhf's flags entirely; use `--cflags` /
-`--cxxflags` (`toolchain.cflags`) to APPEND flags and keep coverage and ASan.
+`trace-pc,trace-cmp` and statically linked sanitizer runtimes. bhf's own
+flags for the `main` build (optimization, debug info, sanitizers and
+coverage) are the Makefile's `BHF_CFLAGS`/`BHF_CXXFLAGS`. A `CFLAGS`/`CXXFLAGS`
+in the environment (a dev shell or an SDK's setup script often exports them)
+or on make's command line comes after them, so it adds flags (a later `-O2`
+wins over bhf's `-O1`) and coverage and the sanitizers stay. `--cflags` /
+`--cxxflags` (`toolchain.cflags`) append as well, and their defines and
+include dirs also reach bhf's driver object and the other lanes. A hand-run
+`make BHF_CFLAGS=...` replaces bhf's flags. The environment's `CFLAGS`/`CXXFLAGS`
+are written for the operator's (or the host's) compiler, so they follow bhf's
+flags only in builds that use it: the operator's compilers, bhf's default
+clang, the gcc retry and an operator's `--target-triple` sweep. They are left
+out, with a note, of a build whose compiler bhf picked in its place: a platform
+guard's cross lane (a host-only `-march=native` would fail the aarch64 build)
+and clang after an operator's compiler fails the `--sanitizers` check.
 The `main` binaries depend on a toolchain stamp (`bhf_toolchain.stamp`), and
 the MemorySanitizer, ThreadSanitizer, coverage and differential lanes on a lane
 stamp of their own (`bhf_lanes.stamp`), so changing a compiler or its flags in
@@ -85,10 +97,11 @@ lane's driver compile takes. Otherwise it links a driver object built by its
 own compiler. A
 compile database's compiler is only the Makefile's default `CC`/`CXX`; it never
 overrides the compiler bhf or the operator selects. `--sanitizers` keeps the
-selected compiler when it can build the requested sanitizers and otherwise
-says which compiler it uses instead. A C translation unit of a C++ harness is
-compiled with `CC` and takes flags spelled for `CC`'s family (with `CFLAGS`
-when the two compilers are of different families and `CFLAGS` is set).
+selected compiler when it builds a program with the requested sanitizers whose
+runtime starts on this host (bhf links and runs a probe with `CC`, and with
+`CXX` for a C++ harness), and otherwise says which compiler it uses instead
+and why (see [Sanitizers](sanitizers.md)). A C translation unit of a C++ harness is
+compiled with `CC` and takes flags spelled for `CC`'s family, then `CFLAGS`.
 `--cflags` also reach bhf's driver object (without `-std=` and `-Werror`; a
 C++ harness's driver takes `--cxxflags` too), so an ABI-selecting flag such as
 `-m32` applies to the whole link. `CC=clang` in the environment is bhf's own
@@ -283,8 +296,8 @@ target applies it in the spelling of the compiler that rebuilds it. Extra
 build input comes from the environment:
 `AUTO_EXTRA_SOURCES` (sources), `AUTO_EXTRA_INCLUDES` (any compile flags:
 `-I`, `-D`, `-include`, `-fms-extensions`), `AUTO_EXTRA_LDFLAGS` (link flags)
-and `CXX_STD`/`C_STD` (language standard). Do not use `CXXFLAGS`/`CFLAGS` for
-this: they replace the sanitizer and coverage flags.
+and `CXX_STD`/`C_STD` (language standard). `CFLAGS`/`CXXFLAGS` are appended
+too, but only to the `main` build; `AUTO_EXTRA_INCLUDES` reaches every lane.
 
 To *recover* a database when none exists, `--probe-build` runs the project's own
 build offline and captures the real compile flags. It detects and drives CMake
@@ -689,8 +702,8 @@ gdb -q -batch -ex 'set debuginfod enabled off' -ex 'break <target>' -ex run -ex 
   (`__ubsan_handle_mul_overflow`) and use `frame 1`.
 - At `-O1` a local can print `<optimized out>`: break at the target's entry,
   where the arguments are live, or rebuild a copy of the harness with
-  `make -B main CFLAGS='-O0 -g -fsanitize=address,undefined'`
-  (`CXXFLAGS='-O0 -g -std=$(CXX_STD) -fsanitize=address,undefined'` for C++).
+  `make -B main CFLAGS=-O0` (`CXXFLAGS=-O0` for C++), which follows bhf's
+  `-O1` and keeps the sanitizers.
 
 ### Harness format version
 

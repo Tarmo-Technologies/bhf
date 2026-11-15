@@ -1881,9 +1881,11 @@ fn a_lane_build_leaves_the_main_toolchain_stamp_alone() {
     )
     .unwrap();
     let flags = "-O1 -g -fsanitize-coverage=trace-pc-guard,trace-cmp";
+    // bhf's own flags for `main`, replaced (BHF_CFLAGS/BHF_CXXFLAGS) by a
+    // build without AddressSanitizer.
     for (source, id, variable) in [
-        ("parse.c", "H-STAMP", "CFLAGS"),
-        ("gadget.cpp", "H-STAMPX", "CXXFLAGS"),
+        ("parse.c", "H-STAMP", "BHF_CFLAGS"),
+        ("gadget.cpp", "H-STAMPX", "BHF_CXXFLAGS"),
     ] {
         let work = tmp.path().join(format!("work-{id}"));
         generate(&src.join(source), id, &work);
@@ -2482,5 +2484,387 @@ fn auto_keeps_the_parent_projects_compiler_switches() {
     assert!(
         out.contains("-gnateDBOARD_REV=7"),
         "the merged switches are named:\n{out}"
+    );
+}
+
+/// The highest `coverage_edges` any pass of `target` recorded.
+fn max_pass_edges(target: &serde_json::Value) -> u64 {
+    target["outcome"]["passes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pass| pass["coverage_edges"].as_u64())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Run `bhf auto` over `src` with `variable` set in its environment (a
+/// dev shell's or an SDK setup script's flags) and the compilers `compilers`
+/// (`None`: bhf's clang default), and check the harness it built kept bhf's
+/// AddressSanitizer and coverage, and took the ambient flags as well.
+fn assert_ambient_flags_are_appended(
+    src: &Path,
+    work: &Path,
+    language: &str,
+    variable: &str,
+    compilers: Option<(&str, &str)>,
+) {
+    let ambient = "-O2 -g -DWIDGET_AMBIENT=1";
+    let mut command = bhf();
+    command
+        .args(auto_args(src, work))
+        .args(["--languages", language, "--per-target-time", "3"])
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .env(variable, ambient);
+    match compilers {
+        Some((cc, cxx)) => command.env("CC", cc).env("CXX", cxx),
+        None => command.env_remove("CC").env_remove("CXX"),
+    };
+    let output = command.output().unwrap();
+    let out = text(&output);
+    let target = target_with_outcome(work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the target must build and fuzz with {variable} set:\n{out}"));
+    let main = harness_main(work, &target);
+    let binary = std::fs::read(&main).expect("read the harness");
+    assert!(
+        binary.windows(11).any(|window| window == b"__asan_init"),
+        "{variable}={ambient} must not drop AddressSanitizer from {}:\n{out}",
+        main.display()
+    );
+    assert!(
+        max_pass_edges(&target) > 0,
+        "{variable}={ambient} must not drop coverage: {target}\n{out}"
+    );
+    let stamp = std::fs::read_to_string(main.with_file_name("bhf_toolchain.stamp")).unwrap();
+    let flags = stamp.split(" | ").nth(1).unwrap_or_default();
+    assert!(
+        flags.contains("-fsanitize=address") && flags.ends_with(ambient),
+        "the ambient flags follow bhf's own: {stamp}"
+    );
+}
+
+/// A CFLAGS or CXXFLAGS in `bhf auto`'s environment adds flags to the
+/// harness build. It used to replace bhf's flags, so the harness was built
+/// without sanitizers and coverage and fuzzed blind, with no word about why.
+#[test]
+fn ambient_cflags_and_cxxflags_add_to_the_harness_flags() {
+    if !have("clang") || !have("clang++") || !have("make") {
+        eprintln!("skip: clang/clang++/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let c_src = tmp.path().join("c-src");
+    write_parser(&c_src);
+    assert_ambient_flags_are_appended(&c_src, &tmp.path().join("work-c"), "c", "CFLAGS", None);
+    let cpp_src = tmp.path().join("cpp-src");
+    std::fs::create_dir_all(&cpp_src).unwrap();
+    std::fs::write(
+        cpp_src.join("gadget.cpp"),
+        "#include <cstddef>\n\
+         int parse_record(const unsigned char *data, std::size_t size) {\n\
+         \x20   if (size > 2 && data[0] == 'W' && data[1] == 'X') return 2;\n\
+         \x20   return size ? data[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    assert_ambient_flags_are_appended(
+        &cpp_src,
+        &tmp.path().join("work-cpp"),
+        "cpp",
+        "CXXFLAGS",
+        None,
+    );
+    if have("gcc") && have("g++") {
+        assert_ambient_flags_are_appended(
+            &c_src,
+            &tmp.path().join("work-gcc"),
+            "c",
+            "CFLAGS",
+            Some(("gcc", "g++")),
+        );
+    }
+}
+
+/// What a sanitizer runtime prints when it cannot start on the host (GCC's
+/// ThreadSanitizer under a kernel's high-entropy ASLR).
+const RUNTIME_START_FAILURE: &str =
+    "FATAL: ThreadSanitizer: unexpected memory mapping 0x7f0000000000-0x7f0000001000";
+
+/// A C compiler named `widget-cc` in `dir`: clang, except that every program
+/// it links aborts before `main` with [`RUNTIME_START_FAILURE`], as a
+/// sanitizer runtime that cannot start here does.
+#[cfg(unix)]
+fn compiler_whose_programs_fail_at_startup(dir: &Path) -> PathBuf {
+    wrapper_whose_programs_fail_at_startup(dir, "widget-cc", "clang")
+}
+
+/// A compiler named `name` in `dir` that runs `real`, except that every
+/// program it links aborts before `main` with [`RUNTIME_START_FAILURE`].
+#[cfg(unix)]
+fn wrapper_whose_programs_fail_at_startup(dir: &Path, name: &str, real: &str) -> PathBuf {
+    // The constructor is compiled by `real`, in its own language.
+    let constructor = dir.join(if real.ends_with("++") {
+        "start_failure.cpp"
+    } else {
+        "start_failure.c"
+    });
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        &constructor,
+        format!(
+            "#include <stdio.h>\n#include <stdlib.h>\n\
+             __attribute__((constructor)) static void widget_runtime_start(void) {{\n\
+             \x20   fputs(\"{RUNTIME_START_FAILURE}\\n\", stderr);\n\
+             \x20   abort();\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let cc = dir.join(name);
+    write_script(
+        &cc,
+        &format!(
+            "#!/bin/sh\n\
+             link=no\n\
+             for arg in \"$@\"; do case \"$arg\" in -o) link=yes;; esac; done\n\
+             for arg in \"$@\"; do case \"$arg\" in -c|-E|-S|-fsyntax-only) link=no;; esac; done\n\
+             if [ \"$link\" = yes ]; then exec {real} \"$@\" -x none '{}'; fi\n\
+             exec {real} \"$@\"\n",
+            constructor.display()
+        ),
+    );
+    cc
+}
+
+/// The sanitizer logs of every finding `work` recorded.
+fn finding_logs(work: &Path) -> Vec<String> {
+    std::fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("sanitizer.log")).ok())
+        .collect()
+}
+
+/// `--sanitizers` checks that the operator's compiler builds a program whose
+/// sanitizer runtime STARTS, not only one that links. A runtime that links
+/// but aborts at startup used to be kept: every input then died with the
+/// runtime's FATAL line, which became HIGH findings. Now clang builds the
+/// harnesses, and the note names the compiler and what its runtime printed.
+#[cfg(unix)]
+#[test]
+fn a_sanitizer_runtime_that_cannot_start_is_not_kept() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let cc = compiler_whose_programs_fail_at_startup(&tmp.path().join("toolchain"));
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--languages", "c", "--per-target-time", "3"])
+        .args(["--sanitizers", "asan"])
+        .env("CC", &cc)
+        .env("CXX", "clang++")
+        // Flags written for the operator's compiler.
+        .env("CFLAGS", "-DWIDGET_AMBIENT=1")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(
+        out.contains("CC=") && out.contains("widget-cc") && out.contains(RUNTIME_START_FAILURE),
+        "the switch names the compiler and its runtime's error:\n{out}"
+    );
+    assert!(out.contains("clang/clang++ instead"), "{out}");
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("clang must build and fuzz the target:\n{out}"));
+    assert!(max_pass_edges(&target) > 0, "{target}\n{out}");
+    // clang is not the compiler the environment's CFLAGS were written for:
+    // they stay out of its build, and the note says so.
+    assert!(
+        out.contains(
+            "CFLAGS from the environment, written for the operator's compiler, are left out"
+        ),
+        "{out}"
+    );
+    let stamp =
+        std::fs::read_to_string(harness_main(&work, &target).with_file_name("bhf_toolchain.stamp"))
+            .unwrap();
+    assert!(!stamp.contains("WIDGET_AMBIENT"), "{stamp}");
+    for log in finding_logs(&work) {
+        assert!(!log.contains("unexpected memory mapping"), "{log}\n{out}");
+    }
+}
+
+/// A harness whose sanitizer runtime cannot start (here bhf's default
+/// sanitizers, which skip the startup probe, with a compiler whose programs
+/// abort at startup) reports an environment error naming the runtime's
+/// message, never a finding. Every input used to come back a HIGH
+/// "reachable crash" whose sanitizer log was that one FATAL line.
+#[cfg(unix)]
+#[test]
+fn a_sanitizer_runtime_start_failure_is_never_a_finding() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let cc = compiler_whose_programs_fail_at_startup(&tmp.path().join("toolchain"));
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--languages", "c", "--per-target-time", "3"])
+        .env("CC", &cc)
+        .env("CXX", "clang++")
+        .env_remove("CFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let logs = finding_logs(&work);
+    assert!(
+        logs.is_empty(),
+        "no finding may be recorded: {logs:?}\n{out}"
+    );
+    assert!(
+        out.contains(RUNTIME_START_FAILURE) && out.contains("could not start"),
+        "the run names the runtime's error:\n{out}"
+    );
+    // An environment problem with its own outcome, naming the compiler, not
+    // the safety rail's runtime error of a faulty harness; and the passes
+    // stop at the first that reports it.
+    let target = target_with_outcome(&work, &["sanitizer_runtime_unavailable"])
+        .unwrap_or_else(|| panic!("the target's outcome names the environment problem:\n{out}"));
+    let reason = target["outcome"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains(RUNTIME_START_FAILURE) && reason.contains("widget-cc"),
+        "{reason}"
+    );
+    let summary = &run_json(&work)["summary"];
+    assert_eq!(summary["sanitizer_runtime_unavailable"], 1, "{summary}");
+    assert_eq!(summary["unrecoverable_runtime"], 0, "{summary}");
+    assert!(
+        out.contains("1 not fuzzed (sanitizer runtime cannot start on this host)")
+            && !out.contains("1 runtime error"),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("fuzz pass `").count(),
+        1,
+        "one pass reports it, and no other runs:\n{out}"
+    );
+    let bug_report = std::fs::read_to_string(work.join("auto/bug-report.md")).unwrap_or_default();
+    assert!(
+        !bug_report.contains("could not start"),
+        "an environment problem is not a bhf defect:\n{bug_report}"
+    );
+}
+
+/// `--sanitizers` checks the operator's C++ compiler too, for a C++ harness.
+/// With only CXX chosen, a C++ compiler whose sanitizer runtime links but
+/// cannot start used to be kept (CC, bhf's clang, passed the check), and
+/// every C++ harness died at startup. Now clang++ builds the C++ harnesses,
+/// and the note names CXX and what its runtime printed.
+#[cfg(unix)]
+#[test]
+fn a_cpp_compiler_whose_sanitizer_runtime_cannot_start_is_not_kept() {
+    if !have("clang") || !have("clang++") || !have("make") {
+        eprintln!("skip: clang/clang++/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("gadget.cpp"),
+        "#include <cstddef>\n\
+         int parse_record(const unsigned char *data, std::size_t size) {\n\
+         \x20   if (size > 2 && data[0] == 'W' && data[1] == 'X') return 2;\n\
+         \x20   return size ? data[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let cxx = wrapper_whose_programs_fail_at_startup(
+        &tmp.path().join("toolchain"),
+        "widget-c++",
+        "clang++",
+    );
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--languages", "cpp", "--per-target-time", "3"])
+        .args(["--sanitizers", "asan"])
+        .env_remove("CC")
+        .env("CXX", &cxx)
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(
+        out.contains("CXX=") && out.contains("widget-c++") && out.contains(RUNTIME_START_FAILURE),
+        "the switch names the C++ compiler and its runtime's error:\n{out}"
+    );
+    assert!(out.contains("with clang++ instead"), "{out}");
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("clang++ must build and fuzz the target:\n{out}"));
+    assert!(max_pass_edges(&target) > 0, "{target}\n{out}");
+    let stamp =
+        std::fs::read_to_string(harness_main(&work, &target).with_file_name("bhf_toolchain.stamp"))
+            .unwrap();
+    assert!(stamp.starts_with("clang++ "), "{stamp}");
+    for log in finding_logs(&work) {
+        assert!(!log.contains("unexpected memory mapping"), "{log}\n{out}");
+    }
+}
+
+/// A platform guard's cross lane builds with a cross compiler bhf picked,
+/// not the operator's, so the environment's CFLAGS (written for the host's
+/// compiler) stay out of it. Once CFLAGS added to bhf's flags, a host-only
+/// `-march=native` reached the aarch64 lane and the target failed to build.
+#[test]
+fn the_environments_cflags_stay_out_of_a_guard_lane() {
+    let tools = ["aarch64-linux-gnu-gcc", "qemu-aarch64", "make"];
+    if tools.iter().any(|tool| !have(tool)) || std::env::consts::ARCH != "x86_64" {
+        eprintln!("skip: needs {tools:?} on an x86_64 host");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("arm64")).unwrap();
+    std::fs::write(
+        src.join("arm64/parse_lane.c"),
+        "#if !defined(__aarch64__)\n#error built for the wrong target\n#endif\n\
+         #include <stddef.h>\n\
+         int parse_record(const unsigned char *data, size_t size) {\n\
+             return size > 1 ? data[0] ^ data[1] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--languages", "c", "--per-target-time", "3"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .env("CFLAGS", "-O2 -march=native")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the aarch64 lane must build and fuzz with CFLAGS set:\n{out}"));
+    let main = harness_main(&work, &target);
+    assert_eq!(elf_machine(&main), EM_AARCH64);
+    let stamp = std::fs::read_to_string(main.with_file_name("bhf_toolchain.stamp")).unwrap();
+    assert!(!stamp.contains("-march=native"), "{stamp}");
+    assert!(
+        out.contains("CFLAGS from the environment")
+            && out.contains("left out of the aarch64-linux-gnu cross builds"),
+        "the run says the flags were left out:\n{out}"
     );
 }

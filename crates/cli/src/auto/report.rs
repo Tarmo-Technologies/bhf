@@ -114,6 +114,11 @@ struct Summary {
     /// outcome). 0 (omitted) when none was.
     #[serde(skip_serializing_if = "is_zero")]
     missing_toolchain: usize,
+    /// Targets whose harness built but whose sanitizer runtime cannot start
+    /// on this host (outcome `sanitizer_runtime_unavailable`; an environment
+    /// problem, not a finding). 0 (omitted) when none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    sanitizer_runtime_unavailable: usize,
     unrecoverable_link: usize,
     unrecoverable_runtime: usize,
     /// M22: targets discovered + statically analyzed but not fuzzed (legacy
@@ -1230,6 +1235,20 @@ pub fn write_reports_with_output_limit(
             Outcome::MissingToolchain { .. } => {
                 summary.missing_toolchain += 1;
             }
+            Outcome::SanitizerRuntimeUnavailable { repairs, .. } => {
+                summary.sanitizer_runtime_unavailable += 1;
+                aggregate_repairs(
+                    repairs,
+                    &id,
+                    &mut bag_headers,
+                    &mut bag_types,
+                    &mut bag_declared,
+                    &mut bag_blind,
+                    &mut bag_ada_stub_units,
+                    &mut bag_ada_stub_symbols,
+                    &mut bag_macros,
+                );
+            }
             Outcome::UnrecoverableLink { missing, .. } => {
                 summary.unrecoverable_link += 1;
                 for m in missing {
@@ -2241,6 +2260,7 @@ fn missing_language_package(outcome: &Outcome) -> Option<String> {
         | Outcome::Built { .. }
         | Outcome::UnrecoverableLink { .. }
         | Outcome::UnrecoverableRuntime { .. }
+        | Outcome::SanitizerRuntimeUnavailable { .. }
         | Outcome::ReportOnly { .. } => return None,
     };
     let at = reason.find("missing module `")?;
@@ -2263,7 +2283,8 @@ fn add_checkpoint_result(
         | Outcome::Built { repairs, .. }
         | Outcome::FailedBuild { repairs, .. }
         | Outcome::UnrecoverableLink { repairs, .. }
-        | Outcome::UnrecoverableRuntime { repairs, .. } => repairs,
+        | Outcome::UnrecoverableRuntime { repairs, .. }
+        | Outcome::SanitizerRuntimeUnavailable { repairs, .. } => repairs,
         Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
         | Outcome::MissingToolchain { .. }
@@ -2526,7 +2547,8 @@ fn add_checkpoint_result(
         Outcome::Built { .. }
         | Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
-        | Outcome::MissingToolchain { .. } => {}
+        | Outcome::MissingToolchain { .. }
+        | Outcome::SanitizerRuntimeUnavailable { .. } => {}
     }
 }
 
@@ -3069,6 +3091,13 @@ fn render_md(r: &RunJson<'_>) -> String {
             s,
             "Skipped (toolchain not installed): {}",
             r.summary.missing_toolchain
+        );
+    }
+    if r.summary.sanitizer_runtime_unavailable > 0 {
+        let _ = writeln!(
+            s,
+            "Not fuzzed (sanitizer runtime cannot start on this host): {}",
+            r.summary.sanitizer_runtime_unavailable
         );
     }
     let _ = writeln!(s, "Unrecoverable link: {}", r.summary.unrecoverable_link);
