@@ -81,6 +81,10 @@
           "description": "The faked resources the runtrace shim served bytes to while the input replayed and crashed ([] when none). Added after the first v1 release; absent when the shim was not loaded for the replay, the replay did not crash, or the capture predates it.",
           "type": "array",
           "items": { "type": "string" }
+        },
+        "harness": {
+          "description": "The harness binary the capture replayed, by file name, in place of the one the finding was fuzzed with (fixture_path): the driver build main beside an AFL++ build main_afl, compiled from the same harness source with bhf's comparison-recording driver. Added after the first v1 release; absent when the finding's own binary was replayed, and when the capture is unavailable (nothing was replayed).",
+          "type": "string"
         }
       }
     },

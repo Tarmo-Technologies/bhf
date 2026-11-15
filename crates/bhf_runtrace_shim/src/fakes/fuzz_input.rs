@@ -353,6 +353,7 @@ pub fn points_into_read_only_image(addr: *const u8) -> bool {
 /// [`format_is_input_controlled`], which also excludes literals in the
 /// program's read-only data.
 pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
+    let _own = crate::reentrancy::OwnWork::enter();
     if needle.is_empty() || needle.len() < min_len {
         return None;
     }
@@ -383,6 +384,7 @@ pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
 /// occasional coincidental run on one input is harmless because the CLI-side
 /// correlator suppresses any command also executed *without* taint.
 pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usize)> {
+    let _own = crate::reentrancy::OwnWork::enter();
     if min_len == 0 || haystack.len() < min_len {
         return None;
     }

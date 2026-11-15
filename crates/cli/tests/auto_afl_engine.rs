@@ -217,3 +217,133 @@ fn an_afl_member_store_past_a_heap_block_is_an_asan_heap_buffer_overflow() {
         "no object-size finding: {findings:#?}"
     );
 }
+
+/// A heap read past a 4-byte block behind two one-byte checks, fuzzed by
+/// AFL++ alone. AFL++ fuzzes `main_afl`, which has no bhf driver; the
+/// finding's comparison evidence is recorded by replaying its input through
+/// the driver build `main` beside it, so `finding.json` carries the gates
+/// the input passed and the results index carries them as input-to-state
+/// evidence.
+#[test]
+fn an_afl_finding_records_the_comparison_evidence_of_its_input() {
+    if !afl_present() || !which("make") || !which("clang") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast, clang or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("tag.c"),
+        "#include <stdlib.h>\n\
+         #include <string.h>\n\
+         int parse_tag(const unsigned char *d, size_t n) {\n\
+         \x20   char *slot;\n\
+         \x20   int r;\n\
+         \x20   if (n < 3 || d[0] != 'T' || d[1] != 'G') return 0;\n\
+         \x20   slot = malloc(4);\n\
+         \x20   if (!slot) return 0;\n\
+         \x20   memset(slot, 0, 4);\n\
+         \x20   r = slot[d[2] & 0x0f];\n\
+         \x20   free(slot);\n\
+         \x20   return r;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--engine",
+            "afl++",
+            "--per-target-time",
+            "20",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+            "--no-discovery-cache",
+        ])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let findings: Vec<serde_json::Value> = std::fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path().join("finding.json")).ok()?;
+            serde_json::from_str(&text).ok()
+        })
+        .collect();
+    let finding = findings
+        .iter()
+        .find(|finding| finding["exception"]["name"] == "ASAN_HEAP_BUFFER_OVERFLOW")
+        .unwrap_or_else(|| panic!("no heap-buffer-overflow: {findings:#?}\n{log}"));
+    assert!(
+        finding["fixture_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("main_afl")),
+        "an AFL++ finding: {finding:#}"
+    );
+    let capture = &finding["gate_capture"];
+    assert_eq!(capture["status"], "recorded", "{finding:#}\n{log}");
+    assert_eq!(capture["harness"], "main", "{finding:#}");
+    let gates = finding["gates"].as_array().expect("gates recorded");
+    for (offset, constant) in [(0, "54"), (1, "47")] {
+        assert!(
+            gates.iter().any(|gate| gate["offset"] == offset
+                && gate["len"] == 1
+                && gate["compared_with_hex"] == constant),
+            "no gate at byte {offset} compared with {constant}: {finding:#}"
+        );
+    }
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(work.join("results/findings.json")).unwrap())
+            .unwrap();
+    let id = finding["id"].as_str().unwrap();
+    let indexed = index["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("{id} is not in the results index: {index:#}"));
+    assert!(
+        indexed["fuzz"]["input_to_state"]
+            .as_array()
+            .is_some_and(|evidence| !evidence.is_empty()),
+        "{indexed:#}"
+    );
+    let csv = std::fs::read_to_string(work.join("results/findings.csv")).unwrap();
+    let row = csv
+        .lines()
+        .find(|line| line.starts_with(&format!("{id},")))
+        .unwrap_or_else(|| panic!("{id} is not in findings.csv: {csv}"));
+    assert!(row.contains("0:1:cmp:54"), "{row}");
+    let sarif: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(work.join("results/findings.sarif")).unwrap(),
+    )
+    .unwrap();
+    let result = sarif["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|run| run["results"].as_array().cloned().unwrap_or_default())
+        .find(|result| result["properties"]["bhfFindingId"] == id)
+        .unwrap_or_else(|| panic!("{id} is not in findings.sarif"));
+    assert!(
+        result["properties"]["bhfInputToState"]
+            .as_array()
+            .is_some_and(|evidence| !evidence.is_empty()),
+        "{result:#}"
+    );
+}

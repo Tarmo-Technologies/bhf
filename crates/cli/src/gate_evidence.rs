@@ -426,6 +426,14 @@ pub(crate) struct CaptureSummary {
     /// for it, the replay did not crash, or the capture predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) served_resources: Option<Vec<String>>,
+    /// The harness binary the replays ran, by file name, in place of the one
+    /// the finding was fuzzed with (`fixture_path`): the driver build `main`
+    /// beside an AFL++ build `main_afl`, which is compiled from the same
+    /// harness source without bhf's driver ([`evidence_harness`]). `None`
+    /// when the finding's own binary was replayed, and for an `unavailable`
+    /// capture, which replayed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) harness: Option<String>,
 }
 
 impl CaptureSummary {
@@ -472,6 +480,7 @@ impl Capture {
                 derived_search: None,
                 searched_bytes: None,
                 served_resources: None,
+                harness: None,
             },
         }
     }
@@ -480,9 +489,16 @@ impl Capture {
 /// How to replay the harness.
 pub(crate) struct Replay<'a> {
     pub(crate) harness: &'a Path,
+    /// The AFL++ build the finding was fuzzed with, when `harness` is the
+    /// driver build beside it, replayed in its place ([`evidence_harness`]).
+    /// A capture that replayed then names `harness` (`gate_capture.harness`).
+    pub(crate) in_place_of: Option<&'a Path>,
     /// The finding's record: its leak rule, recorded runtime mode and
     /// injected environment shape the replay as `bhf replay` does.
     pub(crate) raw: &'a Value,
+    /// The work dir the finding belongs to: where the harness's generation
+    /// metadata is looked up when it cannot record comparisons.
+    pub(crate) work_dir: &'a Path,
     /// Scratch directory for inputs and evidence files; created and removed.
     pub(crate) scratch: PathBuf,
     /// Where the baseline run's runtrace events go (the shim is preloaded for
@@ -518,6 +534,185 @@ pub(crate) fn harness_records_evidence(harness: &Path) -> bool {
     }
 }
 
+/// Whether `harness` is a harness's AFL++ build (`main_afl`): its `main.c`
+/// compiled by `afl-clang-fast` without bhf's driver.
+fn is_afl_build(harness: &Path) -> bool {
+    matches!(
+        harness.file_name().and_then(|name| name.to_str()),
+        Some("main_afl" | "main_afl.exe")
+    )
+}
+
+/// The binary a finding's comparison evidence is recorded with
+/// ([`harness_for_finding`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvidenceHarness {
+    /// The binary to replay.
+    pub(crate) binary: PathBuf,
+    /// The AFL++ build the finding was fuzzed with, when `binary` is the
+    /// driver build beside it, chosen in its place.
+    pub(crate) in_place_of: Option<PathBuf>,
+}
+
+/// The binary a finding's comparison evidence is recorded with: `harness`,
+/// or, for an AFL++ build that has no driver recording comparisons, the
+/// driver build `main` beside it when that one records them. Both are built
+/// from the same harness source and decode an input into the same
+/// arguments; only `main` links bhf's driver.
+pub(crate) fn evidence_harness(harness: PathBuf) -> EvidenceHarness {
+    let own = |binary: PathBuf| EvidenceHarness {
+        binary,
+        in_place_of: None,
+    };
+    if !is_afl_build(&harness) || harness_records_evidence(&harness) {
+        return own(harness);
+    }
+    let Some(dir) = harness.parent() else {
+        return own(harness);
+    };
+    let driver_build = crate::auto::layout::harness_exe(dir, "main");
+    if driver_build.is_file() && harness_records_evidence(&driver_build) {
+        EvidenceHarness {
+            binary: driver_build,
+            in_place_of: Some(harness),
+        }
+    } else {
+        own(harness)
+    }
+}
+
+/// The first C/C++ harness input format ([`harness_gen::HARNESS_FORMAT_VERSION`])
+/// that only a bhf whose driver records comparisons generates. A C or C++
+/// harness generated with an earlier format can predate that driver.
+const FIRST_FORMAT_WITH_COMPARISON_DRIVER: u32 = 4;
+
+/// Why the harness `replay` runs cannot record comparison evidence: it has no
+/// driver that records comparisons ([`harness_records_evidence`]).
+fn no_driver_reason(replay: &Replay<'_>) -> String {
+    let harness = replay.harness;
+    let name = harness
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| harness.display().to_string());
+    let own_dir = harness.parent().map(Path::to_path_buf);
+    let harness_id = replay
+        .raw
+        .get("harness_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = own_dir.iter().cloned().collect();
+    if !harness_id.is_empty() {
+        for dir in crate::repro_lane::harness_dirs(replay.work_dir, harness_id) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    let make_main = |dir: &Path| {
+        if dir.join("Makefile").is_file() {
+            format!("; `make main` in {} builds it", dir.display())
+        } else {
+            String::new()
+        }
+    };
+    if is_afl_build(harness) {
+        let lead = format!(
+            "the AFL++ build {name} is compiled without bhf's driver, so it records no \
+             comparisons; they are recorded by replaying the driver build `main` beside it"
+        );
+        let Some(dir) = own_dir.as_deref() else {
+            return lead;
+        };
+        let driver_build = crate::auto::layout::harness_exe(dir, "main");
+        if !driver_build.is_file() {
+            return format!("{lead}, which was not found{}", make_main(dir));
+        }
+        return format!(
+            "{lead}, and {}",
+            c_family_reason(&driver_build, &dirs, make_main(dir))
+        );
+    }
+    match crate::repro_lane::harness_language(&dirs, harness_id) {
+        Some(language) if !links_comparison_driver(&language) => format!(
+            "comparison evidence is recorded only for harnesses built with bhf's driver, which \
+             the {} lanes link, and this is a {} harness",
+            comparison_driver_lane_names(),
+            crate::repro_lane::language_name(&language)
+        ),
+        // Rust links the driver as its `main.c`; Fortran and COBOL build
+        // through the C harness and its Makefile. None records generation
+        // metadata, so the binary alone cannot say which bhf built it.
+        Some(language) if !is_c_family(&language) => format!(
+            "{name} has no bhf driver that records comparisons, though bhf's {} lane links \
+             that driver into every harness it builds: this one was built by an earlier bhf \
+             or some other way; re-run `bhf auto` with this bhf to rebuild it and record them",
+            crate::repro_lane::language_name(&language)
+        ),
+        _ => {
+            let hint = own_dir.as_deref().map(make_main).unwrap_or_default();
+            c_family_reason(harness, &dirs, hint)
+        }
+    }
+}
+
+/// The lanes whose harnesses `bhf auto` builds with bhf's C driver
+/// (`c_runtime/bhf_driver.c`), the one that records comparisons: C and C++,
+/// Rust (the driver is its `main.c`), and Fortran and COBOL (built through
+/// the C harness and its Makefile).
+const COMPARISON_DRIVER_LANES: &[&str] = &["c", "cpp", "rust", "fortran", "cobol"];
+
+fn is_c_family(language: &str) -> bool {
+    matches!(language, "c" | "cpp" | "c++" | "cxx")
+}
+
+/// Whether harnesses of the lane `language` link bhf's comparison driver.
+fn links_comparison_driver(language: &str) -> bool {
+    is_c_family(language) || COMPARISON_DRIVER_LANES.contains(&language)
+}
+
+/// `C, C++, Rust, Fortran and COBOL`: the lanes in [`COMPARISON_DRIVER_LANES`].
+fn comparison_driver_lane_names() -> String {
+    let names: Vec<String> = COMPARISON_DRIVER_LANES
+        .iter()
+        .map(|tag| crate::repro_lane::language_name(tag))
+        .collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
+/// Why the C or C++ harness binary `binary`, whose harness dirs are `dirs`,
+/// records no comparisons. `hint` says how to build it there, if bhf can.
+fn c_family_reason(binary: &Path, dirs: &[PathBuf], hint: String) -> String {
+    let name = binary
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| binary.display().to_string());
+    match dirs
+        .iter()
+        .find_map(|dir| crate::generate_harness::recorded_harness_format(dir))
+    {
+        Some(format) if format.version < FIRST_FORMAT_WITH_COMPARISON_DRIVER => format!(
+            "{name} comes from a harness an earlier bhf generated (harness input format {}), \
+             before its driver recorded comparisons; rebuild the harness with this bhf to \
+             record them",
+            format.version
+        ),
+        Some(_) => format!(
+            "{name} has no bhf driver that records comparisons, though this bhf generated its \
+             harness: the binary was built some other way{hint}"
+        ),
+        None => format!(
+            "{name} has no bhf driver that records comparisons, and no generation metadata \
+             beside it says bhf generated its harness; comparison evidence is recorded only \
+             for harnesses bhf generated and built with its driver, which the {} lanes link",
+            comparison_driver_lane_names()
+        ),
+    }
+}
+
 /// Replay `input` (named `input_name`) and return the comparison evidence.
 pub(crate) fn capture(replay: &Replay<'_>, input: &[u8], input_name: &str) -> Capture {
     capture_with(
@@ -539,6 +734,25 @@ fn capture_with(
     symbolizer: Option<PathBuf>,
     limits: Limits,
 ) -> Capture {
+    let mut capture = capture_checked(replay, input, input_name, symbolizer, limits);
+    // Only a replay that ran names the binary, and only the driver build
+    // run in place of the finding's AFL++ build.
+    if capture.summary.status != "unavailable" && replay.in_place_of.is_some() {
+        capture.summary.harness = replay
+            .harness
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    capture
+}
+
+fn capture_checked(
+    replay: &Replay<'_>,
+    input: &[u8],
+    input_name: &str,
+    symbolizer: Option<PathBuf>,
+    limits: Limits,
+) -> Capture {
     if !replay.harness.is_file() {
         return Capture::unavailable(
             input_name,
@@ -550,13 +764,7 @@ fn capture_with(
         );
     }
     if !harness_records_evidence(replay.harness) {
-        return Capture::unavailable(
-            input_name,
-            input.len(),
-            "the harness was built without a driver that records comparisons \
-             (built by an earlier bhf, or not by bhf); rebuild it to record them"
-                .to_owned(),
-        );
+        return Capture::unavailable(input_name, input.len(), no_driver_reason(replay));
     }
     if let Err(error) = std::fs::create_dir_all(&replay.scratch) {
         return Capture::unavailable(
@@ -645,6 +853,7 @@ fn capture_in(
         derived_search: None,
         searched_bytes: None,
         served_resources: runner.served_resources.take(),
+        harness: None,
     };
     let mut gates = Vec::new();
     if input.is_empty() {
@@ -1963,12 +2172,15 @@ pub(crate) fn preferred_input(finding_dir: &Path) -> Option<(&'static str, Vec<u
         .find_map(|name| Some((name, std::fs::read(finding_dir.join(name)).ok()?)))
 }
 
-/// The harness binary a finding replays against, as minimization finds it.
+/// The harness binary a finding's comparison evidence is recorded with: the
+/// one minimization replays, or for an AFL++ finding the driver build beside
+/// its `main_afl` ([`evidence_harness`]). `bhf auto`, `bhf report --backfill`
+/// and `bhf explain` all record it with this one.
 pub(crate) fn harness_for_finding(
     work_dir: &Path,
     finding_dir: &Path,
     raw: &Value,
-) -> Option<PathBuf> {
+) -> Option<EvidenceHarness> {
     let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
     let pick = crate::auto::minimize_pass::Pick {
         id: text("id").unwrap_or_default(),
@@ -1976,7 +2188,7 @@ pub(crate) fn harness_for_finding(
         harness_id: text("harness_id"),
         fixture_path: text("fixture_path"),
     };
-    crate::auto::minimize_pass::harness_for(work_dir, &pick)
+    crate::auto::minimize_pass::harness_for(work_dir, &pick).map(evidence_harness)
 }
 
 /// After fuzzing and minimization, `bhf auto` records the comparison evidence
@@ -2026,7 +2238,7 @@ pub(crate) fn run_pass(work_dir: &Path) -> (usize, usize) {
         let Some(harness) = harness_for_finding(work_dir, &dir, &raw) else {
             continue;
         };
-        if !harness_records_evidence(&harness) {
+        if !harness_records_evidence(&harness.binary) {
             continue;
         }
         let remaining = PASS_BUDGET.saturating_sub(started.elapsed());
@@ -2035,8 +2247,10 @@ pub(crate) fn run_pass(work_dir: &Path) -> (usize, usize) {
             continue;
         }
         let replay = Replay {
-            harness: &harness,
+            harness: &harness.binary,
+            in_place_of: harness.in_place_of.as_deref(),
             raw: &raw,
+            work_dir,
             scratch: dir.join(".gate-capture"),
             runtrace_log: Some(dir.join(FINDING_RUNTRACE)),
             deadline: Instant::now() + PER_FINDING.min(remaining),
@@ -2131,6 +2345,7 @@ mod tests {
             derived_search: Some("done".to_owned()),
             searched_bytes: Some(4),
             served_resources: Some(vec!["/etc/widget.conf".to_owned()]),
+            harness: Some("main".to_owned()),
         };
         let recorded = serde_json::to_value(&summary).unwrap();
         for key in recorded.as_object().unwrap().keys() {
@@ -2139,6 +2354,290 @@ mod tests {
                 "the schema does not list gate_capture.{key}"
             );
         }
+    }
+
+    /// A harness dir in `work` holding the files `binaries` names, each with
+    /// the given bytes (a file that holds [`DRIVER_MARKER`] reads as a driver
+    /// build), and a finding fuzzed with `fixture` (a file name in it).
+    fn harness_files(
+        work: &Path,
+        harness_id: &str,
+        binaries: &[(&str, &[u8])],
+        fixture: &str,
+    ) -> (PathBuf, PathBuf, Value) {
+        let dir = crate::auto::layout::harness_dir(work, harness_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in binaries {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let finding = corpus::layout::findings_dir(work).join("F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding).unwrap();
+        let fixture_path = format!("harnesses/{harness_id}/{fixture}");
+        let raw = json!({
+            "id": "F-0001-0a0b0c0d",
+            "harness_id": harness_id,
+            "classification": "unhandled",
+            "fixture_path": fixture_path,
+        });
+        (dir, finding, raw)
+    }
+
+    const DRIVER_BUILD: &[u8] = b"\x7fELF ... getenv(BHF_CMP_EVIDENCE) ...";
+    const AFL_BUILD: &[u8] = b"\x7fELF ... __afl_area_ptr ...";
+
+    /// An AFL++ finding's `main_afl` has no bhf driver, so its comparison
+    /// evidence is recorded with the driver build `main` beside it, which is
+    /// built from the same harness source. A finding fuzzed with `main` keeps
+    /// it, and a `main` without the comparison capture is not chosen over the
+    /// finding's own binary.
+    #[test]
+    fn an_afl_finding_records_its_evidence_with_the_driver_build_beside_it() {
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path();
+        let (dir, finding, afl_raw) = harness_files(
+            work,
+            "H-C0001-0A0B0C0D",
+            &[("main_afl", AFL_BUILD), ("main", DRIVER_BUILD)],
+            "main_afl",
+        );
+        let main = crate::auto::layout::harness_exe(&dir, "main");
+        let own = |binary: PathBuf| {
+            Some(EvidenceHarness {
+                binary,
+                in_place_of: None,
+            })
+        };
+        assert_eq!(
+            harness_for_finding(work, &finding, &afl_raw),
+            Some(EvidenceHarness {
+                binary: main.clone(),
+                in_place_of: Some(dir.join("main_afl")),
+            })
+        );
+        let mut builtin_raw = afl_raw.clone();
+        builtin_raw["fixture_path"] = json!("harnesses/H-C0001-0A0B0C0D/main");
+        assert_eq!(
+            harness_for_finding(work, &finding, &builtin_raw),
+            own(main.clone())
+        );
+        // An older `main` without the comparison capture is no better.
+        std::fs::write(&main, b"\x7fELF ... an older driver ...").unwrap();
+        assert_eq!(
+            harness_for_finding(work, &finding, &afl_raw),
+            own(dir.join("main_afl"))
+        );
+        // Nor is a `main_afl` replaced when it records comparisons itself.
+        std::fs::write(&main, DRIVER_BUILD).unwrap();
+        std::fs::write(dir.join("main_afl"), DRIVER_BUILD).unwrap();
+        assert_eq!(
+            harness_for_finding(work, &finding, &afl_raw),
+            own(dir.join("main_afl"))
+        );
+    }
+
+    /// Why a harness without a driver that records comparisons has no
+    /// evidence, for each kind: an AFL++ build with no driver build beside
+    /// it, a lane whose harnesses do not link bhf's driver, a Rust, Fortran
+    /// or COBOL harness whose binary lacks it, a C harness an earlier bhf
+    /// generated, one this bhf generated but built some other way, and a
+    /// binary bhf did not generate.
+    #[test]
+    fn a_harness_without_the_comparison_driver_says_why_for_its_lane() {
+        let reason = |work: &Path, harness: &Path, raw: &Value| -> String {
+            let replay = Replay {
+                harness,
+                in_place_of: None,
+                raw,
+                work_dir: work,
+                scratch: work.join("scratch"),
+                runtrace_log: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            let capture = capture_with(
+                &replay,
+                b"WIDGET",
+                "min_testcase.bin",
+                None,
+                Limits::default(),
+            );
+            assert_eq!(capture.summary.status, "unavailable", "{capture:?}");
+            assert_eq!(capture.summary.runs, 0, "{capture:?}");
+            capture.summary.reason.unwrap()
+        };
+        let metadata = |dir: &Path, language: &str, version: u32| {
+            std::fs::write(
+                dir.join(crate::repro_lane::GENERATION_METADATA),
+                json!({"language": language, "harness_format_version": version}).to_string(),
+            )
+            .unwrap();
+        };
+
+        let work = tempfile::tempdir().unwrap();
+        let (dir, _, raw) = harness_files(
+            work.path(),
+            "H-C0001-0A0B0C0D",
+            &[("main_afl", AFL_BUILD)],
+            "main_afl",
+        );
+        metadata(&dir, "c", harness_gen::HARNESS_FORMAT_VERSION);
+        std::fs::write(dir.join("Makefile"), b"main:\n").unwrap();
+        let afl = reason(work.path(), &dir.join("main_afl"), &raw);
+        assert!(afl.contains("AFL++ build main_afl"), "{afl}");
+        assert!(afl.contains("driver build `main`"), "{afl}");
+        assert!(afl.contains("was not found"), "{afl}");
+        assert!(afl.contains("`make main` in"), "{afl}");
+        assert!(!afl.contains("earlier bhf"), "{afl}");
+        // The driver build beside it is an old one: rebuilding is the fix.
+        std::fs::write(dir.join("main"), AFL_BUILD).unwrap();
+        metadata(&dir, "c", 2);
+        let afl_old = reason(work.path(), &dir.join("main_afl"), &raw);
+        assert!(afl_old.contains("AFL++ build main_afl"), "{afl_old}");
+        assert!(
+            afl_old.contains("an earlier bhf generated (harness input format 2)"),
+            "{afl_old}"
+        );
+
+        let work = tempfile::tempdir().unwrap();
+        let (dir, _, raw) = harness_files(
+            work.path(),
+            "H-P0001-0A0B0C0D",
+            &[("main", b"import sys\n")],
+            "main",
+        );
+        let python = reason(work.path(), &dir.join("main"), &raw);
+        assert!(
+            python.contains(
+                "only for harnesses built with bhf's driver, which the C, C++, Rust, Fortran \
+                 and COBOL lanes link"
+            ),
+            "{python}"
+        );
+        assert!(python.contains("this is a Python harness"), "{python}");
+        assert!(!python.contains("rebuild"), "{python}");
+        assert!(!python.contains("earlier bhf"), "{python}");
+
+        // The Rust lane links bhf's driver (its `main.c`) and records no
+        // generation metadata; the Fortran and COBOL lanes build through the
+        // C harness and its Makefile. A binary of theirs without the driver
+        // comes from an earlier bhf or another build, and rebuilding fixes it.
+        for (harness_id, lane, beside) in [
+            ("H-R0001-0A0B0C0D", "Rust", "main.c"),
+            ("H-F0001-0A0B0C0D", "Fortran", "Makefile"),
+            ("H-B0001-0A0B0C0D", "COBOL", "Makefile"),
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            let (dir, _, raw) = harness_files(
+                work.path(),
+                harness_id,
+                &[("main", AFL_BUILD), (beside, b"/* parse_record */\n")],
+                "main",
+            );
+            let native = reason(work.path(), &dir.join("main"), &raw);
+            assert!(
+                native.contains(&format!("bhf's {lane} lane links that driver")),
+                "{native}"
+            );
+            assert!(
+                native.contains("built by an earlier bhf or some other way"),
+                "{native}"
+            );
+            assert!(native.contains("re-run `bhf auto`"), "{native}");
+            assert!(!native.contains("only for"), "{native}");
+            assert!(!native.contains("no generation metadata"), "{native}");
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        let (dir, _, raw) = harness_files(
+            work.path(),
+            "H-C0002-0A0B0C0D",
+            &[("main", AFL_BUILD)],
+            "main",
+        );
+        metadata(&dir, "c", 2);
+        let old = reason(work.path(), &dir.join("main"), &raw);
+        assert!(
+            old.contains("an earlier bhf generated (harness input format 2)"),
+            "{old}"
+        );
+        assert!(old.contains("rebuild the harness with this bhf"), "{old}");
+        metadata(&dir, "c", FIRST_FORMAT_WITH_COMPARISON_DRIVER);
+        let current = reason(work.path(), &dir.join("main"), &raw);
+        assert!(
+            current.contains("though this bhf generated its harness"),
+            "{current}"
+        );
+        assert!(!current.contains("earlier bhf"), "{current}");
+        std::fs::remove_file(dir.join(crate::repro_lane::GENERATION_METADATA)).unwrap();
+        let foreign = reason(work.path(), &dir.join("main"), &raw);
+        assert!(foreign.contains("no generation metadata"), "{foreign}");
+        assert!(
+            foreign.contains("the C, C++, Rust, Fortran and COBOL lanes"),
+            "{foreign}"
+        );
+        assert!(!foreign.contains("rebuild"), "{foreign}");
+    }
+
+    /// A capture names the binary it replayed (`gate_capture.harness`) only
+    /// when a replay ran through the driver build chosen in place of the
+    /// finding's AFL++ build: not when nothing could run, and not when the
+    /// finding's own binary is gone and the harness dir's `main` is simply
+    /// the one found.
+    #[test]
+    fn only_a_replay_through_the_driver_build_names_it() {
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path();
+        // The driver build is not executable here: it is chosen, but the
+        // replay cannot start.
+        let (dir, finding, raw) = harness_files(
+            work,
+            "H-C0001-0A0B0C0D",
+            &[("main_afl", AFL_BUILD), ("main", DRIVER_BUILD)],
+            "main_afl",
+        );
+        let main = crate::auto::layout::harness_exe(&dir, "main");
+        let capture = |harness: &EvidenceHarness| {
+            let replay = Replay {
+                harness: &harness.binary,
+                in_place_of: harness.in_place_of.as_deref(),
+                raw: &raw,
+                work_dir: work,
+                scratch: work.join("scratch"),
+                runtrace_log: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            capture_with(
+                &replay,
+                b"WIDGET",
+                "min_testcase.bin",
+                None,
+                Limits::default(),
+            )
+        };
+        let chosen = harness_for_finding(work, &finding, &raw).unwrap();
+        assert_eq!(chosen.binary, main);
+        assert_eq!(chosen.in_place_of, Some(dir.join("main_afl")));
+        let unstarted = capture(&chosen);
+        assert_eq!(unstarted.summary.status, "unavailable", "{unstarted:?}");
+        assert!(
+            unstarted
+                .summary
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cannot run")),
+            "{unstarted:?}"
+        );
+        assert_eq!(unstarted.summary.harness, None, "{unstarted:?}");
+
+        // The AFL++ build is gone, and `main` is found in its place, but it
+        // is not a driver build either: nothing was swapped or replayed.
+        std::fs::remove_file(dir.join("main_afl")).unwrap();
+        std::fs::write(&main, AFL_BUILD).unwrap();
+        let found = harness_for_finding(work, &finding, &raw).unwrap();
+        assert_eq!(found.binary, main);
+        assert_eq!(found.in_place_of, None);
+        let own = capture(&found);
+        assert_eq!(own.summary.status, "unavailable", "{own:?}");
+        assert_eq!(own.summary.harness, None, "{own:?}");
     }
 
     /// The resources a recorded world served bytes to, by name, in the order
@@ -2341,6 +2840,7 @@ mod tests {
                 derived_search: state.map(str::to_owned),
                 searched_bytes: searched,
                 served_resources: None,
+                harness: None,
             };
         assert_eq!(
             summary(64, None, None).incomplete_derived_search(),
@@ -2457,6 +2957,7 @@ mod tests {
                 derived_search: Some("done".to_owned()),
                 searched_bytes: Some(6),
                 served_resources: None,
+                harness: Some("main".to_owned()),
             },
         };
         let (gates, summary) = record_fields(&capture);
@@ -2489,7 +2990,9 @@ mod tests {
         let raw = json!({});
         let replay = Replay {
             harness: &harness,
+            in_place_of: None,
             raw: &raw,
+            work_dir: dir.path(),
             scratch: dir.path().join("scratch"),
             runtrace_log: None,
             deadline: Instant::now() + Duration::from_secs(30),
@@ -2794,7 +3297,9 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             });
             let replay = Replay {
                 harness: &main,
+                in_place_of: None,
                 raw: &raw,
+                work_dir: dir.path(),
                 scratch: dir.path().join(format!("capture-{label}")),
                 runtrace_log: Some(dir.path().join(format!("runtrace-{label}.jsonl"))),
                 deadline: Instant::now() + Duration::from_secs(60),
@@ -2890,7 +3395,9 @@ int bhf_run_one(const uint8_t *data, size_t size) {
         let raw = json!({"runtime_mode": {"pass": "rng", "shim_armed": true}});
         let replay = Replay {
             harness: &main,
+            in_place_of: None,
             raw: &raw,
+            work_dir: dir.path(),
             scratch: dir.path().join("capture"),
             runtrace_log: Some(dir.path().join("runtrace.jsonl")),
             deadline: Instant::now() + Duration::from_secs(60),
@@ -2919,7 +3426,9 @@ int bhf_run_one(const uint8_t *data, size_t size) {
         let raw = json!({});
         let replay = Replay {
             harness,
+            in_place_of: None,
             raw: &raw,
+            work_dir: scratch,
             scratch: scratch.join("capture"),
             runtrace_log: None,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -2942,7 +3451,9 @@ int bhf_run_one(const uint8_t *data, size_t size) {
         let raw = json!({});
         let replay = Replay {
             harness,
+            in_place_of: None,
             raw: &raw,
+            work_dir: scratch,
             scratch: scratch.join("capture-unsymbolized"),
             runtrace_log: None,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -3002,6 +3513,69 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             "recorded"
         );
         assert!(read("F-0002-0a0b0c0d").get("gate_capture").is_none());
+    }
+
+    /// The capture pass records an AFL++ finding's comparison evidence by
+    /// replaying its input through the driver build `main` beside the
+    /// `main_afl` it was fuzzed with, and says so.
+    #[test]
+    fn the_capture_pass_records_an_afl_finding_through_its_driver_build() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let work = dir.path().join("work");
+        let harness_dir = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::copy(&main, harness_dir.join("main")).unwrap();
+        // The AFL++ build is never run; it only has no driver.
+        std::fs::write(harness_dir.join("main_afl"), b"\x7fELF afl build").unwrap();
+        let finding = corpus::layout::findings_dir(&work).join("F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("min_testcase.bin"), b"\x05\x00WIDGET").unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            json!({"id": "F-0001-0a0b0c0d", "harness_id": "H-C0001",
+                   "classification": "unhandled",
+                   "fixture_path": "harnesses/H-C0001/main_afl"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(run_pass(&work), (1, 0));
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+        let summary = &raw["gate_capture"];
+        assert_eq!(summary["status"], "recorded", "{raw:#}");
+        assert_eq!(summary["input"], "min_testcase.bin", "{raw:#}");
+        assert_eq!(summary["harness"], "main", "{raw:#}");
+        let gate = raw["gates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gate| gate["cmp_kind"] == "strcmp")
+            .unwrap_or_else(|| panic!("no strcmp gate: {raw:#}"));
+        assert_eq!(
+            (&gate["offset"], &gate["len"]),
+            (&json!(2), &json!(6)),
+            "{raw:#}"
+        );
+
+        // With the AFL++ build gone, the harness dir's `main` is the binary
+        // found for the finding: it is replayed, but not in place of
+        // anything, so the capture names no other binary.
+        std::fs::remove_file(harness_dir.join("main_afl")).unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            json!({"id": "F-0001-0a0b0c0d", "harness_id": "H-C0001",
+                   "classification": "unhandled",
+                   "fixture_path": "harnesses/H-C0001/main_afl"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(run_pass(&work), (1, 0));
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(raw["gate_capture"]["status"], "recorded", "{raw:#}");
+        assert!(raw["gate_capture"].get("harness").is_none(), "{raw:#}");
     }
 
     #[test]
@@ -3628,5 +4202,211 @@ int bhf_run_one(const uint8_t *data, size_t size) {
         );
         assert!(count("filling") > 1000, "{counts}");
         assert_eq!(count("after"), 0, "unwinds after the cap: {counts}");
+    }
+
+    /// A target that opens files and devices whose names the runtrace shim
+    /// checks (a missing config file, an I2C bus, a memory device, a file it
+    /// creates), stats and probes a missing directory, reads an environment
+    /// variable, and compares its input with one constant through a library
+    /// `memcmp`: the only comparison of its own.
+    const SHIM_PATHS_TARGET: &str = r#"
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+extern void bhf_target_enter(void);
+/* Not a constant, so the compiler keeps the library call. */
+volatile size_t tag_len = 4;
+int bhf_run_one(const uint8_t *data, size_t size) {
+    struct stat st;
+    FILE *f;
+    int fd;
+    bhf_target_enter();
+    fd = open("/etc/widget_settings.conf", O_RDONLY);
+    if (fd >= 0) close(fd);
+    fd = open("/dev/i2c-7", O_RDWR);
+    if (fd >= 0) close(fd);
+    fd = open("/dev/mem", O_RDONLY);
+    if (fd >= 0) close(fd);
+    fd = open("widget_scratch.tmp", O_RDWR | O_CREAT, 0600);
+    if (fd >= 0) close(fd);
+    unlink("widget_scratch.tmp");
+    f = fopen("/etc/widget_other.conf", "r");
+    if (f) fclose(f);
+    (void)stat("/etc/widget_missing.d", &st);
+    (void)access("/etc/widget_missing.d", R_OK);
+    (void)getenv("WIDGET_CONFIG");
+    /* Its sign is returned, so the call stays `memcmp` (not `bcmp`). */
+    return size >= 4 ? memcmp(data, "WXYZ", tag_len) : 1;
+}
+"#;
+
+    /// Build `source` and bhf's driver without a sanitizer, coverage and
+    /// comparison instrumentation only: under the runtrace shim its library
+    /// `memcmp` is the shim's own cmplog hook.
+    fn build_unsanitized(dir: &Path, source: &str) -> Option<PathBuf> {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        std::fs::write(dir.join("target.c"), source).unwrap();
+        let run = |args: &[&str]| {
+            Command::new("clang")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let ok = run(&[
+            "-O1",
+            "-g",
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-c",
+            "target.c",
+            "-o",
+            "target.o",
+        ]) && run(&[
+            "-O1",
+            "-g",
+            "-c",
+            driver.to_str().unwrap(),
+            "-o",
+            "driver.o",
+        ]) && run(&["target.o", "driver.o", "-o", "main"]);
+        ok.then(|| dir.join("main"))
+    }
+
+    /// Under the runtrace shim, with runtime cmplog on as a fuzz pass runs
+    /// it, the comparison log a pass harvests (`cmplog.jsonl`) and the
+    /// learned dictionary written from it hold only the target's own
+    /// comparison: none of the shim's checks of the paths and names the
+    /// target used, in any pass mode, with a recorded world pinned or not,
+    /// for a sanitized harness (whose `memcmp` is the sanitizer's interceptor)
+    /// and an unsanitized one (whose `memcmp` is the shim's).
+    #[test]
+    fn the_shims_own_comparisons_never_reach_the_comparison_log() {
+        if !clang() {
+            eprintln!("skipping: clang not installed");
+            return;
+        }
+        let Some(shim) = built_shim() else {
+            eprintln!("skipping: runtrace shim not built");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let capsule = dir.path().join("world.jsonl");
+        std::fs::write(
+            &capsule,
+            format!("{}:{}\n", hex(b"/etc/widget_settings.conf"), hex(b"mode=1")),
+        )
+        .unwrap();
+        // The shim's own path and name constants, and the paths it checked.
+        let shim_strings: [&[u8]; 14] = [
+            b"/dev/",
+            b"/etc/",
+            b"/tmp/",
+            b"/proc",
+            b"/sys",
+            b"bhf_work",
+            b".build-id",
+            b"generated_harnesses",
+            b".shm",
+            b"runtrace",
+            b"BHF_",
+            b"localhost",
+            b"widget_",
+            b"WIDGET_",
+        ];
+        let mut built = 0;
+        for (lane, sanitized) in [("asan", true), ("plain", false)] {
+            let build = dir.path().join(lane);
+            std::fs::create_dir_all(&build).unwrap();
+            let main = if sanitized {
+                build_target(&build, SHIM_PATHS_TARGET)
+            } else {
+                build_unsanitized(&build, SHIM_PATHS_TARGET)
+            };
+            let Some(main) = main else {
+                eprintln!("skipping the {lane} harness: clang cannot build it here");
+                continue;
+            };
+            built += 1;
+            let harness_dir = build.join("harness");
+            std::fs::create_dir_all(&harness_dir).unwrap();
+            let log = harness_dir.join("runtrace.jsonl");
+            let input = build.join("in.bin");
+            let modes: [(Option<&str>, bool); 5] = [
+                (None, false),
+                (Some("empty"), false),
+                (Some("rng"), false),
+                (Some("fuzz_driven"), false),
+                (Some("rng"), true),
+            ];
+            for (mode, pinned) in modes {
+                for bytes in [&b"WXYA"[..], b"QQQQQQ", b"WXYZ"] {
+                    std::fs::write(&input, bytes).unwrap();
+                    let mut command = Command::new(&main);
+                    command
+                        .arg(&input)
+                        .current_dir(&build)
+                        .env("LD_PRELOAD", &shim)
+                        .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                        .env("BHF_CMPLOG", "1")
+                        .env("BHF_RUNTRACE_LOG", &log)
+                        .env_remove("BHF_RUNTRACE_MODE")
+                        .env_remove("BHF_ENVCAP_REPLAY")
+                        .env_remove("BHF_ENVCAP_RECORD");
+                    if let Some(mode) = mode {
+                        command.env("BHF_RUNTRACE_MODE", mode);
+                    }
+                    if pinned {
+                        command.env("BHF_ENVCAP_REPLAY", &capsule);
+                    }
+                    let output = command.output().unwrap();
+                    assert!(
+                        output.status.code().is_some(),
+                        "{lane} {mode:?}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            let runtrace = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                runtrace.contains("\"e\":\"shim_loaded\""),
+                "{lane}: the shim ran: {runtrace}"
+            );
+            crate::auto::attempt::harvest_pass_cmplog(&harness_dir);
+            let recorded = std::fs::read_to_string(harness_dir.join("cmplog.jsonl"))
+                .unwrap_or_else(|_| panic!("{lane}: no comparison was harvested: {runtrace}"));
+            let target_constant = hex(b"WXYZ");
+            for line in recorded.lines() {
+                let record: Value = serde_json::from_str(line).unwrap();
+                let (a, b) = (record["a"].as_str().unwrap(), record["b"].as_str().unwrap());
+                assert!(
+                    a == target_constant || b == target_constant,
+                    "{lane}: a comparison that is not the target's: {line}"
+                );
+            }
+            let learned =
+                std::fs::read_to_string(harness_dir.join(crate::fuzz::LEARNED_DICTIONARY_FILE))
+                    .unwrap_or_default();
+            for text in [&recorded, &learned] {
+                for shim_string in shim_strings {
+                    let escaped = String::from_utf8_lossy(shim_string).into_owned();
+                    assert!(
+                        !text.contains(&hex(shim_string)) && !text.contains(&escaped),
+                        "{lane}: the shim's {escaped:?} reached the comparison log: {text}"
+                    );
+                }
+            }
+            if sanitized {
+                // The driver names each comparison's site, so the constant
+                // the inputs met is learned.
+                assert!(learned.contains("\"WXYZ\""), "{lane}: {learned}");
+            }
+        }
+        if built == 0 {
+            eprintln!("skipping: no harness could be built");
+        }
     }
 }

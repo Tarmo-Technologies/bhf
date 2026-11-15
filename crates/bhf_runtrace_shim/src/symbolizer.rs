@@ -12,6 +12,7 @@ const VDSO_NAMES: &[&[u8]] = &[b"linux-vdso.so.1", b"linux-gate.so.1", b"linux-v
 /// (`<obj>.debug`, `<dir>/.debug/<obj>`), or the name of an object the
 /// process has loaded. Faking any of them hands the symbolizer a bogus file.
 pub fn is_symbolizer_path(path: &[u8]) -> bool {
+    let _own = crate::reentrancy::OwnWork::enter();
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
     VDSO_NAMES.contains(&name)
         || name.ends_with(b".debug")

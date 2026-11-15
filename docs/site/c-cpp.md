@@ -55,7 +55,10 @@ Generated C/C++ harnesses are Makefile-based. The default build target creates
 runtime), built with ASan and UBSan. It is not a libFuzzer binary;
 `make libfuzzer` builds one for other fuzzers (see the harness's
 `PORTABILITY.md`). `bhf build --c-engine afl++` runs `make afl` and stages
-`main_afl` for `bhf fuzz --engine afl++`.
+`main_afl` for `bhf fuzz --engine afl++`. `main_afl` has no bhf driver, so
+the comparison evidence of an AFL++ finding (`finding.json` `gates`) is
+recorded by replaying its input through the `main` beside it, which is
+built from the same harness source.
 When make's built-in compiler defaults are still `cc` / `g++`, the generated
 Makefile and `bhf build` prefer `clang` / `clang++`. `CC`/`CXX` (or `--cc`/`--cxx`,
 or `[toolchain] cc`/`cxx` in a config file) choose another compiler, and the

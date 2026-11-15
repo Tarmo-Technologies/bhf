@@ -141,7 +141,9 @@ it, and after each `bhf auto` fuzz pass that recorded any, bhf rewrites
 `learned_dictionary.txt` from the comparison constants among them. The bhf
 driver's records name their comparison site (`"s"`); those the runtrace shim
 writes for a harness built without a sanitizer, and those of a harness built
-with an older driver, do not. A constant is an operand that met more distinct
+with an older driver, do not. The shim's own comparisons (its checks of the
+paths, device names and environment variables a target uses) are never
+recorded, whatever the pass mode or harness. A constant is an operand that met more distinct
 values at one site than any of those values met there: a constant is compared
 with input after input (the mutated input varies), while each input meets only
 the constants it is checked against, so at a keyword-table lookup a keyword
@@ -826,13 +828,26 @@ and explain it — all offline and deterministic (no LLM):
     recorded that is not the sanitizer runtime, and reads `site not
     attributable (sanitizer interceptor)` when none resolves. `bhf auto`
     records it after minimization (`finding.json` `gates`); for a finding
-    without it, explain replays the input once (nothing is written).
-    Otherwise it prints `No comparison evidence recorded:` and the reason,
-    which says what was not searched (computed operands beyond the replay
-    budget, comparisons past the driver's 8192-record limit), or, when the
-    target made no comparison the driver recorded, how many comparisons the
-    run recorded and why each was left out (before the target was entered, in
-    bhf's harness code, on pointer values). Dictionary tokens found in the input are listed only as labelled
+    without it, explain replays the input once (nothing is written). An
+    AFL++ finding's `main_afl` is compiled without bhf's driver, so its
+    evidence is recorded by replaying the input through the driver build
+    `main` beside it, built from the same harness source
+    (`gate_capture.harness` names it when that replay ran, and explain says
+    `replayed through main`). Otherwise it prints `No comparison evidence
+    recorded:` and the reason, which says what was not searched (computed
+    operands beyond the
+    replay budget, comparisons past the driver's 8192-record limit), or, when
+    the target made no comparison the driver recorded, how many comparisons
+    the run recorded and why each was left out (before the target was
+    entered, in bhf's harness code, on pointer values). Only harnesses that
+    link bhf's driver record comparisons: those of the C, C++, Rust, Fortran
+    and COBOL lanes. A harness that cannot record them says why: an AFL++
+    build with no driver build beside it; a lane whose harnesses do not link
+    the driver (Python, Java, Go, Ada and the others); a Rust, Fortran or
+    COBOL binary without it (built by an earlier bhf or some other way:
+    re-run `bhf auto`); a C or C++ harness an earlier bhf generated (rebuild
+    it); one this bhf generated whose binary was built some other way; or
+    one bhf did not generate. Dictionary tokens found in the input are listed only as labelled
     substring matches (at least 3 bytes, at most 3 occurrences);
   - the harness arguments: the value each parameter was decoded to, from the
     argument trace recorded with the finding. An argument whose input bytes a
@@ -844,9 +859,11 @@ and explain it — all offline and deterministic (no LLM):
     bytes, each parameter is decoded from those bytes with the harness's
     `arg-layout.json` instead, and one it cannot decode statically reads
     `(not decodable statically; testcase.bin: <value>)`. Without the layout
-    the table keeps `testcase.bin`'s values and says so. The memory access line
-    of such a finding says `(recorded on testcase.bin, N bytes)`, and WHAT
-    HAPPENED names the input shown;
+    the table keeps `testcase.bin`'s values and says so. The memory access
+    and `Sanitizer report` lines of such a finding say `(recorded on
+    testcase.bin, N bytes)`: a value the report names (a shift exponent, an
+    index) is that input's, not the minimized one's. WHAT HAPPENED names the
+    input shown;
   - the environment: the runtrace events of that input's own replay when the
     runtrace shim was loaded for it, else the harness's last fuzz pass (all of
     its inputs, labelled so), and `environment not observed (runtrace shim not

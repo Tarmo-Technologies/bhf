@@ -40,7 +40,7 @@ pub fn env_enabled() -> bool {
         false
     } else {
         let s = unsafe { std::ffi::CStr::from_ptr(value) };
-        s.to_bytes() == b"1"
+        crate::reentrancy::bytes_eq(s.to_bytes(), b"1")
     };
     CACHED.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
     enabled

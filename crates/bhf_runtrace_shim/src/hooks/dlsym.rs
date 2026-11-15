@@ -77,15 +77,30 @@ pub extern "C" fn bhf_shim_real_dlsym() -> *mut libc::c_void {
 }
 
 /// This library's hook that `dlsym(RTLD_NEXT, name)` from an earlier object
-/// should find.
+/// should find. A sanitizer asks while it resolves its interceptors, so the
+/// names are compared without a library call or thread-local state
+/// ([`crate::reentrancy::bytes_eq`]).
 fn next_hook(name: &[u8]) -> Option<*mut libc::c_void> {
-    Some(match name {
-        b"fopen" => crate::hooks::fs::fopen_hook as *mut libc::c_void,
-        b"fopen64" => crate::hooks::fs::fopen64_hook as *mut libc::c_void,
-        b"fdopen" => crate::hooks::fs::fdopen_hook as *mut libc::c_void,
-        b"fclose" => crate::hooks::fs::fclose_hook as *mut libc::c_void,
-        _ => return crate::hooks::format::next_hook(name),
-    })
+    let hooks: [(&[u8], *mut libc::c_void); 4] = [
+        (b"fopen", crate::hooks::fs::fopen_hook as *mut libc::c_void),
+        (
+            b"fopen64",
+            crate::hooks::fs::fopen64_hook as *mut libc::c_void,
+        ),
+        (
+            b"fdopen",
+            crate::hooks::fs::fdopen_hook as *mut libc::c_void,
+        ),
+        (
+            b"fclose",
+            crate::hooks::fs::fclose_hook as *mut libc::c_void,
+        ),
+    ];
+    hooks
+        .iter()
+        .find(|(hooked, _)| crate::reentrancy::bytes_eq(hooked, name))
+        .map(|(_, hook)| *hook)
+        .or_else(|| crate::hooks::format::next_hook(name))
 }
 
 /// glibc's `struct link_map` prefix (`<link.h>`).

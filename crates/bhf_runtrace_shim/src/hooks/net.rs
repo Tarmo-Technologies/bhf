@@ -158,6 +158,9 @@ pub unsafe extern "C" fn connect(
     ) -> libc::c_int = std::mem::transmute(real);
     let result = real(sockfd, addr, addrlen);
     let saved_errno = save_errno();
+    // The shim's own work from here on: the endpoint is classified before a
+    // hook guard is held, and those comparisons are not the target's.
+    let _own = crate::reentrancy::OwnWork::enter();
     // #422: emit the SSRF sink event for every egress to a real endpoint
     // (regardless of success), so a fuzz-controlled destination is confirmed and
     // a constant one is suppressed by the cross-execution correlator (BHF-433).

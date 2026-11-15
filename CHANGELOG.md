@@ -9,6 +9,26 @@
   debuginfod client, as fuzz children already did. On a host whose
   `DEBUGINFOD_URLS` names a server, ASan's symbolizer could wait on it past
   the replay timeout and the replay came back unverified.
+- AFL++ findings now carry comparison evidence: their `main_afl` has no bhf
+  driver, so the input is replayed through the driver build `main` beside it
+  (in `bhf auto`, `bhf report --backfill` and `bhf explain`), filling
+  `finding.json` `gates` and the input-to-state fields of `findings.json`,
+  `findings.csv` and SARIF. The new optional `gate_capture.harness` key
+  (additive to `bhf.finding.v1`) names the driver build when a replay ran
+  through it.
+- A harness that cannot record comparisons says why: an AFL++ build with no
+  driver build beside it, a lane whose harnesses do not link bhf's driver
+  (only the C, C++, Rust, Fortran and COBOL lanes do), a binary of one of
+  those lanes built by an earlier bhf or some other way (told how to rebuild
+  it), or one bhf did not generate. Every one used to read "built by an
+  earlier bhf; rebuild it".
+- `bhf explain` labels the `Sanitizer report` line of a minimized finding
+  `(recorded on testcase.bin, N bytes)`, like the memory access line: the
+  values it names are that input's.
+- `cmplog.jsonl` and `learned_dictionary.txt` no longer hold the runtrace
+  shim's own comparisons (its checks of the paths, device names and
+  environment variables a target uses, such as `/dev/i2c-`), in any pass mode
+  and for sanitized and unsanitized harnesses alike.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

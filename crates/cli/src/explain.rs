@@ -32,12 +32,17 @@ use std::path::{Path, PathBuf};
 /// `bhf explain` — explain, offline, why a crash fired.
 ///
 /// The input shown is the finding's `min_testcase.bin`, else its
-/// `testcase.bin`, named in the output. Comparison evidence is what the
-/// harness recorded while that input ran; a finding without it is replayed
-/// once against its harness to record it (nothing is written). The
-/// environment comes from that replay when the runtrace shim was loaded, else
-/// from the harness's last fuzz pass, and says so; without the shim it reads
-/// "not observed".
+/// `testcase.bin`, named in the output; the sanitizer report and memory
+/// access lines of a minimized finding say they were recorded on
+/// `testcase.bin`. Comparison evidence is what the harness recorded while
+/// that input ran (an AFL++ finding's, through the driver build `main`
+/// beside its `main_afl`); only harnesses that link bhf's driver, those of
+/// the C, C++, Rust, Fortran and COBOL lanes, record it. A finding without it
+/// is replayed once against its harness to record it (nothing is written),
+/// or says why its harness cannot.
+/// The environment comes from that replay when the runtrace shim was loaded,
+/// else from the harness's last fuzz pass, and says so; without the shim it
+/// reads "not observed".
 #[derive(Debug, clap::Args)]
 pub struct ExplainArgs {
     /// Work directory of a prior `auto` run.
@@ -466,11 +471,21 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
             let _ = writeln!(s, "  Sanitizer verdict: {}", terminal_safe(exc));
         }
         // The sanitizer's own report line: the exact check and site it names.
+        // It was recorded on testcase.bin, like the memory access below: a
+        // value it names (a shift exponent, an index) is that input's.
         if let Some(message) = str_at(&f.raw, "/exception/message")
             .and_then(|m| m.lines().next())
             .filter(|m| !m.trim().is_empty())
         {
-            let _ = writeln!(s, "  Sanitizer report: {}", terminal_safe(message.trim()));
+            let label = recorded_on
+                .as_deref()
+                .map(|on| format!(" (recorded on {on})"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "  Sanitizer report{label}: {}",
+                terminal_safe(message.trim())
+            );
         }
     }
     if let Some(access) = f.raw.pointer("/exception/access") {
@@ -1797,8 +1812,10 @@ fn comparison_evidence(work_dir: &Path, f: &Finding, input: Option<&(&str, Vec<u
     };
     let log = scratch.path().join("runtrace.jsonl");
     let replay = gate_evidence::Replay {
-        harness: &harness,
+        harness: &harness.binary,
+        in_place_of: harness.in_place_of.as_deref(),
         raw: &f.raw,
+        work_dir,
         scratch: scratch.path().join("replay"),
         runtrace_log: Some(log.clone()),
         deadline: (std::time::Instant::now() + gate_evidence::PER_FINDING).min(budget_end),
@@ -1860,6 +1877,25 @@ fn evidence_lines(evidence: &Evidence, input_name: &str) -> Vec<String> {
                 "      ",
             );
         }
+    }
+    // A capture that could not run replayed nothing, whatever it names.
+    if let Some(harness) = capture
+        .summary
+        .harness
+        .as_ref()
+        .filter(|_| capture.summary.status != "unavailable")
+    {
+        push_wrapped(
+            &mut lines,
+            &format!(
+                "(replayed through {}, the build of this harness with bhf's comparison \
+                 driver: the binary the finding was fuzzed with has none, and both decode the \
+                 input the same way)",
+                terminal_safe(harness)
+            ),
+            "  ",
+            "   ",
+        );
     }
     if let Some((_, searched)) = capture.summary.incomplete_derived_search() {
         let said = capture.gates.is_empty()
@@ -2464,6 +2500,9 @@ mod tests {
             "direction": "read", "size": 1,
             "region": {"kind": "heap", "size": 21, "offset": 38, "relation": "after", "distance": 17}
         });
+        raw["exception"]["message"] = serde_json::json!(
+            "widget.c:9:14: runtime error: shift exponent 50529027 is too large for 32-bit type 'int'"
+        );
         let finding = finding_in(work.path(), raw);
         let testcase: Vec<u8> = (0u8..33).map(|i| i.wrapping_mul(7) | 1).collect();
         std::fs::write(finding.dir.join("testcase.bin"), &testcase).unwrap();
@@ -2530,6 +2569,15 @@ mod tests {
         assert!(
             out.contains("(recorded on testcase.bin, 33 bytes)"),
             "the access names the file it was recorded on: {out}"
+        );
+        // The report's values (this shift exponent) are testcase.bin's, not
+        // those of the minimized input shown.
+        assert!(
+            out.contains(
+                "  Sanitizer report (recorded on testcase.bin, 33 bytes): widget.c:9:14: runtime \
+                 error: shift exponent 50529027"
+            ),
+            "the report names the file it was recorded on: {out}"
         );
         assert!(
             words.contains("Triggered by the attached test input (`min_testcase.bin`)."),
@@ -3782,6 +3830,94 @@ mod tests {
             !out.contains("Input-to-state") && !out.contains("recovered constant"),
             "{out}"
         );
+    }
+
+    /// Evidence an AFL++ finding recorded through the driver build beside its
+    /// `main_afl` names the binary it was replayed through; evidence recorded
+    /// with the finding's own binary does not.
+    #[test]
+    fn evidence_replayed_through_the_driver_build_names_it() {
+        let work = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({"offset": 2, "len": 6, "operand_hex": "574944474554",
+            "compared_with_hex": "574944474554", "cmp_kind": "strcmp", "site": "0x1a2b",
+            "relation": "equal", "operands_equal": true, "location": null});
+        let mut raw = recorded_capture(serde_json::json!([gate]), None);
+        raw["fixture_path"] = serde_json::json!("harnesses/H-C0001/main_afl");
+        raw["gate_capture"]["harness"] = serde_json::json!("main");
+        let finding = finding_in(work.path(), raw.clone());
+        std::fs::write(finding.dir.join("testcase.bin"), b"\x21\x00WIDGET").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "(replayed through main, the build of this harness with bhf's comparison driver: \
+                 the binary the finding was fuzzed with has none, and both decode the input the \
+                 same way)"
+            ),
+            "{out}"
+        );
+        raw["gate_capture"]
+            .as_object_mut()
+            .unwrap()
+            .remove("harness");
+        let own = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &own, &[], false);
+        assert!(!out.contains("replayed through"), "{out}");
+    }
+
+    /// A finding fuzzed with `main_afl` whose evidence cannot be recorded
+    /// (the AFL++ build is gone, and the `main` found in its place has no
+    /// driver) says why and names no binary it was replayed through: none
+    /// ran. Nor does a capture recorded as unavailable.
+    #[test]
+    fn a_capture_that_could_not_run_names_no_replayed_binary() {
+        let work = tempfile::tempdir().unwrap();
+        let harness_id = "H-C0001-0A0B0C0D";
+        let dir = crate::auto::layout::harness_dir(work.path(), harness_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            crate::auto::layout::harness_exe(&dir, "main"),
+            b"\x7fELF ... __afl_area_ptr ...",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::repro_lane::GENERATION_METADATA),
+            serde_json::json!({"language": "c",
+                "harness_format_version": harness_gen::HARNESS_FORMAT_VERSION})
+            .to_string(),
+        )
+        .unwrap();
+        let mut raw = base_raw();
+        raw["harness_id"] = serde_json::json!(harness_id);
+        raw["fixture_path"] = serde_json::json!(format!("harnesses/{harness_id}/main_afl"));
+        let finding = finding_in(work.path(), raw.clone());
+        std::fs::write(finding.dir.join("testcase.bin"), b"WIDGET").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "No comparison evidence recorded for testcase.bin: main has no bhf driver that \
+                 records comparisons, though this bhf generated its harness"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("replayed through"), "{out}");
+
+        raw["gates"] = serde_json::json!([]);
+        raw["gate_capture"] = serde_json::json!({
+            "input": "testcase.bin", "input_len": 6, "status": "unavailable",
+            "reason": "cannot run main: permission denied", "comparisons": 0,
+            "truncated": false, "unconfirmed": 0, "runs": 0, "shim_armed": false,
+            "harness": "main"
+        });
+        let recorded = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &recorded, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("No comparison evidence recorded for testcase.bin: cannot run main"),
+            "{out}"
+        );
+        assert!(!out.contains("replayed through"), "{out}");
     }
 
     /// A capture whose search for operands computed from input bytes did not

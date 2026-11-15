@@ -77,7 +77,9 @@ fn in_world_writable_tmp(path: &[u8]) -> bool {
 /// predictable path can redirect the write. O_TMPFILE creations are anonymous
 /// (no name) and never set O_CREAT, so they are excluded automatically.
 fn tempfile_is_insecure(path: &[u8], flags: libc::c_int) -> bool {
-    flags & libc::O_CREAT != 0 && flags & libc::O_EXCL == 0 && in_world_writable_tmp(path)
+    flags & libc::O_CREAT != 0
+        && flags & libc::O_EXCL == 0
+        && crate::reentrancy::own_work(|| in_world_writable_tmp(path))
 }
 
 /// Record an attempt to create an insecure temporary file. The attempt itself
@@ -227,8 +229,11 @@ fn log_insecure_chmod(path: &[u8], mode: libc::mode_t) {
 }
 
 /// Memory-mapped device files a driver `open`s and then `mmap`s to reach device
-/// registers (#441). Matched by exact name or `/dev/` family prefix.
+/// registers (#441). Matched by exact name or `/dev/` family prefix, as the
+/// shim's own work: `open` asks before any hook guard is held, and these
+/// names must never reach the comparison log as the target's.
 fn is_mmio_device_path(path: &[u8]) -> bool {
+    let _own = crate::reentrancy::OwnWork::enter();
     const EXACT: &[&[u8]] = &[b"/dev/mem", b"/dev/kmem", b"/dev/gpiomem", b"/dev/watchdog"];
     if EXACT.contains(&path) {
         return true;
@@ -292,6 +297,9 @@ pub unsafe extern "C" fn open(
         std::mem::transmute(real);
     let result = real(path, flags, mode);
     let saved_errno = save_errno();
+    // Everything from here on is the shim's own work: the path is classified
+    // before any hook guard is held, and those comparisons are not the target's.
+    let _own = crate::reentrancy::OwnWork::enter();
     let path_bytes = path_bytes_from_ptr(path);
     if let Some(fake) = maybe_substitute_mmio(path_bytes, result) {
         restore_errno(saved_errno);
@@ -500,6 +508,8 @@ pub unsafe extern "C" fn openat(
     ) -> libc::c_int = std::mem::transmute(real);
     let result = real(dirfd, path, flags, mode);
     let saved_errno = save_errno();
+    // The shim's own work from here on, as in `open`.
+    let _own = crate::reentrancy::OwnWork::enter();
     let path_bytes = path_bytes_from_ptr(path);
     if let Some(fake) = maybe_substitute_mmio(path_bytes, result) {
         restore_errno(saved_errno);
