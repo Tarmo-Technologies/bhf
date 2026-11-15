@@ -1195,6 +1195,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/sanitizer_evidence.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/schedule_perturbation.rs",
       "license": "Apache-2.0"
     },

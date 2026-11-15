@@ -512,8 +512,9 @@ MATCH
   position (an unsymbolized one) is not another site, but it is not a
   reproduction either: the verdict is `UNVERIFIED ... not_compared=sink`
   (exit `4`); `last_seen` and the history are left as they were
-  (`finding.json` does not change). Like every replay it rewrites
-  `replay.log`, and `results/` is rebuilt so the attestation covers it.
+  (`finding.json` does not change). Like every replay it writes the replay
+  log (`replay.log`, or `replay-other-harness.log` for another harness than
+  the finding's own), and `results/` is rebuilt so the attestation covers it.
   When the harness is the recorded build (its sha256 is
   `build.binary.sha256`), replay first symbolizes the report itself with
   `llvm-symbolizer` (or `addr2line`) from `PATH` and compares again. A finding
@@ -545,16 +546,23 @@ MATCH
 - **`--show-output`** also prints the harness's raw stderr and stdout (the full
   sanitizer report).
 - **`replay.log`.** Every replay, `MATCH`, `MISMATCH` or `UNVERIFIED`, writes
-  `<finding>/replay.log`: the verdict, what ran, the exit status, the
-  harness's raw stderr and stdout (each kept to its first 256 KiB and last
-  768 KiB, with the cut marked, so a sanitizer report at the end survives)
-  and any `--debugger` transcript. The summary names it (`log`, and
-  `replay_log` in `--json`). It is overwritten by the next replay, is not one
-  of the finding's evidence files, and results/ is rebuilt after it is
-  written so `attestation.json` stays current. It also has the summary's
-  crash, differences and details lines. A lane with no harness output to
-  keep (session, collector, transport, Ada event log) writes those and why
-  there is no output.
+  a replay log, `<finding>/replay.log`: the verdict, what ran, the exit
+  status, the harness's raw stderr and stdout (each kept to its first 256 KiB
+  and last 768 KiB, with the cut marked, so a sanitizer report at the end
+  survives) and any `--debugger` transcript. The summary names it (`log`, and
+  `replay_log` in `--json`). It is overwritten by the next replay of the
+  finding's own harness (or the next `MATCH`), is not one of the finding's
+  evidence files, and results/ is rebuilt after it is written so
+  `attestation.json` stays current. It also has the summary's crash,
+  differences and details lines. A lane with no harness output to keep
+  (session, collector, transport, Ada event log) writes those and why there
+  is no output. A replay of another harness than the finding's own
+  that does not `MATCH` (a `--harness` whose sha256 is not the recorded
+  `build.binary.sha256`, a rebuild at the same path, or, for a finding that
+  records no build, another file than the harness it names) writes
+  `<finding>/replay-other-harness.log` instead (overwritten by the next such
+  replay, and attested the same way) and leaves `replay.log` as it was, so
+  that log keeps the last replay of the finding's own harness.
 - **`--show-args`** runs a generated C/C++ harness with `BHF_TRACE_ARGS=1` and
   prints the value it decoded for each parameter under the summary: name,
   type, the testcase bytes it came from, its value (or a buffer's length and
@@ -664,7 +672,8 @@ MATCH
   the work dir has a results index, replay rebuilds it so
   `results/findings.json` and `results/attestation.json` match the files on
   disk. This holds for every kind of finding. A `MISMATCH` or an `UNVERIFIED`
-  replay records nothing in the finding (only `replay.log`).
+  replay records nothing in the finding (only `replay.log`, or
+  `replay-other-harness.log` for another harness).
 
 ## Crash → PoC, Explanation, and One-Shot Fuzzing
 

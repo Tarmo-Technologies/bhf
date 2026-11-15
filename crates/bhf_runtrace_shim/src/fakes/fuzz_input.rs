@@ -6,11 +6,11 @@
 //!
 //! 1. **Live buffer** — the generated harness calls
 //!    [`bhf_shim_set_fuzz_input`] at the top of
-//!    `LLVMFuzzerTestOneInput` with `(Data, Size)`. The shim caches
-//!    those bytes in a `Mutex<Option<Vec<u8>>>` and serves them on
-//!    subsequent [`read_into`] calls. This is the per-iteration
-//!    channel — `read_into` reflects the EXACT bytes libFuzzer is
-//!    about to feed to the target.
+//!    `LLVMFuzzerTestOneInput` with `(Data, Size)`. The shim copies
+//!    those bytes into a private anonymous mapping of its own (see
+//!    [`InputCopy`]) and serves them on subsequent [`read_into`]
+//!    calls. This is the per-iteration channel — `read_into` reflects
+//!    the EXACT bytes libFuzzer is about to feed to the target.
 //!
 //! 2. **Shared memfd fallback** — `BHF_FUZZ_INPUT_FD` +
 //!    `BHF_FUZZ_INPUT_LEN` env vars point at a parent-owned
@@ -43,11 +43,117 @@ unsafe impl Sync for Shared {}
 static SHARED: OnceLock<Option<Shared>> = OnceLock::new();
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-struct LiveInput {
-    bytes: Vec<u8>,
+/// The shim's copy of the input the harness published last.
+///
+/// The copy lives in a private anonymous mapping, never on the heap: in a
+/// sanitized target `malloc` is the sanitizer's, and the driver allocates
+/// each input with exactly its size just before publishing it, so a heap copy
+/// sat in the very next chunk. A read past the input beyond its redzone then
+/// landed in the shim's chunk: AddressSanitizer named the shim's allocation,
+/// called a read of the copy the next publication had freed a
+/// heap-use-after-free, and did not report a read of the live copy at all.
+/// Mapped memory is not part of the sanitizer's heap, so the target's heap
+/// looks the same with and without the shim.
+///
+/// The mapping is reused while the input fits and replaced (`munmap`, then
+/// `mmap`) by a larger one when it does not, so a persistent run maps
+/// about as much as its largest input and makes no system call for most
+/// publications.
+struct InputCopy {
+    /// Whether the harness has published an input (an empty one counts).
+    published: bool,
+    /// The mapping's start, or null before the first non-empty input.
+    ptr: *mut u8,
+    /// The mapping's length, a multiple of the page size.
+    capacity: usize,
+    /// The current input's length.
+    len: usize,
 }
 
-static LIVE_INPUT: Mutex<Option<LiveInput>> = Mutex::new(None);
+// The mapping is private to this process and owned by the copy, which only
+// the `LIVE_INPUT` mutex hands out.
+unsafe impl Send for InputCopy {}
+
+impl InputCopy {
+    const NONE: Self = Self {
+        published: false,
+        ptr: std::ptr::null_mut(),
+        capacity: 0,
+        len: 0,
+    };
+
+    /// The current input: `None` before any publication, empty after an
+    /// empty one.
+    fn current(&self) -> Option<&[u8]> {
+        if !self.published {
+            return None;
+        }
+        if self.len == 0 {
+            return Some(&[]);
+        }
+        // SAFETY: `ptr` maps `capacity >= len` readable bytes, of which the
+        // first `len` were copied from the published input.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr, self.len) })
+    }
+
+    /// Make `input` the current input. When no mapping can hold it the
+    /// current input is empty, as for an empty publication: no fake resource
+    /// gets bytes of an earlier input.
+    fn store(&mut self, input: &[u8]) {
+        self.published = true;
+        self.len = 0;
+        if input.is_empty() {
+            return;
+        }
+        if input.len() > self.capacity && !self.grow(input.len()) {
+            return;
+        }
+        // SAFETY: the mapping holds at least `input.len()` writable bytes and
+        // cannot overlap the caller's buffer.
+        unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), self.ptr, input.len()) };
+        self.len = input.len();
+    }
+
+    /// Replace the mapping with one of at least `needed` bytes.
+    fn grow(&mut self, needed: usize) -> bool {
+        let page = page_size();
+        let Some(capacity) = needed.checked_next_multiple_of(page) else {
+            return false;
+        };
+        // SAFETY: a fresh private anonymous mapping; nothing else refers to
+        // the old one, which only this copy owns.
+        unsafe {
+            let mapped = libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if mapped == libc::MAP_FAILED {
+                return false;
+            }
+            if !self.ptr.is_null() {
+                libc::munmap(self.ptr.cast(), self.capacity);
+            }
+            self.ptr = mapped.cast();
+        }
+        self.capacity = capacity;
+        true
+    }
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page)
+        .ok()
+        .filter(|&p| p > 0)
+        .unwrap_or(4096)
+}
+
+static LIVE_INPUT: Mutex<InputCopy> = Mutex::new(InputCopy::NONE);
 
 fn load() -> Option<&'static Shared> {
     SHARED
@@ -94,9 +200,10 @@ fn load() -> Option<&'static Shared> {
 /// # Safety
 ///
 /// `data` must point to at least `size` bytes valid for read for
-/// the duration of this call. The shim copies the bytes into an
-/// owned buffer before returning, so the caller's buffer does not
-/// need to remain valid after `bhf_shim_set_fuzz_input` returns.
+/// the duration of this call. The shim copies the bytes into a mapping
+/// of its own (not the heap, see [`InputCopy`]) before returning, so the
+/// caller's buffer does not need to remain valid after
+/// `bhf_shim_set_fuzz_input` returns.
 #[no_mangle]
 pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::size_t) {
     if size == 0 {
@@ -111,7 +218,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         // by the previous testcase. No-op unless BHF_SCHED is active.
         crate::hooks::sched::reset_for_input();
         if let Ok(mut guard) = LIVE_INPUT.lock() {
-            *guard = Some(LiveInput { bytes: Vec::new() });
+            guard.store(&[]);
         }
         CURSOR.store(0, Ordering::Relaxed);
         return;
@@ -129,9 +236,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         Ok(g) => g,
         Err(_) => return,
     };
-    *guard = Some(LiveInput {
-        bytes: slice.to_vec(),
-    });
+    guard.store(slice);
     CURSOR.store(0, Ordering::Relaxed);
 }
 
@@ -144,16 +249,16 @@ pub fn read_into(out: &mut [u8]) -> usize {
     // setter (or another reader) mid-critical-section; a blocking lock would
     // self-deadlock. On contention, fall through to the mmap'd shared buffer.
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
-            if live.bytes.is_empty() {
+        if let Some(live) = guard.current() {
+            if live.is_empty() {
                 // Some(empty) is an explicit current testcase, not "no live
                 // publication". Never fall through to a stale shared buffer.
                 return 0;
             }
             let cursor = CURSOR.fetch_add(out.len(), Ordering::Relaxed);
-            let len = live.bytes.len();
+            let len = live.len();
             for (i, slot) in out.iter_mut().enumerate() {
-                *slot = live.bytes[(cursor + i) % len];
+                *slot = live[(cursor + i) % len];
             }
             return out.len();
         }
@@ -194,14 +299,14 @@ pub fn read_keyed(key: u64, out: &mut [u8]) -> usize {
     // try_lock, not lock: reachable from a signal handler; fall through to the
     // mmap on contention rather than deadlocking (see read_into).
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
-            if live.bytes.is_empty() {
+        if let Some(live) = guard.current() {
+            if live.is_empty() {
                 return 0;
             }
-            let len = live.bytes.len();
+            let len = live.len();
             let base = (key as usize) % len;
             for (i, slot) in out.iter_mut().enumerate() {
-                *slot = live.bytes[(base + i) % len];
+                *slot = live[(base + i) % len];
             }
             return out.len();
         }
@@ -360,12 +465,11 @@ pub fn taint_span(needle: &[u8], min_len: usize) -> Option<(usize, usize)> {
     // try_lock, not lock: sink hooks call this and may fire from a signal
     // handler; on contention skip the taint tag (None) rather than deadlock.
     let guard = LIVE_INPUT.try_lock().ok()?;
-    let live = guard.as_ref()?;
-    if needle.len() > live.bytes.len() {
+    let live = guard.current()?;
+    if needle.len() > live.len() {
         return None;
     }
-    live.bytes
-        .windows(needle.len())
+    live.windows(needle.len())
         .position(|window| window == needle)
         .map(|offset| (offset, needle.len()))
 }
@@ -392,13 +496,13 @@ pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usiz
     // a cooperating harness publishes). try_lock, not lock: reachable from sink
     // hooks in a signal handler; skip rather than deadlock (see taint_span).
     if let Ok(guard) = LIVE_INPUT.try_lock() {
-        if let Some(live) = guard.as_ref() {
+        if let Some(live) = guard.current() {
             // Some(empty) is an explicit empty current input, not "no publication":
             // never fall through to a stale shared buffer (mirrors `read_into`).
-            if live.bytes.is_empty() {
+            if live.is_empty() {
                 return None;
             }
-            return input_run_in(haystack, &live.bytes, min_len);
+            return input_run_in(haystack, live, min_len);
         }
     }
     // Fallback: the mmap'd shared memfd (`BHF_FUZZ_INPUT_FD`). A black-box target
@@ -444,7 +548,8 @@ mod tests {
     /// Reset module state so tests are independent of each other.
     fn reset() {
         if let Ok(mut g) = LIVE_INPUT.lock() {
-            *g = None;
+            g.published = false;
+            g.len = 0;
         }
         CURSOR.store(0, Ordering::Relaxed);
     }
@@ -463,6 +568,53 @@ mod tests {
         // First five bytes are HELLO; next five wrap to HELLO again.
         assert_eq!(&out[..5], b"HELLO");
         assert_eq!(&out[5..], b"HELLO");
+        reset();
+    }
+
+    #[test]
+    fn each_publication_replaces_the_last_whatever_its_size() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        // Larger than a page, so the next publication reuses a mapping that
+        // still holds this input's bytes past its own end.
+        let mut long = b"OLDTOKEN".repeat(1024);
+        long.extend_from_slice(b"TAIL");
+        unsafe {
+            bhf_shim_set_fuzz_input(long.as_ptr(), long.len());
+        }
+        let mut out = vec![0u8; long.len()];
+        assert_eq!(read_into(&mut out), long.len());
+        assert_eq!(out, long);
+        assert_eq!(taint_span(b"OLDTOKENOLDTOKEN", 4), Some((0, 16)));
+
+        // The caller's buffer can go away once the call returns.
+        let mut short = b"new-record".to_vec();
+        unsafe {
+            bhf_shim_set_fuzz_input(short.as_ptr(), short.len());
+        }
+        short.fill(0);
+        drop(short);
+        let mut out = [0u8; 25];
+        assert_eq!(read_into(&mut out), out.len());
+        assert_eq!(&out, b"new-recordnew-recordnew-r");
+        let mut keyed = [0u8; 12];
+        read_keyed(4, &mut keyed);
+        assert_eq!(&keyed, b"recordnew-re");
+        // Nothing of the earlier, longer input is visible.
+        assert_eq!(taint_span(b"OLDTOKEN", 4), None);
+        assert_eq!(taint_span(b"TAIL", 4), None);
+        assert_eq!(input_derived_run(b"cat OLDTOKEN", 4), None);
+        assert_eq!(input_derived_run(b"cat new-record;", 4), Some((0, 10)));
+
+        // A larger input than the mapping holds gets a larger mapping.
+        let large: Vec<u8> = (0..3 * 4096 + 7).map(|i| (i % 251) as u8).collect();
+        unsafe {
+            bhf_shim_set_fuzz_input(large.as_ptr(), large.len());
+        }
+        let mut out = vec![0u8; large.len() + 3];
+        assert_eq!(read_into(&mut out), out.len());
+        assert_eq!(&out[..large.len()], &large[..]);
+        assert_eq!(&out[large.len()..], &large[..3]);
         reset();
     }
 

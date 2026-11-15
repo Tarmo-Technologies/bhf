@@ -128,6 +128,18 @@ Every hook formats its event into a stack buffer and writes through `libc::write
 Hooks never call `malloc` / `free` / `Box::new` / `String` / `Vec`. The hooked
 process may be inside its own allocator on the call path that reached us.
 
+The copy of the current input that a harness publishes with
+`bhf_shim_set_fuzz_input` (bhf's driver and every generated harness do, once
+per input) is kept in a private anonymous mapping, never on the heap. In a
+sanitized target `malloc` is the sanitizer's, and the driver allocates each
+input with exactly its size just before publishing it, so a heap copy would sit
+in the next chunk: a read past the input beyond its redzone would be reported
+against the shim's allocation, as a heap-use-after-free of the copy the next
+publication freed, or not at all for the live copy. With the copy mapped, an
+AddressSanitizer report (kind, region, allocation stack) and the set of
+findings are the same with and without the shim. The mapping is reused while
+the input fits and replaced by a larger one when it does not.
+
 ## Pass Modes
 
 The shim caches `BHF_RUNTRACE_MODE` on first use:

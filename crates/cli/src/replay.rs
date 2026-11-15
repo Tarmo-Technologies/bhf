@@ -43,7 +43,11 @@ pub struct ReplayArgs {
     /// Harness binary path. Optional: when omitted it is auto-resolved from the
     /// finding's recorded `fixture_path` (relative to the work dir holding the
     /// finding first) or `harness_id` (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
-    /// Pass this to override the auto-resolved path.
+    /// Pass this to override the auto-resolved path. Every replay writes its
+    /// raw output to `<finding>/replay.log`; a replay of another harness than
+    /// the finding's own (another build's sha256, or another file when no
+    /// build is recorded) that does not MATCH writes
+    /// `<finding>/replay-other-harness.log` instead.
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
@@ -1169,8 +1173,9 @@ struct ReplaySummary {
     /// `--debugger`: the batch debugger session.
     #[serde(skip_serializing_if = "Option::is_none")]
     debugger: Option<crate::replay_debugger::DebuggerSession>,
-    /// `<finding>/replay.log`, the raw output of this replay, when it could
-    /// be written.
+    /// The replay log this replay wrote, when it could be written:
+    /// `<finding>/replay.log`, or `<finding>/replay-other-harness.log` for a
+    /// replay of another harness that does not match ([`replay_log_name`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_log: Option<String>,
     /// `bhf replay` printed the status line first; kept for the text view.
@@ -1427,20 +1432,26 @@ fn render_text(summary: &ReplaySummary) -> Vec<String> {
     lines
 }
 
-/// The file every replay writes in the finding dir: what ran and its raw
-/// output. It is not an evidence file of the finding (results/ does not hash
-/// it as one); results/ is rebuilt after it is written so the attestation
-/// covers it.
+/// The file a replay writes in the finding dir: what ran and its raw output
+/// (a replay of another harness that does not match writes
+/// [`OTHER_HARNESS_REPLAY_LOG`] instead). Neither is an evidence file of the
+/// finding (results/ does not hash them as one); results/ is rebuilt after
+/// either is written so the attestation covers it.
 pub(crate) const REPLAY_LOG: &str = "replay.log";
+/// What a replay of another harness than the finding's own writes instead of
+/// [`REPLAY_LOG`] when it does not reproduce the finding, so `replay.log`
+/// keeps the replay of the finding's own harness (see [`replay_log_name`]).
+pub(crate) const OTHER_HARNESS_REPLAY_LOG: &str = "replay-other-harness.log";
 /// Bytes of one output stream a replay log keeps from its start, and from
 /// its end (where a sanitizer report is).
 const REPLAY_LOG_HEAD: usize = 256 * 1024;
 const REPLAY_LOG_TAIL: usize = 768 * 1024;
 
-/// Write `<finding>/replay.log` for `summary`: the verdict and what ran, then
-/// the harness's stderr and stdout (`streams`, each bounded to its first and
-/// last bytes), then a debugger session's transcript. `None` when there was
-/// nothing to write it to (a read-only finding dir).
+/// Write the replay log for `summary` in `finding_dir` (`replay.log`, or
+/// `replay-other-harness.log`; see [`replay_log_name`]): the verdict and what
+/// ran, then the harness's stderr and stdout (`streams`, each bounded to its
+/// first and last bytes), then a debugger session's transcript. `None` when
+/// there was nothing to write it to (a read-only finding dir).
 fn write_replay_log(
     finding_dir: &Path,
     summary: &ReplaySummary,
@@ -1506,9 +1517,45 @@ fn write_replay_log(
             log.push('\n');
         }
     }
-    let path = finding_dir.join(REPLAY_LOG);
+    let path = finding_dir.join(replay_log_name(finding_dir, summary));
     std::fs::write(&path, log).ok()?;
     Some(path)
+}
+
+/// The log file `summary` is written to: [`REPLAY_LOG`], unless the replay did
+/// not reproduce the finding and ran another harness than the finding's own
+/// ([`ran_another_harness`]); that run, with a harness passed to compare or a
+/// rebuild, says nothing about the finding's own harness, so it goes to
+/// [`OTHER_HARNESS_REPLAY_LOG`].
+fn replay_log_name(finding_dir: &Path, summary: &ReplaySummary) -> &'static str {
+    let another = summary.verdict != "match"
+        && summary
+            .harness
+            .as_ref()
+            .is_some_and(|harness| ran_another_harness(finding_dir, harness));
+    if another {
+        OTHER_HARNESS_REPLAY_LOG
+    } else {
+        REPLAY_LOG
+    }
+}
+
+/// Whether `harness` is not the finding's own: its sha256 is not the build
+/// the finding records or, for a finding that records none, it is not the
+/// harness the finding names ([`recorded_harness`]). A finding whose harness
+/// cannot be told counts its replay as its own.
+fn ran_another_harness(finding_dir: &Path, harness: &HarnessSummary) -> bool {
+    if let Some(matches) = harness.sha256_matches {
+        return !matches;
+    }
+    let Ok(recorded) = recorded_harness(finding_dir) else {
+        return false;
+    };
+    let ran = Path::new(&harness.path);
+    match (std::fs::canonicalize(&recorded), std::fs::canonicalize(ran)) {
+        (Ok(recorded), Ok(ran)) => recorded != ran,
+        _ => false,
+    }
 }
 
 /// `bytes` as text, keeping its first [`REPLAY_LOG_HEAD`] and last

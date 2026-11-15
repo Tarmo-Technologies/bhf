@@ -79,6 +79,20 @@
   libFuzzer runtime in a binary without bhf's driver outranks a declared
   `framed` input mode. `bhf fuzz --workers N` prints the libFuzzer-binary
   note once on the terminal, not only in each worker's stderr log.
+- The runtrace shim no longer changes what AddressSanitizer reports. It kept
+  its copy of each published input on the target's heap, in the chunk right
+  after the driver's input buffer, so a read past the input beyond its
+  redzone was reported against the shim's allocation (Rust allocator frames),
+  as a heap-use-after-free of the copy the next publication freed, or not at
+  all. Fuzzing and replay preload the shim, so a finding's kind, allocation
+  stack, and the finding set depended on whether the shim was installed. The
+  copy now lives in a private anonymous mapping: the same input gives the
+  same report, with the driver's buffer as the allocation, with and without
+  the shim.
+- `bhf replay` of another harness than the finding's own (another build's
+  sha256, or another file when no build is recorded) that does not `MATCH`
+  writes `replay-other-harness.log` and leaves the finding's `replay.log` as
+  it was.
 - TSan corpus replay: an input whose run exits cleanly with no race report is
   run once more before it counts as race-free. TSan's shadow-memory update is
   not atomic, so two threads that first touch an address at the same moment

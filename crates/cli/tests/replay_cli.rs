@@ -1688,6 +1688,167 @@ fn build_overflowing_harness(dir: &Path) -> Option<PathBuf> {
     built.status.success().then(|| dir.join("main"))
 }
 
+/// The runtrace shim this checkout built, when it is newer than the code that
+/// copies the published input (an older build would test the old code).
+#[cfg(target_os = "linux")]
+fn fresh_runtrace_shim() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = root.join("crates/bhf_runtrace_shim/src/fakes/fuzz_input.rs");
+    let source_mtime = fs::metadata(source).and_then(|m| m.modified()).ok()?;
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
+    ["debug", "release"].into_iter().find_map(|profile| {
+        let shim = target.join(profile).join("libbhf_runtrace_shim.so");
+        let built = fs::metadata(&shim).and_then(|m| m.modified()).ok()?;
+        (built >= source_mtime).then_some(shim)
+    })
+}
+
+/// llvm-symbolizer on `PATH` or a versioned one.
+#[cfg(target_os = "linux")]
+fn any_llvm_symbolizer() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("llvm-symbolizer"))
+                .find(|candidate| candidate.is_file())
+        })
+        .or_else(|| {
+            (14..=22)
+                .rev()
+                .map(|version| PathBuf::from(format!("/usr/bin/llvm-symbolizer-{version}")))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
+/// A read past the input, beyond its redzone, recorded from a run without the
+/// runtrace shim, replays as the same crash with the shim preloaded: the
+/// same kind, at the same site, in the buffer bhf's driver allocated. The
+/// shim's copy of the input used to sit on the heap right after that buffer,
+/// so with it the read was a heap-use-after-free in the shim's freed copy, or
+/// no crash at all in its live one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_past_the_input_replays_as_recorded_with_the_runtrace_shim() {
+    let Some(shim) = fresh_runtrace_shim() else {
+        eprintln!("skipping: runtrace shim not built (cargo build --workspace)");
+        return;
+    };
+    let Some(symbolizer) = any_llvm_symbolizer() else {
+        eprintln!("skipping: no llvm-symbolizer");
+        return;
+    };
+    let root = temp_dir("shim-overread");
+    let harness_dir = root.join("harness");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("target.c"),
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
+         extern void bhf_shim_set_fuzz_input(const uint8_t *, size_t) __attribute__((weak));\n\
+         __attribute__((noinline)) int parse_record(const uint8_t *data, size_t size) {\n\
+             size_t at = (size_t)data[0] | ((size_t)data[1] << 8);\n\
+             (void)size;\n\
+             return data[at];\n\
+         }\n\
+         int bhf_run_one(const uint8_t *data, size_t size) {\n\
+             if (bhf_shim_set_fuzz_input) {\n\
+                 fprintf(stderr, \"input published to the shim\\n\");\n\
+                 bhf_shim_set_fuzz_input(data, size);\n\
+             }\n\
+             if (size < 2) return 0;\n\
+             volatile int value = parse_record(data, size);\n\
+             (void)value;\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+    let Ok(built) = Command::new("clang")
+        .current_dir(&harness_dir)
+        .args(["-O1", "-g", "-fsanitize=address", "-o", "main", "target.c"])
+        .arg(&driver)
+        .output()
+    else {
+        eprintln!("skipping: clang unavailable");
+        return;
+    };
+    if !built.status.success() {
+        eprintln!(
+            "skipping: clang cannot build with ASan: {}",
+            text(&built.stderr)
+        );
+        return;
+    }
+    let harness = harness_dir.join("main");
+
+    for past in [0usize, 11, 27, 43, 59, 75] {
+        let work = root.join(format!("work-{past}"));
+        fs::create_dir_all(&work).unwrap();
+        let at = 16 + past;
+        let mut input = vec![b'r'; 16];
+        input[0] = (at & 0xff) as u8;
+        input[1] = (at >> 8) as u8;
+        let testcase = work.join("input.bin");
+        fs::write(&testcase, &input).unwrap();
+        let recorded = Command::new(&harness)
+            .arg(&testcase)
+            .env_remove("LD_PRELOAD")
+            .env_remove("DEBUGINFOD_URLS")
+            .env("ASAN_SYMBOLIZER_PATH", &symbolizer)
+            .env("ASAN_OPTIONS", "detect_leaks=0:symbolize=1")
+            .output()
+            .unwrap();
+        let stderr = text(&recorded.stderr);
+        assert!(!stderr.contains("input published"), "{stderr}");
+        let parsed = corpus::parse_sanitizer_report(&stderr).expect("the harness reports");
+        assert_eq!(parsed.kind, "heap-buffer-overflow", "{stderr}");
+        let id = corpus::FindingEmitter::with_metadata(
+            work.clone(),
+            "H-1".to_owned(),
+            "c".to_owned(),
+            harness.display().to_string(),
+        )
+        .with_build_binary(serde_json::json!({"sha256": sha256_hex(&harness)}))
+        .emit_sanitizer_crash_with_log(&input, &parsed, Some(stderr.as_bytes()))
+        .expect("finding emitted");
+        let finding = corpus::layout::findings_dir(&work).join(id.0);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+            .args(["replay", finding.to_str().unwrap(), "--harness"])
+            .arg(&harness)
+            .args(["--json", "--show-output"])
+            .env("BHF_RUNTRACE_SHIM", &shim)
+            .env("ASAN_SYMBOLIZER_PATH", &symbolizer)
+            .env_remove("DEBUGINFOD_URLS")
+            .output()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{}{}", text(&output.stdout), text(&output.stderr)));
+        let replayed = doc["output"]["stderr"].as_str().unwrap_or_default();
+        assert!(
+            replayed.contains("input published to the shim"),
+            "past {past}: the replay preloads the shim: {replayed}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "past {past}: {}\n{replayed}",
+            doc["differences"]
+        );
+        assert_eq!(doc["verdict"], "match", "past {past}: {doc}");
+        assert_eq!(
+            doc["crash"]["kind"], "heap-buffer-overflow",
+            "past {past}: {replayed}"
+        );
+        let allocated = doc["crash"]["allocated"].to_string();
+        assert!(
+            allocated.contains("bhf_run_file") && !allocated.contains("alloc::"),
+            "past {past}: {allocated}\n{replayed}"
+        );
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A finding recorded from a real run of `harness` on `input`, with the
 /// harness build's sha256.
 #[cfg(unix)]
@@ -3319,9 +3480,10 @@ fn replay_debugger_under_lldb_prints_the_crash_stack() {
 }
 
 /// Every replay writes the harness's raw output, bounded, to
-/// `<finding>/replay.log` and names it in the summary and `--json`; the
-/// results index is rebuilt after a mismatch too, so the attestation covers
-/// the log.
+/// `<finding>/replay.log` and names it in the summary and `--json`. A replay
+/// of another harness that does not reproduce the finding writes
+/// `replay-other-harness.log` instead and leaves `replay.log` as it was; the
+/// results index is rebuilt after it too, so the attestation covers the log.
 #[cfg(unix)]
 #[test]
 fn replay_writes_a_bounded_replay_log_and_keeps_the_attestation_current() {
@@ -3353,7 +3515,10 @@ fn replay_writes_a_bounded_replay_log_and_keeps_the_attestation_current() {
     );
     assert_attestation_current(&work);
 
-    // A mismatch writes it too, and results/ is rebuilt for it.
+    let matched_log = fs::read(&log_path).unwrap();
+
+    // A mismatch of another harness writes its own log, and results/ is
+    // rebuilt for it.
     let other = root.join("other/main");
     let noisy = format!(
         "{}{}",
@@ -3369,11 +3534,17 @@ fn replay_writes_a_bounded_replay_log_and_keeps_the_attestation_current() {
     ]);
     assert_eq!(output.status.code(), Some(3));
     let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let other_log_path = finding.join("replay-other-harness.log");
     assert_eq!(
         doc["replay_log"],
-        serde_json::json!(log_path.display().to_string())
+        serde_json::json!(other_log_path.display().to_string())
     );
-    let log = fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        fs::read(&log_path).unwrap(),
+        matched_log,
+        "the replay of the finding's own harness is kept"
+    );
+    let log = fs::read_to_string(&other_log_path).unwrap();
     assert!(
         log.contains("verdict: mismatch"),
         "{}",
@@ -3386,12 +3557,85 @@ fn replay_writes_a_bounded_replay_log_and_keeps_the_attestation_current() {
     );
     assert!(log.contains("bytes not kept"), "the cut is marked");
     assert_attestation_current(&work);
+    let attestation: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("results/attestation.json")).unwrap()).unwrap();
+    for name in ["replay.log", "replay-other-harness.log"] {
+        assert!(
+            attestation["subject"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"].as_str().unwrap().ends_with(&format!("/{name}"))),
+            "the attestation covers {name}"
+        );
+    }
     // The log is not hashed as finding evidence.
     let findings: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
     assert!(
-        !findings.to_string().contains("replay.log"),
-        "replay.log is not an evidence file"
+        !findings.to_string().contains("replay.log")
+            && !findings.to_string().contains("replay-other-harness.log"),
+        "replay logs are not evidence files"
     );
+
+    // The finding's own harness still writes replay.log when it does not
+    // reproduce the finding.
+    write_crashing_harness(&harness, &asan_report("Widget::other", 8));
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("verdict: mismatch"), "{log}");
+    assert_attestation_current(&work);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A finding that records its build: a rebuild of its harness at the same
+/// path is another harness, and a replay of it that does not reproduce the
+/// finding leaves `replay.log` (the recorded build's replay) as it was.
+#[cfg(unix)]
+#[test]
+fn a_non_matching_replay_of_a_rebuilt_harness_keeps_the_replay_log() {
+    let root = temp_dir("replay-log-rebuilt");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    let mut record = read_finding_json(&finding);
+    record["build"] = serde_json::json!({"binary": {"sha256": sha256_hex(&harness)}});
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let log_path = finding.join("replay.log");
+    let matched_log = fs::read(&log_path).unwrap();
+
+    write_crashing_harness(&harness, &asan_report("Widget::other", 8));
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    let summary = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert_eq!(output.status.code(), Some(3), "{summary}");
+    assert!(
+        summary.contains("sha256 differs from the recorded build"),
+        "{summary}"
+    );
+    let other_log_path = finding.join("replay-other-harness.log");
+    assert!(
+        summary.contains(&format!("  log        {}", other_log_path.display())),
+        "{summary}"
+    );
+    assert_eq!(fs::read(&log_path).unwrap(), matched_log);
+    let log = fs::read_to_string(&other_log_path).unwrap();
+    assert!(log.contains("verdict: mismatch"), "{log}");
+
+    // A rebuild that reproduces the finding is its replay.
+    write_crashing_harness(&harness, &format!("{report}# rebuilt\n"));
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stdout));
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("verdict: match"), "{log}");
+    assert_ne!(log.as_bytes(), matched_log.as_slice());
     fs::remove_dir_all(&root).ok();
 }
