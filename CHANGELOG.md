@@ -45,6 +45,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf corpus minimize` with a harness that records no corpus coverage (any
+  but an Ada harness) copies every input to `--out`, names the harness's lane
+  and exits 2. It kept no input, wrote an empty `--out` and exited 0.
 - `bhf generate-harness` refuses a source in a language other than C, C++
   and Ada, naming the language and `bhf auto --target`; it parsed a `.py`,
   `.rb` or `.go` file as Ada and reported that the subprogram was not found.

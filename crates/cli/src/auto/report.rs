@@ -880,7 +880,7 @@ fn lang_tag(l: Lang) -> &'static str {
         Lang::Php => "php",
     }
 }
-fn lang_from_tag(s: &str) -> Option<Lang> {
+pub(crate) fn lang_from_tag(s: &str) -> Option<Lang> {
     Some(match s {
         "ada" => Lang::Ada,
         "c" => Lang::C,

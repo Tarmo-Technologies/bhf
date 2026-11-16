@@ -209,11 +209,21 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
     };
 
     if !saw_coverage {
+        // Nothing told the inputs apart: keep every one, and say this harness
+        // cannot be minimized rather than report an empty minimal corpus.
+        let all: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
+        if let Err(error) = copy_selected(&args.input, &args.output, &all) {
+            bhfeprintln!("error: {error}");
+            return 1;
+        }
         bhfeprintln!(
-            "warning: harness produced no runtrace coverage for any input; \
-             C/C++ libFuzzer harnesses are not supported for coverage-minimal \
-             merge — use `bhf corpus merge` to remove duplicate content"
+            "error: {} records no corpus coverage when it replays an input (Ada harnesses \
+             do), so `bhf corpus minimize` cannot tell its inputs apart; copied all {total} \
+             inputs to {} unchanged. `bhf corpus merge` drops inputs with duplicate content",
+            harness_lane(&args.harness),
+            args.output.display()
         );
+        return 2;
     }
 
     if let Err(error) = copy_selected(&args.input, &args.output, &kept) {
@@ -227,6 +237,42 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
         total - kept.len(),
     );
     0
+}
+
+/// "the C harness", "the Java harness": the lane of the harness executable
+/// `harness`, read from its harness dir (`<dir>/main`, or `<dir>/obj/main` for
+/// an Ada build), else "the harness".
+fn harness_lane(harness: &std::path::Path) -> String {
+    let mut dir = harness.parent();
+    if dir
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "obj")
+    {
+        dir = dir.and_then(std::path::Path::parent);
+    }
+    let Some(dir) = dir else {
+        return "the harness".to_owned();
+    };
+    let id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    // `bhf build` stages `<work>/build/<id>/main`; the generated harness dir
+    // beside it says what it is.
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(work_dir) = dir
+        .parent()
+        .filter(|build| build.file_name().is_some_and(|name| name == "build"))
+        .and_then(std::path::Path::parent)
+    {
+        dirs.extend(crate::auto::layout::harness_dir_candidates(work_dir, id));
+    }
+    crate::repro_lane::harness_language(&dirs, id)
+        .and_then(|tag| crate::auto::report::lang_from_tag(&tag))
+        .map_or_else(
+            || "the harness".to_owned(),
+            |lang| format!("the {} harness", crate::auto::candidate::lang_name(lang)),
+        )
 }
 
 /// Read every regular file in `dir` as `(file_name, bytes)`, sorted by file
