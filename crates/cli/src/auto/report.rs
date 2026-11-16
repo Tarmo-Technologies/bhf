@@ -114,6 +114,12 @@ struct Summary {
     /// outcome). 0 (omitted) when none was.
     #[serde(skip_serializing_if = "is_zero")]
     missing_toolchain: usize,
+    /// Targets whose build runs project-controlled code and the run did not
+    /// consent to it with `--run-untrusted` (outcome `consent_required`; a
+    /// Rust or C# target, counted in `unsupported_params` before it had its
+    /// own outcome). 0 (omitted) when none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    consent_required: usize,
     /// Targets whose harness built but whose sanitizer runtime cannot start
     /// on this host (outcome `sanitizer_runtime_unavailable`; an environment
     /// problem, not a finding). 0 (omitted) when none was.
@@ -1440,6 +1446,9 @@ pub fn write_reports_with_output_limit(
             Outcome::MissingToolchain { .. } => {
                 summary.missing_toolchain += 1;
             }
+            Outcome::ConsentRequired { .. } => {
+                summary.consent_required += 1;
+            }
             Outcome::SanitizerRuntimeUnavailable { repairs, .. } => {
                 summary.sanitizer_runtime_unavailable += 1;
                 aggregate_repairs(
@@ -2723,6 +2732,7 @@ fn missing_language_package(outcome: &Outcome) -> Option<String> {
         Outcome::UnsupportedParams { reason } => reason.as_str(),
         Outcome::UnsafeBuildPath { .. }
         | Outcome::MissingToolchain { .. }
+        | Outcome::ConsentRequired { .. }
         | Outcome::FailedBuild { .. }
         | Outcome::BuiltAndFuzzed { .. }
         | Outcome::BuiltNotEntered { .. }
@@ -2757,6 +2767,7 @@ fn add_checkpoint_result(
         Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
         | Outcome::MissingToolchain { .. }
+        | Outcome::ConsentRequired { .. }
         | Outcome::ReportOnly { .. } => &[],
     };
     // An interpreted target that could not load because a package is not
@@ -3024,6 +3035,7 @@ fn add_checkpoint_result(
         | Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
         | Outcome::MissingToolchain { .. }
+        | Outcome::ConsentRequired { .. }
         | Outcome::SanitizerRuntimeUnavailable { .. } => {}
     }
 }
@@ -3570,6 +3582,13 @@ fn render_md(r: &RunJson<'_>) -> String {
             s,
             "Skipped (toolchain not installed): {}",
             r.summary.missing_toolchain
+        );
+    }
+    if r.summary.consent_required > 0 {
+        let _ = writeln!(
+            s,
+            "Not built (needs --run-untrusted: the build runs project code): {}",
+            r.summary.consent_required
         );
     }
     if r.summary.sanitizer_runtime_unavailable > 0 {

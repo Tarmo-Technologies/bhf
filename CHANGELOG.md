@@ -45,6 +45,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A Rust or C# target run without `--run-untrusted` is reported as needing
+  that consent: outcome `consent_required` (`summary.consent_required`,
+  "needs --run-untrusted" in run.md), and the next steps ask for the flag. It
+  was `unsupported_params`, counted among the targets whose parameters could
+  not be driven, and the next steps told the operator to `--force` it, which
+  cannot help: the build runs the project's own code (Cargo build scripts and
+  proc macros, MSBuild targets). A Java target whose Maven or Gradle build
+  needs the consent and whose `javac` fallback fails gets the same outcome,
+  and `--resume` tries such targets again.
 - auto.md's defaults and limitations match the code: `--jobs` defaults to
   half the host's cores (at most 8, `BHF_DEFAULT_JOBS` overrides), not 1,
   which changes the memory sizing; `--sanitizers` defaults to

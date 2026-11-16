@@ -337,6 +337,7 @@ fn blocker_kind(outcome: &str) -> &'static str {
         "unsupported_params" => "unsupported_params",
         "unsafe_build_path" => "unsafe_build_path",
         "missing_toolchain" => "missing_toolchain",
+        "consent_required" => "consent_required",
         "sanitizer_runtime_unavailable" => "sanitizer_runtime_unavailable",
         "unrecoverable_link" => "link_blocked",
         "unrecoverable_runtime" => "runtime_blocked",
@@ -369,6 +370,12 @@ fn recommendation_for(blocker_kind: &str, candidate: &Candidate) -> String {
         "missing_toolchain" => {
             "Skipped previously because the lane's toolchain is not installed (the reason names \
              the tool); install it and rerun."
+                .to_owned()
+        }
+        "consent_required" => {
+            "Not built previously because its build runs project-controlled code (Cargo build \
+             scripts and proc macros, MSBuild targets); rerun with --run-untrusted, with \
+             dependencies staged and network isolation."
                 .to_owned()
         }
         "sanitizer_runtime_unavailable" => {

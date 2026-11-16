@@ -155,3 +155,14 @@ fn the_table_defaults_match_the_help() {
         "{static_dynamic}"
     );
 }
+
+/// Rust and C# targets need `--run-untrusted`, and the row says how a run
+/// without it reports them (#241).
+#[test]
+fn the_run_untrusted_row_names_rust_csharp_and_consent_required() {
+    let doc = auto_md();
+    let (_, purpose) = cells(&doc, "--run-untrusted");
+    for words in ["Rust", "C#", "`consent_required`", "needs --run-untrusted"] {
+        assert!(purpose.contains(words), "{purpose}");
+    }
+}

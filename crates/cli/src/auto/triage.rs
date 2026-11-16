@@ -25,6 +25,10 @@ pub struct TriageInputs<'a> {
     /// no esbuild), counted per lane (its [`crate::auto::preflight`] name). The
     /// remedy is to install it, not `--force`.
     pub skipped_missing_toolchain: Vec<(&'static str, usize)>,
+    /// Of `skipped`, the Rust and C# targets whose build runs project code and
+    /// the run did not give `--run-untrusted`. The remedy is the consent, not
+    /// `--force`.
+    pub skipped_consent_required: usize,
     pub report_only: usize,
     /// Of `failed_build`, the C++ targets (the C++ dialect ladder applies).
     pub failed_build_cpp: usize,
@@ -148,12 +152,24 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         ));
     }
 
-    // 3d. Skipped (a parameter couldn't be driven) — what --force is actually for.
+    // 3d. Not built because the build runs project code without consent.
+    if inputs.skipped_consent_required > 0 {
+        actions.push(format!(
+            "{} Rust or C# target(s) need --run-untrusted: their build runs project-controlled \
+             code (Cargo build scripts and proc macros, MSBuild targets). Stage the \
+             dependencies, isolate the network and re-run with --run-untrusted; --force cannot \
+             help.",
+            inputs.skipped_consent_required
+        ));
+    }
+
+    // 3e. Skipped (a parameter couldn't be driven) — what --force is actually for.
     let undrivable = inputs
         .skipped
         .saturating_sub(inputs.skipped_missing_package)
         .saturating_sub(inputs.skipped_unsafe_path)
-        .saturating_sub(skipped_missing_toolchain);
+        .saturating_sub(skipped_missing_toolchain)
+        .saturating_sub(inputs.skipped_consent_required);
     if undrivable > 0 {
         actions.push(format!(
             "{undrivable} target(s) were skipped (a parameter couldn't be driven — opaque handle, callback, unknown type). Attempt them anyway with --force.",
@@ -294,6 +310,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 2,
             preflight: &healthy(),
@@ -313,6 +330,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -339,6 +357,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -383,6 +402,7 @@ mod tests {
             skipped_missing_package: 4,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -416,6 +436,7 @@ mod tests {
             skipped_missing_package: 5,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -443,6 +464,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 2,
             skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -502,6 +524,7 @@ mod tests {
                 skipped_missing_package: 0,
                 skipped_unsafe_path: 0,
                 skipped_missing_toolchain: vec![("TypeScript", 2)],
+                skipped_consent_required: 0,
                 report_only: 0,
                 findings: 0,
                 preflight,
@@ -598,5 +621,33 @@ mod tests {
         let text = render_top_findings(&work, 8);
         let expected = format!("reproduce: bhf replay --finding '{}'\n", finding.display());
         assert!(text.contains(&expected), "{text}");
+    }
+
+    /// A Rust or C# target refused for want of consent asks for
+    /// `--run-untrusted`, and is not among the targets `--force` is for.
+    #[test]
+    fn a_target_that_needs_consent_asks_for_run_untrusted_not_force() {
+        let healthy = healthy();
+        let inputs = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
+            skipped: 3,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
+            skipped_consent_required: 3,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy,
+            custom_build: None,
+        };
+        let text = render_triage(&inputs);
+        assert!(
+            text.contains("3 Rust or C# target(s) need --run-untrusted"),
+            "{text}"
+        );
+        assert!(!text.contains("Attempt them anyway with --force"), "{text}");
     }
 }
