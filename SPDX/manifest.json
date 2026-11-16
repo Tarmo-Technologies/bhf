@@ -2691,6 +2691,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/duration_flags_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/embedded_runtime_cache.rs",
       "license": "Apache-2.0"
     },

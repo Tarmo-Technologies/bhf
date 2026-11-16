@@ -297,7 +297,7 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Optional wall-clock budget such as 30s, 5m, or 1h.
+    /// Optional wall-clock budget such as 30s, 5m, 1h or 1.5h.
     #[arg(long, value_parser = parse_duration)]
     pub time: Option<Duration>,
 
@@ -319,7 +319,8 @@ pub struct FuzzArgs {
     /// Per-input timeout (libFuzzer's `-timeout`): a single C/C++ harness
     /// execution that runs longer than this is killed and skipped (the slow unit
     /// is reported). Distinct from `--time`, the whole-campaign budget. Defaults
-    /// to 10s. (The Ada lane bounds runaway inputs via CPU rlimits instead.)
+    /// to 10s; `500ms` and `0.5s` are half a second. (The Ada lane bounds
+    /// runaway inputs via CPU rlimits instead.)
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
@@ -331,8 +332,7 @@ pub struct FuzzArgs {
     /// skipped. Use it for watchdog / RTOS / radar targets where overrunning a
     /// budget is a fault, not just "it hung". When unset, hang handling is
     /// byte-for-byte unchanged. Accepts the same duration spec as `--time`
-    /// (e.g. 250ms is not accepted — use whole seconds like `1s`, or set the
-    /// `BHF_DEADLINE_MS` env for sub-second budgets).
+    /// (`250ms`, `0.5s`, `2s`).
     #[arg(long = "deadline", value_parser = parse_duration)]
     pub deadline: Option<Duration>,
 
@@ -2844,7 +2844,7 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     out.push(args.len_control.to_string());
     if let Some(timeout) = args.timeout {
         out.push("--timeout".to_owned());
-        out.push(format!("{}s", timeout.as_secs().max(1)));
+        out.push(duration_arg(timeout.max(Duration::from_millis(1))));
     }
     if args.rss_limit_mb > 0 {
         out.push("--rss-limit-mb".to_owned());
@@ -2859,7 +2859,7 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     }
     if let Some(deadline) = args.deadline {
         out.push("--deadline".to_owned());
-        out.push(format!("{}s", deadline.as_secs()));
+        out.push(duration_arg(deadline));
     }
     if args.fork_server {
         out.push("--fork-server".to_owned());
@@ -10218,22 +10218,54 @@ pub(crate) fn resolve_env_deadline() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// Parse a duration flag: a number with an optional unit, `ms`, `s`, `m` or
+/// `h` (seconds when bare). The number may be fractional (`0.5s`, `1.5m`), and
+/// `500ms` is half a second, as the docs write it.
 pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("duration must not be empty".to_owned());
     }
-    let (number, multiplier) = match trimmed.as_bytes().last().copied() {
-        Some(b's') | Some(b'S') => (&trimmed[..trimmed.len() - 1], 1),
-        Some(b'm') | Some(b'M') => (&trimmed[..trimmed.len() - 1], 60),
-        Some(b'h') | Some(b'H') => (&trimmed[..trimmed.len() - 1], 60 * 60),
-        Some(b'0'..=b'9') => (trimmed, 1),
-        _ => return Err(format!("invalid duration '{value}'")),
+    let lower = trimmed.to_ascii_lowercase();
+    let (number, unit_millis): (&str, u64) = if let Some(number) = lower.strip_suffix("ms") {
+        (number, 1)
+    } else if let Some(number) = lower.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = lower.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = lower.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        (lower.as_str(), 1_000)
     };
-    let amount = number
-        .parse::<u64>()
-        .map_err(|error| format!("invalid duration '{value}': {error}"))?;
-    Ok(Duration::from_secs(amount.saturating_mul(multiplier)))
+    let number = number.trim();
+    let invalid = || {
+        format!(
+            "invalid duration '{value}': use a number with ms, s, m or h (500ms, 0.5s, 10s, 5m)"
+        )
+    };
+    if number.is_empty()
+        || number.matches('.').count() > 1
+        || !number.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || number.starts_with('.') && number.len() == 1
+    {
+        return Err(invalid());
+    }
+    if let Ok(whole) = number.parse::<u64>() {
+        return Ok(Duration::from_millis(whole.saturating_mul(unit_millis)));
+    }
+    let amount: f64 = number.parse().map_err(|_| invalid())?;
+    Duration::try_from_secs_f64(amount * unit_millis as f64 / 1_000.0).map_err(|_| invalid())
+}
+
+/// A duration as a flag value a child `bhf` parses back exactly: whole
+/// seconds as `Ns`, anything finer as `Nms`.
+pub(crate) fn duration_arg(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn parse_worker_count(value: &str) -> Result<FuzzWorkerCount, String> {
@@ -13013,6 +13045,35 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    /// `500ms` and `0.5s` are half a second, and a value with another unit
+    /// is refused.
+    #[test]
+    fn durations_take_milliseconds_and_fractions() {
+        for (text, millis) in [
+            ("500ms", 500),
+            ("0.5s", 500),
+            ("10s", 10_000),
+            ("10", 10_000),
+            ("1.5m", 90_000),
+            ("2h", 7_200_000),
+            (" 250MS ", 250),
+        ] {
+            assert_eq!(
+                parse_duration(text),
+                Ok(Duration::from_millis(millis)),
+                "{text}"
+            );
+        }
+        for bad in ["5x", "", "ms", ".s", "1.2.3s", "-1s", "1e3s"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(duration_arg(Duration::from_millis(500)), "500ms");
+        assert_eq!(duration_arg(Duration::from_secs(3)), "3s");
+        for value in [Duration::from_millis(1500), Duration::from_secs(30)] {
+            assert_eq!(parse_duration(&duration_arg(value)), Ok(value));
+        }
     }
 
     /// A native executable is named as the shim's target image, by absolute

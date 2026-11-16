@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Duration flags (`--timeout`, `--time`, `--deadline` on `bhf fuzz` and
+  `bhf auto`) accept milliseconds and fractions: `500ms`, `0.5s`, `1.5m`.
+  The documented `--timeout 500ms` was refused. A multi-worker run passes a
+  sub-second `--timeout` or `--deadline` to its workers as it was given; it
+  rounded them to whole seconds.
 - The native Windows ETW collector no longer reports every DLL a target loads
   as BHF-413. ETW names files and images by NT device
   (`\Device\HarddiskVolume3\...`), which the check read as a search-path
