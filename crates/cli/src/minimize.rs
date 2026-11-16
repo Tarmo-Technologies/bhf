@@ -137,6 +137,28 @@ fn minimize_c_engine(
 /// `deadline` has passed (the baseline reproduction check still runs once,
 /// unconditionally: an unreproducible testcase must still error). Used by the
 /// bounded `auto` minimization pass to cap wall-clock time per finding.
+/// A scratch directory inside a finding's evidence directory, removed when it
+/// goes out of scope, so no return path leaves it in the bundle.
+pub(crate) struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    pub(crate) fn create(path: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&path)
+            .with_context(|| format!("create scratch dir {}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn minimize_c_engine_until(
     finding_dir: &Path,
     runner: &replay_min::HarnessRunner,
@@ -158,9 +180,8 @@ fn minimize_c_engine_until(
     let original_input =
         fs::read(&testcase_path).with_context(|| format!("read {}", testcase_path.display()))?;
 
-    let tmp_dir = finding_dir.join("minimize_tmp");
-    fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("create minimize temp dir {}", tmp_dir.display()))?;
+    let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
+    let tmp_dir = scratch.path();
     let raw = fs::read(finding_dir.join("finding.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -219,7 +240,6 @@ fn minimize_c_engine_until(
             other_crash = Some(differences);
         }
         crate::crash_identity::Verdict::Mismatch => {
-            let _ = fs::remove_dir_all(&tmp_dir);
             return Err(BaselineMismatch(format!(
                 "the original testcase crashes {} with another crash than the finding records \
                  ({}); nothing was minimized. Minimize against the finding's own harness; \
@@ -245,8 +265,7 @@ fn minimize_c_engine_until(
         Ok(run_once(candidate)?
             .is_some_and(|report| crate::crash_identity::same_crash(&baseline, &report)))
     })?;
-
-    let _ = fs::remove_dir_all(&tmp_dir);
+    drop(scratch);
 
     let min_path = finding_dir.join("min_testcase.bin");
     fs::write(&min_path, &result.minimized)
@@ -691,6 +710,40 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+        assert!(!finding.join("minimize_tmp").exists());
+    }
+
+    /// A testcase that no longer crashes the harness is not minimized, and the
+    /// scratch directory goes with the error instead of staying in the bundle.
+    #[test]
+    fn a_testcase_that_does_not_reproduce_leaves_no_scratch_dir() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            serde_json::json!({"rule_id": "BHF-415", "paths": {}}).to_string(),
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"no crash here").expect("testcase");
+        let harness = root.path().join("clean.sh");
+        fs::write(&harness, "#!/bin/sh\nexit 0\n").expect("harness");
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let error = minimize_c_engine(
+            &finding,
+            &replay_min::HarnessRunner::direct(&harness),
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+            false,
+        )
+        .expect_err("nothing to minimize");
+        assert!(
+            error.to_string().contains("does not reproduce"),
+            "{error:#}"
+        );
+        assert!(!finding.join("minimize_tmp").exists());
+        assert!(!finding.join("min_testcase.bin").exists());
     }
 
     /// UBSan prints its report and CONTINUES (exit 0) unless told to halt, the

@@ -1189,8 +1189,8 @@ pub(crate) fn minimize_binary_finding(
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let invocation = finding_invocation(&finding, binary);
-    let tmp_dir = finding_dir.join("binary_minimize_tmp");
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
+    let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_minimize_tmp"))?;
+    let tmp_dir = scratch.path().to_path_buf();
     // Reduce against the finding's OWN oracle: a crash signature, a runtime-oracle
     // signature (#59), or a user postcondition signature (#55).
     let result = match finding.get("kind").and_then(Value::as_str) {
@@ -1267,7 +1267,7 @@ pub(crate) fn minimize_binary_finding(
             })?
         }
     };
-    let _ = fs::remove_dir_all(&tmp_dir);
+    drop(scratch);
     fs::write(finding_dir.join("min_testcase.bin"), &result.minimized)
         .with_context(|| format!("write {}", finding_dir.join("min_testcase.bin").display()))?;
     let removed = result.original_len.saturating_sub(result.minimized.len());
@@ -1289,8 +1289,8 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let finding = read_finding(finding_dir)?;
     let input = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
-    let tmp_dir = finding_dir.join("binary_replay_tmp");
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
+    let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_replay_tmp"))?;
+    let tmp_dir = scratch.path().to_path_buf();
     let invocation = finding_invocation(&finding, binary);
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;

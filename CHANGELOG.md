@@ -15,6 +15,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf minimize` (and the binary minimizer and replay) remove their scratch
+  directory on every exit path. One whose testcase did not reproduce left an
+  empty `minimize_tmp/` in the finding's evidence bundle.
 - `bhf replay` and the capture replay keep the runtrace shim out of JVM, CLR,
   Node and interpreter launchers, as fuzzing does. Preloaded, it hung the CLR
   (which ignored SIGTERM), so every C# finding replayed as a timeout
