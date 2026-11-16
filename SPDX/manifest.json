@@ -2143,6 +2143,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_cl_std_prelude.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_closure_failure_memo.rs",
       "license": "Apache-2.0"
     },
@@ -2644,6 +2648,10 @@
     },
     {
       "path": "crates/cli/tests/collector_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/collector_win_live.rs",
       "license": "Apache-2.0"
     },
     {

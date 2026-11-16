@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A C++ declaration of an unqualified standard type (`vector<int> items;` in a
+  pre-standard header) gets clang's `unknown type name 'vector'`, with its
+  source line, from bhf's cl front end, so the std-prelude repair works with
+  `--cc cl`. cl reports it as C2143, C4430, C3646, C2146 or C2238, which
+  name no type, and the target failed unclassified.
 - The C driver's runtime cmplog works on Windows: a native Windows harness
   appends its `{"e":"cmplog",…}` records to the run's log through a
   `FILE_APPEND_DATA` handle, so `bhf auto` writes a learned dictionary for

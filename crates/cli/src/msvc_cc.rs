@@ -473,10 +473,85 @@ pub(crate) fn clang_style_diagnostic(line: &str) -> Option<String> {
             "error: {}",
             message.trim_start_matches("#error:").trim()
         ),
+        // A declaration of an unqualified standard type in a pre-standard
+        // header (`vector<int> items;` with no `std::`): cl reports default
+        // int, an override specifier or a missing `;`, never the name.
+        "C4430" | "C3646" | "C2143" | "C2146" | "C2238" => {
+            return declaration_std_type(line);
+        }
         _ => return None,
     };
     let _ = severity;
     Some(format!("{location}: {clang}"))
+}
+
+/// clang's report of a standard type used unqualified where cl reports a
+/// declaration-position syntax error: `path:row:col: error: unknown type name
+/// 'vector'`, then the source line under a `row |` gutter and a caret, as
+/// clang prints them, read from the file at cl's location. `None` for a C
+/// file, an unreadable line, or a line without such a type.
+fn declaration_std_type(line: &str) -> Option<String> {
+    let close = line.find("): ")?;
+    let open = line[..close].rfind('(')?;
+    let path = &line[..open];
+    let row: usize = line[open + 1..close]
+        .split(',')
+        .next()?
+        .parse()
+        .ok()
+        .filter(|row| *row > 0)?;
+    if Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("c"))
+    {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let source = text.lines().nth(row - 1)?;
+    let (name, column) = unqualified_std_type(source)?;
+    let gutter = row.to_string();
+    Some(format!(
+        "{}:{row}:{column}: error: unknown type name '{name}'\n {gutter} | {source}\n {} | {}^",
+        path.replace('\\', "/"),
+        " ".repeat(gutter.len()),
+        " ".repeat(column - 1)
+    ))
+}
+
+/// The first standard-library type `source` names unqualified in a
+/// declaration (followed by `<`, `&`, `*` or a name), with its 1-based column.
+fn unqualified_std_type(source: &str) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut index = 0;
+    while index < bytes.len() {
+        if source[index..].starts_with("//") {
+            return None;
+        }
+        if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && is_ident(bytes[index]) {
+            index += 1;
+        }
+        let word = &source[start..index];
+        let before = source[..start].trim_end();
+        let qualified = before.ends_with("::") || before.ends_with('.') || before.ends_with("->");
+        let after = source[index..].trim_start();
+        let declares = after.starts_with('<')
+            || after.starts_with('&')
+            || after.starts_with('*')
+            || after
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+        if !qualified && declares && build_classifier::std_library_header(word).is_some() {
+            return Some((word, start + 1));
+        }
+    }
+    None
 }
 
 /// `path(12)` / `path(12,5)` at the start of a cl diagnostic, as `path:12:5`,
@@ -1194,6 +1269,75 @@ mod tests {
             false,
         );
         assert_eq!(cpp, "int ns::Widget::size() const {\n    return 0;\n}\n");
+    }
+
+    /// cl's own report (VS 2022 17.x, `cl /c /EHsc`) of a pre-standard header
+    /// that names `vector`, `string` and `map` without `std::`: syntax errors
+    /// that never name the type. Each gains clang's `unknown type name` with
+    /// the source line, which the std-prelude repair reads.
+    #[test]
+    fn cl_declaration_errors_name_the_unqualified_std_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = dir.path().join("legacy.cpp");
+        std::fs::write(
+            &header,
+            "#include <vector>\n#include <string>\n#include <map>\nstruct Widget {\n    \
+             vector<int> items;\n    string name;\n    map<string, int> fields;\n};\n",
+        )
+        .unwrap();
+        let path = header.display().to_string();
+        let recorded = [
+            "(5): error C2143: syntax error: missing ';' before '<'",
+            "(5): error C4430: missing type specifier - int assumed. Note: C++ does not support default-int",
+            "(5): error C2238: unexpected token(s) preceding ';'",
+            "(6): error C3646: 'name': unknown override specifier",
+            "(6): error C4430: missing type specifier - int assumed. Note: C++ does not support default-int",
+            "(7): error C2143: syntax error: missing ';' before '<'",
+            "(7): error C4430: missing type specifier - int assumed. Note: C++ does not support default-int",
+            "(7): error C2238: unexpected token(s) preceding ';'",
+        ];
+        let mut stderr = String::new();
+        for line in recorded {
+            let line = format!("{path}{line}");
+            stderr.push_str(&line);
+            stderr.push('\n');
+            let clang = clang_style_diagnostic(&line).unwrap_or_else(|| panic!("{line}"));
+            stderr.push_str(&clang);
+            stderr.push('\n');
+        }
+        let slash = path.replace('\\', "/");
+        assert!(
+            stderr.contains(&format!("{slash}:5:5: error: unknown type name 'vector'\n 5 |     vector<int> items;\n   |     ^")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{slash}:6:5: error: unknown type name 'string'")),
+            "{stderr}"
+        );
+        let mut names: Vec<String> = build_classifier::unqualified_std_names(&stderr)
+            .into_iter()
+            .map(|name| name.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["map", "string", "vector"], "{stderr}");
+
+        // A C file's `list` is its own type, and a qualified one is no error.
+        let c = dir.path().join("legacy.c");
+        std::fs::write(&c, "struct w { list<int> l; };\n").unwrap();
+        assert_eq!(
+            clang_style_diagnostic(&format!(
+                "{}(1): error C2143: syntax error: missing ';' before '<'",
+                c.display()
+            )),
+            None
+        );
+        std::fs::write(&header, "struct w { std::vector<int> v; };\n").unwrap();
+        assert_eq!(
+            clang_style_diagnostic(&format!(
+                "{path}(1): error C2143: syntax error: missing ';' before '<'"
+            )),
+            None
+        );
     }
 
     #[test]
