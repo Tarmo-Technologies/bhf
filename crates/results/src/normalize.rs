@@ -150,7 +150,7 @@ pub fn from_finding_report(
     });
 
     let mut caveats = Vec::new();
-    for key in ["fidelity_caveat", "forced_note"] {
+    for key in ["fidelity_caveat", "forced_note", "fuzzing_build_mode_note"] {
         if let Some(text) = str_at(raw, &[key]) {
             caveats.push(text);
         }

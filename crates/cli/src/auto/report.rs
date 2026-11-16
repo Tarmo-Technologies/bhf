@@ -548,6 +548,7 @@ fn with_discovery_sanitizers(
 /// never aborting the report.
 fn annotate_findings_with_fidelity(
     work_dir: &Path,
+    source_root: Option<&Path>,
     results: &[AttemptResult],
     fidelities: &[Option<actionability::Fidelity>],
 ) {
@@ -604,10 +605,33 @@ fn annotate_findings_with_fidelity(
                 obj.remove("fidelity_caveat");
             }
         }
+        // A crash path through code the fuzz-build define switches may not
+        // reproduce in production; say which check it depends on.
+        let guard = (fidelity.fuzzing_build_mode == Some(actionability::FuzzingBuildMode::On))
+            .then(|| crate::auto::build_mode_guard::guard_note(&raw, source_root))
+            .flatten();
+        let Some(obj) = raw.as_object_mut() else {
+            continue;
+        };
+        match guard {
+            Some(note) => {
+                obj.insert(
+                    "fuzzing_build_mode_note".to_owned(),
+                    serde_json::Value::String(note),
+                );
+            }
+            None => {
+                obj.remove("fuzzing_build_mode_note");
+            }
+        }
         if raw == before {
             continue;
         }
-        corpus::finding::append_history(&mut raw, "auto", &["fidelity", "fidelity_caveat"]);
+        corpus::finding::append_history(
+            &mut raw,
+            "auto",
+            &["fidelity", "fidelity_caveat", "fuzzing_build_mode_note"],
+        );
         match serde_json::to_vec_pretty(&raw) {
             Ok(serialized) => {
                 if let Err(error) = atomic_write(&path, &serialized) {
@@ -1502,7 +1526,7 @@ pub fn write_reports_with_output_limit(
         .collect();
 
     // CC-1: stamp every finding.json with its target's structured fidelity block.
-    annotate_findings_with_fidelity(work_dir, results, &target_fidelities);
+    annotate_findings_with_fidelity(work_dir, Some(source_root), results, &target_fidelities);
     // force-fuzz Phase 2: persist the forced floor onto each forced target's
     // findings so every renderer and importer floors them the same way the CSV
     // path does in memory.
@@ -3968,8 +3992,8 @@ mod tests {
         )
         .unwrap();
         // Empty results -> every finding gets the "nothing executed" fidelity record.
-        annotate_findings_with_fidelity(work.path(), &[], &[]);
-        annotate_findings_with_fidelity(work.path(), &[], &[]);
+        annotate_findings_with_fidelity(work.path(), None, &[], &[]);
+        annotate_findings_with_fidelity(work.path(), None, &[], &[]);
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
         assert!(raw.get("fidelity").is_some());

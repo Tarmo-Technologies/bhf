@@ -88,7 +88,11 @@ in a fuzz build, so the builtin, coverage, MemorySanitizer, ThreadSanitizer,
 differential and AFL++ lanes all fuzz the same program, and a reproducer
 capsule rebuilds it the same way. A finding past such a check may not reproduce
 in a production build; each fuzzed target's `fidelity.fuzzing_build_mode` in
-`run.json` (and each finding's) says `on` or `off`. `--no-fuzzing-build-mode`
+`run.json` (and each finding's) says `on` or `off`. A finding whose crash path
+gets past a check under `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` in
+the same function, or runs code under `#ifdef`, says so: its
+`fuzzing_build_mode_note` (a caveat in `results/findings.json` and INDEX.md)
+reads `reachable only with the check under ... at <file>:<line> disabled`. `--no-fuzzing-build-mode`
 (`bhf auto` and `bhf build`) or `BHF_FUZZING_BUILD_MODE=0` builds without it,
 and `make BHF_FUZZING_BUILD_MODE_FLAGS=` drops it from one hand-run build.
 The `main` binaries depend on a toolchain stamp (`bhf_toolchain.stamp`), and

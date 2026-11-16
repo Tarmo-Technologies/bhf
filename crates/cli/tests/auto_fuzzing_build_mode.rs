@@ -16,7 +16,8 @@ mod test_support;
 use test_support::TestDir;
 
 /// `fw_update_parse` copies `buf[0]` bytes into an 8-byte header, past a
-/// signature check that random inputs never pass and fuzz builds skip.
+/// signature check that random inputs never pass and fuzz builds skip;
+/// `log_parse` overflows with no check in the way.
 const TARGET: &str = "#include <stddef.h>\n#include <string.h>\n\n\
 static int signature_ok(const unsigned char *buf, size_t len) {\n  \
 unsigned sum = 0;\n  \
@@ -29,7 +30,11 @@ if (len < 2) return 0;\n\
 if (!signature_ok(buf, len)) return -1;\n\
 #endif\n  \
 memcpy(hdr, buf + 1, buf[0] < len - 1 ? buf[0] : len - 1);\n  \
-return hdr[0];\n}\n";
+return hdr[0];\n}\n\n\
+int log_parse(const unsigned char *buf, size_t len) {\n  \
+unsigned char tag[4];\n  \
+memcpy(tag, buf, len);\n  \
+return tag[0];\n}\n";
 
 struct Run {
     work: PathBuf,
@@ -113,13 +118,51 @@ fn the_builtin_lane_reaches_a_bug_behind_a_check_fuzz_builds_compile_out() {
         run.log
     );
     let findings = run.findings();
-    assert!(
+    let in_function = |name: &str| {
         findings
             .iter()
-            .any(|f| f["location"]["function"] == "fw_update_parse"
-                || f["location"]["file"] == "upd.c"),
-        "the overflow past the signature check is found:\n{findings:#?}\n{}",
-        run.log
+            .find(|f| f["location"]["function"] == name)
+            .unwrap_or_else(|| panic!("no {name} finding:\n{findings:#?}\n{}", run.log))
+            .clone()
+    };
+    let guarded = in_function("fw_update_parse");
+    let note = "reachable only with the check under \
+                `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` at upd.c:13 disabled";
+    let caveats = guarded["fidelity"]["caveats"].to_string();
+    assert!(caveats.contains(note), "{guarded:#}");
+    let id = guarded["id"].as_str().unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            run.work
+                .join("results/findings")
+                .join(id)
+                .join("finding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        raw["fuzzing_build_mode_note"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(note)),
+        "{raw:#}"
+    );
+    // INDEX.md escapes Markdown, so compare the caveat line without it.
+    let index = std::fs::read_to_string(run.work.join("results/INDEX.md")).unwrap();
+    let unescaped = index.replace('\\', "");
+    assert!(
+        unescaped
+            .lines()
+            .any(|line| line.starts_with("- Caveat:") && line.contains(note)),
+        "{index}"
+    );
+
+    let unguarded = in_function("log_parse");
+    assert!(
+        !unguarded["fidelity"]["caveats"]
+            .to_string()
+            .contains("FUZZING_BUILD_MODE"),
+        "{unguarded:#}"
     );
 }
 
@@ -151,10 +194,14 @@ fn the_opt_outs_leave_the_define_out_and_fidelity_says_off() {
             "{name}: {}",
             run.log
         );
+        let past_the_check: Vec<_> = run
+            .findings()
+            .into_iter()
+            .filter(|f| f["location"]["function"] == "fw_update_parse")
+            .collect();
         assert!(
-            run.findings().is_empty(),
-            "{name}: the signature check stands, so nothing past it is found:\n{:#?}",
-            run.findings()
+            past_the_check.is_empty(),
+            "{name}: the signature check stands, so nothing past it is found:\n{past_the_check:#?}"
         );
     }
 }

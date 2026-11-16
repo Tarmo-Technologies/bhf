@@ -1319,6 +1319,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/build_mode_guard.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/build_probe.rs",
       "license": "Apache-2.0"
     },

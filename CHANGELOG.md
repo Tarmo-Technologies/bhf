@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A finding that gets past a check the fuzz-build define compiles out (a
+  signature or checksum under `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`),
+  or that runs code only fuzz builds compile, carries the caveat `reachable
+  only with the check under ... at <file>:<line> disabled`, so a triager knows
+  why a production build does not reproduce it.
 - Every C/C++ lane defines `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, as
   OSS-Fuzz builds and AFL++'s compiler wrappers do. Only the AFL++ lane had
   it, so a crash it found past a check the project compiles out of fuzz
