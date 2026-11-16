@@ -1094,7 +1094,7 @@ const ASAN_ERROR_MARKER: &str = "ERROR: AddressSanitizer:";
 /// Report classes AddressSanitizer names with a phrase on its `ERROR:` line,
 /// each with the kind its `SUMMARY:` line gives it. Every other class is the
 /// first word of the line.
-const ASAN_PHRASE_KINDS: &[(&str, &str)] = &[
+pub const ASAN_PHRASE_KINDS: &[(&str, &str)] = &[
     ("requested allocation size", "allocation-size-too-big"),
     ("calloc parameters overflow", "calloc-overflow"),
     ("reallocarray parameters overflow", "reallocarray-overflow"),
@@ -1135,7 +1135,7 @@ const ASAN_PHRASE_KINDS: &[(&str, &str)] = &[
 /// `double-free` / `free`, not `attempting` (#37). A phrase-named class takes
 /// its `SUMMARY:` name ([`ASAN_PHRASE_KINDS`]), and the colon that follows a
 /// class such as `memcpy-param-overlap:` is not part of it.
-fn asan_kind(after_marker: &str) -> Option<String> {
+pub fn asan_kind(after_marker: &str) -> Option<String> {
     let text = after_marker.trim_start();
     let text = text.strip_prefix("attempting ").unwrap_or(text);
     if let Some((_, kind)) = ASAN_PHRASE_KINDS

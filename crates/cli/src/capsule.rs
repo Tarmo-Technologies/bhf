@@ -1573,11 +1573,16 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
 
 /// Whether an observed signature matches the expected one. Exact, but a bare
 /// `signal:crash` fallback is accepted against any sanitizer class (a coverage-less
-/// rebuild can surface a raw SEGV where the instrumented run named the class).
+/// rebuild can surface a raw SEGV where the instrumented run named the class),
+/// and a capsule an earlier release packaged matches the class its recorded
+/// signature named then ([`repro_lane::is_earlier_signature`]).
 fn signature_matches(expected: &str, observed: &str) -> bool {
     // Exact class agreement, or either side is the coverage-less `signal:crash`
     // fallback (a raw SEGV where the instrumented run named the ASan class).
-    expected == observed || observed == "signal:crash" || expected == "signal:crash"
+    expected == observed
+        || observed == "signal:crash"
+        || expected == "signal:crash"
+        || repro_lane::is_earlier_signature(expected, observed)
 }
 
 /// Resolve a capsule argument to a usable directory root, absolute (the
@@ -1719,6 +1724,25 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leak capsule an earlier release packaged recorded the leak's byte
+    /// count as its signature; it still verifies against today's class, and
+    /// a different class still does not match.
+    #[test]
+    fn an_earlier_leak_capsule_still_matches_its_leak() {
+        assert!(signature_matches(
+            "AddressSanitizer:3",
+            "LeakSanitizer:memory-leak"
+        ));
+        assert!(signature_matches(
+            "AddressSanitizer:memcpy-param-overlap:",
+            "AddressSanitizer:memcpy-param-overlap"
+        ));
+        assert!(!signature_matches(
+            "AddressSanitizer:3",
+            "AddressSanitizer:heap-buffer-overflow"
+        ));
+    }
 
     /// A failed rebuild is reported by the compiler's diagnostic, not by its
     /// closing `N error(s) generated.` tally.

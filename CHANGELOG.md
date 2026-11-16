@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Capsules and `bhf verify-poc` take a sanitizer signature from the report's
+  `ERROR:` line: a leak is `LeakSanitizer:memory-leak` instead of the byte
+  count on its summary line, and a class such as `memcpy-param-overlap` no
+  longer keeps its trailing colon. Capsules packaged by earlier releases
+  still verify.
 - `bhf replay` and `bhf minimize` symbolize a crash without the network
   debuginfod client, as fuzz children already did. On a host whose
   `DEBUGINFOD_URLS` names a server, ASan's symbolizer could wait on it past
