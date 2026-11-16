@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The native Windows ETW collector no longer reports every DLL a target loads
+  as BHF-413. ETW names files and images by NT device
+  (`\Device\HarddiskVolume3\...`), which the check read as a search-path
+  load. The collector now spells them with the drive letter, and the check
+  treats `C:\Windows` and Program Files as system directories and Temp and
+  `C:\Users\Public` as writable ones. A process's own `.exe` image is no
+  longer a library load.
 - The native Windows ETW collector honours the host's replay handshake: it
   roots its attribution at the PID the host writes to `BHF_COLLECTOR_TARGET_PID`
   (events received before the handoff included) and traces until

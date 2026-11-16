@@ -316,7 +316,10 @@ impl WinCoreBuilder {
                 self.events.push(ev);
             }
             WinRawRecord::ImageLoad { pid, path, ts } => {
-                if !self.in_tree(pid) {
+                // The image provider also reports each process's own
+                // executable, which its process start already names: only a
+                // library is a module load.
+                if !self.in_tree(pid) || is_executable_image(&path) {
                     return;
                 }
                 let (input_derived, taint_offset) = self.taint(&path);
@@ -512,6 +515,14 @@ fn split_command(command_line: &str) -> Vec<String> {
     parts.collect()
 }
 
+/// Whether an image path names an executable (`.exe`), not a library.
+fn is_executable_image(path: &str) -> bool {
+    path.len() > 4
+        && path
+            .get(path.len() - 4..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +601,24 @@ mod tests {
             .find(|e| e.kind == EventKind::FileWrite)
             .unwrap();
         assert_eq!(ev.path.as_deref(), Some("C:\\escaped.bin"));
+    }
+
+    /// A process's own executable image is not a module load.
+    #[test]
+    fn executable_images_are_not_module_loads() {
+        let mut b = builder(b"");
+        for path in ["C:\\Windows\\System32\\cmd.exe", "C:\\sandbox\\TOOL.EXE"] {
+            b.ingest(WinRawRecord::ImageLoad {
+                pid: 1000,
+                path: path.into(),
+                ts: 1.0,
+            });
+        }
+        assert!(
+            !b.events().iter().any(|e| e.kind == EventKind::ModuleLoad),
+            "{:#?}",
+            b.events()
+        );
     }
 
     #[test]
@@ -689,7 +718,7 @@ mod tests {
         // After the handoff, records go straight to attribution.
         b.ingest(WinRawRecord::ImageLoad {
             pid: 1240,
-            path: "C:\\Windows\\System32\\cmd.exe".into(),
+            path: "C:\\Windows\\System32\\shell32.dll".into(),
             ts: 0.05,
         });
         b.finish(0.3);

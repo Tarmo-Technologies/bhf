@@ -28,6 +28,8 @@ runtime_collector = { path = "../runtime_collector" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # QueryDosDeviceW: the drive letter of each volume device ETW names.
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Threading",
     # EVENT_TRACE_LOGFILEW / OpenTraceW live on the ETW real-time consumer path

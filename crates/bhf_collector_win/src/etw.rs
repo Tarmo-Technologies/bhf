@@ -43,7 +43,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::win_core::{self, SessionStartDecision, SessionStopTarget, WinCoreBuilder};
-use crate::win_etw_decode::{EtwDecoder, EtwGuid, EtwProvider, PointerSize, RawEtwEvent};
+use crate::win_etw_decode::{
+    DeviceMap, EtwDecoder, EtwGuid, EtwProvider, PointerSize, RawEtwEvent,
+};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
@@ -534,7 +536,7 @@ pub fn collect(
     };
     let mut state = Box::new(ConsumerState {
         builder,
-        decoder: EtwDecoder::new(),
+        decoder: EtwDecoder::with_devices(DeviceMap::from_system()),
         base_ts: None,
         max_ts: 0.0,
     });
