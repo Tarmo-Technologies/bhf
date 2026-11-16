@@ -34,7 +34,8 @@
 //!
 //! `--target-transport <spec>`:
 //! * `agent:tcp:HOST:PORT`   — [`AgentTransport`] over a TCP socket.
-//! * `agent:serial:PATH`     — [`AgentTransport`] over a serial device / file.
+//! * `agent:serial:PATH[,baud=N]` — [`AgentTransport`] over a serial device,
+//!   opened raw with reads bounded by `--timeout`.
 //! * `gdb:HOST:PORT`         — [`GdbRemoteTransport`]; needs `--transport-coverage-map`.
 //! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` — [`FullSystemTransport`];
 //!   needs `--transport-coverage-map`.
@@ -165,8 +166,9 @@ pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
 pub(crate) enum TransportPlan {
     /// On-target agent over a TCP socket.
     AgentTcp { host: String, port: u16 },
-    /// On-target agent over a serial device / file.
-    AgentSerial { path: PathBuf },
+    /// On-target agent over a serial device / file, opened raw at `baud`
+    /// (the device's current rate when `None`).
+    AgentSerial { path: PathBuf, baud: Option<u32> },
     /// Debug-probe / emulator gdbstub over TCP, reading the coverage ring by
     /// memory access described by `map`.
     Gdb {
@@ -207,7 +209,7 @@ pub(crate) enum TransportPlan {
 pub(crate) enum TransportSpecError {
     #[error(
         "empty --target-transport spec; expected one of \
-         agent:tcp:HOST:PORT, agent:serial:PATH, gdb:HOST:PORT, \
+         agent:tcp:HOST:PORT, agent:serial:PATH[,baud=N], gdb:HOST:PORT, \
          qemu-system:qmp=HOST:PORT,gdb=HOST:PORT"
     )]
     Empty,
@@ -284,15 +286,31 @@ impl TransportPlan {
 
         if let Some(rest) = spec.strip_prefix("agent:serial:") {
             reject_coverage_map(coverage_map)?;
-            if rest.trim().is_empty() {
-                return Err(TransportSpecError::Malformed {
-                    backend: "agent:serial",
-                    spec: spec.to_owned(),
-                    reason: "device path is empty".to_owned(),
-                });
+            let malformed = |reason: String| TransportSpecError::Malformed {
+                backend: "agent:serial",
+                spec: spec.to_owned(),
+                reason,
+            };
+            let (path, baud) = match rest.split_once(",baud=") {
+                Some((path, baud)) => {
+                    let baud = baud
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|baud| *baud > 0)
+                        .ok_or_else(|| {
+                            malformed(format!("baud={baud} is not a positive integer"))
+                        })?;
+                    (path, Some(baud))
+                }
+                None => (rest, None),
+            };
+            if path.trim().is_empty() {
+                return Err(malformed("device path is empty".to_owned()));
             }
             return Ok(Self::AgentSerial {
-                path: PathBuf::from(rest),
+                path: PathBuf::from(path),
+                baud,
             });
         }
 
@@ -333,10 +351,8 @@ impl TransportPlan {
     /// connect closures dial their resource only when [`TargetTransport::arm`]
     /// is called, so this never touches hardware/emulator/socket by itself.
     ///
-    /// `io_timeout` bounds each TCP connect/read/write so a wedged peer cannot
-    /// hang the campaign (#70); a serial device uses the OS default (setting a
-    /// read timeout on a character device needs a termios adapter, a documented
-    /// follow-up).
+    /// `io_timeout` bounds each TCP connect/read/write and each serial read so
+    /// a wedged peer cannot hang the campaign (#70).
     pub(crate) fn into_transport(
         self,
         io_timeout: Option<Duration>,
@@ -345,12 +361,10 @@ impl TransportPlan {
             Self::AgentTcp { host, port } => Ok(Box::new(AgentTransport::new(move || {
                 connect_tcp_bounded(&host, port, io_timeout)
             }))),
-            Self::AgentSerial { path } => Ok(Box::new(AgentTransport::new(move || {
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .map_err(TransportError::from)
+            // Raw mode, so no byte of a frame is echoed or translated, and every
+            // read bounded by the I/O timeout, so a silent device ends the run.
+            Self::AgentSerial { path, baud } => Ok(Box::new(AgentTransport::new(move || {
+                crate::serial_port::open(&path, baud, io_timeout).map_err(TransportError::from)
             }))),
             Self::Gdb {
                 host,
@@ -425,7 +439,7 @@ impl TransportPlan {
     fn label(&self) -> String {
         match self {
             Self::AgentTcp { host, port } => format!("agent:tcp:{host}:{port}"),
-            Self::AgentSerial { path } => format!("agent:serial:{}", path.display()),
+            Self::AgentSerial { path, .. } => format!("agent:serial:{}", path.display()),
             Self::Gdb { host, port, .. } => format!("gdb:{host}:{port}"),
             Self::QemuSystem {
                 qmp_host,
@@ -1491,8 +1505,9 @@ mod tests {
     fn parses_agent_serial_spec() {
         let plan = TransportPlan::parse("agent:serial:/dev/ttyUSB0", None).unwrap();
         match plan {
-            TransportPlan::AgentSerial { path } => {
+            TransportPlan::AgentSerial { path, baud } => {
                 assert_eq!(path, PathBuf::from("/dev/ttyUSB0"));
+                assert_eq!(baud, None);
             }
             other => panic!("expected AgentSerial, got {other:?}"),
         }
@@ -1534,6 +1549,33 @@ mod tests {
         );
         let agent = TransportPlan::parse("agent:tcp:127.0.0.1:9", None).unwrap();
         assert_eq!(agent.input_contract(), None);
+    }
+
+    #[test]
+    fn an_agent_serial_spec_takes_a_baud_rate() {
+        let plan = TransportPlan::parse("agent:serial:/dev/ttyACM0,baud=115200", None).unwrap();
+        match plan {
+            TransportPlan::AgentSerial { path, baud } => {
+                assert_eq!(path, PathBuf::from("/dev/ttyACM0"));
+                assert_eq!(baud, Some(115_200));
+            }
+            other => panic!("expected AgentSerial, got {other:?}"),
+        }
+        for bad in [
+            "agent:serial:/dev/ttyACM0,baud=fast",
+            "agent:serial:/dev/ttyACM0,baud=0",
+        ] {
+            let error = TransportPlan::parse(bad, None).unwrap_err();
+            assert!(
+                error.to_string().contains("not a positive integer"),
+                "{error}"
+            );
+        }
+        let error = TransportPlan::parse("agent:serial:,baud=9600", None).unwrap_err();
+        assert!(
+            error.to_string().contains("device path is empty"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -100,6 +100,7 @@ mod runtime_assets;
 mod runtime_oracles;
 mod sbom;
 mod scan;
+mod serial_port;
 mod session_fuzz;
 mod sloc;
 mod snippet;

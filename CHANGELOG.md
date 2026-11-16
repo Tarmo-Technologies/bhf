@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `--target-transport agent:serial:PATH` opens the port raw (8N1, no flow
+  control, echo, line editing or newline translation) and bounds every read by
+  `--timeout`, on Linux and Windows, and takes `,baud=N`. The tty stayed in its
+  cooked mode, which rewrote a frame's 0x0A bytes as 0x0D 0x0A and held the
+  agent's reply until a newline, and a silent device hung the run past
+  `--time`.
 - docs/site/on-target-fuzzing.md no longer claims Renode integration,
   semihosting coverage or target-byte-order typed mutation; each names the
   issue that tracks it. It documents the on-target agent's frame format and

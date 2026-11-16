@@ -1923,6 +1923,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/serial_port.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/session_fuzz.rs",
       "license": "Apache-2.0"
     },
@@ -2872,6 +2876,10 @@
     },
     {
       "path": "crates/cli/tests/toolchain_support.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_agent_serial_cli.rs",
       "license": "Apache-2.0"
     },
     {

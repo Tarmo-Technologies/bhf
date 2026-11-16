@@ -220,7 +220,7 @@ bhf fuzz bhf_work --harness H-C0001 \
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
 `-kernel` boot) — the transport handles the rest.
 
-### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX`)
+### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
 For a device running an agent that receives inputs and streams edges and
 faults back over TCP or serial. No coverage-map needed — coverage rides the
@@ -228,8 +228,15 @@ agent protocol.
 
 ```sh
 bhf fuzz bhf_work --harness H-C0001 --target-transport agent:tcp:192.0.2.10:9000
-bhf fuzz bhf_work --harness H-C0001 --target-transport agent:serial:/dev/ttyUSB0
+bhf fuzz bhf_work --harness H-C0001 --target-transport agent:serial:/dev/ttyUSB0,baud=115200
 ```
+
+BHF opens a serial port raw: 8N1, no flow control, no echo, no line editing
+and no newline translation, so every frame byte crosses unchanged, at
+`baud=` when given and otherwise at the port's current rate. Each read ends at
+`--timeout`, so a silent device stops the run instead of hanging it. On Linux
+and macOS the device is a tty path; on Windows it is a COM port (`COM3`,
+`COM10`).
 
 BHF ships the host side of this lane only. No target-side agent ships yet: a
 reference agent in portable C ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), a FreeRTOS task running it
@@ -253,9 +260,7 @@ one round trip per input:
 The `kind`, `addr`, `detail_len` and `detail` fields are sent only when
 `fault_present` is `1`. The host refuses an input over 16 MiB, more than 2^20
 edges or a detail over 64 KiB before it allocates. The agent has no stdout
-channel. On a serial line the host does not yet put the tty in raw mode or
-bound its reads ([#164](https://github.com/Tarmo-Technologies/bhf/issues/164)), so configure the port raw (`stty raw -echo`)
-before a run.
+channel.
 
 ---
 

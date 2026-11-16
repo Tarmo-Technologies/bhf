@@ -507,7 +507,7 @@ pub struct FuzzArgs {
     /// Fuzz an off-host / on-target backend through the `target_transport` seam
     /// (HDF-1b) instead of the host libFuzzer/AFL lane. Additive: when this is
     /// absent the default host path runs byte-for-byte as before. Spec forms:
-    /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX` (on-target agent),
+    /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
     /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
