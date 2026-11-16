@@ -6,6 +6,8 @@
 //! the sanitizer printed when the re-run was stopped, and an execution that
 //! was slow once is not a finding.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -137,7 +139,6 @@ fn findings(work: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn two_inputs_hanging_in_one_loop_are_one_hang_finding() {
     if !clang_runs() {
@@ -175,7 +176,6 @@ fn two_inputs_hanging_in_one_loop_are_one_hang_finding() {
     assert_eq!(summary["hangs"]["timeout_ms"], 200, "{summary:#}");
 }
 
-#[cfg(unix)]
 #[test]
 fn an_execution_slow_only_once_is_not_a_hang_finding() {
     if !clang_runs() {

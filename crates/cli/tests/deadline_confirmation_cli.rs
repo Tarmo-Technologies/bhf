@@ -4,6 +4,8 @@
 //! only when most of its fresh re-runs overrun it too (#209): one slow run on
 //! a loaded host is not a finding, and a finding records each re-run's time.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -120,7 +122,6 @@ fn deadline_findings(work: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn a_consistently_slow_input_is_one_finding_with_its_timings() {
     if !clang_runs() {
@@ -144,7 +145,6 @@ fn a_consistently_slow_input_is_one_finding_with_its_timings() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_run_slow_only_once_is_not_a_finding() {
     if !clang_runs() {
