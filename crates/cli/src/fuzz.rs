@@ -4658,6 +4658,21 @@ fn run_builtin_with_progress(
             .saturating_div(32 * 1024)
             .clamp(50, 2048)
         });
+    // A shell command with shell syntax that ran without input bytes in it
+    // is a program constant, which BHF-304 does not report: the run notes it
+    // once.
+    {
+        let constants = sink_taint.constant_shell_commands();
+        if let Some((api, command)) = constants.first() {
+            let shown: String = command.chars().take(80).collect();
+            bhfeprintln!(
+                "bhf fuzz: note: {} shell command(s) with shell metacharacters ran without \
+                 fuzz-input bytes in them, such as {api}({shown:?}); a program constant is not \
+                 reported as command injection (BHF-304)",
+                constants.len()
+            );
+        }
+    }
     let dropped_sink_entries = sink_taint.dropped_entries();
     let sink_taint_limit = sink_taint.entry_limit();
     let confirmed_sinks = sink_taint.into_confirmed();
@@ -4666,23 +4681,24 @@ fn run_builtin_with_progress(
         if sink_subject_is_bhf_housekeeping(&confirmed, &prepared.work_dir) {
             continue;
         }
-        let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) else {
-            continue;
-        };
-        let key = oracle_hit_dedupe_key(&hit);
-        if !seen_oracle_hits.insert(key.clone()) {
-            note_duplicate_of_existing(
-                &mut duplicates_of_existing,
-                existing_findings.oracles.get(&key),
-            );
-            continue;
+        // A `system`/`popen` command with shell syntax is also the
+        // shell-metacharacter heuristic's (BHF-304).
+        for hit in crate::auto::runtrace::confirmed_sink_hits(&confirmed) {
+            let key = oracle_hit_dedupe_key(&hit);
+            if !seen_oracle_hits.insert(key.clone()) {
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings.oracles.get(&key),
+                );
+                continue;
+            }
+            let id = emitter
+                .emit_oracle_hit(&confirmed.input, &hit)
+                .map_err(|error| format!("emit oracle finding: {error}"))?;
+            let descent = lineage.of_bytes(&confirmed.input);
+            crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
+            finding_ids.push(id.0);
         }
-        let id = emitter
-            .emit_oracle_hit(&confirmed.input, &hit)
-            .map_err(|error| format!("emit oracle finding: {error}"))?;
-        let descent = lineage.of_bytes(&confirmed.input);
-        crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
-        finding_ids.push(id.0);
     }
     if confirmed_sinks_total > max_sink_taint_findings {
         bhfeprintln!(

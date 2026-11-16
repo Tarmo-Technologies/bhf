@@ -1267,7 +1267,7 @@ pub const RULES: &[Rule] = &[
         id: "BHF-304",
         slug: "bhf.logic/command-injection",
         name: "OS command injection via controlled argv/cmdline",
-        description: "Test-case-controlled bytes flowed into the argv or command string of GNAT.OS_Lib.Spawn / Ada.Command_Line without quoting, allowing arbitrary command execution.",
+        description: "Test-case-controlled bytes flowed into the argv or command string of a process-execution API (system/popen, the exec family, GNAT.OS_Lib.Spawn, os.system, Runtime.exec, ...) without quoting, allowing arbitrary command execution. The static scan reports it when a taint source reaches the call; the runtime oracle when a system/popen command holds shell syntax and is fuzz-controlled (fuzz-input bytes in it on one execution, byte-origin taint, and never run without them). A constant command is never reported, whatever shell syntax it holds.",
         cwe: "CWE-78",
         cwe_top_25: Some(5),
         default_severity: Severity::Critical,

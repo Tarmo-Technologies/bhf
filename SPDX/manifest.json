@@ -2131,6 +2131,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_constant_shell_command.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_cpp_amalgamation.rs",
       "license": "Apache-2.0"
     },

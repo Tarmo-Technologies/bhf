@@ -519,7 +519,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         // (below) before into_confirmed() moves the tracker's retained inputs out.
         campaign_gate_tracker = tracker.clone();
         for confirmed in tracker.into_confirmed() {
-            if let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) {
+            for hit in crate::auto::runtrace::confirmed_sink_hits(&confirmed) {
                 semantic_hits.push((hit, confirmed.input.clone()));
             }
         }
@@ -1415,7 +1415,7 @@ fn replay_oracle_signatures(
     let mut tracker = runtrace::SinkTaintTracker::default();
     tracker.observe(events, input);
     for confirmed in tracker.into_confirmed() {
-        if let Some(hit) = runtrace::confirmed_sink_hit(&confirmed) {
+        for hit in runtrace::confirmed_sink_hits(&confirmed) {
             sigs.push(crate::runtime_oracles::oracle_signature(&hit));
         }
     }

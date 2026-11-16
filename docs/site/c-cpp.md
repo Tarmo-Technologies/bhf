@@ -909,9 +909,11 @@ resolver audit events, and secret-like environment variable names observed
 through redacted `getenv` or `secure_getenv` audit events, into
 `classification: "oracle_hit"` findings carrying the oracle name, API, and
 runtime evidence without recording the environment value. Shell command strings
-observed through `system` or `popen` are promoted when they contain
-command-injection
-metacharacters. Printf-style format strings observed through `printf`,
+observed through `system` or `popen` are promoted (BHF-304) when they contain
+command-injection metacharacters and are fuzz-controlled: input bytes in the
+command on one execution, and never run without them, as BHF-431 decides at
+the end of the run. A constant command, whatever shell syntax it holds, is
+only noted. Printf-style format strings observed through `printf`,
 `fprintf`, `dprintf`, `sprintf`, or `snprintf` are promoted when the format
 is not a literal in the program's read-only data, the whole format, at least
 4 bytes long, occurs verbatim in the current fuzz input, and it contains a

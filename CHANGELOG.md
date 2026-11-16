@@ -1279,6 +1279,13 @@
   functions are separate groups instead of one that hid the second in
   INDEX.md. A stack with no other frame keeps them. Findings written by an
   earlier release keep their stored key.
+- BHF-304 (shell metacharacters in a runtime command) fires only for a
+  fuzz-controlled `system`/`popen` command, confirmed at the end of the run
+  as BHF-431 is (input bytes in the command on one execution, never run
+  without them). A constant command with `;`, `$` or `|` in it was a CRITICAL
+  attacker-reachable CWE-78 finding; the run now prints a note naming it
+  instead. The oracle is `command-injection` (exception
+  `ORACLE_COMMAND_INJECTION`) in every lane, not `command-injection-ada`.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer

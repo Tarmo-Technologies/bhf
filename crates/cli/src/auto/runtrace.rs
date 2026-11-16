@@ -635,6 +635,24 @@ impl SinkTaintTracker {
             .collect()
     }
 
+    /// The shell commands (`system`/`popen`) the run executed that hold
+    /// shell syntax and ran without a fuzz-input byte in them: program
+    /// constants (also when the auto-dictionary echoed one into an input),
+    /// which the command-injection heuristic (BHF-304) does not report. As
+    /// `(api, command)`, ordered by command.
+    pub fn constant_shell_commands(&self) -> Vec<(&str, &str)> {
+        self.entries
+            .iter()
+            .filter(|((class, command), stat)| {
+                *class == SinkClass::ProcessExec
+                    && matches!(stat.api.as_str(), "system" | "popen")
+                    && stat.untainted_seen
+                    && finding_rules::oracle_registry::has_shell_metacharacters(command)
+            })
+            .map(|((_, command), stat)| (stat.api.as_str(), command.as_str()))
+            .collect()
+    }
+
     pub fn dropped_entries(&self) -> usize {
         self.dropped_entries
     }
@@ -707,12 +725,11 @@ impl CollectorTaintGate {
     }
 }
 
-/// Build the taint-confirmed oracle hit for a confirmed sink by mapping its
+/// Build the taint-confirmed oracle hits for a confirmed sink by mapping its
 /// class onto the matching runtime event and running it through the oracle
-/// registry (BHF-405/431/433/435/439/440).
-pub fn confirmed_sink_hit(
-    confirmed: &ConfirmedSink,
-) -> Option<finding_rules::oracle_sdk::OracleHit> {
+/// registry (BHF-405/431/433/435/439/440, and BHF-304 for a `system`/`popen`
+/// command with shell syntax).
+pub fn confirmed_sink_hits(confirmed: &ConfirmedSink) -> Vec<finding_rules::oracle_sdk::OracleHit> {
     use finding_rules::oracle_sdk::OracleRuntimeEvent as E;
     let api = confirmed.api.clone();
     let subject = confirmed.subject.clone();
@@ -751,7 +768,8 @@ pub fn confirmed_sink_hit(
     };
     finding_rules::oracle_registry::ORACLE_REGISTRY
         .iter()
-        .find_map(|oracle| oracle.evaluate(&event))
+        .filter_map(|oracle| oracle.evaluate(&event))
+        .collect()
 }
 
 /// Correlate TOCTOU pairs (CWE-367): a successful path check (access/faccessat)
@@ -834,10 +852,12 @@ fn oracle_runtime_event(
             api: "dlopen".to_owned(),
             library: library.clone(),
         }),
-        // The per-event path only feeds the shell-metacharacter heuristic
-        // (BHF-304). Taint-confirmed command injection (BHF-431) is emitted at
-        // run end from cross-execution correlation, so `taint_offset` is not
-        // consulted here.
+        // No registry oracle reports a single command event: one execution's
+        // taint cannot tell a fuzz-controlled command from a program constant
+        // the auto-dictionary echoed into the input. Both command-injection
+        // rules, the shell-metacharacter heuristic (BHF-304) and taint-
+        // confirmed injection (BHF-431), are emitted at run end from
+        // cross-execution correlation ([`confirmed_sink_hits`]).
         RuntraceEvent::CommandExecuted { api, command, .. } => Some(OracleRuntimeEvent::Command {
             api: api.clone(),
             command: command.clone(),
@@ -884,7 +904,7 @@ fn oracle_runtime_event(
         // PathChecked is consumed only by the TOCTOU correlation pass below,
         // not as a standalone per-event oracle input. The taint-sink events
         // (ProcessExec/NetworkEgress/LibraryLoad/SqlQuery/DestructiveFsOp) are
-        // confirmed at run end via SinkTaintTracker/confirmed_sink_hit — never
+        // confirmed at run end via SinkTaintTracker/confirmed_sink_hits — never
         // from a single raw event — so they do not map here (no per-input flood).
         RuntraceEvent::FileClosed { .. }
         | RuntraceEvent::PathChecked { .. }
@@ -2113,7 +2133,10 @@ mod tests {
         assert_eq!(confirmed[0].taint_offset, 4);
         assert_eq!(confirmed[0].input, b"GET ../../etc/passwd");
 
-        let hit = confirmed_sink_hit(&confirmed[0]).expect("confirmed open yields BHF-405");
+        let hits = confirmed_sink_hits(&confirmed[0]);
+        let [hit] = hits.as_slice() else {
+            panic!("confirmed open yields BHF-405 alone: {hits:?}");
+        };
         assert_eq!(hit.rule_id, "BHF-405");
         assert_eq!(hit.oracle_name, "path-controlled-open-runtime");
         assert_eq!(hit.evidence_value("path"), Some("../../etc/passwd"));
@@ -2192,7 +2215,11 @@ mod tests {
         assert_eq!(confirmed[0].taint_offset, 5);
         assert_eq!(confirmed[0].input, b"AAAA");
 
-        let hit = confirmed_sink_hit(&confirmed[0]).expect("confirmed command yields BHF-431");
+        let hits = confirmed_sink_hits(&confirmed[0]);
+        // No shell syntax in it, so no BHF-304 beside it.
+        let [hit] = hits.as_slice() else {
+            panic!("confirmed command yields BHF-431 alone: {hits:?}");
+        };
         assert_eq!(hit.rule_id, "BHF-431");
         assert_eq!(hit.oracle_name, "command-controlled-runtime");
         assert_eq!(hit.api, "system");
@@ -2300,8 +2327,10 @@ mod tests {
             let confirmed = tracker.confirmed();
             assert_eq!(confirmed.len(), 1, "{rule}: one confirmed sink");
             assert_eq!(confirmed[0].class, *class, "{rule}: class");
-            let hit = confirmed_sink_hit(&confirmed[0])
-                .unwrap_or_else(|| panic!("{rule}: confirmed sink must yield a hit"));
+            let hits = confirmed_sink_hits(&confirmed[0]);
+            let [hit] = hits.as_slice() else {
+                panic!("{rule}: confirmed sink must yield one hit: {hits:?}");
+            };
             assert_eq!(hit.rule_id, *rule);
             assert_eq!(hit.oracle_name, *oracle);
             assert_eq!(hit.evidence_value("controlled"), Some("true"));
@@ -2479,19 +2508,121 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oracle_hits_from_events_maps_command_injection() {
-        let hits = oracle_hits_from_events(&[RuntraceEvent::CommandExecuted {
-            api: "system".to_owned(),
-            command: "echo ok; id".to_owned(),
-            taint_offset: None,
-        }]);
+    fn command_event(api: &str, command: &str, taint_offset: Option<u32>) -> RuntraceEvent {
+        RuntraceEvent::CommandExecuted {
+            api: api.to_owned(),
+            command: command.to_owned(),
+            taint_offset,
+        }
+    }
 
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].oracle_name, "command-injection-ada");
-        assert_eq!(hits[0].rule_id, "BHF-304");
-        assert_eq!(hits[0].api, "system");
-        assert_eq!(hits[0].evidence_value("command"), Some("echo ok; id"));
+    /// A program constant run through `popen` is not command injection,
+    /// whatever shell syntax it holds: no byte of the input is in it, and when
+    /// the auto-dictionary echoes it into one input, it still ran without
+    /// that input's bytes on every other.
+    #[test]
+    fn constant_command_with_metacharacters_is_not_bhf304() {
+        let constant = "if [ -n \"$HOME\" ]; then case x in x) echo ok;; esac; fi";
+        let hits = oracle_hits_from_events(&[command_event("popen", constant, None)]);
+        assert!(hits.is_empty(), "{hits:?}");
+
+        let mut tracker = SinkTaintTracker::default();
+        tracker.observe(&[command_event("popen", constant, None)], b"seed");
+        // One input carried a run of the constant: that execution's event is
+        // tainted, and on its own it is still not a finding.
+        let echoed = [command_event("popen", constant, Some(3))];
+        assert!(oracle_hits_from_events(&echoed).is_empty());
+        tracker.observe(&echoed, b"xx then case");
+        let hits: Vec<_> = tracker
+            .confirmed()
+            .iter()
+            .flat_map(confirmed_sink_hits)
+            .collect();
+        assert!(!hits.iter().any(|hit| hit.rule_id == "BHF-304"), "{hits:?}");
+        assert!(hits.is_empty(), "{hits:?}");
+        assert_eq!(tracker.constant_shell_commands(), [("popen", constant)]);
+    }
+
+    /// A command whose shell syntax comes with the input's bytes, and that
+    /// never ran without them, is still BHF-304, from an oracle named for no
+    /// language, beside the taint-confirmed BHF-431.
+    #[test]
+    fn tainted_command_with_metacharacters_still_raises_bhf304() {
+        let mut tracker = SinkTaintTracker::default();
+        tracker.observe(
+            &[command_event(
+                "system",
+                "echo 'bhf_AAAA; id' > /dev/null",
+                Some(0),
+            )],
+            b"AAAA; id",
+        );
+        let hits: Vec<_> = tracker
+            .confirmed()
+            .iter()
+            .flat_map(confirmed_sink_hits)
+            .collect();
+        let names: Vec<_> = hits
+            .iter()
+            .map(|hit| (hit.rule_id.as_str(), hit.oracle_name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("BHF-304", "command-injection"),
+                ("BHF-431", "command-controlled-runtime")
+            ]
+        );
+        let heuristic = &hits[0];
+        assert_eq!(heuristic.api, "system");
+        assert_eq!(
+            heuristic.evidence_value("command"),
+            Some("echo 'bhf_AAAA; id' > /dev/null")
+        );
+        assert_eq!(heuristic.evidence_value("controlled"), Some("true"));
+        assert_eq!(
+            heuristic.evidence_value("taint_path"),
+            Some("fuzz_input[0..] → system(command)")
+        );
+        assert!(tracker.constant_shell_commands().is_empty());
+
+        // A controlled command with no shell syntax is BHF-431's alone.
+        let mut plain = SinkTaintTracker::default();
+        plain.observe(
+            &[command_event("system", "/usr/bin/true AAAA", Some(14))],
+            b"AAAA",
+        );
+        let rules: Vec<_> = plain
+            .confirmed()
+            .iter()
+            .flat_map(confirmed_sink_hits)
+            .map(|hit| hit.rule_id)
+            .collect();
+        assert_eq!(rules, ["BHF-431"]);
+    }
+
+    /// The constant shell commands a run executed are what it notes instead
+    /// of a BHF-304 finding: shell syntax, run without an input byte in it.
+    #[test]
+    fn constant_shell_commands_are_the_untainted_ones_with_shell_syntax() {
+        let mut tracker = SinkTaintTracker::default();
+        tracker.observe(
+            &[
+                command_event("popen", "uname -a | head -1", None),
+                command_event("system", "/usr/bin/true", None),
+                command_event("system", "echo 'bhf_AAAA' > /dev/null", Some(10)),
+                RuntraceEvent::ProcessExec {
+                    api: "execve".to_owned(),
+                    program: "/bin/sh -c ls;id".to_owned(),
+                    taint_offset: None,
+                },
+            ],
+            b"AAAA",
+        );
+        assert_eq!(
+            tracker.constant_shell_commands(),
+            [("popen", "uname -a | head -1")]
+        );
     }
 
     #[test]

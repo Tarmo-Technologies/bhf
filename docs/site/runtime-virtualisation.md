@@ -34,7 +34,7 @@ oracles described below are unavailable.
 | `getaddrinfo` | Audit only. Logs a `net_egress` / `getaddrinfo` event and returns the real result; no address is synthesised (name resolution is not faked). `gethostbyname` is not hooked. |
 | `chmod`, `fchmod` | Audit only. Logs an `insecure_chmod` event when a setuid/setgid/world-writable mode is requested so executable oracles can flag incorrect-permission assignment (BHF-416, CWE-732). |
 | `mkdir`, `mkdirat` | Audit only. Logs an `insecure_mkdir` event when a directory is created world-writable without the sticky bit (or setuid/setgid), promoted to the same BHF-416 incorrect-permission oracle (CWE-732). |
-| `system`, `popen`, `execv`, `execvp`, `execvpe`, `execve`, `fexecve`, `posix_spawn`, `posix_spawnp` | Audit only. Logs shell command strings and process-execution argv so executable oracles can flag metacharacter-driven command injection (BHF-304). |
+| `system`, `popen`, `execv`, `execvp`, `execvpe`, `execve`, `fexecve`, `posix_spawn`, `posix_spawnp` | Audit only. Logs shell command strings and process-execution argv, with the fuzz-input offset of any input-derived run in them, so executable oracles can flag a fuzz-controlled command (BHF-431) and one whose shell syntax comes with it (BHF-304). |
 | `printf`, `fprintf`, `dprintf`, `sprintf`, `snprintf` | Audit only. Logs printf-style format strings and whether the observed bytes match the current fuzz input so executable oracles can flag controlled conversion formats. |
 | `__assert_fail`, `__assert_perror_fail` | Audit then forward. Logs native assertion/contract failures before preserving libc's aborting assertion behavior. |
 | `sqlite3_exec`, `sqlite3_prepare[_v2/_v3]`, `PQexec`, `PQexecParams`, `mysql_query`, `mysql_real_query` | Audit only. Logs SQL query strings passed to SQLite / libpq / MySQL so the BHF-441 SQL-injection oracle (CWE-89) can flag a fuzz-controlled query. |
@@ -227,9 +227,14 @@ egress destinations observed through connect or resolver audit events, and
 secret-like environment variable names observed through redacted `getenv` or
 `secure_getenv` audit events into `oracle_hit` findings with the matched API
 and runtime evidence, even when the value was already present in the
-environment. Command
-strings observed through `system` or `popen` become command-injection oracle
-hits when they contain shell metacharacters. The resource leak oracle also
+environment. A command
+string observed through `system` or `popen` becomes a `command-injection`
+(BHF-304) oracle hit when it contains shell metacharacters and is
+fuzz-controlled: it carried fuzz-input bytes on one execution and never ran
+without them, the same cross-execution test as BHF-431, decided once at the
+end of the run. A constant command is never a finding, whatever shell syntax
+it holds, also when the auto-dictionary echoed it into an input; the run
+prints one note naming the constant commands it saw instead. The resource leak oracle also
 reports audited file descriptors opened without a matching `close` event before
 the current harness execution ends. Successful `unlink`, `unlinkat`, or
 `remove` events whose path contains a parent-directory segment become

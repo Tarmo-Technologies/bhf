@@ -61,7 +61,9 @@ Notes on individual classes:
 
 - **Process execution.** `system`/`popen` hand their whole argument to `/bin/sh
   -c`, so any controlled span is shell-interpreted — command injection by
-  construction, no shell metacharacter required. The `exec*`/`posix_spawn` forms
+  construction, no shell metacharacter required. A confirmed `system`/`popen`
+  command that also holds shell syntax is reported a second time, under the
+  shell-metacharacter rule BHF-304 (oracle `command-injection`). The `exec*`/`posix_spawn` forms
   run an attacker-chosen program or argument vector directly. The variadic
   `execl*` convenience wrappers take compile-time-fixed arguments (a dynamically
   controlled command uses the argv-array forms), so they are not separately
