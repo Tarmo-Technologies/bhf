@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -29,11 +31,14 @@ fn bhf_bin() -> PathBuf {
 }
 
 fn has_cargo_nightly() -> bool {
-    Command::new("cargo")
-        .args(["+nightly", "--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("cargo")
+            .args(["+nightly", "--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "cargo nightly")
 }
 
 /// Run `bhf auto` on `fixture_dir` and return (combined stdout+stderr, run.json).

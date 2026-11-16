@@ -11,6 +11,8 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -28,14 +30,17 @@ fn bhf_bin() -> PathBuf {
 }
 
 fn have_lua() -> bool {
-    ["lua", "lua5.4", "lua5.3"].iter().any(|l| {
-        Command::new(l)
-            .arg("-e")
-            .arg("return 1")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    let present = {
+        ["lua", "lua5.4", "lua5.3"].iter().any(|l| {
+            Command::new(l)
+                .arg("-e")
+                .arg("return 1")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    };
+    support::require_tool(present, "lua")
 }
 
 #[test]

@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -29,11 +31,14 @@ fn bhf_bin() -> PathBuf {
 }
 
 fn have_go() -> bool {
-    Command::new("go")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "go")
 }
 
 /// Run `bhf auto` on a copy of the fixture; the guard holds the copy and the

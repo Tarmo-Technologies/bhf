@@ -31,12 +31,18 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn clang_available() -> bool {
-    if which::which("clang").is_err() {
-        eprintln!("skipping auto_c_opaque_returning_ctor: clang not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang").is_err() {
+            eprintln!("skipping auto_c_opaque_returning_ctor: clang not on PATH");
+            return false;
+        }
+        true
     }
-    true
+    let present = probe();
+    support::require_tool(present, "clang")
 }
 
 fn write_fixture(root: &Path) {

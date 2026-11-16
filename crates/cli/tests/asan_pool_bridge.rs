@@ -31,13 +31,16 @@ use test_support::TestDir;
 /// clang (with the ASan runtime) is required. A missing toolchain is a skip, not
 /// a failure.
 fn have_clang_asan() -> bool {
-    Command::new("clang")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("clang")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "clang asan")
 }
 
 fn c_runtime_dir() -> PathBuf {

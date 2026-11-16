@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -42,10 +44,13 @@ pub fn digest(data: &[u8]) -> u32 {
 "#;
 
 fn cargo_available() -> bool {
-    Command::new("cargo")
-        .args(["+nightly", "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        Command::new("cargo")
+            .args(["+nightly", "--version"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, "cargo")
 }
 
 fn crate_in(dir: &Path) -> std::path::PathBuf {

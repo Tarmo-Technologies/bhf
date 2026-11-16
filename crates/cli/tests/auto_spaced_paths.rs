@@ -9,16 +9,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn tool_available(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, tool)
 }
 
 /// `(target name, outcome, harness id)` for every target in `auto/run.json`.

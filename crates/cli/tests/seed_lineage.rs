@@ -13,6 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 /// A scratch dir removed when the test ends, passed or failed.
 fn scratch(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -603,8 +605,11 @@ fn a_binary_fuzz_afl_qemu_finding_says_its_lineage_is_unknown_and_why() {
 }
 
 fn have_clang() -> bool {
-    Command::new("clang").arg("--version").output().is_ok()
-        && Command::new("make").arg("--version").output().is_ok()
+    let present = {
+        Command::new("clang").arg("--version").output().is_ok()
+            && Command::new("make").arg("--version").output().is_ok()
+    };
+    support::require_tool(present, "clang")
 }
 
 /// FNV-1a, as the C target computes it, so a seed's first 8 bytes can gate

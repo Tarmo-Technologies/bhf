@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A local test run with `BHF_REQUIRE_TOOLS=1` fails on a missing tool, as the
+  nightly does. Each integration test file had its own tool check that
+  printed a skip line and passed; they all return through a shared
+  `support::require_tool`, which panics under the variable, and a test fails
+  when a tool helper bypasses it.
 - A feature-gated private Rust target builds in the in-crate lane. The lane
   built the copied crate without the features the target's `#[cfg(feature)]`
   gate needs, so the function did not exist (E0425) and the target was a

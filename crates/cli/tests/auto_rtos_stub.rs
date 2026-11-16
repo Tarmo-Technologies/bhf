@@ -16,12 +16,18 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn toolchain_available() -> bool {
-    if which::which("clang").is_err() {
-        eprintln!("skipping auto_rtos_stub: clang not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang").is_err() {
+            eprintln!("skipping auto_rtos_stub: clang not on PATH");
+            return false;
+        }
+        true
     }
-    true
+    let present = probe();
+    support::require_tool(present, "toolchain")
 }
 
 /// A representative unguarded VxWorks translation unit: it pulls in three vendor

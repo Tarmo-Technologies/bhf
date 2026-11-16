@@ -16,17 +16,23 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn toolchain_available() -> bool {
-    if which::which("clang").is_err() {
-        eprintln!("skipping auto_build_command: clang not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang").is_err() {
+            eprintln!("skipping auto_build_command: clang not on PATH");
+            return false;
+        }
+        // The shim execs `cc`; require a host C compiler the build script can call.
+        if which::which("cc").is_err() && which::which("gcc").is_err() {
+            eprintln!("skipping auto_build_command: no cc/gcc on PATH");
+            return false;
+        }
+        true
     }
-    // The shim execs `cc`; require a host C compiler the build script can call.
-    if which::which("cc").is_err() && which::which("gcc").is_err() {
-        eprintln!("skipping auto_build_command: no cc/gcc on PATH");
-        return false;
-    }
-    true
+    let present = probe();
+    support::require_tool(present, "toolchain")
 }
 
 fn write_fixture(root: &Path) {

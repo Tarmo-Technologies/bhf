@@ -12,6 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -21,10 +23,13 @@ fn temp_dir(name: &str) -> TestDir {
 }
 
 fn clang_runs() -> bool {
-    std::process::Command::new("clang")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, "clang")
 }
 
 /// Background re-runs need a second CPU; with one, bhf runs them in the loop.
@@ -489,12 +494,15 @@ mod one_core {
     use std::process::{Child, Command, Stdio};
 
     fn taskset_runs() -> bool {
-        Command::new("taskset")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        let present = {
+            Command::new("taskset")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        crate::support::require_tool(present, "taskset")
     }
 
     /// Busy and idle jiffies of each allowed CPU, from `/proc/stat`.

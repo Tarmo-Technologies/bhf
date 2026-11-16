@@ -19,12 +19,15 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn toolchain_available() -> bool {
-    which::which("clang").is_ok() && which::which("make").is_ok()
+    let present = { which::which("clang").is_ok() && which::which("make").is_ok() };
+    support::require_tool(present, "toolchain")
 }
 
 fn write_fixture(root: &Path) {

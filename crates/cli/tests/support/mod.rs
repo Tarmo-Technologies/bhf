@@ -9,6 +9,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// Whether `BHF_REQUIRE_TOOLS=1` is set, as the nightly suite sets it: a test
+/// that would skip for a missing tool fails instead.
+pub fn tools_required() -> bool {
+    std::env::var_os("BHF_REQUIRE_TOOLS").is_some_and(|value| value == "1")
+}
+
+/// `available`, the answer of a test's check for a tool it needs (`what`:
+/// `clang`, `gnatmake`, ...). Every per-file tool helper returns through it,
+/// so that under `BHF_REQUIRE_TOOLS=1` a missing tool panics here instead of
+/// letting the test print its skip line and pass.
+pub fn require_tool(available: bool, what: &str) -> bool {
+    require_tool_with(available, what, tools_required())
+}
+
+/// [`require_tool`] with `required` given rather than read from the
+/// environment.
+pub fn require_tool_with(available: bool, what: &str, required: bool) -> bool {
+    assert!(
+        available || !required,
+        "BHF_REQUIRE_TOOLS=1 and the test's tool `{what}` is not available"
+    );
+    available
+}
+
 /// Serializes fuzz-bearing tests inside one test binary.
 ///
 /// A test that asserts a planted bug is FOUND is budgeted in wall-clock seconds,

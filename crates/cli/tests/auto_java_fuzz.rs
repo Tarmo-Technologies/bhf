@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -28,8 +30,11 @@ fn bhf_bin() -> PathBuf {
 /// A usable JDK (`javac` + `java`) — the native Java lane needs it; with none it
 /// skips cleanly (the GNAT-less rule), so this test self-skips too.
 fn has_jdk() -> bool {
-    Command::new("javac").arg("-version").output().is_ok()
-        && Command::new("java").arg("-version").output().is_ok()
+    let present = {
+        Command::new("javac").arg("-version").output().is_ok()
+            && Command::new("java").arg("-version").output().is_ok()
+    };
+    support::require_tool(present, "jdk")
 }
 
 #[test]

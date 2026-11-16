@@ -19,12 +19,18 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn clangxx_available() -> bool {
-    if which::which("clang++").is_err() {
-        eprintln!("skipping auto_modules_ts_flag: clang++ not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang++").is_err() {
+            eprintln!("skipping auto_modules_ts_flag: clang++ not on PATH");
+            return false;
+        }
+        true
     }
-    true
+    let present = probe();
+    support::require_tool(present, "clangxx")
 }
 
 fn write_fixture(root: &Path) {

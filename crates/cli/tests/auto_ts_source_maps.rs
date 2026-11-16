@@ -10,6 +10,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -26,7 +28,8 @@ const CODEC: &str = "// SPDX-License-Identifier: Apache-2.0\n\
                      return data[1];\n}\n";
 
 fn have(tool: &str) -> bool {
-    which::which(tool).is_ok()
+    let present = { which::which(tool).is_ok() };
+    support::require_tool(present, tool)
 }
 
 fn auto(src: &Path, work: &Path, language: &str, seed: &Path) -> String {

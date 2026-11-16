@@ -10,6 +10,8 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::{discover, discover_with_dir_filter, DirFilter};
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -125,11 +127,14 @@ fn rust_fuzz_fixture() -> PathBuf {
 /// GNAT-less rule), so the build+fuzz test below self-skips too rather than
 /// failing on a machine without nightly.
 fn has_cargo_nightly() -> bool {
-    Command::new("cargo")
-        .args(["+nightly", "--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("cargo")
+            .args(["+nightly", "--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "cargo nightly")
 }
 
 #[test]

@@ -9,8 +9,11 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn clang_available() -> bool {
-    which::which("clang").is_ok()
+    let present = { which::which("clang").is_ok() };
+    support::require_tool(present, "clang")
 }
 
 /// Whether the runtrace shim, which the env-capsule needs, is built beside

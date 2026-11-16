@@ -11,12 +11,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/windows/vs_solution")
 }
 
 fn have(tool: &str) -> bool {
-    which::which(tool).is_ok()
+    let present = { which::which(tool).is_ok() };
+    support::require_tool(present, tool)
 }
 
 /// A copy of the fixture, so a run never writes into the repository.

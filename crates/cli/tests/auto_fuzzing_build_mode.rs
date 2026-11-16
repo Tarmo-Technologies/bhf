@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -91,10 +93,13 @@ impl Run {
 }
 
 fn have_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    let present = {
+        Command::new("cc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    support::require_tool(present, "cc")
 }
 
 #[test]

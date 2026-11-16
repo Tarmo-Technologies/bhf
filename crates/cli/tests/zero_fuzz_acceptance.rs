@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod support;
+
 fn run_auto(root: &Path, work: &Path, extra: &[&str]) -> (serde_json::Value, Output) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bhf"));
     command
@@ -61,7 +63,8 @@ fn assert_target_entered_and_fuzzed(target: &serde_json::Value, stderr: &[u8]) {
 }
 
 fn have_ada_toolchain() -> bool {
-    which::which("gnatmake").is_ok() && which::which("gprbuild").is_ok()
+    let present = { which::which("gnatmake").is_ok() && which::which("gprbuild").is_ok() };
+    support::require_tool(present, "ada toolchain")
 }
 
 #[test]

@@ -6,8 +6,11 @@
 
 use std::process::Command;
 
+mod support;
+
 fn clang_available() -> bool {
-    which::which("clang").is_ok()
+    let present = { which::which("clang").is_ok() };
+    support::require_tool(present, "clang")
 }
 
 /// byte 0 controls an OOB read offset that lands in the 16-byte heap redzone, so
@@ -102,7 +105,8 @@ fn find_finding(work: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn clangxx_available() -> bool {
-    which::which("clang++").is_ok()
+    let present = { which::which("clang++").is_ok() };
+    support::require_tool(present, "clangxx")
 }
 
 /// A wild read: bytes 0-3 are an index that puts the access far outside a

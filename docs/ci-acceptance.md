@@ -107,8 +107,9 @@ Node 24 with esbuild, a nightly Rust, the SharpFuzz tool, GNAT 13 with
 GPRbuild, AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross compilers,
 qemu-user with the AArch64 cross compilers, `qemu-system-arm` with
 `gcc-arm-none-eabi`, gdb, lldb and LLVM)
-and runs its tests with `BHF_REQUIRE_TOOLS=1`. A test that finds its tool
-missing prints a skip line (one starting with `skip`, `skipping`, `skipped` or
+and runs its tests with `BHF_REQUIRE_TOOLS=1`, under which a test's tool check
+(`support::require_tool`) fails the test when its tool is missing. A test that
+skips for another reason prints a skip line (one starting with `skip`, `skipping`, `skipped` or
 `SKIP`) and passes; `scripts/ci/check-no-skips.py` reads those lines from the
 JUnit report and fails the shard on any that `scripts/ci/allowed-skips.txt`
 does not allow. The allowlist names the few tests another workflow runs;

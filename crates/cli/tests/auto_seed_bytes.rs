@@ -11,13 +11,18 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have_clang() -> bool {
-    Command::new("clang").arg("--version").output().is_ok()
-        && Command::new("make").arg("--version").output().is_ok()
+    let present = {
+        Command::new("clang").arg("--version").output().is_ok()
+            && Command::new("make").arg("--version").output().is_ok()
+    };
+    support::require_tool(present, "clang")
 }
 
 fn on_path(bin: &str) -> bool {

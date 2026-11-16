@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 /// A header that refuses to compile below C++20, exactly like clay.h. The
 /// standalone preflight uses the recovered flags; the harness build climbs the
 /// dialect ladder, so forcing past the gate is what lets it build.
@@ -37,7 +39,8 @@ inline int scan_prefix(const uint8_t *data, size_t len) {
 "#;
 
 fn have_cpp() -> bool {
-    which::which("clang++").is_ok() && which::which("make").is_ok()
+    let present = { which::which("clang++").is_ok() && which::which("make").is_ok() };
+    support::require_tool(present, "cpp")
 }
 
 fn run(root: &Path, work: &Path, force: bool) -> (serde_json::Value, String) {

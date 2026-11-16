@@ -8,10 +8,15 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false)
+    let present = {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+            .unwrap_or(false)
+    };
+    support::require_tool(present, bin)
 }
 
 fn afl_present() -> bool {

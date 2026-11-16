@@ -9,15 +9,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn clang_runs() -> bool {
-    std::process::Command::new("clang")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, "clang")
 }
 
 /// A TLV walker: a record's length byte moves the cursor, so a zero length

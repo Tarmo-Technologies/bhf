@@ -9,6 +9,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -32,7 +34,8 @@ fn tmpdir(tag: &str) -> TestDir {
 }
 
 fn have_c_compiler() -> bool {
-    which::which("clang").is_ok() || which::which("cc").is_ok()
+    let present = { which::which("clang").is_ok() || which::which("cc").is_ok() };
+    support::require_tool(present, "c compiler")
 }
 
 #[test]

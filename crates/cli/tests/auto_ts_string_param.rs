@@ -11,6 +11,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -23,7 +25,8 @@ const TARGET: &str = "export function decode(data: string): number {\n  \
                       return body.length;\n}\n";
 
 fn have(tool: &str) -> bool {
-    which::which(tool).is_ok()
+    let present = { which::which(tool).is_ok() };
+    support::require_tool(present, tool)
 }
 
 #[test]

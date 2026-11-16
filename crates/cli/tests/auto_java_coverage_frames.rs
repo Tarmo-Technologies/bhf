@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -23,8 +25,11 @@ use test_support::TestDir;
 /// A usable JDK (`javac` + `java`) — the native Java lane needs it; with none the
 /// agent never runs, so this test self-skips (the GNAT-less rule).
 fn has_jdk() -> bool {
-    Command::new("javac").arg("-version").output().is_ok()
-        && Command::new("java").arg("-version").output().is_ok()
+    let present = {
+        Command::new("javac").arg("-version").output().is_ok()
+            && Command::new("java").arg("-version").output().is_ok()
+    };
+    support::require_tool(present, "jdk")
 }
 
 fn build_agent_script() -> PathBuf {

@@ -9,6 +9,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -38,16 +40,19 @@ function tlv_ratio(string $data): int {
 ";
 
 fn have_php_with_pcov() -> bool {
-    Command::new("php")
-        .args([
-            "-d",
-            "pcov.enabled=1",
-            "-r",
-            "exit(function_exists('\\\\pcov\\\\start') ? 0 : 1);",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("php")
+            .args([
+                "-d",
+                "pcov.enabled=1",
+                "-r",
+                "exit(function_exists('\\\\pcov\\\\start') ? 0 : 1);",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "php with pcov")
 }
 
 /// `bhf auto` over a tree holding only the fixture, fuzzing `target`.

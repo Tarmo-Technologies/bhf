@@ -12,16 +12,22 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn toolchain_available() -> bool {
-    if which::which("clang").is_err() {
-        eprintln!("skipping auto_autotools_manifest: clang not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang").is_err() {
+            eprintln!("skipping auto_autotools_manifest: clang not on PATH");
+            return false;
+        }
+        if which::which("make").is_err() {
+            eprintln!("skipping auto_autotools_manifest: make not on PATH");
+            return false;
+        }
+        true
     }
-    if which::which("make").is_err() {
-        eprintln!("skipping auto_autotools_manifest: make not on PATH");
-        return false;
-    }
-    true
+    let present = probe();
+    support::require_tool(present, "toolchain")
 }
 
 /// Write a minimal autotools-shaped project: a public header that includes a

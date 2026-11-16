@@ -8,15 +8,20 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have_node() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, "node")
 }
 
 #[test]
