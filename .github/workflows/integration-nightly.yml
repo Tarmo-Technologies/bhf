@@ -128,7 +128,16 @@ jobs:
                       arm-none-eabi-gcc nm gdb lldb llvm-symbolizer dotnet; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
-          php -m | grep -qx pcov || { echo "php has no pcov extension" >&2; exit 1; }
+          # The runner image's PHP ships the pcov module disabled; enable it for
+          # every installed PHP version and SAPI.
+          sudo phpenmod -v ALL -s ALL pcov 2>/dev/null || true
+          if ! php -m | grep -qix pcov; then
+            echo "php has no pcov extension" >&2
+            php --version >&2
+            php --ini >&2
+            ls /etc/php/*/mods-available 2>/dev/null | grep -i pcov >&2 || true
+            exit 1
+          fi
           java -version 2>&1 | grep -q 'version "21' || { echo "java is not 21" >&2; exit 1; }
           cargo +nightly --version
           find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
