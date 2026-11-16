@@ -19,7 +19,8 @@ An **exported** function taking at least one argument is the fuzzable unit. bhf:
    the **public instance methods of exported classes** (`class Parser { parse(x) }`;
    the driver `new`s a no-argument-constructible class and calls the method). The
    first argument is inferred as a `Buffer` or UTF-8 `string` from its name
-   (`buf`/`data`/`bytes` → Buffer; `str`/`text`/`source`/`html` → string).
+   (`buf`/`data`/`bytes` → Buffer; `str`/`text`/`source`/`html` → string), or
+   from its TypeScript annotation when it has one (see below).
 2. **"Builds"** it with a `node -c` syntax check (interpreted — there is no native
    binary) and emits a launcher.
 3. **Fuzzes** it on bhf's builtin fork-server engine driving **one warm Node
@@ -112,10 +113,15 @@ a shared edge map.
 ## TypeScript
 
 `bhf auto --languages typescript` fuzzes `.ts`/`.tsx` the same way. Discovery
-runs directly on the TypeScript source — the name-extracting parser reads a
-signature like `parse(input: string, opts?: Options): Result` and keeps just the
-parameter names, so type annotations, `interface`/`type` declarations, and
-`private`/`protected`/`abstract` members are ignored. The target is then
+runs directly on the TypeScript source — the parser reads a signature like
+`parse(input: string, opts?: Options): Result`; `interface`/`type`
+declarations and `private`/`protected`/`abstract` members are ignored. The
+first parameter's annotation decides what it is passed: `string` gets a
+string, and `Buffer`, `Uint8Array`, `ArrayBuffer`, `DataView` or a union
+holding one gets a `Buffer`, whatever the parameter is called (so
+`decode(data: string)` gets a string). A path-like name (`filePath`,
+`filename`) still gets a temporary file, and an unannotated parameter or
+another type falls back to the name rules above. The target is then
 transpiled to CommonJS with [esbuild](https://esbuild.github.io/) (bundling local
 imports, leaving `node_modules` external) and driven by the identical warm-Node
 framed driver — same V8 block coverage, dictionary, exception oracle, and

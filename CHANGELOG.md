@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A TypeScript function's first parameter gets the type its annotation names:
+  `decode(data: string)` is passed a string and `parse(text: Uint8Array)` a
+  Buffer. The kind used to come from the parameter name alone, so a
+  `data: string` got a Buffer and every input failed with a suppressed
+  `TypeError` before reaching the code under test.
 - The Java lane's javac fallback compiles a target in a package named like
   example or test code (IntelliJ's `org.example`, Spring Initializr's
   `com.example.demo`, a sibling `com.acme.testutil`). It used to skip those
