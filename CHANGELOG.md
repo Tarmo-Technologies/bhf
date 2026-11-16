@@ -15,6 +15,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf auto` with a work directory an earlier run used for a different source
+  tree moves that run to `<work>/archived/` before it starts, instead of
+  reporting the other tree's findings and source path as its own.
 - C/C++ discovery evaluates `#if` and `#elif` expressions as C does
   (comparisons, arithmetic, shifts, bitwise operators, `?:`, every integer
   constant form and character constants), and supports `#elif`. A gate such as

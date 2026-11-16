@@ -1177,6 +1177,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A work dir reused for another source tree: set that run aside before this
+    // one writes anything, so it neither reports nor resumes the other tree's
+    // findings.
+    if let Some((archive, previous)) = crate::auto::work_state::archive_other_tree(&work, &path)
+        .with_context(|| format!("set aside an earlier run's state under {}", work.display()))?
+    {
+        bhfeprintln!(
+            "bhf auto: note: {} held a run over {previous}; moved it to {} so this run over {} \
+             starts clean",
+            work.display(),
+            archive.display(),
+            path.display()
+        );
+    }
     // A runtrace shim installed under a path with spaces is staged here.
     crate::auto::shim_path::set_staging_work_dir(&work);
     // Judged before this run writes any auto state of its own: whether the
@@ -1237,7 +1251,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(2);
         }
     }
-    let work_state = crate::auto::work_state::prepare(&work, args.resume)
+    let work_state = crate::auto::work_state::prepare(&work, args.resume, &path)
         .with_context(|| format!("prepare generated state under {}", work.display()))?;
     bhfeprintln!("bhf auto: work-directory state: {work_state}");
     // A plan-only run (--dry-run / --list-targets) fuzzes nothing, so it

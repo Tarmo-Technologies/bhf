@@ -9,7 +9,7 @@
 //! broken and can build the wrong target.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const WORK_STATE_SCHEMA_VERSION: u32 = 1;
 /// Bumped to 2: the force-fuzz Ada external-stub model, its rendered sources, and
@@ -18,6 +18,9 @@ const WORK_STATE_SCHEMA_VERSION: u32 = 1;
 /// reads.
 pub(crate) const GENERATED_STATE_SEMANTIC_VERSION: u32 = 2;
 const STATE_FILE: &str = "auto/work-state.json";
+/// Where a run over another source tree is moved when this work dir is reused
+/// for a different one ([`archive_other_tree`]).
+pub(crate) const ARCHIVE_DIR: &str = "archived";
 
 const REGENERABLE_DIRECTORIES: &[&str] = &[
     "build",
@@ -59,6 +62,10 @@ pub(crate) struct WorkStateCheckpoint {
     producer_commit: String,
     generated_state_semantic_version: u32,
     disposition: WorkStateDisposition,
+    /// The canonical source tree the run was over. Absent in a work dir an
+    /// earlier release wrote; `auto/run.json` then says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +95,72 @@ impl std::fmt::Display for WorkStateDisposition {
 /// artifacts. A normal run refreshes them even under the same binary. A resume
 /// from an older/semantically different producer is migrated to a fresh attempt,
 /// while preserving corpus, queues, reports, and findings.
-pub(crate) fn prepare(work_dir: &Path, resume: bool) -> std::io::Result<WorkStateDisposition> {
+/// When `work_dir` holds a run over a different source tree than
+/// `source_root` (as `auto/work-state.json`, or an earlier release's
+/// `auto/run.json`, records it), move everything that run left, findings and
+/// corpus included, into `archived/<UTC time>-<tree name>/`, and return that
+/// directory and the other tree's path. A run then neither reports nor
+/// resumes another tree's results; nothing is deleted. Call it before the run
+/// writes anything of its own.
+pub(crate) fn archive_other_tree(
+    work_dir: &Path,
+    source_root: &Path,
+) -> std::io::Result<Option<(PathBuf, String)>> {
+    let Some(previous) = previous_source_root(work_dir) else {
+        return Ok(None);
+    };
+    if Path::new(&previous) == source_root {
+        return Ok(None);
+    }
+    let tree_name: String = Path::new(&previous)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let base = work_dir.join(ARCHIVE_DIR);
+    let mut archive = base.join(format!("{stamp}-{tree_name}"));
+    let mut suffix = 1;
+    while archive.exists() {
+        suffix += 1;
+        archive = base.join(format!("{stamp}-{tree_name}-{suffix}"));
+    }
+    std::fs::create_dir_all(&archive)?;
+    for entry in std::fs::read_dir(work_dir)?.flatten() {
+        if entry.file_name() == ARCHIVE_DIR {
+            continue;
+        }
+        std::fs::rename(entry.path(), archive.join(entry.file_name()))?;
+    }
+    Ok(Some((archive, previous)))
+}
+
+/// The source tree the run that last used `work_dir` was over, if it says.
+fn previous_source_root(work_dir: &Path) -> Option<String> {
+    let recorded = std::fs::read(work_dir.join(STATE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WorkStateCheckpoint>(&bytes).ok())
+        .and_then(|state| state.source_root);
+    recorded.or_else(|| {
+        let bytes = std::fs::read(work_dir.join("auto/run.json")).ok()?;
+        let run: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        run.get("source_root")?.as_str().map(str::to_owned)
+    })
+}
+
+pub(crate) fn prepare(
+    work_dir: &Path,
+    resume: bool,
+    source_root: &Path,
+) -> std::io::Result<WorkStateDisposition> {
     let state_path = work_dir.join(STATE_FILE);
     let previous = std::fs::read(&state_path)
         .ok()
@@ -114,6 +186,7 @@ pub(crate) fn prepare(work_dir: &Path, resume: bool) -> std::io::Result<WorkStat
         producer_commit: crate::auto::bug_report::commit().to_owned(),
         generated_state_semantic_version: GENERATED_STATE_SEMANTIC_VERSION,
         disposition,
+        source_root: Some(source_root.to_string_lossy().into_owned()),
     };
     let bytes = serde_json::to_vec(&checkpoint).map_err(std::io::Error::other)?;
     crate::auto::report::atomic_write(&state_path, &bytes)?;
@@ -211,6 +284,82 @@ mod tests {
     /// the first run after an interrupted one refreshed the work dir, found no
     /// records, and re-ran everything; killing THAT run left records written by
     /// the current binary, so the next `--resume` worked.
+    fn run_left_in(work: &Path, root: &str) {
+        prepare(work, false, Path::new(root)).unwrap();
+        std::fs::create_dir_all(work.join("findings/F-0000-a")).unwrap();
+        std::fs::create_dir_all(work.join("results/findings/F-0000-a")).unwrap();
+        std::fs::write(work.join("results/INDEX.md"), "source `/src/a`").unwrap();
+        std::fs::create_dir_all(work.join("corpus/H-ONE")).unwrap();
+        std::fs::write(work.join("corpus/H-ONE/seed"), b"seed").unwrap();
+    }
+
+    /// A work dir reused for a different tree: the earlier run, findings and
+    /// corpus included, moves to `archived/`, and this run starts new.
+    #[test]
+    fn a_run_over_another_tree_is_archived() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        run_left_in(work, "/src/a");
+
+        let (archive, previous) = archive_other_tree(work, Path::new("/src/b"))
+            .unwrap()
+            .expect("a different tree is archived");
+        assert_eq!(previous, "/src/a");
+        assert!(archive.starts_with(work.join(ARCHIVE_DIR)));
+        assert!(archive.join("findings/F-0000-a").is_dir());
+        assert!(archive.join("results/INDEX.md").is_file());
+        assert!(archive.join("corpus/H-ONE/seed").is_file());
+        let left: Vec<_> = std::fs::read_dir(work)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from(ARCHIVE_DIR)]);
+        assert_eq!(
+            prepare(work, false, Path::new("/src/b")).unwrap(),
+            WorkStateDisposition::New
+        );
+        // The tree it is over now is the one recorded.
+        assert!(archive_other_tree(work, Path::new("/src/b"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A rerun over the same tree keeps its findings.
+    #[test]
+    fn a_rerun_over_the_same_tree_keeps_its_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        run_left_in(work, "/src/a");
+        assert!(archive_other_tree(work, Path::new("/src/a"))
+            .unwrap()
+            .is_none());
+        assert!(work.join("findings/F-0000-a").is_dir());
+        assert!(work.join("results/findings/F-0000-a").is_dir());
+        assert!(!work.join(ARCHIVE_DIR).exists());
+    }
+
+    /// A work dir an earlier release wrote records its tree only in run.json.
+    #[test]
+    fn an_earlier_release_run_is_recognized_by_its_run_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::write(work.join("auto/run.json"), r#"{"source_root":"/src/a"}"#).unwrap();
+        std::fs::create_dir_all(work.join("findings/F-0000-a")).unwrap();
+        let (archive, previous) = archive_other_tree(work, Path::new("/src/b"))
+            .unwrap()
+            .expect("archived");
+        assert_eq!(previous, "/src/a");
+        assert!(archive.join("findings/F-0000-a").is_dir());
+        // Nothing recorded at all: nothing to compare, nothing moved.
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fresh.path().join("findings/F-0000-x")).unwrap();
+        assert!(archive_other_tree(fresh.path(), Path::new("/src/b"))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn a_refresh_keeps_attempt_records_and_drops_only_build_products() {
         let temp = tempfile::tempdir().unwrap();
@@ -237,7 +386,10 @@ mod tests {
     fn fresh_run_refreshes_generated_state_but_preserves_corpus_and_findings() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        assert_eq!(prepare(work, false).unwrap(), WorkStateDisposition::New);
+        assert_eq!(
+            prepare(work, false, Path::new("/src/tree")).unwrap(),
+            WorkStateDisposition::New
+        );
 
         std::fs::create_dir_all(work.join("src_instrumented")).unwrap();
         std::fs::write(work.join("src_instrumented/stale.ads"), "stale").unwrap();
@@ -247,7 +399,7 @@ mod tests {
         std::fs::create_dir_all(work.join("findings/F-ONE")).unwrap();
 
         assert_eq!(
-            prepare(work, false).unwrap(),
+            prepare(work, false, Path::new("/src/tree")).unwrap(),
             WorkStateDisposition::FreshRunRefresh
         );
         assert!(!work.join("src_instrumented").exists());
@@ -260,12 +412,12 @@ mod tests {
     fn compatible_resume_keeps_generated_state() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        prepare(work, false).unwrap();
+        prepare(work, false, Path::new("/src/tree")).unwrap();
         std::fs::create_dir_all(work.join("generated_harnesses/H-ONE")).unwrap();
         std::fs::write(work.join("generated_harnesses/H-ONE/main.adb"), "current").unwrap();
 
         assert_eq!(
-            prepare(work, true).unwrap(),
+            prepare(work, true, Path::new("/src/tree")).unwrap(),
             WorkStateDisposition::CompatibleResume
         );
         assert!(work.join("generated_harnesses/H-ONE/main.adb").is_file());
@@ -275,7 +427,7 @@ mod tests {
     fn incompatible_resume_migrates_generated_state() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        prepare(work, false).unwrap();
+        prepare(work, false, Path::new("/src/tree")).unwrap();
         let state_path = work.join(STATE_FILE);
         let mut state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -286,7 +438,7 @@ mod tests {
         std::fs::write(work.join("harnesses/H-OLD/result.json"), "{}").unwrap();
 
         assert_eq!(
-            prepare(work, true).unwrap(),
+            prepare(work, true, Path::new("/src/tree")).unwrap(),
             WorkStateDisposition::IncompatibleMigration
         );
         // The generated harness goes; the attempt RECORD stays. It is the only

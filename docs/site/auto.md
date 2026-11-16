@@ -748,6 +748,14 @@ by default: an unchanged source/filter fingerprint reuses
 `--fresh-discovery` forces that rebuild. Use `bhf clean --all <work>` to
 wipe state.
 
+A work directory belongs to one source tree. When `bhf auto` is pointed at a
+different tree with a work directory an earlier run used (the default
+`./bhf_work/`, say), it moves everything that run left, findings and corpus
+included, to `<work>/archived/<UTC time>-<tree name>/` and prints
+`bhf auto: note: <work> held a run over <other tree>; moved it to ...` before
+it starts, so `results/` and the console report only the current tree.
+Nothing is deleted, and a run over the same tree keeps its findings.
+
 The coverage-guided corpus is persisted to `corpus/<harness-id>/queue/`
 (content-hash-named, seeds included) at the end of each run (#401), so it
 survives across passes and runs and stays replayable for coverage measurement
