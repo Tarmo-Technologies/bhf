@@ -868,6 +868,10 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
         });
     }
 
+    // The runtime's objects are compiled for one target: a build for another
+    // (a cross build after the host one, in the same harness build dir) starts
+    // them over, or gprbuild may reuse a host object in the cross archive.
+    reset_runtime_for_target(&build_dir, args.target.as_deref());
     let runtime_project_path = build_dir.join("adafuzz_runtime.gpr");
     write_runtime_project(&runtime_project_path, &build_dir, args.probe_backend).map_err(
         |error| {
@@ -3476,6 +3480,26 @@ fn ada_trace_pc_supported(toolchain: &ToolchainConfig) -> bool {
     supported
 }
 
+/// The file in the runtime library dir that names the target its objects
+/// were compiled for (`host` for a native build).
+const RUNTIME_TARGET_STAMP: &str = "adafuzz_lib/.bhf-target";
+
+/// Remove the runtime's object and library dirs under `build_dir` when they
+/// were compiled for a target other than `target`, and record `target`.
+fn reset_runtime_for_target(build_dir: &Path, target: Option<&str>) {
+    let wanted = target.unwrap_or("host");
+    let stamp = build_dir.join(RUNTIME_TARGET_STAMP);
+    let built_for = fs::read_to_string(&stamp).ok();
+    if built_for.as_deref().map(str::trim) != Some(wanted) {
+        for dir in ["adafuzz_obj", "adafuzz_lib"] {
+            let _ = fs::remove_dir_all(build_dir.join(dir));
+        }
+    }
+    if fs::create_dir_all(build_dir.join("adafuzz_lib")).is_ok() {
+        let _ = fs::write(&stamp, wanted);
+    }
+}
+
 fn write_runtime_project(
     project_path: &Path,
     build_dir: &Path,
@@ -4486,6 +4510,26 @@ mod tests {
         let generated =
             fs::read_to_string(args.work_dir.join("build/H-GPR-OVERLAY/bhf_build.gpr")).unwrap();
         assert!(generated.contains(&format!("extends \"{}\"", source_project.display())));
+    }
+
+    #[test]
+    /// A cross build after the host build of the same harness compiles the
+    /// runtime again; a second build for the same target keeps its objects.
+    #[test]
+    fn the_ada_runtime_is_rebuilt_for_another_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let build_dir = temp.path();
+        reset_runtime_for_target(build_dir, None);
+        std::fs::create_dir_all(build_dir.join("adafuzz_obj")).unwrap();
+        std::fs::write(build_dir.join("adafuzz_obj/adafuzz_cov.o"), b"x86-64").unwrap();
+        reset_runtime_for_target(build_dir, None);
+        assert!(build_dir.join("adafuzz_obj/adafuzz_cov.o").is_file());
+        reset_runtime_for_target(build_dir, Some("aarch64-linux-gnu"));
+        assert!(!build_dir.join("adafuzz_obj/adafuzz_cov.o").exists());
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join(RUNTIME_TARGET_STAMP)).unwrap(),
+            "aarch64-linux-gnu"
+        );
     }
 
     #[test]

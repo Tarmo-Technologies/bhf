@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf build --target <triple>` of an Ada harness after a host build of the
+  same harness compiles its runtime library again. It could link the host
+  build's `adafuzz_cov.o` into the cross archive ("Relocations in generic
+  ELF (EM: 62)", "file in wrong format").
 - The Lua lane's coverage hook costs a few times a plain run, not 100–600x:
   line events reach it only while a target chunk runs (a call/return hook
   switches them on and off, and a C function changes nothing), each chunk's
