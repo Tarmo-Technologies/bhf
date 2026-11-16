@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Changed
+- The nightly's `ignored` shard runs the RedQueen/cmplog cold-solve
+  discriminators and the engine-parity cold-solve sweep, `#[ignore]`d tests
+  no workflow ran; `cold_gate_needs_redqueen` checks both arms at a fixed seed
+  and execution count (solved with RedQueen, not with
+  `BHF_DISABLE_REDQUEEN=1`), and `engine_parity`'s ignore reason names what it
+  needs today.
 - sha2 0.11. Ids, signatures and file names derived from SHA-256 digests
   keep their lowercase-hex spelling.
 - A development build reports `v<version>-dev+<commit>` and no longer rebuilds

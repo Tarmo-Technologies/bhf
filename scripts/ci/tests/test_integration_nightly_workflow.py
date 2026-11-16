@@ -28,7 +28,7 @@ SLOW = "binary(=build_recovery) & test(=build_recovery_scenarios)"
 DEDICATED = "build-recovery-scenarios"
 # The shard that runs the #[ignore]d tests the nightly owns, and their filter.
 IGNORED = "ignored"
-IGNORED_FILTER = "binary(=auto_lua_hook)"
+IGNORED_FILTER = "binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)"
 
 
 def integration_job() -> str:

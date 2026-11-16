@@ -176,8 +176,9 @@ jobs:
           set -euo pipefail
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
           # The #[ignore]d tests that need a quiet machine or a long budget:
-          # the Lua line-hook cost benchmark.
-          ignored='binary(=auto_lua_hook)'
+          # the Lua line-hook cost benchmark, the RedQueen/cmplog cold-solve
+          # discriminators and the engine-parity cold-solve sweep.
+          ignored='binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
             cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E "$slow"
           elif [ "$SHARD" = ignored ]; then

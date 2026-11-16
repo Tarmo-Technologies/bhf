@@ -76,10 +76,11 @@ fn tmpdir(case: &str) -> TestDir {
 }
 
 /// Cold-solve sweep: runs the built-in engine on each planted-bug fixture and
-/// prints a TTFC table. `#[ignore]` (slow, clang-gated) — a tracking tool, not
-/// a CI gate, until #399 gives generated C harnesses fork-server throughput.
+/// prints a TTFC table, failing when a fixture does not build, runs nothing or
+/// is not solved. `#[ignore]`: it needs clang and libFuzzer and minutes of
+/// fuzzing, so the nightly's ignored shard runs it.
 #[test]
-#[ignore = "slow cold-solve sweep; tracking tool until #399 throughput fix"]
+#[ignore = "slow cold-solve sweep; needs clang+libFuzzer; the nightly's ignored shard runs it"]
 fn engine_parity_cold_solve_sweep() {
     if !support::libfuzzer_toolchain_available("parity") {
         eprintln!("skipping: clang+libfuzzer toolchain unavailable");

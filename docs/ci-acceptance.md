@@ -76,7 +76,13 @@ issue afterwards.
 ## Nightly integration suite
 
 `.github/workflows/integration-nightly.yml` runs every bhf integration test in
-13 shards. Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
+13 shards, and a 14th, `ignored`, runs the `#[ignore]`d tests the PR suites
+leave out because they need minutes of fuzzing or a quiet machine: the Lua
+line-hook cost benchmark (`auto_lua_hook`), the RedQueen/cmplog cold-solve
+discriminators (`redqueen_cmplog`, including `cold_gate_needs_redqueen`, which
+solves the integer gate in 2000 executions at a fixed seed with RedQueen and
+not with `BHF_DISABLE_REDQUEEN=1`) and the engine-parity cold-solve sweep
+(`engine_parity`). Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
 when an earlier run at the same commit ran every shard and all of them passed;
 a skipped run, which GitHub records as a success, does not count. A nightly
 that failed therefore runs again each day while the commit is unchanged, and a
