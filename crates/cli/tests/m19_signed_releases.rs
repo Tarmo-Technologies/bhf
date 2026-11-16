@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 
+// The installer tests that use it run on Unix only.
+#[cfg(unix)]
 #[path = "../src/test_support.rs"]
 mod test_support;
+#[cfg(unix)]
 use test_support::TestDir;
 
 #[test]
