@@ -60,7 +60,9 @@ impl TestDir {
     ///
     /// When the directory cannot be created; a test cannot go on without it.
     pub fn new(name: &str) -> Self {
-        Self::try_new(name).unwrap_or_else(|error| panic!("create test dir bhf-{name}-*: {error}"))
+        // Only the error's kind: its message holds the generated path.
+        Self::try_new(name)
+            .unwrap_or_else(|error| panic!("create test dir bhf-{name}-*: {:?}", error.kind()))
     }
 
     /// [`TestDir::new`] for a probe that treats a temp dir it cannot create
