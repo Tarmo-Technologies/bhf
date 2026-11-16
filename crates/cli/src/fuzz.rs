@@ -4349,6 +4349,21 @@ fn run_builtin_with_progress(
                                 }
                             }
                         }
+                        // A .NET report names its source lines from the
+                        // uninstrumented build (#212).
+                        let symbolized = dotnet_symbolized_report(
+                            &prepared.runner,
+                            &prepared.work_dir,
+                            input,
+                            report,
+                            &prepared.extra_env,
+                            prepared.per_input_timeout,
+                            prepared.rss_limit_mb,
+                        );
+                        let (report, stderr) = match &symbolized {
+                            Some((report, stderr)) => (report, Some(stderr.as_str())),
+                            None => (report, stderr),
+                        };
                         let id = emitter
                             .emit_sanitizer_crash_with_log(input, report, stderr.map(str::as_bytes))
                             .map_err(|error| format!("emit sanitizer finding: {error}"))?;
@@ -8502,6 +8517,53 @@ fn hang_report(stderr: &str, timeout: Duration, confirm: Duration) -> corpus::Sa
         ),
         ..Default::default()
     }
+}
+
+/// The launcher beside a .NET harness's `main` that runs its build as it was
+/// before SharpFuzz instrumented it, with the debug symbols the instrumented
+/// assembly lost (#212).
+pub(crate) const DOTNET_SYMBOLS_LAUNCHER: &str = "main_symbols";
+
+/// `report` with the source lines of its frames, when it names none and the
+/// harness has [`DOTNET_SYMBOLS_LAUNCHER`]: the input re-run through the
+/// uninstrumented build, whose report must be the same exception. Its stderr
+/// comes with it, as the finding's log. `None` otherwise.
+fn dotnet_symbolized_report(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    report: &corpus::SanitizerReport,
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+) -> Option<(corpus::SanitizerReport, String)> {
+    if report.stack.is_empty() || report.stack.iter().any(|frame| frame.line.is_some()) {
+        return None;
+    }
+    let launcher = runner
+        .harness_path()
+        .with_file_name(DOTNET_SYMBOLS_LAUNCHER);
+    if !launcher.is_file() {
+        return None;
+    }
+    let input_path = write_fuzz_input(work_dir, input).ok()?;
+    let output = run_with_timeout(
+        &launcher,
+        &input_path,
+        per_input_timeout,
+        extra_env,
+        &ensure_harness_scratch(work_dir).ok()?,
+        rss_limit_mb,
+        None,
+        SpawnTweaks::default(),
+    );
+    let _ = fs::remove_file(&input_path);
+    let stderr = String::from_utf8_lossy(&output.ok()?.stderr).into_owned();
+    let symbolized = corpus::parse_sanitizer_report(&stderr)?;
+    (symbolized.rule_id == report.rule_id
+        && symbolized.kind == report.kind
+        && symbolized.stack.iter().any(|frame| frame.line.is_some()))
+    .then_some((symbolized, stderr))
 }
 
 /// The UBSan suppressions that turn its `object-size` check off at run time.

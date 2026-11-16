@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A C# finding names its `.cs` file and line. SharpFuzz rewrites the target
+  assembly without its debug symbols, so the frames of a finding had no line
+  (`at Acme.Tlv.Parser.Pick(Byte[] data)`). bhf keeps the uninstrumented
+  build, with its pdbs, beside the harness (`build/symbols/`, run by
+  `main_symbols`) and re-runs a finding's input through it for the lines.
 - A TypeScript finding names the `.ts` file and line. Its frames pointed at
   the `target.js` esbuild transpiled the source to in the work dir. The lane
   now writes a source map and runs node with `--enable-source-maps`, so the
