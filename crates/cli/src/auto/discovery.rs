@@ -4036,7 +4036,6 @@ mod tests {
             "H-C002A-144FE22B"
         );
     }
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn all_caps_macro_invocations_are_not_targets() {
@@ -4113,14 +4112,8 @@ mod tests {
         );
     }
 
-    fn tmpdir() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-discover-{n}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("discover")
     }
 
     #[test]
@@ -4162,7 +4155,6 @@ mod tests {
             !has(&cands, "harness_entry"),
             "work-dir contents excluded: {cands:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4845,7 +4837,6 @@ mod tests {
             find("widgets::next_bit").input_reachability,
             Some(target_rank::InputReachability::AttackerReachable)
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A buffer spelled through a pointer typedef to bytes, a project's
@@ -4909,7 +4900,6 @@ mod tests {
                 .map(|b| b.rule.as_str()),
             Some("internal_linkage")
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5048,8 +5038,6 @@ mod tests {
         // bare identifier `main`, not substrings.
         assert!(has(&cands, "main_loop"), "main_loop kept: {cands:?}");
         assert!(has(&cands, "domain_parse"), "domain_parse kept: {cands:?}");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5151,8 +5139,6 @@ mod tests {
             !is_under_java_source_root(&root.join("src/test/java/tools")),
             "src/test/java/tools is NOT under src/main/java"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5301,8 +5287,6 @@ mod tests {
             !is_under_header_api_root(&root.join("tests")),
             "a top-level tests/ is NOT under a header root"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5439,8 +5423,6 @@ mod tests {
             Some("gov::parse_bytes"),
             "the first slot of even a cap=1 campaign must be viable"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5469,8 +5451,6 @@ mod tests {
             decode.is_static,
             "qualified internal-linkage metadata must not be lost"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5655,7 +5635,6 @@ mod tests {
             raw.iter().any(|c| c.name == "old_parse") && raw.iter().any(|c| c.name == "new_parse"),
             "raw parse sees both #ifdef branches: {raw:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5692,7 +5671,7 @@ mod tests {
         fs::write(
             root.join("compile_commands.json"),
             serde_json::json!([{
-                "directory": root,
+                "directory": root.path(),
                 "file": "heavy.c",
                 "arguments": ["clang", "-DHAVE_AVX2=1", "-DNDEBUG=1", "-c", "heavy.c"],
             }])
@@ -5708,7 +5687,6 @@ mod tests {
                 "{dropped} compiled out under Auto preprocessing: {cands:?}"
             );
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6175,9 +6153,6 @@ mod tests {
             gpr_main_sources(&empty, &DirFilter::default()).is_empty(),
             "no `for Main` → empty map → nothing skipped"
         );
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&empty);
     }
 
     #[test]

@@ -108,6 +108,10 @@ mod static_scan;
 mod stub;
 mod support_report;
 mod target_filter;
+/// Self-cleaning scratch directories for the tests (the integration tests
+/// include the file by path).
+#[cfg(test)]
+mod test_support;
 mod toolchain;
 pub mod transport_fault;
 mod transport_fuzz;

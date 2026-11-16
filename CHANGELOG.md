@@ -1895,6 +1895,11 @@
 - `fixture_path` in new `finding.json` records is relative to the work dir
   when the harness is inside it (an absolute path otherwise). Readers accept
   both forms.
+- Test scratch directories are removed when the test ends, including when it
+  fails: the new `TestDir` guard (`crates/cli/src/test_support.rs`) makes
+  `<temp>/bhf-<name>-<random>` and deletes it on drop. The six helpers that
+  made most of the `bhf-*` directories left in the temp dir use it;
+  `BHF_KEEP_TEST_DIRS=1` keeps the directories for inspection.
 
 ### Added
 - Seed lineage: the built-in engine records what each input it keeps was

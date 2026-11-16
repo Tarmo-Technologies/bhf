@@ -1939,6 +1939,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/test_support.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/toolchain.rs",
       "license": "Apache-2.0"
     },
@@ -2776,6 +2780,10 @@
     },
     {
       "path": "crates/cli/tests/support/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/test_dir_guard.rs",
       "license": "Apache-2.0"
     },
     {

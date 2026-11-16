@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 mod support;
 
-fn tmpdir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-auto-it-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir() -> TestDir {
+    TestDir::new("auto-it")
 }
 
 fn clangxx_libfuzzer_flags(prefix: &str) -> Option<Vec<String>> {
@@ -3992,7 +3989,7 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
         per_target_finding_count: None,
         no_stubs: false,
         passes: cli::auto::pass::Pass::ALL.to_vec(),
-        source_root: Some(root.clone()),
+        source_root: Some(root.to_path_buf()),
         project: None,
         ada_dep_dirs: Vec::new(),
         mode: actionability::RunMode::Reporting,

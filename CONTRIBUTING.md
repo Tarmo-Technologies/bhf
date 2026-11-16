@@ -52,6 +52,13 @@ cargo run -p spdx_check -- generate       # update SPDX/manifest.json after addi
 - Library crates test in-file (`#[cfg(test)]` at the bottom of `src/lib.rs`); CLI
   integration tests live in `crates/cli/tests/` and shell the binary or call `auto`
   internals against `tests/fixtures/`.
+- Tests write scratch files under a directory that removes itself, never a
+  `temp_dir().join(format!("bhf-..."))` built by hand: `TestDir::new("name")`
+  from `crates/cli/src/test_support.rs` in the `bhf` crate (an integration test
+  includes it with `#[path = "../src/test_support.rs"] mod test_support;`), or
+  `tempfile` in the other crates. A failing test then leaves nothing behind; set
+  `BHF_KEEP_TEST_DIRS=1` to keep a `TestDir` for inspection (its path is printed
+  when the test ends).
 - `ROADMAP.md` is the engineering source of truth (license matrix, milestone criteria);
   user-facing behavior docs live in `docs/site/`. Keep both honest when behavior
   changes — README/docs drift is treated as a bug.

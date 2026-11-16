@@ -9603,12 +9603,7 @@ mod spawn_priority_windows_tests {
             eprintln!("skipping: the hosted runner changes priority classes itself");
             return;
         }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let work = std::env::temp_dir().join(format!("bhf-spawn-priority-{nonce}"));
-        fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("spawn-priority");
         let scratch = ensure_harness_scratch(&work).unwrap();
         // The script prints its own priority class `samples` times, 250 ms
         // apart.
@@ -9659,7 +9654,6 @@ mod spawn_priority_windows_tests {
             raised.is_some_and(|at| seen[at..].iter().all(|class| class == "Normal")),
             "the re-run was not returned to normal priority: {seen:?}"
         );
-        let _ = fs::remove_dir_all(&work);
     }
 }
 
@@ -11171,16 +11165,9 @@ mod auto_path_tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmpdir() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-find-{n}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("find")
     }
 
     fn sanitizer_report(rule_id: &'static str, frames: Vec<&str>) -> corpus::SanitizerReport {
@@ -12654,7 +12641,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_rss_limit_only_when_set() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.rss_limit_mb = 0;
         assert!(!worker_passthrough_args(&args)
             .iter()
@@ -12668,7 +12656,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_timeout_only_when_set() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.timeout = None;
         assert!(
             !worker_passthrough_args(&args)
@@ -12685,7 +12674,8 @@ exit 0
 
     #[test]
     fn multicore_workers_receive_seed_bytes_as_byte_exact_seed_files() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         let seed = non_utf8_seed();
         args.seed_bytes = vec![seed.clone()];
         materialize_seed_bytes(&mut args).unwrap();
@@ -12820,7 +12810,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_len_control() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.len_control = 7;
         let passthrough = worker_passthrough_args(&args);
         assert!(passthrough
@@ -12848,7 +12839,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_max_len() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.max_len = 128;
         let passthrough = worker_passthrough_args(&args);
         assert!(
@@ -12861,7 +12853,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_input_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Record);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Record);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12872,7 +12865,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_json_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Json);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Json);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12883,7 +12877,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_xml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Xml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Xml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12894,7 +12889,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_key_value_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Kv);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Kv);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12905,7 +12901,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_url_encoded_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Url);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Url);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12916,7 +12913,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_multipart_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Multipart);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Multipart);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12927,7 +12925,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_csv_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Csv);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Csv);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12938,7 +12937,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_http_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Http);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Http);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12949,7 +12949,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_ini_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Ini);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Ini);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12960,7 +12961,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_toml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Toml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Toml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12971,7 +12973,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_yaml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Yaml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Yaml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -13362,7 +13365,8 @@ exit 0
     /// engine only, which is the one that runs such a binary on one input.
     #[test]
     fn a_multicore_campaign_notes_a_libfuzzer_binary_once() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         let dir = args.work_dir.join("build/H-X");
         fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("main");
@@ -13786,7 +13790,6 @@ exit 0
             pending.iter().any(|input| input == b"R1" || input == b"R2"),
             "the crasher left over is kept for the next pass: {pending:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14037,7 +14040,8 @@ exit 0
         write_scalars_first_layout(&harness);
         let seed_file = root.join("magic.bin");
         fs::write(&seed_file, b"MAGC").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-PREFIX".to_owned();
         args.seed_files = vec![seed_file];
@@ -14075,7 +14079,8 @@ exit 0
         write_scalars_first_layout(&harness);
         let seed_file = root.join("magic.bin");
         fs::write(&seed_file, b"MAGC").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-PREFIX-MC".to_owned();
         args.seed_files = vec![seed_file];
@@ -14119,7 +14124,8 @@ exit 0
         let queued = work_dir.join("corpus/H-OPERATOR/queue/entry.bin");
         fs::create_dir_all(queued.parent().unwrap()).unwrap();
         fs::write(&queued, b"ENTRY").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-OPERATOR".to_owned();
         args.seed_files = vec![seed_file.clone()];
@@ -14520,9 +14526,12 @@ exit 0
         let _ = std::fs::remove_dir_all(&work);
     }
 
-    fn fuzz_args_for_worker_passthrough(structured_inputs: StructuredInputMode) -> FuzzArgs {
+    fn fuzz_args_for_worker_passthrough(
+        work_dir: &Path,
+        structured_inputs: StructuredInputMode,
+    ) -> FuzzArgs {
         FuzzArgs {
-            work_dir: tmpdir(),
+            work_dir: work_dir.to_path_buf(),
             harness: "H-X".to_owned(),
             engine: FuzzEngine::Builtin,
             afl_mode: AflMode::Native,
