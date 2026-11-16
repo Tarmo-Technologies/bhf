@@ -122,7 +122,7 @@ fn listed_names(manifest: &serde_json::Value) -> Vec<String> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+    corpus::hex_lower(&Sha256::digest(bytes))
 }
 
 fn scratch(name: &str) -> TestDir {

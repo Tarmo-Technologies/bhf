@@ -2514,7 +2514,10 @@ fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
     fs::create_dir_all(&dir)
         .map_err(|error| format!("create seed dir '{}': {error}", dir.display()))?;
     for bytes in std::mem::take(&mut args.seed_bytes) {
-        let path = dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
+        let path = dir.join(format!(
+            "{}.bin",
+            corpus::hex_lower(&Sha256::digest(&bytes))
+        ));
         fs::write(&path, &bytes)
             .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
         args.campaign_seed_files.push(path);

@@ -123,7 +123,7 @@ impl SeedManifest {
                 .map(|seed| SeedEntry {
                     path: seed.path.display().to_string(),
                     source,
-                    sha256: format!("{:x}", Sha256::digest(&seed.bytes)),
+                    sha256: corpus::hex_lower(&Sha256::digest(&seed.bytes)),
                     size: seed.file_size,
                     bytes_used: seed.bytes.len(),
                 })
@@ -188,7 +188,7 @@ pub(crate) fn record_layout_variant(
         layout_prefix,
         sha256: seeds
             .iter()
-            .map(|seed| format!("{:x}", Sha256::digest(seed)))
+            .map(|seed| corpus::hex_lower(&Sha256::digest(seed)))
             .collect(),
     });
     write(work_dir, &manifest).map(|_| ())
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(entry["bytes_used"], 5);
         assert_eq!(
             entry["sha256"],
-            format!("{:x}", Sha256::digest(&bytes)),
+            corpus::hex_lower(&Sha256::digest(&bytes)),
             "the sha256 of the bytes used: the queue name when the seed adds coverage, \
              and the testcase hash when it crashes"
         );
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(variants[0]["layout_prefix"], 8);
         assert_eq!(
             variants[0]["sha256"],
-            serde_json::json!([format!("{:x}", Sha256::digest(&variant))])
+            serde_json::json!([corpus::hex_lower(&Sha256::digest(&variant))])
         );
         assert_eq!(variants[1]["layout_prefix"], 4);
         // Read back, the summary is unchanged.

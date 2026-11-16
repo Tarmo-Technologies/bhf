@@ -352,7 +352,7 @@ fn write_finding(
 ) -> std::io::Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(input_bytes);
-    let signature_hex = format!("{:x}", hasher.finalize());
+    let signature_hex = corpus::hex_lower(&hasher.finalize());
     let oracle_hit = differential_oracle_hit(&signature_hex, div).ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidData,
@@ -478,7 +478,7 @@ fn write_metamorphic_finding(
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    corpus::hex_lower(&hasher.finalize())
 }
 
 fn metamorphic_signature(
@@ -493,7 +493,7 @@ fn metamorphic_signature(
     hasher.update(input_bytes);
     hasher.update(b"\0");
     hasher.update(transformed_bytes);
-    format!("{:x}", hasher.finalize())
+    corpus::hex_lower(&hasher.finalize())
 }
 
 fn differential_oracle_hit(input_sha256: &str, div: &Divergence) -> Option<OracleHit> {

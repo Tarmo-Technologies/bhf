@@ -22,3 +22,15 @@ pub use line_remap::{ResolvedLocation, SourceLineMaps};
 pub use manager::{CorpusError, CorpusManager, SignatureClass, SignatureRecord};
 pub use sanitizer::{parse_sanitizer_report, Sanitizer, SanitizerReport};
 pub use signature::{compute_signature, Signature};
+
+/// `bytes` as lowercase hex, two digits a byte: how bhf spells a digest in
+/// ids, file names and reports.
+pub fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}

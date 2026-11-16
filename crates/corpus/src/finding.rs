@@ -98,7 +98,7 @@ pub fn extension_signature(signature_inputs: &[String]) -> String {
         hasher.update(b"\x1f");
         hasher.update(part.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex_lower(&hasher.finalize())
 }
 
 /// The key a fuzz run dedupes an emitted finding on, by the set it lives in.
@@ -166,7 +166,7 @@ pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String
         hasher.update(b"|");
         hasher.update(frame.function.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex_lower(&hasher.finalize())
 }
 
 /// The key a fuzz run dedupes a sanitizer crash on: its root-cause cluster key,
@@ -493,7 +493,7 @@ impl FindingEmitter {
             hasher.update(b"=");
             hasher.update(evidence.value.as_bytes());
         }
-        let signature_hex = format!("{:x}", hasher.finalize());
+        let signature_hex = crate::hex_lower(&hasher.finalize());
         // The cluster key is DEFECT-level (rule | oracle | dangerous API) and
         // EXCLUDES per-input evidence (the opened path/fd, injected command, ...).
         // The `signature` above keeps the evidence so each finding ID stays unique,
@@ -521,7 +521,7 @@ impl FindingEmitter {
                 cluster_frames.push(format!("{key}={value}"));
             }
         }
-        let cluster_full = format!("{:x}", cluster_hasher.finalize());
+        let cluster_full = crate::hex_lower(&cluster_hasher.finalize());
         let cluster_short = cluster_full.chars().take(16).collect::<String>();
         let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
@@ -613,7 +613,7 @@ impl FindingEmitter {
         cluster_hasher.update(finding.rule.as_bytes());
         cluster_hasher.update(b"|");
         cluster_hasher.update(finding.classification.as_bytes());
-        let cluster_full = format!("{:x}", cluster_hasher.finalize());
+        let cluster_full = crate::hex_lower(&cluster_hasher.finalize());
         let cluster_short = cluster_full.chars().take(16).collect::<String>();
         let cluster_frames = vec![finding.rule.clone(), finding.classification.clone()];
 

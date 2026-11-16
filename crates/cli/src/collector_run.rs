@@ -263,7 +263,7 @@ fn resolved_for(sidecar: PathBuf, window_ms: u64) -> anyhow::Result<ResolvedColl
         .and_then(|s| s.to_str())
         .unwrap_or("sidecar")
         .to_owned();
-    let backend = BackendInfo::new(name, "sidecar", format!("{:x}", Sha256::digest(&bytes)));
+    let backend = BackendInfo::new(name, "sidecar", corpus::hex_lower(&Sha256::digest(&bytes)));
     Ok(ResolvedCollector {
         source: CollectorSource::Sidecar(sidecar),
         window_ms,
@@ -376,7 +376,7 @@ pub struct ReplayTestcase {
 
 /// SHA-256 of `bytes` as lowercase hex.
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    corpus::hex_lower(&Sha256::digest(bytes))
 }
 
 /// Does this crash finding belong to `harness_id`'s campaign? A multi-target work

@@ -1267,11 +1267,11 @@ fn sha256_reader(mut reader: impl Read) -> Option<(String, u64)> {
         total += n as u64;
         hasher.update(&buf[..n]);
     }
-    Some((format!("{:x}", hasher.finalize()), total))
+    Some((corpus::hex_lower(&hasher.finalize()), total))
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    corpus::hex_lower(&Sha256::digest(bytes))
 }
 
 /// `issue_key` per static finding id, from static-report.json `issues[]`.

@@ -346,7 +346,7 @@ fn replay_c_libfuzzer_matches_a_finding_recorded_under_an_earlier_rule() {
 #[cfg(unix)]
 fn sha256_hex(path: &Path) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+    corpus::hex_lower(&Sha256::digest(fs::read(path).unwrap()))
 }
 
 #[cfg(unix)]
@@ -1416,10 +1416,7 @@ fn assert_attestation_current(work: &Path) {
         .any(|s| s["name"].as_str().unwrap().ends_with("finding.json")));
     for subject in subjects {
         let name = subject["name"].as_str().unwrap();
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(fs::read(results.join(name)).unwrap())
-        );
+        let digest = corpus::hex_lower(&Sha256::digest(fs::read(results.join(name)).unwrap()));
         assert_eq!(
             subject["digest"]["sha256"].as_str().unwrap(),
             digest,
@@ -2626,10 +2623,7 @@ fn replay_keeps_the_results_attestation_current() {
         .any(|s| s["name"].as_str().unwrap().ends_with("finding.json")));
     for subject in subjects {
         let name = subject["name"].as_str().unwrap();
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(fs::read(results.join(name)).unwrap())
-        );
+        let digest = corpus::hex_lower(&Sha256::digest(fs::read(results.join(name)).unwrap()));
         assert_eq!(
             subject["digest"]["sha256"].as_str().unwrap(),
             digest,

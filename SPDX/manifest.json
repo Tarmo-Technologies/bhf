@@ -2975,6 +2975,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/tests/digest_ids.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/tests/end_to_end_swallowed_ce.rs",
       "license": "Apache-2.0"
     },

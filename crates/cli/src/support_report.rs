@@ -1469,7 +1469,7 @@ fn render_report(
     }
 
     let digest = Sha256::digest(body.as_bytes());
-    let report_id = format!("{:x}", digest);
+    let report_id = corpus::hex_lower(&digest);
     let mut report = format!(
         "BHF SUPPORT REPORT (SCRUBBED)\nreport_id={}\n{body}END\n",
         &report_id[..16]

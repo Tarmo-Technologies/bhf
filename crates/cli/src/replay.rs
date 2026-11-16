@@ -1198,7 +1198,7 @@ fn sha256_file(path: &Path) -> Option<String> {
         }
         hasher.update(&chunk[..read]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(corpus::hex_lower(&hasher.finalize()))
 }
 
 fn harness_summary(raw: &Value, harness: &Path, detection: &Detection) -> HarnessSummary {

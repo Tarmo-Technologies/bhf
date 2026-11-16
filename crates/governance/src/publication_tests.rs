@@ -65,7 +65,10 @@ fn publication_preserves_a_dangling_destination_symlink() {
     let target = dir.path().join("installed");
     symlink("missing", &target).unwrap();
     assert!(publish_pack_stage(&stage, &target).is_err());
-    assert_eq!(fs::read_link(&target).unwrap(), std::path::Path::new("missing"));
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        std::path::Path::new("missing")
+    );
     assert_eq!(fs::read(stage.join("item")).unwrap(), b"new");
 }
 
@@ -82,7 +85,9 @@ fn publication_rejects_nul_paths_without_changing_stage() {
     use std::os::unix::ffi::OsStringExt;
     let dir = tempfile::tempdir().unwrap();
     let stage = staged(dir.path(), "stage", b"new");
-    let target = dir.path().join(std::ffi::OsString::from_vec(b"bad\0name".to_vec()));
+    let target = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"bad\0name".to_vec()));
     assert!(publish_pack_stage(&stage, &target).is_err());
     assert_eq!(fs::read(stage.join("item")).unwrap(), b"new");
 }
@@ -96,15 +101,22 @@ fn publication_allows_exactly_one_concurrent_publisher() {
     ];
     let target = dir.path().join("installed");
     let barrier = Arc::new(Barrier::new(2));
-    let handles: Vec<_> = stages.iter().cloned().map(|stage| {
-        let target = target.clone();
-        let barrier = Arc::clone(&barrier);
-        std::thread::spawn(move || {
-            barrier.wait();
-            publish_pack_stage(&stage, &target).is_ok()
+    let handles: Vec<_> = stages
+        .iter()
+        .cloned()
+        .map(|stage| {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                publish_pack_stage(&stage, &target).is_ok()
+            })
         })
-    }).collect();
-    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
     assert_eq!(results.iter().filter(|&&won| won).count(), 1);
     let winner = if results[0] { 0 } else { 1 };
     let expected: &[u8] = if winner == 0 { b"a" } else { b"b" };

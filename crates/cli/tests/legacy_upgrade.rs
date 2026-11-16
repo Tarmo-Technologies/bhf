@@ -356,7 +356,7 @@ fn report_backfill_fills_a_location_less_finding_from_its_recorded_build() {
     let legacy = work.join("findings/F-0001-aaaaaaaa");
     let mut record = drop_recorded_location(&legacy);
     record["build"] = serde_json::json!({"binary": {
-        "sha256": format!("{:x}", Sha256::digest(fs::read(&harness).unwrap())),
+        "sha256": corpus::hex_lower(&Sha256::digest(fs::read(&harness).unwrap())),
     }});
     fs::write(
         legacy.join("finding.json"),

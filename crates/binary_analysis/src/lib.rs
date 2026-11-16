@@ -3337,10 +3337,7 @@ fn binary_dedup_key(kind: BinaryKind, sha256: &str) -> String {
     hasher.update(kind.architecture.as_bytes());
     hasher.update(b"|");
     hasher.update(sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
-        .chars()
-        .take(48)
-        .collect()
+    hex_lower(&hasher.finalize()).chars().take(48).collect()
 }
 
 fn binary_analysis_plan(symbol_info: &SymbolInfo) -> BinaryAnalysisPlan {
@@ -3828,7 +3825,7 @@ fn path_string(path: &Path) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
@@ -4103,4 +4100,15 @@ mod build_identity_tests {
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
+}
+
+/// `bytes` as lowercase hex, two digits a byte (a digest's usual spelling).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }

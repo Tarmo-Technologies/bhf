@@ -5,6 +5,8 @@
 ## Unreleased
 
 ### Changed
+- sha2 0.11. Ids, signatures and file names derived from SHA-256 digests
+  keep their lowercase-hex spelling.
 - A development build reports `v<version>-dev+<commit>` and no longer rebuilds
   when another worktree of the same clone fetches, packs refs or adds a tag.
   Release builds (`BHF_RELEASE_VERSION`) still report `v<version>`.
