@@ -315,10 +315,16 @@ pub fn is_recovery_artifact(name: &str) -> bool {
 /// which is a "bring this dependency" situation.
 fn tail_is_codegen(tail: &str) -> bool {
     let lower = tail.to_ascii_lowercase();
-    lower.contains("no member named")
-        || lower.contains("no type named")
-        || lower.contains("did you mean")
-        || lower.contains("use of undeclared identifier")
+    // A lookup failure in the project's own source is the project's error, not
+    // the generated code's: only one located in the generated harness, or one
+    // with no location, is bhf's.
+    let in_generated_code =
+        diagnostic_location(tail).is_none_or(|(file, _)| is_generated_harness_file(&file));
+    (in_generated_code
+        && (lower.contains("no member named")
+            || lower.contains("no type named")
+            || lower.contains("did you mean")
+            || lower.contains("use of undeclared identifier")))
         // Compiler-driver FLAG / OPTION errors are a bhf build-recipe problem
         // (e.g. a recovered `-std=c2x` applied to a C++ TU: "invalid argument
         // '-std=c2x' not allowed with 'C++'"), never an external dependency to
@@ -346,6 +352,37 @@ fn tail_is_codegen(tail: &str) -> bool {
         // generated file name so a genuine syntax error in the project's own source
         // stays a distinct target error.
         || (tail_mentions_generated_harness_file(&lower) && tail_names_generated_syntax_error(&lower))
+}
+
+/// The file and line of the first `file:line:col: error:` (or `file:line:
+/// error:`) a diagnostic tail names.
+pub fn diagnostic_location(tail: &str) -> Option<(String, u32)> {
+    tail.lines().find_map(|line| {
+        let at = line
+            .find(": error:")
+            .or_else(|| line.find(": fatal error:"))?;
+        let mut parts = line[..at].rsplitn(3, ':');
+        let (last, middle) = (parts.next()?, parts.next()?);
+        let (file, line_no) = match parts.next() {
+            // `file:line:col`
+            Some(file) if last.parse::<u32>().is_ok() => (file, middle.parse::<u32>().ok()?),
+            // `file:line`
+            _ => (line[..at].rsplit_once(':')?.0, last.parse::<u32>().ok()?),
+        };
+        let file = file.trim();
+        (!file.is_empty()).then(|| (file.to_owned(), line_no))
+    })
+}
+
+/// Whether `file` is code bhf generated for a harness: the driver it writes
+/// (`main.c`, `main.cpp`) or a repair under the harness's `repairs/`.
+pub fn is_generated_harness_file(file: &str) -> bool {
+    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    matches!(name, "main.c" | "main.cpp" | "main.cc")
+        || file.contains("/repairs/")
+        || file.contains("\\repairs\\")
+        || name.starts_with("auto_stubs")
+        || name.starts_with("auto_types")
 }
 
 /// #105: whether a diagnostic tail is located in the GENERATED harness driver.
@@ -376,6 +413,36 @@ fn tail_names_generated_syntax_error(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An undeclared identifier in the project's own file is the project's
+    /// error; in the generated driver, or with no location, it is bhf's.
+    #[test]
+    fn a_lookup_error_is_codegen_only_in_the_generated_harness() {
+        let in_tree = "/p/src/bad.c:3:25: error: use of undeclared identifier 'counter'";
+        assert!(!is_codegen_error(&BuildErrorKind::Other {
+            tail: in_tree.to_owned()
+        }));
+        assert_eq!(
+            diagnostic_location(in_tree),
+            Some(("/p/src/bad.c".to_owned(), 3))
+        );
+        for generated in [
+            "/w/harnesses/H-C1/main.c:40:9: error: use of undeclared identifier 'ctx'",
+            "/w/harnesses/H-C1/repairs/auto_stubs.c:2:1: error: no member named 'x' in 'struct s'",
+            "error: use of undeclared identifier 'ctx'",
+        ] {
+            assert!(
+                is_codegen_error(&BuildErrorKind::Other {
+                    tail: generated.to_owned()
+                }),
+                "{generated}"
+            );
+        }
+        assert_eq!(
+            diagnostic_location("lib.c:12: error: expected ';'"),
+            Some(("lib.c".to_owned(), 12))
+        );
+    }
 
     #[test]
     fn config_guard_hash_error_is_classified_with_its_location() {
@@ -420,13 +487,19 @@ mod tests {
 
     #[test]
     fn no_member_named_is_a_codegen_error_not_a_missing_dep() {
-        // yaml-cpp: a member/typo lookup failure is a codegen/version mismatch,
-        // never an external dependency to acquire.
+        // yaml-cpp: a member/typo lookup failure in the generated driver is a
+        // codegen/version mismatch, never an external dependency to acquire.
         let other = BuildErrorKind::Other {
-            tail: "node.cpp:9:7: error: no member named 'as' in 'YAML::Node'; did you mean 'at'?"
+            tail: "main.cpp:9:7: error: no member named 'as' in 'YAML::Node'; did you mean 'at'?"
                 .to_owned(),
         };
         assert!(is_codegen_error(&other));
+        // In the project's own file it is the project's error.
+        let in_tree = BuildErrorKind::Other {
+            tail: "node.cpp:9:7: error: no member named 'as' in 'YAML::Node'; did you mean 'at'?"
+                .to_owned(),
+        };
+        assert!(!is_codegen_error(&in_tree));
 
         // A genuine missing-header Other-shaped tail is NOT a codegen error.
         let dep = BuildErrorKind::Other {
@@ -509,9 +582,13 @@ mod tests {
     #[test]
     fn use_of_undeclared_identifier_tail_is_codegen() {
         let other = BuildErrorKind::Other {
-            tail: "h.c:4:5: error: use of undeclared identifier 'helper_fn'".to_owned(),
+            tail: "main.c:4:5: error: use of undeclared identifier 'helper_fn'".to_owned(),
         };
         assert!(is_codegen_error(&other));
+        let in_tree = BuildErrorKind::Other {
+            tail: "h.c:4:5: error: use of undeclared identifier 'helper_fn'".to_owned(),
+        };
+        assert!(!is_codegen_error(&in_tree));
     }
 
     #[test]

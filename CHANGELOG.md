@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A compile error in the project's own source (an undeclared identifier in
+  `bad.c`) is a `source_error` entry in `missing-deps.json`/`.txt` and a
+  `[failed-build]` in `bug-report.md`. It left the manifest empty, which then
+  said "the tree built against its own sources", and was filed as a bhf
+  `[codegen-bug]`. That sentence now appears only when every target built. A
+  lookup error counts as bhf's code generation only when it is located in the
+  generated driver or its repairs.
 - The blocker histogram (`auto/blockers.json`, run.md) keeps the identifier
   each diagnostic names and a dialect's version: it turned every quoted name
   into `X` and `Python 2` into `Python N`, so a row could not say what to

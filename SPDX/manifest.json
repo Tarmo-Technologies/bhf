@@ -2511,6 +2511,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_source_error_manifest.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_spaced_paths.rs",
       "license": "Apache-2.0"
     },

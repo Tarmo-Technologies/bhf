@@ -70,6 +70,9 @@ pub enum DepKind {
     /// `<base>.idl`) is absent — the `.idl` and its compiled output aren't in the
     /// tree, so the IDL-defined types can't be built or fuzzed without them.
     IdlInterface,
+    /// A compile error in the project's own source, as bhf builds it: not a
+    /// dependency to acquire, and not a bhf code-generation defect.
+    SourceError,
     Other,
 }
 
@@ -98,6 +101,7 @@ impl DepKind {
             DepKind::LanguagePackage => "language package",
             DepKind::PkgConfig => "pkg-config",
             DepKind::IdlInterface => "idl interface",
+            DepKind::SourceError => "source error",
             DepKind::Other => "other",
         }
     }
@@ -249,6 +253,9 @@ pub struct DependencyManifest {
     /// Number of completed target attempts folded into this checkpoint.
     #[serde(default)]
     pub completed_targets: usize,
+    /// Targets whose harness did not build, whatever the cause.
+    #[serde(default)]
+    pub failed_builds: usize,
     pub entries: Vec<DepEntry>,
 }
 
@@ -258,6 +265,7 @@ impl Default for DependencyManifest {
             schema_version: manifest_schema_version(),
             complete: false,
             completed_targets: 0,
+            failed_builds: 0,
             entries: Vec::new(),
         }
     }
@@ -434,6 +442,14 @@ impl DependencyManifest {
         self.entries.iter().filter(|e| !e.stubbed).count()
     }
 
+    /// Compile errors in the project's own source: entries, but no dependency.
+    pub fn source_error_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == DepKind::SourceError)
+            .count()
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
     }
@@ -455,18 +471,43 @@ impl DependencyManifest {
             }
         ));
         if self.entries.is_empty() {
-            out.push_str(
-                "No external dependencies were missing — the tree built against its own sources.\n",
-            );
+            if self.failed_builds == 0 {
+                out.push_str(
+                    "No external dependencies were missing — the tree built against its own \
+                     sources.\n",
+                );
+            } else {
+                out.push_str(&format!(
+                    "No external dependencies were missing, but {} target(s) did not build: see \
+                     their outcome.last_errors in auto/run.json, and auto/bug-report.md.\n",
+                    self.failed_builds
+                ));
+            }
             return out;
         }
-        out.push_str(&format!(
-            "{} external dependenc{} needed: {} still blocking, {} stubbed (build continued).\n\n",
-            self.entries.len(),
-            if self.entries.len() == 1 { "y" } else { "ies" },
-            self.blocking_count(),
-            self.stubbed_count(),
-        ));
+        let source_errors = self.source_error_count();
+        let dependencies = self.entries.len() - source_errors;
+        if dependencies > 0 {
+            out.push_str(&format!(
+                "{} external dependenc{} needed: {} still blocking, {} stubbed (build continued).\n",
+                dependencies,
+                if dependencies == 1 { "y" } else { "ies" },
+                self.blocking_count() - source_errors,
+                self.stubbed_count(),
+            ));
+        }
+        if source_errors > 0 {
+            out.push_str(&format!(
+                "{source_errors} compile error{} in the project's own source{}.\n",
+                if source_errors == 1 { "" } else { "s" },
+                if dependencies == 0 {
+                    "; no external dependencies were missing"
+                } else {
+                    ""
+                },
+            ));
+        }
+        out.push('\n');
 
         let mut critical: Vec<&DepEntry> = self
             .entries
@@ -663,6 +704,7 @@ pub fn acquisition_hint(kind: DepKind, name: &str) -> Option<String> {
         | DepKind::Symbol
         | DepKind::NetworkEndpoint
         | DepKind::DlopenLibrary
+        | DepKind::SourceError
         | DepKind::Other => None,
     }
 }
@@ -670,6 +712,48 @@ pub fn acquisition_hint(kind: DepKind, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text says the tree built only when no target failed to build, and
+    /// counts a compile error in the project's source apart from dependencies.
+    #[test]
+    fn render_text_says_the_tree_built_only_when_it_did() {
+        let mut m = DependencyManifest::new();
+        assert!(m
+            .render_text()
+            .contains("the tree built against its own sources"));
+        m.failed_builds = 2;
+        let text = m.render_text();
+        assert!(!text.contains("tree built"), "{text}");
+        assert!(text.contains("2 target(s) did not build"), "{text}");
+
+        m.push(
+            DepKind::SourceError,
+            "src/bad.c:3: use of undeclared identifier 'x'",
+            vec!["H-BAD".into()],
+            false,
+        );
+        let text = m.render_text();
+        assert!(!text.contains("tree built"), "{text}");
+        assert!(!text.contains("external dependency needed"), "{text}");
+        assert!(
+            text.contains(
+                "1 compile error in the project's own source; no external dependencies were \
+                 missing"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("[source error] src/bad.c:3"), "{text}");
+        m.push(DepKind::Header, "zlib.h", vec!["H-Z".into()], false);
+        let text = m.render_text();
+        assert!(
+            text.contains("1 external dependency needed: 1 still blocking, 0 stubbed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 compile error in the project's own source.\n"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn renders_blocking_before_stubbed_with_hints() {

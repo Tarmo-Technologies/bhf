@@ -781,6 +781,15 @@ project's configure step, or `--probe-build`) instead of a dead-end apt-file
 hint. `--deps-only` writes this manifest without paying for the fuzz phase;
 `--install-deps` fetches the still-blocking entries.
 
+A compile error the compiler reports in a file of the project's own tree, such
+as an undeclared identifier in `src/bad.c`, is a `source_error` entry named by
+the file, line and message (`bad.c:3: use of undeclared identifier 'x'`). It is
+counted apart from the external dependencies ("1 compile error in the
+project's own source"), and `bug-report.md` files the target as a
+`[failed-build]`, not a bhf `[codegen-bug]`. A lookup error in the generated
+harness driver or its `repairs/` stays a codegen defect. The manifest says
+"the tree built against its own sources" only when no target failed to build.
+
 ### Per-Finding Replay
 
 Each finding's `finding.json` records the pass, fuzz seed, env vars injected,
