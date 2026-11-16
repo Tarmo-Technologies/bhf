@@ -3053,13 +3053,17 @@ mod tests {
             "{reproduce}"
         );
 
-        // An oracle hit is not a sanitizer crash: no capsule.
+        // A C or C++ oracle hit is packaged (its capsule replays it under the
+        // runtrace shim), but cartography maps sanitizer reports only.
         let mut oracle = frameless_finding(&finding_dir);
         oracle.raw["classification"] = serde_json::json!("oracle_hit");
         let out = explain_one(work.path(), &oracle, &[], false);
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
-        assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
-        assert!(reproduce.contains("oracle finding"), "{reproduce}");
+        assert!(reproduce.contains("bhf verify-poc"), "{reproduce}");
+        assert!(
+            !reproduce.contains("bhf cartography --work-dir"),
+            "{reproduce}"
+        );
     }
 
     /// A finding record as `emit_oracle_hit` writes it.
