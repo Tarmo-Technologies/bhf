@@ -571,8 +571,9 @@ pub fn cluster_for_ada(testcase: &Testcase, handler: &HandlerEvent) -> ClusterKe
 
 /// Reconstruct a `ClusterKey` from a `finding.json` value. Order of
 /// precedence:
-/// 0. A frame-less sanitizer crash an earlier release keyed on its
-///    rule-wide signature: the key this release gives its stored report
+/// 0. A sanitizer crash an earlier release keyed differently (a frame-less
+///    crash on its rule-wide signature, an ASan report under the catch-all
+///    heap-overflow rule): the key this release gives its stored report
 ///    ([`legacy_fallback_cluster_key`]).
 /// 1. `cluster_key_full` + `cluster_normalized_frames` already on
 ///    the record — return them as-is.
@@ -675,61 +676,32 @@ pub fn cluster_from_finding_json(raw: &serde_json::Value) -> Option<ClusterKey> 
 }
 
 /// The root-cause key this release gives a sanitizer crash that an earlier
-/// release recorded with no informative frame, rebuilt from the report the
-/// finding stores.
+/// release keyed differently, rebuilt from the report the finding stores:
+/// a crash recorded with no informative frame
+/// ([`earlier_frameless_report`]), and an ASan report recorded under the
+/// heap-overflow rule an earlier release gave every kind it had no rule for
+/// ([`earlier_rule_report`]).
 ///
-/// Releases up to 0.3.0 keyed such a crash on its signature, which then hashed
-/// only the rule and the crash kind: one constant key per rule, so every
-/// frame-less UBSan report of a rule, at any site and in any harness, was one
-/// root cause, and so was every frame-less crash with no sanitizer report of a
-/// kind: a fatal signal (`FATAL_SIGNAL`, which 0.2.x named
-/// `ASAN_FATAL_SIGNAL` and tagged `asan`), a transport-reported fault
-/// (`TARGET_*`) and a transport deadline (`TRANSPORT_DEADLINE_EXCEEDED`). A
-/// finding is read as one of those when its `cluster_key_full` is its
-/// `signature`, marked `cluster_fallback`, with no normalized frames. A
-/// sanitizer report is parsed again from its stored message; a crash with no
-/// sanitizer report is rebuilt as the shared crash builder builds it now, with
-/// no sanitizer and a fatal signal as its check. The location, check name,
-/// crash stack (written later by `bhf report --backfill`) and pc offset the
-/// record holds take precedence, and the key is computed in the finding's
-/// harness scope as the emitter computes it ([`cluster_for_sanitizer_scoped`]).
+/// The location, check name, crash stack (written later by `bhf report
+/// --backfill`) and pc offset the record holds take precedence over the
+/// stored message, and the key is computed in the finding's harness scope as
+/// the emitter computes it ([`cluster_for_sanitizer_scoped`]).
 ///
 /// `None` for any other record: one this release keyed (whose fallback key is
 /// already scoped and sited), an oracle hit, a finding that is not a sanitizer
 /// crash, and one whose stored report gives no better key than the one it has.
 pub fn legacy_fallback_cluster_key(raw: &serde_json::Value) -> Option<ClusterKey> {
     use serde_json::Value;
-    if raw.get("oracle").is_some()
-        || raw.get("cluster_fallback").and_then(Value::as_bool) != Some(true)
-    {
+    if raw.get("oracle").is_some() {
         return None;
     }
     let persisted = raw
         .get("cluster_key_full")
         .and_then(Value::as_str)
         .filter(|full| !full.is_empty())?;
-    if raw.get("signature").and_then(Value::as_str) != Some(persisted) {
-        return None;
-    }
-    let framed = raw
-        .get("cluster_normalized_frames")
-        .and_then(Value::as_array)
-        .is_some_and(|frames| !frames.is_empty());
     let exception = raw.get("exception")?;
-    let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
-    let undiagnosed = undiagnosed_crash_kind(name);
-    let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
-        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
-            .iter()
-            .any(|prefix| name.starts_with(prefix));
-    if framed || !(sanitizer_crash || undiagnosed.is_some()) {
-        return None;
-    }
-    let message = exception.get("message").and_then(Value::as_str)?;
-    let mut report = match undiagnosed {
-        Some(kind) => earlier_undiagnosed_crash_report(raw, exception, kind, message)?,
-        None => crate::sanitizer::parse_sanitizer_report(message)?,
-    };
+    let mut report = earlier_frameless_report(raw, exception, persisted)
+        .or_else(|| earlier_rule_report(raw, exception))?;
     if let Some(location) = exception
         .get("location")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
@@ -768,6 +740,74 @@ pub fn legacy_fallback_cluster_key(raw: &serde_json::Value) -> Option<ClusterKey
     let harness = raw.get("harness_id").and_then(Value::as_str).unwrap_or("");
     let key = cluster_for_sanitizer_scoped(&report, &crash_scope(harness, None));
     (!key.is_placeholder() && key.full != persisted).then_some(key)
+}
+
+/// The report of a crash an earlier release recorded with no informative
+/// frame. Releases up to 0.3.0 keyed such a crash on its signature, which then
+/// hashed only the rule and the crash kind: one constant key per rule, so
+/// every frame-less UBSan report of a rule, at any site and in any harness,
+/// was one root cause, and so was every frame-less crash with no sanitizer
+/// report of a kind: a fatal signal (`FATAL_SIGNAL`, which 0.2.x named
+/// `ASAN_FATAL_SIGNAL` and tagged `asan`), a transport-reported fault
+/// (`TARGET_*`) and a transport deadline (`TRANSPORT_DEADLINE_EXCEEDED`). A
+/// finding is read as one of those when its `cluster_key_full` (`persisted`)
+/// is its `signature`, marked `cluster_fallback`, with no normalized frames. A
+/// sanitizer report is parsed again from its stored message; a crash with no
+/// sanitizer report is rebuilt as the shared crash builder builds it now, with
+/// no sanitizer and a fatal signal as its check.
+fn earlier_frameless_report(
+    raw: &serde_json::Value,
+    exception: &serde_json::Value,
+    persisted: &str,
+) -> Option<SanitizerReport> {
+    use serde_json::Value;
+    if raw.get("cluster_fallback").and_then(Value::as_bool) != Some(true)
+        || raw.get("signature").and_then(Value::as_str) != Some(persisted)
+    {
+        return None;
+    }
+    let framed = raw
+        .get("cluster_normalized_frames")
+        .and_then(Value::as_array)
+        .is_some_and(|frames| !frames.is_empty());
+    let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
+    let undiagnosed = undiagnosed_crash_kind(name);
+    let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
+        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    if framed || !(sanitizer_crash || undiagnosed.is_some()) {
+        return None;
+    }
+    let message = exception.get("message").and_then(Value::as_str)?;
+    match undiagnosed {
+        Some(kind) => earlier_undiagnosed_crash_report(raw, exception, kind, message),
+        None => crate::sanitizer::parse_sanitizer_report(message),
+    }
+}
+
+/// The report of an ASan crash an earlier release recorded under its
+/// catch-all heap-overflow rule, BHF-201, which this release gives a rule of
+/// its own (a stack overflow, an arithmetic exception or other deadly signal,
+/// an overlapping copy, a refused allocation, ...;
+/// [`crate::sanitizer::legacy_rule_id`]). Parsed again from its stored
+/// message, it takes this release's rule and kind, so the finding groups with
+/// the same crash found now. A Windows access violation or in-page error,
+/// whose rule depends on the access the record stores, keeps its key.
+fn earlier_rule_report(
+    raw: &serde_json::Value,
+    exception: &serde_json::Value,
+) -> Option<SanitizerReport> {
+    use serde_json::Value;
+    if raw.get("rule_id").and_then(Value::as_str) != Some("BHF-201") {
+        return None;
+    }
+    let message = exception.get("message").and_then(Value::as_str)?;
+    let report = crate::sanitizer::parse_sanitizer_report(message)?;
+    (report.sanitizer == Some(Sanitizer::AddressSanitizer)
+        && !crate::sanitizer::is_memory_fault_kind(&report.kind)
+        && crate::sanitizer::legacy_rule_id(&report) == Some("BHF-201"))
+    .then_some(report)
 }
 
 /// The kind of a crash with no sanitizer report, read from the name an

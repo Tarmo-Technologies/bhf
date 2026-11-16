@@ -1251,6 +1251,17 @@
   reporting under the heap-buffer-overflow rule BHF-201 (in SARIF `ruleId`
   and the `bhf explain` header). `bhf replay` still matches findings recorded
   under BHF-201.
+- Every ASan report kind has its own rule instead of the CRITICAL
+  heap-buffer-overflow rule BHF-201: `stack-overflow` is BHF-207 (CWE-674),
+  `FPE` and Windows `int-divide-by-zero`/`flt-divide-by-zero` BHF-222,
+  `out of memory`, `requested allocation size`, `calloc parameters overflow`
+  and the other refused allocations BHF-209, `BUS`/`ILL`/`ABRT`/`TRAP`, the
+  other Windows exceptions and any unknown kind BHF-210, and
+  `memcpy-param-overlap`/`strcpy-param-overlap` the new BHF-229 (overlapping
+  copy arguments, CWE-475). A phrase-named kind takes its `SUMMARY:` name
+  (`out-of-memory`, not `out`). `bhf replay` still matches findings recorded
+  under BHF-201 and the earlier kind, and `results/` groups them with the
+  same crash found now.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer

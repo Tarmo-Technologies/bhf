@@ -2975,6 +2975,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/tests/asan_report_kinds.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/tests/cluster_e2e.rs",
       "license": "Apache-2.0"
     },

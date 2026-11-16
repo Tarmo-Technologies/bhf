@@ -495,10 +495,12 @@ fn replayed_identity(report: &SanitizerReport) -> Identity {
 /// The kind an earlier release gave a UBSan report, from the text after
 /// `runtime error:`: integer overflow and "cannot be represented" were one
 /// kind, the NULL shapes another, array indexes and division by zero their
-/// own, and everything else `undefined-behavior`.
+/// own, and everything else `undefined-behavior`. An ASan report's earlier
+/// kind is the first word of its `ERROR:` line
+/// ([`corpus::sanitizer::legacy_kind`]).
 fn legacy_kind(report: &SanitizerReport) -> Option<String> {
     if report.sanitizer != Some(corpus::sanitizer::Sanitizer::UndefinedBehaviorSanitizer) {
-        return None;
+        return corpus::sanitizer::legacy_kind(report).map(|kind| normalize_kind(&kind));
     }
     let after = report
         .message
@@ -1244,6 +1246,49 @@ mod tests {
             compare_with(&recorded, &report, Some(true)).verdict(),
             Verdict::Match
         );
+    }
+
+    /// Earlier releases recorded an ASan out-of-memory report under the
+    /// heap-overflow rule, with the first word of its `ERROR:` line as its
+    /// kind (`ASAN_OUT`). A replay that reports it now, as BHF-209
+    /// `out-of-memory`, is the same crash.
+    #[test]
+    fn an_earlier_out_of_memory_record_matches_its_replay() {
+        let replay = corpus::parse_sanitizer_report(
+            "==546834==ERROR: AddressSanitizer: out of memory: allocator is trying to allocate 0x8000000000 bytes\n\
+             \x20   #0 0x623d6b09a1b3 in malloc (/w/harnesses/H-1/main+0xc71b3)\n\
+             \x20   #1 0x623d6b0d8e04 in read_blob /src/widget/blob.c:14:43\n\
+             \x20   #2 0x623d6b0d8aab in parse_record /src/widget/parse.c:26:43\n\
+             \n\
+             SUMMARY: AddressSanitizer: out-of-memory (/w/harnesses/H-1/main+0xc71b3)\n",
+        )
+        .expect("asan report");
+        assert_eq!(
+            (replay.rule_id, replay.kind.as_str()),
+            ("BHF-209", "out-of-memory")
+        );
+        let mut recorded = report_record(&replay);
+        recorded["rule_id"] = json!("BHF-201");
+        recorded["exception"]["name"] = json!("ASAN_OUT");
+        recorded["exception"]["sanitizer"] = json!("asan");
+        let comparison = compare(&recorded, &replay);
+        assert!(comparison.matches(), "{comparison:?}");
+        let outcomes: Vec<_> = comparison
+            .checks
+            .iter()
+            .map(|c| (c.field, c.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("rule", Outcome::Legacy),
+                ("kind", Outcome::Legacy),
+                ("sink", Outcome::Equal)
+            ]
+        );
+        // Another earlier kind is still another crash.
+        recorded["exception"]["name"] = json!("ASAN_HEAP_BUFFER_OVERFLOW");
+        assert_eq!(compare(&recorded, &replay).differing_fields(), "kind");
     }
 
     #[test]

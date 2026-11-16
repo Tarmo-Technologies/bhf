@@ -646,6 +646,12 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
                 "Validate the index or slice range against the slice length before the access at {at} (use `get`/`get_mut`, `split_at_checked`, or an explicit length check); reject inputs that drive it out of bounds rather than indexing unchecked."
             ),
         ),
+        BugClass::OverlappingCopy => (
+            "Copy overlapping ranges with memmove",
+            format!(
+                "Use `memmove` (or copy through a separate buffer) at {at} when the source and destination can overlap, or fix the offset or length that makes them overlap."
+            ),
+        ),
         BugClass::Unknown => return None,
     };
     Some(PatchHint {
@@ -2757,6 +2763,10 @@ enum BugClass {
     /// [`BugClass::StackBufferOverflow`] (CWE-121): the storage was reused, not
     /// overrun, so the fix is lifetime, not bounds.
     StaleStackPointerUse,
+    /// A memory or string copy whose source and destination overlap
+    /// (`memcpy-param-overlap`, `strcpy-param-overlap`, ...), which the C
+    /// standard leaves undefined (CWE-475).
+    OverlappingCopy,
     Unknown,
 }
 
@@ -2824,6 +2834,7 @@ impl BugClass {
             Self::StackExhaustion => "stack-exhaustion",
             Self::UncaughtException => "uncaught-exception",
             Self::IndexOutOfBounds => "index-out-of-bounds",
+            Self::OverlappingCopy => "overlapping-copy",
             Self::Unknown => "unknown",
         }
     }
@@ -3066,6 +3077,11 @@ fn classify_bug(raw: &Value) -> BugClass {
     if has("heap-buffer-overflow") {
         return BugClass::HeapBufferOverflow;
     }
+    // `memcpy-param-overlap`, `strcpy-param-overlap`, ...: the copy's ranges
+    // overlap, which is not an out-of-bounds access.
+    if has("-param-overlap") {
+        return BugClass::OverlappingCopy;
+    }
     // Stack exhaustion from uncontrolled recursion is a distinct weakness
     // (CWE-674) from a fixed-buffer stack overflow (CWE-121). Catch the
     // recursion-driven forms (incl. Java `StackOverflowError`) BEFORE the
@@ -3084,6 +3100,10 @@ fn classify_bug(raw: &Value) -> BugClass {
         || has("recursion-depth")
         || has("recursion depth")
         || has("stack-overflow-recursion")
+        // ASan's `stack-overflow` is the thread stack running out; it reports
+        // an overrun of a stack buffer as `stack-buffer-overflow`.
+        || has("asan-stack-overflow")
+        || has("addresssanitizer: stack-overflow")
     {
         return BugClass::StackExhaustion;
     }
@@ -3097,10 +3117,16 @@ fn classify_bug(raw: &Value) -> BugClass {
     if sanitizer == "lsan" || has("memory-leak") || has("detected memory leaks") {
         return BugClass::MemoryLeak;
     }
+    // ASan's refused allocations: `calloc parameters overflow` and its
+    // reallocarray/pvalloc forms are a size computation that overflowed.
     if has("out-of-memory")
         || has("out of memory")
         || has("allocation-size-too-big")
         || has("requested allocation size")
+        || has("calloc-overflow")
+        || has("reallocarray-overflow")
+        || has("pvalloc-overflow")
+        || has("parameters overflow")
         || has("rss-limit")
         || has("rss limit")
         || has_word(&hay, "oom")
@@ -3113,7 +3139,9 @@ fn classify_bug(raw: &Value) -> BugClass {
     // Divide-by-zero is its own weakness (CWE-369), not generic UB. Catch it
     // BEFORE the `sanitizer == "ubsan"` clause below — UBSan reports integer
     // division by zero, but the most defensible leaf is CWE-369.
+    // ASan names the arithmetic exception `FPE` (`ASAN_FPE`).
     if has("sigfpe")
+        || has_word(&hay, "fpe")
         || has("divide-by-zero")
         || has("division-by-zero")
         || has("division by zero")
@@ -3312,6 +3340,7 @@ fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
         BugClass::DivideByZero => ("CWE-369", None),
         BugClass::StackExhaustion => ("CWE-674", None),
         BugClass::UncaughtException => ("CWE-248", None),
+        BugClass::OverlappingCopy => ("CWE-475", None),
         // A bounds-checked panic is a DETECTED out-of-bounds access; direction is
         // usually unstated, so default to CWE-125 (read) with CWE-787 (write)
         // secondary, and flip when the message names a write (`copy_from_slice`,
@@ -3379,6 +3408,7 @@ fn cwe_name(id: &str) -> &'static str {
         "CWE-823" => "Use of Out-of-range Pointer Offset",
         "CWE-843" => "Access of Resource Using Incompatible Type ('Type Confusion')",
         "CWE-1335" => "Incorrect Bitwise Shift of Integer",
+        "CWE-475" => "Undefined Behavior for Input to API",
         _ => "Uncategorized Weakness",
     }
 }
@@ -3443,6 +3473,9 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         ),
         BugClass::IndexOutOfBounds => format!(
             "This is an out-of-bounds index: while processing a crafted input, {fn_ref} tried to read or write past the end of an array or slice. The language's bounds check caught it and stopped the program (denial of service); in a language without that check the same defect would be an out-of-bounds memory access, so the missing length validation should be fixed."
+        ),
+        BugClass::OverlappingCopy => format!(
+            "This is an overlapping copy: while processing a crafted input, {fn_ref} copied memory with a function such as `memcpy` or `strcpy` whose source and destination overlap. The C standard leaves that copy undefined, so depending on the C library it duplicates, drops or scrambles bytes; an input-controlled offset or length behind it corrupts the destination data."
         ),
         BugClass::Unknown => format!(
             "While processing a crafted input, the program hit a fault in {fn_ref} and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed."
