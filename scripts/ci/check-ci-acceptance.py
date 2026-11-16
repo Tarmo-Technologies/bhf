@@ -30,7 +30,10 @@ HEAVY_JOBS = (
     "windows-current-build",
 )
 ALWAYS_REQUIRED = ("changes", "ci-policy")
-EXPECTED_JOBS = frozenset((*ALWAYS_REQUIRED, *HEAVY_JOBS))
+# Run (and required) only for a documentation-only change; a full run covers
+# the same tests in build-test, so there they may be skipped.
+DOCS_LANE_JOBS = ("doc-contracts",)
+EXPECTED_JOBS = frozenset((*ALWAYS_REQUIRED, *HEAVY_JOBS, *DOCS_LANE_JOBS))
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 16
 
@@ -103,7 +106,7 @@ def evaluate(
         blockers.append("unexpected job identifiers; update the acceptance policy")
 
     results: dict[str, str] = {}
-    for job in (*ALWAYS_REQUIRED, *HEAVY_JOBS):
+    for job in (*ALWAYS_REQUIRED, *HEAVY_JOBS, *DOCS_LANE_JOBS):
         observation = needs.get(job)
         if not isinstance(observation, dict):
             results[job] = "missing" if job not in needs else "invalid"
@@ -133,6 +136,10 @@ def evaluate(
             blockers.append(f"{job}: required success, observed {results[job]}")
     for job in HEAVY_JOBS:
         allowed = ("success", "skipped") if scope == "docs_only" else ("success",)
+        if results[job] not in allowed:
+            blockers.append(f"{job}: observed {results[job]}, expected {' or '.join(allowed)}")
+    for job in DOCS_LANE_JOBS:
+        allowed = ("success",) if scope == "docs_only" else ("success", "skipped")
         if results[job] not in allowed:
             blockers.append(f"{job}: observed {results[job]}, expected {' or '.join(allowed)}")
 

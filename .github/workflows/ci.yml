@@ -141,7 +141,10 @@ jobs:
       # covered by the dedicated `--doc` step below.
       # Per-PR gate = the ~5700 fast unit/light tests PLUS a small smoke subset of
       # the heavy build+fuzz integration tests (one representative per language +
-      # build-recovery + the runtime-oracle capability path). The FULL heavy suite
+      # build-recovery + the runtime-oracle capability path) PLUS the release and
+      # docs contract tests (m19_*, offline_dist_scripts, release_bundle_manifest
+      # and the guide checks), which take seconds; doc-contracts runs those for a
+      # documentation-only change. The FULL heavy suite
       # (~110 build+fuzz tests, ~40min) runs in integration-nightly.yml — running
       # all of it on every PR is what pushed this job past its timeout.
       # RAYON_NUM_THREADS=1 + the heavy-bhf concurrency cap (.config/nextest.toml)
@@ -150,7 +153,7 @@ jobs:
       - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=project_build_consent) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=project_build_consent) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash)) | binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/))'
 
       # #57 AC: the out-of-tree extension fixture must also be exercised by a
       # RELEASE-build integration test — the debug nextest above only covers it in
@@ -186,6 +189,37 @@ jobs:
           cargo test --locked -p probe_gnat_actions --features enabled
           cargo check --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
           cargo test --locked -p bhf-daemon --features llm --lib
+
+  # The release and docs contract tests read README.md, INSTALL.md and
+  # docs/site/*.md, which a documentation-only change can break. build-test
+  # runs them with everything else; this lane runs them when the classifier
+  # skipped the heavy jobs, and CI acceptance requires it to pass then.
+  doc-contracts:
+    name: Release and docs contract tests
+    needs: changes
+    if: needs.changes.outputs.heavy == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Test the release and docs contracts
+        env:
+          RAYON_NUM_THREADS: "1"
+        # Builds only the contract binaries (and the library tests), not
+        # every bhf integration test.
+        run: cargo nextest run --locked -p bhf --lib --test 'm19_*' --test offline_dist_scripts --test release_bundle_manifest --test custom_harness_flow --no-fail-fast -E 'binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/)) | (kind(lib) & test(/::the_docs_list_every_config_key$|::the_help_and_docs_list_every_cross_lane$/))'
 
   container-core:
     name: Core container build and run
@@ -624,6 +658,7 @@ jobs:
     needs:
       - changes
       - ci-policy
+      - doc-contracts
       - minimum-rust
       - build-test
       - container-core

@@ -12,7 +12,7 @@ enterprise readiness.
 | Decision | Meaning | Full CI evidence? |
 | --- | --- | --- |
 | `PASS_FULL_CI` | The classifier, policy tests, and every required build/test/platform job succeeded. | Yes, for the recorded commit and this workflow's scope only. |
-| `PASS_DOCS_ONLY` | Classification explicitly permitted documentation-only skips; mandatory policy checks succeeded and no listed job failed or was cancelled. | No. |
+| `PASS_DOCS_ONLY` | Classification explicitly permitted documentation-only skips; mandatory policy checks and the release and docs contract tests (`doc-contracts`) succeeded and no listed job failed or was cancelled. | No. |
 | `BLOCKED` | A required result is missing, unsuccessful, malformed, or incompatible with the selected scope. | No. |
 
 A successful job label, an empty result set, or an unrelated earlier commit
@@ -36,6 +36,13 @@ Path classification now treats crate, fixture, benchmark, and vendor Markdown
 as potentially executable/test-relevant input. Unknown files select full CI.
 A failed or partial `git diff` also selects full CI. Documentation and website
 exemptions remain narrowly enumerated in `should-run-heavy-ci.sh`.
+
+The release and docs contract tests (the `m19_*`, `offline_dist_scripts` and
+`release_bundle_manifest` binaries, and the tests that check a guide against
+the code) read `README.md`, `INSTALL.md` and `docs/site/*.md` and take
+seconds. `build-test` runs them on every code change. A documentation-only
+change, which skips the heavy jobs, runs them in the `doc-contracts` job, and
+`PASS_DOCS_ONLY` requires that job to pass; a full run may skip it.
 
 Each Windows native test command is immediately followed by an exit-code check,
 so a later successful test cannot conceal an earlier failed command. CI Cargo

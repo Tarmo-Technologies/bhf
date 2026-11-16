@@ -24,14 +24,15 @@ ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
 JOBS = ("changes", "ci-policy", "minimum-rust", "build-test", "container-core", "container-full", "rhel7-build",
         "rhel-family-smoke", "ubuntu-release-smoke", "windows-build", "windows-current-build")
+# Runs only for a documentation-only change.
+DOCS_LANE = ("doc-contracts",)
 
 
 def ci_observation(heavy="true"):
-    observation = {job: {"result": "success", "outputs": {}} for job in JOBS}
+    observation = {job: {"result": "success", "outputs": {}} for job in JOBS + DOCS_LANE}
     observation["changes"]["outputs"]["heavy"] = heavy
-    if heavy == "false":
-        for job in JOBS[2:]:
-            observation[job]["result"] = "skipped"
+    for job in JOBS[2:] if heavy == "false" else DOCS_LANE:
+        observation[job]["result"] = "skipped"
     return observation
 
 

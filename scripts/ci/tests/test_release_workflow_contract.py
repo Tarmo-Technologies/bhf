@@ -149,7 +149,8 @@ class ReleaseWorkflowContracts(unittest.TestCase):
 
     def test_original_ci_lanes_remain_required(self):
         expected = {'changes', 'ci-policy', 'minimum-rust', 'build-test', 'container-core', 'container-full', 'rhel7-build',
-                    'rhel-family-smoke', 'ubuntu-release-smoke', 'windows-build', 'windows-current-build'}
+                    'rhel-family-smoke', 'ubuntu-release-smoke', 'windows-build', 'windows-current-build',
+                    'doc-contracts'}
         self.assertEqual(set(self.ci_jobs) - {'ci-acceptance'}, expected)
         self.assertEqual(needs(self.ci_jobs['ci-acceptance']), expected)
 

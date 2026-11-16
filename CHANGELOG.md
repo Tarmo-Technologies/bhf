@@ -1657,6 +1657,11 @@
   been given.
 
 ### Changed
+- Pull request CI runs the release and docs contract tests (`m19_*`,
+  `offline_dist_scripts`, `release_bundle_manifest` and the guide checks),
+  which used to run only nightly; a documentation-only change runs them in
+  a new `doc-contracts` job, which `CI acceptance` requires for
+  `PASS_DOCS_ONLY`.
 - The nightly integration suite skips a commit only after a run at that
   commit passed every shard, instead of whenever the tip commit was over 25
   hours old: a failed nightly runs again the next day, and a skipped run no
