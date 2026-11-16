@@ -115,6 +115,8 @@ fn effects_for(scenario: &str) -> Vec<Effect> {
     match scenario {
         "process_exec" => vec![controlled_exec()],
         "fixed_constants" => fixed_constants(),
+        // The target did nothing worth reporting.
+        "clean" => Vec::new(),
         // positive effects plus a degraded fidelity signal (handled below).
         "lossy" | "unrelated_excluded" => positive_all(),
         _ => positive_all(),
@@ -297,7 +299,24 @@ fn main() {
     let worker = env_u32("BHF_COLLECTOR_WORKER", 0);
     let root_image = std::env::var("BHF_COLLECTOR_ROOT_IMAGE")
         .unwrap_or_else(|_| "/srv/sandbox/target".to_owned());
-    let scenario = std::env::var("BHF_MOCK_SCENARIO").unwrap_or_else(|_| "positive_all".to_owned());
+    let mut scenario =
+        std::env::var("BHF_MOCK_SCENARIO").unwrap_or_else(|_| "positive_all".to_owned());
+    // `input_driven`: what the replayed input does decides what is observed.
+    // The input `BHF_MOCK_CLEAN_INPUT` names is clean; any other one performs
+    // the positive effects, as a target whose discovered inputs reach a sink.
+    if scenario == "input_driven" {
+        let input = std::env::var("BHF_COLLECTOR_INPUT")
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .unwrap_or_default();
+        let clean = std::env::var("BHF_MOCK_CLEAN_INPUT").unwrap_or_default();
+        scenario = if input == clean.as_bytes() {
+            "clean"
+        } else {
+            "positive_all"
+        }
+        .to_owned();
+    }
 
     // #76 degraded-routing scenarios exercise the host's bounded not-observed path.
     match scenario.as_str() {

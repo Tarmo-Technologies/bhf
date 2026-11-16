@@ -402,6 +402,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     let mut seen_postcondition = std::collections::HashSet::new();
 
     let mut finding_ids = Vec::new();
+    // The inputs behind this run's findings, with their lineage: the collector
+    // replays them first (#247).
+    let mut retained: Vec<(
+        collector_run::ReplayTestcase,
+        corpus::lineage::FindingLineage,
+    )> = Vec::new();
     let mut executions = 0usize;
     let mut mutated = 0usize;
     while executions < args.iterations
@@ -514,6 +520,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                             serde_json::to_vec_pretty(&finding)?,
                         )
                         .with_context(|| format!("write {}", dir.join("finding.json").display()))?;
+                        retained.push((
+                            collector_run::ReplayTestcase::new(id.clone(), seed.clone()),
+                            lineage.clone(),
+                        ));
                         finding_ids.push(id);
                     }
                 }
@@ -535,6 +545,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 serde_json::to_vec_pretty(&finding)?,
             )
             .with_context(|| format!("write {}", dir.join("finding.json").display()))?;
+            retained.push((
+                collector_run::ReplayTestcase::new(id.clone(), seed.clone()),
+                lineage.clone(),
+            ));
             finding_ids.push(id);
             break;
         }
@@ -571,12 +585,17 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 &signature,
                 oracles.as_ref(),
             )?;
-            crate::fuzz_lineage::insert(&mut finding, &lineage_of_seed(&seeds, &lineages, input));
+            let lineage = lineage_of_seed(&seeds, &lineages, input);
+            crate::fuzz_lineage::insert(&mut finding, &lineage);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
             )
             .with_context(|| format!("write {}", dir.join("finding.json").display()))?;
+            retained.push((
+                collector_run::ReplayTestcase::new(id.clone(), input.clone()),
+                lineage,
+            ));
             finding_ids.push(id);
         }
     }
@@ -586,144 +605,40 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     // becomes a `binary_semantic` finding through the SAME oracle registry, even
     // when every execution exited cleanly. Inactive (default) leaves behaviour
     // unchanged.
+    let seed_inputs = seeds
+        .iter()
+        .zip(&lineages)
+        .enumerate()
+        .map(|(idx, (seed, lineage))| {
+            (
+                collector_run::ReplayTestcase::new(format!("seed-{idx:04}"), seed.clone()),
+                lineage.clone(),
+            )
+        });
+    let replay_inputs: Vec<_> = retained.into_iter().chain(seed_inputs).collect();
+    // #60: with oracles on, the gate starts from the campaign's #59 evidence;
+    // with oracles off, from what the campaign loop gathered under the
+    // collector's own runtrace shim (see `collector_campaign_shim`).
+    let gate_evidence = if oracles.is_some() {
+        campaign_gate_tracker
+    } else {
+        collector_gate_tracker
+    };
     let collector_provenance = match &resolved_collector {
         None => collector_run::inactive_run_provenance(&args.collector),
-        Some(resolved) => {
-            let representative = seeds.first().cloned().unwrap_or_default();
-            // #76: the collector observes a REPLAY of this specific retained input,
-            // not the whole campaign. Label the observation by the input's content
-            // hash so the finding ties to the exact replayed testcase rather than a
-            // fabricated per-case id, and record it as a limited replay observation.
-            let representative_hash = sha256_hex(&representative);
-            let replay_testcase = format!("replay-{}", &representative_hash[..16]);
-            let observation = collector_run::ObservationMode::Replay;
-            let outcome = if let Some(shim) = resolved.runtrace_shim() {
-                // Linux built-in provider: a dedicated observation pass runs the
-                // target under the LD_PRELOAD runtrace shim and re-expresses its
-                // process/file/library effects as `bhf.collector-event.v1` via the
-                // runtrace→collector adapter. This pass is separate from the
-                // crash-detection loop, so `--runtime-oracles` behaviour is
-                // unchanged; it is an additional, collector-shaped view.
-                let col_log = tmp_dir.join("collector_runtrace.jsonl");
-                let run = run_binary_once(
-                    &invocation,
-                    args.input_mode,
-                    &representative,
-                    &env,
-                    Duration::from_millis(args.timeout_ms),
-                    &tmp_dir,
-                    Some((shim, col_log.as_path())),
-                )?;
-                // #60: a sink is taint-confirmed ONLY from cross-execution
-                // correlation (the SAME #59 gate), never one run's raw
-                // taint_offset. With oracles on, reuse the campaign's accumulated
-                // #59 evidence; with oracles off, reuse the evidence the campaign
-                // loop just accumulated under the collector's OWN runtrace shim
-                // (see `collector_campaign_shim`). Either way it already spans
-                // every real campaign input; fold in this observation pass last so
-                // the representative's events are also represented. A sink is
-                // confirmed only when the campaign's real, varied inputs showed it
-                // fuzz-controlled (it carried byte-origin taint and was never
-                // reached untainted); a constant that some still-reaching input
-                // altered — so its echoing bytes changed while the sink was still
-                // hit — is observed untainted there and suppressed.
-                //
-                // Inherent residual (identical to #59's): a constant whose exact
-                // >=4-byte subject appears in EVERY input that reaches the sink is
-                // fundamentally indistinguishable from a fuzz-controlled subject
-                // and may remain confirmed. This is acceptable — #60's threat model
-                // (printable path / command / module constants) is well served:
-                // across the campaign's distinct inputs (multiple operator-supplied
-                // seeds, or a mutating engine such as afl-qemu) the echoing bytes
-                // vary while the sink is still reached, producing the untainted
-                // observation that suppresses the constant.
-                let mut gate_tracker = if oracles.is_some() {
-                    campaign_gate_tracker.clone()
-                } else {
-                    collector_gate_tracker.clone()
-                };
-                gate_tracker.observe(&run.oracle_events, &representative);
-                let gate = gate_tracker.collector_gate();
-                // The runtrace branch genuinely re-executes the representative input
-                // under the shim (`run_binary_once` above), so this IS a single-
-                // testcase replay with the run's real pids. Label it by the input's
-                // content hash rather than a fabricated per-case id.
-                let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                    testcase: replay_testcase.clone(),
-                    worker: 0,
-                    // Synthetic anchor for this single replayed execution's event
-                    // tree; the shim events carry the real child pids, which drive
-                    // attribution. Not a claim about a specific observed OS pid.
-                    root_pid: 1,
-                };
-                let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
-                    &run.oracle_events,
-                    &adapter_ctx,
-                    &args.binary.display().to_string(),
-                    &gate,
-                );
-                resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
-            } else {
-                // Sidecar provider: a genuine REPLAY. The host launches the target
-                // with the representative input UNDER the ready observer (recording
-                // its real PID), so the observation is of a process that actually
-                // ran — not a synthetic post-exit window. `run_once` bounds the whole
-                // capture and degrades to not_observed if it cannot genuinely
-                // replay-and-observe (#76).
-                let replay_input = representative.clone();
-                let replay_tmp = tmp_dir.clone();
-                let launch: collector_run::ReplayLauncher = Box::new(move || {
-                    spawn_replay_child(
-                        &invocation,
-                        args.input_mode,
-                        &replay_input,
-                        &env,
-                        &replay_tmp,
-                    )
-                });
-                let params = collector_run::CollectorRunParams {
-                    testcase: replay_testcase.clone(),
-                    worker: 0,
-                    root: args.work_dir.display().to_string(),
-                    root_image: args.binary.display().to_string(),
-                    input: &representative,
-                    tmp_dir: tmp_dir.join("collector"),
-                    launch: Some(launch),
-                };
-                resolved.run_once(&params)?
-            };
-            let target = collector_target(&args)?;
-            for finding in &outcome.findings {
-                let id = collector_run::next_collector_finding_id(&findings_dir)?;
-                let dir = findings_dir.join(&id);
-                collector_run::write_finding(
-                    &dir,
-                    &id,
-                    target.clone(),
-                    finding,
-                    &representative,
-                    observation,
-                )?;
-                // The replayed input is the first seed.
-                corpus::lineage::record_in_finding(
-                    &dir,
-                    &lineage_of_seed(&seeds, &lineages, &representative),
-                )
-                .with_context(|| format!("record the lineage of {id}"))?;
-                finding_ids.push(id);
-            }
-            let mut provenance = outcome.run_provenance;
-            observation.stamp(&mut provenance);
-            // Record the replayed input's content hash so the observation is
-            // auditable back to the exact retained input.
-            if let Some(obj) = provenance.as_object_mut() {
-                obj.insert(
-                    "replayed_input_sha256".to_owned(),
-                    json!(representative_hash),
-                );
-            }
-            provenance
-        }
+        Some(resolved) => collector_replays(
+            &args,
+            resolved,
+            &CollectorReplayContext {
+                invocation: &invocation,
+                env: &env,
+                tmp_dir: &tmp_dir,
+                findings_dir: &findings_dir,
+            },
+            gate_evidence,
+            &replay_inputs,
+            &mut finding_ids,
+        )?,
     };
 
     Ok(json!({
@@ -744,6 +659,152 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         "collector": collector_provenance,
         "findings": finding_ids
     }))
+}
+
+/// Where the collector replays run: the target command, its environment, the
+/// scratch dir, and the findings dir its findings go to.
+struct CollectorReplayContext<'a> {
+    invocation: &'a TargetInvocation,
+    env: &'a BTreeMap<String, String>,
+    tmp_dir: &'a Path,
+    findings_dir: &'a Path,
+}
+
+/// Replay each of `replay_inputs` (the inputs behind the run's findings, the
+/// most interesting first, then the seeds; at most
+/// [`collector_run::MAX_REPLAYS`]) under the collector, write a finding for
+/// each distinct violation with the input that produced it, and return the run
+/// provenance (#76, #247). Each observation is of one replayed execution, not
+/// the whole campaign.
+fn collector_replays(
+    args: &BinaryFuzzArgs,
+    resolved: &collector_run::ResolvedCollector,
+    ctx: &CollectorReplayContext<'_>,
+    mut gate_evidence: crate::auto::runtrace::SinkTaintTracker,
+    replay_inputs: &[(
+        collector_run::ReplayTestcase,
+        corpus::lineage::FindingLineage,
+    )],
+    finding_ids: &mut Vec<String>,
+) -> anyhow::Result<Value> {
+    let (replays, dropped) =
+        collector_run::bounded_replay_set(replay_inputs.iter().map(|(r, _)| r.clone()));
+    let root = args.work_dir.display().to_string();
+    let image = args.binary.display().to_string();
+    let mut outcomes = Vec::with_capacity(replays.len());
+    if let Some(shim) = resolved.runtrace_shim() {
+        // Linux built-in provider: each input runs under the LD_PRELOAD runtrace
+        // shim, and its process/file/library effects are re-expressed as
+        // `bhf.collector-event.v1` via the runtrace→collector adapter. This pass
+        // is separate from the crash-detection loop, so `--runtime-oracles`
+        // behaviour is unchanged; it is an additional, collector-shaped view.
+        let col_log = ctx.tmp_dir.join("collector_runtrace.jsonl");
+        let mut runs = Vec::with_capacity(replays.len());
+        for replay in replays {
+            let _ = fs::remove_file(&col_log);
+            let run = run_binary_once(
+                ctx.invocation,
+                args.input_mode,
+                &replay.input,
+                ctx.env,
+                Duration::from_millis(args.timeout_ms),
+                ctx.tmp_dir,
+                Some((shim, col_log.as_path())),
+            )?;
+            gate_evidence.observe(&run.oracle_events, &replay.input);
+            runs.push((replay, run));
+        }
+        // #60: a sink is taint-confirmed ONLY from cross-execution correlation
+        // (the SAME #59 gate), never one run's raw taint_offset: the campaign's
+        // evidence plus every replay. A sink is confirmed only when real, varied
+        // inputs showed it fuzz-controlled (it carried byte-origin taint and was
+        // never reached untainted); a constant that some still-reaching input
+        // altered is observed untainted there and suppressed.
+        //
+        // Inherent residual (identical to #59's): a constant whose exact >=4-byte
+        // subject appears in EVERY input that reaches the sink is
+        // indistinguishable from a fuzz-controlled subject and may remain
+        // confirmed. #60's threat model (printable path / command / module
+        // constants) is well served: across distinct inputs the echoing bytes
+        // vary while the sink is still reached, which suppresses it.
+        let gate = gate_evidence.collector_gate();
+        for (replay, run) in runs {
+            // `run_binary_once` re-executed this input under the shim, so this IS
+            // a single-testcase replay with the run's real pids.
+            let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                testcase: replay.testcase.clone(),
+                worker: replay.worker,
+                // Synthetic anchor for this replayed execution's event tree; the
+                // shim events carry the real child pids, which drive attribution.
+                root_pid: 1,
+            };
+            let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                &run.oracle_events,
+                &adapter_ctx,
+                &image,
+                &gate,
+            );
+            let outcome = resolved.evaluate_jsonl(&jsonl, &root);
+            outcomes.push((replay, outcome));
+        }
+    } else {
+        for replay in replays {
+            // Sidecar provider: a genuine REPLAY. The host launches the target
+            // with this input UNDER the ready observer (recording its real PID),
+            // so the observation is of a process that actually ran. `run_once`
+            // bounds the whole capture and degrades to not_observed if it cannot
+            // genuinely replay-and-observe (#76).
+            let launch: collector_run::ReplayLauncher = Box::new(|| {
+                spawn_replay_child(
+                    ctx.invocation,
+                    args.input_mode,
+                    &replay.input,
+                    ctx.env,
+                    ctx.tmp_dir,
+                )
+            });
+            let params = collector_run::CollectorRunParams {
+                testcase: replay.testcase.clone(),
+                worker: replay.worker,
+                root: root.clone(),
+                root_image: image.clone(),
+                input: &replay.input,
+                tmp_dir: ctx.tmp_dir.join("collector"),
+                launch: Some(launch),
+            };
+            let outcome = resolved.run_once(&params)?;
+            drop(params);
+            outcomes.push((replay, outcome));
+        }
+    }
+    let merged = collector_run::merge_replays(outcomes, dropped);
+    let observation = collector_run::ObservationMode::Replay;
+    let target = collector_target(args)?;
+    for (finding, replay) in &merged.findings {
+        let id = collector_run::next_collector_finding_id(ctx.findings_dir)?;
+        let dir = ctx.findings_dir.join(&id);
+        collector_run::write_finding(
+            &dir,
+            &id,
+            target.clone(),
+            finding,
+            &replay.input,
+            observation,
+        )?;
+        let lineage = replay_inputs
+            .iter()
+            .find(|(candidate, _)| candidate.input_sha256 == replay.input_sha256)
+            .map(|(_, lineage)| lineage.clone())
+            .unwrap_or_else(|| {
+                corpus::lineage::FindingLineage::unknown("the replayed input was not retained")
+            });
+        corpus::lineage::record_in_finding(&dir, &lineage)
+            .with_context(|| format!("record the lineage of {id}"))?;
+        finding_ids.push(id);
+    }
+    let mut provenance = merged.run_provenance;
+    observation.stamp(&mut provenance);
+    Ok(provenance)
 }
 
 /// Lane-specific target descriptor spliced into a collector finding so a reviewer
@@ -1101,6 +1162,7 @@ fn run_afl_qemu(
     let tmp_dir = afl_out.join("replay_tmp");
     fs::create_dir_all(&tmp_dir)?;
     let mut finding_ids = Vec::new();
+    let mut retained = Vec::new();
     let mut seen_signatures = std::collections::HashSet::new();
     // Confirm with the same target args AFL used (runner is forbidden for
     // afl-qemu, so it is always a bare/target-arg invocation here).
@@ -1133,14 +1195,47 @@ fn run_afl_qemu(
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, args, &input, env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
-            crate::fuzz_lineage::insert(&mut finding, &afl_qemu_lineage(&crash));
+            let lineage = afl_qemu_lineage(&crash);
+            crate::fuzz_lineage::insert(&mut finding, &lineage);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
             )?;
+            retained.push((
+                collector_run::ReplayTestcase::new(id.clone(), input),
+                lineage,
+            ));
             finding_ids.push(id);
         }
     }
+    // #247: the collector replays each confirmed crash, then the queue entries
+    // that found new coverage, then the seeds.
+    let collector = match collector_run::resolve(&args.collector, args.collector_window_ms)? {
+        None => collector_run::inactive_run_provenance(&args.collector),
+        Some(resolved) => {
+            let queued = afl_queue_replays(&out_dir.join("default").join("queue"))?;
+            let seeded = seeds.iter().enumerate().map(|(idx, seed)| {
+                (
+                    collector_run::ReplayTestcase::new(format!("seed-{idx:04}"), seed.clone()),
+                    corpus::lineage::FindingLineage::unknown("a seed of an AFL++ QEMU mode run"),
+                )
+            });
+            let replay_inputs: Vec<_> = retained.into_iter().chain(queued).chain(seeded).collect();
+            collector_replays(
+                args,
+                &resolved,
+                &CollectorReplayContext {
+                    invocation: &invocation,
+                    env,
+                    tmp_dir: &tmp_dir,
+                    findings_dir,
+                },
+                crate::auto::runtrace::SinkTaintTracker::default(),
+                &replay_inputs,
+                &mut finding_ids,
+            )?
+        }
+    };
     let _ = fs::remove_dir_all(&tmp_dir);
 
     Ok(json!({
@@ -1152,8 +1247,51 @@ fn run_afl_qemu(
         "time_secs": secs,
         "timeout_ms": args.timeout_ms,
         "mem_limit_mb": mem_provenance,
+        "collector": collector,
         "findings": finding_ids
     }))
+}
+
+/// The entries of an AFL++ `queue/` dir to replay under the collector: those
+/// whose name says they found new coverage (`+cov`) first, then the rest, each
+/// in AFL++'s order.
+fn afl_queue_replays(
+    queue: &Path,
+) -> anyhow::Result<
+    Vec<(
+        collector_run::ReplayTestcase,
+        corpus::lineage::FindingLineage,
+    )>,
+> {
+    let Ok(entries) = fs::read_dir(queue) else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<(bool, String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_owned();
+            Some((!name.contains("+cov"), name, path))
+        })
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|(_, name, path)| {
+            let input = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let lineage = corpus::lineage::FindingLineage::unknown(format!(
+                "AFL++ QEMU mode queue entry {name}; bhf does not see which input it was \
+                 mutated from"
+            ));
+            // `id:000012,src:000003,...,+cov`: the id names the entry.
+            let id = name.split(',').next().unwrap_or(&name).replace(':', "-");
+            Ok((
+                collector_run::ReplayTestcase::new(format!("queue-{id}"), input),
+                lineage,
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
@@ -2832,6 +2970,37 @@ mod tests {
         assert_eq!(replay_binary_finding(&fdir, &script), 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #247: the AFL++ queue entries that found new coverage replay first.
+    /// AFL++ runs on Unix, and its queue names hold `:`, which a Windows path
+    /// cannot.
+    #[cfg(unix)]
+    #[test]
+    fn new_coverage_queue_entries_replay_first() {
+        let dir = crate::test_support::TestDir::new("afl-queue-order");
+        for (name, body) in [
+            ("id:000000,time:0,execs:0,orig:seed-0000", "seed"),
+            (
+                "id:000001,src:000000,time:5,execs:9,op:havoc,rep:2",
+                "plain",
+            ),
+            (
+                "id:000002,src:000001,time:9,execs:40,op:havoc,rep:4,+cov",
+                "cov",
+            ),
+        ] {
+            fs::write(dir.join(name), body).unwrap();
+        }
+        fs::create_dir(dir.join(".state")).unwrap();
+        let replays = afl_queue_replays(&dir).unwrap();
+        let names: Vec<&str> = replays.iter().map(|(r, _)| r.testcase.as_str()).collect();
+        assert_eq!(
+            names,
+            ["queue-id-000002", "queue-id-000000", "queue-id-000001"]
+        );
+        assert_eq!(replays[0].0.input, b"cov");
+        assert!(afl_queue_replays(&dir.join("absent")).unwrap().is_empty());
     }
 
     #[cfg(unix)]

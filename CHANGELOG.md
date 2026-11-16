@@ -52,6 +52,17 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf binary fuzz --collector` replays every retained input under the
+  observer, one by one, instead of only the first seed: the input behind each
+  of the run's findings, then (with `--engine afl-qemu`, which ignored
+  `--collector`) the AFL++ queue entries that found new coverage, then the
+  seeds, at most 16. Each finding keeps the input whose replay produced it, so
+  a violation only a discovered input reaches is reported with that input, and
+  a sink several replays reach is one finding. The
+  run's `collector` block lists each replay (`replays`: testcase, input
+  SHA-256, PID, findings) and counts the inputs past the bound
+  (`replays_dropped`); it is a clean assurance only when every replay was
+  observed clean.
 - cli.md's Common Flow runs as written, and a test runs it: the Ada pipeline
   names its harness with `--id H-PKG-PARSE` and replays, minimizes and reports
   the finding under `bhf_work/results/findings/`, where `bhf fuzz` writes it,

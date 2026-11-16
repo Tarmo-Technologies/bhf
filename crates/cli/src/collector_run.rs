@@ -390,6 +390,160 @@ fn sha256_hex(bytes: &[u8]) -> String {
     corpus::hex_lower(&Sha256::digest(bytes))
 }
 
+/// The most retained inputs a lane replays under the collector after a
+/// campaign, one bounded, observed execution each (#246, #247).
+pub const MAX_REPLAYS: usize = 16;
+
+impl ReplayTestcase {
+    /// A retained input named `testcase` (a finding id, `seed-0003`, an AFL++
+    /// queue entry), replayed by worker 0.
+    pub fn new(testcase: impl Into<String>, input: Vec<u8>) -> Self {
+        let input_sha256 = sha256_hex(&input);
+        Self {
+            testcase: testcase.into(),
+            worker: 0,
+            input,
+            input_sha256,
+        }
+    }
+}
+
+/// The inputs to replay: `candidates` in their order (the most interesting
+/// first), each content once, at most [`MAX_REPLAYS`] of them, with how many
+/// were left out.
+pub fn bounded_replay_set(
+    candidates: impl IntoIterator<Item = ReplayTestcase>,
+) -> (Vec<ReplayTestcase>, usize) {
+    let mut seen = BTreeSet::new();
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    for candidate in candidates {
+        if !seen.insert(candidate.input_sha256.clone()) {
+            continue;
+        }
+        if kept.len() < MAX_REPLAYS {
+            kept.push(candidate);
+        } else {
+            dropped += 1;
+        }
+    }
+    (kept, dropped)
+}
+
+/// What a lane's replays observed together.
+pub struct ReplaySetOutcome {
+    /// One finding per rule, oracle and API, as the aggregate view keeps them,
+    /// with the replayed input that produced it first: two replays that reach
+    /// one sink with different subjects (the command a fuzzed `system()` ran)
+    /// are one finding.
+    pub findings: Vec<(CollectorFinding, ReplayTestcase)>,
+    pub run_provenance: Value,
+}
+
+/// Merge the outcome of each replay into one run provenance. The run was
+/// observed when any replay was; a clean assurance needs every replay observed
+/// and clean, so one replay the observer missed cannot read as clean. Each
+/// replay is listed with its input's hash, the launched PID when there was one,
+/// and its findings; `replays_dropped` counts the retained inputs past
+/// [`MAX_REPLAYS`].
+pub fn merge_replays(
+    replays: Vec<(ReplayTestcase, CollectorOutcome)>,
+    dropped: usize,
+) -> ReplaySetOutcome {
+    let mut findings: Vec<(CollectorFinding, ReplayTestcase)> = Vec::new();
+    let mut sites = BTreeSet::new();
+    let mut listed = Vec::new();
+    let mut tree_scope: BTreeSet<u64> = BTreeSet::new();
+    let mut classes: BTreeSet<String> = BTreeSet::new();
+    let mut unsupported: BTreeSet<String> = BTreeSet::new();
+    let (mut lost, mut permission_denied) = (0u64, false);
+    let mut observed_any = false;
+    let mut clean_all = !replays.is_empty();
+    let mut base: Option<Value> = None;
+    for (replay, outcome) in replays {
+        let provenance = outcome.run_provenance;
+        let observed = provenance["observed"] == Value::Bool(true);
+        observed_any |= observed;
+        clean_all &= observed && provenance["clean_assurance"] == Value::Bool(true);
+        let ints = |key: &str| {
+            provenance[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .collect::<Vec<_>>()
+        };
+        tree_scope.extend(ints("process_tree_scope"));
+        let strings = |value: &Value| {
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        classes.extend(strings(&provenance["observed_event_classes"]));
+        let fidelity = &provenance["fidelity"];
+        unsupported.extend(strings(&fidelity["unsupported_fields"]));
+        lost += fidelity["lost"].as_u64().unwrap_or(0);
+        permission_denied |= fidelity["permission_denied"] == Value::Bool(true);
+        let mut entry = json!({
+            "testcase": replay.testcase,
+            "input_sha256": replay.input_sha256,
+            "observed": observed,
+            "findings": outcome.findings.len(),
+        });
+        if let Some(pid) = provenance.get("replayed_pid") {
+            entry["replayed_pid"] = pid.clone();
+        }
+        if !observed {
+            entry["reason"] = fidelity["unsupported_fields"].clone();
+        }
+        listed.push(entry);
+        for finding in outcome.findings {
+            let site = format!(
+                "{}|{}|{}",
+                finding.hit.rule_id, finding.hit.oracle_name, finding.hit.api
+            );
+            if sites.insert(site) {
+                findings.push((finding, replay.clone()));
+            }
+        }
+        if base.is_none() || (observed && base.as_ref().is_some_and(|b| b["observed"] != true)) {
+            base = Some(provenance);
+        }
+    }
+    let mut run_provenance = base.unwrap_or_else(|| json!({ "active": true }));
+    if let Some(obj) = run_provenance.as_object_mut() {
+        obj.remove("replayed_pid");
+        obj.insert("observed".to_owned(), json!(observed_any));
+        obj.insert("clean_assurance".to_owned(), json!(clean_all));
+        obj.insert(
+            "process_tree_scope".to_owned(),
+            json!(tree_scope.into_iter().collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "observed_event_classes".to_owned(),
+            json!(classes.into_iter().collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "fidelity".to_owned(),
+            json!({
+                "lost": lost,
+                "permission_denied": permission_denied,
+                "unsupported_fields": unsupported.into_iter().collect::<Vec<_>>(),
+            }),
+        );
+        obj.insert("replays".to_owned(), Value::Array(listed));
+        obj.insert("replays_dropped".to_owned(), json!(dropped));
+    }
+    ReplaySetOutcome {
+        findings,
+        run_provenance,
+    }
+}
+
 /// Does this crash finding belong to `harness_id`'s campaign? A multi-target work
 /// dir shares one `results/findings/` tree, so a replay must only adopt THIS
 /// target's retained evidence — never another target's input/ID (#76 P2). The
@@ -1301,6 +1455,67 @@ mod tests {
     use super::*;
     use runtime_collector::mock::MockCollector;
     use runtime_collector::{Collector, CollectorContext};
+
+    /// #247: replays are deduplicated by content and bounded, with the count
+    /// left out recorded.
+    #[test]
+    fn the_replay_set_keeps_each_input_once_and_counts_what_it_drops() {
+        let candidates = (0..MAX_REPLAYS + 3)
+            .map(|i| ReplayTestcase::new(format!("in-{i}"), vec![i as u8]))
+            .chain([ReplayTestcase::new("again", vec![0])]);
+        let (kept, dropped) = bounded_replay_set(candidates);
+        assert_eq!(kept.len(), MAX_REPLAYS);
+        assert_eq!(kept[0].testcase, "in-0");
+        assert_eq!(dropped, 3, "the repeat of in-0 is not counted as dropped");
+    }
+
+    /// #247: a run is observed when any replay was, clean only when every
+    /// replay was observed clean, and a finding seen by two replays is written
+    /// once, with the first input.
+    #[test]
+    fn merged_replays_are_clean_only_when_every_replay_was() {
+        let resolved = mock_resolved(DEFAULT_WINDOW_MS);
+        let observed = |pid: u64| {
+            let mut outcome = resolved.evaluate(&CollectorSessionSet::default(), "/r");
+            outcome.run_provenance["replayed_pid"] = json!(pid);
+            outcome.run_provenance["clean_assurance"] = json!(true);
+            outcome
+        };
+        let a = ReplayTestcase::new("a", b"a".to_vec());
+        let b = ReplayTestcase::new("b", b"b".to_vec());
+        let merged = merge_replays(
+            vec![(a.clone(), observed(11)), (b.clone(), observed(12))],
+            0,
+        );
+        let p = &merged.run_provenance;
+        assert_eq!(p["observed"], true);
+        assert_eq!(p["clean_assurance"], true);
+        assert_eq!(p["replays"][1]["replayed_pid"], 12);
+        assert!(p.get("replayed_pid").is_none(), "{p}");
+
+        let merged = merge_replays(
+            vec![
+                (a.clone(), observed(11)),
+                (
+                    b.clone(),
+                    resolved.not_observed("collector_capture_timeout"),
+                ),
+            ],
+            2,
+        );
+        let p = &merged.run_provenance;
+        assert_eq!(p["observed"], true);
+        assert_eq!(p["clean_assurance"], false, "{p}");
+        assert_eq!(p["replays_dropped"], 2);
+        assert_eq!(p["replays"][1]["reason"][0], "collector_capture_timeout");
+        assert_eq!(
+            p["fidelity"]["unsupported_fields"][0],
+            "collector_capture_timeout"
+        );
+
+        let merged = merge_replays(Vec::new(), 0);
+        assert_eq!(merged.run_provenance["clean_assurance"], false);
+    }
 
     fn mock_resolved(window_ms: u64) -> ResolvedCollector {
         ResolvedCollector {
