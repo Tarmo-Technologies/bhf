@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, clap::Args, PartialEq)]
 pub struct InstrumentArgs {
-    /// Ada source file to instrument.
+    /// Ada source file to instrument. A body's spec beside it (`pkg.ads` for
+    /// `pkg.adb`) is copied to the output directory with it.
     pub source: PathBuf,
 
     /// Output directory. Default: bhf_work/src_instrumented/.
@@ -41,8 +42,38 @@ pub fn run(args: InstrumentArgs) -> Result<()> {
 
     println!("Instrumented: {}", dest.display());
     println!("Sidecar:      {}", sidecar.display());
+    // A package body compiles against its spec: copy the spec beside the
+    // instrumented body, so the output directory builds on its own.
+    if let Some(spec) = companion_spec(&args.source) {
+        let spec_dest = args.output.join(spec.file_name().unwrap_or_default());
+        let same_file = matches!(
+            (spec.canonicalize(), spec_dest.canonicalize()),
+            (Ok(from), Ok(to)) if from == to
+        );
+        if !same_file {
+            std::fs::copy(&spec, &spec_dest).with_context(|| {
+                format!(
+                    "copy Ada spec {} to {}",
+                    spec.display(),
+                    spec_dest.display()
+                )
+            })?;
+        }
+        println!("Spec:         {}", spec_dest.display());
+    }
 
     Ok(())
+}
+
+/// The spec beside an Ada body (`pkg.ads` for `pkg.adb`), when there is one.
+fn companion_spec(body: &Path) -> Option<PathBuf> {
+    let extension = body.extension()?.to_str()?;
+    if !extension.eq_ignore_ascii_case("adb") {
+        return None;
+    }
+    let spec_extension = if extension == "ADB" { "ADS" } else { "ads" };
+    let spec = body.with_extension(spec_extension);
+    spec.is_file().then_some(spec)
 }
 
 #[cfg(test)]

@@ -33,7 +33,9 @@ pub struct GenerateHarnessArgs {
     /// (`Codec::decode(const unsigned char *, size_t)`). An exact spelling
     /// wins over a suffix, and a leading `::` names the global namespace only.
     /// Pair it with --target-line to pick one of several matching definitions.
-    /// For Ada, if omitted, harness the highest-ranked target.
+    /// For Ada, the bare name (`Parse`) or the package-qualified one
+    /// (`Pkg.Parse`, `Pkg.Child.Parse`); if omitted, harness the
+    /// highest-ranked target.
     #[arg(long)]
     pub target: Option<String>,
 
@@ -1630,6 +1632,25 @@ fn ensure_target_not_in_generic_package(ast: &StructuralAst, target: &Subprogram
     Ok(())
 }
 
+/// The dotted name of the package `subprogram` is declared in, through its
+/// parent packages (`A.B`), or `None` for a library-level subprogram.
+fn subprogram_package(ast: &StructuralAst, subprogram: &Subprogram) -> Option<String> {
+    let SubprogramOwner::Package(mut id) = subprogram.owner else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    for _ in 0..64 {
+        let package = ast.packages.iter().find(|package| package.id == id)?;
+        parts.push(package.name.as_str());
+        match package.parent {
+            Some(parent) => id = parent,
+            None => break,
+        }
+    }
+    parts.reverse();
+    Some(parts.join("."))
+}
+
 fn select_subprogram<'a>(
     ast: &'a StructuralAst,
     requested: Option<&str>,
@@ -1637,10 +1658,25 @@ fn select_subprogram<'a>(
 ) -> Result<&'a Subprogram> {
     match requested {
         Some(name) => {
+            // `Pkg.Parse` names `Parse` declared in package `Pkg` (`A.B.Parse`
+            // in the child or nested package `A.B`), unless a subprogram is
+            // itself named `Pkg.Parse` (a child subprogram unit).
+            let qualified = name.rsplit_once('.').filter(|_| {
+                !ast.subprograms
+                    .iter()
+                    .any(|subprogram| subprogram.name.eq_ignore_ascii_case(name))
+            });
             let mut matches = ast
                 .subprograms
                 .iter()
-                .filter(|subprogram| subprogram.name.eq_ignore_ascii_case(name))
+                .filter(|subprogram| match qualified {
+                    Some((package, simple)) => {
+                        subprogram.name.eq_ignore_ascii_case(simple)
+                            && subprogram_package(ast, subprogram)
+                                .is_some_and(|owner| owner.eq_ignore_ascii_case(package))
+                    }
+                    None => subprogram.name.eq_ignore_ascii_case(name),
+                })
                 .collect::<Vec<_>>();
             matches.sort_by_key(|subprogram| subprogram.decl_span.start_line);
             if let Some(line) = target_line {
@@ -18864,6 +18900,44 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let selected = select_subprogram(&ast, Some("Decode"), Some(99)).unwrap();
         assert_eq!(selected.id, SubprogramId(1));
+    }
+
+    /// `Pkg.Parse` selects `Parse` in package `Pkg` (and `A.B.Parse` in the
+    /// nested `A.B`), the same subprogram a bare `Parse` selects when it is
+    /// the only one; a qualifier naming another package selects nothing.
+    #[test]
+    fn a_package_qualified_target_selects_the_subprogram_in_that_package() {
+        let package = |id: u32, name: &str, parent: Option<u32>| Package {
+            id: PackageId(id),
+            name: name.to_owned(),
+            parent: parent.map(PackageId),
+            is_generic: false,
+            formals: Vec::new(),
+            decls: Vec::new(),
+            is_private: false,
+        };
+        let mut in_pkg = subprogram(1, "Parse");
+        in_pkg.owner = SubprogramOwner::Package(PackageId(1));
+        let mut in_nested = subprogram(2, "Parse");
+        in_nested.owner = SubprogramOwner::Package(PackageId(3));
+        in_nested.decl_span = Span::new(2, 3, 20, 1);
+        let ast = StructuralAstForMerge {
+            packages: vec![
+                package(1, "Pkg", None),
+                package(2, "A", None),
+                package(3, "B", Some(2)),
+            ],
+            subprograms: vec![in_pkg, in_nested],
+            ..StructuralAstForMerge::default()
+        };
+
+        let id = |name: &str| select_subprogram(&ast, Some(name), None).map(|s| s.id);
+        assert_eq!(id("Pkg.Parse").unwrap(), SubprogramId(1));
+        assert_eq!(id("pkg.parse").unwrap(), SubprogramId(1));
+        assert_eq!(id("Parse").unwrap(), SubprogramId(1));
+        assert_eq!(id("A.B.Parse").unwrap(), SubprogramId(2));
+        let missing = id("Other.Parse").unwrap_err().to_string();
+        assert!(missing.contains("'Other.Parse' not found"), "{missing}");
     }
 
     fn temp_dir(name: &str) -> crate::test_support::TestDir {

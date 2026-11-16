@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The documented Ada flow works: `bhf generate-harness --target Pkg.Parse`
+  selects `Parse` in package `Pkg` (it said `subprogram 'Pkg.Parse' not
+  found`), and generates the harness `--target Parse` does. `bhf instrument`
+  copies the body's spec (`pkg.ads`) beside the instrumented body, so the
+  build that follows no longer fails on the missing spec.
 - Console output escapes control characters in text a target controls. `bhf
   auto`'s top findings printed a finding's message raw, so an escape sequence
   in it could retitle or clear the operator's terminal. Every line bhf prints
