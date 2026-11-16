@@ -473,7 +473,7 @@ fn replay_one(
              negative-confirmation coverage is partial"
         );
     }
-    let measurement = parse_lcov_detailed(&export_text);
+    let measurement = parse_lcov_project(&export_text, hdir);
     let covered = measurement.covered;
     let instrumented = measurement.instrumented;
     let _ = std::fs::remove_dir_all(&prof_dir);
@@ -1315,9 +1315,10 @@ fn replay_expert_coverage(
     if !export.status.success() {
         return Err("failed to export expert coverage".to_owned());
     }
-    Ok(parse_lcov_detailed(&String::from_utf8_lossy(
-        &export.stdout,
-    )))
+    Ok(parse_lcov_project(
+        &String::from_utf8_lossy(&export.stdout),
+        hdir,
+    ))
 }
 
 fn sequence_control_len(hdir: &Path) -> usize {
@@ -1353,11 +1354,39 @@ struct LcovMeasurement {
 
 #[cfg(test)]
 fn parse_lcov(lcov: &str) -> (Vec<String>, usize) {
-    let measurement = parse_lcov_detailed(lcov);
+    let measurement = parse_lcov_kept(lcov, &|_| true);
     (measurement.covered, measurement.instrumented)
 }
 
-fn parse_lcov_detailed(lcov: &str) -> LcovMeasurement {
+/// Whether `file` is bhf's own code in a harness binary, not the project's:
+/// anything under the work dir's `harnesses/` (the generated `main.c`, its
+/// repairs and stubs) and bhf's C runtime (`c_runtime/bhf_*`, staged in the
+/// user cache or a checkout). Counting it put `bhf_decode.h` and the harness's
+/// `main.c` beside the target's lines.
+fn is_bhf_scaffolding(file: &str, harnesses: &Path) -> bool {
+    let path = Path::new(file);
+    if path.starts_with(harnesses) {
+        return true;
+    }
+    let runtime_file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("bhf_"));
+    runtime_file
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == "c_runtime")
+}
+
+/// [`parse_lcov_detailed`] over the project's own lines: without the harness
+/// scaffolding of `hdir`'s work dir ([`is_bhf_scaffolding`]).
+fn parse_lcov_project(lcov: &str, hdir: &Path) -> LcovMeasurement {
+    let harnesses = hdir.parent().unwrap_or(hdir);
+    parse_lcov_kept(lcov, &|file| !is_bhf_scaffolding(file, harnesses))
+}
+
+fn parse_lcov_kept(lcov: &str, keep: &dyn Fn(&str) -> bool) -> LcovMeasurement {
     let mut out = Vec::new();
     let mut instrumented = 0usize;
     let mut instrumented_files = std::collections::BTreeSet::new();
@@ -1367,6 +1396,9 @@ fn parse_lcov_detailed(lcov: &str) -> LcovMeasurement {
             file.clear();
         } else if let Some(rest) = line.strip_prefix("SF:") {
             file = rest.trim().to_owned();
+            if !keep(&file) {
+                file.clear();
+            }
         } else if let Some(rest) = line.strip_prefix("DA:") {
             let mut parts = rest.split(',');
             let (Some(line_no), Some(count)) = (parts.next(), parts.next()) else {
@@ -1727,5 +1759,23 @@ end_of_record\n";
         run_external_expert_coverage_oracle(&harness, "H-PY002-00000002", &expert);
 
         assert!(!harness.join(EXPERT_ORACLE_FILE).exists());
+    }
+
+    /// bhf's harness and runtime lines are not the project's coverage: an
+    /// 11-line target reported 44 of 457 lines with them.
+    #[test]
+    fn coverage_counts_only_the_projects_lines() {
+        let hdir = Path::new("/w/harnesses/H-C0001");
+        let lcov = "SF:/src/proj/heap_write.c\nDA:6,3\nDA:7,0\nend_of_record\n\
+                    SF:/w/harnesses/H-C0001/main.c\nDA:57,9\nDA:58,9\nend_of_record\n\
+                    SF:/w/harnesses/H-C0001/repairs/auto_stubs.c\nDA:3,1\nend_of_record\n\
+                    SF:/home/u/.cache/bhf/runtime-ab12/c_runtime/bhf_decode.h\nDA:47,9\nend_of_record\n\
+                    SF:/src/proj/c_runtime/runtime.c\nDA:2,1\nend_of_record\n";
+        let measurement = parse_lcov_project(lcov, hdir);
+        assert_eq!(
+            measurement.covered,
+            ["/src/proj/heap_write.c:6", "/src/proj/c_runtime/runtime.c:2"]
+        );
+        assert_eq!(measurement.instrumented, 3);
     }
 }

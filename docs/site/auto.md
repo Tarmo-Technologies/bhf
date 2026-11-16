@@ -445,6 +445,15 @@ column/property with the provenance (`static` | `fuzz` | `runtime` |
 `fuzz_confirmed` finding is not a maybe — it is a defect a fuzzer walked into at
 the exact line the scanner flagged.
 
+After the sweep each C/C++ harness is rebuilt with source coverage and its
+corpus replayed, which writes the lines the campaign executed to
+`harnesses/<id>/covered-lines.txt` and the covered and instrumented line
+counts to `harnesses/<id>/coverage-summary.json`. Both count the project's
+lines only, not bhf's: the generated `main.c`, its repairs and stubs, and the
+C runtime's `bhf_*` headers are left out. The summary's `Coverage: N edges
+(the most any one target reached)` is the largest edge count of one target,
+not a total, since each target has its own edge map.
+
 ## Running a harness under another fuzzer
 
 The generated native harnesses (C, C++, Rust, Ada) are self-contained: the

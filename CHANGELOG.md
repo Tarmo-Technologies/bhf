@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Line coverage counts the project's lines only. `covered-lines.txt` and
+  `coverage-summary.json` counted bhf's generated `main.c`, repairs, stubs
+  and C runtime headers too, so an 11-line target reported 44 of 457 lines.
+  The summary's edge figure now says it is the most any one target reached,
+  not a total.
 - A Rust or C# target run without `--run-untrusted` is reported as needing
   that consent: outcome `consent_required` (`summary.consent_required`,
   "needs --run-untrusted" in run.md), and the next steps ask for the flag. It

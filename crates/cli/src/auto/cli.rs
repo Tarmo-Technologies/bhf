@@ -4848,7 +4848,13 @@ impl AutoSummary {
             );
         }
         if self.coverage_edges > 0 {
-            let _ = writeln!(s, "  Coverage:     {} edges", self.coverage_edges);
+            // The most edges any one target reached: the targets' edge maps
+            // are separate, so their counts do not add up.
+            let _ = writeln!(
+                s,
+                "  Coverage:     {} edges (the most any one target reached)",
+                self.coverage_edges
+            );
         }
         // #417: loud false-clean warning. A stub-only target reports clean while
         // having fuzzed only empty stubs, so call it out explicitly here.
