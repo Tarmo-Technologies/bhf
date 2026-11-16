@@ -1745,10 +1745,14 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 .unwrap_or_else(|_| candidate.source_path.clone())
         };
         let discovered: Vec<PathBuf> = candidates.iter().map(canonical).collect();
+        // Name each file under the root as the operator would type it. The
+        // files are canonical (`\\?\C:\...` on Windows), so the root is too.
+        let canonical_root = path.canonicalize().unwrap_or_else(|_| path.clone());
         let shown: Vec<String> = discovered
             .iter()
             .map(|file| {
-                file.strip_prefix(&path)
+                file.strip_prefix(&canonical_root)
+                    .or_else(|_| file.strip_prefix(&path))
                     .unwrap_or(file)
                     .display()
                     .to_string()
