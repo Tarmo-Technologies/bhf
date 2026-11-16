@@ -323,6 +323,12 @@ bhf auto ./firmware-src --comparison-progress   # alias: --cmp-progress
 Composes with cmplog/RedQueen (armed by default), value-profile, and the
 hit-count buckets.
 
+A transport campaign (`bhf fuzz --target-transport ...`) gets the gate's magic
+from a dictionary instead: the mutator splices in the tokens of `--dict
+<FILE>` (AFL format, `name="token"`) and of the harness's `dictionary.txt`.
+With `--grammar <FILE>` it sends only derivations of the grammar, for a
+target-side parser of a text format.
+
 ---
 
 ## 7. HIL: fuzzing a physical board over gdb-remote

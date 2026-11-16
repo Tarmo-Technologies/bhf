@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The on-target transport lane's mutator gets a dictionary: `bhf fuzz --dict
+  PATH` (new, AFL/libFuzzer format, read by the host loop too) and the
+  harness's `dictionary.txt`, and `--grammar` sends only derivations of the
+  grammar. Its dictionary was hard-coded empty, so a firmware magic gate got no
+  help, and `--grammar` was refused. The agent's TCP link sends each input in
+  one write with `TCP_NODELAY`; a length word sent alone waited on the agent's
+  delayed ACK, about 40 ms per input.
 - The session lane (`--protocol-profile`) treats a session the target ends
   mid-way (a closed or reset connection, or one that stops answering) as a
   crash candidate: it keeps the session, drives it again on a new connection,

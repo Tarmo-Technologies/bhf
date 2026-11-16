@@ -108,6 +108,7 @@ pub(crate) fn should_use_session(args: &FuzzArgs) -> bool {
 const UNSUPPORTED_FLAGS: &[&str] = &[
     "--workers",
     "--grammar",
+    "--dict",
     "--cmplog-log",
     "--len-control",
     "--rss-limit-mb",

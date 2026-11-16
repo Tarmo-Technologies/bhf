@@ -488,6 +488,12 @@ pub struct FuzzArgs {
     #[arg(long = "grammar", value_name = "PATH")]
     pub grammar_file: Option<PathBuf>,
 
+    /// An AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose
+    /// tokens the mutator splices into inputs, on top of the harness's own
+    /// `dictionary.txt`.
+    #[arg(long = "dict", value_name = "PATH")]
+    pub dict_file: Option<PathBuf>,
+
     /// Structure-aware input synthesis for the built-in engine.
     #[arg(long = "structured-inputs", value_enum, default_value_t = StructuredInputMode::Auto)]
     pub structured_inputs: StructuredInputMode,
@@ -1244,6 +1250,7 @@ struct PreparedFuzzRun {
     _local_vp_map: Option<tempfile::TempPath>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
+    dict_file: Option<PathBuf>,
     structured_inputs: StructuredInputMode,
     sanitizers: Vec<multicore_fuzz::Sanitizer>,
     sanitizer_env: Vec<(String, String)>,
@@ -1783,6 +1790,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log,
         grammar_file: None,
+        dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
         stop_after_findings,
@@ -2027,6 +2035,7 @@ fn afl_programmatic_args(
         runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log: None,
         grammar_file: None,
+        dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
         stop_after_findings: None,
@@ -2053,6 +2062,7 @@ pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
     let given = [
         ("--workers", args.workers.is_some()),
         ("--grammar", args.grammar_file.is_some()),
+        ("--dict", args.dict_file.is_some()),
         ("--cmplog-log", args.cmplog_log.is_some()),
         ("--len-control", args.len_control != DEFAULT_LEN_CONTROL),
         ("--rss-limit-mb", args.rss_limit_mb != 0),
@@ -2990,6 +3000,7 @@ fn prepare_with_runner(
         _local_vp_map: local_vp_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
+        dict_file: args.dict_file,
         structured_inputs: args.structured_inputs,
         sanitizers,
         sanitizer_env,
@@ -3814,8 +3825,11 @@ fn run_builtin_with_progress(
             .map(PathBuf::from)
     });
     let grammar = load_grammar_for_run(grammar_path.as_deref())?;
-    let mut dictionary_tokens =
-        load_generated_dictionary_tokens(&prepared.work_dir, &prepared.harness_id)?;
+    let mut dictionary_tokens = run_dictionary_tokens(
+        &prepared.work_dir,
+        &prepared.harness_id,
+        prepared.dict_file.as_deref(),
+    )?;
     if let Some(log) = &cmplog_log {
         for token in log.dictionary_tokens() {
             if !dictionary_tokens.contains(&token) {
@@ -7194,6 +7208,26 @@ fn find_learned_dictionary(work_dir: &Path, harness_id: &str) -> Option<PathBuf>
         .chain([work_dir.join("build").join(harness_id)])
         .map(|dir| dir.join(LEARNED_DICTIONARY_FILE))
         .find(|path| path.is_file())
+}
+
+/// The tokens a fuzz run starts with: those of `--dict`, then the harness's
+/// ([`load_generated_dictionary_tokens`]), each once. A `--dict` that cannot
+/// be read is an error: the operator asked for it.
+pub(crate) fn run_dictionary_tokens(
+    work_dir: &Path,
+    harness_id: &str,
+    dict_file: Option<&Path>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut tokens = match dict_file {
+        Some(path) => load_afl_dictionary_tokens(path)?,
+        None => Vec::new(),
+    };
+    for token in load_generated_dictionary_tokens(work_dir, harness_id)? {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    Ok(tokens)
 }
 
 /// The tokens a fuzz run starts with: the harness's source-mined
@@ -14659,6 +14693,7 @@ exit 0
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
             cmplog_log: None,
             grammar_file: None,
+            dict_file: None,
             structured_inputs,
             bhf_bin: None,
             stop_after_findings: None,

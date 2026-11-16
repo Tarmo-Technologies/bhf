@@ -2907,6 +2907,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/transport_dictionary_grammar_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/transport_fuzz_qemu_cli.rs",
       "license": "Apache-2.0"
     },

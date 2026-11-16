@@ -51,8 +51,8 @@ use std::time::{Duration, Instant};
 use corpus::{CorpusError, FindingEmitter};
 use event_log::Testcase;
 use fuzz_engine_builtin::{
-    CoverageFeedback, CoverageInput, CoverageProxy, Dictionary, MutationInput, MutationRng,
-    MutatorConfig, MutatorSuite, PowerScheduler,
+    CoverageFeedback, CoverageInput, CoverageProxy, Dictionary, Grammar, MutationInput,
+    MutationRng, MutatorConfig, MutatorSuite, PowerScheduler,
 };
 use serde::Serialize;
 use target_transport::{
@@ -107,6 +107,9 @@ fn connect_tcp_bounded(
     stream
         .set_write_timeout(Some(io))
         .map_err(TransportError::from)?;
+    // One small frame per input, then a blocking read of the reply: Nagle
+    // would hold each frame for the agent's delayed ACK.
+    stream.set_nodelay(true).map_err(TransportError::from)?;
     Ok(stream)
 }
 
@@ -121,7 +124,6 @@ pub(crate) fn should_use_transport(args: &FuzzArgs) -> bool {
 /// lane starts honouring it.
 const UNSUPPORTED_FLAGS: &[&str] = &[
     "--workers",
-    "--grammar",
     "--cmplog-log",
     "--len-control",
     "--rss-limit-mb",
@@ -712,6 +714,11 @@ pub(crate) struct TransportFuzzConfig {
     pub stop_after_findings: Option<usize>,
     /// Actionability profile for the emitted findings.
     pub mode: actionability::RunMode,
+    /// The tokens the mutator splices in: `--dict`'s, then the harness's
+    /// `dictionary.txt` and learned ones.
+    pub dictionary: Vec<Vec<u8>>,
+    /// `--grammar`: every input past the seeds is a fresh derivation of it.
+    pub grammar: Option<Grammar>,
 }
 
 /// The JSON summary a transport-driven run reports (mirrors the shape of the
@@ -828,7 +835,7 @@ pub(crate) fn run_transport_campaign(
         ..MutatorConfig::default()
     });
     let mut rng = MutationRng::new(config.rng_seed);
-    let dictionary = Dictionary::from_tokens(std::iter::empty::<Vec<u8>>());
+    let dictionary = Dictionary::from_tokens(config.dictionary.iter().cloned());
 
     let emitter = FindingEmitter::with_metadata(
         config.work_dir.clone(),
@@ -949,12 +956,15 @@ pub(crate) fn run_transport_campaign(
                 ) {
                     break 'outer;
                 }
-                let input = match mutator
-                    .mutate(&MutationInput::new(&scheduled.bytes, &dictionary), &mut rng)
-                {
-                    Some(result) => result.bytes,
-                    None => scheduled.bytes.clone(),
+                // With a grammar, a target that parses it gets only its
+                // sentences: a byte mutation of one would mostly not be.
+                let generated = match &config.grammar {
+                    Some(grammar) => grammar.generate(config.max_len.max(1), &mut rng),
+                    None => mutator
+                        .mutate(&MutationInput::new(&scheduled.bytes, &dictionary), &mut rng)
+                        .map(|result| result.bytes),
                 };
+                let input = generated.unwrap_or_else(|| scheduled.bytes.clone());
                 match run_one_input(session.as_mut(), &input)? {
                     Step::Halt(reason) => {
                         halted = Some(reason);
@@ -1383,10 +1393,18 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         2
     })?;
 
-    let seeds = load_seeds(&args).map_err(|error| {
+    let fail = |error: String| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
         3
-    })?;
+    };
+    let grammar = crate::fuzz::load_grammar_for_run(args.grammar_file.as_deref()).map_err(fail)?;
+    let dictionary = crate::fuzz::run_dictionary_tokens(
+        &args.work_dir,
+        &args.harness,
+        args.dict_file.as_deref(),
+    )
+    .map_err(fail)?;
+    let seeds = load_seeds(&args, grammar.as_ref()).map_err(fail)?;
 
     let config = TransportFuzzConfig {
         work_dir: args.work_dir.clone(),
@@ -1404,6 +1422,8 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
         mode: args.mode,
+        dictionary,
+        grammar,
     };
 
     run_transport_campaign(transport.as_ref(), &config).map_err(|error| {
@@ -1412,9 +1432,10 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
     })
 }
 
-/// Load seeds from `--seed-input` / `--seed-file`, bounding each to `--max-len`,
-/// and fall back to a single default seed so the mutator always has material.
-fn load_seeds(args: &FuzzArgs) -> Result<Vec<Vec<u8>>, String> {
+/// Load seeds from `--seed-input` / `--seed-file`, bounding each to
+/// `--max-len`; with none, a derivation of `grammar` when there is one, else
+/// the default seed.
+fn load_seeds(args: &FuzzArgs, grammar: Option<&Grammar>) -> Result<Vec<Vec<u8>>, String> {
     let cap = args.max_len.max(1);
     let mut seeds: Vec<Vec<u8>> = args
         .seed_inputs
@@ -1428,7 +1449,9 @@ fn load_seeds(args: &FuzzArgs) -> Result<Vec<Vec<u8>>, String> {
         seeds.push(bytes);
     }
     if seeds.is_empty() {
-        seeds.push(truncate(DEFAULT_SEED.to_vec(), cap));
+        let derived =
+            grammar.and_then(|grammar| grammar.generate(cap, &mut MutationRng::new(args.rng_seed)));
+        seeds.push(derived.unwrap_or_else(|| truncate(DEFAULT_SEED.to_vec(), cap)));
     }
     Ok(seeds)
 }
@@ -1971,6 +1994,8 @@ mod tests {
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
             mode: actionability::RunMode::Reporting,
+            dictionary: Vec::new(),
+            grammar: None,
         }
     }
 
