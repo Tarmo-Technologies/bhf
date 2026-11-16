@@ -1267,6 +1267,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/build_support/git_watch.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/ada_bridge.rs",
       "license": "Apache-2.0"
     },
@@ -2464,6 +2468,10 @@
     },
     {
       "path": "crates/cli/tests/bug_report_bundle.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/build_git_watch.rs",
       "license": "Apache-2.0"
     },
     {

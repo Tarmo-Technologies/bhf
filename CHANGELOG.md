@@ -5,6 +5,9 @@
 ## Unreleased
 
 ### Changed
+- A development build reports `v<version>-dev+<commit>` and no longer rebuilds
+  when another worktree of the same clone fetches, packs refs or adds a tag.
+  Release builds (`BHF_RELEASE_VERSION`) still report `v<version>`.
 - Tests in every crate make their scratch directories with a guard that
   removes them when the test ends, including when it fails, and a lint
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
