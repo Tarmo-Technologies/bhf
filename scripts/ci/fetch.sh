@@ -15,7 +15,13 @@ if [ -f "$cached" ] && echo "$sha256  $cached" | sha256sum --check --status -; t
   cp "$cached" "$dest"
   exit 0
 fi
-curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo "$dest.part" "$url"
+# --retry-all-errors (curl 7.71) also retries an HTTP 503 or 403; the
+# RHEL 7 containers' curl is older and retries transient failures only.
+retry=(--retry 5 --retry-delay 5)
+if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then
+  retry+=(--retry-all-errors)
+fi
+curl --proto '=https' --tlsv1.2 "${retry[@]}" -fsSLo "$dest.part" "$url"
 echo "$sha256  $dest.part" | sha256sum --check --quiet - || {
   echo "fetch.sh: $url does not have SHA-256 $sha256" >&2
   rm -f "$dest.part"
