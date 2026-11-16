@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz --target-transport` and `--protocol-profile` refuse, with exit 2
+  and each flag named, the host-lane flags their loops do not wire
+  (`--workers`, `--grammar`, `--cmplog-log`, the sandbox and sanitizer flags
+  and others, and the other lane's flags). They used to run without them, so
+  a `--workers 4 --grammar g.json` campaign was one blind mutator and a
+  missing grammar file went unnoticed.
 - `--target-transport qemu-system:...,done=` clears bit 0 of a Thumb
   (`done_kind=2`) address with a note. `nm` prints a Thumb function's address
   odd, the FreeRTOS runbook took `done=` from it, and the unaligned breakpoint

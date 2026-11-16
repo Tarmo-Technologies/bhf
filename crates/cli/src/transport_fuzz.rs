@@ -116,6 +116,43 @@ pub(crate) fn should_use_transport(args: &FuzzArgs) -> bool {
     args.target_transport.is_some()
 }
 
+/// The `bhf fuzz` flags this lane does not wire. Remove a flag here when the
+/// lane starts honouring it.
+const UNSUPPORTED_FLAGS: &[&str] = &[
+    "--workers",
+    "--grammar",
+    "--cmplog-log",
+    "--len-control",
+    "--rss-limit-mb",
+    "--fork-server",
+    "--no-fork-server",
+    "--qemu-user",
+    "--qemu-arg",
+    "--extension",
+    "--sanitizers",
+    "--symbolic-seed-source",
+    "--sandbox",
+    "--sandbox-tool",
+    "--sandbox-strict",
+    "--runtime-oracles",
+    "--structured-inputs",
+    "--print-final-stats",
+    "--collector",
+    "--collector-window-ms",
+    "--protocol-profile",
+    "--session-transport",
+    "--session-reset",
+    "--max-session-messages",
+];
+
+/// The flags this run gives that the transport lane would ignore.
+pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
+    crate::fuzz::given_flags(args)
+        .into_iter()
+        .filter(|flag| UNSUPPORTED_FLAGS.contains(flag))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Spec parsing (pure, fully testable)
 // ---------------------------------------------------------------------------

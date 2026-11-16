@@ -2663,6 +2663,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_lane_flag_conflicts.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/introspect_cli.rs",
       "license": "Apache-2.0"
     },

@@ -336,7 +336,10 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   parses the spec (including the `done=`/`fault=` completion contract), bounds
   each connection/read/write (`--timeout`), and dials the resource on the first
   execution (a dead endpoint fails with a connection error, not
-  "unimplemented"). A gated end-to-end test (`transport_fuzz_qemu_cli`, present
+  "unimplemented"). It takes the seed, length, time, iteration, timeout,
+  deadline and RNG-seed flags; a host-lane flag it does not wire (`--workers`,
+  `--grammar`, `--cmplog-log` and the others [cli.md](cli.md) lists) is
+  refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
   when `qemu-system-arm` + `arm-none-eabi-gcc` are installed) drives the real
   mps2-an385 fixture through the shipped `bhf fuzz --target-transport
   qemu-system:…` binary and asserts it plants the breakpoint itself and persists
