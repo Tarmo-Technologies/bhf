@@ -71,7 +71,10 @@ coverage signal. Comparison operands are captured two ways and fed to the mutato
 - **String / buffer gates** (`memcmp`, `strcmp`, `strncmp`, …): the generated
   driver defines the ASan `__sanitizer_weak_hook_*` family, which ASan's
   interceptors call with both operands (no libFuzzer runtime required); the
-  LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`.
+  LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`, in the
+  harness's own processes only (`BHF_TARGET_EXE`), not in a shell it runs.
+  When the driver's site-tagged records are present, the shim's untagged ones
+  add no dictionary tokens.
 - **Scalar / character gates** (`*c == '{'`, integer `==`, `switch`): the driver
   is compiled with `-fsanitize-coverage=trace-cmp` and its `trace_cmp*` /
   `trace_switch` callbacks record the integer operand pairs.

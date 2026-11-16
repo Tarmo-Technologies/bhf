@@ -1171,6 +1171,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/cmplog_target.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/determinism.rs",
       "license": "Apache-2.0"
     },
@@ -2132,6 +2136,10 @@
     },
     {
       "path": "crates/cli/tests/auto_closure_failure_memo.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_cmplog_shell_children.rs",
       "license": "Apache-2.0"
     },
     {

@@ -3097,6 +3097,13 @@ fn prepare_with_runner(
             extra_env.extend(shim.env_pairs(&oracle_log));
         }
     }
+    // The shim records comparisons (`BHF_CMPLOG`) only in the harness's image,
+    // not in a shell or tool the harness runs.
+    if !extra_env.iter().any(|(key, _)| key == TARGET_EXE_ENV) {
+        if let Some(target) = native_target_exe(&harness_path) {
+            extra_env.push((TARGET_EXE_ENV.to_owned(), target.display().to_string()));
+        }
+    }
     // Only the standalone bhf-framed C/C++ driver carries the runtime that
     // writes these shared-memory channels; other engines/protocols ignore them.
     let builtin_framed = args.engine == FuzzEngine::Builtin
@@ -7643,6 +7650,24 @@ fn write_input_frame(stdin: &mut impl std::io::Write, input: &[u8]) -> std::io::
     let capped = input.len().min(FRAMED_INPUT_CAP);
     stdin.write_all(&(capped as u32).to_le_bytes())?;
     stdin.write_all(&input[..capped])
+}
+
+/// The variable naming the image the runtrace shim records comparisons in.
+const TARGET_EXE_ENV: &str = "BHF_TARGET_EXE";
+
+/// `harness` as an absolute path when it is a native executable (ELF), the
+/// image its process runs; `None` for a script or launcher, whose process
+/// runs an interpreter.
+fn native_target_exe(harness: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(harness)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .ok()?;
+    if magic != *b"\x7fELF" {
+        return None;
+    }
+    std::path::absolute(harness).ok()
 }
 
 /// The directory of the `BHF_RUNTRACE_LOG` path in `extra_env`, if set, so
@@ -12988,6 +13013,21 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    /// A native executable is named as the shim's target image, by absolute
+    /// path; a script, whose process runs an interpreter, is not.
+    #[test]
+    fn native_target_exe_names_only_an_elf_harness() {
+        let dir = tmpdir();
+        let elf = dir.join("main");
+        fs::write(&elf, b"\x7fELF\x02\x01\x01").unwrap();
+        let script = dir.join("run.sh");
+        fs::write(&script, b"#!/bin/sh\nexec ./main\n").unwrap();
+        assert_eq!(native_target_exe(&elf), Some(elf.clone()));
+        assert!(native_target_exe(&elf).unwrap().is_absolute());
+        assert_eq!(native_target_exe(&script), None);
+        assert_eq!(native_target_exe(&dir.join("missing")), None);
     }
 
     /// Every flag a multi-worker run accepts, but the two the parent carries

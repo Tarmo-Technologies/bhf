@@ -45,6 +45,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A shell or tool the target runs (`system`, `popen`, `exec`) no longer
+  records comparisons into the cmplog log: it inherited `LD_PRELOAD` and
+  `BHF_CMPLOG`, so most records were the shell's keyword lookups, and its
+  keywords became dictionary tokens. bhf names a native harness in
+  `BHF_TARGET_EXE`, and the shim records only in processes running that file,
+  fork-server children included. The shim records each distinct comparison
+  once per process and stops at 8 MiB of log across every process writing it;
+  `cmplog.jsonl` keeps each record once and stops at 8 MiB. Records without a
+  site add no dictionary tokens when site-tagged ones are present.
 - `bhf fuzz --collector auto` on Linux arms the runtrace shim it reads, so
   the collector observes the run without `--runtime-oracles`; it reported
   `runtime_shim_not_armed` and nothing else. With `--runtime-oracles off` the

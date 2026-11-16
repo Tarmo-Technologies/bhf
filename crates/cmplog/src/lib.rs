@@ -51,12 +51,22 @@ impl CmpLog {
     /// engine's `Dictionary::from_tokens` — every magic-byte
     /// comparison the target performed becomes a candidate
     /// dictionary insertion. Empty operands and exact duplicates
-    /// are filtered.
+    /// are filtered. When some records name their site (the fuzz
+    /// driver's), a record without one (the runtrace shim's, which can
+    /// come from any process the target runs) adds no token.
     pub fn dictionary_tokens(&self) -> Vec<Vec<u8>> {
         use std::collections::HashSet;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut out: Vec<Vec<u8>> = Vec::new();
-        for entry in &self.entries {
+        let sited = self
+            .entries
+            .iter()
+            .any(|entry| entry.site_id & UNKNOWN_SITE == 0);
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| !sited || entry.site_id & UNKNOWN_SITE == 0)
+        {
             for operand in [&entry.operand_a, &entry.operand_b] {
                 if operand.is_empty() {
                     continue;
@@ -438,6 +448,27 @@ not-json-just-noise\n\
     /// At a comparison whose one side varies with the input while the other
     /// stays the same, only the side that stays the same is a constant; the
     /// mutated inputs it was compared against are not.
+    #[test]
+    fn dictionary_tokens_leave_out_site_less_records_beside_sited_ones() {
+        let entry = |site_id, a: &[u8], b: &[u8]| CmpEntry {
+            site_id,
+            operand_a: a.to_vec(),
+            operand_b: b.to_vec(),
+            kind: CmpKind::CStringEquality,
+        };
+        let mut log = CmpLog::new();
+        log.record(entry(UNKNOWN_SITE | 1, b"case", b"esac"));
+        assert_eq!(
+            log.dictionary_tokens(),
+            vec![b"case".to_vec(), b"esac".to_vec()]
+        );
+        log.record(entry(7, b"input", b"MAGIC"));
+        assert_eq!(
+            log.dictionary_tokens(),
+            vec![b"input".to_vec(), b"MAGIC".to_vec()]
+        );
+    }
+
     #[test]
     fn constant_operands_keep_the_side_that_stays_the_same() {
         let mut log = CmpLog::new();

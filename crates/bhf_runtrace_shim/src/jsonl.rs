@@ -53,6 +53,22 @@ pub fn emit_raw(line: &[u8]) {
     }
 }
 
+/// The size of the runtrace log, which every process writing it adds to:
+/// `fstat` of the open log. `None` when no log is open or `fstat` fails.
+pub fn log_len() -> Option<u64> {
+    let fd = ensure_fd();
+    if fd < 0 {
+        return None;
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is the open log and `stat` a writable `struct stat`.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat succeeded and filled `stat`.
+    Some(unsafe { stat.assume_init() }.st_size as u64)
+}
+
 /// The event of the line the shim starts its writes to a runtrace log with.
 pub const SHIM_LOADED_EVENT: &str = "shim_loaded";
 
