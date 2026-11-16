@@ -193,6 +193,11 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Image blockers (a CVE published upstream since the change, as often as
+    # not) only annotate pull request and branch push runs; a release caller
+    # (force_full) or a tag run fails on them. See review-image-scan.py.
+    env:
+      BHF_IMAGE_SCAN_MODE: ${{ (inputs.force_full || github.ref_type == 'tag') && 'enforce' || 'auto' }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -219,6 +224,11 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Image blockers (a CVE published upstream since the change, as often as
+    # not) only annotate pull request and branch push runs; a release caller
+    # (force_full) or a tag run fails on them. See review-image-scan.py.
+    env:
+      BHF_IMAGE_SCAN_MODE: ${{ (inputs.force_full || github.ref_type == 'tag') && 'enforce' || 'auto' }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

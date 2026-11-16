@@ -1657,6 +1657,11 @@
   been given.
 
 ### Changed
+- Container image CVE blockers no longer fail pull request or branch push
+  CI: the scan still runs and reports them (`release-review.json` gains
+  `enforcement`), and tag, release and container-release runs still fail on
+  them. A daily image scan opens or updates one `image-scan` tracking issue
+  when it finds blockers.
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
   now exits `3` with an error, as `--engine winafl` does: those flags run the
   builtin engine's own loops, so such a run used to fuzz with the builtin

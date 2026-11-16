@@ -42,6 +42,30 @@ so a later successful test cannot conceal an earlier failed command. CI Cargo
 commands use `--locked`, runner jobs have time limits, and checkouts do not
 persist credentials.
 
+## Container image vulnerability gate
+
+The `container-core` and `container-full` jobs scan the image they built with
+grype and review the scan with `scripts/ci/review-image-scan.py`. Critical,
+High and unknown-severity matches, and Medium matches that have a fix, are
+blockers. On pull requests and branch pushes the review is **report-only**: it
+writes `release-review.json` with `"enforcement": "report-only"`, annotates the
+blockers in the job log and summary, and exits 0, so a CVE published upstream
+after a change does not turn `CI acceptance` red for that change. Tag runs,
+`release` events, and runs of `release.yml` or `container-release.yml`
+(including the CI run they call) **enforce** the gate and fail on any blocker,
+whatever mode was requested; so does a manual or scheduled run, and any run
+outside GitHub Actions. `--mode` (or `BHF_IMAGE_SCAN_MODE`) selects `auto`, the
+default, `enforce` or `report-only`. A scan that did not run, or ran against an
+invalid database or one built more than seven days earlier, fails in every
+mode.
+
+`.github/workflows/image-scan.yml` scans the core, Ada and full images daily.
+When it finds blockers it opens one issue labelled `image-scan`, or updates the
+open one, and comments on it when the blocker list changes. A manual run with
+`seed_blocker` adds a synthetic blocker named `SEEDED-IMAGE-SCAN-BLOCKER`, to
+check that a first run opens the issue and a second run updates it; close the
+issue afterwards.
+
 ## Running and consuming the checks
 
 Run the complete policy and shell-behavior regression suite on Linux without
