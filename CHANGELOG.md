@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An installed bhf stages its embedded harness runtimes once, atomically, in
+  `<user cache>/bhf/runtime-<sha256>/` and reuses them. It wrote them to a
+  temporary directory it never removed, which generated Makefiles and
+  capsules named, so those no longer built once `/tmp` was cleaned.
 - The post-fuzz MSan and TSan corpus replays run each input for at most
   `min(--timeout, 30 s)`, once if it times out. An input that hung under one
   replay is skipped by the other, and a harness's replay stops at its

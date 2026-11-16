@@ -4,17 +4,24 @@
 //!
 //! Release archives carry these directories beside the executable. Installers,
 //! however, install only the executable, so every tracked runtime source is also
-//! embedded in the CLI and materialized into a private temporary directory on
-//! first use. This keeps generated harnesses independent of the build machine's
-//! source checkout.
+//! embedded in the CLI and materialized on first use into
+//! `<user cache>/bhf/runtime-<sha256>/`, named by the content's digest. The
+//! directory outlives the run: the Makefiles and capsules of generated
+//! harnesses name files in it, and a later run of the same bhf reuses it.
+//! (It was a temporary directory that was never removed, which a cleaned
+//! `/tmp` took away from under those Makefiles.)
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 type EmbeddedFile = (&'static str, &'static [u8]);
 
-static EMBEDDED_ROOT: OnceLock<Result<tempfile::TempDir, String>> = OnceLock::new();
+static EMBEDDED_ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// The file a staged runtime directory holds once every runtime file is in it.
+const STAGED_MARKER: &str = ".bhf-runtime-complete";
 
 const EMBEDDED_FILES: &[EmbeddedFile] = &[
     (
@@ -212,17 +219,69 @@ fn embedded_root() -> Option<&'static Path> {
         .get_or_init(stage_embedded)
         .as_ref()
         .ok()
-        .map(|dir| dir.path())
+        .map(PathBuf::as_path)
 }
 
-fn stage_embedded() -> Result<tempfile::TempDir, String> {
-    let dir = tempfile::Builder::new()
-        .prefix("bhf-runtime-")
-        .tempdir()
-        .map_err(|error| format!("create embedded runtime directory: {error}"))?;
+/// Stage the embedded runtimes in the user's cache, else, with no cache
+/// directory to use, in a temporary directory that lasts as long as `/tmp`.
+fn stage_embedded() -> Result<PathBuf, String> {
+    match crate::msvc_cc::per_user_cache_dir(cfg!(windows), &|name| std::env::var(name).ok()) {
+        Some(cache) => stage_embedded_in(&cache.join("bhf")),
+        None => {
+            let dir = tempfile::Builder::new()
+                .prefix("bhf-runtime-")
+                .tempdir()
+                .map_err(|error| format!("create embedded runtime directory: {error}"))?
+                .keep();
+            write_embedded(&dir)?;
+            Ok(dir)
+        }
+    }
+}
 
+/// `<base>/runtime-<sha256 of the embedded files>`, written whole into a
+/// staging directory beside it and renamed into place, so a reader never
+/// sees half of it. A directory already there is reused once its files
+/// match the embedded bytes; one that does not match is replaced.
+fn stage_embedded_in(base: &Path) -> Result<PathBuf, String> {
+    let dir = base.join(format!("runtime-{}", embedded_digest()));
+    if holds_embedded(&dir) {
+        return Ok(dir);
+    }
+    fs::create_dir_all(base).map_err(|error| format!("create '{}': {error}", base.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".runtime-staging-")
+        .tempdir_in(base)
+        .map_err(|error| {
+            format!(
+                "create a staging directory in '{}': {error}",
+                base.display()
+            )
+        })?;
+    write_embedded(staging.path())?;
+    fs::write(staging.path().join(STAGED_MARKER), b"")
+        .map_err(|error| format!("write '{}': {error}", staging.path().display()))?;
+    if dir.exists() && !holds_embedded(&dir) {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    match fs::rename(staging.path(), &dir) {
+        Ok(()) => {
+            // Renamed away: nothing for the guard to remove.
+            let _ = staging.keep();
+            Ok(dir)
+        }
+        // Another bhf staged the same content first.
+        Err(_) if holds_embedded(&dir) => Ok(dir),
+        Err(error) => Err(format!(
+            "move the embedded runtimes into '{}': {error}",
+            dir.display()
+        )),
+    }
+}
+
+fn write_embedded(dir: &Path) -> Result<(), String> {
     for (relative, bytes) in EMBEDDED_FILES {
-        let destination = dir.path().join(relative);
+        let destination = dir.join(relative);
         let parent = destination
             .parent()
             .ok_or_else(|| format!("embedded runtime path has no parent: {relative}"))?;
@@ -231,8 +290,27 @@ fn stage_embedded() -> Result<tempfile::TempDir, String> {
         fs::write(&destination, bytes)
             .map_err(|error| format!("write '{}': {error}", destination.display()))?;
     }
+    Ok(())
+}
 
-    Ok(dir)
+/// Whether `dir` is a complete staging of the embedded runtimes, byte for byte.
+fn holds_embedded(dir: &Path) -> bool {
+    dir.join(STAGED_MARKER).is_file()
+        && EMBEDDED_FILES
+            .iter()
+            .all(|(relative, bytes)| fs::read(dir.join(relative)).is_ok_and(|held| held == *bytes))
+}
+
+/// SHA-256 over every embedded file's path and bytes, in hex.
+fn embedded_digest() -> String {
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in EMBEDDED_FILES {
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    corpus::hex_lower(&hasher.finalize())
 }
 
 #[cfg(test)]
@@ -241,7 +319,8 @@ mod tests {
 
     #[test]
     fn embedded_fallback_contains_every_runtime_lane() {
-        let staged = stage_embedded().expect("stage embedded runtimes");
+        let cache = tempfile::tempdir().unwrap();
+        let staged = stage_embedded_in(cache.path()).expect("stage embedded runtimes");
         for marker in [
             "ada_runtime/adafuzz.ads",
             "c_runtime/bhf_driver.c",
@@ -258,19 +337,43 @@ mod tests {
             "rust_runtime/Cargo.toml",
             "rust_runtime/src/lib.rs",
         ] {
-            assert!(staged.path().join(marker).is_file(), "missing {marker}");
+            assert!(staged.join(marker).is_file(), "missing {marker}");
         }
     }
 
     #[test]
     fn embedded_files_match_the_compiled_assets() {
-        let staged = stage_embedded().expect("stage embedded runtimes");
+        let cache = tempfile::tempdir().unwrap();
+        let staged = stage_embedded_in(cache.path()).expect("stage embedded runtimes");
         for (relative, expected) in EMBEDDED_FILES {
             assert_eq!(
-                fs::read(staged.path().join(relative)).expect("read staged runtime"),
+                fs::read(staged.join(relative)).expect("read staged runtime"),
                 *expected,
                 "staged bytes differ for {relative}"
             );
         }
+    }
+
+    /// The staging is named by its content, reused as long as it holds the
+    /// embedded bytes, and replaced when a file in it was changed.
+    #[test]
+    fn a_staged_runtime_is_reused_and_a_changed_one_replaced() {
+        let cache = tempfile::tempdir().unwrap();
+        let first = stage_embedded_in(cache.path()).unwrap();
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            format!("runtime-{}", embedded_digest())
+        );
+        let driver = first.join("c_runtime/bhf_driver.c");
+        let stamp = fs::metadata(&driver).unwrap().modified().unwrap();
+        assert_eq!(stage_embedded_in(cache.path()).unwrap(), first);
+        assert_eq!(fs::metadata(&driver).unwrap().modified().unwrap(), stamp);
+
+        fs::write(&driver, b"tampered").unwrap();
+        assert_eq!(stage_embedded_in(cache.path()).unwrap(), first);
+        assert!(holds_embedded(&first));
+        // Only the staging is left in the cache.
+        let entries: Vec<_> = fs::read_dir(cache.path()).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
     }
 }
