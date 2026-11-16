@@ -222,21 +222,34 @@ fn embedded_root() -> Option<&'static Path> {
         .map(PathBuf::as_path)
 }
 
-/// Stage the embedded runtimes in the user's cache, else, with no cache
-/// directory to use, in a temporary directory that lasts as long as `/tmp`.
+/// Stage the embedded runtimes in the user's cache, else (no cache directory,
+/// or one that cannot be written: a read-only container image) in a
+/// temporary directory that lasts as long as `/tmp`.
 fn stage_embedded() -> Result<PathBuf, String> {
-    match crate::msvc_cc::per_user_cache_dir(cfg!(windows), &|name| std::env::var(name).ok()) {
-        Some(cache) => stage_embedded_in(&cache.join("bhf")),
-        None => {
-            let dir = tempfile::Builder::new()
-                .prefix("bhf-runtime-")
-                .tempdir()
-                .map_err(|error| format!("create embedded runtime directory: {error}"))?
-                .keep();
-            write_embedded(&dir)?;
-            Ok(dir)
+    stage_embedded_with(crate::msvc_cc::per_user_cache_dir(cfg!(windows), &|name| {
+        std::env::var(name).ok()
+    }))
+}
+
+fn stage_embedded_with(cache: Option<PathBuf>) -> Result<PathBuf, String> {
+    if let Some(cache) = cache {
+        match stage_embedded_in(&cache.join("bhf")) {
+            Ok(dir) => return Ok(dir),
+            Err(error) => {
+                bhfeprintln!(
+                    "bhf: note: the embedded runtimes cannot be cached ({error}); staging \
+                     them in a temporary directory"
+                );
+            }
         }
     }
+    let dir = tempfile::Builder::new()
+        .prefix("bhf-runtime-")
+        .tempdir()
+        .map_err(|error| format!("create embedded runtime directory: {error}"))?
+        .keep();
+    write_embedded(&dir)?;
+    Ok(dir)
 }
 
 /// `<base>/runtime-<sha256 of the embedded files>`, written whole into a
@@ -375,5 +388,26 @@ mod tests {
         // Only the staging is left in the cache.
         let entries: Vec<_> = fs::read_dir(cache.path()).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "{entries:?}");
+    }
+
+    /// A cache directory that cannot be written (a read-only container image)
+    /// leaves the runtimes staged in a temporary directory, not missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_cache_falls_back_to_a_temporary_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = tempfile::tempdir().unwrap();
+        fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(cache.path().join("probe"), b"").is_ok() {
+            // Root ignores the permission bits: nothing to check.
+            fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let staged = stage_embedded_with(Some(cache.path().to_path_buf()));
+        fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let staged = staged.expect("staged in a temporary directory");
+        assert!(!staged.starts_with(cache.path()), "{}", staged.display());
+        assert!(staged.join("c_runtime/bhf_driver.c").is_file());
+        let _ = fs::remove_dir_all(&staged);
     }
 }
