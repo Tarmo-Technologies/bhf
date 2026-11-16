@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A Lua colon method runs on an instance of its class (from its `new`,
+  `create` or `init` constructor, else an empty table with the class as its
+  metatable), so a method that reads its fields is fuzzed: `Reader:average`'s
+  divide by zero is found. The harness passed the class table as `self`, so
+  such methods died on suppressed nil errors and object-oriented Lua reported
+  clean. A Lua target whose first inputs end at least 95% of the time in a
+  nil-value error is flagged `stub_executed` in run.json and run.md.
 - A host SEGV on a fixed device-register address is an environment result:
   `bhf auto` reads the constant-address pointer casts in the crash path's
   sources and headers (macros expanded), and a SEGV on one of those registers

@@ -536,6 +536,15 @@ fork-server binary. COBOL, Fortran, C#, JavaScript/TypeScript, Ruby, Lua, and PH
 likewise use their lane-specific pre-build/interpreter paths described above.
 All of these lanes bypass the Ada/C/C++ repair path.
 
+A Lua colon method (`function Reader:average(data)`) is called on an instance
+of its class: the table that defines it (the returned module, its field named
+for the class, or that global), built by its `new`, `create` or `init`
+constructor called with no arguments, else an empty table with the class as
+its metatable. The Lua driver counts how many of its first 1000 inputs end in a
+nil-value error; at 95% or more (over at least 20 inputs) the target's
+`run.json` entry carries `stub_executed` and its `run.md` row says
+`stub executed:`, since such a run exercised the error path, not the target.
+
 ## Repair Synthesis
 
 Build errors are matched against compiler diagnostics by the `build_classifier`

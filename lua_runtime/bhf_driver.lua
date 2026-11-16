@@ -125,12 +125,44 @@ end
 
 local run_one -- the generated harness entry (dofile'd below)
 
+-- How many of the first STATS_WINDOW inputs ended in a nil-value error, which
+-- bhf reads back (`lua_nil_errors.json` beside the harness): when nearly all
+-- do, the harness is calling the target without the object or state it needs.
+local STATS_WINDOW = 1000
+local stats_runs, stats_nil_errors, stats_written = 0, 0, false
+
+local function is_nil_error(err)
+  local msg = tostring(err)
+  return msg:find("a nil value", 1, true) ~= nil or msg:find("compare nil", 1, true) ~= nil
+end
+
+local function write_stats()
+  -- Only the fuzz loop's own count: a later replay of one input must not
+  -- overwrite it.
+  if stats_written or stats_runs == 0 or not os.getenv("BHF_FRAMED") then return end
+  local harness = os.getenv("BHF_HARNESS") or ""
+  local dir = harness:match("^(.*)[/\\]") or "."
+  local f = io.open(dir .. "/lua_nil_errors.json", "w")
+  if not f then return end
+  f:write(string.format('{"executions": %d, "nil_errors": %d}\n', stats_runs, stats_nil_errors))
+  f:close()
+  stats_written = stats_runs >= STATS_WINDOW
+end
+
 local function run_input(data)
   reset_prev()
   local ok, err = pcall(run_one, data)
+  if stats_runs < STATS_WINDOW then
+    stats_runs = stats_runs + 1
+    if not ok and is_nil_error(err) then stats_nil_errors = stats_nil_errors + 1 end
+    if stats_runs == STATS_WINDOW then write_stats() end
+  end
   if not ok then
     local cwe = bug_cwe(err)
-    if cwe then report_finding(cwe, err) end
+    if cwe then
+      write_stats()
+      report_finding(cwe, err)
+    end
   end
 end
 
@@ -178,7 +210,10 @@ if os.getenv("BHF_FRAMED") then
     count = count + 1
     -- Exponentially spaced early checkpoints keep short campaigns from losing
     -- all line evidence before the old 512-input checkpoint.
-    if (count & (count - 1)) == 0 or (count & 0x1FF) == 0 then dump_covered() end
+    if (count & (count - 1)) == 0 or (count & 0x1FF) == 0 then
+      dump_covered()
+      write_stats()
+    end
   end
 else
   local data
@@ -192,3 +227,4 @@ else
   flush_cov()
 end
 dump_covered()
+write_stats()

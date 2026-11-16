@@ -187,7 +187,15 @@ fn resolve_target(candidate: &Candidate) -> Result<(LuaFunction, String), String
         // back to the returned module table.
         format!("return (_G['{field}'] or (mod and mod['{field}']))(data)")
     } else if f.is_method {
-        format!("return mod['{field}'](mod, data)")
+        // A colon method reads its instance's fields: call it on an instance
+        // of its class, not on the class table.
+        let receiver = f.name.rsplit_once(':').map_or("", |(receiver, _)| receiver);
+        let class = receiver.rsplit('.').next().unwrap_or(receiver);
+        format!(
+            "local class = bhf_class(mod, '{class}', '{field}')\n  \
+             local self_ = bhf_instance(class)\n  \
+             return (self_['{field}'] or class['{field}'])(self_, data)"
+        )
     } else {
         format!("return mod['{field}'](data)")
     };
@@ -224,6 +232,31 @@ fn generate_harness(target_abs: &Path, load_roots: &[std::path::PathBuf], call: 
          \x20 entry:write(string.char(1))\n\
          \x20 entry:close()\n\
          \x20 bhf_target_entered = true\n\
+         end\n\
+         -- The table that defines a colon method: the module, its field named\n\
+         -- for the method's class, or that global.\n\
+         local function bhf_class(m, name, field)\n\
+         \x20 for _, t in ipairs({{m, type(m) == 'table' and m[name] or nil, _G[name]}}) do\n\
+         \x20   if type(t) == 'table' and type(t[field]) == 'function' then return t end\n\
+         \x20 end\n\
+         \x20 return m\n\
+         end\n\
+         -- An instance of class `t`: what its new/create/init constructor builds\n\
+         -- (called with no arguments, as a method and as a function), else an\n\
+         -- empty table with `t` as its metatable.\n\
+         local function bhf_instance(t)\n\
+         \x20 if type(t) ~= 'table' then return t end\n\
+         \x20 for _, name in ipairs({{'new', 'create', 'init'}}) do\n\
+         \x20   local ctor = t[name]\n\
+         \x20   if type(ctor) == 'function' then\n\
+         \x20     local ok, obj = pcall(ctor, t)\n\
+         \x20     if ok and type(obj) == 'table' then return obj end\n\
+         \x20     ok, obj = pcall(ctor)\n\
+         \x20     if ok and type(obj) == 'table' then return obj end\n\
+         \x20   end\n\
+         \x20 end\n\
+         \x20 if rawget(t, '__index') then return setmetatable({{}}, t) end\n\
+         \x20 return setmetatable({{}}, {{__index = t}})\n\
          end\n\
          return function(data)\n\
          \x20 bhf_mark_target_entry()\n\

@@ -308,6 +308,46 @@ struct TargetEntry<'a> {
     /// (omitted) for a target that never fuzzed.
     #[serde(skip_serializing_if = "Option::is_none")]
     behavioral_oracles: Option<BehavioralOracles>,
+    /// Nearly every input the driver ran ended in a nil-value error: the
+    /// harness most likely calls the target without the object or state it
+    /// needs, so the run exercised the error path, not the target. Omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stub_executed: Option<StubExecuted>,
+}
+
+/// The share of a target's first inputs that ended in a nil-value error, when
+/// it is at least [`STUB_EXECUTED_PERCENT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StubExecuted {
+    executions: u64,
+    nil_errors: u64,
+    note: String,
+}
+
+/// The share of nil-value errors at which a target is flagged.
+const STUB_EXECUTED_PERCENT: u64 = 95;
+/// Fewer inputs than this say nothing either way.
+const STUB_EXECUTED_MIN_RUNS: u64 = 20;
+
+/// [`StubExecuted`] from the counts the Lua driver writes beside the harness
+/// (`lua_nil_errors.json`, over its first 1000 inputs).
+fn target_stub_executed(harness_dir: &std::path::Path) -> Option<StubExecuted> {
+    let bytes = std::fs::read(harness_dir.join("lua_nil_errors.json")).ok()?;
+    let counts: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let executions = counts.get("executions")?.as_u64()?;
+    let nil_errors = counts.get("nil_errors")?.as_u64()?;
+    let flagged = executions >= STUB_EXECUTED_MIN_RUNS
+        && nil_errors.saturating_mul(100) >= executions.saturating_mul(STUB_EXECUTED_PERCENT);
+    flagged.then(|| StubExecuted {
+        executions,
+        nil_errors,
+        note: format!(
+            "{nil_errors} of the first {executions} inputs ended in a nil-value error, so \
+             the harness most likely calls the target without the object or state it \
+             needs; a clean result here says nothing about the target"
+        ),
+    })
 }
 
 /// Which behavioral sink oracles a fuzzed target ran with, and why.
@@ -1575,6 +1615,7 @@ pub fn write_reports_with_output_limit(
             },
             lanes: crate::auto::lanes::read(&r.harness_dir),
             behavioral_oracles: target_behavioral_oracles(r),
+            stub_executed: target_stub_executed(&r.harness_dir),
         })
         .collect();
 
@@ -3794,6 +3835,9 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
             oracles.status, oracles.reason
         ));
     }
+    if let Some(stub) = &t.stub_executed {
+        line.push_str(&format!("  [!] stub executed: {}", stub.note));
+    }
     line
 }
 
@@ -4033,6 +4077,28 @@ mod tests {
         assert!(unforced_record.get("forced").is_none());
         assert!(unforced_record.get("history").is_none());
         assert_eq!(unforced_record["actionability"]["confidence"], "high");
+    }
+
+    /// A Lua target is flagged when at least 95% of its first inputs ended in
+    /// a nil-value error, and not below that or on too few inputs.
+    #[test]
+    fn a_target_whose_inputs_nearly_all_hit_nil_is_flagged_stub_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let counts = |executions: u64, nil_errors: u64| {
+            std::fs::write(
+                dir.path().join("lua_nil_errors.json"),
+                serde_json::json!({"executions": executions, "nil_errors": nil_errors}).to_string(),
+            )
+            .unwrap();
+            target_stub_executed(dir.path())
+        };
+        let flagged = counts(1000, 990).expect("99% is flagged");
+        assert!(flagged.note.starts_with("990 of the first 1000 inputs"));
+        assert!(counts(1000, 950).is_some());
+        assert!(counts(1000, 949).is_none());
+        assert!(counts(10, 10).is_none(), "too few inputs");
+        std::fs::remove_file(dir.path().join("lua_nil_errors.json")).unwrap();
+        assert!(target_stub_executed(dir.path()).is_none());
     }
 
     #[test]
