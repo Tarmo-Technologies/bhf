@@ -2571,6 +2571,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_windows_cmplog.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_work_dir_reuse.rs",
       "license": "Apache-2.0"
     },

@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The C driver's runtime cmplog works on Windows: a native Windows harness
+  appends its `{"e":"cmplog",…}` records to the run's log through a
+  `FILE_APPEND_DATA` handle, so `bhf auto` writes a learned dictionary for
+  it, WinAFL campaigns included. It was compiled out. A comparison's site is
+  now limited to the executable's own image there, as on ELF.
 - A standalone Windows C harness built at `-O0` no longer faults on every
   input in `bhf_cmp_buf`: the driver's runtime callbacks (`BHF_NOINSTR`) are
   not address-checked on Windows, as `BHF_NOCOV`'s already were, since ASan's
