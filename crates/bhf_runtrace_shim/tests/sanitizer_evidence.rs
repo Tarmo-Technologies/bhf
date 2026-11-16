@@ -235,7 +235,14 @@ fn a_read_past_the_input_is_reported_the_same_with_and_without_the_shim() {
         eprintln!("skipping: shim cdylib not built (cargo build -p bhf_runtrace_shim)");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-asan-input-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-asan-input-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let harness = dir.join("harness.c");

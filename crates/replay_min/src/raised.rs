@@ -278,12 +278,17 @@ mod tests {
 
     /// Line maps that put instrumented line 16 of widgets.adb at source
     /// line 8.
-    fn widget_line_maps() -> (PathBuf, SourceLineMaps) {
+    fn widget_line_maps() -> (tempfile::TempDir, PathBuf, SourceLineMaps) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-raised-maps-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-raised-maps-{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("widgets.adb.bhf-lines.json"),
@@ -292,7 +297,7 @@ mod tests {
         .unwrap();
         let maps = SourceLineMaps::load(&dir);
         assert!(!maps.is_empty());
-        (dir, maps)
+        (dir_tmp, dir, maps)
     }
 
     #[test]
@@ -322,7 +327,7 @@ mod tests {
     /// (instrumented) line, which the line maps put back at the source line.
     #[test]
     fn a_runtime_check_is_located_by_its_message_on_the_source_line() {
-        let (dir, maps) = widget_line_maps();
+        let (_dir_guard, dir, maps) = widget_line_maps();
         let raised = raised_exceptions(&[handled_check_testcase()], &maps);
         assert_eq!(raised.len(), 1, "{raised:?}");
         let exception = &raised[0];

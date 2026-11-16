@@ -1235,7 +1235,7 @@ mod tests {
 
     #[test]
     fn emit_creates_finding_directory() {
-        let root = temp_dir("directory");
+        let (_root_guard, root) = temp_dir("directory");
         let emitter = FindingEmitter::new(root.clone());
 
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
@@ -1245,7 +1245,7 @@ mod tests {
 
     #[test]
     fn emit_writes_testcase_bin_with_exact_input_bytes() {
-        let root = temp_dir("testcase-bin");
+        let (_root_guard, root) = temp_dir("testcase-bin");
         let emitter = FindingEmitter::new(root.clone());
 
         let id = emitter.emit(b"\x00\x01bad", &testcase(), 0).unwrap();
@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn findings_record_the_harness_format_they_were_found_with() {
-        let root = temp_dir("format-version");
+        let (_root_guard, root) = temp_dir("format-version");
         let emitter = FindingEmitter::new(root.clone()).with_harness_format_version(Some(3));
         let id = emitter.emit(b"abc", &testcase(), 0).unwrap();
         let record: serde_json::Value = serde_json::from_slice(
@@ -1318,7 +1318,7 @@ mod tests {
     /// input format, so inputs kept from another format are recognised.
     #[test]
     fn a_finding_records_the_harness_format_in_the_corpus_metadata() {
-        let root = temp_dir("corpus-format");
+        let (_root_guard, root) = temp_dir("corpus-format");
         let emitter = FindingEmitter::with_metadata(
             root.clone(),
             "H-C0001".to_owned(),
@@ -1361,7 +1361,7 @@ mod tests {
     /// its own format.
     #[test]
     fn a_pass_stamps_a_new_corpus_at_its_start_and_every_corpus_at_its_end() {
-        let root = temp_dir("corpus-pass-format");
+        let (_root_guard, root) = temp_dir("corpus-pass-format");
         let emitter = |version: u32| {
             FindingEmitter::with_metadata(
                 root.clone(),
@@ -1427,7 +1427,7 @@ mod tests {
 
     #[test]
     fn emit_writes_decoded_json_with_input_size() {
-        let root = temp_dir("decoded");
+        let (_root_guard, root) = temp_dir("decoded");
         let emitter = FindingEmitter::new(root.clone());
 
         let id = emitter.emit(b"abcdef", &testcase(), 0).unwrap();
@@ -1445,7 +1445,7 @@ mod tests {
 
     #[test]
     fn emit_writes_lightweight_input_provenance() {
-        let root = temp_dir("decoded-provenance");
+        let (_root_guard, root) = temp_dir("decoded-provenance");
         let emitter = FindingEmitter::new(root.clone());
         let input = b"\x00\x01bad";
 
@@ -1465,7 +1465,7 @@ mod tests {
 
     #[test]
     fn emit_writes_finding_json_with_signature_hex() {
-        let root = temp_dir("finding-json");
+        let (_root_guard, root) = temp_dir("finding-json");
         let emitter = FindingEmitter::new(root.clone());
         let testcase = testcase();
         let expected = compute_signature(&testcase, &testcase.handlers[0]).hex();
@@ -1487,7 +1487,7 @@ mod tests {
 
     #[test]
     fn emit_populates_rule_id_and_exception_block_from_classification() {
-        let root = temp_dir("rule-id-and-exception");
+        let (_root_guard, root) = temp_dir("rule-id-and-exception");
         let emitter = FindingEmitter::new(root.clone());
         let testcase = testcase();
 
@@ -1507,7 +1507,7 @@ mod tests {
 
     #[test]
     fn emit_marks_mock_based_ada_finding_lab_only() {
-        let root = temp_dir("ada-mock-actionability");
+        let (_root_guard, root) = temp_dir("ada-mock-actionability");
         let emitter =
             FindingEmitter::new(root.clone()).with_mode(actionability::RunMode::Attacking);
         let mut testcase = testcase();
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn emit_tags_swallowed_predefined_with_swallowed_check_tier() {
-        let root = temp_dir("tier-swallowed-check");
+        let (_root_guard, root) = temp_dir("tier-swallowed-check");
         let emitter = FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let value: serde_json::Value = serde_json::from_str(
@@ -1548,7 +1548,7 @@ mod tests {
 
     #[test]
     fn emit_records_unhandled_top_level_as_real_fault() {
-        let root = temp_dir("tier-real-fault");
+        let (_root_guard, root) = temp_dir("tier-real-fault");
         let emitter = FindingEmitter::new(root.clone());
         let mut testcase = testcase();
         // An exception that escaped the target unhandled to the harness top
@@ -1579,7 +1579,7 @@ mod tests {
 
     #[test]
     fn emit_returns_finding_id_with_short_sig_prefix() {
-        let root = temp_dir("id");
+        let (_root_guard, root) = temp_dir("id");
         let emitter = FindingEmitter::new(root);
         let testcase = testcase();
         let signature = compute_signature(&testcase, &testcase.handlers[0]).hex();
@@ -1591,7 +1591,7 @@ mod tests {
 
     #[test]
     fn emit_allocates_exclusively_and_never_overwrites_a_taken_ordinal() {
-        let root = temp_dir("alloc");
+        let (_root_guard, root) = temp_dir("alloc");
         let emitter = FindingEmitter::new(root.clone());
         let testcase = testcase();
         let signature = compute_signature(&testcase, &testcase.handlers[0]).hex();
@@ -1637,14 +1637,19 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-finding-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-finding-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     fn testcase_with_message(message: &str) -> Testcase {
@@ -1655,7 +1660,7 @@ mod tests {
 
     #[test]
     fn emit_remaps_exception_line_to_original_source() {
-        let root = temp_dir("remap");
+        let (_root_guard, root) = temp_dir("remap");
         let instr = root.join("src_instrumented");
         fs::create_dir_all(&instr).unwrap();
         // Anchor (62 -> 56): an instrumented line 646 maps to 56 + (646-62) = 640.
@@ -1696,7 +1701,7 @@ mod tests {
 
     #[test]
     fn emit_without_line_maps_leaves_message_unchanged() {
-        let root = temp_dir("no-remap");
+        let (_root_guard, root) = temp_dir("no-remap");
         let emitter = FindingEmitter::new(root.clone());
         let id = emitter
             .emit(
@@ -1724,7 +1729,7 @@ mod tests {
     #[test]
     fn emit_sanitizer_crash_writes_cluster_fields() {
         use crate::sanitizer::{Sanitizer, SanitizerReport, StackFrame};
-        let root = temp_dir("cluster-sanitizer");
+        let (_root_guard, root) = temp_dir("cluster-sanitizer");
         let emitter = super::FindingEmitter::new(root.clone());
         let report = SanitizerReport {
             sanitizer: Some(Sanitizer::AddressSanitizer),
@@ -1776,7 +1781,7 @@ mod tests {
         // An on-target CPU fault ran no sanitizer: the finding must NOT claim one
         // (#78) — no `sanitizer` key, and the exception name is built from the
         // kind, not a synthesized `asan` tag.
-        let root = temp_dir("no-sanitizer");
+        let (_root_guard, root) = temp_dir("no-sanitizer");
         let emitter = super::FindingEmitter::new(root.clone());
         let report = SanitizerReport {
             sanitizer: None,
@@ -1833,7 +1838,7 @@ mod tests {
     #[test]
     fn emit_sanitizer_crash_writes_actionability_object() {
         use crate::sanitizer::{Sanitizer, SanitizerReport, StackFrame};
-        let root = temp_dir("sanitizer-actionability");
+        let (_root_guard, root) = temp_dir("sanitizer-actionability");
         let emitter =
             super::FindingEmitter::new(root.clone()).with_mode(actionability::RunMode::Attacking);
         let report = SanitizerReport {
@@ -1896,7 +1901,7 @@ mod tests {
     /// inside the work dir is recorded relative to it.
     #[test]
     fn a_harness_inside_the_work_dir_is_recorded_relative_to_it() {
-        let root = temp_dir("fixture-relative");
+        let (_root_guard, root) = temp_dir("fixture-relative");
         let harness = root.join("harnesses").join("H-1").join("main");
         let value = fixture_recorded_for(&root, &harness.display().to_string());
         assert_eq!(value["fixture_path"], "harnesses/H-1/main");
@@ -1904,7 +1909,7 @@ mod tests {
 
     #[test]
     fn a_harness_outside_the_work_dir_keeps_its_path() {
-        let root = temp_dir("fixture-outside");
+        let (_root_guard, root) = temp_dir("fixture-outside");
         let value = fixture_recorded_for(&root, "/opt/prebuilt/harness/main");
         assert_eq!(value["fixture_path"], "/opt/prebuilt/harness/main");
         let value = fixture_recorded_for(&root, "examples/widget/pkg.adb");
@@ -1989,7 +1994,7 @@ mod tests {
     fn a_resource_leak_finding_is_named_for_the_oracle_of_its_harness() {
         use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 
-        let root = temp_dir("oracle-leak-names");
+        let (_root_guard, root) = temp_dir("oracle-leak-names");
         let leak = |oracle: &str| OracleHit {
             oracle_name: oracle.to_owned(),
             rule_id: "BHF-306".to_owned(),
@@ -2034,7 +2039,7 @@ mod tests {
     fn emit_oracle_hit_writes_runtime_evidence() {
         use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 
-        let root = temp_dir("oracle-hit");
+        let (_root_guard, root) = temp_dir("oracle-hit");
         let emitter = super::FindingEmitter::with_metadata(
             root.clone(),
             "H-path".to_owned(),
@@ -2085,7 +2090,7 @@ mod tests {
     fn emit_oracle_hit_distinct_assert_sites_cluster_separately_and_populate_sink() {
         use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 
-        let root = temp_dir("oracle-assert-sites");
+        let (_root_guard, root) = temp_dir("oracle-assert-sites");
         let emitter = super::FindingEmitter::with_metadata(
             root.clone(),
             "H-assert".to_owned(),
@@ -2141,7 +2146,7 @@ mod tests {
     fn emit_oracle_hit_same_assert_site_clusters_together() {
         use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 
-        let root = temp_dir("oracle-assert-same");
+        let (_root_guard, root) = temp_dir("oracle-assert-same");
         let emitter = super::FindingEmitter::new(root.clone());
         let hit = OracleHit {
             oracle_name: "native-assertion-contract".to_owned(),
@@ -2207,7 +2212,7 @@ mod tests {
 
     #[test]
     fn emit_extension_finding_writes_confirmation_extension() {
-        let root = temp_dir("ext-confirmation");
+        let (_root_guard, root) = temp_dir("ext-confirmation");
         let emitter = super::FindingEmitter::with_metadata(
             root.clone(),
             "H-ext".to_owned(),
@@ -2241,7 +2246,7 @@ mod tests {
 
     #[test]
     fn emit_extension_finding_signature_is_stable_across_identical_violations() {
-        let root = temp_dir("ext-stable-sig");
+        let (_root_guard, root) = temp_dir("ext-stable-sig");
         let emitter = super::FindingEmitter::new(root.clone());
         let finding = extension_finding("oracle.path-escape", "../etc/passwd");
         let id_a = emitter
@@ -2261,7 +2266,7 @@ mod tests {
 
     #[test]
     fn emit_extension_finding_stamps_executable_config_hashes_and_caps() {
-        let root = temp_dir("ext-provenance");
+        let (_root_guard, root) = temp_dir("ext-provenance");
         let emitter = super::FindingEmitter::new(root.clone());
         let id = emitter
             .emit_extension_finding(
@@ -2278,7 +2283,7 @@ mod tests {
 
     #[test]
     fn emit_extension_finding_distinct_sites_cluster_separately() {
-        let root = temp_dir("ext-distinct-sites");
+        let (_root_guard, root) = temp_dir("ext-distinct-sites");
         let emitter = super::FindingEmitter::new(root.clone());
         let id_a = emitter
             .emit_extension_finding(b"a", &extension_finding("oracle.path-escape", "../a"))
@@ -2300,7 +2305,7 @@ mod tests {
 
     #[test]
     fn emit_writes_cluster_fields_for_ada_path() {
-        let root = temp_dir("cluster-ada");
+        let (_root_guard, root) = temp_dir("cluster-ada");
         let emitter = super::FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -2321,7 +2326,7 @@ mod tests {
     #[test]
     fn emit_sanitizer_crash_falls_back_when_only_noise() {
         use crate::sanitizer::{Sanitizer, SanitizerReport, StackFrame};
-        let root = temp_dir("cluster-fallback");
+        let (_root_guard, root) = temp_dir("cluster-fallback");
         let emitter = super::FindingEmitter::new(root.clone());
         let report = SanitizerReport {
             sanitizer: Some(Sanitizer::AddressSanitizer),
@@ -2352,7 +2357,7 @@ mod tests {
 
     #[test]
     fn new_records_carry_the_v1_envelope() {
-        let root = temp_dir("v1-envelope");
+        let (_root_guard, root) = temp_dir("v1-envelope");
         let emitter = FindingEmitter::new(root.clone());
         let report = crate::sanitizer::SanitizerReport {
             sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
@@ -2598,7 +2603,7 @@ mod tests {
     /// group and one per-run dedupe key.
     #[test]
     fn frameless_ubsan_findings_at_distinct_sites_get_distinct_ids_and_keys() {
-        let root = temp_dir("frameless-sites");
+        let (_root_guard, root) = temp_dir("frameless-sites");
         let a = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 3));
         let b = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 9));
         let c = emit_parsed(&root, &frameless_missing_return("/src/widget/b.c", 3));
@@ -2625,7 +2630,7 @@ mod tests {
     /// out and whether the compiler got a relative or an absolute path.
     #[test]
     fn same_named_files_in_different_directories_are_different_sites() {
-        let root = temp_dir("same-basename-sites");
+        let (_root_guard, root) = temp_dir("same-basename-sites");
         let a = emit_parsed(&root, &frameless_missing_return("/src/a/util.c", 3));
         let b = emit_parsed(&root, &frameless_missing_return("/src/b/util.c", 3));
         assert_ne!(a["signature"], b["signature"]);
@@ -2671,7 +2676,7 @@ mod tests {
     /// dedup set from disk recognizes the same crash and only that crash.
     #[test]
     fn run_dedupe_key_of_the_record_matches_the_reports_runtime_key() {
-        let root = temp_dir("dedupe-roundtrip");
+        let (_root_guard, root) = temp_dir("dedupe-roundtrip");
         for stderr in [
             frameless_missing_return("/src/widget/a.c", 3),
             "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
@@ -2701,7 +2706,7 @@ mod tests {
     /// recorded and separates two crash sites of one harness.
     #[test]
     fn frameless_crashes_are_grouped_per_harness_and_per_pc() {
-        let root = temp_dir("frameless-scope");
+        let (_root_guard, root) = temp_dir("frameless-scope");
         let signal = |pc_offset: Option<u64>| crate::sanitizer::SanitizerReport {
             sanitizer: None,
             kind: "fatal-signal".to_owned(),
@@ -2750,7 +2755,7 @@ mod tests {
     /// are evidence about the object, recorded separately and not hashed.
     #[test]
     fn allocation_and_free_frames_do_not_change_the_signature() {
-        let root = temp_dir("alloc-not-hashed");
+        let (_root_guard, root) = temp_dir("alloc-not-hashed");
         let uaf = |freer: &str| {
             format!(
                 "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x504000000054\n\
@@ -2790,7 +2795,7 @@ mod tests {
 
     #[test]
     fn finding_record_carries_structured_access_location_and_check() {
-        let root = temp_dir("structured-access");
+        let (_root_guard, root) = temp_dir("structured-access");
         let heap = emit_parsed(
             &root,
             "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000015 at pc 0x5 bp 0x6 sp 0x7\n\

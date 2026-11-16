@@ -599,7 +599,12 @@ mod tests {
     /// the child sees the end of its input.
     #[test]
     fn fed_input_reaches_the_child_and_is_closed() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-feed-stdin-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

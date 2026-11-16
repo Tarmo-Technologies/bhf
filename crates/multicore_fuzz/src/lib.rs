@@ -1169,7 +1169,12 @@ mod tests {
         // WRITING anywhere. Holding the writer open reproduces deterministically
         // what a loaded CI runner hits by accident when one thread is still
         // finishing a write while another forks.
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-mc-etxtbsy-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -1279,14 +1284,19 @@ mod tests {
         assert_eq!(sanitize_worker_namespace(""), "harness");
     }
 
-    fn tempdir(name: &str) -> PathBuf {
+    fn tempdir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-multicore-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-multicore-{name}-{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     #[test]
@@ -1318,7 +1328,7 @@ mod tests {
         // is guaranteed to finish last: an unsorted report would lead with
         // worker 1, making both the campaign summary artifact and every
         // consumer that indexes `per_worker[i]` nondeterministic.
-        let work = tempdir("worker-order");
+        let (_work_guard, work) = tempdir("worker-order");
         let script = work.join("stagger.sh");
         std::fs::write(
             &script,
@@ -1363,7 +1373,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         // argv is `fuzz <worker_dir> ...`; record what the worker saw.
-        let work = tempdir("defer");
+        let (_work_guard, work) = tempdir("defer");
         let script = work.join("record-env.sh");
         std::fs::write(
             &script,
@@ -1414,7 +1424,7 @@ mod tests {
 
     #[test]
     fn run_multicore_rejects_missing_bhf_bin() {
-        let work = tempdir("missing-bin");
+        let (_work_guard, work) = tempdir("missing-bin");
         let config = MulticoreConfig {
             work_dir: work,
             harness_id: "H".to_owned(),
@@ -1437,7 +1447,7 @@ mod tests {
 
     #[test]
     fn run_multicore_rejects_zero_workers() {
-        let work = tempdir("zero");
+        let (_work_guard, work) = tempdir("zero");
         let config = MulticoreConfig {
             work_dir: work,
             harness_id: "H".to_owned(),
@@ -1461,13 +1471,13 @@ mod tests {
 
     #[test]
     fn count_findings_returns_zero_for_missing_dir() {
-        let dir = tempdir("count-zero");
+        let (_dir_guard, dir) = tempdir("count-zero");
         assert_eq!(count_findings(&dir), 0);
     }
 
     #[test]
     fn count_findings_counts_finding_subdirectories() {
-        let dir = tempdir("count");
+        let (_dir_guard, dir) = tempdir("count");
         let findings = dir.join("results").join("findings");
         std::fs::create_dir_all(findings.join("F-0001")).unwrap();
         std::fs::create_dir_all(findings.join("F-0002")).unwrap();
@@ -1476,7 +1486,7 @@ mod tests {
 
     #[test]
     fn unique_finding_count_dedups_across_workers_by_cluster_key() {
-        let dir = tempdir("uniq");
+        let (_dir_guard, dir) = tempdir("uniq");
         for worker in 0..2 {
             let worker_dir = dir.join(format!("worker-{worker}"));
             let findings_dir = worker_dir.join("results").join("findings");
@@ -1701,7 +1711,7 @@ mod tests {
     fn run_multicore_two_workers_with_bin_true_yields_two_started_workers() {
         // /bin/true exits 0 immediately; we just want to verify
         // orchestration scaffolding spawns + reaps the right number.
-        let work = tempdir("true-bin");
+        let (_work_guard, work) = tempdir("true-bin");
         let build = work.join("build").join("H-TEST");
         std::fs::create_dir_all(&build).unwrap();
         let config = MulticoreConfig {
@@ -1728,7 +1738,7 @@ mod tests {
     fn run_multicore_syncs_worker_corpus_and_writes_manifest() {
         use std::os::unix::fs::PermissionsExt;
 
-        let work = tempdir("sync-manifest");
+        let (_work_guard, work) = tempdir("sync-manifest");
         let build = work.join("build").join("H-SYNC");
         let shared_queue = work.join("corpus").join("H-SYNC").join("queue");
         std::fs::create_dir_all(&build).unwrap();
@@ -1806,7 +1816,7 @@ printf "worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/worker-
     fn unchecked_inputs_go_to_the_workers_and_come_back_unchecked_not_queued() {
         use std::os::unix::fs::PermissionsExt;
 
-        let work = tempdir("unchecked");
+        let (_work_guard, work) = tempdir("unchecked");
         std::fs::create_dir_all(work.join("build").join("H-HELD")).unwrap();
         std::fs::create_dir_all(work.join("corpus/H-HELD/queue")).unwrap();
         let held = corpus::manager::unchecked_dir(&work, "H-HELD");
@@ -2210,7 +2220,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     fn a_stale_empty_worker_build_dir_is_refreshed() {
         // A failed earlier campaign left the worker's build dir created but
         // empty. Reusing it as-is fails every later retry.
-        let work = tempdir("stale-build");
+        let (_work_guard, work) = tempdir("stale-build");
         let build = work.join("build").join("H-STALE");
         std::fs::create_dir_all(&build).unwrap();
         executable_script(&build.join("main"), "#!/bin/sh\nexit 0\n");
@@ -2246,7 +2256,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     #[test]
     fn workers_get_the_harness_from_the_layout_dir_the_parent_resolved() {
         // `bhf auto` keeps the binary in `harnesses/<id>/`, not `build/<id>/`.
-        let work = tempdir("auto-layout");
+        let (_work_guard, work) = tempdir("auto-layout");
         let harness = work.join("harnesses").join("H-AUTO");
         std::fs::create_dir_all(&harness).unwrap();
         executable_script(&harness.join("main"), "#!/bin/sh\nexit 0\n");
@@ -2284,7 +2294,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     #[cfg(unix)]
     #[test]
     fn a_worker_copy_of_a_rebuilt_harness_is_replaced() {
-        let work = tempdir("rebuilt");
+        let (_work_guard, work) = tempdir("rebuilt");
         let harness = work.join("harnesses").join("H-REBUILT");
         std::fs::create_dir_all(&harness).unwrap();
         executable_script(&harness.join("main"), "#!/bin/sh\n# v1\nexit 0\n");
@@ -2371,7 +2381,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
         // Campaign 1 ran `build/<id>/main`. The parent's build dir is then
         // removed and the harness lives in `harnesses/<id>/`: the workers'
         // copies of the old build dir must not win their lookup.
-        let work = tempdir("moved-harness");
+        let (_work_guard, work) = tempdir("moved-harness");
         let id = "H-MOVED";
         let build = work.join("build").join(id);
         std::fs::create_dir_all(&build).unwrap();
@@ -2401,7 +2411,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     fn a_worker_copy_that_still_holds_an_executable_the_parent_dropped_is_replaced() {
         // The parent's build dir stays (not empty) but loses `main`; the
         // harness the parent resolves is now `harnesses/<id>/main`.
-        let work = tempdir("dropped-exe");
+        let (_work_guard, work) = tempdir("dropped-exe");
         let id = "H-DROPPED";
         let build = work.join("build").join(id);
         std::fs::create_dir_all(&build).unwrap();
@@ -2428,7 +2438,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     #[cfg(unix)]
     #[test]
     fn a_symlinked_harness_executable_reaches_the_worker_as_a_file() {
-        let work = tempdir("symlinked-exe");
+        let (_work_guard, work) = tempdir("symlinked-exe");
         let id = "H-LINK";
         let build = work.join("build").join(id);
         std::fs::create_dir_all(&build).unwrap();
@@ -2441,7 +2451,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
 
     #[test]
     fn a_harness_dir_outside_the_work_dir_is_refused() {
-        let work = tempdir("escape");
+        let (_work_guard, work) = tempdir("escape");
         let config = MulticoreConfig {
             work_dir: work.clone(),
             harness_id: "H-ESC".to_owned(),
@@ -2465,7 +2475,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
 
     #[test]
     fn a_mirrored_tree_matches_its_source_until_either_side_changes() {
-        let work = tempdir("tree-match");
+        let (_work_guard, work) = tempdir("tree-match");
         let src = work.join("src");
         std::fs::create_dir_all(src.join("obj")).unwrap();
         std::fs::write(src.join("main"), b"binary v1").unwrap();
@@ -2488,7 +2498,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     #[cfg(unix)]
     #[test]
     fn a_campaign_starts_without_duplicates_of_removed_findings_and_counts_new_ones() {
-        let work = tempdir("orphaned-duplicates");
+        let (_work_guard, work) = tempdir("orphaned-duplicates");
         let id = "H-ORPHAN";
         let build = work.join("build").join(id);
         std::fs::create_dir_all(&build).unwrap();
@@ -2547,7 +2557,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     #[cfg(unix)]
     #[test]
     fn a_failing_worker_reports_the_tail_of_its_stderr() {
-        let work = tempdir("stderr-tail");
+        let (_work_guard, work) = tempdir("stderr-tail");
         let script = work.join("fails.sh");
         executable_script(
             &script,
@@ -2588,7 +2598,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     fn a_worker_writing_lots_of_stderr_is_not_blocked() {
         // Worker stderr used to be an undrained pipe: a worker that wrote more
         // than the pipe buffer blocked until the deadline killed it.
-        let work = tempdir("stderr-flood");
+        let (_work_guard, work) = tempdir("stderr-flood");
         let script = work.join("chatty.sh");
         executable_script(
             &script,
@@ -2621,7 +2631,7 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
         // A shell script that ignores its args and hangs forever.
         // We need this because /bin/sleep would error on our argv,
         // and /bin/true exits before the kill switch can trigger.
-        let work = tempdir("hang");
+        let (_work_guard, work) = tempdir("hang");
         let build = work.join("build").join("H-HANG");
         std::fs::create_dir_all(&build).unwrap();
         let script = work.join("hang.sh");

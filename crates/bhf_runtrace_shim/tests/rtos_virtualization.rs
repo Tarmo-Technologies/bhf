@@ -137,7 +137,14 @@ fn msgqreceive_delivers_bounded_fuzz_messages_and_reaches_a_byte_gated_branch() 
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-msgq-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-msgq-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("msgq.c");
     std::fs::write(&src, MSGQ_PROBE).unwrap();
@@ -202,7 +209,14 @@ fn semtake_unblocks_a_guarded_consumer_section() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-sem-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-sem-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("sem.c");
     std::fs::write(&src, SEM_PROBE).unwrap();
@@ -256,7 +270,14 @@ fn xqueuereceive_delivers_item_sized_fuzz_data_without_overrun() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-xq-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-xq-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("xq.c");
     std::fs::write(&src, XQUEUE_PROBE).unwrap();
@@ -308,7 +329,14 @@ fn cfe_sb_rcvmsg_delivers_a_fuzz_owned_message_buffer() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-cfe-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-cfe-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("cfe.c");
     std::fs::write(&src, CFE_PROBE).unwrap();
@@ -360,7 +388,14 @@ fn mmio_fixed_address_read_is_fuzz_controlled() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-mmio2-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-mmio2-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("mmio.c");
     std::fs::write(&src, MMIO_PROBE).unwrap();

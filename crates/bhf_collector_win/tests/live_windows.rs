@@ -229,7 +229,14 @@ fn replay_readiness_ack_and_clean_control_scaffold() {
     if !live_enabled() {
         return;
     }
-    let ready = std::env::temp_dir().join(format!("bhf-live-ready-{}", std::process::id()));
+    // Removed when this scope ends.
+    let ready_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let ready = ready_tmp
+        .path()
+        .join(format!("bhf-live-ready-{}", std::process::id()));
     let _ = std::fs::remove_file(&ready);
     // SAFETY: nextest runs each test in its own process, so this env mutation is
     // process-local and not observed by other tests.

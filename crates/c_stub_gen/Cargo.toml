@@ -9,3 +9,6 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true

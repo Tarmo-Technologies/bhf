@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn generate_fake_corba_writes_expected_files() {
-        let temp = temp_dir("write");
+        let (_temp_guard, temp) = temp_dir("write");
         let source_dir = temp.join("src_instrumented");
         fs::create_dir_all(&source_dir).expect("source dir is created");
         fs::write(
@@ -1133,13 +1133,20 @@ mod tests {
             .as_str()
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-fake-corba-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-fake-corba-{name}-{nonce}"));
         fs::create_dir_all(&dir).expect("temporary directory is created");
-        dir
+        (dir_tmp, dir)
     }
 }

@@ -48,3 +48,6 @@ path = "src/bin/bhf-daemon.rs"
 [[bin]]
 name = "daemon"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

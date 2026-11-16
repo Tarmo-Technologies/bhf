@@ -2767,7 +2767,14 @@ mod synth_tests {
              \x20   if (read_sensor() == 0x41414141) return 42;\n\
              \x20   return 0;\n}\n";
 
-        let dir = std::env::temp_dir().join(format!("bhf_fuzzstub_e2e_{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf_fuzzstub_e2e_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("fixture.c"), fixture).unwrap();
         std::fs::write(dir.join("stub_const.c"), &const_stub).unwrap();
@@ -2825,7 +2832,14 @@ mod synth_tests {
         }
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("bhf_stub_tu_{}_{n}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf_stub_tu_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let src = dir.join("stub_tu.c");
         // `enum json_error_code;` is forward-declared (INCOMPLETE) and the

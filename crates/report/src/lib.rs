@@ -5357,7 +5357,14 @@ mod tests {
 
     #[test]
     fn relativize_to_source_root_strips_prefix_everywhere() {
-        let dir = std::env::temp_dir().join(format!("bhf-relr-{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-relr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // The root as a run records it: resolved, without Windows' `\\?\`.
         let canonical = std::fs::canonicalize(&dir).unwrap();
@@ -5411,7 +5418,7 @@ mod tests {
 
     #[test]
     fn bounded_loader_does_not_read_or_generate_large_auxiliary_reproducer() {
-        let root = temp_dir("bounded-readonly");
+        let (_root_guard, root) = temp_dir("bounded-readonly");
         let finding_dir = root.join("F-1");
         write_finding(
             &finding_dir,
@@ -5428,7 +5435,7 @@ mod tests {
 
     #[test]
     fn bounded_reader_rejects_growth_after_file_is_opened() {
-        let root = temp_dir("bounded-growth");
+        let (_root_guard, root) = temp_dir("bounded-growth");
         let path = root.join("finding.json");
         fs::write(&path, br#"{"id":"F-1"}"#).unwrap();
         let mut file = fs::File::open(&path).unwrap();
@@ -5446,7 +5453,7 @@ mod tests {
 
     #[test]
     fn bounded_loader_caps_normalized_expansion() {
-        let root = temp_dir("bounded-normalized");
+        let (_root_guard, root) = temp_dir("bounded-normalized");
         write_finding(&root.join("F-1"), json!({"id": "F-1"}));
         let mut budget = bounded_budget();
         budget.max_normalized_bytes = 32;
@@ -5459,8 +5466,8 @@ mod tests {
     fn bounded_loader_rejects_symlinked_finding_inputs() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("bounded-symlink");
-        let outside = temp_dir("bounded-symlink-outside");
+        let (_root_guard, root) = temp_dir("bounded-symlink");
+        let (_outside_guard, outside) = temp_dir("bounded-symlink-outside");
         write_finding(&outside.join("F-out"), json!({"id": "F-out"}));
         symlink(outside.join("F-out"), root.join("F-link")).unwrap();
         assert!(matches!(
@@ -5468,7 +5475,7 @@ mod tests {
             Err(ReportError::UnsafeFindingInput { .. })
         ));
 
-        let root = temp_dir("bounded-file-symlink");
+        let (_root_guard, root) = temp_dir("bounded-file-symlink");
         let finding_dir = root.join("F-1");
         fs::create_dir(&finding_dir).unwrap();
         symlink(
@@ -5484,7 +5491,7 @@ mod tests {
 
     #[test]
     fn write_reports_emits_sorted_json_and_markdown() {
-        let root = temp_dir("emit");
+        let (_root_guard, root) = temp_dir("emit");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -5554,7 +5561,7 @@ mod tests {
 
     #[test]
     fn load_findings_adds_calibrated_confidence_when_missing() {
-        let root = temp_dir("confidence");
+        let (_root_guard, root) = temp_dir("confidence");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-confidence"),
@@ -5581,7 +5588,7 @@ mod tests {
 
     #[test]
     fn load_findings_preserves_explicit_confidence() {
-        let root = temp_dir("confidence-explicit");
+        let (_root_guard, root) = temp_dir("confidence-explicit");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-confidence"),
@@ -5600,7 +5607,7 @@ mod tests {
 
     #[test]
     fn load_findings_backfills_actionability_for_older_records() {
-        let root = temp_dir("actionability-backfill");
+        let (_root_guard, root) = temp_dir("actionability-backfill");
         write_finding(
             &root.join("F-0001-old"),
             json!({
@@ -5632,7 +5639,7 @@ mod tests {
 
     #[test]
     fn report_counts_include_actionability_verdict_and_impact() {
-        let root = temp_dir("actionability-counts");
+        let (_root_guard, root) = temp_dir("actionability-counts");
         write_finding(
             &root.join("F-0001-real"),
             json!({
@@ -5914,7 +5921,7 @@ mod tests {
 
     #[test]
     fn load_findings_preserves_non_calibrated_confidence_metadata() {
-        let root = temp_dir("confidence-explicit-shape");
+        let (_root_guard, root) = temp_dir("confidence-explicit-shape");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-confidence"),
@@ -5938,7 +5945,7 @@ mod tests {
 
     #[test]
     fn load_findings_preserves_sandbox_metadata_for_reports() {
-        let root = temp_dir("load-findings-sandbox");
+        let (_root_guard, root) = temp_dir("load-findings-sandbox");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001"),
@@ -5968,7 +5975,7 @@ mod tests {
 
     #[test]
     fn load_findings_uses_learned_confidence_model_when_requested() {
-        let root = temp_dir("confidence-learned");
+        let (_root_guard, root) = temp_dir("confidence-learned");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-confidence"),
@@ -5985,7 +5992,7 @@ mod tests {
 
     #[test]
     fn build_report_loads_confidence_model_from_options() {
-        let root = temp_dir("confidence-model-path");
+        let (_root_guard, root) = temp_dir("confidence-model-path");
         let findings = root.join("findings");
         let model_path = root.join("models/tenant-model.bin");
         write_finding(
@@ -6006,7 +6013,7 @@ mod tests {
 
     #[test]
     fn build_report_rejects_tampered_confidence_model_id() {
-        let root = temp_dir("confidence-model-tampered-id");
+        let (_root_guard, root) = temp_dir("confidence-model-tampered-id");
         let findings = root.join("findings");
         let model_path = root.join("models/tenant-model.bin");
         fs::create_dir_all(&findings).unwrap();
@@ -6026,7 +6033,7 @@ mod tests {
 
     #[test]
     fn build_report_rejects_incompatible_confidence_model_layout() {
-        let root = temp_dir("confidence-model-layout");
+        let (_root_guard, root) = temp_dir("confidence-model-layout");
         let findings = root.join("findings");
         let model_path = root.join("models/tenant-model.bin");
         fs::create_dir_all(&findings).unwrap();
@@ -6048,7 +6055,7 @@ mod tests {
 
     #[test]
     fn build_report_accepts_valid_cold_confidence_model() {
-        let root = temp_dir("confidence-model-cold");
+        let (_root_guard, root) = temp_dir("confidence-model-cold");
         let findings = root.join("findings");
         let model_path = root.join("models/tenant-model.bin");
         write_finding(
@@ -6077,7 +6084,7 @@ mod tests {
 
     #[test]
     fn build_report_preserves_explicit_confidence_with_model_path() {
-        let root = temp_dir("confidence-explicit-model");
+        let (_root_guard, root) = temp_dir("confidence-explicit-model");
         let findings = root.join("findings");
         let model_path = root.join("models/tenant-model.bin");
         write_finding(
@@ -6103,7 +6110,7 @@ mod tests {
 
     #[test]
     fn write_reports_emits_valid_sarif_when_requested() {
-        let root = temp_dir("sarif");
+        let (_root_guard, root) = temp_dir("sarif");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6170,7 +6177,7 @@ mod tests {
     /// the catalog CWE.
     #[test]
     fn sarif_result_names_a_lab_only_verdicts_reason() {
-        let root = temp_dir("sarif-verdict-reason");
+        let (_root_guard, root) = temp_dir("sarif-verdict-reason");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6219,7 +6226,7 @@ mod tests {
 
     #[test]
     fn sarif_result_cwe_is_the_findings_cwe_not_the_rules() {
-        let root = temp_dir("sarif-finding-cwe");
+        let (_root_guard, root) = temp_dir("sarif-finding-cwe");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6336,7 +6343,7 @@ mod tests {
 
     #[test]
     fn sarif_emits_rule_catalog_entry_for_each_finding_rule() {
-        let root = temp_dir("sarif-rule-catalog");
+        let (_root_guard, root) = temp_dir("sarif-rule-catalog");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6426,7 +6433,7 @@ mod tests {
 
     #[test]
     fn sarif_falls_back_to_generic_rule_when_classification_unmapped() {
-        let root = temp_dir("sarif-generic");
+        let (_root_guard, root) = temp_dir("sarif-generic");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6461,7 +6468,7 @@ mod tests {
 
     #[test]
     fn sarif_top25_finding_carries_top25_tag() {
-        let root = temp_dir("sarif-top25");
+        let (_root_guard, root) = temp_dir("sarif-top25");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6520,7 +6527,7 @@ mod tests {
 
     #[test]
     fn sarif_result_emits_rule_signature_in_partial_fingerprints() {
-        let root = temp_dir("rule-signature");
+        let (_root_guard, root) = temp_dir("rule-signature");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6559,7 +6566,7 @@ mod tests {
 
     #[test]
     fn sarif_iso_tr_24772_codes_each_emitted_as_separate_tag() {
-        let root = temp_dir("sarif-iso-tags");
+        let (_root_guard, root) = temp_dir("sarif-iso-tags");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -6611,7 +6618,7 @@ mod tests {
 
     #[test]
     fn sarif_emits_stacks_from_sanitizer_stack_frames() {
-        let root = temp_dir("sarif-stacks");
+        let (_root_guard, root) = temp_dir("sarif-stacks");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-stack"),
@@ -6657,7 +6664,7 @@ mod tests {
 
     #[test]
     fn junit_failure_body_includes_sanitizer_stack() {
-        let root = temp_dir("junit-stack");
+        let (_root_guard, root) = temp_dir("junit-stack");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-junit-stack"),
@@ -6689,7 +6696,7 @@ mod tests {
 
     #[test]
     fn markdown_renders_severity_breakdown_in_canonical_order() {
-        let root = temp_dir("md-severity");
+        let (_root_guard, root) = temp_dir("md-severity");
         let findings = root.join("findings");
         for (idx, severity) in ["low", "critical", "medium", "high", "high"]
             .iter()
@@ -6729,7 +6736,7 @@ mod tests {
 
     #[test]
     fn markdown_includes_sanitizer_stack_frames() {
-        let root = temp_dir("md-stack");
+        let (_root_guard, root) = temp_dir("md-stack");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-mdstack"),
@@ -6769,7 +6776,7 @@ mod tests {
 
     #[test]
     fn markdown_stack_trims_bhf_harness_frames() {
-        let root = temp_dir("md-stack-harness");
+        let (_root_guard, root) = temp_dir("md-stack-harness");
         let findings = root.join("findings");
         let finding_dir = findings.join("F-0001-harness");
         write_finding(
@@ -6841,7 +6848,7 @@ mod tests {
 
     #[test]
     fn markdown_flags_unproven_reachability_without_naming_harness() {
-        let root = temp_dir("md-source-unproven");
+        let (_root_guard, root) = temp_dir("md-source-unproven");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-unproven"),
@@ -6890,7 +6897,7 @@ mod tests {
 
     #[test]
     fn sarif_falls_back_to_first_resolved_stack_frame_for_primary_location() {
-        let root = temp_dir("sarif-primary");
+        let (_root_guard, root) = temp_dir("sarif-primary");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-primary"),
@@ -6931,7 +6938,7 @@ mod tests {
 
     #[test]
     fn sarif_keeps_ada_handler_after_actionability_primary_location() {
-        let root = temp_dir("sarif-ada-loc");
+        let (_root_guard, root) = temp_dir("sarif-ada-loc");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-ada"),
@@ -6968,7 +6975,7 @@ mod tests {
 
     #[test]
     fn sarif_emits_physical_location_when_frame_has_file_and_line() {
-        let root = temp_dir("sarif-physloc");
+        let (_root_guard, root) = temp_dir("sarif-physloc");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-physloc"),
@@ -7008,7 +7015,7 @@ mod tests {
 
     #[test]
     fn sarif_omits_stacks_when_no_sanitizer_frames() {
-        let root = temp_dir("sarif-nostack");
+        let (_root_guard, root) = temp_dir("sarif-nostack");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-ada"),
@@ -7037,11 +7044,8 @@ mod tests {
 
     #[test]
     fn sarif_driver_carries_version_and_semantic_version() {
-        let document = build_report(&ReportOptions::new(
-            empty_findings_dir("sarif-version"),
-            "reports",
-        ))
-        .unwrap();
+        let (_findings_guard, findings_dir) = empty_findings_dir("sarif-version");
+        let document = build_report(&ReportOptions::new(findings_dir, "reports")).unwrap();
         let sarif = render_sarif_report(&document);
         let driver = &sarif["runs"][0]["tool"]["driver"];
 
@@ -7056,7 +7060,7 @@ mod tests {
     /// `file://` URI with no `uriBaseId`; the run carries `originalUriBaseIds`.
     #[test]
     fn sarif_relativises_under_root_and_keeps_absolute_outside_root() {
-        let work = temp_dir("sarif-srcroot");
+        let (_work_guard, work) = temp_dir("sarif-srcroot");
         let src_root = work.join("srctree");
         let under_root = src_root.join("src/cbor/internal/loaders.c");
         let outside_root = work.join("auto/H-C000E/main.c");
@@ -7195,7 +7199,7 @@ mod tests {
     /// absolute paths stay as-is, no `uriBaseId`, and no `originalUriBaseIds`.
     #[test]
     fn sarif_without_source_root_emits_no_uri_base_ids() {
-        let root = temp_dir("sarif-no-root");
+        let (_root_guard, root) = temp_dir("sarif-no-root");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-noroot"),
@@ -7231,11 +7235,8 @@ mod tests {
     /// absolute (no leading slash / scheme allowed under a uriBaseId).
     #[test]
     fn sarif_validator_rejects_absolute_uri_under_srcroot() {
-        let document = build_report(&ReportOptions::new(
-            empty_findings_dir("sarif-bad-srcroot"),
-            "reports",
-        ))
-        .unwrap();
+        let (_findings_guard, findings_dir) = empty_findings_dir("sarif-bad-srcroot");
+        let document = build_report(&ReportOptions::new(findings_dir, "reports")).unwrap();
         let mut sarif = render_sarif_report(&document);
         sarif["runs"][0]["originalUriBaseIds"] =
             json!({ "SRCROOT": { "uri": "file:///abs/root/" } });
@@ -7262,11 +7263,8 @@ mod tests {
     /// A run that uses SRCROOT but omits `originalUriBaseIds` is rejected.
     #[test]
     fn sarif_validator_requires_original_uri_base_ids_when_srcroot_used() {
-        let document = build_report(&ReportOptions::new(
-            empty_findings_dir("sarif-missing-base"),
-            "reports",
-        ))
-        .unwrap();
+        let (_findings_guard, findings_dir) = empty_findings_dir("sarif-missing-base");
+        let document = build_report(&ReportOptions::new(findings_dir, "reports")).unwrap();
         let mut sarif = render_sarif_report(&document);
         sarif["runs"][0]["results"] = json!([{
             "ruleId": "bhf.finding",
@@ -7290,11 +7288,8 @@ mod tests {
 
     #[test]
     fn sarif_schema_validator_rejects_wrong_version() {
-        let document = build_report(&ReportOptions::new(
-            empty_findings_dir("sarif-invalid"),
-            "reports",
-        ))
-        .unwrap();
+        let (_findings_guard, findings_dir) = empty_findings_dir("sarif-invalid");
+        let document = build_report(&ReportOptions::new(findings_dir, "reports")).unwrap();
         let mut sarif = render_sarif_report(&document);
         sarif["version"] = json!("2.0.0");
 
@@ -7305,7 +7300,7 @@ mod tests {
 
     #[test]
     fn write_reports_emits_junit_when_requested() {
-        let root = temp_dir("junit");
+        let (_root_guard, root) = temp_dir("junit");
         let findings = root.join("findings");
         let out = root.join("reports");
         write_finding(
@@ -7352,7 +7347,7 @@ mod tests {
 
     #[test]
     fn junit_generation_uses_current_finding_emitter_exception_shape() {
-        let root = temp_dir("junit-emitter-shape");
+        let (_root_guard, root) = temp_dir("junit-emitter-shape");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0000-aabbccdd"),
@@ -7390,7 +7385,7 @@ mod tests {
 
     #[test]
     fn junit_generation_replaces_invalid_xml_control_chars() {
-        let root = temp_dir("junit-control-chars");
+        let (_root_guard, root) = temp_dir("junit-control-chars");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0001-control"),
@@ -7428,7 +7423,7 @@ mod tests {
 
     #[test]
     fn sarif_generation_uses_current_finding_emitter_exception_shape() {
-        let root = temp_dir("sarif-emitter-shape");
+        let (_root_guard, root) = temp_dir("sarif-emitter-shape");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0000-aabbccdd"),
@@ -7485,7 +7480,7 @@ mod tests {
 
     #[test]
     fn build_report_allows_empty_findings_directory() {
-        let root = temp_dir("empty");
+        let (_root_guard, root) = temp_dir("empty");
         let findings = root.join("findings");
         fs::create_dir_all(&findings).unwrap();
 
@@ -7500,7 +7495,7 @@ mod tests {
 
     #[test]
     fn load_findings_uses_directory_name_when_id_is_absent() {
-        let root = temp_dir("fallback-id");
+        let (_root_guard, root) = temp_dir("fallback-id");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-dir-id"),
@@ -7522,7 +7517,7 @@ mod tests {
 
     #[test]
     fn load_findings_normalizes_current_finding_emitter_exception_shape() {
-        let root = temp_dir("emitter-shape");
+        let (_root_guard, root) = temp_dir("emitter-shape");
         let findings = root.join("findings");
         write_finding(
             &findings.join("F-0000-aabbccdd"),
@@ -7580,7 +7575,7 @@ mod tests {
 
     #[test]
     fn write_reports_sanitizes_run_id_for_file_names() {
-        let root = temp_dir("sanitize");
+        let (_root_guard, root) = temp_dir("sanitize");
         let findings = root.join("findings");
         let out = root.join("reports");
         fs::create_dir_all(&findings).unwrap();
@@ -7766,21 +7761,26 @@ mod tests {
         })
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-report-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-report-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
-    fn empty_findings_dir(name: &str) -> PathBuf {
-        let root = temp_dir(name);
+    fn empty_findings_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let (_root_guard, root) = temp_dir(name);
         let findings = root.join("findings");
         fs::create_dir_all(&findings).unwrap();
-        findings
+        (_root_guard, findings)
     }
 
     fn write_cluster_finding(dir: &std::path::Path, id: &str, cluster_key: &str, frame: &str) {
@@ -7807,7 +7807,7 @@ mod tests {
 
     #[test]
     fn load_findings_backfills_cluster_key_when_missing_on_disk() {
-        let dir = temp_dir("backfill");
+        let (_dir_guard, dir) = temp_dir("backfill");
         let finding_dir = dir.join("F-0001-aaaaaa");
         fs::create_dir_all(&finding_dir).unwrap();
         fs::write(
@@ -7841,8 +7841,8 @@ mod tests {
 
     #[test]
     fn build_report_groups_findings_into_clusters_by_cluster_key() {
-        let findings_dir = temp_dir("clusters");
-        let out_dir = temp_dir("clusters-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("clusters");
+        let (_out_dir_guard, out_dir) = temp_dir("clusters-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -7877,8 +7877,8 @@ mod tests {
 
     #[test]
     fn build_report_exposes_cluster_quality_metadata() {
-        let findings_dir = temp_dir("cluster-quality");
-        let out_dir = temp_dir("cluster-quality-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("cluster-quality");
+        let (_out_dir_guard, out_dir) = temp_dir("cluster-quality-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -7902,8 +7902,8 @@ mod tests {
 
     #[test]
     fn markdown_report_includes_clusters_table() {
-        let findings_dir = temp_dir("md-clusters");
-        let out_dir = temp_dir("md-clusters-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("md-clusters");
+        let (_out_dir_guard, out_dir) = temp_dir("md-clusters-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -7933,8 +7933,8 @@ mod tests {
 
     #[test]
     fn sarif_result_carries_cluster_key_in_partial_fingerprints() {
-        let findings_dir = temp_dir("sarif-clusters");
-        let out_dir = temp_dir("sarif-clusters-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("sarif-clusters");
+        let (_out_dir_guard, out_dir) = temp_dir("sarif-clusters-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -7973,8 +7973,8 @@ mod tests {
 
     #[test]
     fn junit_testcase_name_includes_cluster_suffix() {
-        let findings_dir = temp_dir("junit-clusters");
-        let out_dir = temp_dir("junit-clusters-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("junit-clusters");
+        let (_out_dir_guard, out_dir) = temp_dir("junit-clusters-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -7988,8 +7988,8 @@ mod tests {
 
     #[test]
     fn markdown_collapse_clusters_only_emits_representative_detail() {
-        let findings_dir = temp_dir("collapse");
-        let out_dir = temp_dir("collapse-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("collapse");
+        let (_out_dir_guard, out_dir) = temp_dir("collapse-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -8028,8 +8028,8 @@ mod tests {
 
     #[test]
     fn render_csv_report_emits_header_and_one_row_per_issue() {
-        let findings_dir = temp_dir("csv");
-        let out_dir = temp_dir("csv-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("csv");
+        let (_out_dir_guard, out_dir) = temp_dir("csv-out");
         // Two findings in DISTINCT clusters -> two issues -> two data rows.
         write_cluster_finding(
             &findings_dir,
@@ -8075,8 +8075,8 @@ mod tests {
 
     #[test]
     fn render_csv_report_collapses_a_cluster_to_one_issue_row() {
-        let findings_dir = temp_dir("csv-collapse");
-        let out_dir = temp_dir("csv-collapse-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("csv-collapse");
+        let (_out_dir_guard, out_dir) = temp_dir("csv-collapse-out");
         // Three findings: two share a cluster (one issue), one is its own.
         write_cluster_finding(
             &findings_dir,
@@ -8139,8 +8139,8 @@ mod tests {
 
     #[test]
     fn sarif_result_carries_cwe_and_cluster_fingerprint() {
-        let findings_dir = temp_dir("sarif-cwe");
-        let out_dir = temp_dir("sarif-cwe-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("sarif-cwe");
+        let (_out_dir_guard, out_dir) = temp_dir("sarif-cwe-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",
@@ -8165,7 +8165,7 @@ mod tests {
     fn load_finding_backfills_cwe_from_rule_for_oracle_finding() {
         // A behavioral oracle finding has a rule_id but NO bug class -> its CWE
         // comes from the finding_rules catalog (priority 2).
-        let findings_dir = temp_dir("oracle-cwe");
+        let (_findings_dir_guard, findings_dir) = temp_dir("oracle-cwe");
         write_finding(
             &findings_dir.join("F-0001-oracle"),
             json!({
@@ -8218,8 +8218,8 @@ mod tests {
 
     #[test]
     fn markdown_enumerates_issue_members_with_reproducers() {
-        let findings_dir = temp_dir("md-members");
-        let out_dir = temp_dir("md-members-out");
+        let (_findings_dir_guard, findings_dir) = temp_dir("md-members");
+        let (_out_dir_guard, out_dir) = temp_dir("md-members-out");
         write_cluster_finding(
             &findings_dir,
             "F-0001-aaaaaa",

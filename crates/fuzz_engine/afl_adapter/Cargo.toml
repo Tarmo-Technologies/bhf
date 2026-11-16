@@ -17,3 +17,6 @@ path = "src/main.rs"
 
 [dependencies]
 fuzz_engine_builtin = { path = "../builtin" }
+
+[dev-dependencies]
+tempfile.workspace = true

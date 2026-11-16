@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn replay_pipes_testcase_bytes_to_harness_stdin() {
         let _guard = replay_event_file_lock();
-        let root = temp_dir("stdin-pipe");
+        let (_root_guard, root) = temp_dir("stdin-pipe");
         let capture_path = root.join("stdin.bin");
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
         let testcase = b"bhf-stdin-marker\0mismatch\n".to_vec();
@@ -1067,7 +1067,7 @@ mod tests {
     #[test]
     fn qemu_user_runner_wraps_harness_and_preserves_replay_contract() {
         let _guard = replay_event_file_lock();
-        let root = temp_dir("qemu-user-runner");
+        let (_root_guard, root) = temp_dir("qemu-user-runner");
         let capture_path = root.join("stdin.bin");
         let qemu_log_path = root.join("qemu-argv.txt");
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn firejail_sandbox_runner_wraps_harness_and_preserves_replay_contract() {
         let _guard = replay_event_file_lock();
-        let root = temp_dir("firejail-sandbox-runner");
+        let (_root_guard, root) = temp_dir("firejail-sandbox-runner");
         let capture_path = root.join("stdin.bin");
         let sandbox_log_path = root.join("sandbox-argv.txt");
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
@@ -1119,7 +1119,7 @@ mod tests {
         // under non-strict auto/default sandboxing — it must degrade to a
         // direct, unsandboxed execution so fuzzing still proceeds.
         let _guard = replay_event_file_lock();
-        let root = temp_dir("bwrap-broken-degrade");
+        let (_root_guard, root) = temp_dir("bwrap-broken-degrade");
         let capture_path = root.join("stdin.bin");
         let log_path = root.join("bwrap-argv.txt");
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
@@ -1145,7 +1145,7 @@ mod tests {
         // The strict guarantee still holds: if the user demanded isolation and
         // the tool cannot deliver it, surface the failure rather than silently
         // running unsandboxed.
-        let root = temp_dir("bwrap-broken-strict");
+        let (_root_guard, root) = temp_dir("bwrap-broken-strict");
         let log_path = root.join("bwrap-argv.txt");
         let fake = compile_fake_bwrap(&root, "fake_bwrap_broken_strict", false, true, &log_path);
         let runner = HarnessRunner::direct(root.join("harness"))
@@ -1167,7 +1167,7 @@ mod tests {
         // config fails) but filesystem isolation works, keep the sandbox and
         // drop --unshare-net rather than abandoning containment entirely.
         let _guard = replay_event_file_lock();
-        let root = temp_dir("bwrap-fs-only");
+        let (_root_guard, root) = temp_dir("bwrap-fs-only");
         let capture_path = root.join("stdin.bin");
         let log_path = root.join("bwrap-argv.txt");
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn strict_sandbox_runner_reports_missing_sandbox_tool() {
-        let root = temp_dir("missing-strict-sandbox");
+        let (_root_guard, root) = temp_dir("missing-strict-sandbox");
         let runner = HarnessRunner::direct(root.join("harness"))
             .with_sandbox(SandboxConfig::firejail(root.join("missing-firejail")));
 
@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn signatures_for_input_removes_event_file_on_nonzero_exit() {
         let _guard = replay_event_file_lock();
-        let root = temp_dir("event-cleanup");
+        let (_root_guard, root) = temp_dir("event-cleanup");
         let harness_path = compile_nonzero_event_harness(&root);
         let before = replay_event_files();
 
@@ -1517,14 +1517,21 @@ fn main() -> std::io::Result<()> {
         paths
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-replay-unit-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-replay-unit-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     #[cfg(unix)]
@@ -1541,7 +1548,7 @@ fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     #[test]
     fn replay_errors_name_the_file_they_failed_on() {
-        let dir = temp_dir("io-at");
+        let (_dir_guard, dir) = temp_dir("io-at");
         let finding = dir.join("finding");
         fs::create_dir_all(&finding).unwrap();
         fs::write(finding.join("finding.json"), b"{not json").unwrap();
@@ -1566,7 +1573,7 @@ fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     #[test]
     fn a_harness_run_is_killed_after_the_timeout() {
-        let dir = temp_dir("timeout");
+        let (_dir_guard, dir) = temp_dir("timeout");
         let harness = script(&dir, "sleep 30 & sleep 30");
         let runner =
             HarnessRunner::direct(&harness).with_timeout(std::time::Duration::from_millis(300));
@@ -1589,7 +1596,7 @@ fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     #[test]
     fn a_harness_that_ignores_a_large_input_is_killed_after_the_timeout() {
-        let dir = temp_dir("timeout-large-input");
+        let (_dir_guard, dir) = temp_dir("timeout-large-input");
         let harness = script(&dir, "exec sleep 30");
         let runner =
             HarnessRunner::direct(&harness).with_timeout(std::time::Duration::from_millis(300));

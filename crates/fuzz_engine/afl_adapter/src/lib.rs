@@ -214,7 +214,14 @@ mod tests {
 
     #[test]
     fn write_persistent_shim_c_writes_apache_source() {
-        let root = std::env::temp_dir().join(format!("bhf-afl-shim-test-{}", std::process::id()));
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp
+            .path()
+            .join(format!("bhf-afl-shim-test-{}", std::process::id()));
         let path = root.join(PERSISTENT_SHIM_C_FILENAME);
         std::fs::create_dir_all(&root).expect("temp dir is created");
 
@@ -292,7 +299,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
 
-        let root = temp_dir("signal-propagation");
+        let (_root_guard, root) = temp_dir("signal-propagation");
         let shim_source = root.join(PERSISTENT_SHIM_C_FILENAME);
         let harness_source = root.join("crashing_harness.c");
         let shim_bin = root.join("bhf-afl-shim");
@@ -366,10 +373,17 @@ int main(void) {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("bhf-afl-shim-{name}-{}", std::process::id()));
+    fn temp_dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp
+            .path()
+            .join(format!("bhf-afl-shim-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("temp dir is created");
-        root
+        (root_tmp, root)
     }
 }

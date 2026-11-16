@@ -470,7 +470,12 @@ mod tests {
     /// Whether the shim would find a marker in a log holding `bytes`.
     fn log_with(bytes: &[u8]) -> bool {
         use std::os::fd::AsRawFd;
-        let path = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let path_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let path = path_tmp.path().join(format!(
             "bhf-shim-marker-scan-{}-{}",
             std::process::id(),
             bytes.len()

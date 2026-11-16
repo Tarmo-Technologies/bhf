@@ -33,7 +33,7 @@ fn e2e_swallowed_ce_synthetic_stream_produces_finding_ada2022() {
 
 #[test]
 fn e2e_duplicate_signature_returns_duplicate_class() {
-    let root = temp_dir("duplicates");
+    let (_root_guard, root) = temp_dir("duplicates");
     let mut manager = CorpusManager::new(root);
     let events = parse_events(swallowed_ce_stream(1));
 
@@ -57,7 +57,7 @@ fn e2e_duplicate_signature_returns_duplicate_class() {
 }
 
 fn run_dialect(dialect: &str) {
-    let root = temp_dir(dialect);
+    let (_root_guard, root) = temp_dir(dialect);
     let harness_id = format!("m5_swallowed_ce_{dialect}");
     let input = b"not-an-integer";
     let stream = swallowed_ce_stream(1);
@@ -171,12 +171,19 @@ fn push_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(value.as_bytes());
 }
 
-fn temp_dir(name: &str) -> PathBuf {
+fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-e2e-swallowed-ce-{name}-{nonce}"));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-e2e-swallowed-ce-{name}-{nonce}"));
     fs::create_dir_all(&dir).unwrap();
-    dir
+    (dir_tmp, dir)
 }

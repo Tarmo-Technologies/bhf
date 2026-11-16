@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn audit_metadata_reports_missing_third_party_matrix_entries() {
-        let root = temp_dir("missing-third-party");
+        let (_root_guard, root) = temp_dir("missing-third-party");
         write_license_vendor(&root);
         fs::write(
             root.join("THIRD_PARTY.md"),
@@ -802,13 +802,20 @@ mod tests {
         .unwrap();
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-license-policy-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-license-policy-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 }

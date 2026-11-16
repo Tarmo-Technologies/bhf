@@ -81,7 +81,14 @@ fn dev_mem_open_is_redirected_to_private_mmap_under_a_fuzz_pass() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-mmio-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-mmio-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("mmio.c");
     std::fs::write(&src, PROBE).unwrap();

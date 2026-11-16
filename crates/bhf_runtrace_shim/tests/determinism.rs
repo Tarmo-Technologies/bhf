@@ -85,7 +85,14 @@ fn randomness_replays_identically_under_the_gate() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-det-test-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-det-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("det.c");
     let bin = dir.join("det");

@@ -2449,7 +2449,7 @@ mod tests {
 
     #[test]
     fn json_rpc_server_handles_scan_and_list_targets_over_lsp_framing() {
-        let root = temp_dir("json-rpc-scan-targets");
+        let (_root_guard, root) = temp_dir("json-rpc-scan-targets");
         let source = root.join("pkg.adb");
         fs::write(
             &source,
@@ -2493,7 +2493,7 @@ mod tests {
 
     #[test]
     fn json_rpc_server_list_targets_exposes_cpp_api_metadata() {
-        let root = temp_dir("json-rpc-cpp-targets");
+        let (_root_guard, root) = temp_dir("json-rpc-cpp-targets");
         let source = root.join("api.cpp");
         fs::write(
             &source,
@@ -2529,7 +2529,7 @@ mod tests {
 
     #[test]
     fn json_rpc_server_handles_static_scan_over_lsp_framing() {
-        let root = temp_dir("json-rpc-static-scan");
+        let (_root_guard, root) = temp_dir("json-rpc-static-scan");
         let src = root.join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(
@@ -2570,7 +2570,7 @@ mod tests {
 
     #[test]
     fn json_rpc_server_handles_findings_rank_at_and_instrument_preview() {
-        let root = temp_dir("json-rpc-ide-methods");
+        let (_root_guard, root) = temp_dir("json-rpc-ide-methods");
         let source = root.join("pkg.adb");
         fs::write(
             &source,
@@ -2629,7 +2629,7 @@ mod tests {
 
     #[test]
     fn json_rpc_findings_backfills_actionability_for_older_records() {
-        let root = temp_dir("json-rpc-actionability");
+        let (_root_guard, root) = temp_dir("json-rpc-actionability");
         let findings = root.join("results").join("findings");
         write_finding(
             &findings.join("F-0001-old"),
@@ -2683,8 +2683,8 @@ mod tests {
 
     #[test]
     fn json_rpc_multi_tenant_mode_requires_auth_and_blocks_cross_workspace_paths() {
-        let allowed = temp_dir("json-rpc-auth-allowed");
-        let denied = temp_dir("json-rpc-auth-denied");
+        let (_allowed_guard, allowed) = temp_dir("json-rpc-auth-allowed");
+        let (_denied_guard, denied) = temp_dir("json-rpc-auth-denied");
         let allowed_source = allowed.join("pkg.adb");
         let denied_source = denied.join("pkg.adb");
         fs::write(
@@ -2744,7 +2744,7 @@ mod tests {
 
     #[test]
     fn json_rpc_multi_tenant_mode_enforces_roles_and_records_audit_metadata() {
-        let workspace = temp_dir("json-rpc-rbac");
+        let (_workspace_guard, workspace) = temp_dir("json-rpc-rbac");
         let source = workspace.join("pkg.adb");
         fs::write(
             &source,
@@ -2793,7 +2793,7 @@ mod tests {
 
     #[test]
     fn tenant_static_scan_default_output_stays_in_workspace() {
-        let workspace = temp_dir("tenant-default-static-output");
+        let (_workspace_guard, workspace) = temp_dir("tenant-default-static-output");
         let source = workspace.join("legacy.c");
         fs::write(&source, "void f(void) {}\n").unwrap();
         let security = super::DaemonSecurityConfig::workspace_shared(super::TenantConfig {
@@ -2851,7 +2851,8 @@ mod tests {
 
     #[test]
     fn oversized_response_is_an_error_frame_and_next_request_stays_aligned() {
-        let source = temp_dir("oversized-response").join("many.c");
+        let (_scratch6, scratch6) = temp_dir("oversized-response");
+        let source = scratch6.join("many.c");
         let functions = (0..30)
             .map(|index| format!("int f{index}(int x) {{ return x; }}\n"))
             .collect::<String>();
@@ -3011,7 +3012,7 @@ mod tests {
 
     #[test]
     fn bounded_findings_reader_rejects_large_file_and_many_records() {
-        let large = temp_dir("oversized-finding-file");
+        let (_large_guard, large) = temp_dir("oversized-finding-file");
         write_finding(
             &large.join("F-large"),
             serde_json::json!({"id": "F-large", "padding": "x".repeat(2048)}),
@@ -3019,7 +3020,7 @@ mod tests {
         let error = super::load_findings(large.clone(), 512).unwrap_err();
         assert!(error.contains("raw finding JSON exceeds"), "{error}");
 
-        let many = temp_dir("too-many-findings");
+        let (_many_guard, many) = temp_dir("too-many-findings");
         write_finding(&many.join("F-1"), serde_json::json!({"id": "F-1"}));
         write_finding(&many.join("F-2"), serde_json::json!({"id": "F-2"}));
         let error = super::load_findings(many, 8192).unwrap_err();
@@ -3057,8 +3058,8 @@ mod tests {
     fn tenant_findings_reject_symlinked_record_outside_workspace() {
         use std::os::unix::fs::symlink;
 
-        let workspace = temp_dir("tenant-finding-symlink");
-        let outside = temp_dir("tenant-finding-symlink-outside");
+        let (_workspace_guard, workspace) = temp_dir("tenant-finding-symlink");
+        let (_outside_guard, outside) = temp_dir("tenant-finding-symlink-outside");
         let findings = workspace.join("results").join("findings");
         let record = findings.join("F-1");
         fs::create_dir_all(&record).unwrap();
@@ -3284,13 +3285,18 @@ mod tests {
         .unwrap();
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-daemon-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-daemon-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 }

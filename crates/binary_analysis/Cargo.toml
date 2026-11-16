@@ -21,3 +21,6 @@ tar.workspace = true
 flate2.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

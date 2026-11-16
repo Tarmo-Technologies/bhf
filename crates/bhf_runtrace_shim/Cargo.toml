@@ -25,3 +25,6 @@ runtrace_manifest = { path = "../runtrace_manifest" }
 
 [build-dependencies]
 cc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

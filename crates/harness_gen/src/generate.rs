@@ -3714,14 +3714,21 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-harness-gen-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-harness-gen-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     fn span() -> Span {
@@ -3841,7 +3848,8 @@ mod tests {
             Vec::new(),
             vec![package(1, "Schema.Simple_Types")],
         );
-        let output_dir = temp_dir("generic-instance").join("H-GENERIC-INSTANCE");
+        let (_scratch70, scratch70) = temp_dir("generic-instance");
+        let output_dir = scratch70.join("H-GENERIC-INSTANCE");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -4042,14 +4050,16 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
+        let (_scratch69, scratch69) = temp_dir("force-opaque-no");
 
-        let out_no = temp_dir("force-opaque-no").join("H-0042");
+        let out_no = scratch69.join("H-0042");
         assert!(matches!(
             generate_for(&ast, &target, &out_no).unwrap_err(),
             HarnessGenError::UnsupportedParamType(_)
         ));
+        let (_scratch68, scratch68) = temp_dir("force-opaque-yes");
 
-        let out_yes = temp_dir("force-opaque-yes").join("H-0042");
+        let out_yes = scratch68.join("H-0042");
         let files =
             generate_for_forced(&ast, &target, &out_yes).expect("force generates a harness");
         let body = std::fs::read_to_string(&files.main_adb).expect("read main.adb");
@@ -4069,7 +4079,8 @@ mod tests {
             Some(type_ref("Integer", TypeKind::Scalar(ScalarKind::Integer))),
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("writes").join("H-0042");
+        let (_scratch67, scratch67) = temp_dir("writes");
+        let output_dir = scratch67.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
 
@@ -4086,7 +4097,8 @@ mod tests {
         line.type_ref.aspects.0.push("aliased".to_owned());
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", vec![line], None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("aliased").join("H-0042");
+        let (_scratch66, scratch66) = temp_dir("aliased");
+        let output_dir = scratch66.join("H-0042");
 
         generate_for(&ast, &target, &output_dir).unwrap();
         let main = std::fs::read_to_string(output_dir.join("main.adb")).unwrap();
@@ -4100,7 +4112,8 @@ mod tests {
     fn generate_creates_output_dir_if_missing() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("missing").join("nested").join("H-0042");
+        let (_scratch65, scratch65) = temp_dir("missing");
+        let output_dir = scratch65.join("nested").join("H-0042");
 
         generate_for(&ast, &target, &output_dir).unwrap();
 
@@ -4120,7 +4133,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("unsupported").join("H-0042");
+        let (_scratch64, scratch64) = temp_dir("unsupported");
+        let output_dir = scratch64.join("H-0042");
 
         let error = generate_for(&ast, &target, &output_dir).unwrap_err();
 
@@ -4145,7 +4159,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("unsupported-param-context").join("H-0042");
+        let (_scratch63, scratch63) = temp_dir("unsupported-param-context");
+        let output_dir = scratch63.join("H-0042");
 
         let error = generate_for(&ast, &target, &output_dir).unwrap_err();
         let message = error.to_string();
@@ -4178,7 +4193,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("array-setup").join("H-0042");
+        let (_scratch62, scratch62) = temp_dir("array-setup");
+        let output_dir = scratch62.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4250,7 +4266,8 @@ mod tests {
             types: vec![concrete],
             ..StructuralAst::new()
         };
-        let output_dir = temp_dir("class-wide-stream").join("H-0042");
+        let (_scratch61, scratch61) = temp_dir("class-wide-stream");
+        let output_dir = scratch61.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4287,7 +4304,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("no-setup").join("H-0042");
+        let (_scratch60, scratch60) = temp_dir("no-setup");
+        let output_dir = scratch60.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4319,7 +4337,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("direct-param-modes").join("H-0042");
+        let (_scratch59, scratch59) = temp_dir("direct-param-modes");
+        let output_dir = scratch59.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4349,7 +4368,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("out-array-unsupported").join("H-0042");
+        let (_scratch58, scratch58) = temp_dir("out-array-unsupported");
+        let output_dir = scratch58.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4390,7 +4410,8 @@ mod tests {
         );
         let mut ast = ast_with(target.clone(), Vec::new(), vec![bar_impl]);
         ast.types.push(servant_type);
-        let output_dir = temp_dir("servant-param-modes").join("H-M12");
+        let (_scratch57, scratch57) = temp_dir("servant-param-modes");
+        let output_dir = scratch57.join("H-M12");
 
         let generated = generate_servant_direct_harness(GenerateServantDirectArgs {
             ast: &ast,
@@ -4432,7 +4453,8 @@ mod tests {
             constraints: Constraints("PortableServer.Servant_Base".to_owned()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("derived-servant-receiver").join("H-M12-DERIVED");
+        let (_scratch56, scratch56) = temp_dir("derived-servant-receiver");
+        let output_dir = scratch56.join("H-M12-DERIVED");
 
         let generated = generate_servant_direct_harness(GenerateServantDirectArgs {
             ast: &ast,
@@ -4482,7 +4504,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("multi-setup").join("H-0042");
+        let (_scratch55, scratch55) = temp_dir("multi-setup");
+        let output_dir = scratch55.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4545,7 +4568,8 @@ mod tests {
         let mut ast = ast_with(target.clone(), Vec::new(), Vec::new());
         ast.subprograms.push(create);
         ast.subprograms.push(destroy);
-        let output_dir = temp_dir("access-lifecycle").join("H-0042");
+        let (_scratch54, scratch54) = temp_dir("access-lifecycle");
+        let output_dir = scratch54.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -4591,7 +4615,8 @@ mod tests {
         );
         let mut ast = ast_with(target.clone(), Vec::new(), Vec::new());
         ast.subprograms.push(create);
-        let output_dir = temp_dir("access-lifecycle-base").join("H-0042");
+        let (_scratch53, scratch53) = temp_dir("access-lifecycle-base");
+        let output_dir = scratch53.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -4657,7 +4682,8 @@ mod tests {
             constraints: Constraints("Ada.Streams.Stream_IO.File_Mode".to_owned()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("ext-discrete").join("H-FM");
+        let (_scratch52, scratch52) = temp_dir("ext-discrete");
+        let output_dir = scratch52.join("H-FM");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4699,7 +4725,8 @@ mod tests {
         );
         let mut ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Zip")]);
         ast.subprograms.push(loader);
-        let output_dir = temp_dir("out-param-ctor").join("H-CTOR");
+        let (_scratch51, scratch51) = temp_dir("out-param-ctor");
+        let output_dir = scratch51.join("H-CTOR");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4748,7 +4775,8 @@ mod tests {
         );
         argument_parser.owner = TypeOwner::Package(PackageId(7));
         ast.types.push(argument_parser);
-        let output_dir = temp_dir("default-tagged-receiver").join("H-DEFAULT-TAGGED");
+        let (_scratch50, scratch50) = temp_dir("default-tagged-receiver");
+        let output_dir = scratch50.join("H-DEFAULT-TAGGED");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4795,7 +4823,8 @@ mod tests {
             constraints: Constraints("Ada.Finalization.Limited_Controlled".to_owned()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("class-wide-concrete-root").join("H-CLASS-ROOT");
+        let (_scratch49, scratch49) = temp_dir("class-wide-concrete-root");
+        let output_dir = scratch49.join("H-CLASS-ROOT");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -4841,7 +4870,8 @@ mod tests {
             constraints: Constraints("Base_Reader".to_owned()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("access-tagged-backing").join("H-ACCESS-TAGGED");
+        let (_scratch48, scratch48) = temp_dir("access-tagged-backing");
+        let output_dir = scratch48.join("H-ACCESS-TAGGED");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -5009,7 +5039,8 @@ mod tests {
         let mut ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Streams")]);
         ast.subprograms.push(mutator);
         ast.subprograms.push(opener);
-        let output_dir = temp_dir("in-out-ctor").join("H-INOUT");
+        let (_scratch47, scratch47) = temp_dir("in-out-ctor");
+        let output_dir = scratch47.join("H-INOUT");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5043,7 +5074,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Unzip")]);
-        let output_dir = temp_dir("ctor-self-inout").join("H-OPEN");
+        let (_scratch46, scratch46) = temp_dir("ctor-self-inout");
+        let output_dir = scratch46.join("H-OPEN");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5071,7 +5103,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Zip")]);
-        let output_dir = temp_dir("mutator-self-inout").join("H-ADD");
+        let (_scratch45, scratch45) = temp_dir("mutator-self-inout");
+        let output_dir = scratch45.join("H-ADD");
 
         assert!(generate_for(&ast, &target, &output_dir).is_err());
     }
@@ -5112,7 +5145,8 @@ mod tests {
         let mut ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
         ast.subprograms.push(maker);
         ast.types.push(stream_access);
-        let output_dir = temp_dir("ctor-stream-arg").join("H-STREAM");
+        let (_scratch44, scratch44) = temp_dir("ctor-stream-arg");
+        let output_dir = scratch44.join("H-STREAM");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5195,7 +5229,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("access-source-stream").join("H-STREAM-ACCESS");
+        let (_scratch43, scratch43) = temp_dir("access-source-stream");
+        let output_dir = scratch43.join("H-STREAM-ACCESS");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5246,7 +5281,8 @@ mod tests {
             constraints: Constraints(String::new()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("abstract-receiver").join("H-ABS");
+        let (_scratch42, scratch42) = temp_dir("abstract-receiver");
+        let output_dir = scratch42.join("H-ABS");
 
         let result = generate_for(&ast, &target, &output_dir);
         assert!(
@@ -5292,7 +5328,8 @@ mod tests {
             constraints: Constraints(String::new()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("enum-subtype").join("H-ENUM");
+        let (_scratch41, scratch41) = temp_dir("enum-subtype");
+        let output_dir = scratch41.join("H-ENUM");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5322,7 +5359,8 @@ mod tests {
             constraints: Constraints(String::new()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("resolved-param-type").join("H-0042");
+        let (_scratch40, scratch40) = temp_dir("resolved-param-type");
+        let output_dir = scratch40.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5377,7 +5415,8 @@ mod tests {
             constraints: Constraints("Bytes_24".to_owned()),
             aspects: Aspects(Vec::new()),
         });
-        let output_dir = temp_dir("derived-array-alias").join("H-0042");
+        let (_scratch39, scratch39) = temp_dir("derived-array-alias");
+        let output_dir = scratch39.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5396,7 +5435,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("qualified").join("H-0042");
+        let (_scratch38, scratch38) = temp_dir("qualified");
+        let output_dir = scratch38.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5418,7 +5458,8 @@ mod tests {
             vec!["Ada.Text_IO", "Interfaces"],
             vec![package(7, "Pkg")],
         );
-        let output_dir = temp_dir("withs").join("H-0042");
+        let (_scratch37, scratch37) = temp_dir("withs");
+        let output_dir = scratch37.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5432,7 +5473,8 @@ mod tests {
     fn generate_unit_with_clauses_canonicalizes_dotted_names() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), vec!["ada.text_io"], Vec::new());
-        let output_dir = temp_dir("with-case").join("H-0042");
+        let (_scratch36, scratch36) = temp_dir("with-case");
+        let output_dir = scratch36.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5450,7 +5492,8 @@ mod tests {
             Some(type_ref("integer", TypeKind::Scalar(ScalarKind::Integer))),
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "pkg")]);
-        let output_dir = temp_dir("lowercase").join("H-0042");
+        let (_scratch35, scratch35) = temp_dir("lowercase");
+        let output_dir = scratch35.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5464,7 +5507,8 @@ mod tests {
     fn generate_set_target_uses_subprogram_id_hex() {
         let target = subprogram(66, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("target-id").join("H-0042");
+        let (_scratch34, scratch34) = temp_dir("target-id");
+        let output_dir = scratch34.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5476,7 +5520,8 @@ mod tests {
     fn generate_gpr_project_name_replaces_harness_id_punctuation() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("project-name").join("H-TEST");
+        let (_scratch33, scratch33) = temp_dir("project-name");
+        let output_dir = scratch33.join("H-TEST");
 
         let generated = generate_direct_harness(GenerateDirectArgs {
             ast: &ast,
@@ -5503,7 +5548,8 @@ mod tests {
     fn generate_zero_param_procedure_omits_empty_parentheses() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("zero-param").join("H-0042");
+        let (_scratch32, scratch32) = temp_dir("zero-param");
+        let output_dir = scratch32.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5541,7 +5587,8 @@ mod tests {
         );
         let mut ast = ast_with(target.clone(), Vec::new(), vec![package]);
         ast.types.push(model_type);
-        let output_dir = temp_dir("qualified-return").join("H-0042");
+        let (_scratch31, scratch31) = temp_dir("qualified-return");
+        let output_dir = scratch31.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(generated.main_adb).unwrap();
@@ -5553,7 +5600,8 @@ mod tests {
     fn generate_uses_harness_id_in_filenames() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("id").join("H-0042");
+        let (_scratch30, scratch30) = temp_dir("id");
+        let output_dir = scratch30.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
 
@@ -5581,7 +5629,8 @@ mod tests {
         );
         let mut ast = ast_with(push.clone(), Vec::new(), vec![package.clone()]);
         ast.subprograms.push(pop);
-        let output_dir = temp_dir("sequence-loop").join("H-M9");
+        let (_scratch29, scratch29) = temp_dir("sequence-loop");
+        let output_dir = scratch29.join("H-M9");
 
         let generated = super::generate_sequence_harness(super::GenerateSequenceArgs {
             ast: &ast,
@@ -5617,7 +5666,8 @@ mod tests {
             Some(type_ref("Integer", TypeKind::Scalar(ScalarKind::Integer))),
         );
         let ast = ast_with(top.clone(), Vec::new(), vec![package.clone()]);
-        let output_dir = temp_dir("sequence-function").join("H-M9");
+        let (_scratch28, scratch28) = temp_dir("sequence-function");
+        let output_dir = scratch28.join("H-M9");
 
         let generated = super::generate_sequence_harness(super::GenerateSequenceArgs {
             ast: &ast,
@@ -5660,7 +5710,8 @@ mod tests {
             None,
         );
         let ast = ast_with(push, Vec::new(), vec![package.clone()]);
-        let output_dir = temp_dir("sequence-param-modes").join("H-M9");
+        let (_scratch27, scratch27) = temp_dir("sequence-param-modes");
+        let output_dir = scratch27.join("H-M9");
 
         let generated = super::generate_sequence_harness(super::GenerateSequenceArgs {
             ast: &ast,
@@ -5717,7 +5768,8 @@ mod tests {
         let mut ast = ast_with(push_body, Vec::new(), vec![package.clone()]);
         ast.subprograms
             .extend([pop_body, helper_body, push_spec, pop_spec]);
-        let output_dir = temp_dir("sequence-helper").join("H-M9");
+        let (_scratch26, scratch26) = temp_dir("sequence-helper");
+        let output_dir = scratch26.join("H-M9");
 
         let generated = super::generate_sequence_harness(super::GenerateSequenceArgs {
             ast: &ast,
@@ -5743,7 +5795,8 @@ mod tests {
             packages: vec![package.clone()],
             ..StructuralAst::new()
         };
-        let output_dir = temp_dir("sequence-empty").join("H-M9");
+        let (_scratch25, scratch25) = temp_dir("sequence-empty");
+        let output_dir = scratch25.join("H-M9");
 
         let error = super::generate_sequence_harness(super::GenerateSequenceArgs {
             ast: &ast,
@@ -5763,7 +5816,8 @@ mod tests {
     fn generate_returns_target_not_found_when_subprogram_is_not_in_ast() {
         let target = subprogram(1, SubprogramOwner::LibraryLevel, "Run", Vec::new(), None);
         let ast = StructuralAst::new();
-        let output_dir = temp_dir("missing-target").join("H-0042");
+        let (_scratch24, scratch24) = temp_dir("missing-target");
+        let output_dir = scratch24.join("H-0042");
 
         let error = generate_for(&ast, &target, &output_dir).unwrap_err();
 
@@ -5803,7 +5857,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("sink-const-string").join("H-0042");
+        let (_scratch23, scratch23) = temp_dir("sink-const-string");
+        let output_dir = scratch23.join("H-0042");
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
         assert!(
@@ -5831,7 +5886,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("sink-sea").join("H-0042");
+        let (_scratch22, scratch22) = temp_dir("sink-sea");
+        let output_dir = scratch22.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -5867,7 +5923,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("sink-string").join("H-0042");
+        let (_scratch21, scratch21) = temp_dir("sink-string");
+        let output_dir = scratch21.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -5901,7 +5958,8 @@ mod tests {
         );
         let mut ast = ast_with(target.clone(), Vec::new(), Vec::new());
         ast.types = vec![array_decl];
-        let output_dir = temp_dir("sink-local").join("H-0042");
+        let (_scratch20, scratch20) = temp_dir("sink-local");
+        let output_dir = scratch20.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -5927,7 +5985,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("sink-stream").join("H-0042");
+        let (_scratch19, scratch19) = temp_dir("sink-stream");
+        let output_dir = scratch19.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(&generated.main_adb).unwrap();
@@ -5972,7 +6031,8 @@ mod tests {
             constraints: Constraints("Root_My_Stream with private".to_owned()),
             aspects: Aspects(Vec::new()),
         }];
-        let output_dir = temp_dir("sink-custom-stream").join("H-0042");
+        let (_scratch18, scratch18) = temp_dir("sink-custom-stream");
+        let output_dir = scratch18.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -6176,7 +6236,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), Vec::new());
-        let output_dir = temp_dir("sink-opaque").join("H-0042");
+        let (_scratch17, scratch17) = temp_dir("sink-opaque");
+        let output_dir = scratch17.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -6255,7 +6316,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("callback").join("H-0042");
+        let (_scratch16, scratch16) = temp_dir("callback");
+        let output_dir = scratch16.join("H-0042");
 
         let generated = generate_for(&ast, &target, &output_dir).unwrap();
         let main_adb = fs::read_to_string(&generated.main_adb).unwrap();
@@ -6300,7 +6362,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("optional-callback").join("H-OPTIONAL-CB");
+        let (_scratch15, scratch15) = temp_dir("optional-callback");
+        let output_dir = scratch15.join("H-OPTIONAL-CB");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -6334,7 +6397,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("defaulted-suffix").join("H-DEFAULT-SUFFIX");
+        let (_scratch14, scratch14) = temp_dir("defaulted-suffix");
+        let output_dir = scratch14.join("H-DEFAULT-SUFFIX");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();
@@ -6356,7 +6420,8 @@ mod tests {
             None,
         );
         let ast = ast_with(target.clone(), Vec::new(), vec![package(7, "Pkg")]);
-        let output_dir = temp_dir("not-callback").join("H-0042");
+        let (_scratch13, scratch13) = temp_dir("not-callback");
+        let output_dir = scratch13.join("H-0042");
 
         let main_adb =
             fs::read_to_string(generate_for(&ast, &target, &output_dir).unwrap().main_adb).unwrap();

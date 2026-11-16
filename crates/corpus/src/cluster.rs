@@ -2088,7 +2088,12 @@ mod tests {
     /// that is not a sanitizer crash.
     #[test]
     fn records_this_release_keys_are_not_rekeyed() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-cluster-rekey-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

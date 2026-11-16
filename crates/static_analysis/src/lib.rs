@@ -30048,7 +30048,7 @@ mod tests {
     /// inside such a dir must NOT be scanned; one outside must be.
     #[test]
     fn tree_walk_skips_dependency_and_build_dirs() {
-        let root = temp_dir("walk-excludes");
+        let (_root_guard, root) = temp_dir("walk-excludes");
         // Project code (must be scanned).
         std::fs::write(
             root.join("app.py"),
@@ -30160,7 +30160,7 @@ mod tests {
 
     #[test]
     fn sloc_report_aggregates_per_language_with_totals() {
-        let root = temp_dir("sloc-report");
+        let (_root_guard, root) = temp_dir("sloc-report");
         std::fs::write(
             root.join("a.py"),
             "import os\n# c\ndef f():\n    return 1\n",
@@ -30597,7 +30597,7 @@ mod tests {
 
     #[test]
     fn cpp_qt_ignore_ssl_errors_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("cpp-qt-ignore-ssl-fixtures");
+        let (_root_guard, root) = temp_dir("cpp-qt-ignore-ssl-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "void f(QNetworkReply *reply) { reply->ignoreSslErrors(); }\n";
@@ -30628,7 +30628,7 @@ mod tests {
 
     #[test]
     fn cpp_qt_ignore_ssl_errors_ignores_autotest_fixtures_in_production_scan() {
-        let root = temp_dir("cpp-qt-ignore-ssl-autotests");
+        let (_root_guard, root) = temp_dir("cpp-qt-ignore-ssl-autotests");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("autotests")).unwrap();
         let source = "void f(QNetworkReply *reply) { reply->ignoreSslErrors(); }\n";
@@ -30687,7 +30687,7 @@ mod tests {
 
     #[test]
     fn qml_webengine_certificate_acceptance_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qml-webengine-cert-fixtures");
+        let (_root_guard, root) = temp_dir("qml-webengine-cert-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source =
@@ -30769,7 +30769,7 @@ mod tests {
 
     #[test]
     fn qml_webengine_allow_running_insecure_content_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qml-webengine-insecure-content-fixtures");
+        let (_root_guard, root) = temp_dir("qml-webengine-insecure-content-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("autotests")).unwrap();
         let source =
@@ -30903,7 +30903,7 @@ mod tests {
 
     #[test]
     fn cpp_qt_taint_confirms_qprocess_and_qsqlquery_sinks() {
-        let root = temp_dir("cpp-qt-taint-sinks");
+        let (_root_guard, root) = temp_dir("cpp-qt-taint-sinks");
         fs::write(
             root.join("qt.cpp"),
             "#include <QProcess>\n\
@@ -30964,7 +30964,7 @@ mod tests {
 
     #[test]
     fn qml_webengine_local_content_remote_access_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qml-webengine-local-remote-fixtures");
+        let (_root_guard, root) = temp_dir("qml-webengine-local-remote-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("autotests")).unwrap();
         let source =
@@ -31048,7 +31048,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_local_content_file_access_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-local-file-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-local-file-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31124,7 +31124,7 @@ mod tests {
 
     #[test]
     fn python_qt_webengine_local_content_file_access_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("python-qt-webengine-local-file-fixtures");
+        let (_root_guard, root) = temp_dir("python-qt-webengine-local-file-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source =
@@ -31183,7 +31183,7 @@ mod tests {
 
     #[test]
     fn config_qt_webengine_local_content_file_access_ignores_test_fixtures() {
-        let root = temp_dir("config-qt-webengine-local-file-fixtures");
+        let (_root_guard, root) = temp_dir("config-qt-webengine-local-file-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "content.local_content_can_access_file_urls: true\n";
@@ -31260,7 +31260,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_plugins_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-plugins-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-plugins-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31358,7 +31358,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_clipboard_access_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-clipboard-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-clipboard-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31453,7 +31453,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_geolocation_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-geolocation-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-geolocation-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31551,7 +31551,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_unknown_url_scheme_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-unknown-url-scheme-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-unknown-url-scheme-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31648,7 +31648,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_dns_prefetch_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-dns-prefetch-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-dns-prefetch-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31748,7 +31748,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_webrtc_public_interfaces_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-webrtc-public-interfaces-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-webrtc-public-interfaces-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31848,7 +31848,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_screen_capture_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-screen-capture-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-screen-capture-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -31948,7 +31948,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_canvas_readback_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-canvas-readback-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-canvas-readback-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -32048,7 +32048,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_hyperlink_auditing_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-hyperlink-auditing-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-hyperlink-auditing-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -32158,7 +32158,7 @@ mod tests {
 
     #[test]
     fn qt_webengine_sandbox_disabled_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("qt-webengine-sandbox-fixtures");
+        let (_root_guard, root) = temp_dir("qt-webengine-sandbox-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::write(
@@ -32290,7 +32290,7 @@ mod tests {
 
     #[test]
     fn javascript_unsafe_deserialization_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-unsafe-deserialization-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-unsafe-deserialization-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const yaml = require('js-yaml');\nyaml.load(req.body.config);\n";
@@ -32342,7 +32342,7 @@ mod tests {
 
     #[test]
     fn javascript_xxe_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-xxe-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-xxe-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const libxml = require('libxmljs');\nlibxml.parseXml(req.body.xml, { noent: true });\n";
@@ -32412,7 +32412,7 @@ mod tests {
 
     #[test]
     fn javascript_ldap_injection_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-ldap-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-ldap-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const ldap = require('ldapjs');\nconst client = ldap.createClient({ url: 'ldap://directory' });\nclient.search('dc=example', { filter: '(uid=' + req.query.uid + ')' }, cb);\n";
@@ -32464,7 +32464,7 @@ mod tests {
 
     #[test]
     fn javascript_xpath_injection_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-xpath-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-xpath-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const xpath = require('xpath');\nxpath.select('//user[name=' + req.query.name + ']', doc);\n";
@@ -32709,7 +32709,7 @@ mod tests {
 
     #[test]
     fn javascript_rule_pack_scans_vue_and_svelte_raw_html_templates() {
-        let root = temp_dir("javascript-framework-raw-html");
+        let (_root_guard, root) = temp_dir("javascript-framework-raw-html");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/Profile.vue"),
@@ -32744,7 +32744,7 @@ mod tests {
 
     #[test]
     fn javascript_xss_rule_suppresses_test_and_example_fixtures() {
-        let root = temp_dir("javascript-xss-fixture-suppression");
+        let (_root_guard, root) = temp_dir("javascript-xss-fixture-suppression");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
@@ -33096,7 +33096,7 @@ mod tests {
 
     #[test]
     fn javascript_weak_password_kdf_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-weak-password-kdf-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-weak-password-kdf-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const bcrypt = require('bcrypt');\nbcrypt.hash(password, 4);\n";
@@ -33127,7 +33127,7 @@ mod tests {
 
     #[test]
     fn javascript_weak_crypto_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-weak-crypto-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-weak-crypto-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "const crypto = require('crypto');\ncrypto.createHash('md5').update(payload).digest('hex');\n";
@@ -33176,7 +33176,7 @@ mod tests {
 
     #[test]
     fn javascript_tls_verification_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-tls-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-tls-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source = "https.request({ rejectUnauthorized: false });\n";
@@ -33231,7 +33231,7 @@ mod tests {
 
     #[test]
     fn javascript_electron_web_security_disabled_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-electron-web-security-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-electron-web-security-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "new BrowserWindow({ webPreferences: { webSecurity: false } });\n";
@@ -33262,7 +33262,7 @@ mod tests {
 
     #[test]
     fn javascript_electron_web_security_disabled_multiline_location_uses_window_call() {
-        let root = temp_dir("javascript-electron-web-security-multiline-location");
+        let (_root_guard, root) = temp_dir("javascript-electron-web-security-multiline-location");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/main.js"),
@@ -33319,7 +33319,7 @@ mod tests {
     #[test]
     fn javascript_electron_allow_running_insecure_content_ignores_test_fixtures_in_production_scan()
     {
-        let root = temp_dir("javascript-electron-insecure-content-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-electron-insecure-content-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source =
@@ -33351,7 +33351,8 @@ mod tests {
 
     #[test]
     fn javascript_electron_allow_running_insecure_content_multiline_location_uses_window_call() {
-        let root = temp_dir("javascript-electron-insecure-content-multiline-location");
+        let (_root_guard, root) =
+            temp_dir("javascript-electron-insecure-content-multiline-location");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/main.js"),
@@ -33407,7 +33408,7 @@ mod tests {
 
     #[test]
     fn javascript_electron_context_isolation_disabled_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-electron-context-isolation-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-electron-context-isolation-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "new BrowserWindow({ webPreferences: { contextIsolation: false } });\n";
@@ -33438,7 +33439,8 @@ mod tests {
 
     #[test]
     fn javascript_electron_context_isolation_disabled_multiline_location_uses_window_call() {
-        let root = temp_dir("javascript-electron-context-isolation-multiline-location");
+        let (_root_guard, root) =
+            temp_dir("javascript-electron-context-isolation-multiline-location");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/main.js"),
@@ -33504,7 +33506,7 @@ mod tests {
 
     #[test]
     fn javascript_electron_node_integration_enabled_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-electron-node-integration-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-electron-node-integration-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "new BrowserWindow({ webPreferences: { nodeIntegration: true } });\n";
@@ -33535,7 +33537,8 @@ mod tests {
 
     #[test]
     fn javascript_electron_node_integration_enabled_multiline_location_uses_window_call() {
-        let root = temp_dir("javascript-electron-node-integration-multiline-location");
+        let (_root_guard, root) =
+            temp_dir("javascript-electron-node-integration-multiline-location");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/main.js"),
@@ -33587,7 +33590,7 @@ mod tests {
 
     #[test]
     fn production_scan_routes_javascript_files_to_rule_pack() {
-        let root = temp_dir("javascript-production-route");
+        let (_root_guard, root) = temp_dir("javascript-production-route");
         fs::write(
             root.join("app.ts"),
             "import { execSync } from 'child_process';\nexecSync(`rm -rf ${process.env.E2E_DIR}`);\n",
@@ -34589,7 +34592,7 @@ mod tests {
             "javascript cors false positives: {javascript_neg:?}"
         );
 
-        let root = temp_dir("javascript-cors-test-fixture-suppression");
+        let (_root_guard, root) = temp_dir("javascript-cors-test-fixture-suppression");
         fs::create_dir_all(root.join("src/middleware/cors")).unwrap();
         fs::write(
             root.join("src/server.ts"),
@@ -34717,7 +34720,7 @@ mod tests {
 
     #[test]
     fn python_csrf_cookie_secure_ignores_framework_defaults_and_tests() {
-        let root = temp_dir("python-csrf-cookie-secure-fixtures");
+        let (_root_guard, root) = temp_dir("python-csrf-cookie-secure-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join("django/conf")).unwrap();
@@ -34904,7 +34907,7 @@ mod tests {
 
     #[test]
     fn python_flask_wtf_csrf_config_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("python-flask-wtf-csrf-test-fixtures");
+        let (_root_guard, root) = temp_dir("python-flask-wtf-csrf-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
@@ -35036,7 +35039,7 @@ mod tests {
 
     #[test]
     fn javascript_clickjacking_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-clickjacking-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-clickjacking-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
         let source = "const helmet = require('helmet');\nhelmet({ xFrameOptions: false });\n";
@@ -35067,7 +35070,7 @@ mod tests {
 
     #[test]
     fn python_clickjacking_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("python-clickjacking-test-fixtures");
+        let (_root_guard, root) = temp_dir("python-clickjacking-test-fixtures");
         fs::create_dir_all(root.join("app")).unwrap();
         fs::create_dir_all(root.join("tests/decorators")).unwrap();
         let source = "from django.views.decorators.clickjacking import xframe_options_exempt\n\
@@ -35221,7 +35224,7 @@ mod tests {
 
     #[test]
     fn javascript_jwt_hardcoded_keys_ignore_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-jwt-hardcoded-key-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-jwt-hardcoded-key-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         let source =
@@ -35274,7 +35277,7 @@ mod tests {
 
     #[test]
     fn javascript_jwt_middleware_secrets_ignore_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-jwt-middleware-secret-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-jwt-middleware-secret-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
@@ -35329,7 +35332,7 @@ mod tests {
 
     #[test]
     fn javascript_hardcoded_session_secrets_ignore_test_fixtures_in_production_scan() {
-        let root = temp_dir("javascript-hardcoded-session-secret-test-fixtures");
+        let (_root_guard, root) = temp_dir("javascript-hardcoded-session-secret-test-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("test")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
@@ -35442,7 +35445,7 @@ mod tests {
 
     #[test]
     fn django_content_type_nosniff_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("django-content-type-nosniff-fixtures");
+        let (_root_guard, root) = temp_dir("django-content-type-nosniff-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "SECURE_CONTENT_TYPE_NOSNIFF = False\n";
@@ -35523,7 +35526,7 @@ mod tests {
 
     #[test]
     fn django_ssl_redirect_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("django-ssl-redirect-fixtures");
+        let (_root_guard, root) = temp_dir("django-ssl-redirect-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "SECURE_SSL_REDIRECT = False\n";
@@ -35554,7 +35557,7 @@ mod tests {
 
     #[test]
     fn django_ssl_redirect_ignores_django_global_settings() {
-        let root = temp_dir("django-ssl-redirect-global-settings");
+        let (_root_guard, root) = temp_dir("django-ssl-redirect-global-settings");
         fs::create_dir_all(root.join("django/conf")).unwrap();
         fs::write(
             root.join("django/conf/global_settings.py"),
@@ -35579,7 +35582,7 @@ mod tests {
 
     #[test]
     fn c_weak_crypto_ignores_md5_prototypes() {
-        let root = temp_dir("c-weak-crypto-prototype");
+        let (_root_guard, root) = temp_dir("c-weak-crypto-prototype");
         fs::write(
             root.join("crypto.c"),
             "extern void MD5(const unsigned char *, unsigned long, unsigned char *);\n",
@@ -35603,7 +35606,7 @@ mod tests {
 
     #[test]
     fn c_weak_crypto_ignores_macros_and_function_declarations() {
-        let root = temp_dir("c-weak-crypto-declarations");
+        let (_root_guard, root) = temp_dir("c-weak-crypto-declarations");
         fs::write(
             root.join("crypto.cc"),
             "#define DES_set_key DES_SET_KEY\n\
@@ -35639,7 +35642,7 @@ mod tests {
 
     #[test]
     fn generic_hardcoded_secret_ignores_test_fixture_paths() {
-        let root = temp_dir("generic-hardcoded-secret-fixtures");
+        let (_root_guard, root) = temp_dir("generic-hardcoded-secret-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join("examples")).unwrap();
@@ -35727,7 +35730,7 @@ mod tests {
 
     #[test]
     fn hardcoded_secret_does_not_duplicate_verified_secret() {
-        let root = temp_dir("verified-secret-dedupe");
+        let (_root_guard, root) = temp_dir("verified-secret-dedupe");
         let source = "GH_TOKEN = \"ghp_0123456789abcdef0123456789abcdefABCD\"\n";
         fs::write(root.join("settings.py"), source).unwrap();
 
@@ -35768,7 +35771,7 @@ mod tests {
 
     #[test]
     fn django_referrer_policy_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("django-referrer-policy-fixtures");
+        let (_root_guard, root) = temp_dir("django-referrer-policy-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "SECURE_REFERRER_POLICY = 'unsafe-url'\n";
@@ -35815,7 +35818,7 @@ mod tests {
 
     #[test]
     fn django_hsts_zero_seconds_ignores_test_fixtures_in_production_scan() {
-        let root = temp_dir("django-hsts-zero-fixtures");
+        let (_root_guard, root) = temp_dir("django-hsts-zero-fixtures");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("tests")).unwrap();
         let source = "SECURE_HSTS_SECONDS = 0\n";
@@ -35846,7 +35849,7 @@ mod tests {
 
     #[test]
     fn django_hsts_zero_seconds_ignores_django_global_settings() {
-        let root = temp_dir("django-hsts-global-settings");
+        let (_root_guard, root) = temp_dir("django-hsts-global-settings");
         fs::create_dir_all(root.join("django/conf")).unwrap();
         fs::write(
             root.join("django/conf/global_settings.py"),
@@ -35952,7 +35955,7 @@ mod tests {
 
     #[test]
     fn baseline_comparison_marks_resolved_findings() {
-        let root = temp_dir("baseline");
+        let (_root_guard, root) = temp_dir("baseline");
         fs::write(
             root.join("legacy.c"),
             "#include <string.h>\nvoid copy(char *d, const char *s) { strcpy(d, s); }\n",
@@ -35987,7 +35990,7 @@ mod tests {
 
     #[test]
     fn ada_named_argument_taint_maps_to_named_formal() {
-        let root = temp_dir("ada-named-argument-taint");
+        let (_root_guard, root) = temp_dir("ada-named-argument-taint");
         fs::write(
             root.join("pipeline.adb"),
             "procedure Forward (Safe : in String; Cmd : in String) is\n\
@@ -36036,7 +36039,7 @@ mod tests {
     /// just command spawn.
     #[test]
     fn ada_command_line_argument_to_file_open_is_path_traversal() {
-        let root = temp_dir("ada-path-taint");
+        let (_root_guard, root) = temp_dir("ada-path-taint");
         // Stream_IO.Open is NOT matched by the syntactic scan_ada BHF-405 (which keys
         // on `text_io.open`), so a finding here is proof the taint engine fired.
         fs::write(
@@ -36082,7 +36085,7 @@ mod tests {
     /// the Jazzer ScriptEngine-detector gap with an interprocedural taint confirmation.
     #[test]
     fn java_scriptengine_eval_of_request_param_is_code_injection() {
-        let root = temp_dir("java-eval-taint");
+        let (_root_guard, root) = temp_dir("java-eval-taint");
         fs::write(
             root.join("Runner.java"),
             "package com.acme;\n\
@@ -36127,7 +36130,7 @@ mod tests {
     /// query with a tainted bound argument is safe (no dynamic-string → no finding).
     #[test]
     fn multi_class_taint_confirms_path_and_sql() {
-        let root = temp_dir("go-multisink-taint");
+        let (_root_guard, root) = temp_dir("go-multisink-taint");
         fs::write(
             root.join("main.go"),
             "package p\n\
@@ -36189,7 +36192,7 @@ mod tests {
 
     #[test]
     fn open_redirect_taint_confirms_redirect_sinks() {
-        let root = temp_dir("open-redirect-taint");
+        let (_root_guard, root) = temp_dir("open-redirect-taint");
         fs::write(
             root.join("app.py"),
             "from flask import request, redirect\n\
@@ -36257,7 +36260,7 @@ mod tests {
     /// inputs. This is what finds real framework bugs, not just toy examples.
     #[test]
     fn source_api_seeds_taint_without_a_source_named_param() {
-        let root = temp_dir("source-api-taint");
+        let (_root_guard, root) = temp_dir("source-api-taint");
         // Go: os.Getenv -> exec.Command. Param-free function; the source is the API.
         fs::write(
             root.join("h.go"),
@@ -36292,7 +36295,7 @@ mod tests {
 
     #[test]
     fn python_web_request_apis_seed_taint_and_do_not_create_analysis_gaps() {
-        let root = temp_dir("python-web-request-source-taint");
+        let (_root_guard, root) = temp_dir("python-web-request-source-taint");
         fs::write(
             root.join("views.py"),
             "import os\n\
@@ -36365,7 +36368,7 @@ mod tests {
 
     #[test]
     fn python_list_append_propagates_taint_to_element_reads() {
-        let root = temp_dir("python-list-append-taint");
+        let (_root_guard, root) = temp_dir("python-list-append-taint");
         fs::write(
             root.join("app.py"),
             "import os\n\
@@ -36451,7 +36454,7 @@ mod tests {
 
     #[test]
     fn python_container_return_summary_preserves_taint() {
-        let root = temp_dir("python-container-return-taint");
+        let (_root_guard, root) = temp_dir("python-container-return-taint");
         fs::write(
             root.join("app.py"),
             "import os\n\
@@ -36487,7 +36490,7 @@ mod tests {
 
     #[test]
     fn python_external_builtin_and_test_calls_do_not_create_analysis_gaps() {
-        let root = temp_dir("python-external-gap-noise");
+        let (_root_guard, root) = temp_dir("python-external-gap-noise");
         fs::write(
             root.join("test_app.py"),
             "import json\n\
@@ -36553,7 +36556,7 @@ mod tests {
 
     #[test]
     fn java_list_add_propagates_taint_to_element_reads() {
-        let root = temp_dir("java-list-add-taint");
+        let (_root_guard, root) = temp_dir("java-list-add-taint");
         fs::write(
             root.join("Handler.java"),
             "import java.util.*;\n\
@@ -36596,7 +36599,7 @@ mod tests {
 
     #[test]
     fn java_map_put_propagates_taint_to_value_reads() {
-        let root = temp_dir("java-map-put-taint");
+        let (_root_guard, root) = temp_dir("java-map-put-taint");
         fs::write(
             root.join("Handler.java"),
             "import java.util.*;\n\
@@ -36639,7 +36642,7 @@ mod tests {
 
     #[test]
     fn java_stdlib_accessor_and_assertion_calls_do_not_create_analysis_gaps() {
-        let root = temp_dir("java-external-gap-noise");
+        let (_root_guard, root) = temp_dir("java-external-gap-noise");
         fs::write(
             root.join("Handler.java"),
             "import static com.google.common.truth.Truth.assertThat;\n\
@@ -36697,7 +36700,7 @@ mod tests {
 
     #[test]
     fn constructors_and_enum_variants_do_not_create_analysis_gaps() {
-        let root = temp_dir("constructor-value-gap-noise");
+        let (_root_guard, root) = temp_dir("constructor-value-gap-noise");
         fs::write(
             root.join("models.py"),
             "class UserModel:\n\
@@ -36765,7 +36768,7 @@ mod tests {
 
     #[test]
     fn syntactic_member_fragments_and_builtin_calls_do_not_create_analysis_gaps() {
-        let root = temp_dir("syntactic-gap-noise");
+        let (_root_guard, root) = temp_dir("syntactic-gap-noise");
         fs::write(
             root.join("models.py"),
             "class Handler:\n\
@@ -36859,7 +36862,7 @@ mod tests {
 
     #[test]
     fn rust_vec_push_propagates_taint_to_element_reads() {
-        let root = temp_dir("rust-vec-push-taint");
+        let (_root_guard, root) = temp_dir("rust-vec-push-taint");
         fs::write(
             root.join("main.rs"),
             "use std::process::Command;\n\
@@ -36893,7 +36896,7 @@ mod tests {
 
     #[test]
     fn rust_hashmap_insert_propagates_taint_to_value_reads() {
-        let root = temp_dir("rust-hashmap-insert-taint");
+        let (_root_guard, root) = temp_dir("rust-hashmap-insert-taint");
         fs::write(
             root.join("main.rs"),
             "use std::collections::HashMap;\n\
@@ -36928,7 +36931,7 @@ mod tests {
 
     #[test]
     fn cpp_vector_push_back_propagates_taint_to_element_reads() {
-        let root = temp_dir("cpp-vector-pushback-taint");
+        let (_root_guard, root) = temp_dir("cpp-vector-pushback-taint");
         fs::write(
             root.join("main.cpp"),
             "#include <cstdlib>\n\
@@ -36963,7 +36966,7 @@ mod tests {
 
     #[test]
     fn cpp_map_emplace_propagates_taint_to_value_reads() {
-        let root = temp_dir("cpp-map-emplace-taint");
+        let (_root_guard, root) = temp_dir("cpp-map-emplace-taint");
         fs::write(
             root.join("main.cpp"),
             "#include <cstdlib>\n\
@@ -36999,7 +37002,7 @@ mod tests {
 
     #[test]
     fn c_stdlib_and_macro_like_calls_do_not_create_analysis_gaps() {
-        let root = temp_dir("c-stdlib-macro-gap-noise");
+        let (_root_guard, root) = temp_dir("c-stdlib-macro-gap-noise");
         fs::write(
             root.join("main.c"),
             "#include <assert.h>\n\
@@ -37062,7 +37065,7 @@ mod tests {
     /// the program-tainted and shell cases fire.
     #[test]
     fn list_form_exec_flags_tainted_program_not_tainted_argument() {
-        let root = temp_dir("go-listform");
+        let (_root_guard, root) = temp_dir("go-listform");
         fs::write(
             root.join("main.go"),
             "package p\n\
@@ -37119,7 +37122,7 @@ mod tests {
     fn taint_finding_sarif_carries_code_flows_dataflow_path() {
         // A taint flow's source→sink trace must render as SARIF `codeFlows` so
         // GitHub code scanning / IDEs draw the dataflow path.
-        let root = temp_dir("sarif-codeflows");
+        let (_root_guard, root) = temp_dir("sarif-codeflows");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37167,7 +37170,7 @@ mod tests {
     /// command-exec finding resolves to CWE-78.
     #[test]
     fn go_findings_carry_top_level_cwe() {
-        let root = temp_dir("go-cwe");
+        let (_root_guard, root) = temp_dir("go-cwe");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37220,7 +37223,7 @@ mod tests {
     /// `help` + `helpUri` (semgrep/bandit-style fix guidance).
     #[test]
     fn findings_carry_remediation_and_sarif_help() {
-        let root = temp_dir("remediation-help");
+        let (_root_guard, root) = temp_dir("remediation-help");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37284,7 +37287,7 @@ mod tests {
     fn go_tuple_assignment_propagates_taint_to_all_bound_names() {
         // `cmd, _ := ...` binds the tainted value to `cmd`; the previous last-segment
         // logic tainted only `_` and missed it. Idiomatic Go, so this must flow.
-        let root = temp_dir("go-tuple-taint");
+        let (_root_guard, root) = temp_dir("go-tuple-taint");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37324,7 +37327,7 @@ mod tests {
 
     #[test]
     fn go_taint_reaches_command_sink_directly_and_across_calls() {
-        let root = temp_dir("go-taint");
+        let (_root_guard, root) = temp_dir("go-taint");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37372,7 +37375,7 @@ mod tests {
     /// at the same site (one row, not a pattern+taint pair).
     #[test]
     fn go_taint_clears_on_sanitize_and_dedupes_pattern() {
-        let root = temp_dir("go-taint-dedupe");
+        let (_root_guard, root) = temp_dir("go-taint-dedupe");
         fs::write(
             root.join("main.go"),
             "package main\n\
@@ -37431,7 +37434,7 @@ mod tests {
     /// returns its argument still propagates taint.
     #[test]
     fn return_value_summary_stops_non_propagating_call_from_tainting() {
-        let root = temp_dir("go-return-summary");
+        let (_root_guard, root) = temp_dir("go-return-summary");
         fs::write(
             root.join("main.go"),
             "package p\n\
@@ -37490,7 +37493,7 @@ mod tests {
     /// tainted again after it (join-point) — so a post-guard sink still fires.
     #[test]
     fn guard_sanitization_clears_inside_block_and_restores_after() {
-        let root = temp_dir("go-guard-taint");
+        let (_root_guard, root) = temp_dir("go-guard-taint");
         fs::write(
             root.join("main.go"),
             "package p\n\
@@ -37546,7 +37549,7 @@ mod tests {
     /// narrowing cast of a variable is BHF-425 (CWE-197).
     #[test]
     fn defuse_flags_uninitialized_use_and_narrowing_cast() {
-        let root = temp_dir("c-defuse");
+        let (_root_guard, root) = temp_dir("c-defuse");
         fs::write(
             root.join("a.c"),
             "int use_uninit(int flag) {\n\
@@ -37595,7 +37598,7 @@ mod tests {
     /// a heap pointer, a static local, a parameter's address, or a member does not.
     #[test]
     fn dangling_return_flags_local_address_only() {
-        let root = temp_dir("c-dangling");
+        let (_root_guard, root) = temp_dir("c-dangling");
         fs::write(
             root.join("a.c"),
             "int *bad_scalar(void) {\n\
@@ -37652,7 +37655,7 @@ mod tests {
     /// only flag `.c_str()`/`.data()` on a by-value local).
     #[test]
     fn dangling_return_flags_local_container_ptr() {
-        let root = temp_dir("cpp-dangling");
+        let (_root_guard, root) = temp_dir("cpp-dangling");
         fs::write(
             root.join("a.cpp"),
             "const char *bad_cstr() {\n\
@@ -37691,7 +37694,7 @@ mod tests {
     /// returned, stored-out, and passed-onward handles do not.
     #[test]
     fn resource_leak_flags_only_genuine_leak() {
-        let root = temp_dir("c-leak");
+        let (_root_guard, root) = temp_dir("c-leak");
         fs::write(
             root.join("a.c"),
             "void leaks(void) {\n\
@@ -37752,7 +37755,7 @@ mod tests {
     /// dangling return — while a one-line body that returns a heap pointer does not.
     #[test]
     fn dangling_return_handles_one_line_body() {
-        let root = temp_dir("c-dangling-oneline");
+        let (_root_guard, root) = temp_dir("c-dangling-oneline");
         fs::write(
             root.join("a.c"),
             "char *dangling(void) { char buf[16]; return buf; }\n\
@@ -37792,7 +37795,7 @@ mod tests {
     /// `{ char *p = malloc(n); free(p); }` does not (statement order respected).
     #[test]
     fn resource_leak_handles_one_line_body() {
-        let root = temp_dir("c-leak-oneline");
+        let (_root_guard, root) = temp_dir("c-leak-oneline");
         fs::write(
             root.join("a.c"),
             "void leaks(int n) { char *p = malloc(n); use(p[0]); }\n\
@@ -37827,7 +37830,7 @@ mod tests {
     /// would not.
     #[test]
     fn loop_carried_taint_reaches_sink_at_loop_top() {
-        let root = temp_dir("go-loop-taint");
+        let (_root_guard, root) = temp_dir("go-loop-taint");
         fs::write(
             root.join("main.go"),
             "package p\n\
@@ -37867,7 +37870,7 @@ mod tests {
 
     #[test]
     fn loop_carried_container_taint_reaches_sink_at_loop_top() {
-        let root = temp_dir("python-loop-container-taint");
+        let (_root_guard, root) = temp_dir("python-loop-container-taint");
         fs::write(
             root.join("app.py"),
             "import os\n\
@@ -37905,7 +37908,7 @@ mod tests {
     /// is BHF-304; a sanitized value is not.
     #[test]
     fn rust_taint_reaches_command_sink_directly_and_across_calls() {
-        let root = temp_dir("rust-taint");
+        let (_root_guard, root) = temp_dir("rust-taint");
         fs::write(
             root.join("main.rs"),
             "use std::process::Command;\n\
@@ -37960,7 +37963,7 @@ mod tests {
     /// heuristic at the same site); a sanitized value keeps only BHF-404.
     #[test]
     fn java_taint_reaches_command_sink_directly_and_across_calls() {
-        let root = temp_dir("java-taint");
+        let (_root_guard, root) = temp_dir("java-taint");
         fs::write(
             root.join("App.java"),
             "class App {\n\
@@ -38025,7 +38028,7 @@ mod tests {
     /// value is not.
     #[test]
     fn python_taint_reaches_command_sink_directly_and_across_calls() {
-        let root = temp_dir("python-taint");
+        let (_root_guard, root) = temp_dir("python-taint");
         fs::write(
             root.join("app.py"),
             "import os, subprocess, shlex\n\
@@ -38088,7 +38091,7 @@ mod tests {
     /// creating noise while still catching direct and framework logger calls.
     #[test]
     fn log_injection_taint_reaches_message_arguments_without_receiver_fp() {
-        let root = temp_dir("log-injection-taint");
+        let (_root_guard, root) = temp_dir("log-injection-taint");
         fs::write(
             root.join("app.py"),
             "import logging\n\
@@ -38205,7 +38208,7 @@ mod tests {
     /// BHF-304, and a shell_quote-sanitized value is not.
     #[test]
     fn perl_taint_reaches_command_sink_directly_and_across_calls() {
-        let root = temp_dir("perl-taint");
+        let (_root_guard, root) = temp_dir("perl-taint");
         fs::write(
             root.join("app.pl"),
             "sub run {\n\
@@ -38261,7 +38264,7 @@ mod tests {
 
     #[test]
     fn ada_taint_finds_nested_source_param_under_parameterless_procedure() {
-        let root = temp_dir("ada-nested-taint");
+        let (_root_guard, root) = temp_dir("ada-nested-taint");
         fs::write(
             root.join("nested.adb"),
             "with GNAT.OS_Lib;\n\
@@ -38301,7 +38304,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_direct_c_function_calls() {
-        let root = temp_dir("call-graph");
+        let (_root_guard, root) = temp_dir("call-graph");
         fs::write(
             root.join("parse.c"),
             "int parse_header(const unsigned char *data, unsigned long len) { return (int)len; }\n\
@@ -38322,7 +38325,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_ada_parameterless_procedure_calls() {
-        let root = temp_dir("ada-call-graph");
+        let (_root_guard, root) = temp_dir("ada-call-graph");
         fs::write(
             root.join("helper.adb"),
             "procedure Helper is\n\
@@ -38363,7 +38366,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_ada_package_qualified_procedure_calls() {
-        let root = temp_dir("ada-qualified-call-graph");
+        let (_root_guard, root) = temp_dir("ada-qualified-call-graph");
         fs::write(
             root.join("helpers.adb"),
             "package body Helpers is\n\
@@ -38398,7 +38401,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_call_to_ada_subprogram_renaming() {
-        let root = temp_dir("ada-renaming-call-graph");
+        let (_root_guard, root) = temp_dir("ada-renaming-call-graph");
         // A package spec exposing a subprogram renaming (no body of its own).
         fs::write(
             root.join("text_utils.ads"),
@@ -38447,7 +38450,7 @@ mod tests {
 
     #[test]
     fn call_graph_reports_ada_unresolved_parameterless_calls() {
-        let root = temp_dir("ada-unresolved-call-graph");
+        let (_root_guard, root) = temp_dir("ada-unresolved-call-graph");
         fs::write(
             root.join("parse.adb"),
             "procedure Parse (Input : in String) is\n\
@@ -38475,7 +38478,7 @@ mod tests {
 
     #[test]
     fn call_graph_reports_ada_argument_arity_mismatch_as_unresolved_call() {
-        let root = temp_dir("ada-arity-mismatch-call-graph");
+        let (_root_guard, root) = temp_dir("ada-arity-mismatch-call-graph");
         fs::write(
             root.join("helper.adb"),
             "procedure Helper is\n\
@@ -38512,7 +38515,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_ada_grouped_formal_parameter_calls() {
-        let root = temp_dir("ada-grouped-formals-call-graph");
+        let (_root_guard, root) = temp_dir("ada-grouped-formals-call-graph");
         fs::write(
             root.join("helper.adb"),
             "procedure Helper (Left, Right : in String) is\n\
@@ -38556,7 +38559,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_ada_calls_omitting_defaulted_formals() {
-        let root = temp_dir("ada-defaulted-formals-call-graph");
+        let (_root_guard, root) = temp_dir("ada-defaulted-formals-call-graph");
         fs::write(
             root.join("helper.adb"),
             "procedure Helper (Required : in String; Optional : in String := \"fallback\") is\n\
@@ -38600,7 +38603,7 @@ mod tests {
 
     #[test]
     fn call_graph_resolves_ada_multiline_subprogram_headers() {
-        let root = temp_dir("ada-multiline-header-call-graph");
+        let (_root_guard, root) = temp_dir("ada-multiline-header-call-graph");
         fs::write(
             root.join("helper.adb"),
             "procedure Helper\n\
@@ -38648,7 +38651,7 @@ mod tests {
 
     #[test]
     fn bhf403_sprintf_into_fixed_buffer_is_flagged() {
-        let root = temp_dir("bhf403-sprintf");
+        let (_root_guard, root) = temp_dir("bhf403-sprintf");
         fs::write(
             root.join("bad.c"),
             "void vuln(char *in) { char buf[16]; sprintf(buf, \"%s\", in); }\n",
@@ -38673,7 +38676,7 @@ mod tests {
 
     #[test]
     fn bhf403_vsprintf_is_flagged() {
-        let root = temp_dir("bhf403-vsprintf");
+        let (_root_guard, root) = temp_dir("bhf403-vsprintf");
         fs::write(
             root.join("bad.c"),
             "#include <stdarg.h>\nvoid fmt(char *buf, const char *fmt, ...) { va_list ap; va_start(ap, fmt); vsprintf(buf, fmt, ap); va_end(ap); }\n",
@@ -38698,7 +38701,7 @@ mod tests {
 
     #[test]
     fn bhf403_snprintf_is_not_flagged() {
-        let root = temp_dir("bhf403-snprintf-safe");
+        let (_root_guard, root) = temp_dir("bhf403-snprintf-safe");
         fs::write(
             root.join("safe.c"),
             "void safe(char *in) { char buf[16]; snprintf(buf, sizeof(buf), \"%s\", in); }\n",
@@ -38725,7 +38728,7 @@ mod tests {
 
     #[test]
     fn bhf404_system_with_variable_is_flagged() {
-        let root = temp_dir("bhf404-system-var");
+        let (_root_guard, root) = temp_dir("bhf404-system-var");
         fs::write(
             root.join("bad.c"),
             "void vuln(char *cmd) { system(cmd); }\n",
@@ -38750,7 +38753,7 @@ mod tests {
 
     #[test]
     fn bhf404_system_with_literal_is_not_flagged() {
-        let root = temp_dir("bhf404-system-literal");
+        let (_root_guard, root) = temp_dir("bhf404-system-literal");
         fs::write(
             root.join("safe.c"),
             "void harmless(void) { system(\"ls -l\"); }\n",
@@ -38775,7 +38778,7 @@ mod tests {
 
     #[test]
     fn bhf404_ignores_qt_locale_system_member_call() {
-        let root = temp_dir("bhf404-qt-locale-system");
+        let (_root_guard, root) = temp_dir("bhf404-qt-locale-system");
         fs::write(
             root.join("safe.cpp"),
             "#include <QLocale>\nQString f(double v) { return QLocale::system().toString(v, 'f', 2); }\n",
@@ -38800,7 +38803,7 @@ mod tests {
 
     #[test]
     fn bhf404_ignores_api_name_inside_string_literal() {
-        let root = temp_dir("bhf404-system-string-literal");
+        let (_root_guard, root) = temp_dir("bhf404-system-string-literal");
         fs::write(
             root.join("safe.c"),
             "void harmless(void) { perror(\"ERROR: system(make_cmd) failed\"); }\n",
@@ -38825,7 +38828,7 @@ mod tests {
 
     #[test]
     fn bhf404_popen_with_variable_is_flagged() {
-        let root = temp_dir("bhf404-popen-var");
+        let (_root_guard, root) = temp_dir("bhf404-popen-var");
         fs::write(
             root.join("bad.c"),
             "#include <stdio.h>\nvoid vuln(char *cmd) { FILE *f = popen(cmd, \"r\"); }\n",
@@ -38857,7 +38860,7 @@ mod tests {
 
     #[test]
     fn bhf404_perl_piped_open_distinguishes_shell_from_list_form() {
-        let root = temp_dir("bhf404-perl-piped-open");
+        let (_root_guard, root) = temp_dir("bhf404-perl-piped-open");
         fs::write(
             root.join("open.pl"),
             "open(FH, \"$cmd|\") or die;\n\
@@ -38891,7 +38894,7 @@ mod tests {
 
     #[test]
     fn bhf404_perl_system_exec_distinguish_shell_string_from_list_form() {
-        let root = temp_dir("bhf404-perl-system-exec-list-form");
+        let (_root_guard, root) = temp_dir("bhf404-perl-system-exec-list-form");
         fs::write(
             root.join("exec.pl"),
             "system($cmd);\n\
@@ -38929,7 +38932,7 @@ mod tests {
     #[test]
     fn bhf404_getenv_fed_system_is_flagged() {
         // getenv() result stored in a variable and then passed to system().
-        let root = temp_dir("bhf404-getenv-system");
+        let (_root_guard, root) = temp_dir("bhf404-getenv-system");
         fs::write(
             root.join("bad.c"),
             "void vuln(void) { char *cmd = getenv(\"X\"); system(cmd); }\n",
@@ -38971,7 +38974,7 @@ mod tests {
 
     #[test]
     fn bhf401_strcpy_still_flagged_after_new_rules() {
-        let root = temp_dir("bhf401-regression");
+        let (_root_guard, root) = temp_dir("bhf401-regression");
         fs::write(
             root.join("bad.c"),
             "#include <string.h>\nvoid copy(char *d, const char *s) { strcpy(d, s); }\n",
@@ -39300,7 +39303,7 @@ mod tests {
 
     #[test]
     fn sarif_driver_carries_version_and_relativised_uri_base_id() {
-        let root = temp_dir("sarif-srcroot");
+        let (_root_guard, root) = temp_dir("sarif-srcroot");
         fs::write(
             root.join("bad.c"),
             "#include <string.h>\nvoid copy(char *d, const char *s) { strcpy(d, s); }\n",
@@ -39414,14 +39417,21 @@ mod tests {
         assert!(sarif["runs"][0].get("originalUriBaseIds").is_none());
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-static-analysis-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-static-analysis-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     #[test]
@@ -39429,7 +39439,7 @@ mod tests {
         // A finding whose line shifts (unrelated edit above it) has a NEW line-based
         // fingerprint but the SAME durable identity, so a baseline still recognizes
         // it — not resurfaced as "new", not reported "resolved".
-        let root = temp_dir("durable-identity");
+        let (_root_guard, root) = temp_dir("durable-identity");
         let file = root.join("legacy.c");
         fs::write(
             &file,
@@ -39516,7 +39526,7 @@ mod tests {
         // `handle` reads an input source (getenv) and calls `helper`, so `helper`
         // is on an attacker-influenced path; `orphan` is called by nobody and reads
         // no source, so it is isolated even though the tree HAS a source.
-        let root = temp_dir("reachability-tier");
+        let (_root_guard, root) = temp_dir("reachability-tier");
         fs::write(
             root.join("copy.c"),
             "#include <string.h>\n\

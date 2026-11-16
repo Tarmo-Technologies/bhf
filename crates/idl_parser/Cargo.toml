@@ -16,4 +16,5 @@ name = "idl_parser"
 path = "src/main.rs"
 
 [dev-dependencies]
+tempfile.workspace = true
 ada_parser = { path = "../ada_parser" }

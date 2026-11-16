@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn replay_match_when_harness_emits_recorded_signature_events() {
-    let finding_dir = write_finding("match", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding("match", canonical_signature());
 
     let result = replay(&finding_dir, fake_harness()).unwrap();
 
@@ -18,7 +18,7 @@ fn replay_match_when_harness_emits_recorded_signature_events() {
 
 #[test]
 fn replay_mismatch_when_harness_emits_different_signature() {
-    let finding_dir = write_finding("mismatch", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding("mismatch", canonical_signature());
 
     let result = replay(&finding_dir, fake_harness()).unwrap();
 
@@ -35,7 +35,7 @@ fn replay_mismatch_when_harness_emits_different_signature() {
 fn replay_matches_recorded_signature_at_second_handler_index() {
     let testcase = testcase_with_handler_lines(&[5, 9]);
     let recorded = compute_signature(&testcase, &testcase.handlers[1]);
-    let finding_dir = write_finding("multi-handler", recorded);
+    let (_finding_dir_guard, finding_dir) = write_finding("multi-handler", recorded);
 
     let result = replay(&finding_dir, fake_harness()).unwrap();
 
@@ -48,7 +48,7 @@ fn replay_returns_mismatch_when_recorded_signature_absent_from_all_handlers() {
     let actual = compute_signature(&testcase, &testcase.handlers[0]);
     let unrelated = testcase_with_handler_lines(&[13]);
     let recorded = compute_signature(&unrelated, &unrelated.handlers[0]);
-    let finding_dir = write_finding("multi-handler", recorded);
+    let (_finding_dir_guard, finding_dir) = write_finding("multi-handler", recorded);
 
     let result = replay(&finding_dir, fake_harness()).unwrap();
 
@@ -65,7 +65,7 @@ fn replay_returns_mismatch_when_recorded_signature_absent_from_all_handlers() {
 fn replay_returns_match_when_recorded_signature_at_first_handler_index() {
     let testcase = testcase_with_handler_lines(&[5, 9]);
     let recorded = compute_signature(&testcase, &testcase.handlers[0]);
-    let finding_dir = write_finding("multi-handler", recorded);
+    let (_finding_dir_guard, finding_dir) = write_finding("multi-handler", recorded);
 
     let result = replay(&finding_dir, fake_harness()).unwrap();
 
@@ -74,7 +74,8 @@ fn replay_returns_match_when_recorded_signature_at_first_handler_index() {
 
 #[test]
 fn replay_returns_error_when_finding_missing() {
-    let missing = temp_dir("missing").join("F-0000-missing");
+    let (_scratch4, scratch4) = temp_dir("missing");
+    let missing = scratch4.join("F-0000-missing");
 
     let error = replay(&missing, fake_harness()).unwrap_err();
 
@@ -83,8 +84,9 @@ fn replay_returns_error_when_finding_missing() {
 
 #[test]
 fn replay_returns_error_when_harness_binary_missing() {
-    let finding_dir = write_finding("match", canonical_signature());
-    let missing_harness = temp_dir("missing-harness").join("missing-harness");
+    let (_finding_dir_guard, finding_dir) = write_finding("match", canonical_signature());
+    let (_scratch3, scratch3) = temp_dir("missing-harness");
+    let missing_harness = scratch3.join("missing-harness");
 
     let error = replay(&finding_dir, &missing_harness).unwrap_err();
 
@@ -107,7 +109,7 @@ fn a_replay_report_describes_the_recorded_and_the_replayed_exception() {
     let runner = HarnessRunner::direct(fake_harness());
     let maps = corpus::SourceLineMaps::default();
 
-    let finding_dir = write_finding_json("match", &described);
+    let (_finding_dir_guard, finding_dir) = write_finding_json("match", &described);
     let report = replay_report_with_runner(&finding_dir, &runner, &maps).unwrap();
     assert_eq!(report.result, ReplayResult::Match);
     let recorded = report.recorded.as_ref().expect("the finding describes it");
@@ -117,7 +119,7 @@ fn a_replay_report_describes_the_recorded_and_the_replayed_exception() {
         assert_eq!(raised.handled_at.as_deref(), Some("pkg.adb:9"));
     }
 
-    let finding_dir = write_finding_json("mismatch", &described);
+    let (_finding_dir_guard, finding_dir) = write_finding_json("mismatch", &described);
     let report = replay_report_with_runner(&finding_dir, &runner, &maps).unwrap();
     assert!(matches!(report.result, ReplayResult::Mismatch { .. }));
     assert_eq!(
@@ -149,7 +151,7 @@ fn a_mismatch_compares_the_replayed_exception_closest_to_the_recorded_one() {
         "raises": [],
         "exception": {"name": "CONSTRAINT_ERROR", "message": "bad input"},
     });
-    let finding_dir = write_finding_json("multi-handler", &described);
+    let (_finding_dir_guard, finding_dir) = write_finding_json("multi-handler", &described);
     let runner = HarnessRunner::direct(fake_harness());
     let report =
         replay_report_with_runner(&finding_dir, &runner, &corpus::SourceLineMaps::default())
@@ -168,8 +170,9 @@ fn a_mismatch_compares_the_replayed_exception_closest_to_the_recorded_one() {
     assert_eq!(report.deciding(), Some(closest));
 }
 
-fn write_finding_json(input: &str, finding: &serde_json::Value) -> PathBuf {
-    let finding_dir = temp_dir(input).join("findings/F-0000-test");
+fn write_finding_json(input: &str, finding: &serde_json::Value) -> (tempfile::TempDir, PathBuf) {
+    let (_scratch2, scratch2) = temp_dir(input);
+    let finding_dir = scratch2.join("findings/F-0000-test");
     fs::create_dir_all(&finding_dir).unwrap();
     fs::write(finding_dir.join("testcase.bin"), input.as_bytes()).unwrap();
     fs::write(
@@ -177,7 +180,7 @@ fn write_finding_json(input: &str, finding: &serde_json::Value) -> PathBuf {
         serde_json::to_vec(finding).unwrap(),
     )
     .unwrap();
-    finding_dir
+    (_scratch2, finding_dir)
 }
 
 fn canonical_signature() -> Signature {
@@ -212,8 +215,9 @@ fn testcase_with_handler_lines(handler_lines: &[u32]) -> Testcase {
     }
 }
 
-fn write_finding(input: &str, signature: Signature) -> PathBuf {
-    let finding_dir = temp_dir(input).join("findings/F-0000-test");
+fn write_finding(input: &str, signature: Signature) -> (tempfile::TempDir, PathBuf) {
+    let (_scratch1, scratch1) = temp_dir(input);
+    let finding_dir = scratch1.join("findings/F-0000-test");
     fs::create_dir_all(&finding_dir).unwrap();
     fs::write(finding_dir.join("testcase.bin"), input.as_bytes()).unwrap();
     fs::write(
@@ -221,14 +225,14 @@ fn write_finding(input: &str, signature: Signature) -> PathBuf {
         serde_json::to_vec(&serde_json::json!({ "signature": signature })).unwrap(),
     )
     .unwrap();
-    finding_dir
+    (_scratch1, finding_dir)
 }
 
 fn fake_harness() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_fake_harness"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
+fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -238,7 +242,14 @@ fn temp_dir(name: &str) -> PathBuf {
     // and two tests sharing a dir overwrite each other's finding.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("bhf-replay-{name}-{nonce}-{next}"));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-replay-{name}-{nonce}-{next}"));
     fs::create_dir_all(&dir).unwrap();
-    dir
+    (dir_tmp, dir)
 }

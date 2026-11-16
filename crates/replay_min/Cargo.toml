@@ -29,3 +29,6 @@ path = "src/main.rs"
 [[bin]]
 name = "fake_harness"
 path = "tests/fixtures/fake_harness.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -20,3 +20,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "spdx_check"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

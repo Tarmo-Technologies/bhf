@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+### Changed
+- Tests in every crate make their scratch directories with a guard that
+  removes them when the test ends, including when it fails, and a lint
+  (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
+
 ### Fixed
 - `bhf replay` and `bhf minimize` symbolize a crash without the network
   debuginfod client, as fuzz children already did. On a host whose

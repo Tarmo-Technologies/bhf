@@ -13,14 +13,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn temp_dir(name: &str) -> PathBuf {
+fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-harness-snapshot-{name}-{nonce}"));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-harness-snapshot-{name}-{nonce}"));
     fs::create_dir_all(&dir).unwrap();
-    dir
+    (dir_tmp, dir)
 }
 
 fn span() -> Span {
@@ -112,9 +119,14 @@ fn ast_with(target: Subprogram, packages: Vec<Package>) -> StructuralAst {
     }
 }
 
-fn generate_main(ast: &StructuralAst, target: &Subprogram, name: &str) -> PathBuf {
-    let output_dir = temp_dir(name).join("H-0042");
-    generate_direct_harness(GenerateDirectArgs {
+fn generate_main(
+    ast: &StructuralAst,
+    target: &Subprogram,
+    name: &str,
+) -> (tempfile::TempDir, PathBuf) {
+    let (output_guard, output_root) = temp_dir(name);
+    let output_dir = output_root.join("H-0042");
+    let harness = generate_direct_harness(GenerateDirectArgs {
         ast,
         target_subprogram: target,
         harness_id: "H-0042".to_owned(),
@@ -128,13 +140,18 @@ fn generate_main(ast: &StructuralAst, target: &Subprogram, name: &str) -> PathBu
         child_harness_unit: None,
         force: false,
     })
-    .unwrap()
-    .main_adb
+    .unwrap();
+    (output_guard, harness.main_adb)
 }
 
-fn generate_sequence_main(ast: &StructuralAst, target_package: &Package, name: &str) -> PathBuf {
-    let output_dir = temp_dir(name).join("H-M9");
-    generate_sequence_harness(GenerateSequenceArgs {
+fn generate_sequence_main(
+    ast: &StructuralAst,
+    target_package: &Package,
+    name: &str,
+) -> (tempfile::TempDir, PathBuf) {
+    let (output_guard, output_root) = temp_dir(name);
+    let output_dir = output_root.join("H-M9");
+    let harness = generate_sequence_harness(GenerateSequenceArgs {
         ast,
         target_package,
         harness_id: "H-M9".to_owned(),
@@ -143,13 +160,18 @@ fn generate_sequence_main(ast: &StructuralAst, target_package: &Package, name: &
         source_roots: Vec::new(),
         project_imports: Vec::new(),
     })
-    .unwrap()
-    .main_adb
+    .unwrap();
+    (output_guard, harness.main_adb)
 }
 
-fn generate_servant_direct_main(ast: &StructuralAst, target: &Subprogram, name: &str) -> PathBuf {
-    let output_dir = temp_dir(name).join("H-M12");
-    generate_servant_direct_harness(GenerateServantDirectArgs {
+fn generate_servant_direct_main(
+    ast: &StructuralAst,
+    target: &Subprogram,
+    name: &str,
+) -> (tempfile::TempDir, PathBuf) {
+    let (output_guard, output_root) = temp_dir(name);
+    let output_dir = output_root.join("H-M12");
+    let harness = generate_servant_direct_harness(GenerateServantDirectArgs {
         ast,
         target_subprogram: target,
         harness_id: "H-M12".to_owned(),
@@ -158,8 +180,8 @@ fn generate_servant_direct_main(ast: &StructuralAst, target: &Subprogram, name: 
         source_roots: Vec::new(),
         project_imports: Vec::new(),
     })
-    .unwrap()
-    .main_adb
+    .unwrap();
+    (output_guard, harness.main_adb)
 }
 
 fn snapshot_path(name: &str) -> PathBuf {
@@ -206,7 +228,7 @@ fn snapshot_simple_string_target() {
     );
     let ast = ast_with(target.clone(), vec![package(1, "Pkg")]);
 
-    let main_adb = generate_main(&ast, &target, "simple-string");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "simple-string");
 
     snapshot_compare(&main_adb, "simple_string_target.main.adb");
 }
@@ -226,7 +248,7 @@ fn snapshot_integer_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "integer-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "integer-param");
 
     snapshot_compare(&main_adb, "integer_param_target.main.adb");
 }
@@ -247,7 +269,7 @@ fn snapshot_multi_param_target() {
     );
     let ast = ast_with(target.clone(), vec![package(1, "Pkg")]);
 
-    let main_adb = generate_main(&ast, &target, "multi-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "multi-param");
 
     snapshot_compare(&main_adb, "multi_param_target.main.adb");
 }
@@ -271,7 +293,7 @@ fn snapshot_enum_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "enum-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "enum-param");
 
     snapshot_compare(&main_adb, "enum_param.main.adb");
 }
@@ -296,7 +318,7 @@ fn snapshot_array_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "array-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "array-param");
 
     snapshot_compare(&main_adb, "array_param.main.adb");
 }
@@ -319,7 +341,7 @@ fn snapshot_record_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "record-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "record-param");
 
     snapshot_compare(&main_adb, "record_param.main.adb");
 }
@@ -342,7 +364,7 @@ fn snapshot_discriminated_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "discriminated-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "discriminated-param");
 
     snapshot_compare(&main_adb, "discriminated_param.main.adb");
 }
@@ -362,7 +384,7 @@ fn snapshot_access_param_target() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "access-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "access-param");
 
     snapshot_compare(&main_adb, "access_param.main.adb");
 }
@@ -381,7 +403,7 @@ fn snapshot_object_ref_param_target() {
         name: "CORBA.Object".to_owned(),
     });
 
-    let main_adb = generate_main(&ast, &target, "object-ref-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "object-ref-param");
 
     snapshot_compare(&main_adb, "object_ref_param.main.adb");
 }
@@ -413,7 +435,7 @@ fn snapshot_direct_param_modes_target() {
         name: "CORBA.Object".to_owned(),
     });
 
-    let main_adb = generate_main(&ast, &target, "direct-param-modes");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "direct-param-modes");
 
     snapshot_compare(&main_adb, "direct_param_modes.main.adb");
 }
@@ -461,7 +483,7 @@ fn snapshot_tagged_param_target() {
         ..StructuralAst::new()
     };
 
-    let main_adb = generate_main(&ast, &target, "tagged-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "tagged-param");
 
     snapshot_compare(&main_adb, "tagged_param.main.adb");
 }
@@ -494,7 +516,8 @@ fn snapshot_private_state_sequence_target() {
     ast.subprograms.push(pop);
     ast.subprograms.push(top);
 
-    let main_adb = generate_sequence_main(&ast, &state, "private-state-sequence");
+    let (_main_adb_guard, main_adb) =
+        generate_sequence_main(&ast, &state, "private-state-sequence");
 
     snapshot_compare(&main_adb, "private_state_sequence.main.adb");
 }
@@ -527,7 +550,7 @@ fn snapshot_servant_direct_target() {
     let mut ast = ast_with(target.clone(), vec![bar_impl]);
     ast.types.push(servant_type);
 
-    let main_adb = generate_servant_direct_main(&ast, &target, "servant-direct");
+    let (_main_adb_guard, main_adb) = generate_servant_direct_main(&ast, &target, "servant-direct");
 
     snapshot_compare(&main_adb, "servant_direct.main.adb");
 }
@@ -571,7 +594,8 @@ fn snapshot_servant_direct_param_modes_target() {
     let mut ast = ast_with(target.clone(), vec![bar_impl]);
     ast.types.push(servant_type);
 
-    let main_adb = generate_servant_direct_main(&ast, &target, "servant-direct-param-modes");
+    let (_main_adb_guard, main_adb) =
+        generate_servant_direct_main(&ast, &target, "servant-direct-param-modes");
 
     snapshot_compare(&main_adb, "servant_direct_param_modes.main.adb");
 }
@@ -587,7 +611,7 @@ fn generated_harness_for_float_param_includes_explicit_float_conversion() {
     );
     let ast = ast_with(target.clone(), Vec::new());
 
-    let main_adb = generate_main(&ast, &target, "float-param");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "float-param");
     let main_text = fs::read_to_string(&main_adb).unwrap();
 
     assert!(
@@ -616,7 +640,7 @@ fn direct_harness_result_var_does_not_collide_with_a_param_named_r() {
     );
     let ast = ast_with(target.clone(), vec![package(1, "Pkg")]);
 
-    let main_adb = generate_main(&ast, &target, "result-name-collision");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "result-name-collision");
     let text = fs::read_to_string(&main_adb).unwrap();
 
     assert!(
@@ -656,7 +680,7 @@ fn direct_harness_drives_root_stream_type_class_param_with_fuzz_source() {
     );
     let ast = ast_with(target.clone(), vec![package(1, "Gid")]);
 
-    let main_adb = generate_main(&ast, &target, "root-stream-source");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "root-stream-source");
     let text = fs::read_to_string(&main_adb).unwrap();
 
     assert!(text.contains("with Bhf_Source_Streams;"), "{text}");
@@ -716,7 +740,7 @@ fn direct_harness_constructs_private_type_via_out_param_ctor_with_fuzz_stream() 
     let mut ast = ast_with(target.clone(), vec![package(1, "Gid")]);
     ast.subprograms.push(ctor);
 
-    let main_adb = generate_main(&ast, &target, "private-ctor-stream");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "private-ctor-stream");
     let text = fs::read_to_string(&main_adb).unwrap();
 
     assert!(text.contains("with Bhf_Source_Streams;"), "{text}");
@@ -746,7 +770,7 @@ fn generated_harness_main_adb_parses_via_ada_parser() {
     );
     let ast = ast_with(target.clone(), vec![package(1, "Pkg")]);
 
-    let main_adb = generate_main(&ast, &target, "parse-main");
+    let (_main_adb_guard, main_adb) = generate_main(&ast, &target, "parse-main");
 
     parse_ada_file(&main_adb);
 }

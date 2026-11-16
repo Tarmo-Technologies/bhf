@@ -556,12 +556,19 @@ mod test_support {
     pub(crate) static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     pub(crate) struct TestPathDir {
+        // Removes the directory when the guard is dropped.
+        _root: tempfile::TempDir,
         path: PathBuf,
     }
 
     impl TestPathDir {
         pub(crate) fn new(test_name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
+            // Removed when this scope ends.
+            let path_tmp = tempfile::Builder::new()
+                .prefix("bhf-")
+                .tempdir()
+                .expect("create test dir");
+            let path = path_tmp.path().join(format!(
                 "bhf-compiler-adapter-{test_name}-{}",
                 std::process::id()
             ));
@@ -569,7 +576,10 @@ mod test_support {
                 std::fs::remove_dir_all(&path).expect("old test directory is removed");
             }
             std::fs::create_dir_all(&path).expect("test directory is created");
-            Self { path }
+            Self {
+                _root: path_tmp,
+                path,
+            }
         }
 
         pub(crate) fn path(&self) -> &Path {

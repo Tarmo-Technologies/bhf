@@ -3858,19 +3858,24 @@ mod deb_scan_tests {
         Zstd,
     }
 
-    fn temp_root(tag: &str) -> PathBuf {
+    fn temp_root(tag: &str) -> (tempfile::TempDir, PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-deb-scan-{tag}-{}-{nanos}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     /// A minimal but well-formed 64-bit little-endian x86-64 ELF header.
@@ -3956,7 +3961,7 @@ mod deb_scan_tests {
         let tar = build_data_tar(&minimal_elf64());
         let deb = build_deb(data_member, &compress(codec, &tar));
 
-        let root = temp_root(&data_member.replace('.', "_"));
+        let (_root_guard, root) = temp_root(&data_member.replace('.', "_"));
         fs::write(root.join("pkg.deb"), &deb).unwrap();
         let options = BinaryScanOptions {
             root: root.clone(),
@@ -4026,7 +4031,7 @@ mod deb_scan_tests {
         encoder.write_all(&payload).unwrap();
         let gz = encoder.finish().unwrap();
 
-        let root = temp_root("bomb");
+        let (_root_guard, root) = temp_root("bomb");
         fs::write(root.join("payload.gz"), &gz).unwrap();
         let options = BinaryScanOptions {
             root: root.clone(),
@@ -4055,24 +4060,29 @@ mod build_identity_tests {
     use super::build_identity;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    fn temp_dir(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-build-identity-{tag}-{}-{nanos}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     #[test]
     fn build_identity_hashes_any_file_and_reads_elf_build_id() {
-        let tmp = temp_dir("plain");
+        let (_tmp_guard, tmp) = temp_dir("plain");
         let plain = tmp.join("plain");
         std::fs::write(&plain, b"abc").unwrap();
         let id = build_identity(&plain).unwrap();

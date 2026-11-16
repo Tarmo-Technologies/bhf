@@ -165,20 +165,25 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tempdir(name: &str) -> PathBuf {
+    fn tempdir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-nyx-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-nyx-{name}-{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     #[cfg(not(feature = "nyx-engine"))]
     #[test]
     fn run_snapshot_once_returns_snapshot_missing_when_target_absent() {
-        let dir = tempdir("no-target");
+        let (_dir_guard, dir) = tempdir("no-target");
         let config = NyxAdapterConfig {
             snapshot_dir: dir,
             coverage: CoverageStrategy::SanCov,
@@ -192,7 +197,7 @@ mod tests {
     #[test]
     fn run_snapshot_once_software_replay_against_bin_true() {
         use std::os::unix::fs::symlink;
-        let dir = tempdir("sw-true");
+        let (_dir_guard, dir) = tempdir("sw-true");
         symlink("/bin/true", dir.join("target")).unwrap();
         let config = NyxAdapterConfig {
             snapshot_dir: dir,
@@ -207,7 +212,7 @@ mod tests {
     #[test]
     fn run_snapshot_once_software_replay_against_bin_false() {
         use std::os::unix::fs::symlink;
-        let dir = tempdir("sw-false");
+        let (_dir_guard, dir) = tempdir("sw-false");
         symlink("/bin/false", dir.join("target")).unwrap();
         let config = NyxAdapterConfig {
             snapshot_dir: dir,
@@ -222,7 +227,7 @@ mod tests {
     #[test]
     fn software_replay_drains_large_stdout_before_waiting() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir("large-stdout");
+        let (_dir_guard, dir) = tempdir("large-stdout");
         let target = dir.join("target");
         std::fs::write(&target, "#!/bin/sh\nhead -c 2097152 /dev/zero\n").unwrap();
         let mut permissions = std::fs::metadata(&target).unwrap().permissions();
@@ -253,7 +258,7 @@ mod tests {
     #[cfg(feature = "nyx-engine")]
     #[test]
     fn enabled_but_unimplemented_engine_returns_error_instead_of_panicking() {
-        let dir = tempdir("feature-not-implemented");
+        let (_dir_guard, dir) = tempdir("feature-not-implemented");
         let config = NyxAdapterConfig {
             snapshot_dir: dir,
             coverage: CoverageStrategy::IntelPt,
@@ -296,7 +301,7 @@ mod tests {
         #[cfg(all(unix, not(feature = "nyx-engine")))]
         {
             use std::os::unix::fs::symlink;
-            let dir = tempdir("zero-cov");
+            let (_dir_guard, dir) = tempdir("zero-cov");
             symlink("/bin/true", dir.join("target")).unwrap();
             let config = NyxAdapterConfig {
                 snapshot_dir: dir,

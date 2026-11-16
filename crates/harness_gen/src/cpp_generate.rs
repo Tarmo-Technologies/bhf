@@ -2629,14 +2629,19 @@ mod tests {
         );
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cppgen-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-cppgen-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     fn cppfunction(name: &str) -> CppFunction {
@@ -2679,7 +2684,7 @@ mod tests {
     }
 
     fn clangxx_probe(prefix: &str, extra_flags: &[String]) -> bool {
-        let dir = temp_dir(&format!("{prefix}-clangxx-probe"));
+        let (_dir_guard, dir) = temp_dir(&format!("{prefix}-clangxx-probe"));
         let src = dir.join("p.cpp");
         let obj = dir.join("p.o");
         let wrote = fs::write(
@@ -2703,7 +2708,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_emits_main_and_makefile() {
-        let out = temp_dir("cpp-emit");
+        let (_out_guard, out) = temp_dir("cpp-emit");
         let mut target = cppfunction("parse");
         target.qualifier_path = vec!["demo".to_owned()];
         let args = GenerateCppDirectArgs {
@@ -2812,7 +2817,7 @@ mod tests {
 
     #[test]
     fn static_member_uses_qualified_call_without_receiver() {
-        let out = temp_dir("cpp-static-member");
+        let (_out_guard, out) = temp_dir("cpp-static-member");
         let mut target = cppfunction("Parse");
         target.qualifier_path = vec!["demo".to_owned(), "Regexp".to_owned()];
         target.api.namespace_path = vec!["demo".to_owned()];
@@ -2858,7 +2863,7 @@ mod tests {
 
     #[test]
     fn re2_parse_uses_whole_input_flags_status_and_intrusive_cleanup() {
-        let out = temp_dir("cpp-re2-parse");
+        let (_out_guard, out) = temp_dir("cpp-re2-parse");
         let include = out.join("include");
         fs::create_dir_all(include.join("re2")).unwrap();
         fs::write(
@@ -2982,7 +2987,7 @@ mod tests {
         // buffer's own char count (`Size`), not an independent fuzzed length — a
         // decoupled `n` up to 65536 made `std::string(s, n)` read past the
         // `Size`-byte `s` (ASan heap-buffer-overflow FALSE POSITIVE).
-        let out = temp_dir("cpp-udl");
+        let (_out_guard, out) = temp_dir("cpp-udl");
         let target = cppfunction("operator\"\"_json_pointer");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
@@ -3043,7 +3048,7 @@ mod tests {
         // (no project header declares it), must get a namespace-qualified forward
         // declaration so the qualified call resolves the identifier. Regression for
         // the `use of undeclared identifier 'UtilitiesLib'` codegen bug.
-        let out = temp_dir("cpp-qual-ns");
+        let (_out_guard, out) = temp_dir("cpp-qual-ns");
         let mut target = cppfunction("Extract_Minutes");
         target.qualifier_path = vec!["UtilitiesLib".to_owned()];
         let args = GenerateCppDirectArgs {
@@ -3117,7 +3122,7 @@ mod tests {
         //
         // Only a header that actually declares the target may suppress the forward
         // declaration.
-        let out = temp_dir("cpp-global-fwd");
+        let (_out_guard, out) = temp_dir("cpp-global-fwd");
         fs::write(
             out.join("sesspp.hpp"),
             "#pragma once\nnamespace ssh { class Session { public: int readFrame(); }; }\n",
@@ -3256,7 +3261,7 @@ mod tests {
         // `UtilitiesLib` bug). A namespace-scoped redeclaration matching the real
         // one is legal C++, so the redundant decl is harmless when the header does
         // declare it.
-        let out = temp_dir("cpp-qual-ns-hdr");
+        let (_out_guard, out) = temp_dir("cpp-qual-ns-hdr");
         let mut target = cppfunction("Extract_Minutes");
         target.qualifier_path = vec!["UtilitiesLib".to_owned()];
         let args = GenerateCppDirectArgs {
@@ -3373,7 +3378,7 @@ mod tests {
         // #455 / §27.5: a templated free function with a resolved specialization
         // emits a turbofish call and substitutes the type arg into the decoded
         // parameter / result types.
-        let out = temp_dir("cpp-template");
+        let (_out_guard, out) = temp_dir("cpp-template");
         let mut target = cppfunction("convert");
         target.api.is_template = true;
         target.api.api_kind = "template_function".to_owned();
@@ -3454,7 +3459,7 @@ mod tests {
         // otherwise leak into the result-variable TYPE — and the header `#undef`s it,
         // so `<ret> R = call();` won't compile. The emitter falls back to
         // `auto R = call();`, which deduces the real type and always compiles.
-        let out = temp_dir("cpp-auto-fallback");
+        let (_out_guard, out) = temp_dir("cpp-auto-fallback");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -3503,7 +3508,7 @@ mod tests {
         // <runtime call>;` is rejected ("constexpr variable 'R' must be initialized
         // by a constant expression"). The qualifier must be stripped from the
         // result-variable type, leaving the bare `int`.
-        let out = temp_dir("cpp-constexpr-macro");
+        let (_out_guard, out) = temp_dir("cpp-constexpr-macro");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -3549,7 +3554,7 @@ mod tests {
         // local-var specifier. `const char * R = call();` is perfectly legal and the
         // const must NOT be stripped (doing so would make assigning a `const char *`
         // return into a `char *` local ill-formed).
-        let out = temp_dir("cpp-const-pointee");
+        let (_out_guard, out) = temp_dir("cpp-const-pointee");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -3590,7 +3595,7 @@ mod tests {
         // #366 (C++ mirror): project include dirs must be -iquote (not -I or
         // -isystem) so a vendored header (capnproto's C++ endian.h) cannot
         // shadow a system header of the same name pulled in via angle include.
-        let out = temp_dir("cpp-iquote");
+        let (_out_guard, out) = temp_dir("cpp-iquote");
         let mut target = cppfunction("parse");
         target.qualifier_path = vec!["demo".to_owned()];
         let args = GenerateCppDirectArgs {
@@ -3651,7 +3656,7 @@ mod tests {
         // direct-initialization `Text::Reader _bhf_receiver(args);`, NOT as a member
         // call `_bhf_receiver.Reader(args)` — naming a constructor as a member is
         // illegal C++ ("invalid use of 'capnp::Text::Reader::Reader'").
-        let out = temp_dir("cpp-ctor-target");
+        let (_out_guard, out) = temp_dir("cpp-ctor-target");
         let mut target = cppfunction("Reader");
         target.qualifier_path = vec!["capnp".to_owned(), "Text".to_owned(), "Reader".to_owned()];
         target.api.is_method = true;
@@ -3697,7 +3702,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_sequence_harness_constructs_receiver_from_decoded_constructor_params() {
-        let out = temp_dir("cpp-sequence-ctor");
+        let (_out_guard, out) = temp_dir("cpp-sequence-ctor");
         let mut target = cppfunction("parse");
         target.qualifier_path = vec!["gov".to_owned(), "Parser".to_owned()];
         target.api.class_name = Some("Parser".to_owned());
@@ -3787,7 +3792,7 @@ mod tests {
         // #456: an abstract declaring class is replaced by the caller-resolved
         // concrete subclass for the receiver, so the virtual method dispatches
         // polymorphically (`MemoryReader::read`).
-        let out = temp_dir("cpp-abstract-subclass");
+        let (_out_guard, out) = temp_dir("cpp-abstract-subclass");
         let mut target = cppfunction("read");
         target.qualifier_path = vec!["e57".to_owned(), "Reader".to_owned()];
         target.api.class_name = Some("Reader".to_owned());
@@ -3842,7 +3847,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("cpp-exe-suffix");
+        let (_out_guard, out) = temp_dir("cpp-exe-suffix");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -3931,7 +3936,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_makefile_includes_afl_target() {
-        let out = temp_dir("cpp-emit-afl");
+        let (_out_guard, out) = temp_dir("cpp-emit-afl");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4010,7 +4015,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_handles_vector_uint8() {
-        let out = temp_dir("cpp-emit-vec");
+        let (_out_guard, out) = temp_dir("cpp-emit-vec");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4049,7 +4054,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_handles_vector_string() {
-        let out = temp_dir("cpp-emit-vector-string");
+        let (_out_guard, out) = temp_dir("cpp-emit-vector-string");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4085,7 +4090,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_handles_vector_of_supported_values() {
-        let out = temp_dir("cpp-emit-vector-scalar");
+        let (_out_guard, out) = temp_dir("cpp-emit-vector-scalar");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4122,7 +4127,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_deque_and_list() {
-        let out = temp_dir("cpp-emit-sequence-containers");
+        let (_out_guard, out) = temp_dir("cpp-emit-sequence-containers");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4167,7 +4172,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_forward_list() {
-        let out = temp_dir("cpp-emit-forward-list");
+        let (_out_guard, out) = temp_dir("cpp-emit-forward-list");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4205,7 +4210,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_set_and_map() {
-        let out = temp_dir("cpp-emit-associative-containers");
+        let (_out_guard, out) = temp_dir("cpp-emit-associative-containers");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4251,7 +4256,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_unordered_set_and_map() {
-        let out = temp_dir("cpp-emit-unordered-associative-containers");
+        let (_out_guard, out) = temp_dir("cpp-emit-unordered-associative-containers");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4300,7 +4305,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_cpp_struct_by_value_with_registry() {
-        let out = temp_dir("cpp-emit-struct-by-value");
+        let (_out_guard, out) = temp_dir("cpp-emit-struct-by-value");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4367,7 +4372,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_source_for_source_only_aggregate_reference() {
-        let out = temp_dir("cpp-emit-struct-ref");
+        let (_out_guard, out) = temp_dir("cpp-emit-struct-ref");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4420,7 +4425,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_drives_file_pointer_with_fmemopen() {
-        let work = temp_dir("cpp-emit-file-pointer");
+        let (_work_guard, work) = temp_dir("cpp-emit-file-pointer");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4484,7 +4489,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_drives_std_file_pointer_with_fmemopen() {
-        let work = temp_dir("cpp-emit-std-file-pointer");
+        let (_work_guard, work) = temp_dir("cpp-emit-std-file-pointer");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4521,7 +4526,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_emits_callback_trampoline_for_typedef() {
-        let out = temp_dir("cpp-emit-callback");
+        let (_out_guard, out) = temp_dir("cpp-emit-callback");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4566,7 +4571,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_emits_std_function_callback() {
-        let out = temp_dir("cpp-emit-std-function-callback");
+        let (_out_guard, out) = temp_dir("cpp-emit-std-function-callback");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4607,7 +4612,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_array_for_fixed_array() {
-        let out = temp_dir("cpp-emit-array");
+        let (_out_guard, out) = temp_dir("cpp-emit-array");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4646,7 +4651,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_array_for_supported_values() {
-        let out = temp_dir("cpp-emit-array-values");
+        let (_out_guard, out) = temp_dir("cpp-emit-array-values");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4684,7 +4689,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_bitset_for_bitset() {
-        let out = temp_dir("cpp-emit-bitset");
+        let (_out_guard, out) = temp_dir("cpp-emit-bitset");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -4722,7 +4727,7 @@ mod tests {
 
     #[test]
     fn generated_cpp_harness_names_its_input_format_version() {
-        let out = temp_dir("cpp-format-version");
+        let (_out_guard, out) = temp_dir("cpp-format-version");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5345,7 +5350,7 @@ mod tests {
                 "const std::byte * data = (const std::byte *)Data",
             ),
         ] {
-            let out = temp_dir(name);
+            let (_out_guard, out) = temp_dir(name);
             let args = GenerateCppDirectArgs {
                 decoder_limits: Default::default(),
                 force: false,
@@ -5394,7 +5399,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_output_capacity_does_not_consume_input_pair() {
-        let out = temp_dir("cpp-emit-output-capacity");
+        let (_out_guard, out) = temp_dir("cpp-emit-output-capacity");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5452,7 +5457,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_output_length_pointer_does_not_consume_input_pair() {
-        let out = temp_dir("cpp-emit-output-length-pointer");
+        let (_out_guard, out) = temp_dir("cpp-emit-output-length-pointer");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5512,7 +5517,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_uses_cpp20_for_span_params() {
-        let out = temp_dir("cpp-emit-span");
+        let (_out_guard, out) = temp_dir("cpp-emit-span");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5550,7 +5555,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_uses_cpp20_for_mutable_span_params() {
-        let out = temp_dir("cpp-emit-mutable-span");
+        let (_out_guard, out) = temp_dir("cpp-emit-mutable-span");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5590,7 +5595,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_optional_for_optional_string() {
-        let out = temp_dir("cpp-emit-optional-string");
+        let (_out_guard, out) = temp_dir("cpp-emit-optional-string");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5629,7 +5634,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_optional_for_optional_scalar() {
-        let out = temp_dir("cpp-emit-optional-scalar");
+        let (_out_guard, out) = temp_dir("cpp-emit-optional-scalar");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5669,7 +5674,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_optional_visible_aggregate() {
-        let out = temp_dir("cpp-emit-optional-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-optional-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5722,7 +5727,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_vector_visible_aggregate() {
-        let out = temp_dir("cpp-emit-vector-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-vector-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5776,7 +5781,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_array_visible_aggregate() {
-        let out = temp_dir("cpp-emit-array-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-array-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5830,7 +5835,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_forward_list_visible_aggregate() {
-        let out = temp_dir("cpp-emit-forward-list-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-forward-list-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5884,7 +5889,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_variant_visible_aggregate() {
-        let out = temp_dir("cpp-emit-variant-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-variant-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5940,7 +5945,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_unordered_map_visible_aggregate_value() {
-        let out = temp_dir("cpp-emit-unordered-map-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-unordered-map-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -5996,7 +6001,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_span_visible_aggregate() {
-        let out = temp_dir("cpp-emit-span-aggregate");
+        let (_out_guard, out) = temp_dir("cpp-emit-span-aggregate");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6053,7 +6058,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_memory_for_smart_pointers() {
-        let out = temp_dir("cpp-emit-smart-pointers");
+        let (_out_guard, out) = temp_dir("cpp-emit-smart-pointers");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6098,7 +6103,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_utility_for_pair() {
-        let out = temp_dir("cpp-emit-pair");
+        let (_out_guard, out) = temp_dir("cpp-emit-pair");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6137,7 +6142,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_tuple_for_tuple() {
-        let out = temp_dir("cpp-emit-tuple");
+        let (_out_guard, out) = temp_dir("cpp-emit-tuple");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6206,7 +6211,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("cpp-quoted-define");
+        let (_out_guard, out) = temp_dir("cpp-quoted-define");
         let marker = out.join("injected");
         let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
         let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
@@ -6306,7 +6311,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("cpp-driver-reuse");
+        let (_out_guard, out) = temp_dir("cpp-driver-reuse");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6472,7 +6477,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_variant_for_variant() {
-        let out = temp_dir("cpp-emit-variant");
+        let (_out_guard, out) = temp_dir("cpp-emit-variant");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -6525,7 +6530,14 @@ mod tests {
         if clangxx_compile_flags("libfuzzer-probe") != Some(Vec::new()) {
             return false;
         }
-        let smoke = std::env::temp_dir().join(format!("bhf-cpp-lf-smoke-{}", std::process::id()));
+        // Removed when this scope ends.
+        let smoke_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let smoke = smoke_tmp
+            .path()
+            .join(format!("bhf-cpp-lf-smoke-{}", std::process::id()));
         if fs::create_dir_all(&smoke).is_err() {
             return false;
         }
@@ -6636,7 +6648,7 @@ mod tests {
     /// string, and an in-out reference before and after the call.
     #[test]
     fn built_cpp_harness_traces_receiver_and_reference_arguments() {
-        let out = temp_dir("cpp-trace-receiver");
+        let (_out_guard, out) = temp_dir("cpp-trace-receiver");
         fs::write(
             out.join("widget.hpp"),
             "#pragma once\n\
@@ -6736,7 +6748,7 @@ mod tests {
     /// describes it like the plain scalar, so it decodes statically.
     #[test]
     fn cpp_reference_scalars_decode_statically_like_their_referent() {
-        let out = temp_dir("cpp-layout-references");
+        let (_out_guard, out) = temp_dir("cpp-layout-references");
         let args = cpp_args_for(
             &out,
             "H-CPP-REFS",
@@ -6795,7 +6807,7 @@ mod tests {
     /// whole-input parameter takes the bytes left, and replays like the trace.
     #[test]
     fn cpp_receiver_harness_layout_matches_its_argument_trace() {
-        let out = temp_dir("cpp-layout-receiver");
+        let (_out_guard, out) = temp_dir("cpp-layout-receiver");
         fs::write(
             out.join("widget.hpp"),
             "#pragma once\n\
@@ -6952,7 +6964,7 @@ mod tests {
     /// values and spans as the trace.
     #[test]
     fn built_cpp_harness_gives_each_buffer_of_a_call_its_own_bytes() {
-        let out = temp_dir("cpp-merge-records");
+        let (_out_guard, out) = temp_dir("cpp-merge-records");
         let mut target = cpp_method("Widget", "feed");
         target.api.is_method = true;
         let args = cpp_args_for(
@@ -7045,7 +7057,7 @@ mod tests {
              \x20   for (std::size_t i = 0; i < n; i++) dst[i] ^= src[i];\n\
              \x20   return n ? dst[0] : 0;\n\
              }\n";
-        let out = temp_dir("cpp-lone-prefix");
+        let (_out_guard, out) = temp_dir("cpp-lone-prefix");
         let args = cpp_args_for(
             &out,
             "H-CPP-LONE",
@@ -7086,7 +7098,7 @@ mod tests {
         }
         fs::remove_dir_all(&out).ok();
 
-        let out = temp_dir("cpp-lone-writable");
+        let (_out_guard, out) = temp_dir("cpp-lone-writable");
         let args = cpp_args_for(
             &out,
             "H-CPP-LONE-W",
@@ -7155,7 +7167,7 @@ mod tests {
             ),
         ];
         for (name, params) in cases {
-            let out = temp_dir(&format!("cpp-reserved-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-reserved-{name}"));
             let args = cpp_args_for(
                 &out,
                 "H-CPP-RESERVED",
@@ -7213,7 +7225,7 @@ mod tests {
             ),
             ("sum_bytes", [("pb", "const BYTE*"), ("cb", "DWORD")]),
         ] {
-            let out = temp_dir(&format!("cpp-count-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-count-{name}"));
             let mut args =
                 cpp_args_for(&out, "H-CPP-COUNT", cppfunction(name), &params, &[], header);
             args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
@@ -7262,7 +7274,7 @@ mod tests {
                 "pmatch",
             ),
         ] {
-            let out = temp_dir(&format!("cpp-typed-array-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-typed-array-{name}"));
             let mut args =
                 cpp_args_for(&out, "H-CPP-ARRAY", cppfunction(name), &params, &[], header);
             args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
@@ -7299,7 +7311,7 @@ mod tests {
             ("sum_incl", ""),
             ("LLVMFuzzerTestOneInput", "extern \"C\" "),
         ] {
-            let out = temp_dir(&format!("cpp-standalone-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-standalone-{name}"));
             let header = format!(
                 "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
                  {linkage}int {name}(const uint8_t *buf, std::size_t len);\n"
@@ -7402,7 +7414,7 @@ mod tests {
             ),
         ];
         for (name, params, reached, clean) in cases {
-            let out = temp_dir(&format!("cpp-const-member-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-const-member-{name}"));
             let mut args = cpp_args_for(
                 &out,
                 "H-CPP-CONST-MEMBER",
@@ -7448,7 +7460,7 @@ mod tests {
     /// reported there too, and makes them addressable before the next input.
     #[test]
     fn built_cpp_afl_lane_reports_a_read_one_past_the_input() {
-        let out = temp_dir("cpp-afl-probe");
+        let (_out_guard, out) = temp_dir("cpp-afl-probe");
         let header = "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
                       int probe(const uint8_t *buf, std::size_t len);\n";
         fs::write(
@@ -7535,7 +7547,7 @@ mod tests {
                 [("nmatch", "std::size_t"), ("pmatch", "item_t *")],
             ),
         ] {
-            let out = temp_dir(&format!("cpp-typed-array-elements-{name}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-typed-array-elements-{name}"));
             let mut args = cpp_args_for(
                 &out,
                 "H-CPP-ELEMENTS",
@@ -7581,7 +7593,7 @@ mod tests {
     /// receiver's constructor arguments: no input byte feeds two parameters.
     #[test]
     fn built_cpp_harnesses_never_share_bytes_between_a_buffer_and_scalars() {
-        let out = temp_dir("cpp-layout-free");
+        let (_out_guard, out) = temp_dir("cpp-layout-free");
         let args = cpp_args_for(
             &out,
             "H-CPP-LAYOUT",
@@ -7611,7 +7623,7 @@ mod tests {
         assert_eq!(cpp_traced(&args, "len", None)["value"], "2");
         fs::remove_dir_all(&out).ok();
 
-        let out = temp_dir("cpp-layout-receiver");
+        let (_out_guard, out) = temp_dir("cpp-layout-receiver");
         let mut target = cppfunction("feed");
         target.qualifier_path = vec!["Widget".to_owned()];
         target.api.is_method = true;
@@ -7663,7 +7675,7 @@ mod tests {
     /// receiver is shown as its object bytes.
     #[test]
     fn built_cpp_harness_traces_receivers_and_pointers_of_any_shape() {
-        let out = temp_dir("cpp-trace-get");
+        let (_out_guard, out) = temp_dir("cpp-trace-get");
         let args = cpp_args_for(
             &out,
             "H-CPP-TRACE-GET",
@@ -7691,7 +7703,7 @@ mod tests {
         assert_eq!(receiver["preview_hex"], "00000000");
         fs::remove_dir_all(&out).ok();
 
-        let out = temp_dir("cpp-trace-void-data");
+        let (_out_guard, out) = temp_dir("cpp-trace-void-data");
         let args = cpp_args_for(
             &out,
             "H-CPP-TRACE-VOID-DATA",
@@ -7718,7 +7730,7 @@ mod tests {
         assert_eq!(cpp_traced(&args, "this", None)["len"], 4);
         fs::remove_dir_all(&out).ok();
 
-        let out = temp_dir("cpp-trace-volatile");
+        let (_out_guard, out) = temp_dir("cpp-trace-volatile");
         let args = cpp_args_for(
             &out,
             "H-CPP-TRACE-VOLATILE",
@@ -7795,7 +7807,7 @@ mod tests {
                   \x20   bhf_tl_end();\n\
                   \x20   return 0;\n\
                   }\n";
-        let dir = temp_dir("cpp-trace-shapes");
+        let (_dir_guard, dir) = temp_dir("cpp-trace-shapes");
         let source = dir.join("shapes.cpp");
         fs::write(&source, tu).unwrap();
         // The oldest standard the host's C++ library accepts: Microsoft's
@@ -7865,7 +7877,7 @@ mod tests {
     /// is decoded from the cursor in the C++ lane too, and the harness builds.
     #[test]
     fn built_cpp_harness_decodes_a_struct_with_fields_named_like_the_input() {
-        let out = temp_dir("cpp-struct-size-field");
+        let (_out_guard, out) = temp_dir("cpp-struct-size-field");
         let header = "#pragma once\n\
                       typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;\n\
                       inline int widget_check(const widget_hdr *hdr, int level) {\n\
@@ -7902,7 +7914,7 @@ mod tests {
     /// bytes the method's scalars left, not the whole input again.
     #[test]
     fn built_cpp_harness_gives_constructor_input_the_bytes_after_the_target_scalars() {
-        let out = temp_dir("cpp-ctor-input");
+        let (_out_guard, out) = temp_dir("cpp-ctor-input");
         let args = cpp_args_for(
             &out,
             "H-CPP-CTOR-INPUT",
@@ -7945,7 +7957,7 @@ mod tests {
             eprintln!("skipping C++ make_libfuzzer e2e: clang++/libFuzzer unavailable");
             return;
         }
-        let out = temp_dir("cpp-libfuzzer-e2e");
+        let (_out_guard, out) = temp_dir("cpp-libfuzzer-e2e");
         let runtime = runtime_dir();
         let target_cpp = out.join("target.cpp");
         fs::write(
@@ -8051,7 +8063,7 @@ mod tests {
             eprintln!("skipping C++ passthrough make_libfuzzer e2e: clang++/libFuzzer unavailable");
             return;
         }
-        let out = temp_dir("cpp-passthrough-libfuzzer");
+        let (_out_guard, out) = temp_dir("cpp-passthrough-libfuzzer");
         let driver = out.join("drive_codec.cpp");
         fs::write(
             &driver,
@@ -8156,7 +8168,7 @@ mod tests {
             eprintln!("skipping spaced-path e2e: make unavailable");
             return;
         }
-        let root = temp_dir("cpp spaced paths");
+        let (_root_guard, root) = temp_dir("cpp spaced paths");
         let src_dir = root.join("My Proj (copy)/src lib");
         let inc_dir = root.join("My Proj (copy)/include dir");
         let runtime = root.join("tool's runtime/c_runtime");
@@ -8269,7 +8281,7 @@ mod tests {
             eprintln!("skipping typedef pair e2e: make unavailable");
             return;
         }
-        let out = temp_dir("cpp-typedef-pair-e2e");
+        let (_out_guard, out) = temp_dir("cpp-typedef-pair-e2e");
         let header = "#include <stddef.h>\n\
                       typedef unsigned char u8_t;\n\
                       namespace demo {\n\
@@ -8364,7 +8376,7 @@ mod tests {
             eprintln!("skipping pointer typedef pair e2e: make unavailable");
             return;
         }
-        let out = temp_dir("cpp-ptr-typedef-pair-e2e");
+        let (_out_guard, out) = temp_dir("cpp-ptr-typedef-pair-e2e");
         let header = "typedef unsigned char BYTE;\n\
                       typedef const BYTE *LPCBYTE;\n\
                       typedef unsigned long DWORD;\n\
@@ -8512,7 +8524,7 @@ mod tests {
                 true,
             ),
         ] {
-            let out = temp_dir(&format!("cpp-writable-byte-buffer-{label}"));
+            let (_out_guard, out) = temp_dir(&format!("cpp-writable-byte-buffer-{label}"));
             let header = format!(
                 "#include <cstdint>\n\
                  {typedef}\
@@ -8626,7 +8638,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_variant_monostate_alternative() {
-        let out = temp_dir("cpp-emit-variant-monostate");
+        let (_out_guard, out) = temp_dir("cpp-emit-variant-monostate");
         let runtime = runtime_dir();
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
@@ -8688,7 +8700,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_enum_class_param() {
-        let out = temp_dir("cpp-emit-enum-class");
+        let (_out_guard, out) = temp_dir("cpp-emit-enum-class");
         let runtime = runtime_dir();
         let header_text = r#"
             enum class Mode { Fast, Safe };
@@ -8751,7 +8763,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_source_only_namespaced_enum_class_param() {
-        let out = temp_dir("cpp-emit-namespaced-enum-class");
+        let (_out_guard, out) = temp_dir("cpp-emit-namespaced-enum-class");
         let runtime = runtime_dir();
         let source_text = r#"
             namespace gov {
@@ -8819,7 +8831,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_decodes_qualified_namespaced_enum_class_param() {
-        let out = temp_dir("cpp-emit-qualified-enum-class");
+        let (_out_guard, out) = temp_dir("cpp-emit-qualified-enum-class");
         let runtime = runtime_dir();
         let source_text = r#"
             namespace gov {
@@ -8885,7 +8897,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_filesystem_for_path() {
-        let out = temp_dir("cpp-emit-filesystem-path");
+        let (_out_guard, out) = temp_dir("cpp-emit-filesystem-path");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -8924,7 +8936,7 @@ mod tests {
 
     #[test]
     fn generate_cpp_direct_harness_includes_chrono_for_duration() {
-        let out = temp_dir("cpp-emit-chrono-duration");
+        let (_out_guard, out) = temp_dir("cpp-emit-chrono-duration");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -8989,7 +9001,7 @@ mod tests {
 
     #[test]
     fn existing_libfuzzer_entrypoint_is_not_wrapped_recursively() {
-        let out = temp_dir("cpp-existing-libfuzzer");
+        let (_out_guard, out) = temp_dir("cpp-existing-libfuzzer");
         let args = GenerateCppDirectArgs {
             decoder_limits: Default::default(),
             force: false,
@@ -9093,7 +9105,7 @@ mod tests {
     /// owner declaration must precede the receiver so it outlives the call.
     #[test]
     fn generate_cpp_factory_pointer_receiver_emits_owner_and_null_guard() {
-        let out = temp_dir("cpp-factory-pointer");
+        let (_out_guard, out) = temp_dir("cpp-factory-pointer");
         let mut target = cppfunction("IntAttribute");
         target.qualifier_path = vec!["tinyxml2".to_owned(), "XMLElement".to_owned()];
         target.api.class_name = Some("XMLElement".to_owned());
@@ -9183,7 +9195,7 @@ mod tests {
     /// must NOT emit a null guard.
     #[test]
     fn generate_cpp_factory_value_receiver_uses_dot_access_without_null_guard() {
-        let out = temp_dir("cpp-factory-value");
+        let (_out_guard, out) = temp_dir("cpp-factory-value");
         let mut target = cppfunction("parse");
         target.qualifier_path = vec!["acme".to_owned(), "Token".to_owned()];
         target.api.class_name = Some("Token".to_owned());
@@ -9249,7 +9261,7 @@ mod tests {
     /// declaration and call the factory function directly.
     #[test]
     fn generate_cpp_free_function_factory_receiver_omits_owner() {
-        let out = temp_dir("cpp-factory-free-fn");
+        let (_out_guard, out) = temp_dir("cpp-factory-free-fn");
         let mut target = cppfunction("encode");
         target.qualifier_path = vec!["codec".to_owned(), "Frame".to_owned()];
         target.api.class_name = Some("Frame".to_owned());
@@ -9316,7 +9328,7 @@ mod tests {
     /// must not activate.
     #[test]
     fn generate_cpp_no_factory_plan_uses_direct_receiver_construction() {
-        let out = temp_dir("cpp-factory-absent");
+        let (_out_guard, out) = temp_dir("cpp-factory-absent");
         let mut target = cppfunction("value");
         target.qualifier_path = vec!["acme".to_owned(), "Item".to_owned()];
         target.api.class_name = Some("Item".to_owned());
@@ -9399,7 +9411,7 @@ mod tests {
 
     #[test]
     fn pugixml_owned_buffer_is_not_freed_by_sequence_harness() {
-        let out = temp_dir("cpp-pugixml-owned-buffer");
+        let (_out_guard, out) = temp_dir("cpp-pugixml-owned-buffer");
         let mut target = cppfunction("load_buffer_inplace_own");
         target.qualifier_path = vec!["pugi".to_owned(), "xml_document".to_owned()];
         target.api.class_name = Some("xml_document".to_owned());
@@ -9480,7 +9492,7 @@ mod tests {
     /// emitting the genuine member, rather than producing an un-compilable harness.
     #[test]
     fn sequence_harness_drops_uncompilable_lifecycle_steps() {
-        let out = temp_dir("cpp-sequence-drop-artifacts");
+        let (_out_guard, out) = temp_dir("cpp-sequence-drop-artifacts");
         let mut target = cppfunction("open");
         target.qualifier_path = vec!["ns".to_owned(), "MappedFile".to_owned()];
         target.api.class_name = Some("MappedFile".to_owned());
@@ -9559,7 +9571,7 @@ mod tests {
     /// emitting `namespace R = receiver.detail_fp();`.
     #[test]
     fn sequence_harness_skips_malformed_target_cleanly() {
-        let out = temp_dir("cpp-sequence-bad-target");
+        let (_out_guard, out) = temp_dir("cpp-sequence-bad-target");
         let mut target = cppfunction("detail_fp");
         target.qualifier_path = vec!["ns".to_owned(), "MappedFile".to_owned()];
         target.api.class_name = Some("MappedFile".to_owned());

@@ -20,3 +20,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "license_policy"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

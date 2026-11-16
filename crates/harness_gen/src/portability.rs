@@ -465,7 +465,12 @@ mod tests {
 
     #[test]
     fn passthrough_harness_gets_no_shim_and_links_the_project_entry_point() {
-        let tmp = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let tmp_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let tmp = tmp_tmp.path().join(format!(
             "bhf-portability-passthrough-{}",
             std::process::id()
         ));
@@ -501,7 +506,14 @@ mod tests {
 
     #[test]
     fn write_artifacts_emits_shim_only_when_a_libfuzzer_binary_exists() {
-        let tmp = std::env::temp_dir().join(format!("bhf-portability-{}", std::process::id()));
+        // Removed when this scope ends.
+        let tmp_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let tmp = tmp_tmp
+            .path()
+            .join(format!("bhf-portability-{}", std::process::id()));
         let c_dir = tmp.join("c");
         let ada_dir = tmp.join("ada");
         fs::create_dir_all(&c_dir).unwrap();

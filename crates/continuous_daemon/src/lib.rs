@@ -986,14 +986,19 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tempdir(name: &str) -> PathBuf {
+    fn tempdir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cd-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-cd-{name}-{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     /// A file that exists on every host, for a scheduler that refuses to
@@ -1029,7 +1034,7 @@ mod tests {
 
     #[test]
     fn start_rejects_missing_bin() {
-        let dir = tempdir("missing-bin");
+        let (_dir_guard, dir) = tempdir("missing-bin");
         let config = DaemonConfig {
             data_dir: dir,
             max_concurrent_jobs: 1,
@@ -1045,7 +1050,7 @@ mod tests {
 
     #[test]
     fn start_rejects_excessive_worker_count_and_zero_poll_interval() {
-        let dir = tempdir("worker-capacity");
+        let (_dir_guard, dir) = tempdir("worker-capacity");
         let mut config = ok_config(dir, PathBuf::from("/bin/true"));
         config.max_concurrent_jobs = MAX_CONCURRENT_WORKERS + 1;
         assert!(matches!(
@@ -1064,7 +1069,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn submit_and_list_returns_queued_job() {
-        let dir = tempdir("submit");
+        let (_dir_guard, dir) = tempdir("submit");
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
         let id = scheduler
@@ -1079,7 +1084,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_runs_submitted_job_to_completion_against_bin_true() {
-        let dir = tempdir("run-complete");
+        let (_dir_guard, dir) = tempdir("run-complete");
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
         let id = scheduler
@@ -1144,8 +1149,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fuzz_children_defer_and_the_daemon_rebuilds_results_once_idle() {
-        let dir = tempdir("results-refresh");
-        let project = tempdir("results-refresh-project");
+        let (_dir_guard, dir) = tempdir("results-refresh");
+        let (_project_guard, project) = tempdir("results-refresh-project");
         let scheduler = Scheduler::start(&ok_config(dir.clone(), recording_bin(&dir))).unwrap();
         let id = scheduler
             .submit(project.clone(), "H".to_owned(), Duration::ZERO)
@@ -1181,8 +1186,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_blocked_rebuild_never_stalls_job_claiming() {
-        let dir = tempdir("refresh-stall");
-        let project = tempdir("refresh-stall-project");
+        let (_dir_guard, dir) = tempdir("refresh-stall");
+        let (_project_guard, project) = tempdir("refresh-stall-project");
         let results_dir = project.join("results");
         std::fs::create_dir_all(&results_dir).unwrap();
         // Hold the project's results lock, so any rebuild of it blocks.
@@ -1225,7 +1230,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_marks_failure_when_bin_exits_nonzero() {
-        let dir = tempdir("run-fail");
+        let (_dir_guard, dir) = tempdir("run-fail");
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/false"))).unwrap();
         let id = scheduler
@@ -1388,7 +1393,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restart_recovers_queued_jobs_from_disk() {
-        let dir = tempdir("restart");
+        let (_dir_guard, dir) = tempdir("restart");
         {
             let scheduler =
                 Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/sleep"))).unwrap();
@@ -1412,7 +1417,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restart_assigns_distinct_id_after_restored_job() {
-        let dir = tempdir("restart-id");
+        let (_dir_guard, dir) = tempdir("restart-id");
         let old = FuzzJob {
             job_id: "J-000007".to_owned(),
             project_dir: dir.clone(),
@@ -1489,7 +1494,7 @@ mod tests {
             ),
         ];
         for (name, snapshot, line, reason) in cases {
-            let dir = tempdir(name);
+            let (_dir_guard, dir) = tempdir(name);
             let path = dir.join("jobs.jsonl");
             std::fs::write(&path, snapshot.as_bytes()).unwrap();
             // The binary only has to exist: startup refuses before running it.
@@ -1509,7 +1514,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn startup_accepts_legacy_unpadded_numeric_id() {
-        let dir = tempdir("legacy-id");
+        let (_dir_guard, dir) = tempdir("legacy-id");
         let old = FuzzJob {
             job_id: "J-7".to_owned(),
             project_dir: dir.clone(),
@@ -1536,7 +1541,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn submit_does_not_acknowledge_job_if_persistence_fails() {
-        let dir = tempdir("persist-error");
+        let (_dir_guard, dir) = tempdir("persist-error");
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
         // Corrupt the destination after startup; startup now rejects non-files.
@@ -1552,7 +1557,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn post_replace_sync_failure_preserves_id_and_stops_submissions() {
-        let dir = tempdir("dir-sync-failure");
+        let (_dir_guard, dir) = tempdir("dir-sync-failure");
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
         let error = scheduler
@@ -1593,7 +1598,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistence_keeps_unrelated_temp_name_sentinel() {
-        let dir = tempdir("persist-sentinel");
+        let (_dir_guard, dir) = tempdir("persist-sentinel");
         let sentinel = dir.join(format!(".jobs.jsonl.{}.0.tmp", std::process::id()));
         std::fs::write(&sentinel, b"keep").unwrap();
         let scheduler =
@@ -1623,7 +1628,7 @@ mod tests {
     fn ignored_child_time_budget_is_killed_and_persisted_failed() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempdir("wall-budget-tree");
+        let (_dir_guard, dir) = tempdir("wall-budget-tree");
         let pid_file = dir.join("grandchild.pid");
         let script = dir.join("ignore-time.sh");
         std::fs::write(
@@ -1695,7 +1700,7 @@ mod tests {
     fn shutdown_kills_owned_process_tree_and_requeues_job_for_restart() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempdir("shutdown-tree");
+        let (_dir_guard, dir) = tempdir("shutdown-tree");
         let pid_file = dir.join("grandchild.pid");
         let script = dir.join("ignore-time.sh");
         std::fs::write(
@@ -1760,7 +1765,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_capacity_rejects_without_changing_acknowledged_snapshot() {
-        let dir = tempdir("capacity-retained");
+        let (_dir_guard, dir) = tempdir("capacity-retained");
         let limits = SchedulerLimits {
             max_jobs: 1,
             max_list_page: 1,
@@ -1799,7 +1804,7 @@ mod tests {
 
     #[test]
     fn startup_enforces_byte_record_and_job_caps_without_rewriting_input() {
-        let dir = tempdir("capacity-recovery");
+        let (_dir_guard, dir) = tempdir("capacity-recovery");
         let config = ok_config(dir.clone(), existing_bin());
         let path = dir.join("jobs.jsonl");
         let job = FuzzJob {
@@ -1852,7 +1857,7 @@ mod tests {
     #[test]
     fn queued_capacity_rejects_before_id_or_snapshot_change() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir("capacity-queue");
+        let (_dir_guard, dir) = tempdir("capacity-queue");
         let entered = dir.join("entered");
         let release = dir.join("release");
         let script = dir.join("wait.sh");

@@ -36,7 +36,12 @@ fn a_native_tool_prefix_configures_gprbuild_for_the_host_gnat() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-gprconfig-native-{nonce}"));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp.path().join(format!("bhf-gprconfig-native-{nonce}"));
     let src = dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(dir.join("obj")).unwrap();

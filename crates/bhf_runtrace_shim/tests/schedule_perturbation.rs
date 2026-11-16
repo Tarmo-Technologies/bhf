@@ -206,7 +206,14 @@ fn race_found_under_schedule_perturbation_missed_by_plain_execution() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-sched-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-sched-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("race.c");
     std::fs::write(&src, FIXTURE).unwrap();
@@ -265,7 +272,14 @@ fn pinned_schedule_replay_is_deterministic() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-sched-replay-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-sched-replay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("race.c");
     std::fs::write(&src, FIXTURE).unwrap();
@@ -324,7 +338,14 @@ fn a_different_pinned_schedule_yields_the_safe_interleaving() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-sched-safe-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-sched-safe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("race.c");
     std::fs::write(&src, FIXTURE).unwrap();

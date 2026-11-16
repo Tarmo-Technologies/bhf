@@ -21,3 +21,6 @@ event_log = { path = "../event_log" }
 # workspace dependency, rather than hand-rolling a JSON reader.
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

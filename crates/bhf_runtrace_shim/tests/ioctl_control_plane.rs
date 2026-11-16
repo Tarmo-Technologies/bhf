@@ -91,7 +91,14 @@ fn a_capability_ioctl_is_answered_so_the_driver_reaches_the_register_window() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-ioctl-test-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-ioctl-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("ioctl.c");
     let bin = dir.join("ioctl_probe");

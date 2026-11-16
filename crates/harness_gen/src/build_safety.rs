@@ -949,7 +949,14 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("bhf-recipe-token-{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-recipe-token-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tokens = FLAGS_THAT_NEED_QUOTING
             .iter()
@@ -1025,7 +1032,14 @@ mod tests {
             assert_eq!(unquotable_environment_flag_char(flag), None, "{flag:?}");
             assert_eq!(unquotable_flag_char(flag), Some('#'), "{flag:?}");
         }
-        let dir = std::env::temp_dir().join(format!("bhf-env-token-{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-env-token-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("Makefile"),
