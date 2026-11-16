@@ -1618,7 +1618,11 @@ fn run_collector_for_fuzz(
                 &gate,
             );
             (
-                resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string()),
+                resolved.evaluate_aggregate_jsonl(
+                    &jsonl,
+                    &work_dir.display().to_string(),
+                    &oracle_lane_rules(&findings_dir, harness_id),
+                ),
                 crate::collector_run::ObservationMode::Aggregate,
                 // Aggregate: no single triggering input, so the finding is
                 // campaign-level (its `coverage` says so), not reproducible from one.
@@ -1644,17 +1648,33 @@ fn run_collector_for_fuzz(
         )
     };
     let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
+    // An aggregate observation is one session, the whole campaign: written
+    // once, beside the findings, for all of them.
+    let shared_evidence = match (observation, outcome.findings.first()) {
+        (crate::collector_run::ObservationMode::Aggregate, Some(first)) => {
+            use sha2::Digest;
+            let digest = corpus::hex_lower(&sha2::Sha256::digest(first.session_jsonl.as_bytes()));
+            let name = format!("aggregate-{}.jsonl", &digest[..16]);
+            let dir = findings_dir.with_file_name("collector");
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            std::fs::write(dir.join(&name), first.session_jsonl.as_bytes())
+                .with_context(|| format!("write {}", dir.join(&name).display()))?;
+            Some(format!("../../collector/{name}"))
+        }
+        _ => None,
+    };
     let mut ids = Vec::new();
     for finding in &outcome.findings {
         let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
         let dir = findings_dir.join(&id);
-        crate::collector_run::write_finding(
+        crate::collector_run::write_finding_with_evidence(
             &dir,
             &id,
             target.clone(),
             finding,
             &finding_input,
             observation,
+            shared_evidence.as_deref(),
         )?;
         ids.push(id);
     }
@@ -1662,6 +1682,26 @@ fn run_collector_for_fuzz(
     observation.stamp(&mut provenance);
     provenance["findings"] = serde_json::json!(ids);
     Ok(provenance)
+}
+
+/// The rules of the runtime-oracle findings already written for `harness_id`
+/// in `findings_dir`: the oracle lane's own findings, with their testcases, so
+/// the campaign-aggregate collector view does not repeat them.
+fn oracle_lane_rules(findings_dir: &Path, harness_id: &str) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(findings_dir) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path().join("finding.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|raw| {
+            raw["classification"] == "oracle_hit"
+                && raw.get("collector").is_none()
+                && raw["harness_id"] == harness_id
+        })
+        .filter_map(|raw| raw["rule_id"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Programmatic fuzz entry used by `bhf auto`. Builds a

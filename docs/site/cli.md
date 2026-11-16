@@ -408,6 +408,14 @@ scope, the observation window, the backend's declared **supported event classes*
 (kept distinct from the classes actually **observed** firing this run), and the
 fidelity limitations. `bhf minimize` on a collector finding is a no-op (the provider-captured
 evidence does not vary with the testcase bytes) that re-confirms reproduction.
+On Linux, `bhf fuzz --collector auto` reads the whole campaign's runtrace as one
+*aggregate* session: it keeps one finding per rule, oracle and API (a fuzzed
+`system()` runs a different command for each input, which the replay view would
+count as distinct violations), writes none for a rule the runtime-oracle lane
+already reported with its testcase, labels the effects with their POSIX APIs
+(`execve`, `dlopen`), records them at `medium` confidence with no clean
+assurance, and stores the session once, in `results/collector/`, which each
+finding's `paths.collector_evidence` names.
 
 `bhf binary fuzz` also accepts **user-defined postcondition oracles** with
 per-case fixture hooks: `--setup-command` runs before each testcase (prepare a

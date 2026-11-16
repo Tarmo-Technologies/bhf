@@ -20,13 +20,17 @@ use finding_rules::oracle_sdk::OracleRuntimeEvent;
 /// evidence (the runtime oracles themselves do not gate on it).
 fn api_label(kind: &EventKind) -> &'static str {
     match kind {
-        EventKind::ProcessCreate => "CreateProcess",
+        // The events this host's collector observed are this host's: Win32 on
+        // Windows, POSIX elsewhere (the Linux runtrace view of a campaign).
+        EventKind::ProcessCreate if cfg!(windows) => "CreateProcess",
+        EventKind::ProcessCreate => "execve",
         EventKind::ShellExecute => "ShellExecute",
         EventKind::FileCreate | EventKind::FileOpen => "open",
         EventKind::FileWrite => "write",
         EventKind::FileRename => "rename",
         EventKind::FileDelete => "unlink",
-        EventKind::ModuleLoad => "LoadLibrary",
+        EventKind::ModuleLoad if cfg!(windows) => "LoadLibrary",
+        EventKind::ModuleLoad => "dlopen",
         EventKind::Network => "connect",
         EventKind::Registry => "RegOpenKey",
         EventKind::Unknown(_) => "unknown",

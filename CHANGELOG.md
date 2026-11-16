@@ -45,6 +45,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz --collector auto` on Linux writes at most one COL finding per rule,
+  oracle and API of its aggregate campaign view, none for a rule the
+  runtime-oracle lane already reported, at medium confidence and with no clean
+  assurance, and stores the campaign session once in `results/collector/`. It
+  deduplicated on a signature that held each input's command, so one fuzzed
+  `system()` wrote 240 high-confidence, clean-assurance findings with 0-byte
+  inputs, each with its own copy of the session. Linux effects carry their
+  POSIX API names (`execve`, `dlopen`).
 - `bhf build --target <triple>` of an Ada harness after a host build of the
   same harness compiles its runtime library again. It could link the host
   build's `adafuzz_cov.o` into the cross archive ("Relocations in generic
