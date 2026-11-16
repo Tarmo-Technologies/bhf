@@ -119,7 +119,7 @@ pub struct AutoArgs {
     /// explicit flag). Only these flags have a
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
-    /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
+    /// extra-include, extra-source, exclude-path, cxx-expected-exception, seed-file, seed-dir, sanitizers,
     /// engine, languages, project, ada-deps, passes, force, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
     /// msbuild-evaluate, winafl-path, dynamorio-path (`seed-mining = false` is
@@ -194,6 +194,14 @@ pub struct AutoArgs {
     /// than `--timeout`. Off by default.
     #[arg(long = "deadline", value_parser = crate::fuzz::parse_duration)]
     pub deadline: Option<std::time::Duration>,
+
+    /// A C++ exception type an API throws to tell its callers about bad input
+    /// (`std::invalid_argument`, `json::parse_error`; `*` for any), so one
+    /// that leaves the target is not an uncaught-exception finding (BHF-231).
+    /// Repeatable. Without it every exception that leaves a C++ target is one,
+    /// as it would terminate a program that calls the target the same way.
+    #[arg(long = "cxx-expected-exception", value_name = "TYPE")]
+    pub cxx_expected_exceptions: Vec<String>,
 
     /// Force the C++ standard for every harness build (e.g. `gnu++14`, `c++03`),
     /// pinning the dialect for legacy C++. Without it, `auto` builds C++ at the modern
@@ -1390,6 +1398,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(EXIT_NO_CANDIDATES);
         }
         std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
+    }
+    // --cxx-expected-exception reaches the C++ harnesses through their env.
+    if !args.cxx_expected_exceptions.is_empty() {
+        std::env::set_var(
+            "BHF_CXX_EXPECTED_EXCEPTIONS",
+            args.cxx_expected_exceptions.join(","),
+        );
     }
     // --cxx-std pins the C++ dialect for every harness build (disabling the ladder).
     // Validate the shape so a typo fails fast rather than every C++ build silently.

@@ -52,6 +52,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An exception that leaves a C++ target is a finding, BHF-231
+  `bhf.cpp/uncaught-exception` (CWE-248): the C++ harness caught every
+  exception with `catch (...)` and returned, so a `std::out_of_range` from
+  `vector::at` on an input-derived index was never reported. The finding names
+  the exception type and its `what()`. `--cxx-expected-exception TYPE`
+  (repeatable, `*` for any) lists the types a target throws to reject an
+  input; the libstdc++ and libc++abi terminate messages are parsed the same
+  way.
 - The docs site publishes the extension protocol page (cli.md's link reached
   the page as literal Markdown) and names no public host: index.md named
   `docs.buildharnessfuzz.dev`, which has no DNS record, and GitHub Pages is

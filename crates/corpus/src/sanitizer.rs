@@ -280,6 +280,61 @@ pub fn parse_sanitizer_report(stderr: &str) -> Option<SanitizerReport> {
         // pre-resolved driver-side (the exception class → rule mapping is cleaner in
         // the driver where the Error object is live), so the parser reads it directly.
         .or_else(|| parse_js_finding(stderr))
+        // An uncaught C++ exception: the bhf C++ harness reports one that left
+        // the target (`== bhf cpp finding: CWE-248: <type>: <what>`), and the
+        // C++ runtime prints its own line when one escaped a noexcept
+        // function and std::terminate ended the process.
+        .or_else(|| parse_cpp_exception(stderr))
+}
+
+/// Parse an uncaught C++ exception out of stderr: bhf's C++ harness marker
+/// `== bhf cpp finding: CWE-248: <type>: <what>`, libstdc++'s `terminate
+/// called after throwing an instance of '<type>'` (and its `what():` line),
+/// or libc++abi's `terminating due to uncaught exception of type <type>:
+/// <what>`. The exception's type is the report's check, which tells one
+/// uncaught exception from another (BHF-231, CWE-248).
+fn parse_cpp_exception(stderr: &str) -> Option<SanitizerReport> {
+    const MARKER: &str = "== bhf cpp finding: CWE-248:";
+    const LIBSTDCXX: &str = "terminate called after throwing an instance of '";
+    const LIBCXXABI: &str = "terminating due to uncaught exception of type ";
+    let type_and_what = |line: &str, prefix: &str| {
+        let after = line.split(prefix).nth(1).unwrap_or("").trim();
+        let (exception, what) = after.split_once(": ").unwrap_or((after, ""));
+        (exception.trim().to_owned(), what.trim().to_owned())
+    };
+    let (exception, what) = if let Some(line) = stderr.lines().find(|l| l.contains(MARKER)) {
+        type_and_what(line, MARKER)
+    } else if let Some(line) = stderr.lines().find(|l| l.contains(LIBSTDCXX)) {
+        let after = line.split(LIBSTDCXX).nth(1).unwrap_or("");
+        let exception = after.split('\'').next().unwrap_or("").to_owned();
+        let what = stderr
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("what():"))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        (exception, what)
+    } else {
+        let line = stderr.lines().find(|l| l.contains(LIBCXXABI))?;
+        type_and_what(line, LIBCXXABI)
+    };
+    let exception = if exception.is_empty() {
+        "unknown".to_owned()
+    } else {
+        exception
+    };
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::AddressSanitizer),
+        kind: "cpp-uncaught-exception".to_owned(),
+        rule_id: "BHF-231",
+        message: if what.is_empty() {
+            format!("uncaught C++ exception {exception}")
+        } else {
+            format!("uncaught C++ exception {exception}: {what}")
+        },
+        check: Some(exception),
+        ..Default::default()
+    })
 }
 
 /// Parse a bhf JavaScript finding out of stderr. The Node driver prints
@@ -667,7 +722,10 @@ pub fn hang_frames(stderr: &str) -> Vec<StackFrame> {
     if stderr.contains(HANG_MARKER) {
         return parse_bhf_frames(stderr);
     }
-    if stderr.lines().any(|line| line.starts_with("SIGABRT: abort")) {
+    if stderr
+        .lines()
+        .any(|line| line.starts_with("SIGABRT: abort"))
+    {
         let mut frames = parse_go_stack_frames(stderr);
         frames.truncate(5);
         return frames;
@@ -3567,5 +3625,38 @@ SUMMARY: AddressSanitizer: heap-buffer-overflow (/work/build/H-1/main+0x12b1b2)\
         assert_eq!(frames[0].function, "example.com/w.spin");
         assert_eq!(frames[0].line, Some(7));
         assert!(hang_frames("no stack\n").is_empty());
+    }
+
+    #[test]
+    fn an_uncaught_cpp_exception_names_its_type() {
+        let harness = parse_sanitizer_report(
+            "== bhf cpp finding: CWE-248: std::out_of_range: vector::_M_range_check: __n (which is 101) >= this->size() (which is 4)\n",
+        )
+        .unwrap();
+        assert_eq!(harness.rule_id, "BHF-231");
+        assert_eq!(harness.kind, "cpp-uncaught-exception");
+        assert_eq!(harness.check.as_deref(), Some("std::out_of_range"));
+        assert!(
+            harness.message.contains("vector::_M_range_check"),
+            "{}",
+            harness.message
+        );
+
+        let terminate = parse_sanitizer_report(
+            "terminate called after throwing an instance of 'net::ParseError'\n  what():  bad tag\n",
+        )
+        .unwrap();
+        assert_eq!(terminate.check.as_deref(), Some("net::ParseError"));
+        assert_eq!(
+            terminate.message,
+            "uncaught C++ exception net::ParseError: bad tag"
+        );
+
+        let libcxx = parse_sanitizer_report(
+            "libc++abi: terminating due to uncaught exception of type std::invalid_argument: stoi: no conversion\n",
+        )
+        .unwrap();
+        assert_eq!(libcxx.check.as_deref(), Some("std::invalid_argument"));
+        assert!(parse_sanitizer_report("plain output\n").is_none());
     }
 }

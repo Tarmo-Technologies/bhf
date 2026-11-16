@@ -844,6 +844,27 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-231",
+        slug: "bhf.cpp/uncaught-exception",
+        name: "Uncaught C++ exception",
+        description: "A fuzz input made the target throw a C++ exception that left the function the harness called (or escaped a noexcept function, which std::terminate ends at once). A program that calls the function the way the harness does terminates on it, so one input stops the process: a denial of service. A std::out_of_range from vector::at or a std::invalid_argument from stoi on unvalidated input are the common causes. The finding names the exception's type and message. When the type is how the API reports bad input to callers that catch it, list it as expected (`bhf auto --cxx-expected-exception TYPE`); otherwise validate the input before the throwing call, or catch the exception where the input is parsed.",
+        cwe: "CWE-248",
+        cwe_top_25: None,
+        default_severity: Severity::Low,
+        default_confidence: Confidence::Medium,
+        security_severity: 3.7,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/248.html",
+            "https://en.cppreference.com/w/cpp/error/terminate",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: Some("ERR51-CPP"),
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-555",
         slug: "bhf.timing/response-deadline-exceeded",
         name: "Response deadline exceeded (real-time timing oracle)",
@@ -5304,6 +5325,7 @@ mod tests {
             ("BHF-227", "CWE-119", "bhf.c/insufficient-object-size"),
             ("BHF-228", "CWE-758", "bhf.c/invalid-builtin-use"),
             ("BHF-230", "CWE-835", "bhf.c/hang"),
+            ("BHF-231", "CWE-248", "bhf.cpp/uncaught-exception"),
         ] {
             let rule = by_id(id).unwrap_or_else(|| panic!("{id} must exist"));
             assert_eq!(rule.cwe, cwe, "{id}");

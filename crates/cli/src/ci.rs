@@ -226,6 +226,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         max_len: "auto".to_owned(),
         timeout: None,
         deadline: None,
+        cxx_expected_exceptions: Vec::new(),
         cxx_std: None,
         unsafe_search_and_run_build_commands: false,
         dry_run: false,

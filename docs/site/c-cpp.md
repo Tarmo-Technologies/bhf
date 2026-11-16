@@ -957,6 +957,26 @@ time and parses sanitizer stderr. AFL++ mode runs `afl-fuzz` against the staged
 `main_afl` sanitizer binary, then replays crash artifacts through that binary to
 emit normalized findings.
 
+### Uncaught C++ exceptions
+
+A C++ harness calls the target inside `try`/`catch` (when the build enables
+exceptions; under `-fno-exceptions` it runs unguarded). An exception that
+leaves the target is an uncaught-exception finding, BHF-231 (CWE-248, low
+severity), named by the exception's demangled type and its `what()`: a
+program that calls the target the way the harness does would terminate on
+it, as `std::out_of_range` from `vector::at` or `std::invalid_argument` from
+`stoi` on unvalidated input does. An exception type the API throws on
+purpose, to tell its callers about bad input that they catch, is not a
+finding once it is listed as expected: `bhf auto --cxx-expected-exception
+json::parse_error` (repeatable, `*` for every type; config key
+`cxx-expected-exception`; `BHF_CXX_EXPECTED_EXCEPTIONS` for `bhf fuzz`), and
+the harness then returns from that input as a rejection. An exception that
+escapes a `noexcept` function is always a finding: `std::terminate` ends the
+process before any `catch`, and bhf reads the C++ runtime's own line
+(`terminate called after throwing an instance of ...`, or libc++abi's
+`terminating due to uncaught exception of type ...`). Before this a C++
+harness swallowed every exception, so the class was never reported.
+
 When `bhf auto` runs with the runtrace shim, the built-in engine also
 evaluates executable oracle hits per input. The current executable oracles
 promote file APIs that receive paths with a parent-directory segment such as

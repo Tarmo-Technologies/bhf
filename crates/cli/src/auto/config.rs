@@ -41,6 +41,8 @@ pub struct AutoConfig {
     pub extra_include: Option<Vec<PathBuf>>,
     pub extra_source: Option<Vec<PathBuf>>,
     pub exclude_path: Option<Vec<String>>,
+    /// `--cxx-expected-exception`: C++ exception types that are not findings.
+    pub cxx_expected_exception: Option<Vec<String>>,
     pub seed_file: Option<Vec<PathBuf>>,
     pub seed_dir: Option<Vec<PathBuf>>,
     pub sanitizers: Option<Vec<String>>,
@@ -93,6 +95,7 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ("extra-include", "extra-include"),
     ("extra-source", "extra-source"),
     ("exclude-path", "exclude-path"),
+    ("cxx-expected-exception", "cxx-expected-exception"),
     ("seed-file", "seed-file"),
     ("seed-dir", "seed-dir"),
     ("sanitizers", "sanitizers"),
@@ -369,6 +372,11 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             args.exclude_paths = v;
         }
     }
+    if let Some(v) = config.cxx_expected_exception {
+        if args.cxx_expected_exceptions.is_empty() {
+            args.cxx_expected_exceptions = v;
+        }
+    }
     if let Some(v) = config.seed_file {
         if args.seed_files.is_empty() {
             args.seed_files = resolved_all(base, v);
@@ -526,9 +534,22 @@ mod tests {
             | "unsafe-search-and-run-build-commands"
             | "probe-build"
             | "msbuild-evaluate" => "true",
-            "extra-include" | "extra-source" | "exclude-path" | "seed-file" | "seed-dir"
-            | "sanitizers" | "languages" | "ada-deps" | "cflags" | "cxxflags" | "ldflags"
-            | "defines" | "include-dirs" | "runner-args" | "switches" => "[\"c\"]",
+            "extra-include"
+            | "extra-source"
+            | "exclude-path"
+            | "cxx-expected-exception"
+            | "seed-file"
+            | "seed-dir"
+            | "sanitizers"
+            | "languages"
+            | "ada-deps"
+            | "cflags"
+            | "cxxflags"
+            | "ldflags"
+            | "defines"
+            | "include-dirs"
+            | "runner-args"
+            | "switches" => "[\"c\"]",
             _ => "\"x\"",
         }
     }
