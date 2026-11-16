@@ -1271,6 +1271,14 @@
   location. A command-injection finding (CWE-78) is explained as one, never
   as a crash or from words in the injected command, and a runtime oracle's
   finding is not described as a fault.
+- C++ standard-library frames (`std::`/`__gnu_cxx::` functions, Rust's
+  `std::` too, and frames in `include/c++/` or MSVC STL headers) are no
+  longer part of the root-cause
+  key, so independent out-of-bounds reads through one STL accessor
+  (`std::unique_ptr::get`, `std::vector::operator[]`) in different project
+  functions are separate groups instead of one that hid the second in
+  INDEX.md. A stack with no other frame keeps them. Findings written by an
+  earlier release keep their stored key.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer

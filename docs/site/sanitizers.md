@@ -258,7 +258,13 @@ per crashing input.
   sanitizer-runtime and interceptor frames (`__memcmp_avx2_movbe`,
   `MemcmpInterceptorCommon`, `bcmp`, glibc component sources such as
   `sysdeps/`, `csu/`, `assert/` and `signal/`) are skipped, so the key starts
-  at the project code that made the call. A UBSan report keys on its site and
+  at the project code that made the call. So are C++ standard-library frames
+  (`std::` and `__gnu_cxx::` functions, and any frame in a standard-library
+  header under `include/c++/` or MSVC's `VC/Tools/MSVC/.../include/`; a
+  Rust `std::` frame is dropped by the same rule): two
+  out-of-bounds reads through `std::unique_ptr::get` in two project functions
+  are two groups. A crash with no other frame keeps its standard-library
+  frames. A UBSan report keys on its site and
   the function it is in: the same site reached from several harnesses is one
   group, two sites are two groups. A crash with neither a project frame nor a
   source site keys on its rule, kind, check name, the faulting pc offset when

@@ -163,11 +163,15 @@ const ALLOC_RUNTIME: &[&str] = &[
 ];
 
 /// Drop noise, strip toolchain decoration, strip C++ argument lists,
-/// and truncate to the top `TOP_FRAMES` frames. Returns an empty
-/// `Vec` when every frame was noise — callers fall back to the
-/// per-input signature in that case.
+/// and truncate to the top `TOP_FRAMES` frames. C++ standard-library
+/// frames ([`is_cpp_stdlib_frame`]) are dropped too, unless no other frame
+/// is left: every out-of-bounds read through `std::unique_ptr::get` or
+/// `std::vector::operator[]` shares them, whatever project code made the
+/// call. Returns an empty `Vec` when every frame was noise — callers fall
+/// back to the per-input signature in that case.
 pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut stdlib: Vec<String> = Vec::new();
     for frame in input {
         let stripped = strip_toolchain_decoration(frame.function.as_str());
         let trimmed = stripped.trim();
@@ -198,12 +202,66 @@ pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
         if actionability::is_runtime_noise_frame(trimmed, frame.file.as_deref()) {
             continue;
         }
+        if is_cpp_stdlib_frame(&no_args, frame.file.as_deref()) {
+            if stdlib.len() < TOP_FRAMES {
+                stdlib.push(no_args);
+            }
+            continue;
+        }
         out.push(no_args);
         if out.len() >= TOP_FRAMES {
             break;
         }
     }
-    out
+    if out.is_empty() {
+        stdlib
+    } else {
+        out
+    }
+}
+
+/// Namespaces of the C++ standard library and its runtime: libstdc++'s
+/// `std::` and `__gnu_cxx::` (libc++'s `std::__1::` is under `std::`), and
+/// the C++ ABI runtime.
+const CPP_STDLIB_NAMESPACES: &[&str] = &["std::", "__gnu_cxx::", "__gnu_debug::", "__cxxabiv1::"];
+
+/// Whether a frame (its function with the argument list stripped) is C++
+/// standard-library code: a function in one of [`CPP_STDLIB_NAMESPACES`],
+/// also when the demangler printed a template's return type first
+/// (`void std::vector<...>::_M_realloc_append<...>`), or any frame in a
+/// standard-library header (libstdc++'s and libc++'s `include/c++/`, MSVC's
+/// `VC/Tools/MSVC/<version>/include/`).
+fn is_cpp_stdlib_frame(function: &str, file: Option<&str>) -> bool {
+    let name = without_return_type(function);
+    if CPP_STDLIB_NAMESPACES
+        .iter()
+        .any(|namespace| name.starts_with(namespace))
+    {
+        return true;
+    }
+    file.is_some_and(|file| {
+        let path = file.replace('\\', "/").to_ascii_lowercase();
+        path.contains("/include/c++/")
+            || (path.contains("/vc/tools/msvc/") && path.contains("/include/"))
+    })
+}
+
+/// A demangled function name without the return type the demangler prints
+/// before a template function's name: the text after the last space outside
+/// `<...>` and `(...)`.
+fn without_return_type(function: &str) -> &str {
+    let mut depth = 0_i32;
+    let mut start = 0;
+    for (index, ch) in function.char_indices() {
+        match ch {
+            '<' | '(' => depth += 1,
+            // `operator->` closes nothing.
+            '>' | ')' => depth = (depth - 1).max(0),
+            ' ' if depth == 0 => start = index + 1,
+            _ => {}
+        }
+    }
+    &function[start..]
 }
 
 /// Runtime (`printf`/`fprintf`/`vfprintf`, the `str*`/`mem*` builtins, glibc

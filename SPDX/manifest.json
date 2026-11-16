@@ -2995,6 +2995,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/tests/stl_frames_cluster.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cpp_parser/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3996,6 +4000,10 @@
     },
     {
       "path": "crates/results/tests/golden.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/tests/stl_frame_groups.rs",
       "license": "Apache-2.0"
     },
     {
