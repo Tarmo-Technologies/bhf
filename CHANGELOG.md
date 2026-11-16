@@ -45,6 +45,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Hangs in the interpreted lanes are findings located in the target. A
+  re-run of an input that hung had no stack there, because an interpreter
+  answers no signal while its target loops: a Python `while True` gave a
+  finding with no location, and every hang of a target was one finding. The
+  re-run now sets `BHF_HANG_REPORT_MS`, and the Python, Node, Ruby, PHP, Lua,
+  Perl and JVM drivers print the frames their target is running when it
+  passes, which key the finding; a Go target's goroutine dump on SIGABRT does
+  the same. The Lua re-run drops the coverage hook, so a recursion that
+  outlived the timeout under it overflows the stack and is reported as that
+  crash in the target file.
 - On Windows a background re-run starts one priority class below bhf's own
   and is returned to bhf's own class, not to a fixed BelowNormal and Normal:
   under a BelowNormal parent (the GitHub runner's worker, or any BelowNormal

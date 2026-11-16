@@ -654,6 +654,29 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
     })
 }
 
+/// What an interpreted lane's driver prints, before its `== bhf frame:`
+/// lines, when bhf's re-run of an input that hung reaches
+/// `BHF_HANG_REPORT_MS`: the frames the target was running.
+pub const HANG_MARKER: &str = "== bhf hang:";
+
+/// The stack a hung process gave when bhf stopped it: an interpreted lane's
+/// driver frames after [`HANG_MARKER`], the Go runtime's goroutine dump on
+/// SIGABRT (without the runtime and harness frames), else the stack of the
+/// sanitizer report SIGABRT produced (`handle_abort=1`).
+pub fn hang_frames(stderr: &str) -> Vec<StackFrame> {
+    if stderr.contains(HANG_MARKER) {
+        return parse_bhf_frames(stderr);
+    }
+    if stderr.lines().any(|line| line.starts_with("SIGABRT: abort")) {
+        let mut frames = parse_go_stack_frames(stderr);
+        frames.truncate(5);
+        return frames;
+    }
+    parse_sanitizer_report(stderr)
+        .map(|report| report.stack)
+        .unwrap_or_default()
+}
+
 /// The frames an interpreted lane's driver prints under its finding line, one
 /// `== bhf frame: <function> @ <file>:<line>` per frame, innermost first and
 /// without the driver's and the harness's own frames (the Perl, Ruby, PHP and
@@ -3523,5 +3546,26 @@ SUMMARY: AddressSanitizer: heap-buffer-overflow (/work/build/H-1/main+0x12b1b2)\
     #0 0x55d0c3a1b2c4 in parse /src/p.c:9:3\n";
         assert!(unsymbolized_frames(symbolized).is_empty());
         assert!(unsymbolized_frames("no report here\n").is_empty());
+    }
+
+    #[test]
+    fn a_hung_process_names_the_frames_its_driver_or_runtime_printed() {
+        let python = "bhf: noise\n== bhf hang: python\n\
+                      == bhf frame: spin @ /src/t.py:3\n\
+                      == bhf frame: parse @ /src/t.py:9\n";
+        let frames = hang_frames(python);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].function, "spin");
+        assert_eq!(frames[0].file.as_deref(), Some("/src/t.py"));
+        assert_eq!(frames[0].line, Some(3));
+
+        let go = "SIGABRT: abort\nPC=0x46d6e1 m=0 sigcode=0\n\n\
+                  goroutine 1 gp=0xc000002380 m=0 mp=0x5a0d40 [running]:\n\
+                  example.com/w.spin(...)\n\t/src/w/w.go:7 +0x1d\n\
+                  example.com/w.Parse({0xc0000140a8, 0x3, 0x8})\n\t/src/w/w.go:12 +0x25\n";
+        let frames = hang_frames(go);
+        assert_eq!(frames[0].function, "example.com/w.spin");
+        assert_eq!(frames[0].line, Some(7));
+        assert!(hang_frames("no stack\n").is_empty());
     }
 }

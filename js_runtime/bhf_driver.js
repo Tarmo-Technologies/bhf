@@ -489,6 +489,65 @@ function setupControlFd() {
   return ctrl;
 }
 
+// In bhf's re-run of an input that hung, print the frames the target is
+// running once the run reaches BHF_HANG_REPORT_MS, then halt: bhf keys the hang
+// finding on them. A loop in JavaScript never yields to the event loop, so a
+// worker thread keeps the time and pauses the main thread through the
+// inspector (V8 answers at the loop's next back edge); the paused frames' URLs
+// come from the scripts the debugger reported. The worker enables the debugger
+// before the input runs, while the main thread can still answer.
+const HANG_WATCHDOG = `
+const fs = require('fs');
+const inspector = require('inspector');
+const { fileURLToPath } = require('url');
+const { parentPort, workerData } = require('worker_threads');
+const alive = setInterval(() => {}, 1000);
+const scripts = new Map();
+const session = new inspector.Session();
+session.connectToMainThread();
+session.on('Debugger.scriptParsed', ({ params }) => scripts.set(params.scriptId, params.url));
+session.on('Debugger.paused', ({ params }) => {
+  const lines = ['== bhf hang: js'];
+  for (const frame of params.callFrames) {
+    let file = frame.url || scripts.get(frame.location.scriptId) || '';
+    if (file.startsWith('file://')) file = fileURLToPath(file);
+    if (!file || file.startsWith('node:') || workerData.own.includes(file)) continue;
+    if (workerData.prefix && !file.startsWith(workerData.prefix)) continue;
+    const name = frame.functionName || '(anonymous)';
+    lines.push('== bhf frame: ' + name + ' @ ' + file + ':' + (frame.location.lineNumber + 1));
+    if (lines.length > 5) break;
+  }
+  fs.writeSync(2, lines.join('\\n') + '\\n');
+  process.kill(process.pid, 'SIGKILL');
+});
+session.post('Debugger.enable', () => {
+  parentPort.postMessage('ready');
+  setTimeout(() => session.post('Debugger.pause'), Math.max(0, workerData.deadline - Date.now()));
+});
+`;
+
+// Start the watchdog when BHF_HANG_REPORT_MS asks for one; resolves once it
+// is ready (at once without one, or if it cannot start).
+function armHangReport() {
+  const after = Number(process.env.BHF_HANG_REPORT_MS);
+  if (!Number.isFinite(after) || after <= 0) return Promise.resolve();
+  let Worker;
+  try {
+    ({ Worker } = require('worker_threads'));
+  } catch (_) {
+    return Promise.resolve();
+  }
+  const deadline = Date.now() + after - process.uptime() * 1000;
+  const workerData = { deadline, own: [__filename], prefix: process.env.BHF_TRACE_PREFIX || '' };
+  return new Promise((resolve) => {
+    const watchdog = new Worker(HANG_WATCHDOG, { eval: true, workerData });
+    watchdog.unref();
+    watchdog.once('message', resolve);
+    watchdog.once('error', resolve);
+    watchdog.once('exit', resolve);
+  });
+}
+
 function main() {
   covInit();
   installSinkGuards();
@@ -517,7 +576,8 @@ function main() {
       input = Buffer.alloc(0);
     }
   }
-  runInput(input)
+  armHangReport()
+    .then(() => runInput(input))
     .then(() => covFold())
     .then(() => process.exit(0));
 }

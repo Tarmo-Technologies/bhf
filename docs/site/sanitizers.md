@@ -383,8 +383,25 @@ hangs, bhf sends it SIGABRT with `handle_abort=1` added to the sanitizer
 options, so a sanitizer runtime prints the stack the target was looping in.
 The finding's stack starts at the first frame below the coverage or
 comparison callback the signal interrupted, and two inputs that loop in the
-same functions are one finding. Without a sanitizer runtime (or on Windows)
-the finding has no stack, and the pass's hangs are one finding.
+same functions are one finding.
+
+An interpreter answers no signal while its target loops, so in the
+interpreted lanes the re-run's driver keeps the time instead: bhf sets
+`BHF_HANG_REPORT_MS` to the re-run's limit and lets it run up to half that
+again (at most 2s) past it, and when the limit passes the driver prints the
+frames its target is running (`== bhf hang: <lane>`, then `== bhf frame:
+<function> @ <file>:<line>` lines) and halts. The Python driver uses a
+SIGALRM timer, Ruby and the JVM a watchdog thread, Perl a SIGALRM handler,
+PHP an async `pcntl` SIGALRM (whole seconds; without the `pcntl` extension
+the hang has no stack), Lua a count hook on the run's CPU time, and Node a
+worker thread that pauses the main thread through the inspector. A Go
+target's runtime answers SIGABRT with its goroutine dump, whose target
+frames make the stack. The Lua re-run runs without the coverage line hook,
+whose cost can make a deep recursion outlast the timeout: an input that,
+given the time, crashes instead (that recursion overflowing the stack) is
+reported as that crash. Without a sanitizer runtime, a driver that reports,
+or a goroutine dump (a native target on Windows, say), the finding has no
+stack, and the pass's hangs are one finding.
 
 A pass re-runs at most four hangs, and none it has less time left for than
 the re-run needs. `fuzz_runs/<harness>-latest.json` counts them under

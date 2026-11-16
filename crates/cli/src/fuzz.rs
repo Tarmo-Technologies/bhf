@@ -4813,6 +4813,11 @@ fn run_builtin_with_progress(
                     run.sanitizer = Some(*report);
                     run.stderr = Some(stderr);
                 }
+                HangConfirmation::Crashed(report, stderr) => {
+                    hangs.cleared += 1;
+                    run.sanitizer = Some(*report);
+                    run.stderr = Some(stderr);
+                }
                 HangConfirmation::Finished => {
                     hangs.cleared += 1;
                     bhfeprintln!(
@@ -8688,17 +8693,24 @@ pub struct HangRunSummary {
 enum HangConfirmation {
     /// It hung again: the hang report and the stderr it was made from.
     Hung(Box<corpus::SanitizerReport>, String),
+    /// Given the time, it crashed: that report and its stderr (deep recursion
+    /// under an interpreter's coverage hook can outlast the timeout).
+    Crashed(Box<corpus::SanitizerReport>, String),
     /// It finished: one slow execution.
     Finished,
     /// It was not re-run: too little of the pass's time was left.
     NotRerun,
 }
 
-/// The `<SAN>_OPTIONS` a hang confirmation runs under: `extra_env`'s, with
-/// `handle_abort=1`, so the runtime answers [`signal_for_stack`] with the
-/// stack the target is looping in.
-fn hang_stack_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+/// The environment a hang confirmation runs under: `extra_env`, its
+/// `<SAN>_OPTIONS` with `handle_abort=1`, so the runtime answers
+/// [`signal_for_stack`] with the stack the target is looping in, and
+/// `BHF_HANG_REPORT_MS`, when an interpreted lane's driver prints the frames
+/// its target is running and halts ([`HANG_REPORT_ENV`]).
+fn hang_stack_env(extra_env: &[(String, String)], confirm: Duration) -> Vec<(String, String)> {
     let mut env = extra_env.to_vec();
+    env.retain(|(name, _)| name != HANG_REPORT_ENV);
+    env.push((HANG_REPORT_ENV.to_owned(), confirm.as_millis().to_string()));
     for key in [
         "ASAN_OPTIONS",
         "UBSAN_OPTIONS",
@@ -8721,11 +8733,24 @@ fn hang_stack_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
     env
 }
 
+/// When an interpreted lane's driver reports the frames its target is
+/// running: at the re-run's `confirm` limit. An interpreter answers no signal
+/// while its target loops in bytecode, so the driver keeps the time, and bhf
+/// stops the re-run only [`hang_report_slack`] after the limit.
+const HANG_REPORT_ENV: &str = "BHF_HANG_REPORT_MS";
+
+/// How long past its limit a hang confirmation runs, so a driver that reports
+/// at the limit is not stopped first: half the limit, at most 2s.
+fn hang_report_slack(confirm: Duration) -> Duration {
+    (confirm / 2).min(Duration::from_secs(2))
+}
+
 /// Re-run an input that hung at `per_input_timeout` in a fresh process with
-/// twice that, asking the process for its stack if it hangs again: it has up
-/// to [`HANG_STACK_GRACE`] to print it, or what is left of the pass after the
-/// re-run if that is less. Not re-run when the pass has less time left than
-/// the re-run itself.
+/// twice that (and [`hang_report_slack`] more, for an interpreted lane's
+/// driver to report the frames it is running), asking the process for its
+/// stack if it hangs again: it has up to [`HANG_STACK_GRACE`] to print it, or
+/// what is left of the pass after the re-run if that is less. Not re-run when
+/// the pass has less time left than the re-run itself.
 fn confirm_hang(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
@@ -8736,13 +8761,14 @@ fn confirm_hang(
     pass_deadline: Option<Instant>,
 ) -> Result<HangConfirmation, String> {
     let confirm = per_input_timeout.saturating_mul(2);
+    let limit = confirm + hang_report_slack(confirm);
     let grace = match pass_deadline {
         Some(deadline) => {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left < confirm {
+            if left < limit {
                 return Ok(HangConfirmation::NotRerun);
             }
-            HANG_STACK_GRACE.min(left - confirm)
+            HANG_STACK_GRACE.min(left - limit)
         }
         None => HANG_STACK_GRACE,
     };
@@ -8750,8 +8776,8 @@ fn confirm_hang(
     let output = run_with_timeout(
         runner.harness_path(),
         &input_path,
-        confirm,
-        &hang_stack_env(extra_env),
+        limit,
+        &hang_stack_env(extra_env, confirm),
         &ensure_harness_scratch(work_dir)?,
         rss_limit_mb,
         runner.qemu_prefix(),
@@ -8762,22 +8788,28 @@ fn confirm_hang(
     );
     let _ = fs::remove_file(&input_path);
     let stderr = String::from_utf8_lossy(&output?.stderr).into_owned();
-    if !stderr.contains("exceeded per-input timeout") {
-        return Ok(HangConfirmation::Finished);
+    // Stopped at the limit, or a driver reported its target still running.
+    let hung = stderr.contains("exceeded per-input timeout")
+        || stderr.contains(corpus::sanitizer::HANG_MARKER);
+    if !hung {
+        return Ok(match corpus::parse_sanitizer_report(&stderr) {
+            Some(report) => HangConfirmation::Crashed(Box::new(report), stderr),
+            None => HangConfirmation::Finished,
+        });
     }
     let report = hang_report(&stderr, per_input_timeout, confirm);
     Ok(HangConfirmation::Hung(Box::new(report), stderr))
 }
 
-/// The BHF-230 report of a confirmed hang. Its stack is the one the sanitizer
-/// runtime printed when [`signal_for_stack`] stopped the re-run, if it printed
-/// one, from the first frame that is not instrumentation; the signal's own
-/// report is not the finding. Keyed on the stack's functions alone, so two
-/// inputs looping on different lines of one loop are one finding.
+/// The BHF-230 report of a confirmed hang. Its stack is the one the re-run
+/// gave ([`corpus::sanitizer::hang_frames`]: an interpreted lane's driver
+/// frames, the Go runtime's goroutine dump, or the sanitizer runtime's report
+/// when [`signal_for_stack`] stopped it), from the first frame that is not
+/// instrumentation; the signal's own report is not the finding. Keyed on the
+/// stack's functions alone, so two inputs looping on different lines of one
+/// loop are one finding.
 fn hang_report(stderr: &str, timeout: Duration, confirm: Duration) -> corpus::SanitizerReport {
-    let mut stack = corpus::parse_sanitizer_report(stderr)
-        .map(|signalled| signalled.stack)
-        .unwrap_or_default();
+    let mut stack = corpus::sanitizer::hang_frames(stderr);
     if let Some(looping) = stack
         .iter()
         .position(|frame| !is_instrumentation_frame(&frame.function))
@@ -14053,13 +14085,16 @@ exit 0
     /// with its stack, after the options the run already had.
     #[test]
     fn hang_confirmations_arm_handle_abort_after_the_run_options() {
-        let env = hang_stack_env(&[
-            (
-                "ASAN_OPTIONS".to_owned(),
-                "abort_on_error=1:symbolize=1".to_owned(),
-            ),
-            ("BHF_COV_SHM".to_owned(), "/dev/shm/x".to_owned()),
-        ]);
+        let env = hang_stack_env(
+            &[
+                (
+                    "ASAN_OPTIONS".to_owned(),
+                    "abort_on_error=1:symbolize=1".to_owned(),
+                ),
+                ("BHF_COV_SHM".to_owned(), "/dev/shm/x".to_owned()),
+            ],
+            Duration::from_secs(20),
+        );
         let value = |key: &str| {
             env.iter()
                 .find(|(name, _)| name == key)
@@ -14076,6 +14111,29 @@ exit 0
                 "{key}: {env:?}"
             );
         }
+        // An interpreted lane's driver reports its frames at the 20s limit,
+        // and the re-run is stopped 2s later.
+        assert_eq!(value(HANG_REPORT_ENV), Some("20000"));
+        assert_eq!(
+            hang_report_slack(Duration::from_secs(20)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            hang_report_slack(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+    }
+
+    /// A driver's frames make the report's stack.
+    #[test]
+    fn an_interpreted_lanes_hang_is_keyed_on_the_frames_its_driver_printed() {
+        let report = hang_report(
+            "== bhf hang: python\n== bhf frame: spin @ /src/t.py:3\n",
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+        assert_eq!(report.stack[0].function, "spin");
+        assert_eq!(report.stack[0].file.as_deref(), Some("/src/t.py"));
     }
 
     /// `500ms` and `0.5s` are half a second, and a value with another unit

@@ -106,21 +106,9 @@ end
 # 5), without this driver's and the harness's own frames. A SystemStackError's
 # backtrace is the deep end of the recursion, which is the target's.
 def bhf_target_frames(err)
-  skip = [File.expand_path(__FILE__), File.expand_path(ENV['BHF_HARNESS'].to_s)]
-  frames = []
-  locations = err.backtrace_locations || []
-  locations.each_with_index do |loc, i|
-    path = loc.absolute_path || loc.path
-    next if path.nil? || skip.include?(File.expand_path(path))
-    # A C method (`Integer#/`) is reported at the line that called it, which
-    # the next frame names too: that frame's method is the target's.
-    caller_frame = locations[i + 1]
-    next if caller_frame && caller_frame.lineno == loc.lineno &&
-            (caller_frame.absolute_path || caller_frame.path) == path
-    frames << "#{loc.label} @ #{path}:#{loc.lineno}"
-    break if frames.size >= 5
-  end
+  frames = bhf_location_frames(err.backtrace_locations || [])
   if frames.empty?
+    skip = bhf_own_paths
     (err.backtrace || []).each do |line|
       m = line.match(/\A(.+):(\d+):in [`'](.+)'\z/) or next
       next if skip.include?(File.expand_path(m[1]))
@@ -129,6 +117,56 @@ def bhf_target_frames(err)
     end
   end
   frames
+end
+
+def bhf_own_paths
+  [File.expand_path(__FILE__), File.expand_path(ENV['BHF_HARNESS'].to_s)]
+end
+
+# `function @ file:line` of the target's frames among `locations` (at most 5).
+def bhf_location_frames(locations)
+  skip = bhf_own_paths
+  frames = []
+  locations.each_with_index do |loc, i|
+    path = loc.absolute_path || loc.path
+    next if path.nil? || path.start_with?('<internal:') || skip.include?(File.expand_path(path))
+    # A C method (`Integer#/`) is reported at the line that called it, which
+    # the next frame names too: that frame's method is the target's.
+    caller_frame = locations[i + 1]
+    next if caller_frame && caller_frame.lineno == loc.lineno &&
+            (caller_frame.absolute_path || caller_frame.path) == path
+    frames << "#{loc.label} @ #{path}:#{loc.lineno}"
+    break if frames.size >= 5
+  end
+  frames
+end
+
+# In bhf's re-run of an input that hung, print the frames the target is
+# running once the run reaches BHF_HANG_REPORT_MS, then halt: bhf keys the hang
+# finding on them. A watchdog thread keeps the time; Ruby switches threads
+# while the target loops, so it reads the main thread's stack where it loops.
+def bhf_arm_hang_report
+  after = Integer(ENV['BHF_HANG_REPORT_MS'] || '', exception: false)
+  return unless after&.positive?
+  main = Thread.current
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC) - bhf_process_age
+  watchdog = Thread.new do
+    left = started + after / 1000.0 - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    sleep(left) if left.positive?
+    frames = bhf_location_frames(main.backtrace_locations || [])
+    lines = ['== bhf hang: ruby'] + frames.map { |frame| "== bhf frame: #{frame}" }
+    $stderr.write(lines.join("\n") + "\n")
+    $stderr.flush
+    exit!(FINDING_HALT)
+  end
+  watchdog.report_on_exception = false
+end
+
+# Seconds this process has run, so the watchdog counts from its start.
+def bhf_process_age
+  Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
+rescue StandardError
+  0.0
 end
 
 def bhf_handle_error(err)
@@ -192,6 +230,7 @@ if ENV.key?('BHF_FRAMED')
     bhf_dump_covered if (count & (count - 1)).zero? || (count & 0x1FF).zero?
   end
 else
+  bhf_arm_hang_report
   data =
     if ARGV[0] && File.file?(ARGV[0])
       File.binread(ARGV[0])

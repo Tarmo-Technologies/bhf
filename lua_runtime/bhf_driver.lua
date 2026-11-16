@@ -257,9 +257,43 @@ local function write_stats()
   stats_written = stats_runs >= STATS_WINDOW
 end
 
+-- In bhf's re-run of an input that hung, print the frames the target is
+-- running once the run's CPU time reaches BHF_HANG_REPORT_MS, then halt: bhf
+-- keys the hang finding on them. Lua answers no signal, so a count hook keeps
+-- the time. The re-run needs no coverage, so the line hook stays off: its cost
+-- can make a deep recursion outlast the timeout where it would overflow the
+-- stack, which the re-run then reports.
+local HANG_WATCH_COUNT = 10000
+local hang_after = tonumber(os.getenv("BHF_HANG_REPORT_MS") or "")
+
+local function hang_watchdog()
+  if os.clock() * 1000 < hang_after then return end
+  sethook()
+  io.stderr:write("== bhf hang: lua\n")
+  local shown = 0
+  for level = 2, 200 do
+    local info = getinfo(level, "Sln")
+    if not info then break end
+    if chunk_of(info.source) and info.currentline and info.currentline > 0 then
+      -- A tail-called function has no name: name it where it is defined, as
+      -- Lua's traceback does.
+      local name = info.name or ("function <" .. info.short_src .. ":" .. info.linedefined .. ">")
+      io.stderr:write("== bhf frame: " .. name .. " @ "
+        .. info.source:sub(2) .. ":" .. info.currentline .. "\n")
+      shown = shown + 1
+      if shown >= 5 then break end
+    end
+  end
+  os.exit(FINDING_HALT)
+end
+
 local function run_input(data)
   reset_prev()
-  hook_on()
+  if hang_after then
+    sethook(hang_watchdog, "", HANG_WATCH_COUNT)
+  else
+    hook_on()
+  end
   local ok, err = xpcall(run_one, capture_frames, data)
   -- Formatting the error runs no target code worth tracing.
   hook_off()
