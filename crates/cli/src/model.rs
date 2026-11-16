@@ -16,16 +16,21 @@ pub struct ModelArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
+    /// Train a confidence model from findings you labeled (true positive,
+    /// false positive, low value), for `bhf report --model`
     Train(TrainArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct TrainArgs {
-    /// Labeled findings JSON file.
+    /// Labels JSON: a list of records (or `{"labels": [...]}`), each with a
+    /// `label` (`true_positive`, `false_positive` or `low_value`) and the
+    /// finding, inline as `finding` (a finding.json object) or as
+    /// `finding_path` (a finding.json or its directory, relative to this file).
     #[arg(long)]
     pub labels: PathBuf,
 
-    /// Output model path.
+    /// Where to write the model JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
@@ -129,6 +134,12 @@ fn read_finding_path(base_dir: &Path, path: &Path) -> Result<Value> {
         path.to_path_buf()
     } else {
         base_dir.join(path)
+    };
+    // A finding's directory names its finding.json.
+    let resolved = if resolved.is_dir() {
+        resolved.join("finding.json")
+    } else {
+        resolved
     };
     serde_json::from_slice(
         &fs::read(&resolved).with_context(|| format!("read {}", resolved.display()))?,

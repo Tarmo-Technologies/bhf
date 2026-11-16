@@ -10,7 +10,7 @@ checks.
 
 | Area | Commands |
 |---|---|
-| Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report` |
+| Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report`, `model` |
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
@@ -19,7 +19,7 @@ checks.
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
 | Rules and governance | `rules`, `policy`, `audit`, `pack`, `export` |
 | Optional assistance | `llm` (`status`, `test`, `prompt`, `assist`) |
-| CI and operations | `ci`, `runners`, `clean`, `introspect` |
+| CI and operations | `ci`, `runners`, `clean`, `introspect`, `bug-report` |
 
 Run `bhf --help` for the live top-level inventory and `bhf <command>
 --help` for the exact language scope, defaults, and accepted values. In
@@ -93,10 +93,32 @@ harness is not its recorded build, or whose replay is unsymbolized (put
 the LLVM toolchain `bhf auto` uses on `PATH`) is listed and left as it was. Pass `--findings <DIR>` and/or `--out <DIR>` for the
 explicit mode shown above, which reports over an arbitrary findings directory
 and writes a standalone Markdown/JSON/SARIF/CSV report to `--out` instead of
-touching `results/`; `--sarif`/`--csv` are no-ops in work-dir mode (always
-written). `--junit <PATH>`, `--baseline <PATH>`, and `--model <PATH>` write
-into `<work-dir>/results/report/` (the `bhf.report.v2` snapshot baseline
-comparisons need).
+touching `results/`: `--sarif` and `--csv` add `<run>.sarif` and `<run>.csv`
+there. In work-dir mode they change nothing, since `results/findings.sarif`
+and `results/findings.csv` are always written. `--junit` (a switch, with no
+path) writes `<run>.junit.xml`, into `<work-dir>/results/report/` in work-dir
+mode, with the `bhf.report.v2` snapshot that `--baseline <PATH>` and
+`--model <PATH>` also write there (baseline comparisons need it).
+
+`bhf model train --labels <FILE> --out <MODEL>` trains the confidence model
+`bhf report --model` applies. The labels file is a JSON list of records (or an
+object whose `labels` holds that list); each record has a `label`,
+`true_positive`, `false_positive` or `low_value`, and its finding, either
+inline as `finding` (a `finding.json` object) or as `finding_path` (a
+`finding.json`, or the finding's directory, relative to the labels file):
+
+```json
+[
+  {"label": "true_positive", "finding_path": "bhf_work/results/findings/F-0001"},
+  {"label": "false_positive", "finding": {"rule_id": "BHF-205", "kind": "signed-integer-overflow"}}
+]
+```
+
+`bhf license-audit` checks bhf's own Cargo dependencies, in a checkout of
+bhf's source (`--root`, default `.`; `--package`, default `bhf`), against its
+Apache-2.0/MIT/BSD policy and the THIRD_PARTY.md matrix. It is not a license
+check of a scanned project; `bhf sbom` lists a tree's dependencies and their
+licenses.
 
 ## Actionability Modes
 

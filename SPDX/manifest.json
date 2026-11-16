@@ -2239,6 +2239,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_cpp_uncaught_exception.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_csharp_isolation.rs",
       "license": "Apache-2.0"
     },
@@ -2704,6 +2708,10 @@
     },
     {
       "path": "crates/cli/tests/collector_win_live.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/command_help_cli.rs",
       "license": "Apache-2.0"
     },
     {

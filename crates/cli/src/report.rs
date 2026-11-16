@@ -27,16 +27,19 @@ pub struct ReportArgs {
     #[arg(long)]
     pub model: Option<PathBuf>,
 
-    /// Explicit mode only; work-dir mode always writes results/findings.{sarif,csv}.
-    #[arg(long, hide = true)]
+    /// Explicit mode: also write a SARIF 2.1.0 report (`<run>.sarif` in
+    /// `--out`). Work-dir mode always writes `results/findings.sarif`.
+    #[arg(long)]
     pub sarif: bool,
 
-    /// Also emit a JUnit-style XML report.
+    /// Also write a JUnit XML report (`<run>.junit.xml`, in `--out`, or in
+    /// `results/report/` in work-dir mode). A switch: it takes no path.
     #[arg(long)]
     pub junit: bool,
 
-    /// Explicit mode only; work-dir mode always writes results/findings.{sarif,csv}.
-    #[arg(long, hide = true)]
+    /// Explicit mode: also write a CSV report (`<run>.csv` in `--out`).
+    /// Work-dir mode always writes `results/findings.csv`.
+    #[arg(long)]
     pub csv: bool,
 
     /// Collapse non-representative findings inside each cluster under

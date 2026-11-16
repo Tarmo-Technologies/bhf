@@ -52,6 +52,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The help says what `report`, `model`, `snippet` and `license-audit` do:
+  `bhf report --sarif`/`--csv` and `bhf model` are no longer hidden, and
+  `model train`'s help and cli.md give its labels schema; `--junit` is
+  documented as the switch it is, not `--junit <PATH>`; snippet's help lists
+  its languages from the language enum (it named 8 of the 16); and
+  `license-audit` says it checks bhf's own Cargo dependency licenses, not a
+  scanned project's. The top-level "COMMANDS BY AREA" guide names every
+  visible command, as do cli.md's command map, and `model train` accepts a
+  finding's directory as `finding_path`.
 - `docs/expected-gaps.md` marks the fixed classes (Go-2, C++-1, C-1 in part)
   and its ranked work list names none of them; the Go lane's re-sweep is
   recorded in `docs/validation/2026-11-16-go-resweep.md`. It re-ran the 40 Go
