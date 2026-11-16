@@ -1246,9 +1246,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         coverage_modules: args.winafl_coverage_modules.clone(),
         page_heap: args.winafl_page_heap,
     };
-    if crate::fuzz::parse_engine_list(&args.engine)
-        .is_ok_and(|engines| engines.contains(&crate::fuzz::FuzzEngine::Winafl))
-    {
+    // Every value is checked before anything runs, `--dry-run` included: a
+    // plan for an engine or sanitizer set that cannot run is no plan.
+    let engines = match crate::fuzz::parse_engine_list(&args.engine) {
+        Ok(engines) => engines,
+        Err(error) => {
+            bhfeprintln!("error: --engine: {error}");
+            return Ok(2);
+        }
+    };
+    if let Err(error) = crate::fuzz::parse_sanitizer_args(&args.sanitizers) {
+        bhfeprintln!("error: {error}");
+        return Ok(2);
+    }
+    if engines.contains(&crate::fuzz::FuzzEngine::Winafl) {
         if let Err(error) = crate::fuzz::check_winafl_available(&winafl) {
             bhfeprintln!("error: {error}");
             return Ok(2);

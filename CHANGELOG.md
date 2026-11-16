@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `--sanitizers` refuses `msan` or `tsan` combined with another sanitizer (exit
+  2, on `bhf auto` and `bhf fuzz`). Every target then failed to build and was
+  filed as a bhf code-generation bug. `bhf auto --dry-run` checks `--engine`
+  and `--sanitizers` before it exits: it accepted `--engine bogus`.
 - Duration flags (`--timeout`, `--time`, `--deadline` on `bhf fuzz` and
   `bhf auto`) accept milliseconds and fractions: `500ms`, `0.5s`, `1.5m`.
   The documented `--timeout 500ms` was refused. A multi-worker run passes a

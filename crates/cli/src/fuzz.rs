@@ -1435,6 +1435,10 @@ pub fn run(args: FuzzArgs) -> i32 {
         bhfeprintln!("{error}");
         return 2;
     }
+    if let Err(error) = parse_sanitizer_args(&args.sanitizers) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
     // HDF-1b: when a target transport is requested, drive the additive
     // transport-fuzz path (a separate loop over the `target_transport` seam) and
     // leave the host libFuzzer/AFL path below untouched.
@@ -6771,6 +6775,28 @@ pub(crate) fn parse_sanitizer_args(
         };
         if !out.contains(&sanitizer) {
             out.push(sanitizer);
+        }
+    }
+    // MemorySanitizer and ThreadSanitizer each need a build of their own: no
+    // other sanitizer links beside either (clang refuses
+    // `-fsanitize=address,memory`), so every target would fail to build.
+    for exclusive in [
+        multicore_fuzz::Sanitizer::Msan,
+        multicore_fuzz::Sanitizer::Tsan,
+    ] {
+        if out.contains(&exclusive) && out.len() > 1 {
+            let others: Vec<&str> = out
+                .iter()
+                .filter(|sanitizer| **sanitizer != exclusive)
+                .map(|sanitizer| sanitizer.as_str())
+                .collect();
+            return Err(format!(
+                "--sanitizers: {} cannot be combined with {}: it needs a build of its own; \
+                 run it as a separate campaign (`--sanitizers {}`)",
+                exclusive.as_str(),
+                others.join(", "),
+                exclusive.as_str()
+            ));
         }
     }
     Ok(SanitizerSelection::Set(out))
@@ -13045,6 +13071,30 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    /// MemorySanitizer and ThreadSanitizer each need a build of their own;
+    /// ASan, UBSan and LSan combine.
+    #[test]
+    fn exclusive_sanitizers_are_refused_in_a_set() {
+        let set = |values: &[&str]| {
+            parse_sanitizer_args(&values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+        };
+        for (values, named) in [
+            (&["msan", "asan"][..], "msan cannot be combined with asan"),
+            (&["tsan", "ubsan"][..], "tsan cannot be combined with ubsan"),
+            (
+                &["asan", "tsan", "lsan"][..],
+                "tsan cannot be combined with asan, lsan",
+            ),
+            (&["msan", "tsan"][..], "msan cannot be combined with tsan"),
+        ] {
+            let error = set(values).expect_err(&format!("{values:?}"));
+            assert!(error.contains(named), "{values:?}: {error}");
+        }
+        for ok in [&["asan", "ubsan", "lsan"][..], &["msan"][..], &["tsan"][..]] {
+            assert!(set(ok).is_ok(), "{ok:?}");
+        }
     }
 
     /// `500ms` and `0.5s` are half a second, and a value with another unit
