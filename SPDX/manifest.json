@@ -3,6 +3,10 @@
   "version": 1,
   "files": [
     {
+      "path": ".bhf.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".config/nextest.toml",
       "license": "Apache-2.0"
     },
