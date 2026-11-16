@@ -149,6 +149,11 @@ pub fn run(args: CapsuleArgs) -> i32 {
     for (record, eligible) in selection.eligible {
         let Some(harness_dir) = eligible.harness_dir else {
             failed += 1;
+            bhfeprintln!(
+                "  {} failed: no dir of harness {} to package",
+                record.id,
+                eligible.harness_id
+            );
             continue;
         };
         let finding = FindingRef {
@@ -245,12 +250,19 @@ pub fn run(args: CapsuleArgs) -> i32 {
         // Only removes an empty dir: nothing was packaged into it.
         let _ = std::fs::remove_dir(&out_root);
     }
+    // Every finding considered is written, skipped (with its reason above)
+    // or failed (with its error above).
     let skipped = match selection_refused + refused_at_plan {
         0 => String::new(),
         n => format!("; {n} finding(s) skipped"),
     };
+    let failures = match failed {
+        0 => String::new(),
+        n => format!("; {n} failed"),
+    };
     println!(
-        "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to reproduce{skipped})",
+        "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to \
+         reproduce{skipped}{failures})",
         out_root.display()
     );
     repro_lane::exit_code(&repro_lane::RunTally {
@@ -311,6 +323,12 @@ struct Verification {
     /// The rebuild failed because it was denied running a program
     /// (`Permission denied`, as on a mount without exec permission).
     exec_denied: bool,
+    /// How the replay that showed the finding's oracle hit or capability
+    /// compared with it, when that is how the capsule reproduces it.
+    oracle: Option<IdentityCheck>,
+    /// What differed from the finding's oracle hit or capability, when no
+    /// input showed it.
+    oracle_differences: Option<String>,
 }
 
 /// How a reproduced crash compared with the finding's identity.
@@ -385,9 +403,16 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let identity = f
         .lane
         .finding_identity(&f.raw, &|path: &str| paths.shipped(path));
+    // The oracle hit or capability a finding that is not (only) a crash
+    // records, in the capsule's paths.
+    let oracle = f
+        .lane
+        .shows_oracle_findings()
+        .then(|| crate::replay_oracle::capsule_record(&f.raw, &|path: &str| paths.shipped(path)))
+        .flatten();
     // Verify by construction: build + replay, capture the signature. The
     // minimized input ships when it reproduces; otherwise the recorded one.
-    let verification = verify_packaged(cap, f, &inputs, identity.as_ref());
+    let verification = verify_packaged(cap, f, &inputs, identity.as_ref(), oracle.as_ref());
     // Leave the capsule pristine (no compiled binary with a machine-specific path).
     remove_build_outputs(cap, &plan.build_outputs);
     let chosen = verification
@@ -439,6 +464,7 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
             &source,
             &verification,
             finding_signature.as_deref(),
+            oracle.as_ref(),
         ),
     )?;
     let mut manifest = manifest_value(
@@ -451,6 +477,18 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
         identity.as_ref(),
         &paths,
     );
+    if let Some(oracle) = &oracle {
+        // What verify-poc shows again, and how the packaging replay compared.
+        manifest["finding_oracle"] = oracle.clone();
+        manifest["oracle_comparison"] =
+            match (&verification.oracle, &verification.oracle_differences) {
+                (Some(check), _) => json!({"verdict": check.verdict, "compared": check.line}),
+                (None, Some(differences)) => {
+                    json!({"verdict": "mismatch", "differences": differences})
+                }
+                (None, None) => json!({"verdict": "none"}),
+            };
+    }
     // Portable means a rebuild elsewhere reaches nothing on this host: no
     // shipped file and no manifest field names the work dir or the tree.
     let mut portability = plan.portability.problems.clone();
@@ -506,9 +544,17 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
                     describe_identity(identity, finding_signature.as_deref())
                 )
             }
-            _ => other.unwrap_or_else(|| {
-                "the rebuilt PoC did not crash on the finding's input".to_owned()
-            }),
+            _ => match (&verification.oracle_differences, &oracle) {
+                (Some(differences), Some(_)) => {
+                    format!("the rebuilt PoC did not show the finding's oracle: {differences}")
+                }
+                (None, Some(_)) if verification.reproduced_with.is_none() => {
+                    "the rebuilt PoC did not show the finding's oracle".to_owned()
+                }
+                _ => other.unwrap_or_else(|| {
+                    "the rebuilt PoC did not crash on the finding's input".to_owned()
+                }),
+            },
         },
     };
     Ok(CapsuleReport {
@@ -516,7 +562,10 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
         capsule_path: final_dir,
         reproduced,
         signature: verification.signature,
-        compared: verification.identity.map(|check| check.line),
+        compared: verification
+            .identity
+            .or(verification.oracle)
+            .map(|check| check.line),
         input_note: format!(
             "{source} ({}, {size} bytes) as {SHIPPED_INPUT}",
             if minimized {
@@ -754,6 +803,7 @@ fn verify_capsule(
     lane: &dyn Lane,
     inputs: &[String],
     identity: Option<&Value>,
+    oracle: Option<&Value>,
 ) -> Verification {
     let (mut build, script, poc) = build_command(cap);
     let built = |cap: &Path| cap.join(poc).is_file();
@@ -784,7 +834,15 @@ fn verify_capsule(
     let record = identity.and_then(|identity| identity.get("record"));
     let mut mismatch = None;
     let mut unrunnable = false;
-    for input in inputs {
+    // A finding that is not a crash is shown by its oracle hit or capability
+    // alone; a crash filed as the format-string bug by its crash, else by
+    // the format-string oracle at its call.
+    let recorded = oracle.and_then(crate::replay_oracle::Recorded::from_finding);
+    let crash_inputs = match &recorded {
+        Some(recorded) if !recorded.is_crash() => &[][..],
+        _ => inputs,
+    };
+    for input in crash_inputs {
         // A replay that ran out its wall clock did not show the crash.
         let replay = match repro_lane::replay_poc(cap, input, protocol, REPLAY_TIMEOUT) {
             Ok(replay) if !replay.timed_out => replay,
@@ -822,15 +880,97 @@ fn verify_capsule(
             mismatch,
             unrunnable: false,
             exec_denied: false,
+            oracle: None,
+            oracle_differences: None,
         };
+    }
+    let mut oracle_differences = None;
+    if let Some(recorded) = &recorded {
+        match verify_oracle(cap, recorded, inputs, protocol) {
+            Ok((input, check)) => {
+                return Verification {
+                    built: true,
+                    reproduced_with: Some(input),
+                    signature: recorded.signature(),
+                    protocol: Some((protocol, basis)),
+                    mismatch,
+                    oracle: Some(check),
+                    ..Verification::default()
+                };
+            }
+            Err(differences) => oracle_differences = differences,
+        }
     }
     Verification {
         built: true,
         protocol: Some((protocol, basis)),
         mismatch,
         unrunnable,
+        oracle_differences,
         ..Verification::default()
     }
+}
+
+/// Replay each input under the runtrace shim, as `bhf replay` replays an
+/// oracle or capability finding: the first input that shows `recorded`, with
+/// what was compared, or what the last replay showed instead.
+fn verify_oracle(
+    cap: &Path,
+    recorded: &crate::replay_oracle::Recorded,
+    inputs: &[String],
+    protocol: HarnessProtocol,
+) -> Result<(String, IdentityCheck), Option<String>> {
+    let log = crate::replay_oracle::RuntraceLog::create().map_err(Some)?;
+    let mut env = vec![
+        (
+            "BHF_RUNTRACE_LOG".to_owned(),
+            log.path().display().to_string(),
+        ),
+        ("BHF_RUNTRACE_MODE".to_owned(), "audit".to_owned()),
+    ];
+    if let Some(shim) = crate::auto::shim_path::locate().filter(|_| cfg!(target_os = "linux")) {
+        env.push((
+            "LD_PRELOAD".to_owned(),
+            crate::auto::shim_path::ld_preload_value(&shim),
+        ));
+    }
+    let mut shown = None;
+    for input in inputs {
+        // The shim appends: each replay's log holds that replay alone.
+        if std::fs::write(log.path(), "").is_err() {
+            continue;
+        }
+        let replay =
+            match repro_lane::replay_poc_with_env(cap, input, protocol, REPLAY_TIMEOUT, &env) {
+                Ok(replay) if !replay.timed_out => replay,
+                _ => continue,
+            };
+        let observed = crate::replay_oracle::observe(
+            recorded,
+            &log.events(),
+            &replay.stderr,
+            Path::new(input),
+        );
+        let comparison = crate::crash_identity::Comparison {
+            checks: observed.checks.clone(),
+            same_binary: None,
+        };
+        if observed.reproduced() {
+            return Ok((
+                input.clone(),
+                IdentityCheck {
+                    verdict: "match",
+                    line: comparison.compared_line(),
+                },
+            ));
+        }
+        let mut differences = comparison.difference_lines().join("; ");
+        if let Some(note) = observed.note {
+            differences = format!("{differences} ({note})");
+        }
+        shown = Some(differences);
+    }
+    Err(shown)
 }
 
 /// Why a capsule of a lane that compares identities has none to compare
@@ -848,10 +988,11 @@ fn verify_packaged(
     f: &FindingRef,
     inputs: &[String],
     identity: Option<&Value>,
+    oracle: Option<&Value>,
 ) -> Verification {
-    match verify_elsewhere(cap, f, inputs, identity) {
+    match verify_elsewhere(cap, f, inputs, identity, oracle) {
         Some(verification) if !verification.unrunnable && !verification.exec_denied => verification,
-        _ => verify_capsule(cap, f.lane, inputs, identity),
+        _ => verify_capsule(cap, f.lane, inputs, identity, oracle),
     }
 }
 
@@ -869,6 +1010,7 @@ fn verify_elsewhere(
     f: &FindingRef,
     inputs: &[String],
     identity: Option<&Value>,
+    oracle: Option<&Value>,
 ) -> Option<Verification> {
     let scratch = tempfile::Builder::new()
         .prefix("bhf-capsule-verify-")
@@ -876,7 +1018,7 @@ fn verify_elsewhere(
         .ok()?;
     let copy = scratch.path().join(format!("capsule_{}", f.finding_id));
     copy_tree(cap, &copy).ok()?;
-    Some(verify_capsule(&copy, f.lane, inputs, identity))
+    Some(verify_capsule(&copy, f.lane, inputs, identity, oracle))
 }
 
 /// Copy the tree under `from` to `to`, file modes included.
@@ -1180,6 +1322,7 @@ fn readme(
     input_source: &str,
     verification: &Verification,
     finding_signature: Option<&str>,
+    oracle: Option<&Value>,
 ) -> String {
     use std::fmt::Write as _;
     let which_input = if input_source == "min_testcase.bin" {
@@ -1263,6 +1406,21 @@ fn readme(
         None => String::new(),
     };
     let run = run_line(protocol, SHIPPED_INPUT);
+    let oracle_note = match oracle.and_then(crate::replay_oracle::Recorded::from_finding) {
+        Some(recorded) if !recorded.is_crash() => format!(
+            "\nThis finding is not a crash: bhf's runtrace shim saw `{}` while the\n\
+             input ran. The PoC exits (a failed assertion aborts with its message);\n\
+             `bhf verify-poc` replays it under the shim and compares what it records.\n",
+            recorded.signature()
+        ),
+        Some(recorded) => format!(
+            "\nThe crash reads whatever the format's conversions find in the argument\n\
+             area, so it may not come back; `bhf verify-poc` then replays the input\n\
+             under bhf's runtrace shim and looks for `{}`.\n",
+            recorded.signature()
+        ),
+        None => String::new(),
+    };
     let stdin_note = if protocol == HarnessProtocol::StdinEventLog {
         "\nThe harness reads its input from stdin and records what it raised in the\n\
          event log `$BHF_EVENTS_PATH`; pipe the input in (`cat ... |`), as a file\n\
@@ -1280,7 +1438,7 @@ fn readme(
          sh build.sh                 # {summary}\n\
          {run}    # replay {which_input}\n\
          ```\n\
-         {stdin_note}{windows}\n\
+         {stdin_note}{oracle_note}{windows}\n\
          Or verify with bhf:\n\n\
          ```sh\n\
          bhf verify-poc .\n\
@@ -1400,7 +1558,9 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         .get("finding_identity")
         .filter(|identity| identity.get("record").is_some());
     // Rebuild in place (or a temp copy — for a tar it's already scratch).
-    let verification = verify_capsule(&root, lane, std::slice::from_ref(&input), identity);
+    // The oracle hit or capability of a finding a replay shows that way.
+    let oracle = manifest.get("finding_oracle");
+    let verification = verify_capsule(&root, lane, std::slice::from_ref(&input), identity, oracle);
     remove_build_outputs(
         &root,
         &[
@@ -1456,7 +1616,10 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                 Some(error) if !verification.built => {
                     println!("  observed: the rebuild failed: {error}");
                 }
-                _ => println!("  observed: <no crash>"),
+                _ => match &verification.oracle_differences {
+                    Some(differences) => println!("  observed: {differences}"),
+                    None => println!("  observed: <no crash>"),
+                },
             }
         } else if manifest.get("rebuilt").and_then(Value::as_bool) == Some(false) {
             // The capsule never ran: its own rebuild failed when it was
@@ -1529,7 +1692,11 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         if matched { "PASS" } else { "MISMATCH" },
         observed,
     );
-    match &verification.identity {
+    match verification
+        .identity
+        .as_ref()
+        .or(verification.oracle.as_ref())
+    {
         Some(check) if check.verdict == "match" => println!("  compared: {}", check.line),
         Some(check) => println!("  note:     {}", check.line),
         None if lane.compares_identity() && matched => {
@@ -2054,14 +2221,14 @@ build.ps1: C:\\VS\\cl.exe exited with 2 at step link_1
             raw: json!({}),
         };
         let inputs = vec!["input/testcase.bin".to_owned()];
-        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None).unwrap();
+        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None, None).unwrap();
         assert!(!elsewhere.built, "{elsewhere:?}");
         assert!(
             !cap.join("poc").exists(),
             "the copy's build leaves the staged capsule as packaged"
         );
         // In place, the same build reaches the file and the PoC reproduces.
-        let in_place = verify_capsule(&cap, &repro_lane::C_LANE, &inputs, None);
+        let in_place = verify_capsule(&cap, &repro_lane::C_LANE, &inputs, None, None);
         assert!(in_place.reproduced_with.is_some(), "{in_place:?}");
     }
 
@@ -2102,9 +2269,9 @@ build.ps1: C:\\VS\\cl.exe exited with 2 at step link_1
             raw: json!({}),
         };
         let inputs = vec!["input/testcase.bin".to_owned()];
-        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None).unwrap();
+        let elsewhere = verify_elsewhere(&cap, &finding, &inputs, None, None).unwrap();
         assert!(!elsewhere.built, "{elsewhere:?}");
-        let verified = verify_packaged(&cap, &finding, &inputs, None);
+        let verified = verify_packaged(&cap, &finding, &inputs, None, None);
         assert!(verified.reproduced_with.is_some(), "{verified:?}");
 
         // A build that fails for any other reason fails where it was copied
@@ -2116,7 +2283,7 @@ build.ps1: C:\\VS\\cl.exe exited with 2 at step link_1
              printf '#!/bin/sh\\nexit 1\\n' > poc\nchmod +x poc\n",
         )
         .unwrap();
-        let verified = verify_packaged(&cap, &finding, &inputs, None);
+        let verified = verify_packaged(&cap, &finding, &inputs, None, None);
         assert!(!verified.built, "{verified:?}");
         assert_eq!(
             verified.build_error.as_deref(),

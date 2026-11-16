@@ -137,6 +137,28 @@ fn minimize_c_engine(
 /// `deadline` has passed (the baseline reproduction check still runs once,
 /// unconditionally: an unreproducible testcase must still error). Used by the
 /// bounded `auto` minimization pass to cap wall-clock time per finding.
+/// A scratch directory inside a finding's evidence directory, removed when it
+/// goes out of scope, so no return path leaves it in the bundle.
+pub(crate) struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    pub(crate) fn create(path: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&path)
+            .with_context(|| format!("create scratch dir {}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn minimize_c_engine_until(
     finding_dir: &Path,
     runner: &replay_min::HarnessRunner,
@@ -158,9 +180,8 @@ fn minimize_c_engine_until(
     let original_input =
         fs::read(&testcase_path).with_context(|| format!("read {}", testcase_path.display()))?;
 
-    let tmp_dir = finding_dir.join("minimize_tmp");
-    fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("create minimize temp dir {}", tmp_dir.display()))?;
+    let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
+    let tmp_dir = scratch.path();
     let raw = fs::read(finding_dir.join("finding.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -173,80 +194,145 @@ fn minimize_c_engine_until(
     // fuzz child's sanitizer options (UBSan prints and continues by default)
     // and, for an argv harness, the recorded runtime mode and injected env,
     // so a finding reproduces as the crash it was recorded as.
-    let env = crate::replay::replay_env(&raw, runner, input);
-    let run_once = |bytes: &[u8]| -> anyhow::Result<Option<corpus::SanitizerReport>> {
+    let mut env = crate::replay::replay_env(&raw, runner, input);
+    // An oracle, assertion or capability finding is shown again by what the
+    // run does, which the runtrace shim records, as `bhf replay` decides it.
+    let recorded_oracle = crate::replay_oracle::Recorded::from_finding(&raw);
+    let runtrace_log = recorded_oracle
+        .as_ref()
+        .map(|_| crate::replay_oracle::RuntraceLog::create())
+        .transpose()
+        .map_err(|error| anyhow!(error))?;
+    if let Some(log) = &runtrace_log {
+        env.push((
+            "BHF_RUNTRACE_LOG".to_owned(),
+            log.path().display().to_string(),
+        ));
+    }
+    // The memory cap the finding's input ran past: a reduction that runs past
+    // it reproduces an out-of-memory finding, and none may take the host's.
+    let rss_limit = crate::replay::recorded_rss_limit_mb(&raw);
+    let run_once = |bytes: &[u8]| -> anyhow::Result<CEngineRun> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let path = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        if let Some(log) = &runtrace_log {
+            // The shim appends: each run's log holds that run alone.
+            fs::write(log.path(), "").with_context(|| format!("reset {}", log.path().display()))?;
+        }
         // Its own process group: a timeout kills whatever the harness started.
-        let run = crate::replay::run_c_harness(runner, input, &path, Duration::from_secs(10), &env);
+        let run = crate::replay::run_c_harness(
+            runner,
+            input,
+            &path,
+            Duration::from_secs(10),
+            &env,
+            rss_limit,
+        );
         let _ = fs::remove_file(&path);
         let run = run.map_err(|error| anyhow!(error))?;
-        if run.timed_out || run.status.is_some_and(|status| status.success()) {
-            return Ok(None);
-        }
-        // Attributed the way the finding was (a COBOL harness's libcob error).
-        Ok(run.report_for(&raw))
+        let observed =
+            recorded_oracle
+                .as_ref()
+                .zip(runtrace_log.as_ref())
+                .map(|(recorded, log)| {
+                    crate::replay_oracle::observe(
+                        recorded,
+                        &log.events(),
+                        &String::from_utf8_lossy(&run.stderr),
+                        &path,
+                    )
+                });
+        let report = if run.timed_out || run.status.is_some_and(|status| status.success()) {
+            None
+        } else {
+            // Attributed the way the finding was (a COBOL harness's libcob error).
+            run.report_for(&raw)
+        };
+        Ok(CEngineRun { report, observed })
     };
 
-    let baseline = run_once(&original_input)?.ok_or_else(|| {
-        anyhow!(
-            "original testcase {} does not reproduce a sanitizer crash against {}",
-            testcase_path.display(),
-            harness.display()
-        )
-    })?;
-    // The testcase's crash must be the one the finding records, compared the
-    // way `bhf replay` compares it; else the reduction would follow another
-    // bug.
-    let same_binary = crate::replay::recorded_build_matches(&raw, harness);
-    let comparison = crate::crash_identity::compare_with(&raw, &baseline, same_binary);
+    let baseline_run = run_once(&original_input)?;
+    let oracle_reproduced = baseline_run
+        .observed
+        .as_ref()
+        .is_some_and(crate::replay_oracle::Observed::reproduced);
     let mut unverified = None;
     let mut other_crash = None;
-    match comparison.verdict() {
-        crate::crash_identity::Verdict::Match => {}
-        crate::crash_identity::Verdict::Mismatch if allow_other_crash => {
-            let differences = comparison.difference_lines().join("; ");
-            bhfeprintln!(
-                "warning: the original testcase crashes {} with another crash than the finding \
-                 records ({differences}); minimizing against the crash this harness reports, as \
-                 --allow-other-crash asks",
+    // What every reduction must still do: the testcase's own crash, or, for
+    // a finding that is not a crash (and a format-string crash whose crash
+    // does not come back), the oracle or capability the finding records.
+    let same_binary = crate::replay::recorded_build_matches(&raw, harness);
+    let crash_comes_back = |report: &corpus::SanitizerReport| {
+        crate::crash_identity::compare_with(&raw, report, same_binary).verdict()
+            != crate::crash_identity::Verdict::Mismatch
+    };
+    let held = match (&recorded_oracle, baseline_run.report) {
+        (Some(recorded), _) if !recorded.is_crash() => {
+            if !oracle_reproduced {
+                let shown = baseline_run
+                    .observed
+                    .map(|observed| {
+                        crate::crash_identity::Comparison {
+                            checks: observed.checks,
+                            same_binary,
+                        }
+                        .difference_lines()
+                        .join("; ")
+                    })
+                    .unwrap_or_default();
+                return Err(BaselineMismatch(format!(
+                    "the original testcase does not show what the finding records against {} \
+                     ({shown}); nothing was minimized. `bhf replay` shows the comparison",
+                    harness.display(),
+                ))
+                .into());
+            }
+            Held::Oracle
+        }
+        (Some(_), report)
+            if oracle_reproduced && !report.as_ref().is_some_and(crash_comes_back) =>
+        {
+            Held::Oracle
+        }
+        (_, None) => {
+            return Err(anyhow!(
+                "original testcase {} does not reproduce a sanitizer crash against {}",
+                testcase_path.display(),
                 harness.display()
-            );
-            other_crash = Some(differences);
+            ));
         }
-        crate::crash_identity::Verdict::Mismatch => {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return Err(BaselineMismatch(format!(
-                "the original testcase crashes {} with another crash than the finding records \
-                 ({}); nothing was minimized. Minimize against the finding's own harness; \
-                 `bhf replay` shows the comparison",
-                harness.display(),
-                comparison.difference_lines().join("; ")
-            ))
-            .into());
-        }
-        // The reductions are held to the testcase's own crash (`same_crash`),
-        // so the minimized input is no less trustworthy than the testcase.
-        // The caller says so: `bhf minimize` per finding, the auto pass in one
-        // line for all of them.
-        crate::crash_identity::Verdict::Unverified => {
-            unverified = Some(comparison.not_compared_fields());
-        }
+        (_, Some(report)) => Held::Crash(report),
+    };
+    if let Held::Crash(baseline) = &held {
+        check_baseline_crash(
+            &raw,
+            baseline,
+            harness,
+            same_binary,
+            allow_other_crash,
+            &mut unverified,
+            &mut other_crash,
+        )?;
     }
 
     let result = replay_min::ddmin_bytes(&original_input, |candidate| -> anyhow::Result<bool> {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(false); // budget spent: reject further reductions, keep best-so-far
         }
-        Ok(run_once(candidate)?
-            .is_some_and(|report| crate::crash_identity::same_crash(&baseline, &report)))
+        let run = run_once(candidate)?;
+        Ok(match &held {
+            Held::Crash(baseline) => run
+                .report
+                .is_some_and(|report| crate::crash_identity::same_crash(baseline, &report)),
+            Held::Oracle => run.observed.is_some_and(|observed| observed.reproduced()),
+        })
     })?;
-
-    let _ = fs::remove_dir_all(&tmp_dir);
+    drop(scratch);
+    drop(runtrace_log);
 
     let min_path = finding_dir.join("min_testcase.bin");
     fs::write(&min_path, &result.minimized)
@@ -289,6 +375,69 @@ fn minimize_c_engine_until(
         reduced,
         unverified,
     })
+}
+
+/// One run of a C/C++ harness while minimizing: the crash it reported, and,
+/// for a finding a replay shows by its oracle or capability, what it showed.
+struct CEngineRun {
+    report: Option<corpus::SanitizerReport>,
+    observed: Option<crate::replay_oracle::Observed>,
+}
+
+/// What every reduction of a C/C++ testcase must still do.
+enum Held {
+    /// Crash as the testcase does ([`crate::crash_identity::same_crash`]).
+    Crash(corpus::SanitizerReport),
+    /// Show the oracle hit or capability the finding records.
+    Oracle,
+}
+
+/// Hold the testcase's crash `baseline` to the one the finding `raw`
+/// records, compared the way `bhf replay` compares it; else the reduction
+/// would follow another bug. With `allow_other_crash`, another crash is
+/// minimized against (recorded in `other_crash`); a crash whose place could
+/// not be compared is minimized against too (recorded in `unverified`).
+fn check_baseline_crash(
+    raw: &serde_json::Value,
+    baseline: &corpus::SanitizerReport,
+    harness: &Path,
+    same_binary: Option<bool>,
+    allow_other_crash: bool,
+    unverified: &mut Option<String>,
+    other_crash: &mut Option<String>,
+) -> anyhow::Result<()> {
+    let comparison = crate::crash_identity::compare_with(raw, baseline, same_binary);
+    match comparison.verdict() {
+        crate::crash_identity::Verdict::Match => {}
+        crate::crash_identity::Verdict::Mismatch if allow_other_crash => {
+            let differences = comparison.difference_lines().join("; ");
+            bhfeprintln!(
+                "warning: the original testcase crashes {} with another crash than the finding \
+                 records ({differences}); minimizing against the crash this harness reports, as \
+                 --allow-other-crash asks",
+                harness.display()
+            );
+            *other_crash = Some(differences);
+        }
+        crate::crash_identity::Verdict::Mismatch => {
+            return Err(BaselineMismatch(format!(
+                "the original testcase crashes {} with another crash than the finding records \
+                 ({}); nothing was minimized. Minimize against the finding's own harness; \
+                 `bhf replay` shows the comparison",
+                harness.display(),
+                comparison.difference_lines().join("; ")
+            ))
+            .into());
+        }
+        // The reductions are held to the testcase's own crash (`same_crash`),
+        // so the minimized input is no less trustworthy than the testcase.
+        // The caller says so: `bhf minimize` per finding, the auto pass in one
+        // line for all of them.
+        crate::crash_identity::Verdict::Unverified => {
+            *unverified = Some(comparison.not_compared_fields());
+        }
+    }
+    Ok(())
 }
 
 /// Classify `harness` with the detector fuzz and replay use, searching the
@@ -691,6 +840,40 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+        assert!(!finding.join("minimize_tmp").exists());
+    }
+
+    /// A testcase that no longer crashes the harness is not minimized, and the
+    /// scratch directory goes with the error instead of staying in the bundle.
+    #[test]
+    fn a_testcase_that_does_not_reproduce_leaves_no_scratch_dir() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            serde_json::json!({"rule_id": "BHF-415", "paths": {}}).to_string(),
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"no crash here").expect("testcase");
+        let harness = root.path().join("clean.sh");
+        fs::write(&harness, "#!/bin/sh\nexit 0\n").expect("harness");
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let error = minimize_c_engine(
+            &finding,
+            &replay_min::HarnessRunner::direct(&harness),
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+            false,
+        )
+        .expect_err("nothing to minimize");
+        assert!(
+            error.to_string().contains("does not reproduce"),
+            "{error:#}"
+        );
+        assert!(!finding.join("minimize_tmp").exists());
+        assert!(!finding.join("min_testcase.bin").exists());
     }
 
     /// UBSan prints its report and CONTINUES (exit 0) unless told to halt, the

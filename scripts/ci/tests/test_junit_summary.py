@@ -87,8 +87,9 @@ class CiProfileTests(unittest.TestCase):
         timeout = self.ci["slow-timeout"]
         period = int(re.fullmatch(r"(\d+)s", timeout["period"])[1])
         self.assertGreater(timeout["terminate-after"], 0)
-        # A hang is killed well inside the 40-minute job, with time to retry.
-        self.assertLessEqual(period * timeout["terminate-after"], 20 * 60)
+        # A hang and its retry fit in the 40-minute job with time for the
+        # shard's other tests and its report.
+        self.assertLessEqual(2 * period * timeout["terminate-after"], 20 * 60)
         junit = self.ci["junit"]
         self.assertEqual(junit["path"], "junit.xml")
         self.assertIs(junit["store-success-output"], True)
@@ -101,6 +102,16 @@ class CiProfileTests(unittest.TestCase):
         limit = int(timeout["period"].rstrip("s")) * timeout["terminate-after"]
         self.assertGreaterEqual(limit, 40 * 60)
         self.assertLess(limit, 55 * 60)
+        self.assertEqual(override["retries"], 0)
+
+    def test_the_ignored_shards_long_tests_get_a_limit_inside_its_timeout(self):
+        [override] = [o for o in self.ci.get("overrides", [])
+                      if "binary(=redqueen_cmplog)" in o["filter"]]
+        timeout = override["slow-timeout"]
+        limit = int(timeout["period"].rstrip("s")) * timeout["terminate-after"]
+        # The RedQueen discriminator takes about 13 minutes on a runner.
+        self.assertGreaterEqual(limit, 20 * 60)
+        self.assertLess(limit, 40 * 60)
         self.assertEqual(override["retries"], 0)
 
     def test_the_heavy_test_group_still_applies(self):

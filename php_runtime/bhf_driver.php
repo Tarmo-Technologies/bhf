@@ -98,10 +98,40 @@ function bhf_bug_cwe(Throwable $e): ?string {
     return null;
 }
 
-function bhf_report_finding(string $cwe, string $msg): void {
+function bhf_report_finding(string $cwe, string $msg, ?Throwable $e = null): void {
     $msg = trim(preg_replace('/\s+/', ' ', $msg));
     fwrite(STDERR, "== bhf php finding: $cwe: $msg\n");
+    if ($e !== null) {
+        foreach (bhf_target_frames($e) as $frame) {
+            fwrite(STDERR, "== bhf frame: $frame\n");
+        }
+    }
     exit(FINDING_HALT);
+}
+
+// The target's frames of $e, innermost first, as `function @ file:line` (at
+// most 5): where it was thrown, then each call site, without this driver's and
+// the harness's own frames.
+function bhf_target_frames(Throwable $e): array {
+    global $harness;
+    $skip = [realpath(__FILE__) ?: __FILE__, realpath((string)$harness) ?: (string)$harness];
+    $trace = $e->getTrace();
+    // The function a location is in is the one the next trace entry called.
+    $locations = [[$e->getFile(), $e->getLine()]];
+    foreach ($trace as $call) {
+        $locations[] = [$call['file'] ?? '', $call['line'] ?? 0];
+    }
+    $frames = [];
+    foreach ($locations as $k => [$file, $line]) {
+        if ($file === '' || in_array(realpath($file) ?: $file, $skip, true)) continue;
+        $call = $trace[$k] ?? null;
+        $function = $call === null
+            ? '{main}'
+            : (isset($call['class']) ? $call['class'] . $call['type'] : '') . $call['function'];
+        $frames[] = "$function @ $file:$line";
+        if (count($frames) >= 5) break;
+    }
+    return $frames;
 }
 
 $BHF_RUN_ONE = null; // the generated harness entry
@@ -117,7 +147,7 @@ function bhf_run_input(string $data): void {
         bhf_fold_coverage();
         $cwe = bhf_bug_cwe($e);
         if ($cwe !== null) {
-            bhf_report_finding($cwe, get_class($e) . ': ' . $e->getMessage());
+            bhf_report_finding($cwe, get_class($e) . ': ' . $e->getMessage(), $e);
         }
         return;
     }

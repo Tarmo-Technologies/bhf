@@ -968,6 +968,19 @@ fn each_demoting_rule_has_its_own_reason_code() {
             overflow_of_a_decoded_string(),
         ),
         (
+            "mmio_register",
+            Verdict::LabOnly,
+            json!({
+                "id": "F-0004-0a0b0c0d", "rule_id": "BHF-223", "harness_id": "H-C0004",
+                "environment_origin": { "kind": "mmio_register", "register": "UART_SR" },
+                "exception": {
+                    "name": "ASAN_SEGV", "sanitizer": "asan",
+                    "message": "SEGV on unknown address 0x000040011000",
+                    "stack": [{ "function": "uart_send", "file": "/src/uart.c", "line": 6 }]
+                }
+            }),
+        ),
+        (
             "entry_not_input",
             Verdict::LabOnly,
             json!({

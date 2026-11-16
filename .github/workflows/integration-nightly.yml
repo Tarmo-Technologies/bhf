@@ -48,9 +48,65 @@ jobs:
             --workflow integration-nightly.yml --sha "$GITHUB_SHA" \
             --event "$EVENT_NAME" --run-id "$GITHUB_RUN_ID"
 
+  # Build every test binary once, with the cdylibs bhf preloads and the
+  # release bhf the heavy tests run (BHF_TEST_BIN), into one nextest archive
+  # that every shard runs from. Line tables only keep the archive small.
+  build:
+    name: Build the test archive
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache the cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: nightly-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: nightly-cargo-
+
+      - name: Install cargo-nextest
+        run: bash scripts/ci/install-nextest.sh
+
+      # bhf preloads the runtrace shim, and the compiler intercept, from beside
+      # itself. Both are cdylibs, which nextest's build of the test binaries does
+      # not produce; the archive includes them (.config/nextest.toml).
+      - name: Build the cdylibs, the release bhf and the test archive
+        run: |
+          set -euo pipefail
+          cargo build --locked -p bhf_runtrace_shim -p bhf_cc_intercept
+          cargo build --locked --release -p bhf -p bhf_runtrace_shim
+          cargo nextest archive --locked --workspace --profile ci --archive-file nightly-tests.tar.zst
+
+      # Named by the run alone: a rerun of a failed shard does not rebuild the
+      # archive and downloads this one; a rerun of this job replaces it.
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-tests-${{ github.run_id }}
+          overwrite: true
+          path: nightly-tests.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+
   integration:
     name: Integration tests (bhf)
-    needs: gate
+    needs: [gate, build]
     if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     # The heavy compile+fuzz tests are slow on CI's shared vCPUs and the hash
@@ -67,7 +123,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, build-recovery-scenarios]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, build-recovery-scenarios, ignored]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,14 +136,29 @@ jobs:
           toolchain: stable
 
       # The lane tests skip, and pass, when their toolchain is missing; these
-      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C# and
-      # Cortex-M emulator lanes, and the skip-line check after the tests fails
-      # the shard if a test still skips (scripts/ci/allowed-skips.txt lists
-      # the lanes not installed yet: Ada, AFL++, COBOL, Wine and AArch64).
+      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C#, Ada,
+      # AFL++, COBOL, Wine/MinGW, AArch64 (C, C++ and Ada), armhf and Cortex-M
+      # emulator lanes, and the skip-line check after the tests fails the shard
+      # if a test still skips (scripts/ci/allowed-skips.txt lists only tests
+      # another workflow runs).
       - name: Install the interpreter and emulator toolchains
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            gnat \
+            gprbuild \
+            afl++ \
+            gnucobol3 \
+            wine \
+            wine64 \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            qemu-user \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gnat-13-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross \
             lua5.4 \
             php-cli \
             php-pcov \
@@ -124,8 +195,12 @@ jobs:
       - name: Check the installed toolchains
         run: |
           set -euo pipefail
-          for tool in lua5.4 php ruby perl java javac node esbuild qemu-system-arm qemu-img \
-                      arm-none-eabi-gcc nm gdb lldb llvm-symbolizer dotnet; do
+          for tool in gnatmake gprbuild afl-fuzz afl-clang-fast cobc wine \
+                      x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ qemu-aarch64 \
+                      aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
+                      arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
+                      javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
+                      lldb llvm-symbolizer dotnet; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for
@@ -143,18 +218,36 @@ jobs:
           find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
             -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
 
-      - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-
-      # bhf preloads the runtrace shim, and the compiler intercept, from beside
-      # itself (target/debug). Both are cdylibs, which nextest's build of the
-      # test binaries does not produce: without this step every fuzz ran with
-      # the runtime audit off and the env-capsule tests skipped as passes.
-      - name: Build the runtrace shim and compiler intercept
+      # A Wine prefix's first start takes longer than the fork server waits
+      # for a harness, so the first Wine test would run nothing; create it now.
+      - name: Initialize the Wine prefix
         run: |
-          cargo build --locked -p bhf_runtrace_shim -p bhf_cc_intercept
-          test -f target/debug/libbhf_runtrace_shim.so
-          test -f target/debug/libbhf_cc_intercept.so
+          set -euo pipefail
+          WINEDEBUG=-all wineboot --init
+          wineserver --wait
+
+      # The build job's registry cache: the Rust capsule tests vendor a crate
+      # from it.
+      - name: Restore the cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: nightly-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: nightly-cargo-
+
+      - name: Install cargo-nextest
+        run: bash scripts/ci/install-nextest.sh
+
+      # The test binaries, the cdylibs and the release bhf, built once by the
+      # build job. The run extracts them to target/, where the binaries were
+      # built, so the paths compiled into the tests hold.
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nightly-tests-${{ github.run_id }}
 
       # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
       # the heavy-bhf concurrency cap (.config/nextest.toml) limits concurrent
@@ -172,13 +265,22 @@ jobs:
           BHF_REQUIRE_TOOLS: "1"
           SHARD: ${{ matrix.shard }}
           HASH_SHARDS: "12"
+          # The release bhf the heavy tests would otherwise `cargo run --release`.
+          BHF_TEST_BIN: ${{ github.workspace }}/target/release/bhf
         run: |
           set -euo pipefail
+          archive='--archive-file nightly-tests.tar.zst --workspace-remap . --extract-to .'
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
+          # The #[ignore]d tests that need a quiet machine or a long budget:
+          # the Lua line-hook cost benchmark, the RedQueen/cmplog cold-solve
+          # discriminators and the engine-parity cold-solve sweep.
+          ignored='binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
-            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E "$slow"
+            cargo nextest run $archive --no-fail-fast --profile ci -E "$slow"
+          elif [ "$SHARD" = ignored ]; then
+            cargo nextest run $archive --no-fail-fast --profile ci --run-ignored only -E "$ignored"
           elif [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$HASH_SHARDS" ]; then
-            cargo nextest run --locked --workspace --no-fail-fast --profile ci -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
+            cargo nextest run $archive --no-fail-fast --profile ci -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
           else
             echo "unknown shard: $SHARD" >&2
             exit 1
@@ -210,8 +312,8 @@ jobs:
   # cancelled by a newer one reports nothing.
   report-failure:
     name: Report a failed nightly
-    needs: [gate, integration]
-    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled') }}
+    needs: [gate, build, integration]
+    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.build.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

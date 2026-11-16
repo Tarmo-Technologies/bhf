@@ -367,6 +367,10 @@ pub const VERDICT_REASONS: &[(&str, &str)] = &[
          passes without a length",
     ),
     (
+        "mmio_register",
+        "a read of a fixed device-register address, which no device backs on the host",
+    ),
+    (
         "entry_not_input",
         "the fuzzed entry's signature does not take input (an internal helper or output \
          serializer the harness drove directly)",
@@ -397,7 +401,7 @@ pub fn classify_verdict_with_reason(
     // (byteorder-style documented length precondition, #467). Reproducible in the
     // lab but not an attacker-reachable bug — demote so they don't read as real
     // findings (still surfaced, not dropped).
-    let demoting: [DemotingRule; 7] = [
+    let demoting: [DemotingRule; 8] = [
         (is_rust_alloc_only_leak, "allocator_only_leak"),
         (is_relational_contract_panic, "contract_assertion"),
         (is_fixed_width_slice_read_panic, "short_slice_precondition"),
@@ -408,6 +412,7 @@ pub fn classify_verdict_with_reason(
             "enum_domain_precondition",
         ),
         (is_harness_sized_buffer_overflow, "harness_sized_buffer"),
+        (is_device_register_fault, "mmio_register"),
     ];
     if let Some((_, reason)) = demoting.iter().find(|(applies, _)| applies(raw)) {
         return (Verdict::LabOnly, Some(reason));
@@ -2121,6 +2126,15 @@ pub fn allocated_by_harness(access: &Value) -> Option<bool> {
         return Some(false);
     }
     Some(is_harness_frame(&function, file.as_deref()))
+}
+
+/// Whether `bhf auto` found the crash to be a read of a fixed device-register
+/// address (`environment_origin.kind` `mmio_register`): the host has no device
+/// there, so the fault is the missing peripheral, not the input.
+pub fn is_device_register_fault(raw: &Value) -> bool {
+    raw.pointer("/environment_origin/kind")
+        .and_then(Value::as_str)
+        == Some("mmio_register")
 }
 
 /// Whether [`harness_sized_buffer`] finds one.

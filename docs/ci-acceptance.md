@@ -76,7 +76,13 @@ issue afterwards.
 ## Nightly integration suite
 
 `.github/workflows/integration-nightly.yml` runs every bhf integration test in
-13 shards. Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
+13 shards, and a 14th, `ignored`, runs the `#[ignore]`d tests the PR suites
+leave out because they need minutes of fuzzing or a quiet machine: the Lua
+line-hook cost benchmark (`auto_lua_hook`), the RedQueen/cmplog cold-solve
+discriminators (`redqueen_cmplog`, including `cold_gate_needs_redqueen`, which
+solves the integer gate in 2000 executions at a fixed seed with RedQueen and
+not with `BHF_DISABLE_REDQUEEN=1`) and the engine-parity cold-solve sweep
+(`engine_parity`). Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
 when an earlier run at the same commit ran every shard and all of them passed;
 a skipped run, which GitHub records as a success, does not count. A nightly
 that failed therefore runs again each day while the commit is unchanged, and a
@@ -84,16 +90,28 @@ manual dispatch always runs. A failed or timed-out shard opens one issue
 labelled `integration-nightly` for the branch, or updates the open one, and
 comments on it when a new commit fails; close it once a nightly passes.
 
-Each shard builds the runtrace shim and installs the interpreter, JVM,
-TypeScript, Rust-nightly, C# and Cortex-M emulator toolchains (Lua 5.4, PHP
-with pcov, Ruby, Perl, JDK 21, Node 24 with esbuild, a nightly Rust, the
-SharpFuzz tool, `qemu-system-arm` with `gcc-arm-none-eabi`, gdb, lldb and LLVM)
+A `build` job compiles every test binary once, with line tables only, into
+one nextest archive (`cargo nextest archive --profile ci`) that also carries
+the runtrace shim and the compiler intercept, which bhf preloads from beside
+itself, and the release bhf (`.config/nextest.toml` `archive.include`); every
+shard downloads it and runs `cargo nextest run --archive-file ... --extract-to
+.`, so the binaries sit where they were built and no shard compiles. The heavy
+tests that ran `cargo run --release` inside the test run the prebuilt bhf that
+`BHF_TEST_BIN` names instead (set it locally to a release bhf to skip that
+build too); the support helpers then never invoke cargo.
+
+Each shard installs the interpreter, JVM,
+TypeScript, Rust-nightly, C#, Ada, AFL++, COBOL, Windows-cross, AArch64 and
+Cortex-M emulator toolchains (Lua 5.4, PHP with pcov, Ruby, Perl, JDK 21,
+Node 24 with esbuild, a nightly Rust, the SharpFuzz tool, GNAT 13 with
+GPRbuild, AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross compilers,
+qemu-user with the AArch64 cross compilers, `qemu-system-arm` with
+`gcc-arm-none-eabi`, gdb, lldb and LLVM)
 and runs its tests with `BHF_REQUIRE_TOOLS=1`. A test that finds its tool
 missing prints a skip line (one starting with `skip`, `skipping`, `skipped` or
 `SKIP`) and passes; `scripts/ci/check-no-skips.py` reads those lines from the
 JUnit report and fails the shard on any that `scripts/ci/allowed-skips.txt`
-does not allow. The allowlist names the lanes the nightly does not install yet
-(Ada, AFL++, COBOL, Wine and AArch64) and the few tests another workflow runs;
+does not allow. The allowlist names the few tests another workflow runs;
 each entry gives its reason.
 
 ## Test reports, retries and hangs

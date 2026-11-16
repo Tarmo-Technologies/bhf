@@ -92,13 +92,43 @@ def bhf_bug_cwe(err)
   end
 end
 
-def bhf_report_finding(cwe, msg)
+def bhf_report_finding(cwe, msg, err = nil)
   msg = msg.to_s.gsub(/\s+/, ' ').strip
   # Marker mirrors the Perl/Python/JVM drivers; the engine's parse_ruby_finding maps
   # the CWE token to a BHF rule.
   $stderr.puts "== bhf ruby finding: #{cwe}: #{msg}"
+  bhf_target_frames(err).each { |frame| $stderr.puts "== bhf frame: #{frame}" } if err
   $stderr.flush
   exit(FINDING_HALT)
+end
+
+# The target's frames of err, innermost first, as `function @ file:line` (at most
+# 5), without this driver's and the harness's own frames. A SystemStackError's
+# backtrace is the deep end of the recursion, which is the target's.
+def bhf_target_frames(err)
+  skip = [File.expand_path(__FILE__), File.expand_path(ENV['BHF_HARNESS'].to_s)]
+  frames = []
+  locations = err.backtrace_locations || []
+  locations.each_with_index do |loc, i|
+    path = loc.absolute_path || loc.path
+    next if path.nil? || skip.include?(File.expand_path(path))
+    # A C method (`Integer#/`) is reported at the line that called it, which
+    # the next frame names too: that frame's method is the target's.
+    caller_frame = locations[i + 1]
+    next if caller_frame && caller_frame.lineno == loc.lineno &&
+            (caller_frame.absolute_path || caller_frame.path) == path
+    frames << "#{loc.label} @ #{path}:#{loc.lineno}"
+    break if frames.size >= 5
+  end
+  if frames.empty?
+    (err.backtrace || []).each do |line|
+      m = line.match(/\A(.+):(\d+):in [`'](.+)'\z/) or next
+      next if skip.include?(File.expand_path(m[1]))
+      frames << "#{m[3]} @ #{m[1]}:#{m[2]}"
+      break if frames.size >= 5
+    end
+  end
+  frames
 end
 
 def bhf_handle_error(err)
@@ -107,7 +137,7 @@ def bhf_handle_error(err)
   return if !TARGET_MODULE.empty? && cls.start_with?("#{TARGET_MODULE}::")
   return if EXPECTED.any? { |x| !x.empty? && err.message.to_s.include?(x) }
   cwe = bhf_bug_cwe(err)
-  bhf_report_finding(cwe, "#{cls}: #{err.message}") if cwe
+  bhf_report_finding(cwe, "#{cls}: #{err.message}", err) if cwe
 end
 
 def bhf_run_input(data)

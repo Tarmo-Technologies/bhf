@@ -88,19 +88,26 @@ pub struct BinaryFuzzArgs {
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
 
-    /// Fuzzing engine. `builtin` replays the seeds and detects crashes (no
-    /// mutation/coverage). `afl-qemu` drives AFL++ in QEMU mode (`afl-fuzz -Q`)
-    /// so a binary-only / foreign-arch target with NO source still gets
-    /// coverage-guided mutation — qemu's DBT injects edge coverage during
-    /// translation. `auto` (default) uses afl-qemu when its toolchain is present,
-    /// else falls back to builtin.
+    /// Fuzzing engine. `builtin` runs the seeds, then a blind havoc loop:
+    /// stacked byte mutations of the seeds, with no coverage feedback, until
+    /// `--iterations`, `--time` or the first crash. `afl-qemu` drives AFL++ in
+    /// QEMU mode (`afl-fuzz -Q`) so a binary-only / foreign-arch target with NO
+    /// source still gets coverage-guided mutation — qemu's DBT injects edge
+    /// coverage during translation. `auto` (default) uses afl-qemu when its
+    /// toolchain is present, else falls back to builtin; the run JSON says so
+    /// (`degraded`).
     #[arg(long, value_enum, default_value_t = BinaryFuzzEngine::Auto)]
     pub engine: BinaryFuzzEngine,
 
-    /// Wall-clock budget for the afl-qemu engine (e.g. 30s, 5m). Ignored by the
-    /// builtin engine. Defaults to ~100ms per `--iterations`, clamped to [1s,30s].
+    /// Wall-clock budget (e.g. 30s, 5m). For afl-qemu it defaults to ~100ms per
+    /// `--iterations`, clamped to [1s,30s]; the builtin engine stops at it, or
+    /// at `--iterations`, whichever comes first.
     #[arg(long = "time")]
     pub time: Option<String>,
+
+    /// Seed of the builtin engine's mutation, so a run repeats exactly.
+    #[arg(long = "rng-seed", default_value_t = 0)]
+    pub rng_seed: u64,
 
     /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59) so a
     /// clean-exit semantic violation — a fuzz-controlled command execution, path
@@ -309,8 +316,8 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     } else {
         seeds
     };
-    // What each seed is, in order, for the lineage of a finding the
-    // seed-replay engine saves: it runs them as they are.
+    // What each seed is, in order, for the lineage of a finding the builtin
+    // engine saves: a seed runs as it is, a mutation of one a generation down.
     let lineages = seed_lineages(&args, &seeds);
     let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
@@ -332,17 +339,25 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
              --engine builtin; drop --oracle-command or pass --engine builtin"
         ));
     }
-    match engine {
+    let degraded = match engine {
         ResolvedEngine::AflQemu(aq) => {
             return run_afl_qemu(&args, &aq, &seeds, &env, &findings_dir);
         }
-        ResolvedEngine::Builtin => {}
-    }
+        ResolvedEngine::Builtin { degraded } => degraded,
+    };
+    let time_budget = match args.time.as_deref() {
+        Some(time) => Some(Duration::from_secs(parse_duration_secs(time).ok_or_else(
+            || anyhow!("--time {time:?} is not a duration (e.g. 30s, 5m)"),
+        )?)),
+        None => None,
+    };
+    let started = Instant::now();
+    let mut havoc = BlindHavoc::new(&seeds, args.rng_seed);
 
     let tmp_dir = args.work_dir.join("binary_fuzz/tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
 
-    // #59: resolve the runtime sink oracles for the builtin seed-replay engine.
+    // #59: resolve the runtime sink oracles for the builtin engine.
     // `on` errors if the shim/platform is unavailable; `auto` quietly stays off.
     let oracles = RuntimeOracles::resolve(args.runtime_oracles, "reporting")?;
     let oracle_log = tmp_dir.join("runtrace.jsonl");
@@ -385,12 +400,22 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
 
     let mut finding_ids = Vec::new();
     let mut executions = 0usize;
-    for (seed, lineage) in seeds
-        .iter()
-        .zip(&lineages)
-        .cycle()
-        .take(args.iterations.min(seeds.len()))
+    let mut mutated = 0usize;
+    while executions < args.iterations
+        && !time_budget.is_some_and(|budget| started.elapsed() >= budget)
     {
+        // The seeds as they are, then blind mutations of them.
+        let (input, lineage) = match seeds.get(executions) {
+            Some(seed) => (seed.clone(), lineages[executions].clone()),
+            None => {
+                let (parent, child) = havoc.next();
+                mutated += 1;
+                let lineage =
+                    crate::fuzz_lineage::of_mutation(&lineages[parent], &seeds[parent], &child);
+                (child, lineage)
+            }
+        };
+        let (seed, lineage) = (&input, &lineage);
         executions += 1;
         // #55: prepare a fresh fixture directory and run the setup hook before the
         // target, so filesystem/process state does not leak across testcases.
@@ -702,6 +727,15 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         "schema_version": "bhf.binary_fuzz.run.v1",
         "binary": args.binary,
         "input_mode": args.input_mode.as_str(),
+        "engine": "builtin",
+        "fidelity": {
+            "mutation": "blind havoc: stacked byte mutations of the seeds",
+            "coverage": "none",
+            "seeds_run": executions.min(seeds.len()),
+            "mutated_inputs": mutated,
+        },
+        "degraded": true,
+        "degraded_reason": degraded,
         "executions": executions,
         "runtime_oracles": runtime_oracle_provenance(args.runtime_oracles, oracles.as_ref()),
         "collector": collector_provenance,
@@ -745,8 +779,52 @@ fn runtime_oracle_provenance(
 /// The concrete engine a binary-fuzz run resolved to.
 #[derive(Debug)]
 enum ResolvedEngine {
-    Builtin,
+    /// The blind havoc loop, and why it runs without coverage.
+    Builtin {
+        degraded: String,
+    },
     AflQemu(AflQemu),
+}
+
+/// The builtin engine's blind havoc mutator: each input is a seed, picked at
+/// random, with 1, 2 or 4 byte-level mutations stacked on it. Nothing guides
+/// it, so it finds what is a few random edits from a seed.
+struct BlindHavoc<'a> {
+    seeds: &'a [Vec<u8>],
+    suite: fuzz_engine_builtin::MutatorSuite,
+    dictionary: fuzz_engine_builtin::Dictionary,
+    rng: fuzz_engine_builtin::MutationRng,
+}
+
+impl<'a> BlindHavoc<'a> {
+    fn new(seeds: &'a [Vec<u8>], rng_seed: u64) -> Self {
+        let longest = seeds.iter().map(Vec::len).max().unwrap_or(0);
+        Self {
+            seeds,
+            suite: fuzz_engine_builtin::MutatorSuite::new(fuzz_engine_builtin::MutatorConfig {
+                max_len: longest.saturating_mul(2).clamp(64, 1 << 16),
+                ..fuzz_engine_builtin::MutatorConfig::default()
+            }),
+            dictionary: fuzz_engine_builtin::Dictionary::from_tokens(std::iter::empty::<Vec<u8>>()),
+            rng: fuzz_engine_builtin::MutationRng::new(rng_seed),
+        }
+    }
+
+    /// The next mutated input, with the index of the seed it came from.
+    fn next(&mut self) -> (usize, Vec<u8>) {
+        let parent = (self.rng.next_u64() % self.seeds.len().max(1) as u64) as usize;
+        let mut bytes = self.seeds.get(parent).cloned().unwrap_or_default();
+        for _ in 0..1u32 << (self.rng.next_u64() % 3) {
+            let input = fuzz_engine_builtin::MutationInput::new(&bytes, &self.dictionary);
+            if let Some(result) = self.suite.mutate(&input, &mut self.rng) {
+                bytes = result.bytes;
+            }
+        }
+        if bytes.is_empty() {
+            bytes.push(self.rng.next_u8());
+        }
+        (parent, bytes)
+    }
 }
 
 /// AFL++ QEMU-mode toolchain: `afl-fuzz` plus the `afl-qemu-trace` it shells out
@@ -761,7 +839,11 @@ pub(crate) struct AflQemu {
 /// (actionable error if missing); `auto` falls back to builtin with a note.
 fn resolve_binary_engine(engine: BinaryFuzzEngine) -> anyhow::Result<ResolvedEngine> {
     match engine {
-        BinaryFuzzEngine::Builtin => Ok(ResolvedEngine::Builtin),
+        BinaryFuzzEngine::Builtin => Ok(ResolvedEngine::Builtin {
+            degraded: "--engine builtin: no coverage feedback reaches the mutator; \
+                       --engine afl-qemu gives coverage-guided mutation"
+                .to_owned(),
+        }),
         BinaryFuzzEngine::AflQemu => resolve_afl_qemu()
             .map(ResolvedEngine::AflQemu)
             .map_err(|reason| anyhow!(reason)),
@@ -769,10 +851,10 @@ fn resolve_binary_engine(engine: BinaryFuzzEngine) -> anyhow::Result<ResolvedEng
             Ok(aq) => Ok(ResolvedEngine::AflQemu(aq)),
             Err(reason) => {
                 bhfeprintln!(
-                    "bhf binary-fuzz: {reason}; falling back to the builtin \
-                     seed-replay engine (no coverage-guided mutation)"
+                    "bhf binary-fuzz: {reason}; falling back to the builtin engine's \
+                     blind mutation (no coverage feedback)"
                 );
-                Ok(ResolvedEngine::Builtin)
+                Ok(ResolvedEngine::Builtin { degraded: reason })
             }
         },
     }
@@ -1189,8 +1271,8 @@ pub(crate) fn minimize_binary_finding(
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let invocation = finding_invocation(&finding, binary);
-    let tmp_dir = finding_dir.join("binary_minimize_tmp");
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
+    let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_minimize_tmp"))?;
+    let tmp_dir = scratch.path().to_path_buf();
     // Reduce against the finding's OWN oracle: a crash signature, a runtime-oracle
     // signature (#59), or a user postcondition signature (#55).
     let result = match finding.get("kind").and_then(Value::as_str) {
@@ -1267,7 +1349,7 @@ pub(crate) fn minimize_binary_finding(
             })?
         }
     };
-    let _ = fs::remove_dir_all(&tmp_dir);
+    drop(scratch);
     fs::write(finding_dir.join("min_testcase.bin"), &result.minimized)
         .with_context(|| format!("write {}", finding_dir.join("min_testcase.bin").display()))?;
     let removed = result.original_len.saturating_sub(result.minimized.len());
@@ -1289,8 +1371,8 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let finding = read_finding(finding_dir)?;
     let input = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
-    let tmp_dir = finding_dir.join("binary_replay_tmp");
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
+    let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_replay_tmp"))?;
+    let tmp_dir = scratch.path().to_path_buf();
     let invocation = finding_invocation(&finding, binary);
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;
@@ -2058,8 +2140,8 @@ fn render_postcondition_finding(
     }))
 }
 
-/// The lineage of each of `seeds` (as [`run_inner`] collects them), for the
-/// seed-replay engine, which runs them as they are: the operator's
+/// The lineage of each of `seeds` (as [`run_inner`] collects them), as the
+/// builtin engine runs them before it mutates them: the operator's
 /// `--seed-input`s, then `--seed-file`s named by their path, each 0
 /// generations down; or, when given none, the empty input bhf made itself.
 fn seed_lineages(args: &BinaryFuzzArgs, seeds: &[Vec<u8>]) -> Vec<corpus::lineage::FindingLineage> {
@@ -2724,6 +2806,7 @@ mod tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            rng_seed: 0,
         };
 
         // Without the triggering arg the target exits 0 — no finding.
@@ -2961,7 +3044,7 @@ mod afl_qemu_tests {
     fn engine_builtin_is_always_builtin() {
         assert!(matches!(
             resolve_binary_engine(BinaryFuzzEngine::Builtin).unwrap(),
-            ResolvedEngine::Builtin
+            ResolvedEngine::Builtin { degraded } if degraded.contains("no coverage feedback")
         ));
     }
 
@@ -2981,7 +3064,11 @@ mod afl_qemu_tests {
                 err.contains("afl-qemu-trace") || err.contains("afl-fuzz"),
                 "skip reason must name the missing tool: {err}"
             );
-            assert!(matches!(auto.unwrap(), ResolvedEngine::Builtin));
+            // The fallback says why it has no coverage.
+            assert!(matches!(
+                auto.unwrap(),
+                ResolvedEngine::Builtin { degraded } if degraded == err
+            ));
         }
     }
 
@@ -3068,6 +3155,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         let ids = summary["findings"].as_array().expect("findings array");
@@ -3155,6 +3243,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Auto,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         assert_eq!(
@@ -3467,6 +3556,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         let ids = summary["findings"].as_array().expect("findings array");

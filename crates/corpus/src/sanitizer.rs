@@ -213,6 +213,7 @@ pub enum Sanitizer {
     AddressSanitizer,
     UndefinedBehaviorSanitizer,
     LeakSanitizer,
+    MemorySanitizer,
 }
 
 impl Sanitizer {
@@ -221,6 +222,7 @@ impl Sanitizer {
             Sanitizer::AddressSanitizer => "asan",
             Sanitizer::UndefinedBehaviorSanitizer => "ubsan",
             Sanitizer::LeakSanitizer => "lsan",
+            Sanitizer::MemorySanitizer => "msan",
         }
     }
 }
@@ -229,6 +231,7 @@ pub fn parse_sanitizer_report(stderr: &str) -> Option<SanitizerReport> {
     parse_asan(stderr)
         .or_else(|| parse_ubsan(stderr))
         .or_else(|| parse_lsan(stderr))
+        .or_else(|| parse_msan(stderr))
         // A Rust panic is the PRIMARY bug signal for the native Rust lane: a
         // bounds-check / unwrap / overflow / explicit panic aborts via SIGABRT,
         // which the C-oriented `is_input_rejection` would otherwise dismiss as an
@@ -641,7 +644,7 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Perl finding".to_owned()
         } else {
@@ -649,6 +652,28 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         },
         ..Default::default()
     })
+}
+
+/// The frames an interpreted lane's driver prints under its finding line, one
+/// `== bhf frame: <function> @ <file>:<line>` per frame, innermost first and
+/// without the driver's and the harness's own frames (the Perl, Ruby, PHP and
+/// Lua drivers).
+fn parse_bhf_frames(stderr: &str) -> Vec<StackFrame> {
+    const MARKER: &str = "== bhf frame: ";
+    stderr
+        .lines()
+        .filter_map(|line| {
+            let frame = line.split_once(MARKER)?.1.trim_end();
+            let (function, location) = frame.split_once(" @ ")?;
+            let (file, line) = location.rsplit_once(':')?;
+            Some(StackFrame {
+                function: function.to_owned(),
+                file: (!file.is_empty()).then(|| file.to_owned()),
+                line: line.parse().ok(),
+            })
+        })
+        .take(MAX_SANITIZER_FRAMES)
+        .collect()
 }
 
 /// Parse a bhf Ruby finding out of stderr. The driver prints
@@ -674,7 +699,7 @@ fn parse_ruby_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Ruby finding".to_owned()
         } else {
@@ -706,7 +731,7 @@ fn parse_lua_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Lua finding".to_owned()
         } else {
@@ -738,7 +763,7 @@ fn parse_php_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "PHP finding".to_owned()
         } else {
@@ -1356,6 +1381,28 @@ fn parse_lsan(stderr: &str) -> Option<SanitizerReport> {
         rule_id: "BHF-208",
         stack: parse_stack_frames(stderr),
         message: line.to_owned(),
+        ..Default::default()
+    })
+}
+
+/// A MemorySanitizer report: `==N==WARNING: MemorySanitizer:
+/// use-of-uninitialized-value`, then the stack of the read (BHF-212).
+fn parse_msan(stderr: &str) -> Option<SanitizerReport> {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("WARNING: MemorySanitizer:"))?;
+    let kind = line
+        .split_once("WARNING: MemorySanitizer:")
+        .map(|(_, kind)| kind.trim())
+        .and_then(|kind| kind.split_whitespace().next())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("use-of-uninitialized-value");
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::MemorySanitizer),
+        kind: kind.to_owned(),
+        rule_id: "BHF-212",
+        stack: parse_stack_frames(stderr),
+        message: line.trim().to_owned(),
         ..Default::default()
     })
 }
@@ -1987,6 +2034,22 @@ fn parse_file_line(token: &str) -> (Option<String>, Option<u32>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_a_memory_sanitizer_report() {
+        let report = parse_sanitizer_report(
+            "==4242==WARNING: MemorySanitizer: use-of-uninitialized-value\n\
+             \x20   #0 0x55d1 in parse_record /proj/src/uninit.c:16:1\n\
+             \x20   #1 0x55d2 in bhf_run_one /w/harnesses/H-C1/main.c:92:5\n\
+             SUMMARY: MemorySanitizer: use-of-uninitialized-value /proj/src/uninit.c:16:1 in parse_record\n",
+        )
+        .expect("an MSan report");
+        assert_eq!(report.sanitizer, Some(Sanitizer::MemorySanitizer));
+        assert_eq!(report.rule_id, "BHF-212");
+        assert_eq!(report.kind, "use-of-uninitialized-value");
+        assert_eq!(report.stack[0].function, "parse_record");
+        assert_eq!(Sanitizer::MemorySanitizer.as_str(), "msan");
+    }
+
     use super::*;
 
     #[test]
@@ -2260,6 +2323,32 @@ java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 1
             "BHF-210"
         );
         assert!(parse_perl_finding("Use of uninitialized value\n").is_none());
+    }
+
+    /// The Perl, Ruby and PHP drivers print the target's frames under the
+    /// finding line, and each lane's report carries them.
+    #[test]
+    fn interpreted_lane_findings_carry_the_driver_frames() {
+        for (marker, function, file) in [
+            ("lua", "walk", "/src/walk.lua"),
+            ("perl", "Calc::ratio", "/src/lib/Calc.pm"),
+            ("ruby", "Reader#average", "/src/lib/reader.rb"),
+            ("php", "Calc->ratio", "C:\\src\\Calc.php"),
+        ] {
+            let stderr = format!(
+                "== bhf {marker} finding: CWE-369: divided by 0\n\
+                 == bhf frame: {function} @ {file}:12\n\
+                 == bhf frame: main @ /src/bin/run:3\n"
+            );
+            let report = parse_sanitizer_report(&stderr).unwrap();
+            assert_eq!(report.rule_id, "BHF-205", "{marker}");
+            assert_eq!(report.stack.len(), 2, "{marker}");
+            assert_eq!(report.stack[0].function, function);
+            assert_eq!(report.stack[0].file.as_deref(), Some(file));
+            assert_eq!(report.stack[0].line, Some(12));
+        }
+        let bare = parse_sanitizer_report("== bhf ruby finding: CWE-369: x\n").unwrap();
+        assert!(bare.stack.is_empty());
     }
 
     #[test]

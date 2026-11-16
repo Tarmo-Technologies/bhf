@@ -15,7 +15,6 @@ use test_support::TestDir;
 /// Host-lane flags neither lane wires, each with the arguments that set it.
 const HOST_ONLY: &[(&str, &[&str])] = &[
     ("--workers", &["--workers", "2"]),
-    ("--grammar", &["--grammar", "/nonexistent/grammar.json"]),
     ("--cmplog-log", &["--cmplog-log", "cmplog.txt"]),
     ("--len-control", &["--len-control", "5"]),
     ("--rss-limit-mb", &["--rss-limit-mb", "128"]),
@@ -47,6 +46,8 @@ const HOST_ONLY: &[(&str, &[&str])] = &[
 
 /// Flags only the session lane does not wire.
 const SESSION_ONLY: &[(&str, &[&str])] = &[
+    ("--grammar", &["--grammar", "/nonexistent/grammar.json"]),
+    ("--dict", &["--dict", "/nonexistent/tokens.dict"]),
     ("--seed-input", &["--seed-input", "A"]),
     ("--seed-file", &["--seed-file", "seed.bin"]),
     ("--max-len", &["--max-len", "32"]),
@@ -117,8 +118,8 @@ fn several_ignored_flags_are_named_together() {
         &[
             "--workers",
             "4",
-            "--grammar",
-            "g.json",
+            "--len-control",
+            "5",
             "--cmplog-log",
             "c.txt",
         ],
@@ -126,8 +127,8 @@ fn several_ignored_flags_are_named_together() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("--workers, --cmplog-log, --grammar")
-            || stderr.contains("--workers, --grammar, --cmplog-log"),
+        stderr.contains("--workers, --cmplog-log, --len-control")
+            || stderr.contains("--workers, --len-control, --cmplog-log"),
         "{stderr}"
     );
 }
@@ -137,10 +138,16 @@ fn several_ignored_flags_are_named_together() {
 #[test]
 fn the_flags_each_lane_wires_still_run() {
     let work = TestDir::new("lane-flag-conflicts-supported");
+    std::fs::write(work.join("grammar.json"), r#"{"START": ["AB"]}"#).unwrap();
+    std::fs::write(work.join("tokens.dict"), "magic=\"MAGIC\"\n").unwrap();
     let transport = fuzz(
         &work,
         TRANSPORT,
         &[
+            "--grammar",
+            "grammar.json",
+            "--dict",
+            "tokens.dict",
             "--seed-input",
             "AB",
             "--max-len",

@@ -536,6 +536,22 @@ fork-server binary. COBOL, Fortran, C#, JavaScript/TypeScript, Ruby, Lua, and PH
 likewise use their lane-specific pre-build/interpreter paths described above.
 All of these lanes bypass the Ada/C/C++ repair path.
 
+A Lua colon method (`function Reader:average(data)`) is called on an instance
+of its class: the table that defines it (the returned module, its field named
+for the class, or that global), built by its `new`, `create` or `init`
+constructor called with no arguments, else an empty table with the class as
+its metatable. The Lua driver counts how many of its first 1000 inputs end in a
+nil-value error; at 95% or more (over at least 20 inputs) the target's
+`run.json` entry carries `stub_executed` and its `run.md` row says
+`stub executed:`, since such a run exercised the error path, not the target.
+The Lua driver's coverage hook gets line events only while a target chunk
+(under the target's root, not the driver or the harness) runs, and a function
+that runs 256 line events with no new edge stops getting them until a count
+hook resumes them 100000 instructions later, so a long loop or a deep recursion
+costs a few times a plain run. A Lua finding is located at the target frame the
+driver records when the error is raised (a stack overflow at the recursing
+line, not in the driver).
+
 ## Repair Synthesis
 
 Build errors are matched against compiler diagnostics by the `build_classifier`
@@ -886,16 +902,19 @@ Lanes that replay inputs bhf already knows record their lineage too. The
 corpus replays (the MSan and TSan replays, the memory profile and the
 `--differential` post-pass) look up the queue entry they ran in
 `lineage.jsonl`, as a pass does; an entry with no line there is a `corpus`
-root. An MSan or TSan finding saves no testcase, so its lineage is that of
-the queue entry that first showed the site, which its oracle evidence names
-by `input_sha256` (left out, with the reason in the lineage, when the entry
-could not be read back), and `bhf explain` prints that lineage under the
-entry's sha256. The capability profile folds what the whole corpus
-reached into one finding, so its lineage is `unknown` and the reason says
-so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
-the operator's inputs as they are: `user_seed`, depth `0`, with the file's
-path (`generated` for the empty input `bhf binary-fuzz` runs when it is given
-no seed). Findings saved before lineage was kept, and those of lanes that
+root. An MSan or TSan finding's lineage is that of the queue entry that
+first showed the site, which its oracle evidence names by `input_sha256`
+(left out, with the reason in the lineage, when the entry could not be read
+back), and `bhf explain` prints that lineage under the entry's sha256. An
+MSan finding also saves that entry as its `testcase.bin`. The capability profile folds what the whole corpus
+reached into one finding, and saves as its `testcase.bin` the queue entry
+that reached the most of the finding's operands (named in
+`capability.testcase_operands`), so its lineage is that entry's; with no
+such entry it is `unknown` and the reason says so. `bhf differential` and the builtin engine of `bhf binary-fuzz` run the
+operator's inputs as they are: `user_seed`, depth `0`, with the file's path
+(`generated` for the empty input `bhf binary-fuzz` runs when it is given no
+seed). A blind mutation of one in `bhf binary-fuzz` is a generation below it:
+depth `1`, `parent_sha256` the seed's. Findings saved before lineage was kept, and those of lanes that
 keep none (the target-transport and protocol-session lanes, `bhf
 relational`, the JVM sink oracle and the campaign-wide collector view, which
 observe a whole run rather than one input, and extensions), have no

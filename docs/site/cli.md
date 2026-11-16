@@ -61,7 +61,11 @@ minimized with a note (`bhf auto` names all such findings in one line).
 After an intentional rebuild whose inlining, line numbers or symbolizer moved
 the sink, `--allow-other-crash` minimizes against the crash the harness
 reports instead: it prints a warning naming what differs and records it as
-`minimization.other_crash` in `finding.json`.
+`minimization.other_crash` in `finding.json`. A runtime-oracle finding (a
+failed assertion, a fuzz-controlled format string) and an input-triggered
+capability finding minimize the same way, with every reduction held to what
+`bhf replay` compares for them: the oracle's rule, API and site again, or the
+capability with an operand the testcase reached.
 
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
@@ -343,7 +347,12 @@ in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
 `--target-arg` applies to both engines.
 
 `--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
-replays the seeds and detects crashes (no mutation/coverage); `afl-qemu` drives
+runs the seeds, then a blind havoc loop (each input a seed with 1, 2 or 4
+byte-level mutations stacked on it, from `--rng-seed`, with no coverage
+feedback) until `--iterations`, `--time` or the first crash; its run JSON says
+so (`engine`, `fidelity` with `seeds_run` and `mutated_inputs`, `degraded:
+true` and `degraded_reason`, which names the missing afl-qemu tool when `auto`
+fell back). `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
 mode (`afl-fuzz -Q`); `auto` (the default) uses `afl-qemu` when its toolchain is
 present and otherwise falls back to `builtin`. Under `afl-qemu`, `--timeout-ms`
@@ -508,6 +517,24 @@ MATCH
   Rules and kinds earlier releases gave the same report still match. A hang
   is reported as `actual=<timeout>` after 10 s, a clean exit as
   `actual=<none>` with its exit status.
+- **Oracle, assertion and capability findings.** A finding that is not a
+  sanitizer crash replays with the runtrace shim recording what the harness
+  did. A runtime-oracle finding (`classification: "oracle_hit"`, such as a
+  failed assertion, BHF-415, or a fuzz-controlled format string, BHF-408) is a
+  `MATCH` when the oracle registry, run over the replay's runtrace, reports
+  the same rule at the same API with the same site evidence (an assertion's
+  `source` and `expression`). An assertion the runtrace did not record (the
+  shim did not run in the harness) is read from the message the C runtime
+  printed: glibc's `` Assertion `expr' failed. ``, the Microsoft C runtime's
+  `Assertion failed: expr, file f, line n`, or the BSD or musl form; its
+  expression must be the same and its source the same file and line. An
+  input-triggered capability finding (BHF-668) is a `MATCH` when the replay of
+  its testcase (a corpus entry that reached the capability) reaches the same
+  kind of capability with an operand that entry reached. A crash `bhf auto`
+  filed as the format-string bug compares as the crash its sanitizer reported
+  (`format_string.crash_rule_id`); when that crash does not come back (the
+  format reads whatever is in the argument area), the format-string oracle
+  firing at the recorded call is the `MATCH`, and a note says so.
 - **Unverified.** A replayed report that names no function and no source
   position (an unsymbolized one) is not another site, but it is not a
   reproduction either: the verdict is `UNVERIFIED ... not_compared=sink`
@@ -700,7 +727,14 @@ and explain it — all offline and deterministic (no LLM):
   `finding_identity`): a minimized input that crashes another way does not
   ship, and when no input shows the finding's crash the capsule says what
   the rebuilt PoC showed instead (`reproduced: false`,
-  `reproduced_other_crash: true`, `other_crash`). Every path
+  `reproduced_other_crash: true`, `other_crash`). A C or C++ runtime-oracle
+  or capability finding is packaged too: its capsule records the oracle hit
+  or capability in the capsule's paths (`finding_oracle`), and the rebuilt PoC
+  reproduces it when a replay under bhf's runtrace shim shows it the way
+  `bhf replay` decides (`oracle_comparison`; a failed assertion is also read
+  from the message the C runtime printed). The summary counts every runtime
+  finding as written, skipped (each with its reason) or failed (each with its
+  error). Every path
   the harness's build and launch files name is relocated into the capsule:
   `build.sh` renders those files into `build/` with the capsule's own location
   and the programs it finds on the host, builds there, and writes `./poc`, so
@@ -797,7 +831,10 @@ and explain it — all offline and deterministic (no LLM):
   verify-poc prints that reason. A capsule whose own rebuild failed when it
   was packaged (manifest `rebuilt: false`, `build_error`) is reported as such
   when its rebuild fails here too, with both errors; one that rebuilds here
-  but whose input does not crash says that instead.
+  but whose input does not crash says that instead. A capsule that records a
+  `finding_oracle` is verified by replaying its input under the runtrace shim:
+  `PASS` names the compared fields, and a replay that does not show it is a
+  `FAIL` with what differed.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
   reproduces deterministically. It works on the built harness of a native lane
@@ -1263,7 +1300,8 @@ so a run whose crashes were all known does not read as clean.
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there. `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. Required with `--protocol-profile`.
-- The transport (`--target-transport`) and session (`--protocol-profile`) lanes run their own loops and refuse, with exit `2` and the flags named, a host-lane flag they do not wire rather than ignore it: `--workers`, `--grammar`, `--cmplog-log`, `--len-control`, `--rss-limit-mb`, the fork-server, qemu-user, extension, sanitizer, symbolic-seed, sandbox, runtime-oracle, structured-input, final-stats and collector flags. The transport lane also refuses the session flags; the session lane, whose seeds come from the profile, also refuses `--seed-input`, `--seed-file`, `--max-len`, `--timeout`, `--deadline` and `--transport-coverage-map`.
+- `--dict <PATH>` — an AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose tokens the mutator splices into inputs, on top of the harness's own `dictionary.txt`. The host loop and the transport lane read it; a file that cannot be read stops the run. The transport lane also reads the harness's `dictionary.txt` and `--grammar`: with a grammar, a seed is a derivation of it when no `--seed-input` or `--seed-file` is given, and every other input is a fresh derivation, so a target that parses the grammar receives only its sentences.
+- The transport (`--target-transport`) and session (`--protocol-profile`) lanes run their own loops and refuse, with exit `2` and the flags named, a host-lane flag they do not wire rather than ignore it: `--workers`, `--cmplog-log`, `--len-control`, `--rss-limit-mb`, the fork-server, qemu-user, extension, sanitizer, symbolic-seed, sandbox, runtime-oracle, structured-input, final-stats and collector flags. The transport lane also refuses the session flags; the session lane, whose seeds come from the profile, also refuses `--grammar`, `--dict`, `--seed-input`, `--seed-file`, `--max-len`, `--timeout`, `--deadline` and `--transport-coverage-map`.
 - `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
 - `--max-session-messages <N>` — bounded cap on messages per session (default `64`); a sequence mutation that would exceed it fails with a diagnostic rather than growing unbounded.
 - `--rng-seed <N>` — deterministic RNG seed for built-in mutation.
@@ -1367,6 +1405,19 @@ recorded session against a **fresh reset** (re-capturing a different handle and
 re-resolving the reference, so it still reproduces), and minimize shrinks the
 sequence and bytes fields while re-repairing the computed fields and keeping the
 dynamic bindings live.
+
+A session the target ends after accepting it (it closes or resets the
+connection, or stops answering within the I/O timeout) is a crash candidate:
+the session is kept under `<work_dir>/session_disconnects/`, driven again on a
+new connection, and written as a BHF-210 finding (oracle `session-disconnect`,
+deduplicated by the message it dropped at) when the target drops it at the same
+message again; the summary counts these in `crashes` and the ones a second drive
+did not repeat in `unconfirmed_disconnects`. The campaign goes on. A failure to
+connect skips the session, and three in a row stop the campaign (exit `1`),
+naming them; the wait before each retry grows by 200 ms, so a service that
+restarts after a crash has time to come back. `bhf replay` of a
+`session-disconnect` finding is a `MATCH` when the target drops the session
+again.
 
 Every bound is explicit and surfaced as a bounded diagnostic rather than a panic
 or an unbounded loop: a malformed profile or an unresolved reference, a truncated
@@ -1489,7 +1540,7 @@ Flags:
 - `--per-target-finding-count <N>` — stop a target's cascade as soon as it has produced N *distinct* findings (crash signatures), or when `--per-target-time` is spent, whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash. Unset by default (collect every finding).
 - `--total-time <SECS>` — **deprecated** alias of `--per-target-time` (overrides it when set); retained for existing benchmark/parity invocations. Hidden from `--help`.
 - `--iterations <N>` — per-pass execution cap (libFuzzer `-runs`); unset (or `0`) lets `--per-target-time` govern depth. The old hardcoded 1024 cap is retired.
-- `--rss-limit-mb <MB>` — per-harness resident-set memory cap; a test case over budget is killed and reported as a BHF-209 OOM finding instead of OOM-killing the host (libFuzzer `-rss_limit_mb`). Defaults to one quarter of available host/cgroup memory, clamped to 512..8192 MiB; pass an exact value or `0` to disable.
+- `--rss-limit-mb <MB>` — per-harness resident-set memory cap; a test case over budget is killed and reported as a BHF-209 OOM finding instead of OOM-killing the host (libFuzzer `-rss_limit_mb`). Defaults to one quarter of available host/cgroup memory, clamped to 512..8192 MiB; pass an exact value or `0` to disable. The finding records the limit (`rss_limit_mb`), and `bhf replay` and `bhf minimize` run its testcase under it, so the replay reproduces the out-of-memory kill (MATCH) instead of allocating the host's memory; a BHF-209 finding recorded without it replays under the default.
 - `--max-targets <N>` — keep only the top-N highest-scored targets after ranking, before the build/fuzz sweep; `--dry-run` prints this bounded plan, while `--list-targets` still prints the full ranked list. The kept-vs-total count is logged (never a silent truncation). Bounds *which* targets a huge tree attempts. Unset by default.
 - `--campaign-time <SECS>` — whole-*run* budget across all targets. Default: an OUTER wall-clock cap — once exceeded, `auto` stops STARTING new (ranked) targets and reports how many of the N discovered were reached. With `--min-target-time`, switches to SPLIT mode (below). Unset by default.
 - `--min-target-time <SECS>` — SPLIT-mode floor, used only with `--campaign-time` (errors otherwise): divide the campaign budget across the N attempted targets — each gets `max(min, campaign / N)` of fuzz time, and only the top `floor(campaign / per_target)` ranked targets are attempted (the rest logged unfuzzed), never below this floor. Overrides `--per-target-time`. Unset by default.

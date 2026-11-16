@@ -106,7 +106,17 @@ fn count_fuzz_crash_findings(work: &std::path::Path) -> usize {
 /// exact entry point the engine trade study drives — distinct from the `auto`
 /// orchestration exercised above. `redqueen` selects the default in-campaign
 /// cmplog channels vs. the `BHF_DISABLE_REDQUEEN=1` kill-switch.
+/// How long a `bhf fuzz` run lasts.
+enum Budget<'a> {
+    Seconds(&'a str),
+    Executions(&'a str),
+}
+
 fn run_fuzz(tag: &str, redqueen: bool, budget_secs: &str) -> usize {
+    run_fuzz_for(tag, redqueen, Budget::Seconds(budget_secs))
+}
+
+fn run_fuzz_for(tag: &str, redqueen: bool, budget: Budget<'_>) -> usize {
     let work = tmpdir(tag);
     std::fs::copy(fixture(), work.join("redqueen_int.c")).unwrap();
     let seed = work.join("seed-zero-8");
@@ -143,9 +153,12 @@ fn run_fuzz(tag: &str, redqueen: bool, budget_secs: &str) -> usize {
     cmd.current_dir(&work)
         .args(["fuzz", "."])
         .args(["--harness", id])
-        .args(["--engine", "builtin"])
-        .args(["--time", &format!("{budget_secs}s")])
-        .arg("--seed-file")
+        .args(["--engine", "builtin"]);
+    match budget {
+        Budget::Seconds(secs) => cmd.args(["--time", &format!("{secs}s")]),
+        Budget::Executions(executions) => cmd.args(["--iterations", executions]),
+    };
+    cmd.arg("--seed-file")
         .arg(&seed)
         .args(["--rng-seed", "1000"])
         .args(["--max-len", "64"])
@@ -162,6 +175,30 @@ fn run_fuzz(tag: &str, redqueen: bool, budget_secs: &str) -> usize {
         status.code()
     );
     count_fuzz_crash_findings(&work)
+}
+
+/// The fixture's integer gate falls to the cmplog channels and to nothing
+/// else: at a fixed RNG seed and execution count, `bhf fuzz` solves it by
+/// default and does not with `BHF_DISABLE_REDQUEEN=1`. Deterministic, unlike
+/// the time-budgeted discriminators below.
+#[test]
+#[ignore = "cold-solve discriminator; needs clang+make; the nightly's ignored shard runs it"]
+fn cold_gate_needs_redqueen() {
+    if !support::libfuzzer_toolchain_available("redqueen-cold") {
+        eprintln!("skipping: clang+make toolchain unavailable");
+        return;
+    }
+    let executions = std::env::var("BHF_RQ_EXECS").unwrap_or_else(|_| "2000".to_owned());
+    let without = run_fuzz_for("cold-off", false, Budget::Executions(&executions));
+    assert_eq!(
+        without, 0,
+        "BHF_DISABLE_REDQUEEN=1 solved the integer gate in {executions} executions"
+    );
+    let with = run_fuzz_for("cold-on", true, Budget::Executions(&executions));
+    assert!(
+        with > 0,
+        "RedQueen did not solve the integer gate in {executions} executions"
+    );
 }
 
 /// Best-in-class parity: the DEFAULT `bhf fuzz` run must solve the integer gate

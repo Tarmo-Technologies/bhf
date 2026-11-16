@@ -25,10 +25,14 @@
 # Bootstrap HTTPS from an exact, checksum-verified Ubuntu CA package. This
 # avoids a mutable apt install before selecting the reviewed archive snapshot.
 # The package comes from that snapshot (UBUNTU_SNAPSHOT below): the archive
-# pool drops a version once it is superseded, the snapshot keeps it.
-FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS certificates
-ADD --checksum=sha256:f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0 https://snapshot.ubuntu.com/ubuntu/20261111T000000Z/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.2_all.deb /tmp/ca.deb
-RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
+# pool drops a version once it is superseded, the snapshot keeps it. A
+# digest-pinned image with curl fetches it, retrying the snapshot service's
+# 503s, which BuildKit's ADD cannot.
+FROM buildpack-deps:noble-curl@sha256:ff017c6ddb753a820436187146da5035237aca43e0ac53cd64cf5cb18241b733 AS certificates
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/ca.deb \
+        https://snapshot.ubuntu.com/ubuntu/20261111T000000Z/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.2_all.deb \
+    && echo "f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0  /tmp/ca.deb" | sha256sum -c - \
+    && dpkg-deb -x /tmp/ca.deb /tmp/ca \
     && mkdir /certificates \
     && cat /tmp/ca/usr/share/ca-certificates/mozilla/*.crt > /certificates/ca-certificates.crt
 
@@ -59,7 +63,7 @@ RUN source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$
     mkdir -p /out/usr/local/bin /out/usr/share/bhf/licenses/javascript; \
     if bhf_has_language "$languages" javascript || bhf_has_language "$languages" typescript; then \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
-      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-${BHF_NODE_ARCH}.tar.xz" \
+      && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-${BHF_NODE_ARCH}.tar.xz" \
       && echo "${BHF_NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
       && mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
       && cp /opt/node/bin/node /out/usr/local/bin/node \
@@ -92,7 +96,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pin the reviewed builder Rust version.
 RUN . /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
+    curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
     && echo "${BHF_RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --profile minimal --default-toolchain 1.99.0 \
@@ -153,7 +157,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" go; then \
     source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
+    curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/go.tgz \
         "https://go.dev/dl/go${GO_VERSION}.linux-${BHF_GO_ARCH}.tar.gz" \
     && echo "${BHF_GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
     && tar -C /usr/local -xzf /tmp/go.tgz \
@@ -169,7 +173,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" csharp; then \
     source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/dotnet.tgz \
+    curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/dotnet.tgz \
         "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-${BHF_DOTNET_ARCH}.tar.gz" \
     && echo "${BHF_DOTNET_SHA512}  /tmp/dotnet.tgz" | sha512sum -c - \
     && mkdir -p /usr/share/dotnet /usr/share/bhf/licenses/csharp && tar -C /usr/share/dotnet -xzf /tmp/dotnet.tgz \
@@ -187,7 +191,7 @@ COPY --from=javascript-tools /out/ /
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" java; then \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache.org/dist/maven/maven-3/3.10.0/binaries/apache-maven-3.10.0-bin.tar.gz \
+    curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/maven.tgz https://archive.apache.org/dist/maven/maven-3/3.10.0/binaries/apache-maven-3.10.0-bin.tar.gz \
     && echo '908b1501bfb420bf7c8affb855534a9c407fd6099367bfb9f2f2dcb8e9799102bffb84518cde74c679bd76870247c6528683abdd620581bffa90f95d92d175aa  /tmp/maven.tgz' | sha512sum -c - \
     && mkdir /opt/maven && tar -xzf /tmp/maven.tgz --strip-components=1 -C /opt/maven \
     && ln -s /opt/maven/bin/mvn /usr/local/bin/mvn && rm /tmp/maven.tgz \
@@ -321,7 +325,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" rust; then \
     source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
+    curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
     && echo "${BHF_RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --profile minimal --default-toolchain nightly-2026-06-10 \

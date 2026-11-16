@@ -1689,18 +1689,21 @@ fn build_overflowing_harness(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The runtrace shim this checkout built, when it is newer than the code that
-/// copies the published input (an older build would test the old code).
+/// copies the published input (an older build would test the old code). A
+/// prebuilt bhf (`$BHF_TEST_BIN`) comes with the shim built from this
+/// checkout, which an extracted test archive dates before the checkout.
 #[cfg(target_os = "linux")]
 fn fresh_runtrace_shim() -> Option<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = root.join("crates/bhf_runtrace_shim/src/fakes/fuzz_input.rs");
     let source_mtime = fs::metadata(source).and_then(|m| m.modified()).ok()?;
+    let prebuilt = std::env::var_os("BHF_TEST_BIN").is_some();
     let target =
         std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
     ["debug", "release"].into_iter().find_map(|profile| {
         let shim = target.join(profile).join("libbhf_runtrace_shim.so");
         let built = fs::metadata(&shim).and_then(|m| m.modified()).ok()?;
-        (built >= source_mtime).then_some(shim)
+        (prebuilt || built >= source_mtime).then_some(shim)
     })
 }
 
@@ -3641,4 +3644,64 @@ fn a_non_matching_replay_of_a_rebuilt_harness_keeps_the_replay_log() {
     assert!(log.contains("verdict: match"), "{log}");
     assert_ne!(log.as_bytes(), matched_log.as_slice());
     fs::remove_dir_all(&root).ok();
+}
+
+/// A replay that runs into its timeout kills everything the harness
+/// started: a launcher that ignores SIGTERM and has forked a child leaves
+/// neither behind.
+#[cfg(unix)]
+#[test]
+fn a_timed_out_replay_leaves_no_child_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("replay-timeout-children");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-S0009-00000009");
+    fs::create_dir_all(&harness).unwrap();
+    let pid_file = root.join("child.pid");
+    let main = harness.join("main");
+    fs::write(
+        &main,
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED BHF_CS_LAUNCHER\ntrap '' TERM\nsleep 300 &\necho $! > '{}'\n\
+             while :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&main, fs::Permissions::from_mode(0o755)).unwrap();
+    let finding = work.join("results/findings/F-0000-00000009");
+    fs::create_dir_all(&finding).unwrap();
+    fs::write(finding.join("testcase.bin"), b"A").unwrap();
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::json!({
+            "id": "F-0000-00000009",
+            "harness_id": "H-S0009-00000009",
+            "rule_id": "BHF-201",
+            "classification": "unhandled",
+            "exception": { "name": "ASAN_CSHARP_INDEX_OUT_OF_BOUNDS", "sanitizer": "asan" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["replay", "--finding"])
+        .arg(&finding)
+        .output()
+        .expect("run bhf replay");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        format!("{stdout}{stderr}").contains("actual=<timeout>"),
+        "{stdout}\n{stderr}"
+    );
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .expect("the launcher started its child")
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only checks that the pid exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(!alive, "the harness's child {pid} outlived the replay");
 }

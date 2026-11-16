@@ -89,6 +89,7 @@ mod readiness;
 mod relational;
 mod replay;
 mod replay_debugger;
+mod replay_oracle;
 mod report;
 mod report_backfill;
 mod repro_lane;

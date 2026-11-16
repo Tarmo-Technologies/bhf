@@ -64,9 +64,11 @@ fn libfuzzer_toolchain_probe_entrypoint_is_callable() {
     let _ = support::libfuzzer_toolchain_available("entrypoint");
 }
 
+/// Without a prebuilt bhf (`$BHF_TEST_BIN`), the command is `cargo run` of
+/// this crate's manifest.
 #[test]
 fn bhf_cargo_command_uses_manifest_path() {
-    let cmd = support::bhf_cargo_command();
+    let cmd = support::bhf_command_with(None);
     let rendered = cmd
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())

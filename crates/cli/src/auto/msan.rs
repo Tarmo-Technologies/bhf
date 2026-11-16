@@ -70,7 +70,7 @@ fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize)
         return 0;
     };
     // Each site, with the first queue entry that showed it.
-    let mut sites: BTreeMap<(String, u64), PathBuf> = BTreeMap::new();
+    let mut sites: BTreeMap<(String, u64), (PathBuf, String)> = BTreeMap::new();
     let mut replayed = 0usize;
     for input in inputs.flatten() {
         if replayed >= MAX_INPUTS {
@@ -95,7 +95,9 @@ fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize)
             continue;
         }
         if let Some(site) = first_target_frame(&stderr, hdir) {
-            sites.entry(site).or_insert(path);
+            sites
+                .entry(site)
+                .or_insert_with(|| (path, stderr.into_owned()));
         }
     }
 
@@ -104,11 +106,16 @@ fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize)
         return written;
     }
     let queue = crate::fuzz_lineage::ReplayedQueue::open(work_dir, harness_id);
-    for ((file, line), input) in sites {
+    for ((file, line), (input, stderr)) in sites {
         let id = format!("F-MSAN-{:04}", *index);
         *index += 1;
         let shown_by = queue.entry(&input);
-        if write_msan_finding(work_dir, &id, harness_id, &file, line, &shown_by) {
+        let evidence = MsanEvidence {
+            input: Some(input),
+            report: stderr,
+            binary: Some(bin.clone()),
+        };
+        if write_msan_finding(work_dir, &id, harness_id, &file, line, &shown_by, &evidence) {
             written += 1;
         }
     }
@@ -163,6 +170,17 @@ fn is_noise_frame(file: &str, hdir: &str) -> bool {
 
 /// Persist one MSan finding as a runtime crash (`classification: unhandled`) so the
 /// confirmation join + attestation treat it like any other fuzz-found defect.
+/// What an MSan replay saw for one uninitialized-read site.
+#[derive(Default)]
+struct MsanEvidence {
+    /// The corpus entry that showed the read, saved as the finding's testcase.
+    input: Option<PathBuf>,
+    /// MemorySanitizer's report, saved as `sanitizer.log`.
+    report: String,
+    /// The MSan build that ran it, which replay runs again.
+    binary: Option<PathBuf>,
+}
+
 fn write_msan_finding(
     work: &Path,
     id: &str,
@@ -170,15 +188,30 @@ fn write_msan_finding(
     file: &str,
     line: u64,
     shown_by: &crate::fuzz_lineage::ReplayedEntry,
+    seen: &MsanEvidence,
 ) -> bool {
     let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
-    let name = Path::new(file)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file.to_owned());
+    // The report as replay will parse it again, and its frame at the site.
+    let report = corpus::parse_sanitizer_report(&seen.report)
+        .filter(|report| report.sanitizer == Some(corpus::Sanitizer::MemorySanitizer));
+    let function = report
+        .as_ref()
+        .and_then(|report| {
+            report.stack.iter().find(|frame| {
+                frame.file.as_deref() == Some(file) && frame.line.map(u64::from) == Some(line)
+            })
+        })
+        .map(|frame| frame.function.clone())
+        .filter(|function| !function.is_empty());
+    let name = function.clone().unwrap_or_else(|| {
+        Path::new(file)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_owned())
+    });
     // One issue per distinct uninitialized-read site (rule + file:line), as a stable
     // 64-hex cluster key so the report collapses repeat inputs into one row.
     let cluster_key_full = hex(&Sha256::digest(format!("BHF-212:{file}:{line}").as_bytes()));
@@ -195,12 +228,46 @@ fn write_msan_finding(
         "exception": {
             "name": "MemorySanitizer",
             "message": "use of uninitialized memory (MSan corpus replay)",
-            "stack": [ { "function": "", "file": file, "line": line } ],
+            "stack": [ { "function": function.clone().unwrap_or_default(), "file": file, "line": line } ],
         },
         "oracle": { "evidence": evidence },
         "analysis": { "engine": "bhf.dynamic.msan.replay" },
         "actionability": { "cwe": ["CWE-457"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    // The exception as the emitter writes a sanitizer crash, so `bhf replay`
+    // compares the MSan build's report with it.
+    if let Some(report) = &report {
+        record["exception"] = json!({
+            "name": format!("MSAN_{}", report.kind.to_uppercase().replace('-', "_")),
+            "sanitizer": "msan",
+            "message": report.message,
+            "stack": report.stack,
+        });
+    }
+    let mut paths = serde_json::Map::new();
+    paths.insert("finding".to_owned(), json!("finding.json"));
+    // The corpus entry that showed the read is the finding's testcase.
+    if let Some(input) = &seen.input {
+        if std::fs::copy(input, dir.join("testcase.bin")).is_ok() {
+            paths.insert("testcase".to_owned(), json!("testcase.bin"));
+        }
+    }
+    if !seen.report.is_empty()
+        && corpus::finding::write_sanitizer_log(&dir, seen.report.as_bytes()).is_ok()
+    {
+        paths.insert("sanitizer_log".to_owned(), json!("sanitizer.log"));
+    }
+    record["paths"] = serde_json::Value::Object(paths);
+    // Replay runs the MSan build, not the ASan `main`.
+    if let Some(binary) = &seen.binary {
+        record["fixture_path"] = json!(corpus::finding::stored_fixture_path(
+            work,
+            &binary.display().to_string()
+        ));
+        if let Some(format) = crate::fuzz::harness_format_for(binary, work, harness_id) {
+            record["harness_format_version"] = json!(format.version);
+        }
+    }
     crate::fuzz_lineage::insert(&mut record, &shown_by.lineage);
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
@@ -248,8 +315,8 @@ mod tests {
     }
 
     /// An MSan finding carries the lineage of the queue entry that showed the
-    /// read, from that entry's record beside the queue, and names the entry
-    /// (it saves no testcase of its own).
+    /// read, from that entry's record beside the queue, names the entry, and
+    /// saves it as its testcase with MSan's report and the MSan build.
     #[test]
     #[cfg(unix)]
     fn an_msan_finding_carries_the_lineage_of_the_queue_entry_that_showed_it() {
@@ -303,6 +370,20 @@ mod tests {
                 .any(|e| e["key"] == "input_sha256" && e["value"] == child.as_str()),
             "{record}"
         );
+        let finding = work.join("results/findings/F-MSAN-0000");
+        assert_eq!(
+            std::fs::read(finding.join("testcase.bin")).unwrap(),
+            b"CHILD"
+        );
+        assert!(finding.join("sanitizer.log").is_file());
+        assert_eq!(
+            record["fixture_path"], "harnesses/H-C0001/main_msan",
+            "{record}"
+        );
+        assert_eq!(
+            record["exception"]["stack"][0]["function"], "classify",
+            "{record}"
+        );
     }
 
     /// A queue entry that cannot be read back names no sha256: the finding
@@ -319,7 +400,8 @@ mod tests {
             "H-C0001",
             "/proj/src/site.c",
             8,
-            &shown_by
+            &shown_by,
+            &MsanEvidence::default()
         ));
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(work.join("results/findings/F-MSAN-0009/finding.json")).unwrap(),

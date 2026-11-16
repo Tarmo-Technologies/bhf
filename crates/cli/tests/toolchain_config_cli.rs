@@ -2381,12 +2381,12 @@ fn bhf_build_refuses_a_runner_for_a_native_ada_harness() {
 
 /// An Ada tool prefix whose gprbuild is not installed fails the dry run with
 /// the key and the missing program, instead of planning a sweep whose every
-/// Ada build then fails.
+/// Ada build then fails. The prefix is one no GNAT ships, so the test runs
+/// whether or not an aarch64 GNAT is installed.
 #[test]
 fn a_missing_prefixed_gprbuild_fails_the_dry_run() {
-    if have("aarch64-linux-gnu-gprbuild") || have("aarch64-linux-gnu-gnat") || !have("qemu-aarch64")
-    {
-        eprintln!("skip: an aarch64 GNAT is installed, or qemu-aarch64 is not");
+    if !have("qemu-aarch64") {
+        eprintln!("skip: qemu-aarch64 is not installed");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -2398,7 +2398,7 @@ fn a_missing_prefixed_gprbuild_fails_the_dry_run() {
         .args([
             "--dry-run",
             "--ada-prefix",
-            "aarch64-linux-gnu",
+            "aarch64-bhfmissing-linux-gnu",
             "--runner",
             "qemu-aarch64",
         ])
@@ -2407,7 +2407,9 @@ fn a_missing_prefixed_gprbuild_fails_the_dry_run() {
     let out = text(&output);
     assert_eq!(output.status.code(), Some(2), "{out}");
     assert!(
-        out.contains("toolchain.ada.prefix: aarch64-linux-gnu-gprbuild not found on PATH"),
+        out.contains(
+            "toolchain.ada.prefix: aarch64-bhfmissing-linux-gnu-gprbuild not found on PATH"
+        ),
         "{out}"
     );
     assert!(!out.contains("would fuzz"), "{out}");

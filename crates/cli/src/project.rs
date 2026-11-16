@@ -708,6 +708,7 @@ fn plan_to_fuzz_args(
         runtime_oracles: map_runtime_oracles(launch.runtime_oracles),
         cmplog_log: None,
         grammar_file,
+        dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
         stop_after_findings: None,
@@ -775,6 +776,7 @@ fn plan_to_binary_fuzz_args(
         reset_command: launch.reset_command.clone(),
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        rng_seed: 0,
     })
 }
 

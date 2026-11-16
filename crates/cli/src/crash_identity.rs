@@ -440,7 +440,10 @@ fn recorded_identity(raw: &Value) -> Identity {
                 .and_then(message_signal)
         });
     Identity {
-        rule: text(raw.get("rule_id")),
+        // A crash `bhf auto` filed as the format-string bug keeps the rule
+        // its sanitizer report gave it.
+        rule: text(raw.pointer("/format_string/crash_rule_id"))
+            .or_else(|| text(raw.get("rule_id"))),
         kind,
         sink: actionability::sink_for_finding(raw).and_then(SinkSite::from_sink),
         site,
@@ -950,6 +953,23 @@ mod tests {
         assert_eq!(comparison.differing_fields(), "rule");
     }
 
+    /// A crash filed as the format-string bug (BHF-408) is compared with the
+    /// rule its own report gave it.
+    #[test]
+    fn a_format_string_crash_compares_with_its_crash_rule() {
+        let report = asan(COPY_AT);
+        let recorded = json!({
+            "rule_id": "BHF-408",
+            "format_string": {"api": "snprintf", "crash_rule_id": "BHF-201"},
+        });
+        assert!(compare(&recorded, &report).matches());
+        let recorded = json!({
+            "rule_id": "BHF-408",
+            "format_string": {"api": "snprintf", "crash_rule_id": "BHF-206"},
+        });
+        assert_eq!(compare(&recorded, &report).differing_fields(), "rule");
+    }
+
     /// The same crash replayed without a symbolizer has frames that name no
     /// function and a summary without a position: its location cannot be
     /// compared, which is not a difference.
@@ -1153,6 +1173,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
             env: Vec::new(),
+            rss_exceeded: None,
         }
     }
 

@@ -5,6 +5,36 @@
 ## Unreleased
 
 ### Changed
+- The nightly installs AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross
+  compilers, and qemu-user with the AArch64 cross compilers, and runs those
+  lanes' tests, which skipped as passes; the skip allowlist no longer names a
+  lane.
+- The nightly installs GNAT 13 and GPRbuild and runs the Ada lane tests,
+  which skipped as passes, and no longer allows an Ada skip line; the PR
+  smoke's Ada representative runs on a runner with GNAT.
+- The nightly builds every test binary once, into one nextest archive with
+  the runtrace shim, the compiler intercept and the release bhf, and each shard
+  runs from it instead of compiling the workspace. The heavy tests run the
+  prebuilt bhf `BHF_TEST_BIN` names instead of `cargo run --release` inside the
+  test, which counted the build against their deadlines. CI caches the cargo
+  registry.
+- Every download in the Dockerfile and the workflows retries transient
+  failures and checks a pinned digest: the CA bootstrap is fetched with
+  `curl --retry` in a digest-pinned `buildpack-deps:noble-curl` stage instead
+  of BuildKit's `ADD`, which cannot retry; the Dockerfile's other `curl`s retry;
+  nextest, rustup-init and cargo-dist come from pinned release files through
+  `scripts/ci/fetch.sh` (retry, SHA-256 check, a cache the RHEL 7 job keeps)
+  instead of `curl | sh` installers. `scripts/ci/check-network-fetches.sh`
+  fails CI on a `curl` or `wget` without retry and checksum, or an `ADD` of a
+  URL.
+- CI runs bhf's `llm`-feature unit tests (`cargo test -p bhf --features llm
+  --lib llm::`); it only type-checked the feature.
+- The nightly's `ignored` shard runs the RedQueen/cmplog cold-solve
+  discriminators and the engine-parity cold-solve sweep, `#[ignore]`d tests
+  no workflow ran; `cold_gate_needs_redqueen` checks both arms at a fixed seed
+  and execution count (solved with RedQueen, not with
+  `BHF_DISABLE_REDQUEEN=1`), and `engine_parity`'s ignore reason names what it
+  needs today.
 - sha2 0.11. Ids, signatures and file names derived from SHA-256 digests
   keep their lowercase-hex spelling.
 - A development build reports `v<version>-dev+<commit>` and no longer rebuilds
@@ -15,6 +45,100 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf build --target <triple>` of an Ada harness after a host build of the
+  same harness compiles its runtime library again. It could link the host
+  build's `adafuzz_cov.o` into the cross archive ("Relocations in generic
+  ELF (EM: 62)", "file in wrong format").
+- The Lua lane's coverage hook costs a few times a plain run, not 100–600x:
+  line events reach it only while a target chunk runs (a call/return hook
+  switches them on and off, and a C function changes nothing), each chunk's
+  hash is computed once and its covered lines are integer ids, and a stretch
+  of 256 line events with no new edge pauses that function's line events until
+  a count hook resumes them 100000 instructions later. A recursion to a stack
+  overflow takes half a second under the harness; it took 24 s and timed out
+  unreported. The driver records the target's frames when an error is raised,
+  so a stack overflow is located in the target, not at `bhf_driver.lua:26`. The
+  nightly's new `ignored` shard runs the hook's cost benchmark.
+- A Lua colon method runs on an instance of its class (from its `new`,
+  `create` or `init` constructor, else an empty table with the class as its
+  metatable), so a method that reads its fields is fuzzed: `Reader:average`'s
+  divide by zero is found. The harness passed the class table as `self`, so
+  such methods died on suppressed nil errors and object-oriented Lua reported
+  clean. A Lua target whose first inputs end at least 95% of the time in a
+  nil-value error is flagged `stub_executed` in run.json and run.md.
+- A host SEGV on a fixed device-register address is an environment result:
+  `bhf auto` reads the constant-address pointer casts in the crash path's
+  sources and headers (macros expanded), and a SEGV on one of those registers
+  is `lab_only` (`mmio_register`) at low severity, with `environment_origin`
+  naming the register and `hardware_peripherals` fidelity `not_exercised`. A
+  UART driver polling its status register was reported as a HIGH
+  attacker-reachable out-of-bounds read with `hardware_peripherals:
+  not_applicable`.
+- `bhf binary fuzz`'s builtin engine, which `auto` falls back to without
+  AFL++'s QEMU mode, runs the seeds and then a blind havoc loop (stacked byte
+  mutations of the seeds, from the new `--rng-seed`) until `--iterations`,
+  `--time` or the first crash, and its run JSON records `engine`, `fidelity`
+  and `degraded` with the reason. It replayed each seed once, ignored
+  `--iterations` and `--time`, and wrote a run JSON that read as a clean pass.
+- The on-target transport lane's mutator gets a dictionary: `bhf fuzz --dict
+  PATH` (new, AFL/libFuzzer format, read by the host loop too) and the
+  harness's `dictionary.txt`, and `--grammar` sends only derivations of the
+  grammar. Its dictionary was hard-coded empty, so a firmware magic gate got no
+  help, and `--grammar` was refused. The agent's TCP link sends each input in
+  one write with `TCP_NODELAY`; a length word sent alone waited on the agent's
+  delayed ACK, about 40 ms per input.
+- The session lane (`--protocol-profile`) treats a session the target ends
+  mid-way (a closed or reset connection, or one that stops answering) as a
+  crash candidate: it keeps the session, drives it again on a new connection,
+  writes a BHF-210 `session-disconnect` finding when the target drops it at the
+  same message again, and goes on fuzzing. It used to abort the campaign with
+  exit 1, saving nothing, and reported `crashes: 0` always. Three failed
+  connections in a row stop the campaign.
+- Perl, Ruby and PHP findings are located at the target line that raised them,
+  in results/findings.json, the SARIF and INDEX.md. Each driver prints the
+  target's frames under its finding line (`== bhf frame: <function> @
+  <file>:<line>`, without the driver's and the harness's own), and the
+  finding records them as its stack. The Perl driver stripped the die
+  message's `at FILE line N`, and the Ruby and PHP drivers printed no
+  backtrace, so these findings had no location.
+- `bhf minimize` minimizes runtime-oracle, assertion and capability findings,
+  holding each reduction to what `bhf replay` compares for them; it held every
+  reduction to a sanitizer crash, so they never minimized. `bhf capsule`
+  packages the C and C++ ones (manifest `finding_oracle`,
+  `oracle_comparison`) and `bhf verify-poc` verifies them under the runtrace
+  shim; it skipped the oracle findings and left capability findings out of
+  its count. Its summary now accounts for every runtime finding as written,
+  skipped or failed.
+- `bhf replay` confirms runtime-oracle, assertion and capability findings
+  from what the replay did: the runtrace shim records the run, and the
+  finding is a `MATCH` when the oracle registry reports the same rule, API and
+  site again (an assertion's source and expression), or, for an input-triggered
+  capability (BHF-668), when the replay reaches the same kind of capability
+  with an operand its testcase reached. An assertion the runtrace did not record
+  is read from the glibc, Microsoft C runtime, BSD or musl assertion message
+  (new `corpus::assertion` parsers). A crash filed as the format-string bug
+  compares as the crash its sanitizer reported, and else is confirmed by the
+  format-string oracle at its call. Each of them used to replay as MISMATCH;
+  an assertion as `no crash: signal 6 (SIGABRT)`. A capability finding saves
+  the corpus entry that reached it as its `testcase.bin`.
+- An uninitialized-memory finding from the MSan corpus replay ships the queue
+  entry as `testcase.bin`, MSan's report as `sanitizer.log`, the function from
+  the report's frame and the `main_msan` build as its fixture, so `bhf replay`
+  runs the MSan build and reports MATCH and replay.py reproduces the read. It
+  used to carry only `finding.json`. The C driver says so, and exits 2, when it
+  cannot open its input; it exited 0, so a replay of a missing input passed.
+- An out-of-memory finding (BHF-209) records the `--rss-limit-mb` it ran
+  past, and `bhf replay` and `bhf minimize` run its testcase under that limit
+  and count running past it as reproducing the finding. They used to run it
+  with no cap, so the testcase really allocated (gigabytes, on the operator's
+  machine) and the replay reported MISMATCH.
+- `bhf minimize` (and the binary minimizer and replay) remove their scratch
+  directory on every exit path. One whose testcase did not reproduce left an
+  empty `minimize_tmp/` in the finding's evidence bundle.
+- `bhf replay` and the capture replay keep the runtrace shim out of JVM, CLR,
+  Node and interpreter launchers, as fuzzing does. Preloaded, it hung the CLR
+  (which ignored SIGTERM), so every C# finding replayed as a timeout
+  MISMATCH. A replay that times out kills the harness's whole process group.
 - `--target-transport agent:serial:PATH` opens the port raw (8N1, no flow
   control, echo, line editing or newline translation) and bounds every read by
   `--timeout`, on Linux and Windows, and takes `,baud=N`. The tty stayed in its

@@ -73,6 +73,13 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("    branches: [main, rtos-radar-fuzzing]", self.source)
         self.assertIn("  workflow_dispatch:\n", self.source)
 
+    def test_the_llm_feature_unit_tests_run(self):
+        # Type-checking the feature leaves its tests unrun.
+        self.assertIn(
+            "          cargo test --locked -p bhf --features llm --lib llm::\n",
+            self.jobs["build-test"],
+        )
+
     def test_all_ci_cargo_commands_use_the_lockfile(self):
         commands = re.findall(r"(?m)^\s*(?:run: )?cargo (?:\+\S+ )?(?:build|check|test|clippy) (.*)$", self.source)
         self.assertTrue(commands)

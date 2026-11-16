@@ -157,7 +157,15 @@ impl Refusal {
             Refusal::NotACrash { classification } if is_oracle_classification(classification) => {
                 format!(
                     "it is an oracle finding (a behavioral check fired, not a sanitizer crash); \
-                 {command} works from a sanitizer crash"
+                 {command} works from a sanitizer crash{}",
+                    oracle_lanes_note(tool)
+                )
+            }
+            Refusal::NotACrash { classification } if classification == "capability" => {
+                format!(
+                    "it is an input-triggered capability finding, not a sanitizer crash; \
+                 {command} works from a sanitizer crash{}",
+                    oracle_lanes_note(tool)
                 )
             }
             Refusal::NotACrash { classification } if classification.is_empty() => format!(
@@ -244,6 +252,16 @@ impl Refusal {
                 language_name(language)
             ),
         }
+    }
+}
+
+/// For `bhf capsule`, the lanes whose oracle and capability findings it
+/// packages.
+fn oracle_lanes_note(tool: Tool) -> &'static str {
+    if tool == Tool::Capsule {
+        " (it packages oracle and capability findings of C and C++ harnesses)"
+    } else {
+        ""
     }
 }
 
@@ -343,7 +361,9 @@ pub(crate) fn select(work_dir: &Path, only: Option<&str>, tool: Tool) -> anyhow:
                 .raw
                 .get("classification")
                 .and_then(Value::as_str)
-                .is_some_and(|class| class == "unhandled" || is_oracle_classification(class))
+                .is_some_and(|class| {
+                    class == "unhandled" || class == "capability" || is_oracle_classification(class)
+                })
         });
     }
     records.sort_by(|a, b| a.id.cmp(&b.id));
@@ -435,10 +455,15 @@ pub(crate) fn assess(
         .get("classification")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if classification != "unhandled" {
-        return Err(Refusal::NotACrash {
-            classification: classification.to_owned(),
-        });
+    let not_a_crash = || Refusal::NotACrash {
+        classification: classification.to_owned(),
+    };
+    // A capsule of an oracle or capability finding shows it the way `bhf
+    // replay` does, on a lane whose replays the runtrace shim records.
+    let shown_by_replay =
+        classification == "capability" || is_oracle_classification(classification);
+    if classification != "unhandled" && !(tool == Tool::Capsule && shown_by_replay) {
+        return Err(not_a_crash());
     }
     let harness_id = finding
         .raw
@@ -476,6 +501,9 @@ pub(crate) fn assess(
             language,
         });
     };
+    if shown_by_replay && !lane.shows_oracle_findings() {
+        return Err(not_a_crash());
+    }
     if let Some(reason) = lane.tool_gap(tool) {
         return Err(Refusal::ToolNotForLane {
             harness_id,
@@ -1367,6 +1395,12 @@ pub(crate) trait Lane: Sync {
     fn compares_identity(&self) -> bool {
         false
     }
+    /// Whether a rebuilt PoC of this lane shows an oracle or capability
+    /// finding: the runtrace shim records a native C or C++ harness's run,
+    /// and the C runtime prints a failed assertion.
+    fn shows_oracle_findings(&self) -> bool {
+        false
+    }
     /// The built harness executable that perturbation analysis and
     /// environment capture replay.
     fn harness_binary(&self, work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
@@ -1553,10 +1587,22 @@ pub(crate) fn replay_poc(
     protocol: crate::protocol_detect::HarnessProtocol,
     timeout: Duration,
 ) -> std::io::Result<ReplayOutput> {
+    replay_poc_with_env(capsule, input, protocol, timeout, &[])
+}
+
+/// [`replay_poc`] with `env` set on top of the offline replay's environment.
+pub(crate) fn replay_poc_with_env(
+    capsule: &Path,
+    input: &str,
+    protocol: crate::protocol_detect::HarnessProtocol,
+    timeout: Duration,
+    env: &[(String, String)],
+) -> std::io::Result<ReplayOutput> {
     use crate::protocol_detect::HarnessProtocol;
     let capsule = &std::path::absolute(capsule)?;
     let mut command = Command::new(poc_path(capsule));
     configure_offline_replay(&mut command);
+    command.envs(env.iter().map(|(key, value)| (key, value)));
     command.current_dir(capsule);
     match protocol {
         HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
@@ -1918,6 +1964,10 @@ impl Lane for CFamilyLane {
         self.glue.is_none()
     }
 
+    fn shows_oracle_findings(&self) -> bool {
+        self.glue.is_none()
+    }
+
     fn tool_gap(&self, tool: Tool) -> Option<&'static str> {
         match tool {
             Tool::Cartography if self.glue.is_some() => Some(CARTOGRAPHY_GAP),
@@ -1997,7 +2047,12 @@ pub(crate) fn sanitizer_finding_identity(
     capsule_path: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Value> {
     let sanitizer = recorded_sanitizer(finding)?;
-    let rule_id = finding.get("rule_id").and_then(Value::as_str);
+    // A crash `bhf auto` filed as the format-string bug is compared as the
+    // crash its sanitizer reported.
+    let rule_id = finding
+        .pointer("/format_string/crash_rule_id")
+        .or_else(|| finding.get("rule_id"))
+        .and_then(Value::as_str);
     let exception = finding.get("exception")?;
     let text = |key: &str| exception.get(key).and_then(Value::as_str);
     let name = text("name");
@@ -4797,12 +4852,18 @@ mod tests {
             &fdir,
             json!({"id": "F-1", "classification": "oracle_hit", "harness_id": "H-C0001"}),
         );
-        let refusal = assess(work, &oracle, Tool::Capsule).err().unwrap();
+        let refusal = assess(work, &oracle, Tool::Cartography).err().unwrap();
         assert!(
-            refusal.reason(Tool::Capsule).contains("oracle finding"),
+            refusal.reason(Tool::Cartography).contains("oracle finding"),
             "{}",
-            refusal.reason(Tool::Capsule)
+            refusal.reason(Tool::Cartography)
         );
+        // A capsule takes a C or C++ oracle finding, so this one gets as far
+        // as looking for its harness.
+        assert!(matches!(
+            assess(work, &oracle, Tool::Capsule),
+            Err(Refusal::HarnessNotFound { .. })
+        ));
 
         let missing = finding(
             &fdir,
@@ -4833,6 +4894,19 @@ mod tests {
             refusal.reason(Tool::Cartography),
             "harness H-A0003 is an Ada harness, and bhf cartography maps the AddressSanitizer \
              reports of C and C++ harnesses only"
+        );
+        // An Ada oracle finding is not one a capsule shows.
+        let ada_oracle = finding(
+            &fdir,
+            json!({"id": "F-1", "classification": "oracle_hit", "harness_id": "H-A0003"}),
+        );
+        let reason = assess(work, &ada_oracle, Tool::Capsule)
+            .err()
+            .unwrap()
+            .reason(Tool::Capsule);
+        assert!(
+            reason.contains("oracle finding") && reason.contains("C and C++ harnesses"),
+            "{reason}"
         );
 
         let no_input = finding(
@@ -4908,17 +4982,31 @@ mod tests {
             &json!({"id": "F-2", "classification": "oracle_hit", "harness_id": "H-C0001"})
                 .to_string(),
         );
-        let sweep = select(work, None, Tool::Capsule).unwrap();
+        let sweep = select(work, None, Tool::Cartography).unwrap();
         assert_eq!(sweep.considered, 1);
         assert_eq!(sweep.refused.len(), 1);
         assert!(
             sweep.refused[0]
                 .refusal
-                .reason(Tool::Capsule)
+                .reason(Tool::Cartography)
                 .contains("oracle finding"),
             "{}",
-            sweep.refused[0].refusal.reason(Tool::Capsule)
+            sweep.refused[0].refusal.reason(Tool::Cartography)
         );
+        // A capsule sweep counts it and capability findings too; this one's
+        // harness is missing.
+        write(
+            &work.join("results/findings/F-3/finding.json"),
+            &json!({"id": "F-3", "classification": "capability", "harness_id": "H-C0001"})
+                .to_string(),
+        );
+        write(&work.join("results/findings/F-3/testcase.bin"), "x");
+        let sweep = select(work, None, Tool::Capsule).unwrap();
+        assert_eq!(sweep.considered, 2);
+        assert!(sweep
+            .refused
+            .iter()
+            .all(|refused| matches!(refused.refusal, Refusal::HarnessNotFound { .. })));
 
         // A work dir whose runs recorded nothing has no findings dir at all.
         let empty = tempfile::tempdir().unwrap();

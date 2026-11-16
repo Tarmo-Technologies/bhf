@@ -5055,7 +5055,7 @@ pub(crate) fn lane_sink_oracles(lang: crate::auto::candidate::Lang) -> LaneSinkO
 /// An interpreter/VM launcher harness (`main` is a launcher script), whose
 /// language-aware driver owns coverage and finding classification, so the
 /// native runtrace shim is not preloaded into it.
-fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
+pub(crate) fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
     use clap::ValueEnum as _;
     std::fs::read_to_string(harness_dir.join("main"))
         .map(|s| {

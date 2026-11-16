@@ -44,10 +44,29 @@ sub bug_cwe {
     return '';    # generic die = normal Perl error handling, suppressed
 }
 
+# The target's frames at the last die, innermost first, as `function @ file:line`
+# (at most 5), without this driver's and the harness's own frames. A __DIE__ hook
+# records them where the die happened; the message's own `at FILE line N` is
+# trimmed from the finding line.
+my @DIE_FRAMES;
+sub capture_die_frames {
+    @DIE_FRAMES = ();
+    # Frame $i is where the sub named by frame $i + 1 was running.
+    for (my $i = 0; my @here = caller($i); $i++) {
+        next if $here[1] eq __FILE__ || $here[1] eq $harness || $here[1] =~ /^\(eval/;
+        my @in = caller($i + 1);
+        my $function = @in ? $in[3] : 'main';
+        push @DIE_FRAMES, "$function @ $here[1]:$here[2]";
+        last if @DIE_FRAMES >= 5;
+    }
+}
+
 sub run_input {
     my ($data) = @_;
     Devel::BhfCov::reset_prev();
+    @DIE_FRAMES = ();
     my $ok = eval {
+        local $SIG{__DIE__} = \&capture_die_frames;
         bhfgen::bhf_run_one($data);
         1;
     };
@@ -72,6 +91,7 @@ sub report_finding {
     # Marker mirrors the JVM/Python drivers; the engine's parse_perl_finding maps
     # the CWE token to a BHF rule.
     print STDERR "== bhf perl finding: $cwe: $msg\n";
+    print STDERR "== bhf frame: $_\n" for @DIE_FRAMES;
     exit($FINDING_HALT);
 }
 

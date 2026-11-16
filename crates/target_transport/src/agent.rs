@@ -97,8 +97,12 @@ pub fn write_input_frame<W: Write>(writer: &mut W, input: &[u8]) -> Result<()> {
             input.len()
         ))
     })?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(input)?;
+    // One write: a length word sent alone, then the input, waits on the
+    // peer's delayed ACK over TCP (Nagle), ~40 ms per input.
+    let mut frame = Vec::with_capacity(4 + input.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(input);
+    writer.write_all(&frame)?;
     writer.flush()?;
     Ok(())
 }

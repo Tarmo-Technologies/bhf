@@ -308,6 +308,46 @@ struct TargetEntry<'a> {
     /// (omitted) for a target that never fuzzed.
     #[serde(skip_serializing_if = "Option::is_none")]
     behavioral_oracles: Option<BehavioralOracles>,
+    /// Nearly every input the driver ran ended in a nil-value error: the
+    /// harness most likely calls the target without the object or state it
+    /// needs, so the run exercised the error path, not the target. Omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stub_executed: Option<StubExecuted>,
+}
+
+/// The share of a target's first inputs that ended in a nil-value error, when
+/// it is at least [`STUB_EXECUTED_PERCENT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StubExecuted {
+    executions: u64,
+    nil_errors: u64,
+    note: String,
+}
+
+/// The share of nil-value errors at which a target is flagged.
+const STUB_EXECUTED_PERCENT: u64 = 95;
+/// Fewer inputs than this say nothing either way.
+const STUB_EXECUTED_MIN_RUNS: u64 = 20;
+
+/// [`StubExecuted`] from the counts the Lua driver writes beside the harness
+/// (`lua_nil_errors.json`, over its first 1000 inputs).
+fn target_stub_executed(harness_dir: &std::path::Path) -> Option<StubExecuted> {
+    let bytes = std::fs::read(harness_dir.join("lua_nil_errors.json")).ok()?;
+    let counts: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let executions = counts.get("executions")?.as_u64()?;
+    let nil_errors = counts.get("nil_errors")?.as_u64()?;
+    let flagged = executions >= STUB_EXECUTED_MIN_RUNS
+        && nil_errors.saturating_mul(100) >= executions.saturating_mul(STUB_EXECUTED_PERCENT);
+    flagged.then(|| StubExecuted {
+        executions,
+        nil_errors,
+        note: format!(
+            "{nil_errors} of the first {executions} inputs ended in a nil-value error, so \
+             the harness most likely calls the target without the object or state it \
+             needs; a clean result here says nothing about the target"
+        ),
+    })
 }
 
 /// Which behavioral sink oracles a fuzzed target ran with, and why.
@@ -587,7 +627,38 @@ fn annotate_findings_with_fidelity(
             .get(harness_id)
             .copied()
             .unwrap_or(&static_record);
-        let fidelity = with_discovery_sanitizers(fidelity, obj.get("discovery"));
+        let mut fidelity = with_discovery_sanitizers(fidelity, obj.get("discovery"));
+        // An MSan corpus-replay finding ran under the harness's MSan build,
+        // not the sanitizers its fuzz passes armed.
+        let msan = obj
+            .get("exception")
+            .and_then(|exception| exception.get("sanitizer"))
+            .and_then(serde_json::Value::as_str)
+            == Some("msan");
+        if msan {
+            fidelity.sanitizers = actionability::FidelityDimension::exercised(
+                "ran under msan (the MSan build replayed the corpus)",
+            );
+        }
+        // A SEGV on a fixed device-register address is the missing device: an
+        // environment result, at low severity, with the peripheral unexercised.
+        let register_fault = crate::auto::mmio_registers::register_fault(&before);
+        if let Some(fault) = &register_fault {
+            let reason = fault.describe(source_root);
+            fidelity.hardware_peripherals =
+                actionability::FidelityDimension::not_exercised(reason.clone());
+            obj.insert(
+                "environment_origin".to_owned(),
+                serde_json::json!({
+                    "kind": "mmio_register",
+                    "fault_address": format!("{:#x}", fault.fault),
+                    "register_address": format!("{:#x}", fault.register.address),
+                    "register": fault.register.name,
+                    "note": reason,
+                }),
+            );
+            obj.insert("severity".to_owned(), serde_json::json!("low"));
+        }
         let Ok(value) = serde_json::to_value(&fidelity) else {
             continue;
         };
@@ -624,13 +695,35 @@ fn annotate_findings_with_fidelity(
                 obj.remove("fuzzing_build_mode_note");
             }
         }
+        if register_fault.is_some() {
+            // The verdict and impact follow the environment origin.
+            let mode = raw
+                .pointer("/actionability/mode")
+                .cloned()
+                .and_then(|mode| serde_json::from_value::<actionability::RunMode>(mode).ok())
+                .unwrap_or_default();
+            if let Some(obj) = raw.as_object_mut() {
+                obj.remove("actionability");
+            }
+            let recomputed = actionability::value_for_finding(mode, &raw, Some(&path));
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("actionability".to_owned(), recomputed);
+            }
+        }
         if raw == before {
             continue;
         }
         corpus::finding::append_history(
             &mut raw,
             "auto",
-            &["fidelity", "fidelity_caveat", "fuzzing_build_mode_note"],
+            &[
+                "fidelity",
+                "fidelity_caveat",
+                "fuzzing_build_mode_note",
+                "environment_origin",
+                "severity",
+                "actionability",
+            ],
         );
         match serde_json::to_vec_pretty(&raw) {
             Ok(serialized) => {
@@ -1522,6 +1615,7 @@ pub fn write_reports_with_output_limit(
             },
             lanes: crate::auto::lanes::read(&r.harness_dir),
             behavioral_oracles: target_behavioral_oracles(r),
+            stub_executed: target_stub_executed(&r.harness_dir),
         })
         .collect();
 
@@ -3741,6 +3835,9 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
             oracles.status, oracles.reason
         ));
     }
+    if let Some(stub) = &t.stub_executed {
+        line.push_str(&format!("  [!] stub executed: {}", stub.note));
+    }
     line
 }
 
@@ -3980,6 +4077,28 @@ mod tests {
         assert!(unforced_record.get("forced").is_none());
         assert!(unforced_record.get("history").is_none());
         assert_eq!(unforced_record["actionability"]["confidence"], "high");
+    }
+
+    /// A Lua target is flagged when at least 95% of its first inputs ended in
+    /// a nil-value error, and not below that or on too few inputs.
+    #[test]
+    fn a_target_whose_inputs_nearly_all_hit_nil_is_flagged_stub_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let counts = |executions: u64, nil_errors: u64| {
+            std::fs::write(
+                dir.path().join("lua_nil_errors.json"),
+                serde_json::json!({"executions": executions, "nil_errors": nil_errors}).to_string(),
+            )
+            .unwrap();
+            target_stub_executed(dir.path())
+        };
+        let flagged = counts(1000, 990).expect("99% is flagged");
+        assert!(flagged.note.starts_with("990 of the first 1000 inputs"));
+        assert!(counts(1000, 950).is_some());
+        assert!(counts(1000, 949).is_none());
+        assert!(counts(10, 10).is_none(), "too few inputs");
+        std::fs::remove_file(dir.path().join("lua_nil_errors.json")).unwrap();
+        assert!(target_stub_executed(dir.path()).is_none());
     }
 
     #[test]

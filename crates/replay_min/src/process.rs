@@ -97,6 +97,17 @@ pub struct ProcessGroupGuard {
     slot: Option<usize>,
 }
 
+/// How a guarded run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The child exited on its own.
+    Exited,
+    /// It was still running at the timeout and was killed.
+    TimedOut,
+    /// The caller's watchdog asked for it to be killed.
+    Stopped,
+}
+
 /// How many live process groups the signal handler can kill.
 pub const GUARDED_GROUPS: usize = 64;
 
@@ -144,22 +155,8 @@ impl ProcessGroupGuard {
         child: &mut Child,
         timeout: Duration,
     ) -> std::io::Result<(Option<ExitStatus>, bool)> {
-        let deadline = Instant::now() + timeout;
-        let timed_out = loop {
-            if leader_exited(child)? {
-                break false;
-            }
-            if Instant::now() >= deadline {
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        self.kill_and_release();
-        if timed_out {
-            let _ = child.kill();
-            return Ok((child.wait().ok(), true));
-        }
-        child.wait().map(|status| (Some(status), false))
+        let (status, ended) = self.wait_then_kill_unless(child, timeout, |_| false)?;
+        Ok((status, ended == Ended::TimedOut))
     }
 
     #[cfg(not(unix))]
@@ -169,6 +166,56 @@ impl ProcessGroupGuard {
         timeout: Duration,
     ) -> std::io::Result<(Option<ExitStatus>, bool)> {
         wait_with_timeout(child, timeout)
+    }
+
+    /// [`Self::wait_then_kill`], also ending the run early when `stop`, asked
+    /// with the child's pid every few milliseconds while it runs, says so (a
+    /// memory watchdog). Returns how the run ended.
+    #[cfg(unix)]
+    pub fn wait_then_kill_unless(
+        &mut self,
+        child: &mut Child,
+        timeout: Duration,
+        mut stop: impl FnMut(u32) -> bool,
+    ) -> std::io::Result<(Option<ExitStatus>, Ended)> {
+        let deadline = Instant::now() + timeout;
+        let ended = loop {
+            if leader_exited(child)? {
+                break Ended::Exited;
+            }
+            if Instant::now() >= deadline {
+                break Ended::TimedOut;
+            }
+            if stop(child.id()) {
+                break Ended::Stopped;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        self.kill_and_release();
+        if ended != Ended::Exited {
+            let _ = child.kill();
+            return Ok((child.wait().ok(), ended));
+        }
+        child.wait().map(|status| (Some(status), Ended::Exited))
+    }
+
+    /// [`Self::wait_then_kill`]; `stop` is not consulted on this platform.
+    #[cfg(not(unix))]
+    pub fn wait_then_kill_unless(
+        &mut self,
+        child: &mut Child,
+        timeout: Duration,
+        _stop: impl FnMut(u32) -> bool,
+    ) -> std::io::Result<(Option<ExitStatus>, Ended)> {
+        let (status, timed_out) = wait_with_timeout(child, timeout)?;
+        Ok((
+            status,
+            if timed_out {
+                Ended::TimedOut
+            } else {
+                Ended::Exited
+            },
+        ))
     }
 
     /// SIGKILL the group (once), then take it out of the signal handler's

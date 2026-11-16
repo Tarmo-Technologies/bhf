@@ -1479,6 +1479,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/mmio_registers.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/mod.rs",
       "license": "Apache-2.0"
     },
@@ -1832,6 +1836,10 @@
     },
     {
       "path": "crates/cli/src/replay_debugger.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/replay_oracle.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2307,6 +2315,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_interpreted_finding_locations.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_interpreted_numeric_dictionary.rs",
       "license": "Apache-2.0"
     },
@@ -2359,7 +2371,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_lua_hook.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_lua_lane.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_lua_methods.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2383,7 +2403,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_mmio_register_fault.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_modules_ts_flag.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_msan_finding_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2416,6 +2444,10 @@
     },
     {
       "path": "crates/cli/tests/auto_resume_build_context.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_rss_limit_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2767,6 +2799,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/oracle_findings_minimize_capsule.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/output_sink.rs",
       "license": "Apache-2.0"
     },
@@ -2808,6 +2844,10 @@
     },
     {
       "path": "crates/cli/tests/replay_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/replay_oracle_findings.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2863,6 +2903,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/support_test_bin.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/target_selection_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2880,6 +2924,10 @@
     },
     {
       "path": "crates/cli/tests/transport_agent_serial_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_dictionary_grammar_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2988,6 +3036,10 @@
     },
     {
       "path": "crates/corpus/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/src/assertion.rs",
       "license": "Apache-2.0"
     },
     {

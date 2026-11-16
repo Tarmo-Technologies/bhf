@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod assertion;
 pub mod bridge;
 pub mod classify;
 pub mod cluster;

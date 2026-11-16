@@ -169,6 +169,49 @@ fn start_toy_service() -> u16 {
     port
 }
 
+/// The toy service, except that the WRITE through an escaped path, which the
+/// toy service answers with the boundary status, kills the session instead:
+/// the connection closes with no reply, as a service that crashes on the
+/// request does. It goes on accepting new connections.
+fn start_aborting_toy_service() -> u16 {
+    fn serve(mut stream: TcpStream) {
+        stream.set_nodelay(true).ok();
+        let mut current_handle: Option<u32> = None;
+        let mut tainted = false;
+        loop {
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).is_err() {
+                return;
+            }
+            let mut frame = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+            if stream.read_exact(&mut frame).is_err() {
+                return;
+            }
+            let reply = handle_frame(&frame, &mut current_handle, &mut tainted);
+            if reply == [0xEF] {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            let reply_len = (reply.len() as u16).to_be_bytes();
+            if stream
+                .write_all(&reply_len)
+                .and_then(|()| stream.write_all(&reply))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind aborting toy service");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || serve(stream));
+        }
+    });
+    port
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -255,6 +298,83 @@ fn session_campaign_over_tcp_reaches_boundary_and_records_evidence() {
     assert!(finding_dir.join("finding.json").is_file());
 
     std::fs::remove_dir_all(&work_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// A session the service drops is a crash finding; a service that is gone
+// stops the campaign
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_session_the_service_drops_is_a_finding_and_the_campaign_goes_on() {
+    let port = start_aborting_toy_service();
+    let work_dir = temp_dir("disconnect");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(work_dir.path())
+        .args(["--harness", "H-session", "--protocol-profile"])
+        .arg(toy_profile_path())
+        .args(["--session-transport", &format!("tcp:127.0.0.1:{port}")])
+        .args(["--iterations", "1500"])
+        .output()
+        .expect("run bhf fuzz");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the campaign goes on:\n{stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("summary ({e}):\n{stderr}"));
+    assert_eq!(summary["executions"], 1500, "{summary:#}");
+    assert!(summary["crashes"].as_u64().unwrap() >= 1, "{summary:#}");
+    assert_eq!(
+        summary["findings"].as_array().unwrap().len(),
+        1,
+        "{summary:#}"
+    );
+
+    let finding = find_session_finding(&work_dir).expect("a session finding");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(raw["rule_id"], "BHF-210", "{raw:#}");
+    assert_eq!(raw["oracle"]["name"], "session-disconnect");
+    assert_eq!(raw["oracle"]["api"], "WRITE");
+
+    // The dropped session replays as one the service drops again.
+    let replay = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["replay", "--finding"])
+        .arg(&finding)
+        .output()
+        .expect("run bhf replay");
+    let shown = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay.status.success() && shown.starts_with("MATCH"),
+        "{shown}\n{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+}
+
+#[test]
+fn a_service_that_refuses_three_connections_in_a_row_stops_the_campaign() {
+    // A port nothing listens on.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let work_dir = temp_dir("refused");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(work_dir.path())
+        .args(["--harness", "H-session", "--protocol-profile"])
+        .arg(toy_profile_path())
+        .args(["--session-transport", &format!("tcp:127.0.0.1:{port}")])
+        .args(["--iterations", "50"])
+        .output()
+        .expect("run bhf fuzz");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("3 connection attempts in a row failed"),
+        "{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

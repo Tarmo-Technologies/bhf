@@ -119,10 +119,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # The pinned dist tarball, its download retried and its SHA-256 checked.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: "bash scripts/ci/install-cargo-dist.sh"
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -164,10 +163,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        # The pinned dist tarball, its download retried and its SHA-256 checked.
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: "bash scripts/ci/install-cargo-dist.sh"
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -278,7 +276,7 @@ jobs:
             dist_args: "--artifacts=local --target=x86_64-unknown-linux-gnu"
             install_dist:
               shell: sh
-              run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+              run: "bash scripts/ci/install-cargo-dist.sh"
             cache_provider: github
           - runner: windows-2022
             host: x86_64-pc-windows-msvc
@@ -328,7 +326,7 @@ jobs:
         if: ${{ matrix.container }}
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            bash scripts/ci/install-rustup.sh -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
@@ -364,9 +362,9 @@ jobs:
               set -euo pipefail
               # Trust only the host-owned checkout mounted in this container.
               git config --global --add safe.directory "$PWD"
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              bash scripts/ci/install-rustup.sh -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
-              curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+              bash scripts/ci/install-cargo-dist.sh
               # Bash 4.2 treats empty arrays as unset under nounset. Publishing
               # always requires a tag, validated before this job starts work.
               : "${RELEASE_TAG:?release tag is required}"

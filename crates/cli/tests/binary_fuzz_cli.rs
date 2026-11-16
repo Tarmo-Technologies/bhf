@@ -216,6 +216,76 @@ fn ci_fails_on_binary_crash_findings() {
     );
 }
 
+/// Aborts when its stdin starts with `FU`.
+#[cfg(unix)]
+const ABORT_ON_FU: &str = "#include <stdio.h>\n#include <stdlib.h>\n\
+                           int main(void) {\n  char b[2] = {0};\n  \
+                           if (fread(b, 1, 2, stdin) == 2 && b[0] == 'F' && b[1] == 'U') abort();\n  \
+                           return 0;\n}\n";
+
+/// Without afl-qemu, the builtin engine mutates the seeds blindly up to
+/// `--iterations`, and its run JSON says it is the degraded engine. It used
+/// to run each seed once and write a run JSON that read as a clean pass.
+#[cfg(unix)]
+#[test]
+fn the_builtin_engine_mutates_its_seeds_and_says_it_is_degraded() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    }
+    let root = temp_dir("blind-havoc");
+    fs::write(root.join("fu.c"), ABORT_ON_FU).unwrap();
+    let elf = root.join("fu");
+    assert_success(
+        Command::new("cc")
+            .arg(root.join("fu.c"))
+            .arg("-o")
+            .arg(&elf)
+            .output()
+            .unwrap(),
+    );
+    let fuzz = |work: &str, iterations: &str| {
+        let out = Command::new(bhf_bin())
+            .arg("binary-fuzz")
+            .arg(&elf)
+            .args(["--work-dir", root.join(work).to_str().unwrap()])
+            .args(["--engine", "builtin", "--input-mode", "stdin"])
+            // One arithmetic mutation of the first byte from the abort.
+            .args(["--seed-input", "AU", "--rng-seed", "1"])
+            .args(["--iterations", iterations])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+    };
+
+    // The seed alone does not abort.
+    let seed_only = fuzz("work-seed", "1");
+    assert_eq!(seed_only["findings"], json!([]), "{seed_only:#}");
+    assert_eq!(seed_only["fidelity"]["mutated_inputs"], 0);
+
+    let run = fuzz("work-havoc", "2000");
+    assert_eq!(run["engine"], "builtin", "{run:#}");
+    assert_eq!(run["degraded"], true);
+    assert!(run["degraded_reason"]
+        .as_str()
+        .unwrap()
+        .contains("no coverage feedback"));
+    assert_eq!(run["fidelity"]["coverage"], "none");
+    assert_eq!(run["findings"].as_array().unwrap().len(), 1, "{run:#}");
+    assert!(run["executions"].as_u64().unwrap() <= 2000);
+    let finding = read_json(&root.join("work-havoc/results/findings/BF-0001/finding.json"));
+    let testcase = fs::read(root.join("work-havoc/results/findings/BF-0001/testcase.bin")).unwrap();
+    assert!(testcase.starts_with(b"FU"), "{testcase:?}");
+    assert_eq!(finding["lineage"]["depth"], 1, "{finding:#}");
+    assert_eq!(finding["lineage"]["origin"], "user_seed");
+}
+
 #[cfg(unix)]
 fn write_executable(path: &Path, source: &str) {
     fs::write(path, source).unwrap();

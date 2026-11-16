@@ -581,12 +581,17 @@ pub(crate) struct CRun {
     /// The variables the harness was given on top of the inherited
     /// environment.
     pub(crate) env: Vec<(String, String)>,
+    /// The RSS limit in MB the harness ran past, when it was killed for it.
+    pub(crate) rss_exceeded: Option<usize>,
 }
 
 impl CRun {
     /// The crash this run reported: a sanitizer report, or an undiagnosed
     /// fatal signal shaped the way the fuzz loop records one.
     pub(crate) fn report(&self) -> Option<corpus::SanitizerReport> {
+        if self.rss_exceeded.is_some() {
+            return Some(crate::fuzz::rss_limit_report());
+        }
         let stderr = String::from_utf8_lossy(&self.stderr);
         corpus::parse_sanitizer_report(&stderr).or_else(|| {
             let status = self.status.filter(|_| !self.timed_out)?;
@@ -694,8 +699,14 @@ pub(crate) fn replay_env(
 
     // The host LD_PRELOAD runtrace shim is a HOST .so, so it is injected only
     // for a NATIVE replay — never forced into a foreign process running under
-    // qemu-user (#81).
-    if runner.qemu_prefix().is_none() {
+    // qemu-user (#81) — and, as when fuzzing, never into an interpreter or VM
+    // launcher: the runtime's own startup trips it, and the CLR hangs under
+    // it until the replay times out.
+    let launcher = runner
+        .harness_path()
+        .parent()
+        .is_some_and(crate::auto::attempt::harness_owns_runtime_instrumentation);
+    if runner.qemu_prefix().is_none() && !launcher {
         if let Some(shim) = crate::auto::shim_path::locate() {
             env.push((
                 "LD_PRELOAD".to_owned(),
@@ -736,7 +747,28 @@ pub(crate) fn run_c_testcase_with_env(
         .into_iter()
         .chain(extra_env.iter().cloned())
         .collect();
-    run_c_harness(runner, input, testcase_path, timeout, &env)
+    run_c_harness(
+        runner,
+        input,
+        testcase_path,
+        timeout,
+        &env,
+        recorded_rss_limit_mb(raw),
+    )
+}
+
+/// The `--rss-limit-mb` a replay of finding `raw` runs under: the one it
+/// recorded, else, for an out-of-memory finding recorded without it, `bhf
+/// auto`'s default, so its testcase cannot allocate the host's memory.
+pub(crate) fn recorded_rss_limit_mb(raw: &Value) -> Option<usize> {
+    raw.get("rss_limit_mb")
+        .and_then(Value::as_u64)
+        .and_then(|mb| usize::try_from(mb).ok())
+        .filter(|mb| *mb > 0)
+        .or_else(|| {
+            (raw.get("rule_id").and_then(Value::as_str) == Some("BHF-209"))
+                .then(crate::auto::cli::default_auto_rss_limit_mb)
+        })
 }
 
 /// Run `testcase_path` through a C/C++ harness via `runner` with exactly the
@@ -745,12 +777,17 @@ pub(crate) fn run_c_testcase_with_env(
 /// (a launcher's children too), and its output pipes are drained for a
 /// bounded time after it ends, so a descendant that keeps a pipe open cannot
 /// hang the replay.
+///
+/// With `rss_limit_mb`, the group is also killed as soon as the harness's
+/// resident set passes it, as the fuzz loop's `--rss-limit-mb` watchdog does,
+/// and the run reports that out-of-memory crash.
 pub(crate) fn run_c_harness(
     runner: &HarnessRunner,
     input: CInput,
     testcase_path: &Path,
     timeout: Duration,
     env: &[(String, String)],
+    rss_limit_mb: Option<usize>,
 ) -> Result<CRun, String> {
     use std::process::Stdio;
 
@@ -799,9 +836,15 @@ pub(crate) fn run_c_harness(
     let writer = bytes.and_then(|bytes| replay_min::process::feed_stdin(&mut child, bytes));
     // Whatever the harness left running would keep the pipes open: the wait
     // kills its whole group, before the harness is reaped.
-    let (status, timed_out) = group
-        .wait_then_kill(&mut child, timeout)
+    let (status, ended) = group
+        .wait_then_kill_unless(&mut child, timeout, |pid| {
+            rss_limit_mb.is_some_and(|limit| {
+                crate::fuzz::process_rss_mb(pid).is_some_and(|rss| rss > limit)
+            })
+        })
         .map_err(|error| format!("poll {}: {error}", harness.display()))?;
+    let timed_out = ended == replay_min::process::Ended::TimedOut;
+    let rss_exceeded = rss_limit_mb.filter(|_| ended == replay_min::process::Ended::Stopped);
     let duration = started.elapsed();
     // A harness that exits before reading all of its input closes the pipe;
     // its exit status, not the write, is the result.
@@ -822,6 +865,7 @@ pub(crate) fn run_c_harness(
         stdout: join(stdout),
         stderr: join(stderr),
         env: env.to_vec(),
+        rss_exceeded,
     })
 }
 
@@ -1944,7 +1988,7 @@ pub(crate) fn replay_c(
         return report_error(&output, finding_dir, &error);
     };
     let testcase_path = finding_dir.join("testcase.bin");
-    let trace_env: Vec<(String, String)> = if output.show_args {
+    let mut trace_env: Vec<(String, String)> = if output.show_args {
         vec![(
             corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
             "1".to_owned(),
@@ -1952,6 +1996,23 @@ pub(crate) fn replay_c(
     } else {
         Vec::new()
     };
+    // An oracle, assertion or capability finding is shown again by what the
+    // replay does, which the runtrace shim records.
+    let recorded_oracle = crate::replay_oracle::Recorded::from_finding(&raw);
+    let runtrace_log = match recorded_oracle
+        .as_ref()
+        .map(|_| crate::replay_oracle::RuntraceLog::create())
+        .transpose()
+    {
+        Ok(log) => log,
+        Err(error) => return report_error(&output, finding_dir, &error),
+    };
+    if let Some(log) = &runtrace_log {
+        trace_env.push((
+            "BHF_RUNTRACE_LOG".to_owned(),
+            log.path().display().to_string(),
+        ));
+    }
     let run = match run_c_testcase_with_env(
         &raw,
         runner,
@@ -2001,16 +2062,47 @@ pub(crate) fn replay_c(
             comparison = comparison_again;
         }
     }
-    let verdict = if report.is_some() {
+    let crash_verdict = if report.is_some() {
         comparison.verdict()
     } else {
         crash_identity::Verdict::Mismatch
     };
+    // A finding that is not a crash is the oracle hit or capability it
+    // records; a crash filed as the format-string bug is its crash, or else
+    // the format-string oracle at its call.
+    let observed = recorded_oracle.as_ref().and_then(|recorded| {
+        let events = runtrace_log
+            .as_ref()
+            .map(crate::replay_oracle::RuntraceLog::events)
+            .unwrap_or_default();
+        let observed = crate::replay_oracle::observe(
+            recorded,
+            &events,
+            &String::from_utf8_lossy(&run.stderr),
+            &testcase_path,
+        );
+        let decides = !recorded.is_crash()
+            || (crash_verdict == crash_identity::Verdict::Mismatch && observed.reproduced());
+        decides.then_some(observed)
+    });
+    let verdict = match &observed {
+        Some(observed) if observed.reproduced() => crash_identity::Verdict::Match,
+        Some(_) => crash_identity::Verdict::Mismatch,
+        None => crash_verdict,
+    };
+    if let Some(observed) = &observed {
+        comparison = crash_identity::Comparison {
+            checks: observed.checks.clone(),
+            same_binary,
+        };
+        notes.extend(observed.note.clone());
+    }
     let reproduced = verdict == crash_identity::Verdict::Match;
-    let actual = match (&report, run.timed_out) {
-        (Some(report), _) => report.rule_id.to_owned(),
-        (None, true) => "<timeout>".to_owned(),
-        (None, false) => "<none>".to_owned(),
+    let actual = match (observed.as_ref().map(|o| o.actual.as_deref()), &report) {
+        (Some(Some(rule)), _) => rule.to_owned(),
+        (None, Some(report)) => report.rule_id.to_owned(),
+        _ if run.timed_out => "<timeout>".to_owned(),
+        _ => "<none>".to_owned(),
     };
     let status_line = match verdict {
         crash_identity::Verdict::Match => "MATCH".to_owned(),
@@ -2018,7 +2110,7 @@ pub(crate) fn replay_c(
             "UNVERIFIED recorded={recorded_rule} actual={actual} not_compared={}",
             comparison.not_compared_fields()
         ),
-        crash_identity::Verdict::Mismatch if report.is_some() => format!(
+        crash_identity::Verdict::Mismatch if report.is_some() || observed.is_some() => format!(
             "MISMATCH recorded={recorded_rule} actual={actual} differs={}",
             comparison.differing_fields()
         ),
@@ -2027,7 +2119,7 @@ pub(crate) fn replay_c(
         }
     };
     let mut differences = comparison.difference_lines();
-    if report.is_none() {
+    if report.is_none() && observed.is_none() {
         differences.push(if run.timed_out {
             format!(
                 "no crash: the harness was still running after {}s and was killed",
@@ -2570,6 +2662,7 @@ mod silent_abort_tests {
             &testcase,
             std::time::Duration::from_millis(300),
             &[],
+            None,
         )
         .expect("run");
         assert!(run.timed_out);
@@ -2631,6 +2724,30 @@ mod tests {
                 Some("abort_on_error=1"),
                 "{key}"
             );
+        }
+    }
+
+    /// An interpreter or VM launcher harness replays without the runtrace
+    /// shim, as it fuzzed: the CLR hangs under it until the replay times out.
+    #[test]
+    fn a_launcher_harness_replays_without_the_runtrace_shim() {
+        let dir = crate::test_support::TestDir::new("replay-launcher-env");
+        let raw = serde_json::json!({"rule_id": "BHF-201", "runtime_mode": {"pass": "empty"}});
+        for marker in [
+            "BHF_CS_LAUNCHER",
+            "BHF_JVM_LAUNCHER",
+            "BHF_JS_LAUNCHER",
+            "BHF_PY_LAUNCHER",
+        ] {
+            let main = dir.join("main");
+            std::fs::write(&main, format!("#!/bin/sh\n# {marker}\nexec dotnet run\n")).unwrap();
+            let runner = replay_min::HarnessRunner::direct(&main);
+            let env = super::replay_env(&raw, &runner, super::CInput::ArgvFile);
+            assert!(
+                !env.iter().any(|(key, _)| key == "LD_PRELOAD"),
+                "{marker}: {env:?}"
+            );
+            assert!(env.contains(&("BHF_RUNTRACE_MODE".to_owned(), "empty".to_owned())));
         }
     }
 

@@ -84,10 +84,7 @@ fn swallowed_constraint_error_host_run_emits_expected_finding_when_gnat_availabl
 #[test]
 fn swallowed_constraint_error_aarch64_qemu_run_matches_host_finding_when_tools_available() {
     let Some(tools) = Aarch64Tools::discover() else {
-        eprintln!(
-            "skipping: requires gprbuild, aarch64-linux-gnu-gprbuild, \
-             aarch64-linux-gnu-gnat, and qemu-aarch64"
-        );
+        eprintln!("skipping: requires gprbuild, aarch64-linux-gnu-gnat, and qemu-aarch64");
         return;
     };
 
@@ -130,9 +127,18 @@ fn swallowed_constraint_error_aarch64_qemu_run_matches_host_finding_when_tools_a
 
     let cross_testcase =
         run_harness_qemu(&tools, &cross_exe, &input, &temp.join("cross-events.bin"));
-    let (_cross_finding_dir, cross_finding) =
+    let (_cross_finding_dir, mut cross_finding) =
         emit_finding(&temp.join("cross-corpus"), &input, &cross_testcase);
 
+    // The same finding, written a moment later.
+    let mut host_finding = host_finding;
+    for finding in [&mut host_finding, &mut cross_finding] {
+        finding
+            .as_object_mut()
+            .expect("a finding is an object")
+            .remove("created_at")
+            .expect("a finding records created_at");
+    }
     assert_eq!(cross_finding, host_finding);
 }
 
@@ -297,11 +303,11 @@ struct Aarch64Tools {
 }
 
 impl Aarch64Tools {
+    /// bhf runs `aarch64-linux-gnu-gprbuild` when there is one, else the
+    /// multi-target `gprbuild` with the prefixed GNAT (Debian and Ubuntu ship
+    /// only the latter).
     fn discover() -> Option<Self> {
-        if which::which("gprbuild").is_err()
-            || which::which("aarch64-linux-gnu-gprbuild").is_err()
-            || which::which("aarch64-linux-gnu-gnat").is_err()
-        {
+        if which::which("gprbuild").is_err() || which::which("aarch64-linux-gnu-gnat").is_err() {
             return None;
         }
 

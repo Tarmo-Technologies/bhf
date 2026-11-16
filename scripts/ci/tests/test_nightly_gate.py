@@ -174,11 +174,13 @@ class NightlyWorkflowTests(unittest.TestCase):
     def test_only_the_failure_report_can_write_issues(self):
         self.assertEqual(self.source.count("issues: write"), 1)
         self.assertIn("    permissions:\n      contents: read\n      issues: write\n", self.report)
-        self.assertIn("    needs: [gate, integration]\n", self.report)
+        self.assertIn("    needs: [gate, build, integration]\n", self.report)
         condition = re.search(r"(?m)^    if: (.+)$", self.report)[1]
-        # Runs after a failed or timed-out shard, not after the whole run was
-        # cancelled by a newer one, nor after a skip or a pass.
+        # Runs after a failed or timed-out shard, or a failed archive build,
+        # not after the whole run was cancelled by a newer one, nor after a
+        # skip or a pass.
         self.assertIn("!cancelled()", condition)
+        self.assertIn("needs.build.result == 'failure'", condition)
         self.assertIn("needs.integration.result == 'failure'", condition)
         self.assertIn("needs.integration.result == 'cancelled'", condition)
         self.assertIn("needs.gate.result == 'failure'", condition)

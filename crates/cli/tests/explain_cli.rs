@@ -100,14 +100,22 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
         !text.contains("matched recovered constant") && !text.contains("solved"),
         "no heuristic presented as solved gates:\n{text}"
     );
-    let finding = std::fs::read_dir(work.join("results/findings"))
+    // The minimized crash: a slow run can also save, and minimize, a finding
+    // of another class (an out-of-memory input), whose comparisons the
+    // capture pass does not record.
+    let record: serde_json::Value = std::fs::read_dir(work.join("results/findings"))
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.join("min_testcase.bin").is_file())
-        .expect("a minimized finding");
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+        .filter(|p| p.join("min_testcase.bin").is_file())
+        .map(|p| {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(p.join("finding.json")).unwrap(),
+            )
+            .unwrap()
+        })
+        .find(|record| record["classification"] == "unhandled")
+        .expect("a minimized crash");
     let gates = record["gates"].as_array().expect("finding.json gates");
     assert!(
         gates.iter().any(|g| g["operand_hex"]
