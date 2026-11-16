@@ -2371,6 +2371,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_php_coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_php_lane.rs",
       "license": "Apache-2.0"
     },

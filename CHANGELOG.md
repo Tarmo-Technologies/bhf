@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The PHP lane counts only the lines an input ran as coverage. pcov also
+  lists a loaded file's unexecuted lines (as -1), and counting those made
+  coverage the same for every input, so the fuzzer never saw a gate open; it
+  also filled each harness's `covered-lines.txt` with lines that never ran,
+  which could mark a static finding on them as fuzz-exercised.
 - A TypeScript function's first parameter gets the type its annotation names:
   `decode(data: string)` is passed a string and `parse(text: Uint8Array)` a
   Buffer. The kind used to come from the parameter name alone, so a
