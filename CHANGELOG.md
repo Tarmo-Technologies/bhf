@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz` prints a progress line on stderr while it runs (executions,
+  exec/s, corpus entries, findings, edges, elapsed), 2s in and then at
+  doubling intervals up to every 30s; `--quiet` (`-q`) prints none. It printed
+  nothing until it finished, so a long run looked hung. Workers of
+  `--workers` run quiet.
 - The nightly runs the WinAFL end-to-end tests, which no workflow ran: a
   Windows job builds the pinned WinAFL and DynamoRIO with
   `scripts/ci/build-winafl.ps1` (the DynamoRIO zip's SHA-256 checked), caches

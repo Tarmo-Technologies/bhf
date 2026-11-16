@@ -3724,18 +3724,17 @@ fn run_attempt(
                         findings: 0,
                         is_final: false,
                     });
-                    let tick =
-                        |executions: usize, findings: usize, edges: usize, elapsed: Duration| {
-                            progress.update(&ProgressUpdate {
-                                phase: Phase::Fuzz { pass: pass_label },
-                                elapsed,
-                                budget: time_budget,
-                                executions,
-                                edges,
-                                findings,
-                                is_final: false,
-                            });
-                        };
+                    let tick = |tick: &crate::fuzz::FuzzTick| {
+                        progress.update(&ProgressUpdate {
+                            phase: Phase::Fuzz { pass: pass_label },
+                            elapsed: tick.elapsed,
+                            budget: time_budget,
+                            executions: tick.executions,
+                            edges: tick.edges,
+                            findings: tick.findings,
+                            is_final: false,
+                        });
+                    };
                     let pass_started = std::time::Instant::now();
                     // #383: carry coverage forward — reseed this pass from the
                     // prior passes' persisted, signature-deduped corpus queue so

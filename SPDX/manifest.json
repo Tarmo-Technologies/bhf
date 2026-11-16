@@ -2807,6 +2807,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_progress_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/generate_harness_languages.rs",
       "license": "Apache-2.0"
     },

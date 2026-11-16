@@ -342,6 +342,14 @@ pub struct FuzzArgs {
     #[arg(long = "print-final-stats")]
     pub print_final_stats: bool,
 
+    /// Print no progress lines. Without it the builtin engine prints a status
+    /// line on stderr (executions, exec/s, corpus entries, findings, edges,
+    /// elapsed) 2s into the run, then at doubling intervals up to every 30s,
+    /// so a long run does not look hung. Workers of `--workers` always run
+    /// quiet.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
     /// Resident-memory ceiling in MB for a single C/C++ harness execution
     /// (libFuzzer's `-rss_limit_mb`). An execution whose RSS exceeds this is
     /// killed and reported as an out-of-memory finding. `0` (default) disables
@@ -1493,6 +1501,7 @@ pub fn run(args: FuzzArgs) -> i32 {
     let collector_window_ms = args.collector_window_ms;
     let collector_work_dir = args.work_dir.clone();
     let collector_harness = args.harness.clone();
+    let quiet = args.quiet;
 
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
@@ -1509,8 +1518,14 @@ pub fn run(args: FuzzArgs) -> i32 {
         .find(|(key, _)| key == "BHF_RUNTRACE_LOG")
         .map(|(_, value)| PathBuf::from(value));
 
+    let progress_lines = (!quiet).then(ProgressLines::new);
+    let print_progress = |tick: &FuzzTick| {
+        if let Some(line) = progress_lines.as_ref().and_then(|lines| lines.line(tick)) {
+            bhfeprintln!("{line}");
+        }
+    };
     let result = match prepared.engine {
-        FuzzEngine::Builtin => run_builtin(prepared),
+        FuzzEngine::Builtin => run_builtin_with_progress(prepared, Some(&print_progress)),
         FuzzEngine::AflPlusPlus => run_afl_plus_plus(prepared),
         FuzzEngine::Winafl => winafl::run(prepared),
     };
@@ -1744,15 +1759,64 @@ fn oracle_lane_rules(findings_dir: &Path, harness_id: &str) -> std::collections:
 /// without serialising it. Errors bubble up as `String` (same shape as
 /// [`prepare`] / [`run_builtin`]) so the caller can downgrade them to a
 /// `Built` outcome without losing the original message.
-/// Periodic live-progress callback for the builtin fuzz loop:
-/// `(executions, findings_so_far, elapsed)` sampled at most every
-/// 500ms so the hot loop stays hot.
-/// `(executions, findings, edges, elapsed)`. Edges is the live distinct-edge
+/// Periodic live-progress callback for the builtin fuzz loop, sampled at most
+/// every 500ms so the hot loop stays hot.
+pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(&FuzzTick);
+
+/// A live sample of the builtin fuzz loop. `edges` is the live distinct-edge
 /// count from the coverage tracker (0 for harnesses with no edge runtime): the
 /// dashboard needs coverage growth WHILE a pass runs, not only in the pass
 /// summary, because "no new edge for four minutes" is the signal that the rest
 /// of this target's budget is being wasted.
-pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(usize, usize, usize, Duration);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuzzTick {
+    pub(crate) executions: usize,
+    pub(crate) findings: usize,
+    pub(crate) edges: usize,
+    /// Inputs in the in-memory corpus the mutator draws from.
+    pub(crate) corpus: usize,
+    pub(crate) elapsed: Duration,
+}
+
+/// When `bhf fuzz` prints its progress lines: 2s into the run, then after
+/// as long again as the run has taken, at most 30s apart.
+struct ProgressLines {
+    next: std::cell::Cell<Duration>,
+}
+
+impl ProgressLines {
+    const FIRST: Duration = Duration::from_secs(2);
+    const MAX_GAP: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            next: std::cell::Cell::new(Self::FIRST),
+        }
+    }
+
+    /// The line to print for `tick`, if one is due.
+    fn line(&self, tick: &FuzzTick) -> Option<String> {
+        if tick.elapsed < self.next.get() {
+            return None;
+        }
+        let gap = tick.elapsed.clamp(Self::FIRST, Self::MAX_GAP);
+        self.next.set(tick.elapsed + gap);
+        Some(format_progress_line(tick))
+    }
+}
+
+fn format_progress_line(tick: &FuzzTick) -> String {
+    let secs = tick.elapsed.as_secs_f64();
+    format!(
+        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {} | elapsed: {:.1}s",
+        tick.executions,
+        executions_per_sec(tick.executions, secs),
+        tick.corpus,
+        tick.findings,
+        tick.edges,
+        secs,
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_one_target_programmatic(
@@ -1838,6 +1902,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         max_len: resolve_env_max_len(largest_seed),
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
+        quiet: true,
         // Per-harness memory cap so a fuzzer-controlled huge allocation is caught
         // as an OOM finding (BHF-209) instead of OOM-killing the host (#386).
         rss_limit_mb,
@@ -2085,6 +2150,7 @@ fn afl_programmatic_args(
         max_len,
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
+        quiet: true,
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
@@ -2811,6 +2877,8 @@ fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> 
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     let mut out = vec![
+        // A worker's stderr is its log, whose tail a failed campaign prints.
+        "--quiet".to_owned(),
         "--engine".to_owned(),
         engine_arg_name(args.engine).to_owned(),
         "--mode".to_owned(),
@@ -3911,10 +3979,6 @@ fn format_final_stats(
     )
 }
 
-fn run_builtin(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
-    run_builtin_with_progress(prepared, None)
-}
-
 fn run_builtin_with_progress(
     mut prepared: PreparedFuzzRun,
     progress: Option<FuzzProgressFn<'_>>,
@@ -4771,12 +4835,13 @@ fn run_builtin_with_progress(
         sink_taint.observe(&runtrace_events, &input);
         if let Some(tick) = progress {
             if last_tick.elapsed() >= Duration::from_millis(500) {
-                tick(
+                tick(&FuzzTick {
                     executions,
-                    finding_ids.len(),
-                    cov_tracker.as_ref().map_or(0, |cov| cov.count()),
-                    start.elapsed(),
-                );
+                    findings: finding_ids.len(),
+                    edges: cov_tracker.as_ref().map_or(0, |cov| cov.count()),
+                    corpus: pool.len(),
+                    elapsed: start.elapsed(),
+                });
                 last_tick = Instant::now();
             }
         }
@@ -13968,6 +14033,43 @@ exit 0
     }
 
     #[test]
+    fn progress_lines_come_two_seconds_in_then_at_doubling_gaps_up_to_thirty_seconds() {
+        let lines = ProgressLines::new();
+        let at = |secs: u64| {
+            lines.line(&FuzzTick {
+                executions: 400 * secs as usize,
+                findings: 1,
+                edges: 37,
+                corpus: 5,
+                elapsed: Duration::from_secs(secs),
+            })
+        };
+        assert_eq!(at(1), None);
+        let first = at(2).expect("a line 2s in");
+        assert_eq!(
+            first,
+            "bhf: fuzz: 800 execs (400/s) | corpus: 5 | findings: 1 | edges: 37 | elapsed: 2.0s"
+        );
+        assert_eq!(at(3), None);
+        assert!(at(4).is_some());
+        assert_eq!(at(7), None);
+        assert!(at(8).is_some());
+        assert!(at(16).is_some());
+        assert!(at(32).is_some());
+        // From here at most 30s apart.
+        assert_eq!(at(61), None);
+        assert!(at(62).is_some());
+        assert!(at(92).is_some());
+    }
+
+    #[test]
+    fn workers_run_quiet() {
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
+        assert!(worker_passthrough_args(&args).contains(&"--quiet".to_owned()));
+    }
+
+    #[test]
     fn final_stats_line_reports_execs_rate_corpus_findings() {
         let line = format_final_stats(1000, 12, 988, 3, Duration::from_secs(2));
         assert!(line.contains("execs: 1000 (500/s)"), "{line}");
@@ -15701,6 +15803,7 @@ exit 0
             max_len: DEFAULT_MAX_LEN,
             len_control: DEFAULT_LEN_CONTROL,
             print_final_stats: false,
+            quiet: true,
             rss_limit_mb: 0,
             fork_server: false,
             no_fork_server: false,
