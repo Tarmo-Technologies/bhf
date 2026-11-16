@@ -25,7 +25,12 @@ A `public` method taking a byte buffer (`byte[]`, `ReadOnlySpan<byte>`,
    `ProjectReference` to the owning `.csproj`, alongside a generated
    `BhfEntry.Run(byte[])` shim that decodes the fuzz bytes to the parameter's
    exact static type (`byte[]` straight through, `string` via UTF-8, `Stream` via
-   a `MemoryStream`, spans via the matching wrapper).
+   a `MemoryStream`, spans via the matching wrapper). Every project of that
+   build, the target's own included, writes its `obj/` and `bin/` under the
+   harness (`harnesses/<id>/build/`), through a props file passed as
+   `DirectoryBuildPropsPath` that imports the project's own
+   `Directory.Build.props` first. The source tree is left as it was, and the
+   harnesses of one project build side by side under any `--jobs`.
 3. **Instruments** the target assembly's IL with
    [SharpFuzz](https://github.com/Metalnem/sharpfuzz) (`sharpfuzz <dll>`, Apache-2.0),
    which rewrites every basic block to record edge coverage.

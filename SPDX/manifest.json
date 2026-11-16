@@ -2207,6 +2207,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_csharp_isolation.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_cxx_std_cli.rs",
       "license": "Apache-2.0"
     },

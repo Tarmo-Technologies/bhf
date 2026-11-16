@@ -191,6 +191,10 @@ jobs:
           npm install -g --no-fund --no-audit esbuild@0.28.2
           rustup toolchain install nightly --profile minimal --component llvm-tools-preview
           dotnet tool install --global --version 2.3.0 SharpFuzz.CommandLine
+          # The C# harness restores only from NuGet's global packages folder:
+          # put the SharpFuzz package its project references there.
+          dotnet new classlib --output "$RUNNER_TEMP/sharpfuzz-stage" --force
+          dotnet add "$RUNNER_TEMP/sharpfuzz-stage" package SharpFuzz --version 2.3.0
 
       - name: Check the installed toolchains
         run: |
@@ -217,6 +221,8 @@ jobs:
           cargo +nightly --version
           find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
             -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
+          test -f "$HOME/.nuget/packages/sharpfuzz/2.3.0/.nupkg.metadata" \
+            || { echo "no SharpFuzz 2.3.0 in the NuGet package cache" >&2; exit 1; }
 
       # A Wine prefix's first start takes longer than the fork server waits
       # for a harness, so the first Wine test would run nothing; create it now.

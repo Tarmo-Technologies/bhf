@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- C# harness builds write every project's `obj/` and `bin/` under the
+  harness, not into the source tree. Two harnesses of one project, built at
+  once, raced on the project's `obj/` (MSB4018 in GenerateDepsFile, CS2012),
+  so with the default `--jobs` most targets of a project failed; all build
+  now. A failed build's report leads with its error lines, not the end of an
+  exception's stack. `--probe-build` no longer leaves an empty `.bhf-build`
+  in a tree it found no build system in.
 - C# preflight checks NuGet's global packages folder for the SharpFuzz 2.3.0
   package the harness restores (offline only), and reports the lane MISSING it
   when it is absent. Every target used to fail instead, with NU1101 filed as an

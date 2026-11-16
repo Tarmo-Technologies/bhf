@@ -1154,6 +1154,8 @@ pub fn probe_build(
                  build at {} (use --build-command \"<cmd>\" to intercept a custom build)",
                 tree.display()
             );
+            // Nothing was built into it: leave the tree as it was.
+            let _ = std::fs::remove_dir(&probe_dir);
             None
         }
     };

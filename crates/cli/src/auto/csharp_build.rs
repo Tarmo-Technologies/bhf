@@ -645,8 +645,77 @@ fn effective_package_references(csproj: &Path) -> Vec<(String, String)> {
 
 /// Copy the harness's build output (`bin/Release/<tfm>/`) into `out_dir`, which
 /// the rest of the lane treats as the single place the assemblies live.
-fn collect_build_output(proj_dir: &Path, out_dir: &Path) -> Result<(), String> {
-    let release = proj_dir.join("bin").join("Release");
+/// The props file every project of a harness's build imports in place of a
+/// `Directory.Build.props` (through `DirectoryBuildPropsPath`), under `hdir`.
+const ISOLATION_PROPS: &str = "bhf.Directory.Build.props";
+
+/// Where a project of the harness build in `hdir` writes its `bin/`: its
+/// own directory under the harness, never beside its `.csproj`.
+fn isolated_bin_dir(hdir: &Path, project_name: &str) -> PathBuf {
+    hdir.join("build").join("bin").join(project_name)
+}
+
+/// The props file that sends every project of the harness build, the
+/// target's and its references included, to its own `obj/` and `bin/` under
+/// `hdir`. The user's tree is left as it was, and two harnesses of one
+/// project, built at once, write nothing the other reads (they raced on the
+/// project's own `obj/`: MSB4018 in GenerateDepsFile, CS2012). The project's
+/// own `Directory.Build.props`, which MSBuild no longer finds by itself, is
+/// imported first.
+fn isolation_props(hdir: &Path) -> String {
+    let escape = |path: &Path| {
+        path.display()
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let root = hdir.join("build");
+    format!(
+        "<Project>\n\
+         \x20 <PropertyGroup>\n\
+         \x20   <BhfProjectBuildProps>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', \
+         '$(MSBuildProjectDirectory)'))</BhfProjectBuildProps>\n\
+         \x20 </PropertyGroup>\n\
+         \x20 <Import Project=\"$(BhfProjectBuildProps)\" \
+         Condition=\"'$(BhfProjectBuildProps)' != ''\" />\n\
+         \x20 <PropertyGroup>\n\
+         \x20   <BaseIntermediateOutputPath>{obj}/$(MSBuildProjectName)/</BaseIntermediateOutputPath>\n\
+         \x20   <BaseOutputPath>{bin}/$(MSBuildProjectName)/</BaseOutputPath>\n\
+         \x20 </PropertyGroup>\n\
+         </Project>\n",
+        obj = escape(&root.join("obj")),
+        bin = escape(&root.join("bin")),
+    )
+}
+
+/// A failed `dotnet build`'s report: every line that names an error first
+/// (`error MSB4018: The "GenerateDepsFile" task failed unexpectedly`), then
+/// the end of the output. The end alone was often only an exception's stack
+/// frames.
+fn build_failure(output: &str) -> String {
+    let mut errors: Vec<&str> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if (line.contains(": error ") || line.starts_with("error "))
+            && !line.contains(": error MSB4018:    at ")
+            && !errors.contains(&line)
+        {
+            errors.push(line);
+            if errors.len() == 20 {
+                break;
+            }
+        }
+    }
+    format!(
+        "dotnet build failed:\n{}\n{}",
+        errors.join("\n"),
+        tail(output, 2000)
+    )
+}
+
+fn collect_build_output(hdir: &Path, out_dir: &Path) -> Result<(), String> {
+    let release = isolated_bin_dir(hdir, "bhf_harness").join("Release");
     let tfm_dir = std::fs::read_dir(&release)
         .map_err(|e| format!("read {}: {e}", release.display()))?
         .flatten()
@@ -1003,6 +1072,11 @@ pub fn build_csharp_harness(
     if let Err(e) = std::fs::create_dir_all(&offline_feed) {
         return CSharpBuildResult::Failed(format!("create offline NuGet feed: {e}"));
     }
+    let isolation = hdir.join(ISOLATION_PROPS);
+    let _ = std::fs::remove_dir_all(hdir.join("build"));
+    if let Err(e) = std::fs::write(&isolation, isolation_props(&hdir)) {
+        return CSharpBuildResult::Failed(format!("write {}: {e}", isolation.display()));
+    }
     // Under source-inclusion the first build often fails on project files that
     // are nothing to do with the target (view models needing a source
     // generator); those get ejected and the build retried until the compiling
@@ -1014,8 +1088,9 @@ pub fn build_csharp_harness(
         // No `-o`: forcing one output directory across a project GRAPH also
         // redirects the referenced project's output, and the second harness to
         // build the same project hits MSB4018 in GetAssemblyAttributes because
-        // its `obj/` still describes the first harness's layout. Build into the
-        // default per-project locations and copy the harness's own output out.
+        // its `obj/` still describes the first harness's layout. The isolation
+        // props give every project of the graph its own `obj/` and `bin/`
+        // under this harness; the harness's own output is copied out.
         let build = crate::command_output::output_with_timeout(
             Command::new("dotnet")
                 .arg("build")
@@ -1026,6 +1101,10 @@ pub fn build_csharp_harness(
                 .arg(format!("-p:RestoreSources={}", offline_feed.display()))
                 .arg("-p:RestoreAdditionalProjectSources=")
                 .arg("-p:NuGetAudit=false")
+                .arg(format!(
+                    "-p:DirectoryBuildPropsPath={}",
+                    isolation.display()
+                ))
                 .arg("-v")
                 .arg("quiet")
                 .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
@@ -1034,7 +1113,7 @@ pub fn build_csharp_harness(
         );
         let output = match build {
             Ok(o) if o.status.success() => {
-                if let Err(e) = collect_build_output(&proj_dir, &out_dir) {
+                if let Err(e) = collect_build_output(&hdir, &out_dir) {
                     return CSharpBuildResult::Failed(e);
                 }
                 break;
@@ -1048,10 +1127,7 @@ pub fn build_csharp_harness(
         };
 
         let TargetLinkage::SourceInclusion { excluded } = &mut linkage else {
-            return CSharpBuildResult::Failed(format!(
-                "dotnet build failed:\n{}",
-                tail(&output, 4000)
-            ));
+            return CSharpBuildResult::Failed(build_failure(&output));
         };
         // A `global using` the compiler rejected takes only that line with it.
         // Ejecting the whole GlobalUsings.cs would strip EVERY project-wide
@@ -1098,10 +1174,7 @@ pub fn build_csharp_harness(
         if failing.is_empty() || round == MAX_EJECT_ROUNDS {
             // Either the target's own file is what fails, or ejecting stopped
             // helping: report the real diagnostic.
-            return CSharpBuildResult::Failed(format!(
-                "dotnet build failed:\n{}",
-                tail(&output, 4000)
-            ));
+            return CSharpBuildResult::Failed(build_failure(&output));
         }
         bhfeprintln!(
             "bhf auto: C# source-inclusion: ejecting {} file(s) that do not compile \
@@ -1237,6 +1310,68 @@ mod tests {
             kind,
             raw_type: raw.to_owned(),
         }
+    }
+
+    /// Every project of the harness build gets its own obj/ and bin/ under the
+    /// harness, after the project's own Directory.Build.props.
+    #[test]
+    fn the_isolation_props_put_each_project_under_the_harness() {
+        let hdir = Path::new("/w/harnesses/H-S1&2");
+        let props = isolation_props(hdir);
+        // The harness directory as the host spells it, `&` escaped.
+        let under = |dir: &str| {
+            hdir.join("build")
+                .join(dir)
+                .display()
+                .to_string()
+                .replace('&', "&amp;")
+        };
+        let import = props
+            .find("<Import Project=\"$(BhfProjectBuildProps)\"")
+            .unwrap_or_else(|| panic!("{props}"));
+        let obj = props
+            .find(&format!(
+                "<BaseIntermediateOutputPath>{}/$(MSBuildProjectName)/",
+                under("obj")
+            ))
+            .unwrap_or_else(|| panic!("{props}"));
+        assert!(import < obj, "{props}");
+        assert!(
+            props.contains(&format!(
+                "<BaseOutputPath>{}/$(MSBuildProjectName)/",
+                under("bin")
+            )),
+            "{props}"
+        );
+        assert!(
+            props.contains("GetPathOfFileAbove('Directory.Build.props'"),
+            "{props}"
+        );
+        assert_eq!(
+            isolated_bin_dir(Path::new("/w/h"), "bhf_harness"),
+            Path::new("/w/h/build/bin/bhf_harness")
+        );
+    }
+
+    /// A failed build's report leads with the error lines, not an exception's
+    /// stack frames.
+    #[test]
+    fn a_build_failure_leads_with_its_error_lines() {
+        let output = format!(
+            "{}/sdk/Microsoft.NET.Sdk.targets(284,5): error MSB4018: The \"GenerateDepsFile\" task \
+             failed unexpectedly.\n{}",
+            "/usr/lib/dotnet",
+            "/usr/lib/dotnet/sdk/Microsoft.NET.Sdk.targets(284,5): error MSB4018:    at \
+             Microsoft.NET.Build.Tasks.GenerateDepsFile.WriteDepsFile(String depsFilePath)\n"
+                .repeat(200)
+        );
+        let report = build_failure(&output);
+        let first = report.lines().nth(1).unwrap();
+        assert!(
+            first.contains("The \"GenerateDepsFile\" task failed unexpectedly"),
+            "{first}"
+        );
+        assert!(report.len() < 4000, "{}", report.len());
     }
 
     /// NU1101 names no version; the harness project's PackageReference does.
