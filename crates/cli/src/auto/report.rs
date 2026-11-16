@@ -587,7 +587,19 @@ fn annotate_findings_with_fidelity(
             .get(harness_id)
             .copied()
             .unwrap_or(&static_record);
-        let fidelity = with_discovery_sanitizers(fidelity, obj.get("discovery"));
+        let mut fidelity = with_discovery_sanitizers(fidelity, obj.get("discovery"));
+        // An MSan corpus-replay finding ran under the harness's MSan build,
+        // not the sanitizers its fuzz passes armed.
+        let msan = obj
+            .get("exception")
+            .and_then(|exception| exception.get("sanitizer"))
+            .and_then(serde_json::Value::as_str)
+            == Some("msan");
+        if msan {
+            fidelity.sanitizers = actionability::FidelityDimension::exercised(
+                "ran under msan (the MSan build replayed the corpus)",
+            );
+        }
         let Ok(value) = serde_json::to_value(&fidelity) else {
             continue;
         };

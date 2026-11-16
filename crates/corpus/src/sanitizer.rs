@@ -213,6 +213,7 @@ pub enum Sanitizer {
     AddressSanitizer,
     UndefinedBehaviorSanitizer,
     LeakSanitizer,
+    MemorySanitizer,
 }
 
 impl Sanitizer {
@@ -221,6 +222,7 @@ impl Sanitizer {
             Sanitizer::AddressSanitizer => "asan",
             Sanitizer::UndefinedBehaviorSanitizer => "ubsan",
             Sanitizer::LeakSanitizer => "lsan",
+            Sanitizer::MemorySanitizer => "msan",
         }
     }
 }
@@ -229,6 +231,7 @@ pub fn parse_sanitizer_report(stderr: &str) -> Option<SanitizerReport> {
     parse_asan(stderr)
         .or_else(|| parse_ubsan(stderr))
         .or_else(|| parse_lsan(stderr))
+        .or_else(|| parse_msan(stderr))
         // A Rust panic is the PRIMARY bug signal for the native Rust lane: a
         // bounds-check / unwrap / overflow / explicit panic aborts via SIGABRT,
         // which the C-oriented `is_input_rejection` would otherwise dismiss as an
@@ -1360,6 +1363,28 @@ fn parse_lsan(stderr: &str) -> Option<SanitizerReport> {
     })
 }
 
+/// A MemorySanitizer report: `==N==WARNING: MemorySanitizer:
+/// use-of-uninitialized-value`, then the stack of the read (BHF-212).
+fn parse_msan(stderr: &str) -> Option<SanitizerReport> {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("WARNING: MemorySanitizer:"))?;
+    let kind = line
+        .split_once("WARNING: MemorySanitizer:")
+        .map(|(_, kind)| kind.trim())
+        .and_then(|kind| kind.split_whitespace().next())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("use-of-uninitialized-value");
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::MemorySanitizer),
+        kind: kind.to_owned(),
+        rule_id: "BHF-212",
+        stack: parse_stack_frames(stderr),
+        message: line.trim().to_owned(),
+        ..Default::default()
+    })
+}
+
 /// Most frames kept per stack (crash, allocation, free), each capped on its own
 /// so a deep crash stack cannot push the allocation site out.
 pub const MAX_SANITIZER_FRAMES: usize = 16;
@@ -1987,6 +2012,22 @@ fn parse_file_line(token: &str) -> (Option<String>, Option<u32>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_a_memory_sanitizer_report() {
+        let report = parse_sanitizer_report(
+            "==4242==WARNING: MemorySanitizer: use-of-uninitialized-value\n\
+             \x20   #0 0x55d1 in parse_record /proj/src/uninit.c:16:1\n\
+             \x20   #1 0x55d2 in bhf_run_one /w/harnesses/H-C1/main.c:92:5\n\
+             SUMMARY: MemorySanitizer: use-of-uninitialized-value /proj/src/uninit.c:16:1 in parse_record\n",
+        )
+        .expect("an MSan report");
+        assert_eq!(report.sanitizer, Some(Sanitizer::MemorySanitizer));
+        assert_eq!(report.rule_id, "BHF-212");
+        assert_eq!(report.kind, "use-of-uninitialized-value");
+        assert_eq!(report.stack[0].function, "parse_record");
+        assert_eq!(Sanitizer::MemorySanitizer.as_str(), "msan");
+    }
+
     use super::*;
 
     #[test]

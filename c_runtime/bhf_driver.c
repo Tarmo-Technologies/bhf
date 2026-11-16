@@ -1096,9 +1096,10 @@ BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
     bhf_run_one(data, size);
     bhf_c8_flush();
 }
-static void bhf_run_file(const char *path) {
+/* Returns -1, having run nothing, when `path` cannot be opened. */
+static int bhf_run_file(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) return -1;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     if (n < 0) n = 0;
@@ -1108,11 +1109,12 @@ static void bhf_run_file(const char *path) {
      * views the input is reported on replay too. An empty input gets one byte
      * (ASan's malloc(0) is one addressable byte as well). */
     uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1));
-    if (!b) { fclose(f); return; }
+    if (!b) { fclose(f); return 0; }
     size_t r = fread(b, 1, (size_t)n, f);
     fclose(f);
     bhf_run_one_bytes(b, r);
     free(b);
+    return 0;
 }
 #ifdef _WIN32
 /* WinAFL's persistent entry (`--engine winafl` runs WinAFL with
@@ -1149,7 +1151,7 @@ static void bhf_winafl_check_heap(void) {
 #define BHF_WINAFL_EXPORT
 #endif
 BHF_WINAFL_EXPORT BHF_NOINLINE int bhf_winafl_fuzz(const char *path) {
-    bhf_run_file(path);
+    (void)bhf_run_file(path);
 #if defined(BHF_WINAFL)
     bhf_winafl_check_heap();
 #endif
@@ -1229,10 +1231,18 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc < 2) return 0;
+    /* A replay of an input that is not there ran nothing: say so, and fail,
+     * instead of exiting 0 as if the input ran clean. */
+    FILE *probe = fopen(argv[1], "rb");
+    if (!probe) {
+        fprintf(stderr, "bhf: cannot open input '%s'\n", argv[1]);
+        return 2;
+    }
+    fclose(probe);
 #ifdef _WIN32
     bhf_winafl_fuzz(argv[1]);
 #else
-    bhf_run_file(argv[1]);
+    (void)bhf_run_file(argv[1]);
 #endif
     return 0;
 }

@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An uninitialized-memory finding from the MSan corpus replay ships the queue
+  entry as `testcase.bin`, MSan's report as `sanitizer.log`, the function from
+  the report's frame and the `main_msan` build as its fixture, so `bhf replay`
+  runs the MSan build and reports MATCH and replay.py reproduces the read. It
+  used to carry only `finding.json`. The C driver says so, and exits 2, when it
+  cannot open its input; it exited 0, so a replay of a missing input passed.
 - An out-of-memory finding (BHF-209) records the `--rss-limit-mb` it ran
   past, and `bhf replay` and `bhf minimize` run its testcase under that limit
   and count running past it as reproducing the finding. They used to run it

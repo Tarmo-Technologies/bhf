@@ -2387,6 +2387,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_msan_finding_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_msbuild_import.rs",
       "license": "Apache-2.0"
     },

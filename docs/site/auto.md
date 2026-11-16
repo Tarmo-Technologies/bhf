@@ -886,11 +886,11 @@ Lanes that replay inputs bhf already knows record their lineage too. The
 corpus replays (the MSan and TSan replays, the memory profile and the
 `--differential` post-pass) look up the queue entry they ran in
 `lineage.jsonl`, as a pass does; an entry with no line there is a `corpus`
-root. An MSan or TSan finding saves no testcase, so its lineage is that of
-the queue entry that first showed the site, which its oracle evidence names
-by `input_sha256` (left out, with the reason in the lineage, when the entry
-could not be read back), and `bhf explain` prints that lineage under the
-entry's sha256. The capability profile folds what the whole corpus
+root. An MSan or TSan finding's lineage is that of the queue entry that
+first showed the site, which its oracle evidence names by `input_sha256`
+(left out, with the reason in the lineage, when the entry could not be read
+back), and `bhf explain` prints that lineage under the entry's sha256. An
+MSan finding also saves that entry as its `testcase.bin`. The capability profile folds what the whole corpus
 reached into one finding, so its lineage is `unknown` and the reason says
 so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
 the operator's inputs as they are: `user_seed`, depth `0`, with the file's
