@@ -99,8 +99,7 @@ jobs:
             libnewlib-arm-none-eabi \
             gdb \
             lldb \
-            llvm \
-            libstdc++-14-dev
+            llvm
 
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0

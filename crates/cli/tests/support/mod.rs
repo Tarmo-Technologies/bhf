@@ -135,7 +135,10 @@ pub fn libfuzzer_toolchain_available_with(compiler: &str, prefix: &str) -> bool 
     let src = dir.join("p.c");
     if fs::write(
         &src,
-        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n){return (int)n;}\n",
+        // `extern "C"` when a C++ driver (clang++) compiles it as C++: a
+        // mangled name would leave libFuzzer's main without its entry point.
+        "#ifdef __cplusplus\nextern \"C\"\n#endif\n\
+         int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n){return (int)n;}\n",
     )
     .is_err()
     {
