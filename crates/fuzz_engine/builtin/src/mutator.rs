@@ -443,7 +443,7 @@ impl<'a> MutationInput<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MutatorSuite {
     config: MutatorConfig,
     /// Byte order + pointer width the typed-input generator serializes multi-byte
@@ -451,7 +451,69 @@ pub struct MutatorSuite {
     /// byte-for-byte the historical behavior; set a foreign target's ABI with
     /// [`MutatorSuite::with_abi`] to fuzz a big-endian target faithfully.
     abi: TargetAbi,
+    /// The inputs this suite produced last, so it does not hand the loop one
+    /// it just ran (#219).
+    recent: std::sync::Mutex<RecentOutputs>,
 }
+
+impl Clone for MutatorSuite {
+    /// A clone starts with no recent outputs of its own.
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            abi: self.abi,
+            recent: std::sync::Mutex::new(RecentOutputs::default()),
+        }
+    }
+}
+
+/// How many of a suite's last outputs it remembers to avoid repeating.
+const RECENT_OUTPUTS: usize = 16384;
+
+/// How many more times a kind is tried when its output repeats a recent one,
+/// before the pick moves to another kind: the small edit spaces (one bit flip,
+/// one dictionary insertion) repeat often on a short base.
+const RETRIES_ON_REPEAT: usize = 2;
+
+/// The hashes of a suite's last [`RECENT_OUTPUTS`] outputs.
+#[derive(Debug, Default)]
+struct RecentOutputs {
+    order: std::collections::VecDeque<u64>,
+    hashes: std::collections::HashSet<u64>,
+}
+
+impl RecentOutputs {
+    fn hash(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn contains(&self, hash: u64) -> bool {
+        self.hashes.contains(&hash)
+    }
+
+    fn push(&mut self, hash: u64) {
+        if !self.hashes.insert(hash) {
+            return;
+        }
+        self.order.push_back(hash);
+        if self.order.len() > RECENT_OUTPUTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.hashes.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// The largest share of a suite's mutations the dictionary generators (the
+/// structured shapes, which ignore the base) get, in per mille, and the
+/// number of dictionary tokens that earns it. With fewer tokens their share
+/// shrinks in proportion: a one-token dictionary gives each generator a few
+/// outputs, which a uniform pick over a dozen of them re-ran endlessly (#219).
+const MAX_GENERATOR_SHARE_PER_MILLE: u64 = 500;
+const GENERATOR_TOKENS_FOR_FULL_SHARE: usize = 64;
 
 impl Default for MutatorSuite {
     fn default() -> Self {
@@ -464,6 +526,7 @@ impl MutatorSuite {
         Self {
             config,
             abi: TargetAbi::host(),
+            recent: std::sync::Mutex::new(RecentOutputs::default()),
         }
     }
 
@@ -494,15 +557,54 @@ impl MutatorSuite {
             }
         }
 
-        while !available.is_empty() {
-            let index = rng.choose_index(available.len())?;
-            let kind = available.swap_remove(index);
-            if let Some(result) = self.try_mutate_with_kind(input, kind, rng) {
+        // The dictionary generators share the pick in proportion to the
+        // dictionary's size (a `--grammar` derivation keeps its own slot).
+        let (mut generators, mut edits): (Vec<MutationKind>, Vec<MutationKind>) =
+            available.into_iter().partition(|kind| {
+                !kind.derives_from_base() && *kind != MutationKind::StructuredGrammar
+            });
+        let generator_share = if edits.is_empty() {
+            1000
+        } else {
+            let natural =
+                (generators.len() as u64 * 1000) / (generators.len() + edits.len()) as u64;
+            let richness = input.dictionary.len().min(GENERATOR_TOKENS_FOR_FULL_SHARE) as u64;
+            natural.min(MAX_GENERATOR_SHARE_PER_MILLE) * richness
+                / GENERATOR_TOKENS_FOR_FULL_SHARE as u64
+        };
+
+        let mut recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut repeat = None;
+        while !generators.is_empty() || !edits.is_empty() {
+            let from_generators = edits.is_empty()
+                || (!generators.is_empty() && rng.next_u64() % 1000 < generator_share);
+            let pool = if from_generators {
+                &mut generators
+            } else {
+                &mut edits
+            };
+            let index = rng.choose_index(pool.len())?;
+            let kind = pool.swap_remove(index);
+            for _ in 0..=RETRIES_ON_REPEAT {
+                let Some(result) = self.try_mutate_with_kind(input, kind, rng) else {
+                    break;
+                };
+                // An input one of the last ones repeats is handed back only
+                // when every kind gives one.
+                let hash = RecentOutputs::hash(&result.bytes);
+                if recent.contains(hash) {
+                    repeat.get_or_insert(result);
+                    continue;
+                }
+                recent.push(hash);
                 return Some(result);
             }
         }
 
-        None
+        repeat
     }
 
     pub fn try_mutate_with_kind(
@@ -3537,11 +3639,13 @@ mod tests {
         });
         let bytes = b"--abcd--";
         let input = MutationInput::new(bytes, &dictionary).with_cmplog(&log);
-        let suite = suite();
 
         let mut splices = 0usize;
         let trials = 2000usize;
         for seed in 0..trials as u64 {
+            // A suite of its own per trial: one suite does not repeat the
+            // splice's single output (`mutate_does_not_repeat_its_recent_outputs`).
+            let suite = suite();
             let mut rng = MutationRng::new(seed);
             if let Some(result) = suite.mutate(&input, &mut rng) {
                 if result.kind == MutationKind::CmpLogSplice {
@@ -3555,6 +3659,73 @@ mod tests {
             splices * 2 > trials,
             "expected CmpLogSplice to dominate when evidence present, got {splices}/{trials}"
         );
+    }
+
+    /// A one-token dictionary gives each structured generator a handful of
+    /// outputs. Picked uniformly beside the edits they re-ran the same few
+    /// inputs; their share now follows the dictionary's size and a suite does
+    /// not repeat its recent outputs, so most mutations are new (#219).
+    #[test]
+    fn a_one_token_dictionary_keeps_most_mutations_distinct() {
+        let dictionary = Dictionary::from_tokens([b"GET".to_vec()]);
+        // A small corpus: sixteen bases of 8 to 68 bytes, taken in turn.
+        let bases: Vec<Vec<u8>> = (0..16u8)
+            .map(|n| (0..8 + 4 * n).map(|byte| byte ^ n).collect())
+            .collect();
+        let suite = suite();
+        let mut rng = MutationRng::new(219);
+        let mut seen = std::collections::HashSet::new();
+        let trials = 10_000;
+        for at in 0..trials {
+            let input = MutationInput::new(&bases[at % bases.len()], &dictionary);
+            let result = suite.mutate(&input, &mut rng).expect("a mutation");
+            seen.insert(result.bytes);
+        }
+        assert!(
+            seen.len() * 100 >= trials * 80,
+            "{} of {trials} mutations distinct",
+            seen.len()
+        );
+    }
+
+    /// With a rich dictionary the generators keep a large share.
+    #[test]
+    fn a_rich_dictionary_still_uses_the_structured_generators() {
+        let dictionary =
+            Dictionary::from_tokens((0..200).map(|n| format!("token{n}").into_bytes()));
+        let base: Vec<u8> = (0u8..32).collect();
+        let input = MutationInput::new(&base, &dictionary);
+        let suite = suite();
+        let mut rng = MutationRng::new(219);
+        let trials = 10_000;
+        let generated = (0..trials)
+            .filter_map(|_| suite.mutate(&input, &mut rng))
+            .filter(|result| !result.kind.derives_from_base())
+            .count();
+        assert!(
+            generated * 100 >= trials * 30,
+            "{generated} of {trials} generated"
+        );
+    }
+
+    /// One suite does not hand back an input it produced among its last ones
+    /// while another kind gives a new one.
+    #[test]
+    fn mutate_does_not_repeat_its_recent_outputs() {
+        let dictionary = Dictionary::default();
+        let base: Vec<u8> = (0u8..32).collect();
+        let input = MutationInput::new(&base, &dictionary);
+        let suite = suite();
+        let mut rng = MutationRng::new(7);
+        let mut last = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let result = suite.mutate(&input, &mut rng).expect("a mutation");
+            assert!(
+                last.insert(result.bytes.clone()),
+                "repeated {:?}",
+                result.bytes
+            );
+        }
     }
 
     #[test]

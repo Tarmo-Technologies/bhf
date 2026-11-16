@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The builtin mutator no longer re-runs the same few inputs when the
+  dictionary is small. The structured generators, which ignore the base, were
+  picked uniformly beside the edits, and with one token each has a handful of
+  outputs (7% of one Ruby run's inputs were distinct). Their share now follows
+  the dictionary's size (at most half, at 64 tokens or more), and a suite
+  skips an output it produced among its last 16384 while another kind gives a
+  new one.
 - The README says Ada 83, K&R C, pre-C++98 and Python 2 are discovered and
   statically analyzed (report-only), not supported for fuzzing; a test holds
   the sentence to the report-only dialect set. The comparison pages list
