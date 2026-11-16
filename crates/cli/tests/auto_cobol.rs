@@ -176,9 +176,10 @@ fn auto_cobol_finding_replays_as_a_match_and_is_minimized() {
         .lines()
         .find(|line| line.trim_start().starts_with("compared"))
         .unwrap_or_default();
-    // The site is the COBOL source line libcob named.
+    // The location is the COBOL source line libcob named: a `site`, or a
+    // `sink` naming the program when the finding records its target.
     let site = format!(
-        "site {}/parseit.cob:11",
+        "{}/parseit.cob:11",
         src.file_name().unwrap().to_string_lossy()
     );
     for field in ["kind cobol-runtime-error", "signal SIGSEGV", site.as_str()] {
