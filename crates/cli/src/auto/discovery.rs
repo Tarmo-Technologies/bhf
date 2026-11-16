@@ -112,17 +112,39 @@ fn compile_database_preprocessor_defines(path: &Path) -> Vec<(String, String)> {
     defines
 }
 
+/// Tell the operator about every `#if`/`#elif` in `origin` that CPP-lite could
+/// not evaluate (a function-like macro, say): discovery kept every branch of
+/// it, so functions from a branch the compiler drops may be listed.
+fn note_unevaluated_conditionals(origin: &Path, preprocessed: &str) {
+    for message in unevaluated_conditionals(preprocessed) {
+        bhfeprintln!("bhf auto: note: {}: {message}", origin.display());
+    }
+}
+
+/// The preprocessor's notes on conditionals it kept every branch of.
+fn unevaluated_conditionals(preprocessed: &str) -> Vec<String> {
+    preprocessed
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#pragma bhf_warning \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .map(|text| text.replace("\"\"", "\"").replace("\\\\", "\\"))
+        .filter(|text| text.contains("every branch kept"))
+        .collect()
+}
+
 /// Parse `source` for C functions under `mode`, returning each function with its
 /// line number translated back to the ORIGINAL source (§27.6). When preprocessing
 /// is off (or the source has no heavy conditional compilation) this is exactly
 /// `c_parser::parse_c_functions` on the raw text with identity line numbers.
 fn parse_c_functions_preprocessed(
+    origin: &Path,
     source: &str,
     mode: PreprocessMode,
     defines: &[(String, String)],
 ) -> Result<Vec<c_parser::CFunction>, c_parser::CParseError> {
     if should_preprocess(mode, source, !defines.is_empty()) {
         let (pp, line_map) = idl_parser::preprocess_c_like_with_line_map(source, defines);
+        note_unevaluated_conditionals(origin, &pp);
         let mut fns = c_parser::parse_c_functions(&pp)?;
         for f in &mut fns {
             f.line = line_map.to_original(f.line);
@@ -155,12 +177,14 @@ fn parse_c_functions_preprocessed(
 
 /// C++ counterpart of [`parse_c_functions_preprocessed`].
 fn parse_cpp_functions_preprocessed(
+    origin: &Path,
     source: &str,
     mode: PreprocessMode,
     defines: &[(String, String)],
 ) -> Result<Vec<cpp_parser::CppFunction>, cpp_parser::CppParseError> {
     if should_preprocess(mode, source, !defines.is_empty()) {
         let (pp, line_map) = idl_parser::preprocess_c_like_with_line_map(source, defines);
+        note_unevaluated_conditionals(origin, &pp);
         let mut fns = cpp_parser::parse_cpp_functions(&pp)?;
         for f in &mut fns {
             f.line = line_map.to_original(f.line);
@@ -2120,7 +2144,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                 // while the actual old-style helper stays in the report-only lane.
                 let mut merged = knr;
                 if let Ok(modern) =
-                    parse_c_functions_preprocessed(&source, preprocess, &preprocessor_defines)
+                    parse_c_functions_preprocessed(path, &source, preprocess, &preprocessor_defines)
                 {
                     for function in modern {
                         if !knr_names.contains(&function.name) {
@@ -2131,6 +2155,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                 merged
             } else {
                 let modern = match parse_c_functions_preprocessed(
+                    path,
                     &source,
                     preprocess,
                     &preprocessor_defines,
@@ -2226,6 +2251,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
             // each surviving function's line back to the ORIGINAL source.
             let _t0 = std::time::Instant::now();
             let fns = match parse_cpp_functions_preprocessed(
+                path,
                 &source,
                 preprocess,
                 &preprocessor_defines,
@@ -6218,6 +6244,65 @@ mod tests {
         ));
     }
 
+    /// A version gate written as a comparison selects the compiled-in branch:
+    /// with a project macro context (a compile database's -D) and enough
+    /// conditionals to preprocess by default, `#if API_LEVEL >= 2` lists
+    /// `parse_v2`, not the dead `parse_legacy`.
+    #[test]
+    fn a_comparison_gate_lists_the_compiled_in_branch() {
+        let source = "#define API_LEVEL 3\n\
+                      #ifdef A\n#endif\n#ifdef B\n#endif\n#ifdef C\n#endif\n\
+                      #if API_LEVEL >= 2\nint parse_v2(const char *s) { return s[0]; }\n\
+                      #else\nint parse_legacy(const char *s) { return s[0]; }\n#endif\n\
+                      #if API_LEVEL != 0\nint checksum(const char *s) { return s[1]; }\n#endif\n\
+                      int always(const char *s) { return s[2]; }\n";
+        let defines = [("BUILD_FLAVOR".to_owned(), "1".to_owned())];
+        let names: Vec<String> = parse_c_functions_preprocessed(
+            Path::new("src/lib.c"),
+            source,
+            PreprocessMode::Auto,
+            &defines,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|function| function.name)
+        .collect();
+        for name in ["parse_v2", "checksum", "always"] {
+            assert!(names.iter().any(|found| found == name), "{name}: {names:?}");
+        }
+        assert!(
+            !names.iter().any(|found| found == "parse_legacy"),
+            "{names:?}"
+        );
+    }
+
+    /// An `#if` CPP-lite cannot evaluate keeps both branches, and discovery
+    /// can name it for the note it prints.
+    #[test]
+    fn an_unevaluated_gate_keeps_both_branches_and_is_named() {
+        let source = "#if VERSION_AT_LEAST(2, 0)\nint parse_v2(const char *s) { return s[0]; }\n\
+                      #else\nint parse_legacy(const char *s) { return s[0]; }\n#endif\n";
+        let names: Vec<String> = parse_c_functions_preprocessed(
+            Path::new("src/lib.c"),
+            source,
+            PreprocessMode::Always,
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|function| function.name)
+        .collect();
+        assert!(names.contains(&"parse_v2".to_owned()), "{names:?}");
+        assert!(names.contains(&"parse_legacy".to_owned()), "{names:?}");
+        let (preprocessed, _) = idl_parser::preprocess_c_like_with_line_map(source, &[]);
+        let notes = unevaluated_conditionals(&preprocessed);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("line 1") && notes[0].contains("VERSION_AT_LEAST"),
+            "{notes:?}"
+        );
+    }
+
     #[test]
     fn preprocess_zeroing_out_all_functions_falls_back_to_raw_parse() {
         // #2 campaign (mpack): a whole-file `#if FEATURE` gate whose macro is
@@ -6229,7 +6314,9 @@ mod tests {
                       int mpack_reader_init(int x) { return x; }\n\
                       int mpack_read_u8(int x) { return x + 1; }\n\
                       #endif\n";
-        let fns = parse_c_functions_preprocessed(source, PreprocessMode::Always, &[]).unwrap();
+        let fns =
+            parse_c_functions_preprocessed(Path::new("t.c"), source, PreprocessMode::Always, &[])
+                .unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(
             names.contains(&"mpack_reader_init") && names.contains(&"mpack_read_u8"),
@@ -6240,7 +6327,13 @@ mod tests {
     #[test]
     fn cpp_preprocess_zero_result_has_the_same_raw_safety_fallback_as_c() {
         let source = "#if PROJECT_FEATURE\nnamespace Api { int parse(const char *p) { return p[0]; } }\n#endif\n";
-        let fns = parse_cpp_functions_preprocessed(source, PreprocessMode::Always, &[]).unwrap();
+        let fns = parse_cpp_functions_preprocessed(
+            Path::new("t.cpp"),
+            source,
+            PreprocessMode::Always,
+            &[],
+        )
+        .unwrap();
         assert!(
             fns.iter().any(|function| function.name == "parse"),
             "{fns:?}"

@@ -128,9 +128,24 @@ of the signature heuristics.
 `bhf auto` accepts `--preprocess auto|always|never` to control the built-in
 CPP-lite preprocessor used for discovery: `auto` (the default) preprocesses only
 files with heavy conditional compilation, `always` forces it on every C/C++
-file, and `never` parses raw source. Preprocessing resolves `#ifdef`/`#if`
-branches so conditionally compiled functions are not missed, and a line map
-keeps reported locations pointing at the original source.
+file, and `never` parses raw source. `auto` preprocesses a file when it has a
+project macro context (a compile database's `-D` flags) and five or more
+conditional directives. Preprocessing resolves `#ifdef`/`#ifndef`/`#if`/`#elif`/
+`#else` branches so conditionally compiled functions are not missed, and a line
+map keeps reported locations pointing at the original source.
+
+An `#if` or `#elif` expression is evaluated as C evaluates it: integer
+constants (decimal, octal, hex, binary, with `u`/`l` suffixes and `'`
+separators), character constants, `defined`, every arithmetic, shift,
+comparison, bitwise and logical operator, and `?:`. Object-like macros from the
+file and the compile database expand; an identifier no macro defines is 0, and
+an empty macro (`-DFLAG`) is 1. CPP-lite does not follow `#include` into
+headers, so a macro a header defines reads as 0, and it does not expand
+function-like macros. When an expression uses one, or anything else it cannot
+evaluate, discovery keeps every branch of that `#if` chain and prints
+`bhf auto: note: <file>: #if expression not evaluated at line N, every branch
+kept: ...`: a function the compiler drops may then be listed (and fail to
+build), but none that it compiles is hidden.
 
 ## Harness Generation
 

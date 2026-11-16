@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- C/C++ discovery evaluates `#if` and `#elif` expressions as C does
+  (comparisons, arithmetic, shifts, bitwise operators, `?:`, every integer
+  constant form and character constants), and supports `#elif`. A gate such as
+  `#if API_LEVEL >= 2` used to read as false, so discovery listed the dead
+  `#else` branch and dropped the compiled-in function. An expression it still
+  cannot evaluate (a function-like macro) keeps every branch and is named in a
+  `bhf auto: note:` line.
 - Capsules and `bhf verify-poc` take a sanitizer signature from the report's
   `ERROR:` line: a leak is `LeakSanitizer:memory-leak` instead of the byte
   count on its summary line, and a class such as `memcpy-param-overlap` no
