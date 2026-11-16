@@ -4890,12 +4890,16 @@ pub mod ubsan {
         Some(match check {
             "signed-integer-overflow" => "signed-integer-overflow",
             "unsigned-integer-overflow" => "unsigned-integer-overflow",
+            // `nullptr-with-offset` is a zero offset: the pointer stays NULL.
             "null-pointer-use"
             | "nullptr-with-offset"
-            | "nullptr-with-nonzero-offset"
             | "invalid-null-argument"
             | "invalid-null-return" => "null-pointer-dereference",
-            "nullptr-after-nonzero-offset" | "pointer-overflow" => "pointer-overflow",
+            // A non-zero offset applied to a null pointer, such as `&v[i]` on
+            // an empty vector: an out-of-range pointer, not a dereference of NULL.
+            "nullptr-with-nonzero-offset" | "nullptr-after-nonzero-offset" | "pointer-overflow" => {
+                "pointer-overflow"
+            }
             "out-of-bounds-index" => "out-of-bounds-access",
             "non-positive-vla-index" => "invalid-vla-bound",
             "integer-divide-by-zero" | "float-divide-by-zero" => "division-by-zero",
@@ -4917,6 +4921,42 @@ pub mod ubsan {
             "invalid-builtin-use" => "invalid-builtin-use",
             _ => return None,
         })
+    }
+
+    /// The kind of a null-plus-offset report (`pointer-overflow`, from
+    /// `applying non-zero offset N to null pointer`) whose first frame is a
+    /// standard container's element access: an index into an empty container,
+    /// so an index-validation bug (`out-of-bounds-access`, CWE-129). Any other
+    /// kind or frame is returned as it is.
+    pub fn refine_for_container(
+        kind: &'static str,
+        message: &str,
+        first_function: Option<&str>,
+    ) -> &'static str {
+        let null_offset =
+            message.contains("non-zero offset") && message.contains("to null pointer");
+        let container_access = first_function.is_some_and(|function| {
+            let function = function.replace(' ', "");
+            [
+                "std::vector<",
+                "std::__1::vector<",
+                "std::array<",
+                "std::span<",
+                "std::basic_string<",
+                "std::__cxx11::basic_string<",
+                "std::deque<",
+            ]
+            .iter()
+            .any(|container| function.contains(container))
+                && ["::operator[]", "::at(", "::data(", "::front(", "::back("]
+                    .iter()
+                    .any(|access| function.contains(access))
+        });
+        if kind == "pointer-overflow" && null_offset && container_access {
+            "out-of-bounds-access"
+        } else {
+            kind
+        }
     }
 
     /// The kind for UBSan's report text: the message after `runtime error:`,
@@ -4943,6 +4983,11 @@ pub mod ubsan {
         if starts("applying") && has("produced null pointer") {
             return "pointer-overflow";
         }
+        // `applying non-zero offset 4 to null pointer`: an out-of-range
+        // offset from an empty buffer, not a dereference of NULL.
+        if starts("applying non-zero offset") && has("to null pointer") {
+            return "pointer-overflow";
+        }
         if starts("load of null pointer")
             || starts("store to null pointer")
             || starts("member access within null pointer")
@@ -4950,7 +4995,7 @@ pub mod ubsan {
             || starts("reference binding to null pointer")
             || starts("null pointer passed as argument")
             || starts("null pointer returned from function")
-            || (starts("applying") && has("to null pointer"))
+            || (starts("applying zero offset") && has("to null pointer"))
         {
             return "null-pointer-dereference";
         }
@@ -5245,6 +5290,44 @@ mod tests {
         assert!(by_id("BHF-206").unwrap().name.contains("NULL"));
     }
 
+    /// `&v[i]` on an empty `std::vector` is UBSan's null-plus-offset report
+    /// from the vector's `operator[]`: an unvalidated index (CWE-129), not a
+    /// NULL dereference. The same report elsewhere is an out-of-range pointer
+    /// (CWE-823).
+    #[test]
+    fn null_plus_offset_from_container_is_index_validation() {
+        let message = "applying non-zero offset 4 to null pointer";
+        let kind = ubsan::kind_for_message(message);
+        assert_eq!(kind, "pointer-overflow");
+        assert_eq!(
+            ubsan::kind_for_check_name("nullptr-with-nonzero-offset"),
+            Some("pointer-overflow")
+        );
+        let in_vector = ubsan::refine_for_container(
+            kind,
+            message,
+            Some("std::vector<unsigned char, std::allocator<unsigned char> >::operator[](unsigned long)"),
+        );
+        assert_eq!(in_vector, "out-of-bounds-access");
+        assert_eq!(
+            by_id(ubsan::rule_for_kind(in_vector)).unwrap().cwe,
+            "CWE-129"
+        );
+        assert_eq!(by_id(ubsan::rule_for_kind(kind)).unwrap().cwe, "CWE-823");
+        assert_eq!(
+            ubsan::refine_for_container(kind, message, Some("tlv_decode")),
+            kind
+        );
+        assert_eq!(
+            ubsan::refine_for_container(
+                "null-pointer-dereference",
+                "load of null pointer of type 'int'",
+                Some("std::vector<int>::operator[](unsigned long)")
+            ),
+            "null-pointer-dereference"
+        );
+    }
+
     #[test]
     fn every_ubsan_check_name_maps_to_its_kind() {
         for (check, kind) in [
@@ -5252,7 +5335,7 @@ mod tests {
             ("unsigned-integer-overflow", "unsigned-integer-overflow"),
             ("null-pointer-use", "null-pointer-dereference"),
             ("nullptr-with-offset", "null-pointer-dereference"),
-            ("nullptr-with-nonzero-offset", "null-pointer-dereference"),
+            ("nullptr-with-nonzero-offset", "pointer-overflow"),
             ("invalid-null-argument", "null-pointer-dereference"),
             ("invalid-null-return", "null-pointer-dereference"),
             ("nullptr-after-nonzero-offset", "pointer-overflow"),
@@ -5311,7 +5394,7 @@ mod tests {
             ("reference binding to null pointer of type 'int'", "null-pointer-dereference"),
             ("null pointer passed as argument 1, which is declared to never be null", "null-pointer-dereference"),
             ("null pointer returned from function declared to never return null", "null-pointer-dereference"),
-            ("applying non-zero offset 8 to null pointer", "null-pointer-dereference"),
+            ("applying non-zero offset 8 to null pointer", "pointer-overflow"),
             ("applying zero offset to null pointer", "null-pointer-dereference"),
             ("applying non-zero offset to non-null pointer 0x000000000010 produced null pointer", "pointer-overflow"),
             ("pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", "pointer-overflow"),

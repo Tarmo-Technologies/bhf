@@ -45,6 +45,17 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `results/` groups fuzz and runtime findings by sink: their first project
+  frame and bug family. One out-of-bounds read in `tlv_decode`, reached
+  through two call stacks and reported by ASan and UBSan, was three findings
+  in three root-cause groups. It is now one group whose `observations` are
+  the two call stacks (new in `bhf.findings.v1`; INDEX.md says "Reached
+  through 2 call stacks").
+- A UBSan "applying non-zero offset N to null pointer" is an out-of-range
+  pointer (BHF-219, CWE-823), and inside a standard container's element
+  access an unvalidated index into an empty container (CWE-129). It was
+  labelled a NULL dereference. A finding recorded under the old rule still
+  replays as a match.
 - C# harness builds write every project's `obj/` and `bin/` under the
   harness, not into the source tree. Two harnesses of one project, built at
   once, raced on the project's `obj/` (MSB4018 in GenerateDepsFile, CS2012),

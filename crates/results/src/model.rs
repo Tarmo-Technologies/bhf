@@ -92,6 +92,18 @@ pub struct Group {
     pub key: String,
     pub representative: String,
     pub members: Vec<String>,
+    /// For a group of runtime findings at one sink: the call stacks it was
+    /// reached through, each with its members. Absent when there is one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<Observation>,
+}
+
+/// One call stack a root-cause group's sink was reached through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observation {
+    pub key: String,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

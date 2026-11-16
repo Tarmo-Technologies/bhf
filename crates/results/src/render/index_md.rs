@@ -367,6 +367,26 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
         if group.members.len() > 1 {
             let _ = writeln!(out, "- Collapsed observations: {}", group.members.len());
         }
+        if !group.observations.is_empty() {
+            let _ = writeln!(
+                out,
+                "- Reached through {} call stacks: {}",
+                group.observations.len(),
+                group
+                    .observations
+                    .iter()
+                    .map(|observation| {
+                        observation
+                            .members
+                            .iter()
+                            .map(|id| format!("`{}`", md_code(id)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            );
+        }
         if rep.fidelity.forced || !rep.fidelity.caveats.is_empty() {
             let _ = writeln!(
                 out,

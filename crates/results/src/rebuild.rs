@@ -4,8 +4,8 @@
 
 use crate::lock::ResultsLock;
 use crate::model::{
-    Counts, Finding, FindingsDocument, Group, Kind, LoadError, Manifest, ProducerRecord,
-    ProducerStatus, ToolInfo, FINDINGS_SCHEMA_VERSION,
+    Counts, Finding, FindingsDocument, Group, Kind, LoadError, Manifest, Observation,
+    ProducerRecord, ProducerStatus, ToolInfo, FINDINGS_SCHEMA_VERSION,
 };
 use crate::normalize::{self, NormalizeContext};
 use crate::render::{
@@ -15,6 +15,7 @@ use crate::render::{
 };
 use crate::{io_err, layout, manifest, ResultsError};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -484,16 +485,142 @@ fn dedupe(findings: &mut Vec<Finding>, errors: &mut Vec<LoadError>) -> Deduped {
     }
 }
 
-/// Group by `group` key; set occurrences and first/last seen across members;
-/// representative = most severe, then lowest id. Groups ordered most severe first.
-fn finalize_groups(findings: &mut [Finding]) -> Vec<Group> {
-    let mut members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (i, f) in findings.iter().enumerate() {
-        let key = f
+/// The bug family a runtime finding's CWEs name, so one sink reported by two
+/// sanitizers (an ASan heap read and a UBSan index at one line) is one root
+/// cause. A CWE outside the families is its own.
+fn bug_family(cwe: &[u32]) -> Option<String> {
+    cwe.iter()
+        .find_map(|cwe| {
+            Some(
+                match cwe {
+                    119..=127 | 129 | 131 | 170 | 787 | 788 | 805 | 806 | 823 => "out-of-bounds",
+                    476 => "null-dereference",
+                    415 | 416 | 562 | 825 => "lifetime",
+                    190 | 191 | 680 => "integer-overflow",
+                    369 => "divide-by-zero",
+                    457 | 908 => "uninitialized",
+                    401 | 772 => "leak",
+                    362 => "race",
+                    134 => "format-string",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        })
+        .or_else(|| cwe.first().map(|cwe| format!("CWE-{cwe}")))
+}
+
+/// The root-cause key of a fuzz or runtime finding: its sink, the first
+/// project frame (`location`), and its bug family. The same defect reached
+/// through two call stacks, or reported by two sanitizers, is one root cause;
+/// the stacks are its observations. `None` without a sink line or a CWE.
+fn sink_key(f: &Finding) -> Option<String> {
+    if !matches!(f.kind, Kind::Fuzz | Kind::Runtime) {
+        return None;
+    }
+    let location = f.location.as_ref()?;
+    let line = location.line?;
+    let family = bug_family(&f.cwe)?;
+    let digest = Sha256::digest(format!("{}:{line}|{family}", location.file).as_bytes());
+    Some(format!("sink-{}", &corpus::hex_lower(&digest)[..16]))
+}
+
+/// The call stack a finding was observed through: its frames' functions,
+/// files and lines, without the sanitizer or check that reported it.
+fn observation_key(f: &Finding) -> String {
+    if f.stack.is_empty() {
+        return f
             .group
             .clone()
             .unwrap_or_else(|| f.fingerprint.primary.clone());
-        members.entry(key).or_default().push(i);
+    }
+    let frames: Vec<String> = f
+        .stack
+        .iter()
+        .map(|frame| {
+            format!(
+                "{}@{}:{}",
+                frame.function.as_deref().unwrap_or("?"),
+                frame.file.as_deref().unwrap_or("?"),
+                frame.line.unwrap_or(0)
+            )
+        })
+        .collect();
+    let digest = Sha256::digest(frames.join("\n").as_bytes());
+    format!("stack-{}", &corpus::hex_lower(&digest)[..16])
+}
+
+/// Group by root cause: findings that share a sink ([`sink_key`]) or a
+/// `group` key (a crash cluster, or a key a grouping pass gave findings of one
+/// bug) are one group, keyed by its sink when it has one. List a sink group's
+/// call stacks as observations; set occurrences and first/last seen across
+/// members; representative = most severe, then lowest id. Groups ordered most
+/// severe first.
+fn finalize_groups(findings: &mut [Finding]) -> Vec<Group> {
+    // Union-find over the findings: each joins the findings of its sink and
+    // of its cluster.
+    let mut parent: Vec<usize> = (0..findings.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let sinks: Vec<Option<String>> = findings.iter().map(sink_key).collect();
+    let mut first_of: HashMap<String, usize> = HashMap::new();
+    for (i, f) in findings.iter().enumerate() {
+        let cluster = f
+            .group
+            .clone()
+            .unwrap_or_else(|| f.fingerprint.primary.clone());
+        for key in sinks[i]
+            .iter()
+            .cloned()
+            .chain([format!("cluster:{cluster}")])
+        {
+            match first_of.entry(key) {
+                Entry::Occupied(first) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, *first.get()));
+                    parent[a.max(b)] = a.min(b);
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(i);
+                }
+            }
+        }
+    }
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..findings.len() {
+        let r = root(&mut parent, i);
+        components.entry(r).or_default().push(i);
+    }
+    let mut members: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut observed: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for idx in components.into_values() {
+        let key = idx
+            .iter()
+            .filter_map(|&i| sinks[i].clone())
+            .min()
+            .unwrap_or_else(|| {
+                findings[idx[0]]
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| findings[idx[0]].fingerprint.primary.clone())
+            });
+        if sinks
+            .iter()
+            .any(|sink| sink.as_deref() == Some(key.as_str()))
+        {
+            let stacks = observed.entry(key.clone()).or_default();
+            for &i in &idx {
+                stacks
+                    .entry(observation_key(&findings[i]))
+                    .or_default()
+                    .push(findings[i].id.clone());
+            }
+        }
+        members.entry(key).or_default().extend(idx);
     }
     let mut groups = Vec::with_capacity(members.len());
     for (key, idx) in members {
@@ -524,12 +651,23 @@ fn finalize_groups(findings: &mut [Finding]) -> Vec<Group> {
             f.first_seen = first_seen.clone();
             f.last_seen = last_seen.clone();
         }
+        let observations: Vec<Observation> = observed
+            .remove(&key)
+            .filter(|stacks| stacks.len() > 1)
+            .into_iter()
+            .flatten()
+            .map(|(key, mut members)| {
+                members.sort();
+                Observation { key, members }
+            })
+            .collect();
         groups.push((
             findings[rep].severity.rank(),
             Group {
                 key,
                 representative: findings[rep].id.clone(),
                 members: ids,
+                observations,
             },
         ));
     }
