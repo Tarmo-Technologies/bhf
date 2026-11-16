@@ -1896,7 +1896,7 @@ speaks the versioned `bhf.extension.v1` protocol (length-framed JSON over
 stdin/stdout). An extension lets a *private* semantic oracle judge whether a
 clean-exiting input violates a contract a crash-only fuzzer cannot see — without
 vendoring that oracle into bhf and in any language (see
-[`docs/extension-protocol.md`](../extension-protocol.md) and the Python
+[the extension protocol](extension-protocol.md) and the Python
 reference extension under `crates/extension_host/tests/fixtures/`).
 
 ```sh
@@ -1935,7 +1935,7 @@ run or a finding). `--json` emits a machine-readable report.
 `scenario.next`/`observe-response`, and `lifecycle.setup`/`reset`/`teardown`.
 Negotiation advertises them all as optional on top of the manifest's
 `required-capabilities`, so an extension that implements only a subset still
-works. See [`docs/extension-protocol.md`](../extension-protocol.md) for the wire
+works. See [the extension protocol](extension-protocol.md) for the wire
 shapes.
 
 **Trust boundary.** The manifest is only ever loaded through an explicit

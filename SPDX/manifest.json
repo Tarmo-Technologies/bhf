@@ -4807,10 +4807,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "docs/extension-protocol.md",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "docs/finding-report-fields.md",
       "license": "Apache-2.0"
     },
@@ -4940,6 +4936,10 @@
     },
     {
       "path": "docs/site/engine-parity-benchmark.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/extension-protocol.md",
       "license": "Apache-2.0"
     },
     {

@@ -2,8 +2,10 @@
 
 # BHF Documentation
 
-`docs.buildharnessfuzz.dev` is the public documentation site for BHF
-(Build Harness Fuzz) operators, release engineers, and IDE integrators.
+This is the documentation for BHF (Build Harness Fuzz) operators, release
+engineers, and IDE integrators. It is built from `docs/site` by
+`scripts/docs/build-site.py`; no public host serves it yet (see
+[Docs Hosting Architecture](architecture.md#docs-hosting-architecture)).
 BHF builds the harness so you do not have to: it is an offline fuzz lab
 generator for sixteen languages — Ada, C, C++, Rust, Java, Python, Perl, Go,
 COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP — with

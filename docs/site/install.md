@@ -4,7 +4,9 @@
 bhf is a Rust workspace. Building it also produces the runtime
 virtualisation shim (`libbhf_runtrace_shim.so`) and the build-time compiler
 interception shim (`libbhf_cc_intercept.so`) next to the binaries, where
-`bhf auto` locates them automatically.
+`bhf auto` locates them automatically. How much CPU, memory and disk a run
+needs, per lane and per tree size, is in the README's
+[Resource Requirements](../../README.md#resource-requirements).
 
 ## From source
 

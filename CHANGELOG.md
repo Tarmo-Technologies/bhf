@@ -52,6 +52,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The docs site publishes the extension protocol page (cli.md's link reached
+  the page as literal Markdown) and names no public host: index.md named
+  `docs.buildharnessfuzz.dev`, which has no DNS record, and GitHub Pages is
+  not enabled. The build writes canonical links, a sitemap and a `Sitemap:`
+  line only for a host given with `--base-url`, no longer ships a CNAME, and
+  fails on a relative link to a Markdown file that does not exist (a link to
+  an unpublished repository file goes to it on GitHub). install.md links the
+  README's resource requirements.
 - The help says what `report`, `model`, `snippet` and `license-audit` do:
   `bhf report --sarif`/`--csv` and `bhf model` are no longer hidden, and
   `model train`'s help and cli.md give its labels schema; `--junit` is

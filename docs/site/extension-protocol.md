@@ -11,7 +11,7 @@ written for generic importers (SARIF / vulnerability-management tooling).
 
 The authoritative parser is the host's serde envelope
 (`crates/extension_host`), which rejects unknown fields; the published JSON
-Schemas under [`schemas/`](../schemas/) (`bhf.extension.v1.request.schema.json`,
+Schemas under [`schemas/`](https://github.com/Tarmo-Technologies/bhf/tree/main/schemas) (`bhf.extension.v1.request.schema.json`,
 `bhf.extension.v1.response.schema.json`) describe the same bytes for external
 implementers, and the committed golden fixtures under
 `crates/extension_host/tests/fixtures/` are validated against **both** so the two
