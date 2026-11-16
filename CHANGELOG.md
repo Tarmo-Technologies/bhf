@@ -1262,6 +1262,15 @@
   (`out-of-memory`, not `out`). `bhf replay` still matches findings recorded
   under BHF-201 and the earlier kind, and `results/` groups them with the
   same crash found now.
+- Stack exhaustion is CWE-674 (uncontrolled recursion) in every lane: ASan's
+  `stack-overflow`, the JS/Go/C# stack-overflow kinds, V8's `Maximum call
+  stack size exceeded`, and an interpreter (PHP, Python, Perl, Ruby, Lua,
+  Node) killed by SIGSEGV with no error of its own, which was CWE-121 or
+  CWE-119 with a buffer-overflow or bad-pointer narrative. A V8 builtin frame
+  (`<anonymous>`, `native`, `node:internal/...`) is no longer the sink or fix
+  location. A command-injection finding (CWE-78) is explained as one, never
+  as a crash or from words in the injected command, and a runtime oracle's
+  finding is not described as a fault.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer

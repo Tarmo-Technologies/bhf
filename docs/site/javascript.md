@@ -40,6 +40,10 @@ driver hard-halts with exit 86). The error is classified into a BHF rule + CWE:
 | `RangeError: Invalid array/string length`, out-of-memory | BHF-209 | CWE-789 (resource exhaustion) |
 | `ReferenceError`, an explicit `throw new Error(...)`, and other ECMAScript built-in error types | BHF-210 | reachable crash |
 
+The finding's sink and fix location are the first frame of the target's own
+code: a V8 builtin frame (`at get length [as length] (<anonymous>)`, `native`,
+`node:internal/...`) has no source file to fix and is skipped.
+
 Errors whose `.name` is not an ECMAScript built-in — Node's `AssertionError`, a
 library's `ValidationError`, and similar — are treated as ordinary input
 rejection and suppressed, as are the `TypeError`/`SyntaxError` artifacts of the

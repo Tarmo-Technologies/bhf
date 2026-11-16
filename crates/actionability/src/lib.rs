@@ -646,6 +646,18 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
                 "Validate the index or slice range against the slice length before the access at {at} (use `get`/`get_mut`, `split_at_checked`, or an explicit length check); reject inputs that drive it out of bounds rather than indexing unchecked."
             ),
         ),
+        BugClass::CommandInjection => (
+            "Run a fixed argument vector, not a shell command string",
+            format!(
+                "Run the program with a fixed argument vector instead of a shell command string at {at}: pass input-derived values as separate arguments, never as shell syntax, and allow-list the program it runs."
+            ),
+        ),
+        BugClass::InterpreterCrash(_) => (
+            "Bound the recursion depth",
+            format!(
+                "Cap the recursion depth near {at} (or convert it to an explicit, bounded loop), and reject inputs that nest without bound. An interpreter stack limit (PHP's `zend.max_allowed_stack_size`, Python's recursion limit) turns the overflow into an error the program can handle."
+            ),
+        ),
         BugClass::OverlappingCopy => (
             "Copy overlapping ranges with memmove",
             format!(
@@ -1104,7 +1116,7 @@ fn sanitizer_stack_location(raw: &Value) -> Option<FixLocation> {
         let Some(file) = string_at(frame, &["file"]) else {
             continue;
         };
-        if file.starts_with('(') {
+        if file.starts_with('(') || is_runtime_internal_location(&file) {
             continue;
         }
         // A glibc-internal source file (libio/iofread.c, sysdeps/.../memmove.S)
@@ -2513,6 +2525,15 @@ impl ReachabilityBasisText {
     }
 }
 
+/// A frame location a language runtime prints for its own code, which has no
+/// source file a developer could fix: V8's builtins (`<anonymous>`, `native`,
+/// `node:internal/...`) and the `<...>` pseudo-files of other runtimes
+/// (`<frozen importlib._bootstrap>`, `<string>`, `<built-in>`).
+fn is_runtime_internal_location(file: &str) -> bool {
+    let file = file.trim();
+    file == "native" || file.starts_with("node:") || (file.starts_with('<') && file.ends_with('>'))
+}
+
 /// The bhf harness scaffolding (entry shims + the generated `main`), which
 /// drives the input but is not where the target's bug lives. Shared with the
 /// report writeup so the rendered crash Stack can trim these synthetic-driver
@@ -2572,6 +2593,9 @@ fn sink_from(raw: &Value) -> Option<Sink> {
             continue;
         }
         let file = string_at(frame, &["file"]).filter(|file| !file.starts_with('('));
+        if file.as_deref().is_some_and(is_runtime_internal_location) {
+            continue;
+        }
         if is_harness_frame(&function, file.as_deref())
             || is_runtime_noise_frame(&function, file.as_deref())
             || is_rust_stdlib_frame(&function, file.as_deref())
@@ -2767,6 +2791,14 @@ enum BugClass {
     /// (`memcpy-param-overlap`, `strcpy-param-overlap`, ...), which the C
     /// standard leaves undefined (CWE-475).
     OverlappingCopy,
+    /// Input-controlled text reached a command a shell or process-execution
+    /// API runs (CWE-78): the program misbehaved, nothing crashed.
+    CommandInjection,
+    /// The interpreter of an interpreted lane (named) died by SIGSEGV with no
+    /// report of its own. Code it runs cannot corrupt memory, so this is its
+    /// native stack running out under deep recursion (CWE-674), not a
+    /// memory-safety bug in the target.
+    InterpreterCrash(&'static str),
     Unknown,
 }
 
@@ -2835,6 +2867,8 @@ impl BugClass {
             Self::UncaughtException => "uncaught-exception",
             Self::IndexOutOfBounds => "index-out-of-bounds",
             Self::OverlappingCopy => "overlapping-copy",
+            Self::CommandInjection => "command-injection",
+            Self::InterpreterCrash(_) => "interpreter-crash",
             Self::Unknown => "unknown",
         }
     }
@@ -3041,6 +3075,29 @@ fn access_direction(raw: &Value) -> Direction {
     Direction::Unknown
 }
 
+/// The interpreter a harness `bhf auto` generated runs its target under, from
+/// the language its id encodes (`H-W0003-...` is a PHP harness, as the repro
+/// lanes read it). `None` for a native or managed lane and a custom id.
+fn interpreter_of(raw: &Value) -> Option<&'static str> {
+    const INTERPRETERS: &[(&str, &str)] = &[
+        ("H-P", "Python"),
+        ("H-L", "Perl"),
+        ("H-U", "Ruby"),
+        ("H-V", "Lua"),
+        ("H-W", "PHP"),
+        ("H-N", "Node.js"),
+        ("H-T", "Node.js"),
+    ];
+    let harness = string_at(raw, &["harness_id"])?;
+    INTERPRETERS.iter().find_map(|(prefix, interpreter)| {
+        let rest = harness.strip_prefix(prefix)?;
+        rest.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
+            .then_some(*interpreter)
+    })
+}
+
 fn classify_bug(raw: &Value) -> BugClass {
     let name = string_at(raw, &["exception", "name"]).unwrap_or_default();
     let sanitizer = string_at(raw, &["exception", "sanitizer"])
@@ -3053,6 +3110,17 @@ fn classify_bug(raw: &Value) -> BugClass {
         return class_for_ubsan_kind(kind);
     }
     let rule_id = string_at(raw, &["rule_id"]).unwrap_or_default();
+    // A command-injection finding's message is the injected command, which
+    // the input chose: its words (`SEGV`, `abort`) are not evidence. Its rule
+    // or kind says what it is.
+    if finding_rules::by_id(&rule_id).is_some_and(|rule| rule.cwe == "CWE-78")
+        || name
+            .to_ascii_lowercase()
+            .replace('_', "-")
+            .contains("command-injection")
+    {
+        return BugClass::CommandInjection;
+    }
     // Normalize `_`/`-` so `HEAP_BUFFER_OVERFLOW` and `heap-buffer-overflow`
     // both match the same needles. Only the message text after any source
     // location prefix is read.
@@ -3083,12 +3151,20 @@ fn classify_bug(raw: &Value) -> BugClass {
         return BugClass::OverlappingCopy;
     }
     // Stack exhaustion from uncontrolled recursion is a distinct weakness
-    // (CWE-674) from a fixed-buffer stack overflow (CWE-121). Catch the
-    // recursion-driven forms (incl. Java `StackOverflowError`) BEFORE the
-    // stack-buffer-overflow needles so `stack-overflow-recursion` is not
-    // miscategorised as a buffer overflow. A bare `stack-overflow` with no
-    // recursion signal stays a stack-buffer-overflow.
+    // (CWE-674) from a fixed-buffer stack overflow (CWE-121). Every
+    // `stack-overflow` is exhaustion: ASan's (it reports an overrun of a stack
+    // buffer as `stack-buffer-overflow`), the language lanes' kinds
+    // (`js-stack-overflow`, `go-stack-overflow`, `csharp-stack-overflow`) and
+    // Windows' `EXCEPTION_STACK_OVERFLOW`; so are V8's `Maximum call stack
+    // size exceeded`, Ruby's `stack level too deep`, Java's
+    // `StackOverflowError` and the recursion-limit errors.
     if has("stack-exhaustion")
+        || has("stack-overflow")
+        || has("stack overflow")
+        || has("maximum call stack")
+        || has("call stack size exceeded")
+        || has("stack level too deep")
+        || has("too much recursion")
         || has("stackoverflowerror")
         || has("uncontrolled-recursion")
         || has("infinite-recursion")
@@ -3099,15 +3175,12 @@ fn classify_bug(raw: &Value) -> BugClass {
         || has("recursion limit")
         || has("recursion-depth")
         || has("recursion depth")
-        || has("stack-overflow-recursion")
-        // ASan's `stack-overflow` is the thread stack running out; it reports
-        // an overrun of a stack buffer as `stack-buffer-overflow`.
-        || has("asan-stack-overflow")
-        || has("addresssanitizer: stack-overflow")
     {
         return BugClass::StackExhaustion;
     }
-    if has("stack-buffer-overflow") || has("dynamic-stack-buffer-overflow") || has("stack-overflow")
+    if has("stack-buffer-overflow")
+        || has("dynamic-stack-buffer-overflow")
+        || has("stack-buffer-underflow")
     {
         return BugClass::StackBufferOverflow;
     }
@@ -3182,6 +3255,15 @@ fn classify_bug(raw: &Value) -> BugClass {
         || has("exception in thread")
     {
         return BugClass::UncaughtException;
+    }
+    // An interpreter killed by SIGSEGV with no report of its own: the code it
+    // runs cannot corrupt memory, so its native stack ran out under deep
+    // recursion (PHP before 8.3's stack limit, CPython past its recursion
+    // limit), not a wild pointer of the target's.
+    if sanitizer.is_empty() && has("fatal-signal") && has("sigsegv") {
+        if let Some(interpreter) = interpreter_of(raw) {
+            return BugClass::InterpreterCrash(interpreter);
+        }
     }
     // Windows ASan names the deadly memory-access signal by its exception:
     // `access-violation`, or `in-page-error` for a mapped page that could not
@@ -3341,6 +3423,8 @@ fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
         BugClass::StackExhaustion => ("CWE-674", None),
         BugClass::UncaughtException => ("CWE-248", None),
         BugClass::OverlappingCopy => ("CWE-475", None),
+        BugClass::CommandInjection => ("CWE-78", None),
+        BugClass::InterpreterCrash(_) => ("CWE-674", None),
         // A bounds-checked panic is a DETECTED out-of-bounds access; direction is
         // usually unstated, so default to CWE-125 (read) with CWE-787 (write)
         // secondary, and flip when the message names a write (`copy_from_slice`,
@@ -3409,6 +3493,7 @@ fn cwe_name(id: &str) -> &'static str {
         "CWE-843" => "Access of Resource Using Incompatible Type ('Type Confusion')",
         "CWE-1335" => "Incorrect Bitwise Shift of Integer",
         "CWE-475" => "Undefined Behavior for Input to API",
+        "CWE-78" => "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
         _ => "Uncategorized Weakness",
     }
 }
@@ -3477,6 +3562,29 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         BugClass::OverlappingCopy => format!(
             "This is an overlapping copy: while processing a crafted input, {fn_ref} copied memory with a function such as `memcpy` or `strcpy` whose source and destination overlap. The C standard leaves that copy undefined, so depending on the C library it duplicates, drops or scrambles bytes; an input-controlled offset or length behind it corrupts the destination data."
         ),
+        BugClass::CommandInjection => format!(
+            "This is OS command injection: while processing a crafted input, {fn_ref} put text derived from the input into a command that a shell or process-execution API runs. An attacker who can supply this input chooses part of that command, so they can run commands of their own with the program's privileges."
+        ),
+        BugClass::InterpreterCrash(interpreter) => format!(
+            "The {interpreter} interpreter itself died with a segmentation fault (SIGSEGV) while running {fn_ref} on a crafted input. Code the interpreter runs cannot corrupt memory on its own, so this is almost always the interpreter's native call stack running out under deep recursion (uncontrolled recursion); a defect in a native extension is the other cause. An attacker who can supply this input can kill the process (denial of service)."
+        ),
+        // A runtime oracle flags how the program behaved, which is not a crash.
+        BugClass::Unknown
+            if matches!(
+                string_at(raw, &["classification"]).as_deref(),
+                Some("oracle" | "oracle_hit")
+            ) =>
+        {
+            let oracle = string_at(raw, &["oracle", "name"])
+                .map(|name| format!("the runtime oracle `{name}`"))
+                .unwrap_or_else(|| "a runtime oracle".to_owned());
+            let call = string_at(raw, &["oracle", "api"])
+                .map(|api| format!("how {fn_ref} called `{api}`"))
+                .unwrap_or_else(|| format!("what {fn_ref} did"));
+            format!(
+                "While processing a crafted input, {oracle} flagged {call}; it is not a crash, the behavior itself is the finding."
+            )
+        }
         BugClass::Unknown => format!(
             "While processing a crafted input, the program hit a fault in {fn_ref} and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed."
         ),
