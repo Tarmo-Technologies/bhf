@@ -1244,7 +1244,11 @@ component was observed by a built-and-fuzzed harness, are annotated with
 `reachability.status: "reached_by_fuzz"` and counted under
 `counts.reached_matches`. Use `--fail-on
 low|medium|high|critical` for a direct gate, or `--policy` to read
-`/ci/fail_on_vulnerability_severity` from policy-as-code. `bhf ci` forwards
+`/ci/fail_on_vulnerability_severity` from policy-as-code. Either gate needs
+`--vuln-db`: without advisories nothing can match, so `--fail-on` without it
+is refused (exit 2), and so is a policy gate (exit 1). `vulnerabilities.json`
+records the database the matches came from as `advisory_db` (its path,
+sha256 and number of entries), or `null` when none was given. `bhf ci` forwards
 the `auto` budget knobs so a CI run can be bounded the same way: `--per-target-time`
 (per-target total fuzz wall), `--per-target-finding-count N` (stop a target after
 N distinct findings; `1` ≈ stop-on-first-crash), and `--campaign-time` (whole-run

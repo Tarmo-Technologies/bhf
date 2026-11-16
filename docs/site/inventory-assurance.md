@@ -54,7 +54,7 @@ bhf sbom /path/to/source --vuln-db /path/to/advisories.json \
 `--fail-on-unreviewed` requires explicit `--vuln-db` and writes `vex-review.json`
 even with a narrower `--emit` or `--format` selection. It blocks on any pending
 match, including a low-severity match below a separate severity threshold.
-Existing `--fail-on` and policy severity gates still operate independently.
+Existing `--fail-on` and policy severity gates still operate independently, and need `--vuln-db` too.
 
 | Outcome | CLI exit |
 | --- | ---: |

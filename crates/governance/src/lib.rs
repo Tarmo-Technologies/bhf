@@ -4282,17 +4282,36 @@ fn match_vulnerabilities(
     components: &[Component],
 ) -> Result<Value, GovernanceError> {
     let fail_on = sbom_gate_threshold(options)?;
+    if fail_on.is_some() && options.vuln_db.is_none() {
+        // Nothing can match without advisories: the gate would pass whatever
+        // the inventory holds.
+        return Err(GovernanceError::InvalidInput {
+            message: "the vulnerability severity gate (--fail-on, or the policy's \
+                      /ci/fail_on_vulnerability_severity) needs an advisory database: \
+                      pass --vuln-db"
+                .to_owned(),
+        });
+    }
     let reachability = load_sbom_reachability(options)?;
     let campaign_ran = reachability.campaign_ran();
     let mut matches = Vec::new();
+    // Which database the matches came from, so a report with no matches says
+    // whether any advisory was checked.
+    let mut advisory_db = Value::Null;
     if let Some(vuln_db) = &options.vuln_db {
-        let db = read_json(vuln_db)?;
+        let bytes = fs::read(vuln_db)?;
+        let db: Value = serde_json::from_slice(&bytes)?;
         let advisories = db
             .get("vulnerabilities")
             .and_then(Value::as_array)
             .ok_or_else(|| GovernanceError::InvalidInput {
                 message: "advisory database requires a vulnerabilities array".to_owned(),
             })?;
+        advisory_db = json!({
+            "path": vuln_db.display().to_string(),
+            "sha256": sha256_hex(&bytes),
+            "entries": advisories.len(),
+        });
         for (index, vuln) in advisories.iter().enumerate() {
             validate_advisory(vuln, index)?;
             let package = vuln.get("package").unwrap_or(&Value::Null);
@@ -4385,6 +4404,7 @@ fn match_vulnerabilities(
             "fail_on": fail_on,
             "failed": gate_failed
         },
+        "advisory_db": advisory_db,
         "matches": matches
     }))
 }

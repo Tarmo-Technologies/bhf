@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf sbom --fail-on` requires `--vuln-db` (exit 2), and a policy severity
+  gate without a database is refused. Without advisories nothing can match,
+  so the gate passed with 0 matches whatever the inventory held.
+  `vulnerabilities.json` records the advisory database as `advisory_db`
+  (path, sha256, entry count), or `null` when none was given.
 - The daemon docs say `bhf-daemon --mcp` exposes three read-only tools in a
   default build (`bhf_scan`, `bhf_list_targets`, `bhf_load_findings`) and
   five with `--features llm`. They said five, but the release binaries
