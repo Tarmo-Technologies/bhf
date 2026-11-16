@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- docs/site/on-target-fuzzing.md no longer claims Renode integration,
+  semihosting coverage or target-byte-order typed mutation; each names the
+  issue that tracks it. It documents the on-target agent's frame format and
+  says no target-side agent ships yet. The roadmap's §1a and CC-2 entries and
+  the semihosting emitter's header say the same.
 - The `gdb` and `qemu-system` transports take the staging buffer's size,
   `input_cap=` in `--transport-coverage-map` (required), and an optional
   `input_len=` word the firmware reads the input's length from. They wrote
