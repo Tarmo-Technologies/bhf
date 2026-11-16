@@ -92,7 +92,15 @@ pub struct WinCoreBuilder {
     seq: u64,
     fidelity: Fidelity,
     finished: bool,
+    /// Records held until the testcase's PID is known ([`Self::new_pending`]):
+    /// the host launches the target after the observer is ready, and its first
+    /// events can arrive before the PID handoff.
+    pending: Option<Vec<WinRawRecord>>,
 }
+
+/// The most records a pending observation holds before its PID arrives; the
+/// rest count as lost.
+pub const MAX_PENDING_RECORDS: usize = 200_000;
 
 impl WinCoreBuilder {
     /// Start observing a testcase rooted at `root_pid`. `fuzz_input` is the
@@ -115,6 +123,7 @@ impl WinCoreBuilder {
             seq: 0,
             fidelity: Fidelity::default(),
             finished: false,
+            pending: None,
         };
         builder.tree.insert(root_pid);
         let mut begin = builder.event(EventPhase::Begin, EventKind::ProcessCreate);
@@ -126,6 +135,47 @@ impl WinCoreBuilder {
         begin.ts = Some(0.0);
         builder.events.push(begin);
         builder
+    }
+
+    /// Start observing a testcase whose PID is not known yet: every record is
+    /// held until [`Self::set_root`] names the PID, then attributed to that
+    /// process's tree as if it had been known from the start.
+    pub fn new_pending(
+        ctx: &CollectorContext,
+        root_image: impl Into<String>,
+        fuzz_input: impl Into<Vec<u8>>,
+    ) -> Self {
+        let mut builder = Self::new(ctx, 0, root_image, fuzz_input);
+        builder.tree.clear();
+        builder.pending = Some(Vec::new());
+        builder
+    }
+
+    /// Whether the observation has its root PID.
+    pub fn is_rooted(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    /// The root PID (0 while pending).
+    pub fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    /// Root a pending observation at `pid`, the process the host launched,
+    /// and attribute every record held so far. No effect on a rooted one.
+    pub fn set_root(&mut self, pid: u32) {
+        let Some(held) = self.pending.take() else {
+            return;
+        };
+        self.root_pid = pid;
+        self.tree.clear();
+        self.tree.insert(pid);
+        if let Some(begin) = self.events.first_mut() {
+            begin.process.pid = pid;
+        }
+        for record in held {
+            self.ingest(record);
+        }
     }
 
     fn event(&mut self, phase: EventPhase, kind: EventKind) -> CollectorEvent {
@@ -173,6 +223,14 @@ impl WinCoreBuilder {
     /// Ingest one decoded record. Records for processes outside the testcase's
     /// descendant tree are ignored (they are not the testcase's effects).
     pub fn ingest(&mut self, record: WinRawRecord) {
+        if let Some(held) = &mut self.pending {
+            if held.len() < MAX_PENDING_RECORDS {
+                held.push(record);
+            } else {
+                self.fidelity.lost = self.fidelity.lost.saturating_add(1);
+            }
+            return;
+        }
         match record {
             WinRawRecord::ProcessStart {
                 pid,
@@ -287,6 +345,10 @@ impl WinCoreBuilder {
     pub fn finish(&mut self, end_ts: f64) {
         if self.finished {
             return;
+        }
+        // Never rooted: the host handed no PID, so nothing is the testcase's.
+        if self.pending.take().is_some() {
+            self.mark_unsupported("target_pid_not_received");
         }
         let fidelity = self.fidelity.clone();
         let mut end = self.event(EventPhase::End, EventKind::ProcessCreate);
@@ -582,6 +644,88 @@ mod tests {
         );
         // The unrelated record emits no attributed event.
         assert!(b.events().iter().all(|e| e.process.pid != 5000));
+    }
+
+    /// The host launches the target after the observer is ready and hands
+    /// its PID over a file, so the target's first events (its start, a
+    /// ShellExecute, a file it opens) can arrive first, among other
+    /// processes'. A pending observation holds them and, once rooted at the
+    /// PID, attributes exactly that process's tree, its start included.
+    #[test]
+    fn a_pending_observation_reroots_at_the_handed_off_pid() {
+        let ctx = CollectorContext::new("tc-1", 0, "C:\\sandbox", 250);
+        let mut b = WinCoreBuilder::new_pending(&ctx, "C:\\sandbox\\main.exe", b"".to_vec());
+        assert!(!b.is_rooted());
+        let start = |pid, parent_pid, image: &str, ts| WinRawRecord::ProcessStart {
+            pid,
+            parent_pid,
+            image: image.into(),
+            command_line: String::new(),
+            user: None,
+            session: None,
+            ts,
+        };
+        b.ingest(start(7000, 4, "svchost.exe", 0.01));
+        // The launched target, child of the host (bhf, pid 900).
+        b.ingest(start(1234, 900, "C:\\sandbox\\main.exe", 0.02));
+        b.ingest(WinRawRecord::ShellExecute {
+            pid: 1234,
+            verb: "open".into(),
+            file: "cmd.exe".into(),
+            params: vec!["/c".into(), "echo".into()],
+            child_pid: 1240,
+            ts: 0.03,
+        });
+        b.ingest(WinRawRecord::FileOp {
+            pid: 7000,
+            op: WinFileOp::Open,
+            path: "C:\\Windows\\x.log".into(),
+            ts: 0.04,
+        });
+        assert!(b.events().len() == 1, "nothing attributed before the PID");
+        b.set_root(1234);
+        assert!(b.is_rooted());
+        assert_eq!(b.root_pid(), 1234);
+        // After the handoff, records go straight to attribution.
+        b.ingest(WinRawRecord::ImageLoad {
+            pid: 1240,
+            path: "C:\\Windows\\System32\\cmd.exe".into(),
+            ts: 0.05,
+        });
+        b.finish(0.3);
+        let events = b.events();
+        assert_eq!(
+            events[0].process.pid, 1234,
+            "the begin boundary names the target"
+        );
+        assert!(events.iter().all(|e| e.process.pid != 7000), "{events:#?}");
+        assert!(events
+            .iter()
+            .any(|e| e.kind == EventKind::ShellExecute && e.process.pid == 1234));
+        assert!(events
+            .iter()
+            .any(|e| e.kind == EventKind::ModuleLoad && e.process.pid == 1240));
+        let tree: Vec<u32> = b.tree_pids().collect();
+        assert_eq!(tree, [1234, 1240]);
+        let end = events.last().unwrap();
+        assert!(end.fidelity.unsupported_fields.is_empty(), "{end:#?}");
+    }
+
+    /// A pending observation the host never hands a PID attributes nothing,
+    /// and says so.
+    #[test]
+    fn a_pending_observation_without_a_pid_is_degraded() {
+        let ctx = CollectorContext::new("tc-1", 0, "C:\\sandbox", 250);
+        let mut b = WinCoreBuilder::new_pending(&ctx, "main.exe", b"".to_vec());
+        b.ingest(WinRawRecord::ImageLoad {
+            pid: 1234,
+            path: "x.dll".into(),
+            ts: 0.1,
+        });
+        b.finish(0.3);
+        let end = b.events().last().unwrap();
+        assert_eq!(end.fidelity.unsupported_fields, ["target_pid_not_received"]);
+        assert_eq!(b.events().len(), 2);
     }
 
     #[test]

@@ -39,8 +39,8 @@ use runtime_collector::CollectorContext;
 use std::ffi::c_void;
 use std::io::Write;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::win_core::{self, SessionStartDecision, SessionStopTarget, WinCoreBuilder};
 use crate::win_etw_decode::{EtwDecoder, EtwGuid, EtwProvider, PointerSize, RawEtwEvent};
@@ -61,6 +61,17 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
 /// name and GUID. Bumped by [`MAX_SESSION_NAME_ATTEMPTS`](win_core::MAX_SESSION_NAME_ATTEMPTS)
 /// per acquisition to leave room for that acquisition's retries.
 static SESSION_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// The PID of the target the host launched, read from `BHF_COLLECTOR_TARGET_PID`
+/// by the controlling thread while the session runs; the callback roots a
+/// pending observation at it. 0 until the handoff.
+static TARGET_PID: AtomicU32 = AtomicU32::new(0);
+
+/// The longest an observation waits for the host's `BHF_COLLECTOR_DONE` after
+/// the session starts. The host stops a replayed target at its own bound and
+/// kills a sidecar that outlives its drain, so this only ends a session whose
+/// host went away.
+const MAX_OBSERVATION: Duration = Duration::from_secs(300);
 
 /// Shared state the real-time callback mutates. Only the `ProcessTrace` worker
 /// thread touches it between session start and join; the controlling thread
@@ -351,12 +362,20 @@ fn run_consumer(
         }
     });
 
-    std::thread::sleep(Duration::from_millis(window_ms));
+    wait_for_replay(window_ms);
 
     // Stopping the OWNED session unblocks ProcessTrace on the worker thread. The
     // stop is issued strictly via the handle StartTraceW returned, not the name.
     stop_owned_session(control, name.len());
     let _ = worker.join();
+    // The callback roots the observation at the handed-off PID on the next
+    // event; with none after the handoff, root it here. The worker has
+    // joined, so this thread again has `state` to itself.
+    let target = TARGET_PID.load(Ordering::Acquire);
+    if target != 0 {
+        // SAFETY: as below — the callback can no longer run.
+        unsafe { (*state_ptr).builder.set_root(target) };
+    }
 
     // SAFETY: the worker thread has joined, so the callback can no longer run and
     // this is again the only accessor of `state`/the trace handle.
@@ -365,6 +384,41 @@ fn run_consumer(
     }
     // keep `logger_name` alive until the consumer is fully torn down.
     drop(logger_name);
+}
+
+/// Hold the session open for the replay the host runs under it. With the
+/// host's handshake (`BHF_COLLECTOR_TARGET_PID`, `BHF_COLLECTOR_DONE`), read
+/// the launched target's PID when the host writes it and publish it to the
+/// callback, and trace until the host says the replay and its post-exit window
+/// are over, at most [`MAX_OBSERVATION`]. Without the handshake (a standalone
+/// run), observe for `window_ms`.
+fn wait_for_replay(window_ms: u64) {
+    let file = |name: &str| std::env::var_os(name).filter(|path| !path.is_empty());
+    let (pid_file, done_file) = (file("BHF_COLLECTOR_TARGET_PID"), file("BHF_COLLECTOR_DONE"));
+    if pid_file.is_none() && done_file.is_none() {
+        std::thread::sleep(Duration::from_millis(window_ms));
+        return;
+    }
+    let deadline = Instant::now() + MAX_OBSERVATION;
+    while Instant::now() < deadline {
+        if TARGET_PID.load(Ordering::Acquire) == 0 {
+            if let Some(pid) = pid_file
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .filter(|pid| *pid != 0)
+            {
+                TARGET_PID.store(pid, Ordering::Release);
+            }
+        }
+        if done_file
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).exists())
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Signal the #76 readiness ack to the host: once the session is live and the
@@ -440,6 +494,12 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         user_data,
     };
     if let Some(decoded) = state.decoder.decode(&raw) {
+        if !state.builder.is_rooted() {
+            let target = TARGET_PID.load(Ordering::Acquire);
+            if target != 0 {
+                state.builder.set_root(target);
+            }
+        }
         state.builder.ingest(decoded);
     }
 }
@@ -463,8 +523,17 @@ pub fn collect(
     root_image: &str,
     fuzz_input: Vec<u8>,
 ) -> String {
+    // Under the host's replay the target is launched after the session is
+    // ready and its PID handed over a file: observe pending until then.
+    let handed_off = root_pid == 0
+        && std::env::var_os("BHF_COLLECTOR_TARGET_PID").is_some_and(|path| !path.is_empty());
+    let builder = if handed_off {
+        WinCoreBuilder::new_pending(ctx, root_image, fuzz_input)
+    } else {
+        WinCoreBuilder::new(ctx, root_pid, root_image, fuzz_input)
+    };
     let mut state = Box::new(ConsumerState {
-        builder: WinCoreBuilder::new(ctx, root_pid, root_image, fuzz_input),
+        builder,
         decoder: EtwDecoder::new(),
         base_ts: None,
         max_ts: 0.0,

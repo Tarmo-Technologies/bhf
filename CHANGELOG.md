@@ -45,6 +45,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The native Windows ETW collector honours the host's replay handshake: it
+  roots its attribution at the PID the host writes to `BHF_COLLECTOR_TARGET_PID`
+  (events received before the handoff included) and traces until
+  `BHF_COLLECTOR_DONE`. It rooted at PID 0 and slept a fixed window, so every
+  `bhf binary fuzz --collector auto` replay on Windows degraded to
+  `replayed_process_not_observed`. A live Windows control (ShellExecute of the
+  input found, a constant command not) runs in CI, and windows.md and cli.md
+  claim native ETW findings only as far as it shows.
 - A C++ declaration of an unqualified standard type (`vector<int> items;` in a
   pre-standard header) gets clang's `unknown type name 'vector'`, with its
   source line, from bhf's cl front end, so the std-prelude repair works with

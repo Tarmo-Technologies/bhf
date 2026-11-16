@@ -395,7 +395,11 @@ native Windows ETW provider `bhf-collector-win`, or on Linux the in-process
 only when the shim is unavailable. The adapter re-expresses the shim's effect
 events as the collector contract.
 A PATH runs an external sidecar that speaks the protocol, and `none` (default)
-disables it, leaving behaviour unchanged. The collector is an *additional*,
+disables it, leaving behaviour unchanged. On Windows, `bhf binary fuzz` replays a
+retained input under the native sidecar, which roots its attribution at the PID
+the host hands it. The live controls show a controlled process execution
+(BHF-431) found through `ShellExecuteEx`, and no finding for a constant command;
+see [Windows](windows.md). `bhf fuzz` does not replay a harness under a sidecar. The collector is an *additional*,
 collector-shaped view over the same shim events `--runtime-oracles` uses, so
 enabling it does not change `--runtime-oracles` behaviour.
 A collector finding stores its raw `CollectorSession` evidence next to
