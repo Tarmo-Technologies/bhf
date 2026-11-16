@@ -79,6 +79,61 @@ jobs:
         with:
           toolchain: stable
 
+      # The lane tests skip, and pass, when their toolchain is missing; these
+      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C# and
+      # Cortex-M emulator lanes, and the skip-line check after the tests fails
+      # the shard if a test still skips (scripts/ci/allowed-skips.txt lists
+      # the lanes not installed yet: Ada, AFL++, COBOL, Wine and AArch64).
+      - name: Install the interpreter and emulator toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 \
+            php-cli \
+            php-pcov \
+            ruby \
+            perl \
+            qemu-system-arm \
+            qemu-utils \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            gdb \
+            lldb \
+            llvm
+
+      - name: Install a JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # esbuild for the TypeScript lane, as the container image pins it; a
+      # nightly Rust for the Rust lane's sanitizer builds; the SharpFuzz tool
+      # whose SharpFuzz.Common.dll the C# capsule tests use.
+      - name: Install esbuild, a nightly Rust and SharpFuzz
+        run: |
+          npm install -g --no-fund --no-audit esbuild@0.28.2
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+          dotnet tool install --global --version 2.3.0 SharpFuzz.CommandLine
+
+      - name: Check the installed toolchains
+        run: |
+          set -euo pipefail
+          for tool in lua5.4 php ruby perl java javac node esbuild qemu-system-arm qemu-img \
+                      arm-none-eabi-gcc nm gdb lldb llvm-symbolizer dotnet; do
+            command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
+          done
+          php -m | grep -qx pcov || { echo "php has no pcov extension" >&2; exit 1; }
+          java -version 2>&1 | grep -q 'version "21' || { echo "java is not 21" >&2; exit 1; }
+          cargo +nightly --version
+          find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
+            -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
+
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
@@ -119,6 +174,12 @@ jobs:
             echo "unknown shard: $SHARD" >&2
             exit 1
           fi
+
+      # A skip line in a test's output (kept in the JUnit report) means a lane
+      # that ran nothing; only those scripts/ci/allowed-skips.txt allows pass.
+      - name: Fail on unexpected skip lines
+        if: ${{ always() }}
+        run: python3 scripts/ci/check-no-skips.py --allowlist scripts/ci/allowed-skips.txt target/nextest/ci/junit.xml
 
       - name: Summarize the nextest report
         if: ${{ always() }}

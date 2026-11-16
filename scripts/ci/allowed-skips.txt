@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Skip lines the nightly integration suite may print. scripts/ci/check-no-skips.py
+# reads every test's captured output from the nextest JUnit report and fails the
+# shard on any skip line (one starting with skip, skipping, skipped or SKIP)
+# that no entry here allows. An entry is
+#
+#   TEST_GLOB  LINE_GLOB
+#
+# matched, ignoring case, with fnmatch globs against `<binary id>::<test name>`
+# and the skip line; LINE_GLOB may contain spaces. Give each entry its reason,
+# keep it as narrow as the lane, and delete it once the nightly installs what
+# the lane needs.
+
+# Ada: the nightly installs no GNAT or GPRbuild yet. The real-code validation
+# workflow and the GNAT Matrix run the Ada build and fuzz pipelines.
+*  *gnatmake*
+*  *gprbuild*
+*  *no gnat toolchain*
+*  *no ada compiler*
+*  *the ada toolchain is not installed*
+# The GNAT Matrix workflow sets BHF_M19_FULL_CI for this one.
+bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  skipping: BHF_M19_FULL_CI is not set
+
+# AFL++: afl-fuzz and afl-clang-fast are not installed yet.
+*  *afl-fuzz*
+
+# COBOL: GnuCOBOL (cobc) is not installed yet.
+*  *cobc*
+
+# Wine and MinGW-w64: the Windows cross lane is not installed yet.
+*  *x86_64-w64-mingw32-*
+
+# AArch64: the cross compilers and qemu-aarch64 are not installed yet.
+*  *aarch64*
+
+# The FreeRTOS CLI acceptance fetches a pinned kernel; hil-emu.yml runs it with
+# BHF_RTOS_CLI=1.
+bhf::transport_fuzz_qemu_cli::cli_freertos_clean_fault_clean  skip cli_freertos_clean_fault_clean: set BHF_RTOS_CLI=1
+
+# The arrow-key installer prompt needs a real terminal, which no CI job has.
+bhf::offline_dist_scripts::offline_dist_installer_interactive_prompt_accepts_down_arrow_to_ok  skip: interactive arrow-key TUI needs a real terminal*

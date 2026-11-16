@@ -84,6 +84,18 @@ manual dispatch always runs. A failed or timed-out shard opens one issue
 labelled `integration-nightly` for the branch, or updates the open one, and
 comments on it when a new commit fails; close it once a nightly passes.
 
+Each shard builds the runtrace shim and installs the interpreter, JVM,
+TypeScript, Rust-nightly, C# and Cortex-M emulator toolchains (Lua 5.4, PHP
+with pcov, Ruby, Perl, JDK 21, Node 24 with esbuild, a nightly Rust, the
+SharpFuzz tool, `qemu-system-arm` with `gcc-arm-none-eabi`, gdb, lldb and LLVM)
+and runs its tests with `BHF_REQUIRE_TOOLS=1`. A test that finds its tool
+missing prints a skip line (one starting with `skip`, `skipping`, `skipped` or
+`SKIP`) and passes; `scripts/ci/check-no-skips.py` reads those lines from the
+JUnit report and fails the shard on any that `scripts/ci/allowed-skips.txt`
+does not allow. The allowlist names the lanes the nightly does not install yet
+(Ada, AFL++, COBOL, Wine and AArch64) and the few tests another workflow runs;
+each entry gives its reason.
+
 ## Test reports, retries and hangs
 
 CI's nextest runs (`build-test`, `doc-contracts` and every nightly shard) use

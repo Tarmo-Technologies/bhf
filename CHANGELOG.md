@@ -1657,6 +1657,12 @@
   been given.
 
 ### Changed
+- The nightly integration suite installs the Lua, PHP (with pcov), Ruby,
+  Perl, Java, TypeScript (esbuild), Rust-nightly, C# (SharpFuzz) and Cortex-M
+  QEMU toolchains, whose lane tests used to skip and pass there, and fails a
+  shard when a test prints a skip line that `scripts/ci/allowed-skips.txt`
+  does not allow (it starts with the Ada, AFL++, COBOL, Wine and AArch64
+  lanes).
 - CI's nextest runs use a new `ci` profile: a failing test is retried once
   and reported FLAKY in the job summary if it then passes, a test running
   past 16 minutes is killed and reported, and each job uploads a JUnit report
