@@ -3360,7 +3360,9 @@ fn build_copy(tree: &Path, probe_dir: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(&copy);
     std::fs::create_dir_all(&copy)
         .map_err(|error| format!("create {}: {error}", copy.display()))?;
-    let copy = copy.canonicalize().unwrap_or(copy);
+    // The build's compilers report their directory without Windows' `\\?\`
+    // prefix, and a compile entry is mapped back to the tree by that prefix.
+    let copy = crate::auto::cli::strip_verbatim_prefix(copy.canonicalize().unwrap_or(copy));
     let from = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
     copy_tree(&from, &copy, &copy).map_err(|error| {
         format!(
@@ -4256,6 +4258,33 @@ mod tests {
 
     fn tmpdir() -> crate::test_support::TestDir {
         crate::test_support::TestDir::new("probe")
+    }
+
+    /// The copy a `--build-command` builds is named as its compilers name
+    /// their directory: on Windows, without the `\\?\` prefix `canonicalize`
+    /// adds, so a compile entry built there maps back to the tree's file.
+    #[test]
+    fn a_compile_entry_built_in_the_copy_names_the_tree_file() {
+        let root = tmpdir();
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("core")).unwrap();
+        fs::write(tree.join("core/widget.c"), "int widget;\n").unwrap();
+        let home = root.join("probe/tree-0");
+        let probe = home.join(PROBE_DIR);
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(home.join(SOURCE_TREE_MARKER), tree.display().to_string()).unwrap();
+
+        let copy = build_copy(&tree, &probe).unwrap();
+        assert!(
+            !copy.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            copy.display()
+        );
+        assert!(copy.join("core/widget.c").is_file());
+        assert_eq!(
+            source_path_in_tree(&copy.join("core"), Path::new("widget.c"), &copy, &tree),
+            tree.join("core").join("widget.c")
+        );
     }
 
     #[test]
