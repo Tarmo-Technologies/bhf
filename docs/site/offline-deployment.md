@@ -232,9 +232,9 @@ Each app is a separate archive with a `.sha256` sidecar:
 - `bhf-*` — the CLI
 - `bhf-daemon-*` — the JSON-RPC/read-only-MCP daemon (only for IDE or MCP use)
 - `bhf_runtrace_shim-*` — the `LD_PRELOAD` shim `bhf auto` uses for
-  runtime virtualisation on Linux (native C/C++/Ada/Rust/Go/COBOL/Fortran plus
-  Python/Perl/Ruby/Lua/PHP interpreters; deliberately off for Java, C#,
-  JavaScript/TypeScript, and cross/emulated targets)
+  runtime virtualisation on Linux (native C/C++/Ada/Rust/Go/COBOL/Fortran
+  harnesses; off for the interpreted and managed lanes and for cross/emulated
+  targets)
 - `bhf_cc_intercept-*` — the `LD_PRELOAD` shim C/C++ build recovery uses to
   capture compiler invocations made by absolute path or via `posix_spawn`
 

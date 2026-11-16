@@ -25,9 +25,9 @@ CLI.
 6. **Virtualise the runtime** via an LD_PRELOAD shim — fake missing files,
    sockets, env vars, and `dlopen` chains so the harness reaches the target
    code. The shim and its behavioral/taint oracles run on native
-   C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and interpose the
-   Python/Perl/Ruby/Lua/PHP interpreters. They are deliberately not armed for
-   Java, C#, JavaScript/TypeScript, or cross/emulated (qemu/wine) runs.
+   C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. They are not armed for the
+   interpreted and managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#,
+   JavaScript/TypeScript) or for cross/emulated (qemu/wine) runs.
 7. **Normalize findings** into JSON, Markdown, SARIF, JUnit, and IDE-facing
    daemon responses.
 
@@ -84,9 +84,8 @@ Build / fuzz / replay:
 - `crates/bhf_runtrace_shim` — LD_PRELOAD shim
   (`libbhf_runtrace.so`) that audits and fakes the runtime
   environment around a fuzz target. Armed for native
-  C/C++/Ada/Rust/Go/COBOL/Fortran and the Python/Perl/Ruby/Lua/PHP interpreter
-  processes; not armed for Java, C#, JavaScript/TypeScript, or cross/emulated
-  targets.
+  C/C++/Ada/Rust/Go/COBOL/Fortran harnesses; not armed for the interpreted and
+  managed lanes or for cross/emulated targets.
 - `crates/replay_min` — replay and delta-debug minimization.
 
 Output and policy:

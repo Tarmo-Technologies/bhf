@@ -11,11 +11,11 @@ The shim lives in `crates/bhf_runtrace_shim` and is Linux-only. On other
 hosts the cdylib is built empty; `bhf auto` falls through to build-time
 sweeping with no runtime audit.
 
-The shim is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and for
-the interpreted Python/Perl/Ruby/Lua/PHP lanes by interposing their interpreter
-processes. It is **not** armed for Java/JVM, C#/.NET, or
-JavaScript/TypeScript/Node—each uses managed-runtime-specific coverage and crash
-signals—and not under cross-compiled or emulated runs (qemu-user, wine). In
+The shim is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. It is
+**not** armed for the interpreted Python/Perl/Ruby/Lua/PHP lanes or for
+Java/JVM, C#/.NET, or JavaScript/TypeScript/Node—each uses its own runtime's
+coverage and crash signals—and not under cross-compiled or emulated runs
+(qemu-user, wine). In
 those cases the runtime audit, resource virtualisations, and shim-fed executable
 oracles described below are unavailable.
 
@@ -210,9 +210,9 @@ and `empty`; `fuzz_driven` requires the same fuzz input bytes.
 ## Executable Oracles
 
 Most of these oracles consume the shim's audit stream, so they fire wherever the
-shim is armed (native C/C++/Ada/Rust/Go/COBOL/Fortran and the interposed
-Python/Perl/Ruby/Lua/PHP interpreters). They do not fire for Java, C#,
-JavaScript/TypeScript, or cross-compiled/emulated targets. The Ada
+shim is armed: native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. They do not
+fire for the Python, Perl, Ruby, Lua, PHP, Java, C# or JavaScript/TypeScript
+lanes, or for cross-compiled/emulated targets. The Ada
 constraint-check oracles (BHF-102/103/104/105)
 below are the exception — they are fed by Ada source instrumentation compiled
 into the binary, not the LD_PRELOAD shim, so they remain available on

@@ -453,10 +453,10 @@ from cross-execution matching, not per input, and capped per harness.
 These runtrace-derived findings — BHF-413, BHF-414, BHF-415, and BHF-405, together
 with the BHF-304 command-injection, BHF-417 insecure-temp, and BHF-305
 sensitive-environment behavioral/taint oracles — are produced by the LD_PRELOAD
-runtrace shim. It is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses
-and interposes the Python/Perl/Ruby/Lua/PHP interpreter processes. It is
-deliberately **not** loaded for Java, C#, or JavaScript/TypeScript and is not
-armed under cross-compiled or emulated (qemu/wine) runs. Those configurations
+runtrace shim. It is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses.
+It is **not** loaded into the Python, Perl, Ruby, Lua, PHP, Java, C# or
+JavaScript/TypeScript lanes and is not armed under cross-compiled or emulated
+(qemu/wine) runs. Those configurations
 still fuzz for their documented coverage/crash/exception signals; the
 LD_PRELOAD behavioral and taint findings are the unavailable layer.
 

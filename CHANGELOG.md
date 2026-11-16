@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `run.json` and `run.md` say for each fuzzed target whether the behavioral
+  sink oracles ran (`behavioral_oracles`: `on`, `driver` or `off`, with the
+  reason). The docs and the Python, Perl and Ruby drivers said the runtrace
+  shim interposed the Python, Perl, Ruby, Lua and PHP interpreters, but it is
+  never loaded into them, so those lanes report exceptions only. The docs now
+  say so, and a test keeps vulnerability-coverage.md's lane lists in line with
+  the lanes that preload the shim.
 - The Ruby, Lua and PHP lanes mine integer literals into the fuzzing
   dictionary, not only strings, so a byte check such as `getbyte(0) == 0x52`
   or `ord($c) - 48` gets the byte it compares against. These lanes have no

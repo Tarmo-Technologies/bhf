@@ -53,7 +53,9 @@ toolchains. Missing dependencies and unsupported targets are reported.
 
 Behavioral / taint oracles (path control, command injection, insecure temp, sensitive env) run
 under the Linux runtime virtualization shim on native C/C++/Ada/Rust/Go/COBOL/Fortran
-targets and the Python/Perl/Ruby/Lua/PHP interpreters. The shim is disabled for Java, C#, JavaScript/TypeScript, and cross/emulated targets.
+targets. The shim is not loaded into the interpreted and managed lanes or into
+cross/emulated targets; `run.md` and `run.json` say for each target whether its
+sink oracles ran.
 
 ## Quick Start
 

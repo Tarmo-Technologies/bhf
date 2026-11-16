@@ -92,9 +92,9 @@ the deepest repair loop; Rust and Java use native/JVM builders; Python, Perl,
 JavaScript/TypeScript, Ruby, Lua, and PHP use persistent interpreter drivers;
 and Go, COBOL, Fortran, and C# use their lane-specific compiled/runtime paths.
 The LD_PRELOAD behavioral/taint layer is narrower than the fuzzing surface: it
-runs on native Ada/C/C++/Rust/Go/COBOL/Fortran harnesses and interposes the
-Python/Perl/Ruby/Lua/PHP interpreters. Java, C#, and JavaScript/TypeScript retain
-their managed-runtime coverage and crash/exception signals without that shim.
+runs on native Ada/C/C++/Rust/Go/COBOL/Fortran harnesses. The interpreted and
+managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#, JavaScript/TypeScript)
+keep their own coverage and crash/exception signals without that shim.
 
 ---
 

@@ -19,8 +19,8 @@ findings for the dangerous *behaviors* a program performs on attacker-controlled
 input — not only the crashes. And because it auto-harnesses functions across a
 tree instead of the one a human wrote a harness for, it fuzzes the whole
 sixteen-language product surface. The behavioral oracles arm on native
-C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and the Python/Perl/Ruby/Lua/PHP
-interpreters. Java, C#, and JavaScript/TypeScript retain their managed-runtime
+C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. The interpreted and managed lanes
+(Python, Perl, Ruby, Lua, PHP, Java, C#, JavaScript/TypeScript) keep their own
 coverage and crash/exception signals without this LD_PRELOAD oracle layer.
 
 In a measured head-to-head on a library with one CWE per function, bhf found
@@ -75,10 +75,10 @@ access (`BHF-305`/CWE-522), format string (`BHF-408`/CWE-134), SSRF
 location, and the tainted byte range as evidence.
 
 **Oracle-enabled lanes.** The `LD_PRELOAD` taint and behavioral oracles attach
-to native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and interpose the
-Python/Perl/Ruby/Lua/PHP interpreters. Java, C#, and JavaScript/TypeScript use
-managed runtimes whose own startup activity would create false positives, so
-the shim is deliberately off there; it is also off for cross-compiled or
+to native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. The interpreted and
+managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#, JavaScript/TypeScript)
+run runtimes whose own startup activity would create false positives, so the
+shim is off there; it is also off for cross-compiled or
 emulated targets (qemu-user, wine). Those configurations still auto-harness and
 fuzz with their managed-runtime coverage and crash/exception signals.
 

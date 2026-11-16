@@ -45,8 +45,9 @@ FINDING_HALT_CODE = 86
 # Genuine bugs still surface: IndexError (real OOB on the real bytes we feed →
 # BHF-201), RecursionError (BHF-207), MemoryError (BHF-209), ArithmeticError
 # (BHF-205), AssertionError + SystemError + custom errors (BHF-210). Campaigns tune
-# this boundary; the behavioral/taint oracles (the shim) catch the security
-# classes regardless of the exception policy.
+# this boundary. This lane has no behavioral sink oracles yet (the runtrace shim
+# is not loaded into the interpreter), so an injection that raises nothing is not
+# reported.
 REJECTION_EXC = (
     ValueError, TypeError, AttributeError, KeyError, UnicodeError, EOFError,
     NotImplementedError, OSError, StopIteration, StopAsyncIteration,

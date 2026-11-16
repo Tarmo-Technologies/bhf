@@ -619,11 +619,14 @@ explicit `--passes`/`--single-pass`, the shared deadline, or
 `--per-target-finding-count` can stop or skip remaining passes.
 
 The runtime-virtualisation shim that backs these passes is Linux-only. It is
-armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and interposes the
-Python/Perl/Ruby/Lua/PHP interpreters. It is deliberately off for Java, C#, and
-JavaScript/TypeScript (where managed-runtime startup activity would create false
-positives) and for cross-compiled or emulated (qemu/wine) targets. Those
-configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracles.
+armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. It is off for the
+interpreted and managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#,
+JavaScript/TypeScript), where the runtime's own startup activity would create
+false positives, and for cross-compiled or emulated (qemu/wine) targets. Those
+configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace
+oracles. Each fuzzed target's `behavioral_oracles` in `run.json` (and its
+`[behavioral oracles: …]` note in `run.md`) says `on`, `driver` (the Java and
+JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 
 ## Outputs
 
@@ -953,9 +956,9 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
   are single-state per resource — two threads reading the same fake fd race
   for bytes.
 - **Runtime virtualisation by lane.** The LD_PRELOAD behavioral/taint shim is
-  armed for native Ada/C/C++/Rust/Go/COBOL/Fortran and for the
-  Python/Perl/Ruby/Lua/PHP interpreter processes. It is not armed for Java, C#,
-  JavaScript/TypeScript, or cross/emulated targets. Those configurations retain
+  armed for native Ada/C/C++/Rust/Go/COBOL/Fortran harnesses. It is not armed
+  for the Python, Perl, Ruby, Lua, PHP, Java, C# or JavaScript/TypeScript lanes,
+  or for cross/emulated targets. Those configurations retain
   their documented fuzz coverage and crash/exception oracles;
   BHF-405/BHF-304/BHF-417/BHF-305 runtrace findings are the unavailable layer.
 - **C++ API lifecycle.** C++ harnesses cover both direct-call and

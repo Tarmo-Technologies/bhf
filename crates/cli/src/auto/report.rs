@@ -303,6 +303,59 @@ struct TargetEntry<'a> {
     /// not; omitted when none was attempted.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     lanes: std::collections::BTreeMap<String, crate::auto::lanes::LaneStatus>,
+    /// Whether the behavioral sink oracles (command injection, path control
+    /// and the other classes that raise no crash) ran on this target. `None`
+    /// (omitted) for a target that never fuzzed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behavioral_oracles: Option<BehavioralOracles>,
+}
+
+/// Which behavioral sink oracles a fuzzed target ran with, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BehavioralOracles {
+    /// `on` (the runtrace shim), `driver` (a few checks in the lane's own
+    /// driver) or `off`.
+    status: &'static str,
+    reason: String,
+}
+
+/// [`BehavioralOracles`] for a target that fuzzed. A native harness gets the
+/// runtrace shim unless it ran under an emulator or the shim is not on disk.
+fn target_behavioral_oracles(r: &AttemptResult) -> Option<BehavioralOracles> {
+    use crate::auto::attempt::LaneSinkOracles;
+    if !matches!(
+        r.outcome,
+        Outcome::BuiltAndFuzzed { .. } | Outcome::BuiltNotEntered { .. }
+    ) {
+        return None;
+    }
+    let (status, reason) = match crate::auto::attempt::lane_sink_oracles(r.candidate.lang) {
+        LaneSinkOracles::Shim => {
+            if crate::gate_evidence::recorded_runner(&r.harness_dir.join("main")).is_some() {
+                (
+                    "off",
+                    "the harness ran under an emulator, and the runtrace shim is not loaded \
+                     into one"
+                        .to_owned(),
+                )
+            } else if crate::auto::shim_path::locate().is_none() {
+                ("off", crate::auto::shim_path::unavailable_reason())
+            } else {
+                ("on", "runtrace shim".to_owned())
+            }
+        }
+        LaneSinkOracles::Driver(checks) => ("driver", checks.to_owned()),
+        LaneSinkOracles::None => (
+            "off",
+            format!(
+                "the {} lane has no sink oracles yet; only exceptions are reported",
+                crate::repro_lane::language_name(crate::auto::candidate::lang_tag(
+                    r.candidate.lang
+                ))
+            ),
+        ),
+    };
+    Some(BehavioralOracles { status, reason })
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1426,6 +1479,7 @@ pub fn write_reports_with_output_limit(
                 _ => Vec::new(),
             },
             lanes: crate::auto::lanes::read(&r.harness_dir),
+            behavioral_oracles: target_behavioral_oracles(r),
         })
         .collect();
 
@@ -3635,6 +3689,12 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
         .and_then(actionability::Fidelity::caveat)
     {
         line.push_str(&format!("  [!] {caveat}"));
+    }
+    if let Some(oracles) = &t.behavioral_oracles {
+        line.push_str(&format!(
+            "  [behavioral oracles: {} — {}]",
+            oracles.status, oracles.reason
+        ));
     }
     line
 }
