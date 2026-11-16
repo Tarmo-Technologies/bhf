@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A standalone Windows C harness built at `-O0` no longer faults on every
+  input in `bhf_cmp_buf`: the driver's runtime callbacks (`BHF_NOINSTR`) are
+  not address-checked on Windows, as `BHF_NOCOV`'s already were, since ASan's
+  interceptors reach them before its shadow memory is set up.
 - Without a compile database, a C harness gets the `-D`/`-U` defines a
   non-executing scan of the project's CMakeLists.txt or Makefile finds,
   labelled statically recovered in the harness Makefile. Only a few

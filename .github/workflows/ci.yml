@@ -577,6 +577,14 @@ jobs:
           choco install make --version=4.4.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # harness_gen's standalone-driver unit tests build a harness with make
+      # too, so they skipped in the library step above: run them with it.
+      - name: Test the standalone harness drivers
+        shell: pwsh
+        run: |
+          cargo test --locked -p harness_gen --lib standalone
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
       # paths, capsules, explain, cartography and provenance, plus every
