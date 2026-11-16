@@ -60,9 +60,11 @@ impl TestDir {
     ///
     /// When the directory cannot be created; a test cannot go on without it.
     pub fn new(name: &str) -> Self {
-        // Only the error's kind: its message holds the generated path.
+        // Neither the name nor the error's message: CodeQL's cleartext-logging
+        // query reads a name such as `c-sequence-private` as sensitive, and
+        // the message holds the generated path. The backtrace names the test.
         Self::try_new(name)
-            .unwrap_or_else(|error| panic!("create test dir bhf-{name}-*: {:?}", error.kind()))
+            .unwrap_or_else(|error| panic!("cannot create a test dir: {:?}", error.kind()))
     }
 
     /// [`TestDir::new`] for a probe that treats a temp dir it cannot create
