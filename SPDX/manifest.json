@@ -2891,6 +2891,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/m19_docs_auto_flags.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/m19_docs_cli_examples.rs",
       "license": "Apache-2.0"
     },

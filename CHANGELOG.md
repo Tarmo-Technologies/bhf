@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- auto.md documents every `bhf auto` flag: `--max-attempts`, `--sbom`,
+  `--sloc`, `--extra-source`, `--project`, `--preprocess`,
+  `--no-minimize`, `--no-fuzzing-build-mode`, the WinAFL flags and the C and
+  C++ decoder bounds had no row. The `--max-targets` row and the "Scaling to
+  large trees" text describe the flag as it works, a cap on the targets that
+  fuzz with lower-ranked ones backfilled, not a top-N prefilter. A docs test
+  compares the table with `bhf auto --help`.
 - The docs name the `results/` layout a run writes: `results/INDEX.md`,
   `results/findings.json` and `.csv`, and `results/findings/<id>/`. auto,
   install, cli, llm, the release checklist and the recommended sweep still
