@@ -388,10 +388,12 @@ bug-oracle registry as the runtime oracles, so a controlled process execution
 load (BHF-435) becomes a `kind: binary_semantic` finding **with no crash**. Unlike
 `--runtime-oracles` (the in-process Linux `LD_PRELOAD` layer), the collector is a
 decoupled provider addressed by the JSONL wire format, so an out-of-repo provider
-can implement it: `auto` selects the built-in provider for the platform — the
+can implement it: `auto` selects the built-in provider for the platform: the
 native Windows ETW provider `bhf-collector-win`, or on Linux the in-process
-`LD_PRELOAD` runtrace adapter that re-expresses the shim's effect events as the
-collector contract (it stays inactive only when the runtrace shim is unavailable).
+`LD_PRELOAD` runtrace adapter, which arms the runtrace shim for the run (with
+`--runtime-oracles off` it writes no runtime-oracle findings) and stays inactive
+only when the shim is unavailable. The adapter re-expresses the shim's effect
+events as the collector contract.
 A PATH runs an external sidecar that speaks the protocol, and `none` (default)
 disables it, leaving behaviour unchanged. The collector is an *additional*,
 collector-shaped view over the same shim events `--runtime-oracles` uses, so

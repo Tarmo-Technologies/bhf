@@ -563,9 +563,12 @@ pub struct FuzzArgs {
     pub max_session_messages: usize,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the harness performs even on a clean exit (#60). `auto` picks the
-    /// built-in provider for this platform (native Windows ETW; inactive on
-    /// Linux); a PATH runs an external sidecar that speaks the
+    /// effects the harness performs even on a clean exit (#60). `auto` selects the
+    /// built-in provider for the platform: the native Windows ETW provider
+    /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
+    /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
+    /// off` it writes no runtime-oracle findings) and stays inactive only when the
+    /// shim is unavailable. A PATH runs an external sidecar that speaks the
     /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
     /// collected semantic violation becomes a `binary_semantic` finding (no crash
     /// needed), with the raw collector session stored for deterministic replay.
@@ -1218,6 +1221,9 @@ struct PreparedFuzzRun {
     harness_id: String,
     harness_path: PathBuf,
     runner: replay_min::HarnessRunner,
+    /// Whether the loop reads the runtrace log for runtime-oracle findings:
+    /// false when only `--collector auto` armed the shim.
+    runtrace_oracles: bool,
     seeds: Vec<Vec<u8>>,
     /// sha256 (and path, for a file) of each seed this `bhf fuzz` was given
     /// (`--seed-input`, `--seed-file`), which its lineage names as user seeds.
@@ -3061,15 +3067,34 @@ fn prepare_with_runner(
     // The builtin loop already reads BHF_RUNTRACE_LOG, evaluates the oracle
     // registry + cross-execution taint tracker, and emits oracle findings — we
     // only supply the env that was missing on this path.
-    if !extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG") {
+    //
+    // Without them, `--collector auto` on Linux is the runtrace adapter, which
+    // reads the same log: arm the shim for it alone, and keep the runtime
+    // oracles' findings off, as `--runtime-oracles off` asks.
+    let mut runtrace_oracles = extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG");
+    if !runtrace_oracles {
         let mode_label = args.mode.to_string().to_ascii_lowercase();
-        if let Some(oracles) =
+        let oracles =
             crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                .map_err(|e| e.to_string())?;
+        runtrace_oracles = oracles.is_some();
+        let shim = match oracles {
+            Some(oracles) => Some(oracles),
+            None if !cfg!(windows)
+                && matches!(args.collector, crate::collector_run::CollectorSpec::Auto) =>
+            {
+                crate::runtime_oracles::RuntimeOracles::resolve(
+                    crate::runtime_oracles::RuntimeOracleMode::Auto,
+                    &mode_label,
+                )
                 .map_err(|e| e.to_string())?
-        {
+            }
+            None => None,
+        };
+        if let Some(shim) = shim {
             let oracle_log = work_dir.join("runtrace.jsonl");
             let _ = std::fs::write(&oracle_log, b"");
-            extra_env.extend(oracles.env_pairs(&oracle_log));
+            extra_env.extend(shim.env_pairs(&oracle_log));
         }
     }
     // Only the standalone bhf-framed C/C++ driver carries the runtime that
@@ -3128,6 +3153,7 @@ fn prepare_with_runner(
         harness_id: args.harness,
         harness_path,
         runner,
+        runtrace_oracles,
         seeds,
         operator_seeds,
         iterations,
@@ -4123,7 +4149,11 @@ fn run_builtin_with_progress(
     };
     let mut productive_since_ceiling_raise = false;
     let mut execs_since_new_signature = 0_usize;
-    let mut runtrace_cursor = RuntraceLogCursor::from_extra_env(&prepared.extra_env);
+    let mut runtrace_cursor = if prepared.runtrace_oracles {
+        RuntraceLogCursor::from_extra_env(&prepared.extra_env)
+    } else {
+        RuntraceLogCursor::none()
+    };
     // #422: unified cross-execution byte-origin taint correlation for every
     // taint-confirmed sink oracle (path-open BHF-405, process-exec BHF-431, SSRF
     // BHF-433, library-load BHF-435, SQL BHF-441, destructive-fs BHF-440). Fed each
@@ -5211,6 +5241,14 @@ struct RuntraceLogCursor {
 }
 
 impl RuntraceLogCursor {
+    /// A cursor that reads no events.
+    fn none() -> Self {
+        Self {
+            path: None,
+            offset: 0,
+        }
+    }
+
     fn from_extra_env(extra_env: &[(String, String)]) -> Self {
         let path = extra_env
             .iter()

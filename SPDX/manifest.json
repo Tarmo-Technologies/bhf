@@ -2603,6 +2603,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/collector_help.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/collector_mock.rs",
       "license": "Apache-2.0"
     },

@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz --collector auto` on Linux arms the runtrace shim it reads, so
+  the collector observes the run without `--runtime-oracles`; it reported
+  `runtime_shim_not_armed` and nothing else. With `--runtime-oracles off` the
+  run still writes no runtime-oracle findings. The `--collector` help of
+  `bhf fuzz` and `bhf binary fuzz` said `auto` is inactive on Linux; it now
+  says what the docs say.
 - A multi-worker or sanitizer-matrix `bhf fuzz` gives every worker
   `--runtime-oracles`, `--grammar`, `--dict`, `--deadline` and the fork-server
   switch, which it dropped, so its workers ran crash-only and a sink the

@@ -26,38 +26,45 @@ fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
 }
 
-#[test]
-fn one_system_sink_gives_at_most_one_aggregate_finding() {
-    if Command::new("clang").arg("--version").output().is_err() {
-        eprintln!("skipping: no clang");
-        return;
-    }
-    let work = TestDir::new("collector-aggregate");
+const HARNESS: &str = "H-TOOL";
+
+/// The tool target, built under `work`; returns the seed file to fuzz from.
+fn build_tool(work: &TestDir) -> std::path::PathBuf {
     std::fs::write(work.join("tool.c"), TARGET).unwrap();
-    let id = "H-TOOL";
-    let ok = |cmd: &mut Command| {
-        let out = cmd.current_dir(work.path()).output().unwrap();
+    for args in [
+        &[
+            "generate-harness",
+            "tool.c",
+            "--target",
+            "run_tool",
+            "--output",
+            "generated_harnesses",
+            "--id",
+            HARNESS,
+        ][..],
+        &["build", ".", "--harness", HARNESS][..],
+    ] {
+        let out = bhf().current_dir(work.path()).args(args).output().unwrap();
         assert!(
             out.status.success(),
-            "{}",
+            "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        out
-    };
-    ok(bhf()
-        .args(["generate-harness", "tool.c", "--target", "run_tool"])
-        .args(["--output", "generated_harnesses", "--id", id]));
-    ok(bhf().args(["build", ".", "--harness", id]));
+    }
     let seed = work.join("seed");
     std::fs::write(&seed, b"hello world").unwrap();
+    seed
+}
+
+/// `bhf fuzz` of the tool with `flags`, under the runtrace shim.
+fn fuzz_tool(work: &TestDir, seed: &std::path::Path, flags: &[&str]) -> std::process::Output {
     let mut fuzz = bhf();
     support::configure_runtrace_shim(&mut fuzz);
-    let out = fuzz
-        .current_dir(work.path())
-        .args(["fuzz", ".", "--harness", id, "--engine", "builtin"])
-        .args(["--runtime-oracles", "on", "--collector", "auto"])
+    fuzz.current_dir(work.path())
+        .args(["fuzz", ".", "--harness", HARNESS, "--engine", "builtin"])
+        .args(flags)
         .arg("--seed-file")
-        .arg(&seed)
+        .arg(seed)
         .args([
             "--iterations",
             "400",
@@ -67,18 +74,38 @@ fn one_system_sink_gives_at_most_one_aggregate_finding() {
             "none",
         ])
         .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let findings = work.join("results/findings");
-    let collector: Vec<serde_json::Value> = std::fs::read_dir(&findings)
+        .unwrap()
+}
+
+/// The `finding.json` of each finding under `work` whose id starts with
+/// `prefix`.
+fn findings(work: &TestDir, prefix: &str, stderr: &str) -> Vec<serde_json::Value> {
+    std::fs::read_dir(work.join("results/findings"))
         .unwrap_or_else(|e| panic!("no findings ({e}):\n{stderr}"))
         .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("COL-"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
         .map(|entry| {
             serde_json::from_slice(&std::fs::read(entry.path().join("finding.json")).unwrap())
                 .unwrap()
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn one_system_sink_gives_at_most_one_aggregate_finding() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        eprintln!("skipping: no clang");
+        return;
+    }
+    let work = TestDir::new("collector-aggregate");
+    let seed = build_tool(&work);
+    let out = fuzz_tool(
+        &work,
+        &seed,
+        &["--runtime-oracles", "on", "--collector", "auto"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let collector = findings(&work, "COL-", &stderr);
     let process = collector
         .iter()
         .filter(|raw| raw["oracle"]["api"] == "execve" || raw["rule_id"] == "BHF-431")
@@ -94,4 +121,46 @@ fn one_system_sink_gives_at_most_one_aggregate_finding() {
             Some(true)
         );
     }
+}
+
+/// `--collector auto` alone used to leave the runtrace shim unarmed on Linux,
+/// so the collector observed nothing (`runtime_shim_not_armed`). It arms the
+/// shim and observes the sink, and `--runtime-oracles off` still writes no
+/// runtime-oracle finding.
+#[test]
+fn collector_auto_alone_arms_the_runtrace_shim() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        eprintln!("skipping: no clang");
+        return;
+    }
+    let work = TestDir::new("collector-auto-alone");
+    let seed = build_tool(&work);
+    let out = fuzz_tool(&work, &seed, &["--collector", "auto"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("summary ({e}): {stderr}"));
+    let collector = &summary["collector"];
+    assert_eq!(collector["observed"], true, "{collector:#}");
+    assert!(
+        !collector["fidelity"]["unsupported_fields"]
+            .as_array()
+            .is_some_and(|fields| fields.iter().any(|f| f == "runtime_shim_not_armed")),
+        "{collector:#}"
+    );
+    assert!(
+        collector["observed_event_classes"]
+            .as_array()
+            .is_some_and(|classes| classes.iter().any(|c| c == "process_create")),
+        "{collector:#}"
+    );
+    let oracle: Vec<serde_json::Value> = findings(&work, "F-", &stderr)
+        .into_iter()
+        .filter(|raw| raw["classification"] == "oracle_hit")
+        .collect();
+    assert!(oracle.is_empty(), "{oracle:#?}");
+    assert!(
+        !findings(&work, "COL-", &stderr).is_empty(),
+        "the collector reports the fuzzed system(): {collector:#}"
+    );
 }

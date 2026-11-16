@@ -142,9 +142,12 @@ pub struct BinaryFuzzArgs {
     pub reset_command: Option<String>,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the target performs even on a clean exit (#60). `auto` picks the
-    /// built-in provider for this platform (native Windows ETW; inactive on
-    /// Linux); a PATH runs an external sidecar that speaks the
+    /// effects the target performs even on a clean exit (#60). `auto` selects the
+    /// built-in provider for the platform: the native Windows ETW provider
+    /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
+    /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
+    /// off` it writes no runtime-oracle findings) and stays inactive only when the
+    /// shim is unavailable. A PATH runs an external sidecar that speaks the
     /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
     /// collected semantic violation — a controlled process exec, a path escaping
     /// the allowed root, or a controlled library load — becomes a
