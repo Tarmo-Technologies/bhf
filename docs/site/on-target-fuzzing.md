@@ -298,6 +298,21 @@ is a defect. Off by default — unset, hang handling is byte-for-byte unchanged.
 
 ---
 
+### Device registers on the host
+
+Firmware that reads a peripheral through a fixed address
+(`#define UART_SR (*(volatile uint32_t *)(UART1_BASE + 0x00))`, a CMSIS
+`((UART_TypeDef *) UART1_BASE)`, or a cast of a literal) SEGVs on the host, where
+nothing is mapped there. `bhf auto` reads the pointer casts of constants in the
+crash path's sources and the headers they include, macros expanded, and a SEGV
+whose address lies on one of those registers (or the same 4 KiB page) is an
+environment result, not an out-of-bounds read: the finding records
+`environment_origin` (`kind: "mmio_register"`, the fault and register addresses
+and the macro), its verdict is `lab_only` (`verdict_reason: "mmio_register"`) at
+low severity, and its `hardware_peripherals` fidelity is `not_exercised` with
+the register named. Fuzz such a target on a transport from §3, or give the
+register an accessor the harness can fake.
+
 ## 5. Big-endian & non-x86 fidelity
 
 A cross build runs the target's own byte order: a big-endian-only bug (a field

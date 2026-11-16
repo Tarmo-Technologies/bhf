@@ -13,6 +13,7 @@ pub mod blocker_histogram;
 pub mod bug_report;
 pub mod build_fidelity;
 pub(crate) mod build_mode_guard;
+pub(crate) mod mmio_registers;
 pub mod build_probe;
 pub mod candidate;
 pub mod capability;

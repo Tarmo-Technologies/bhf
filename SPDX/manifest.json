@@ -1479,6 +1479,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/mmio_registers.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/mod.rs",
       "license": "Apache-2.0"
     },
@@ -2388,6 +2392,10 @@
     },
     {
       "path": "crates/cli/tests/auto_mfc_cstring.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_mmio_register_fault.rs",
       "license": "Apache-2.0"
     },
     {

@@ -600,6 +600,25 @@ fn annotate_findings_with_fidelity(
                 "ran under msan (the MSan build replayed the corpus)",
             );
         }
+        // A SEGV on a fixed device-register address is the missing device: an
+        // environment result, at low severity, with the peripheral unexercised.
+        let register_fault = crate::auto::mmio_registers::register_fault(&before);
+        if let Some(fault) = &register_fault {
+            let reason = fault.describe(source_root);
+            fidelity.hardware_peripherals =
+                actionability::FidelityDimension::not_exercised(reason.clone());
+            obj.insert(
+                "environment_origin".to_owned(),
+                serde_json::json!({
+                    "kind": "mmio_register",
+                    "fault_address": format!("{:#x}", fault.fault),
+                    "register_address": format!("{:#x}", fault.register.address),
+                    "register": fault.register.name,
+                    "note": reason,
+                }),
+            );
+            obj.insert("severity".to_owned(), serde_json::json!("low"));
+        }
         let Ok(value) = serde_json::to_value(&fidelity) else {
             continue;
         };
@@ -636,13 +655,35 @@ fn annotate_findings_with_fidelity(
                 obj.remove("fuzzing_build_mode_note");
             }
         }
+        if register_fault.is_some() {
+            // The verdict and impact follow the environment origin.
+            let mode = raw
+                .pointer("/actionability/mode")
+                .cloned()
+                .and_then(|mode| serde_json::from_value::<actionability::RunMode>(mode).ok())
+                .unwrap_or_default();
+            if let Some(obj) = raw.as_object_mut() {
+                obj.remove("actionability");
+            }
+            let recomputed = actionability::value_for_finding(mode, &raw, Some(&path));
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("actionability".to_owned(), recomputed);
+            }
+        }
         if raw == before {
             continue;
         }
         corpus::finding::append_history(
             &mut raw,
             "auto",
-            &["fidelity", "fidelity_caveat", "fuzzing_build_mode_note"],
+            &[
+                "fidelity",
+                "fidelity_caveat",
+                "fuzzing_build_mode_note",
+                "environment_origin",
+                "severity",
+                "actionability",
+            ],
         );
         match serde_json::to_vec_pretty(&raw) {
             Ok(serialized) => {

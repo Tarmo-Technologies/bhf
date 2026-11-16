@@ -15,6 +15,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A host SEGV on a fixed device-register address is an environment result:
+  `bhf auto` reads the constant-address pointer casts in the crash path's
+  sources and headers (macros expanded), and a SEGV on one of those registers
+  is `lab_only` (`mmio_register`) at low severity, with `environment_origin`
+  naming the register and `hardware_peripherals` fidelity `not_exercised`. A
+  UART driver polling its status register was reported as a HIGH
+  attacker-reachable out-of-bounds read with `hardware_peripherals:
+  not_applicable`.
 - `bhf binary fuzz`'s builtin engine, which `auto` falls back to without
   AFL++'s QEMU mode, runs the seeds and then a blind havoc loop (stacked byte
   mutations of the seeds, from the new `--rng-seed`) until `--iterations`,
