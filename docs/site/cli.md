@@ -1458,6 +1458,10 @@ name, a `::`-qualified suffix (`Parser::parse`), the fully qualified name as
 exact spelling wins over a suffix, a leading `::` names the global namespace
 only, and a miss lists the closest definitions. The generated harness is Makefile-based, so
 `bhf build` runs `make` and stages `build/<harness-id>/main`.
+`bhf generate-harness` writes C, C++ and Ada harnesses only: a source in
+another language `bhf auto` fuzzes (Python, Ruby, Go, Java, Rust and the
+rest) is refused with its language named, and `bhf auto <dir> --target
+<function>` builds that harness instead.
 
 ```sh
 bhf generate-harness src/parser.cpp --target Parser::parse --output bhf_work/harnesses

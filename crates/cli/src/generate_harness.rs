@@ -224,6 +224,9 @@ pub fn run(args: GenerateHarnessArgs) -> Result<()> {
         Some(CFamilySource::Cpp) => return run_cpp_direct(&args),
         None => {}
     }
+    if let Some(error) = unsupported_language(&args.source) {
+        bail!(error);
+    }
 
     let source = crate::source_text::read_source_text(&args.source)
         .with_context(|| format!("read Ada source {}", args.source.display()))?;
@@ -2466,6 +2469,21 @@ fn fnv1a(hash: u64, byte: u8) -> u64 {
 enum CFamilySource {
     C,
     Cpp,
+}
+
+/// Why `source` cannot get a harness here: it is in a language other than C,
+/// C++ or Ada, which the Ada front end would otherwise parse and report as
+/// having no such subprogram.
+fn unsupported_language(source: &Path) -> Option<String> {
+    use crate::auto::candidate::{lang_name, Lang};
+    let lang = crate::auto::discovery::extension_lang_hint(source)
+        .filter(|lang| !matches!(lang, Lang::Ada | Lang::C | Lang::Cpp))?;
+    let name = lang_name(lang);
+    Some(format!(
+        "{} is {name} source; bhf generate-harness writes C, C++ and Ada harnesses only. \
+         `bhf auto <dir> --target <function>` builds and fuzzes a {name} target",
+        source.display()
+    ))
 }
 
 fn detect_c_family_source(path: &Path) -> Result<Option<CFamilySource>> {

@@ -45,6 +45,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf generate-harness` refuses a source in a language other than C, C++
+  and Ada, naming the language and `bhf auto --target`; it parsed a `.py`,
+  `.rb` or `.go` file as Ada and reported that the subprogram was not found.
 - A shell or tool the target runs (`system`, `popen`, `exec`) no longer
   records comparisons into the cmplog log: it inherited `LD_PRELOAD` and
   `BHF_CMPLOG`, so most records were the shell's keyword lookups, and its
