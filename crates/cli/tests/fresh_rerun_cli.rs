@@ -309,12 +309,18 @@ fn an_input_reaches_the_queue_only_once_a_fresh_run_clears_it() {
     );
     let queued = inputs_in(&queue_dir);
     assert!(!queued.contains(&b"READ".to_vec()), "{queued:?}");
-    for input in pending.iter().filter(|input| input.as_slice() != b"READ") {
+    // A mutant of READ that keeps its first two bytes and length crashes in
+    // a fresh process too: a later hit of READ's finding, not queued.
+    let crashes = |input: &[u8]| input.len() >= 4 && input.starts_with(b"RE");
+    for input in pending.iter().filter(|input| !crashes(input)) {
         assert!(
             queued.contains(input),
             "clean {:?} joins the queue once checked: {queued:?}",
             String::from_utf8_lossy(input)
         );
+    }
+    for input in pending.iter().filter(|input| crashes(input)) {
+        assert!(!queued.contains(input), "{queued:?}");
     }
     let _ = fs::remove_dir_all(&root);
 }
