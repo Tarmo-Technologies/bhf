@@ -35,30 +35,47 @@ files under the work dir keep the text as it was.
 
 ## Common Flow
 
+The manual pipeline for one Ada subprogram, run from the directory that holds
+`path/to/pkg.adb` and its spec `path/to/pkg.ads`:
+
+```sh
+bhf list targets path/to/pkg.adb --top 20
+bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented
+bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --id H-PKG-PARSE --output bhf_work/generated_harnesses
+bhf build bhf_work --harness H-PKG-PARSE
+bhf fuzz bhf_work --harness H-PKG-PARSE --iterations 1000 --seed-input smoke
+bhf replay --finding bhf_work/results/findings/<finding-id>
+bhf minimize --finding bhf_work/results/findings/<finding-id>
+bhf report --findings bhf_work/results/findings --out bhf_work/reports
+```
+
+`bhf instrument` copies the package spec beside the instrumented body, which
+the build needs. `--id` names the harness the later steps use; without it,
+`generate-harness` derives one from the file and target, the id `bhf list
+targets` prints. `<finding-id>` is the directory `bhf fuzz` writes under
+`bhf_work/results/findings/` (`bhf_work/results/INDEX.md` lists it), and
+`--finding <finding-id>` alone finds it in `./bhf_work`. Without `--harness`,
+`bhf replay` and `bhf minimize` run the harness the finding records, here
+`bhf_work/build/H-PKG-PARSE/obj/main`. A `--finding` that names no finding is
+refused with the path bhf looked at, before anything runs.
+
+Other entry points, on a source tree and on a binary:
+
 ```sh
 bhf scan path/to/src --work-dir bhf_work
 bhf static-scan path/to/src --out bhf_work/static --sarif
+bhf introspect path/to/src --work-dir bhf_work
 bhf binary scan path/to/bin-or-firmware --out bhf_work/binary
 bhf --profile external-tools binary adapter path/to/bin --adapter rizin --out bhf_work/binary-adapter
 bhf binary fuzz path/to/bin --work-dir bhf_work --input-mode stdin --seed-input smoke
-bhf list targets path/to/pkg.adb --top 20
-bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented
-bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --output bhf_work/generated_harnesses
-bhf build bhf_work --harness H-PKG-PARSE
-bhf fuzz bhf_work --harness H-PKG-PARSE --iterations 1000 --seed-input smoke
-bhf replay --finding findings/F-0001 --harness build/H-PKG-PARSE/main
-bhf minimize --finding findings/F-0001 --harness build/H-PKG-PARSE/main
-bhf report --findings findings --out reports
-bhf introspect path/to/src --work-dir bhf_work
 bhf clean bhf_work --build --corpus --reports
 ```
 
-The replay and minimize lines show the Ada layout. A C or C++ harness replays
-from the `build/<id>/main` that `bhf build` stages or from
-`bhf_work/harnesses/<id>/main` (`main.exe` on Windows, as every harness
-binary there is named: `main_cov.exe`, `main_afl.exe`, ...); without
-`--harness`, `bhf replay` and `bhf minimize` resolve the finding's harness in
-its work dir.
+The adapter line needs `rizin` on `PATH`; without it, it exits `1` saying so.
+To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
+that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
+Windows, as every harness binary there is named: `main_cov.exe`,
+`main_afl.exe`, ...).
 `bhf minimize` first runs the testcase and compares its crash with the finding
 the way `bhf replay` does, with the environment `bhf replay` gives the harness
 (the finding's recorded runtime mode and injected variables too), as does

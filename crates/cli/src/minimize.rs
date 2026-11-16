@@ -489,6 +489,10 @@ pub(crate) fn minimize_for_auto(
 
 pub fn run(args: MinimizeArgs) -> i32 {
     let finding_dir = resolve_finding_arg(args.finding_dir.clone(), args.finding.clone());
+    if let Some(error) = crate::finding_arg::missing_finding(&finding_dir) {
+        bhfeprintln!("error: {error}");
+        return 1;
+    }
     // HDF-7: a session finding minimizes by shrinking the recorded multi-message
     // session (re-repairing computed fields / re-resolving bindings each
     // candidate), not by delta-debugging a flat testcase against a harness.

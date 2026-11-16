@@ -52,6 +52,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- cli.md's Common Flow runs as written, and a test runs it: the Ada pipeline
+  names its harness with `--id H-PKG-PARSE` and replays, minimizes and reports
+  the finding under `bhf_work/results/findings/`, where `bhf fuzz` writes it,
+  instead of `findings/F-0001` and `build/H-PKG-PARSE/main`. `bhf replay` and
+  `bhf minimize` given a `--finding` that names no finding say which path
+  they looked at, before anything runs; replay said the harness had been run
+  as an Ada stdin harness.
 - An exception that leaves a C++ target is a finding, BHF-231
   `bhf.cpp/uncaught-exception` (CWE-248): the C++ harness caught every
   exception with `catch (...)` and returned, so a `std::out_of_range` from

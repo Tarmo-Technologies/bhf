@@ -149,6 +149,9 @@ pub fn run(args: ReplayArgs) -> i32 {
         show_output: args.show_output,
         show_args: args.show_args,
     };
+    if let Some(error) = crate::finding_arg::missing_finding(&finding_dir) {
+        return report_error(&output, &finding_dir, &error);
+    }
     // A requested debugger must exist before anything runs.
     let debugger = match args.debugger.as_deref() {
         None => None,
