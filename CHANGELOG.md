@@ -52,6 +52,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz --collector` replays the campaign's retained inputs one by one on
+  the harness: its crash findings, then its persisted corpus, at most 16, each
+  launched as `bhf replay` runs the harness. A sidecar now observes each one
+  (it was never run against an execution:
+  `harness_sidecar_replay_unsupported`), and the observation names the
+  testcase and the PID it ran as. On Linux each runs under the runtrace shim,
+  so a finding keeps the input whose replay reached the sink; the campaign's
+  runtrace log, which the collector read as one aggregate session with no
+  input, now adds only the sinks no replay reached.
 - `bhf binary fuzz --collector` replays every retained input under the
   observer, one by one, instead of only the first seed: the input behind each
   of the run's findings, then (with `--engine afl-qemu`, which ignored

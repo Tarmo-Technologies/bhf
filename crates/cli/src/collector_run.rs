@@ -570,23 +570,25 @@ fn finding_matches_harness(finding_dir: &Path, harness_id: &str) -> bool {
     false
 }
 
-/// Select a retained testcase to replay under the collector: a crash finding's
-/// stored `testcase.bin` **from this harness's campaign** first (the most
-/// interesting retained input), else a persisted coverage-corpus input (already
-/// stored per-harness). Returns `None` when this campaign retained nothing to
-/// replay — the caller then records a degraded, not-observed run rather than
-/// fabricating a synthetic observation. Deterministic (lowest id / name first) so
-/// a replayed finding is reproducible, and the selected input's hash is recorded.
+/// The retained testcases of `harness_id`'s campaign to replay under the
+/// collector, the most interesting first: a crash finding's stored
+/// `testcase.bin` **from this harness's campaign** by id, then its persisted
+/// coverage-corpus inputs (already stored per-harness) by name (#246). Empty
+/// when the campaign retained nothing to replay — the caller then records a
+/// degraded, not-observed run rather than fabricating a synthetic
+/// observation. Deterministic, so a replayed finding is reproducible, and each
+/// input's hash is recorded.
 ///
 /// Collector findings (`COL-` ids) are skipped: they are what this pass writes,
 /// and are not themselves campaign testcases. Crash findings whose recorded target
 /// does not match `harness_id` are skipped so a sibling target's input is never
 /// adopted.
-pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<ReplayTestcase> {
+pub fn retained_replay_testcases(work_dir: &Path, harness_id: &str) -> Vec<ReplayTestcase> {
+    let mut retained = Vec::new();
     // 1) This harness's crash findings: results/findings/<id>/testcase.bin.
     let findings_dir = corpus::layout::findings_dir(work_dir);
     if let Ok(entries) = std::fs::read_dir(&findings_dir) {
-        let mut crash_ids: Vec<(String, PathBuf, PathBuf)> = entries
+        let mut crash_ids: Vec<(String, PathBuf)> = entries
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.to_owned();
@@ -596,20 +598,13 @@ pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<Repla
                 let dir = e.path();
                 let tc = dir.join("testcase.bin");
                 // Only this harness's findings — never a sibling target's input.
-                (tc.is_file() && finding_matches_harness(&dir, harness_id))
-                    .then_some((name, dir, tc))
+                (tc.is_file() && finding_matches_harness(&dir, harness_id)).then_some((name, tc))
             })
             .collect();
-        crash_ids.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some((id, _dir, tc)) = crash_ids.first() {
-            if let Ok(bytes) = std::fs::read(tc) {
-                let input_sha256 = sha256_hex(&bytes);
-                return Some(ReplayTestcase {
-                    testcase: id.clone(),
-                    worker: 0,
-                    input: bytes,
-                    input_sha256,
-                });
+        crash_ids.sort();
+        for (id, tc) in crash_ids {
+            if let Ok(bytes) = std::fs::read(&tc) {
+                retained.push(ReplayTestcase::new(id, bytes));
             }
         }
     }
@@ -626,27 +621,20 @@ pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<Repla
                 (p.extension().and_then(|x| x.to_str()) == Some("bin")).then_some((stem, p))
             })
             .collect();
-        inputs.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some((stem, path)) = inputs.first() {
-            if let Ok(bytes) = std::fs::read(path) {
-                let input_sha256 = sha256_hex(&bytes);
-                return Some(ReplayTestcase {
-                    testcase: format!("corpus-{stem}"),
-                    worker: 0,
-                    input: bytes,
-                    input_sha256,
-                });
+        inputs.sort();
+        for (stem, path) in inputs {
+            if let Ok(bytes) = std::fs::read(&path) {
+                retained.push(ReplayTestcase::new(format!("corpus-{stem}"), bytes));
             }
         }
     }
-
-    None
+    retained
 }
 
 /// Wait for `child` to exit, but no later than `deadline`. Returns its exit
 /// status if it exited in time, or `None` after killing and reaping it on
 /// timeout. Guarantees a bounded wait (no unbounded `child.wait()`).
-fn wait_child_until(
+pub(crate) fn wait_child_until(
     child: &mut std::process::Child,
     deadline: Instant,
 ) -> Option<std::process::ExitStatus> {
@@ -1879,6 +1867,12 @@ mod tests {
         .unwrap();
     }
 
+    fn select_replay_testcase(work: &Path, harness_id: &str) -> Option<ReplayTestcase> {
+        retained_replay_testcases(work, harness_id)
+            .into_iter()
+            .next()
+    }
+
     #[test]
     fn select_replay_prefers_crash_finding_then_corpus_then_none() {
         let work = unique_dir("sel");
@@ -1911,6 +1905,12 @@ mod tests {
         );
         assert_eq!(picked.testcase, "BF-0001");
         assert_eq!(picked.input_sha256, sha256_hex(b"CRASH-INPUT"));
+        // #246: every retained input, the crash's first.
+        let all: Vec<String> = retained_replay_testcases(&work, hid)
+            .into_iter()
+            .map(|r| r.testcase)
+            .collect();
+        assert_eq!(all, ["BF-0001", "corpus-aaaa"]);
 
         let _ = std::fs::remove_dir_all(&work);
     }

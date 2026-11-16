@@ -1735,6 +1735,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/collector_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/shared_map.rs",
       "license": "Apache-2.0"
     },
@@ -2696,6 +2700,10 @@
     },
     {
       "path": "crates/cli/tests/collector_aggregate_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/collector_fuzz_replay.rs",
       "license": "Apache-2.0"
     },
     {

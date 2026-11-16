@@ -807,8 +807,9 @@ cmplog, and ASan all work natively on Windows.
 
     The file and image-load classes are decoded and unit-tested against
     ETW-shaped records, but no live control covers a BHF-405 or BHF-435
-    finding yet. The `bhf fuzz` harness path does not replay under the sidecar
-    (`harness_sidecar_replay_unsupported`).
+    finding yet. `bhf fuzz --collector` replays the harness the same way, on
+    each of the campaign's retained inputs (its crash findings, then its
+    persisted corpus, at most 16), launched as `bhf replay` runs the harness.
   - **Rights.** Starting an ETW session needs session rights (an elevated
     prompt). Without them the provider records `fidelity.permission_denied`
     instead of reporting a silent clean run.
