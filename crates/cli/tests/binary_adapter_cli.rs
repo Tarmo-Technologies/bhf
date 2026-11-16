@@ -111,27 +111,109 @@ fn binary_adapter_blocks_real_adapters_by_default_and_skips_missing_tools_when_o
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("not allowed"));
 
     let out = root.join("skipped");
-    assert_success(
-        Command::new(bhf_bin())
-            .args([
-                "--profile",
-                "external-tools",
-                "binary-adapter",
-                target.to_str().unwrap(),
-                "--adapter",
-                "rizin",
-                "--tool",
-                &missing_tool,
-                "--out",
-                out.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap(),
-    );
+    let skipped = Command::new(bhf_bin())
+        .args([
+            "--profile",
+            "external-tools",
+            "binary-adapter",
+            target.to_str().unwrap(),
+            "--adapter",
+            "rizin",
+            "--tool",
+            &missing_tool,
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    // A missing tool is an error, not a successful run.
+    assert_eq!(skipped.status.code(), Some(1));
     let report = read_json(&out.join("binary-adapter-report.json"));
     assert_eq!(report["adapter"]["kind"], "rizin");
     assert_eq!(report["status"], "skipped");
     assert_eq!(report["errors"][0]["reason"], "tool_not_found");
+}
+
+/// `bhf --profile external-tools binary adapter <target> --adapter <kind>
+/// --tool <tool>`: its exit code and report.
+#[cfg(unix)]
+fn run_adapter(root: &Path, kind: &str, tool: &Path) -> (Option<i32>, serde_json::Value) {
+    let target = root.join("sample.elf");
+    write_elf64_x86_64(&target);
+    let out = root.join(format!("out-{kind}"));
+    let output = Command::new(bhf_bin())
+        .args(["--profile", "external-tools", "binary", "adapter"])
+        .arg(&target)
+        .args(["--adapter", kind, "--tool"])
+        .arg(tool)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        read_json(&out.join("binary-adapter-report.json")),
+    )
+}
+
+/// A script that exits `code` whatever it is asked.
+#[cfg(unix)]
+fn fake_tool(root: &Path, name: &str, code: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join(name);
+    fs::write(
+        &path,
+        format!("#!/bin/sh\necho {name} 1.2.3\nexit {code}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The Rizin, Ghidra and angr adapters run no analysis: with their tool they
+/// say so (exit 3), without it they are skipped (exit 1). They wrote empty
+/// arrays as a successful `smoke_tested` analysis, and angr's ran
+/// `python3 --version`, which succeeds without angr.
+#[cfg(unix)]
+#[test]
+fn each_real_adapter_is_not_implemented_with_its_tool_and_skipped_without() {
+    for kind in ["rizin", "ghidra", "angr"] {
+        let root = temp_dir(&format!("real-{kind}"));
+        let present = fake_tool(&root, &format!("{kind}-tool"), 0);
+        let (code, report) = run_adapter(&root, kind, &present);
+        assert_eq!(code, Some(3), "{kind}: {report:#}");
+        assert_eq!(report["status"], "not_implemented", "{kind}");
+        assert_eq!(report["errors"][0]["reason"], "not_implemented", "{kind}");
+        assert_eq!(report["functions"], json!([]), "{kind}");
+
+        let (code, report) = run_adapter(&root, kind, &root.join("no-such-tool"));
+        assert_eq!(code, Some(1), "{kind}: {report:#}");
+        assert_eq!(report["status"], "skipped", "{kind}");
+        assert_eq!(report["errors"][0]["reason"], "tool_not_found", "{kind}");
+    }
+    // A Python that cannot import angr is no angr.
+    let root = temp_dir("real-angr-missing");
+    let python_without_angr = fake_tool(&root, "python-no-angr", 1);
+    let (code, report) = run_adapter(&root, "angr", &python_without_angr);
+    assert_eq!(code, Some(1), "{report:#}");
+    assert_eq!(report["errors"][0]["reason"], "tool_not_found");
+}
+
+#[test]
+fn the_adapter_help_does_not_claim_an_analysis() {
+    let output = Command::new(bhf_bin())
+        .args(["binary", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !help.contains("Analyze a binary via external adapters"),
+        "{help}"
+    );
+    assert!(
+        help.contains("no analysis through them is implemented yet"),
+        "{help}"
+    );
 }
 
 fn assert_success(output: std::process::Output) {

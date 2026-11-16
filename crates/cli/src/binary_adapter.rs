@@ -25,7 +25,8 @@ pub struct BinaryAdapterArgs {
     #[arg(long)]
     pub mock_output: Option<PathBuf>,
 
-    /// Local adapter executable. Missing tools are reported as skipped.
+    /// Local adapter executable (`rizin`, `analyzeHeadless`, or the Python
+    /// that imports angr). A missing tool is reported as skipped (exit 1).
     #[arg(long)]
     pub tool: Option<PathBuf>,
 }
@@ -74,7 +75,7 @@ pub fn run(args: BinaryAdapterArgs, profile: Profile) -> i32 {
 
     let result = match args.adapter {
         AdapterKind::Mock => run_mock(&args),
-        AdapterKind::Rizin | AdapterKind::Ghidra | AdapterKind::Angr => run_real_smoke(&args),
+        AdapterKind::Rizin | AdapterKind::Ghidra | AdapterKind::Angr => run_real_adapter(&args),
     };
     match result {
         Ok(exit_code) => exit_code,
@@ -123,12 +124,27 @@ fn run_mock(args: &BinaryAdapterArgs) -> Result<i32, String> {
     Ok(if status == "error" { 1 } else { 0 })
 }
 
-fn run_real_smoke(args: &BinaryAdapterArgs) -> Result<i32, String> {
+/// The exit code of an adapter whose analysis bhf does not implement.
+const NOT_IMPLEMENTED_EXIT: i32 = 3;
+
+/// The Rizin, Ghidra and angr adapters find their tool and report that bhf
+/// runs no analysis through it yet (`status: not_implemented`, exit 3). They
+/// only ever ran its `--version` and wrote empty function, call-graph,
+/// string and xref arrays as a successful `smoke_tested` analysis; the angr
+/// one ran `python3 --version`, which succeeds without angr. A missing tool is
+/// `skipped`, exit 1.
+fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
     let tool = args
         .tool
         .clone()
         .unwrap_or_else(|| PathBuf::from(args.adapter.default_tool()));
-    match Command::new(&tool).arg("--version").output() {
+    let mut probe = Command::new(&tool);
+    match args.adapter {
+        // The tool is a Python; angr is the module it must import.
+        AdapterKind::Angr => probe.args(["-c", "import angr; print(angr.__version__)"]),
+        _ => probe.arg("--version"),
+    };
+    match probe.output() {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -136,13 +152,36 @@ fn run_real_smoke(args: &BinaryAdapterArgs) -> Result<i32, String> {
                 .unwrap_or("")
                 .trim()
                 .to_owned();
-            let mut report = base_report(args, "smoke_tested", "external_subprocess").finish();
+            let mut report = base_report(args, "not_implemented", "external_subprocess")
+                .with_error(
+                    "not_implemented",
+                    &format!(
+                        "bhf runs no {} analysis yet: the tool was found, but no functions, call \
+                         graph, strings or xrefs are extracted from the binary",
+                        args.adapter.as_str()
+                    ),
+                )
+                .finish();
             report["tool"] = json!({
                 "path": tool.to_string_lossy(),
                 "version": version
             });
             write_report(&args.out, &report)?;
-            Ok(0)
+            bhfeprintln!(
+                "binary adapter '{}': not implemented; bhf ran no analysis (report: {})",
+                args.adapter.as_str(),
+                args.out.join("binary-adapter-report.json").display()
+            );
+            Ok(NOT_IMPLEMENTED_EXIT)
+        }
+        Ok(_) if args.adapter == AdapterKind::Angr => {
+            let mut report = base_report(args, "skipped", "external_subprocess")
+                .with_error("tool_not_found", "angr is not importable by this Python")
+                .finish();
+            report["tool"] = json!({ "path": tool.to_string_lossy() });
+            write_report(&args.out, &report)?;
+            bhfeprintln!("binary adapter 'angr': {} cannot import angr", tool.display());
+            Ok(1)
         }
         Ok(output) => {
             let mut report = base_report(args, "error", "external_subprocess")
@@ -158,7 +197,12 @@ fn run_real_smoke(args: &BinaryAdapterArgs) -> Result<i32, String> {
                 .finish();
             report["tool"] = json!({ "path": tool.to_string_lossy() });
             write_report(&args.out, &report)?;
-            Ok(0)
+            bhfeprintln!(
+                "binary adapter '{}': {} was not found",
+                args.adapter.as_str(),
+                tool.display()
+            );
+            Ok(1)
         }
         Err(error) => Err(format!("run {}: {error}", tool.display())),
     }

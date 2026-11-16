@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Rizin, Ghidra and angr binary adapters say they run no analysis: with
+  their tool present `bhf binary adapter` writes `status: not_implemented`
+  and exits 3, and without it `status: skipped` and exits 1. They reported
+  the tool's `--version` as a successful `smoke_tested` analysis with empty
+  arrays (exit 0, also for a missing tool), and the angr adapter "found"
+  angr whenever `python3` ran; it now has the Python import `angr`. The help
+  and cli.md no longer claim an analysis.
 - Line coverage counts the project's lines only. `covered-lines.txt` and
   `coverage-summary.json` counted bhf's generated `main.c`, repairs, stubs
   and C runtime headers too, so an 11-line target reported 44 of 457 lines.

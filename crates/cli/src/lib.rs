@@ -266,7 +266,7 @@ enum Command {
     DecodeArgs(decode_args::DecodeArgsArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
-    /// No-source analysis of compiled binaries & firmware: scan, adapter, fuzz (CVE/SBOM, Rizin/Ghidra/angr, black-box)
+    /// No-source analysis of compiled binaries & firmware: scan (CVE/SBOM), fuzz (black-box), and the adapter stubs
     Binary(BinaryArgs),
 
     // ── External project/target profiles ────────────────────────────────────
@@ -367,7 +367,7 @@ struct BinaryArgs {
 enum BinaryCommand {
     /// Inventory binaries and firmware, extract archives, match CVE components for SBOM/SCA
     Scan(binary_scan::BinaryScanArgs),
-    /// Analyze a binary via external adapters (Rizin, Ghidra, angr) into a JSON report
+    /// Check for an external binary-analysis adapter (Rizin, Ghidra, angr; no analysis through them is implemented yet, exit 3) or run the mock adapter's JSON contract
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),

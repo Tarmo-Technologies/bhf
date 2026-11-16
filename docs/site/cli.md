@@ -320,12 +320,17 @@ promoted into packed-binary or binary-layout review triage. Use
 limit.
 
 `bhf binary adapter <BINARY> --adapter mock|rizin|ghidra|angr --out <DIR>`
-writes `binary-adapter-report.json` with adapter-derived functions, call-graph
-hints, strings, xrefs, signatures, and errors. The command never links external
-tools into BHF. The mock adapter consumes `--mock-output` JSON for contract
-tests. Real adapters are subprocess smoke paths, are blocked in
-`strict-permissive`, require `--profile external-tools` or `research-lab`, and
-write `status: skipped` when the requested tool is absent.
+writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`: functions,
+call-graph hints, strings, xrefs and errors). The command never links
+external tools into BHF. Only the mock adapter fills the report: it reads
+`--mock-output` JSON, for contract tests of a consumer. The Rizin, Ghidra and
+angr adapters run no analysis yet. They are blocked in `strict-permissive`
+(they need `--profile external-tools` or `research-lab`), look for their tool
+(`rizin`, Ghidra's `analyzeHeadless`, a Python that imports `angr`; `--tool`
+names another), and write `status: not_implemented` with a `not_implemented`
+error and exit 3 when it is there, or `status: skipped` with `tool_not_found`
+and exit 1 when it is not. They used to report the tool's `--version` as a
+successful `smoke_tested` analysis with empty arrays.
 
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
