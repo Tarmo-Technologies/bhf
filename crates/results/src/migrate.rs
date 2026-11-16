@@ -28,7 +28,7 @@ pub struct MigrationReport {
 
 /// Legacy index files; the rebuild regenerates their content under
 /// `results/`, and migration keeps the old copies under `results/legacy/`.
-const LEGACY_DERIVED: [&str; 3] = ["FINDINGS.md", "findings.csv", "auto/findings.csv"];
+pub const LEGACY_DERIVED: [&str; 3] = ["FINDINGS.md", "findings.csv", "auto/findings.csv"];
 
 /// The directory under `results/` holding what a migrated work dir's legacy
 /// layout had.

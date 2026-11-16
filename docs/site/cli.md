@@ -330,7 +330,7 @@ write `status: skipped` when the requested tool is absent.
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
 repeatable `--env KEY=VALUE` launch profiles. Crashes and timeouts are written
-under `<work-dir>/findings/BF-NNNN/` as `kind: binary_crash` findings with the
+under `<work-dir>/results/findings/BF-NNNN/` as `kind: binary_crash` findings with the
 command, input mode, testcase, environment, binary SHA-256, stderr excerpt, and
 exit/timeout signature. Existing `bhf replay`, `bhf minimize`, and
 `bhf ci --fail-on ...` understand these binary findings.
@@ -1134,7 +1134,7 @@ bhf llm status --json
 bhf llm test --provider codex
 bhf llm prompt --task diagnose-error --input bhf_work/auto/run.json
 bhf llm assist --provider local --model '<served-model>' \
-  --task analyze-findings --input bhf_work/findings/F-0001/finding.json
+  --task analyze-findings --input bhf_work/results/findings/F-0001/finding.json
 ```
 
 Task names are `plan-run`, `generate-harness`, `analyze-findings`,
@@ -1290,7 +1290,7 @@ decodes fixed-width parameters before its buffer also gets each
 `arg-layout.json`), so the buffer starts with it; with `--workers`, the
 campaign makes these once and its workers add none. It writes corpus entries under
 `bhf_work/corpus/` (with the harness input format in
-`corpus/<harness-id>/metadata.json`), emits findings under `bhf_work/findings/`, and stores
+`corpus/<harness-id>/metadata.json`), emits findings under `bhf_work/results/findings/`, and stores
 the latest run metadata in `bhf_work/fuzz_runs/<harness-id>-latest.json`.
 Fuzz run summaries and finding records include `sandbox` metadata so reports
 distinguish sandboxed and unsandboxed executions.
@@ -1548,8 +1548,9 @@ remove disposable compiler caches and scratch files while preserving findings,
 reports, corpora, checkpoints, generated source, and replay binaries. Use
 `--build`, `--corpus`, `--reports`, `--findings`, or `--all` for explicit deletion
 scopes under the work directory. `--findings` removes `results/` (findings,
-indexes, `static/` and `sbom/` reports) plus any legacy `findings/`/
-`FINDINGS.md`/`findings.csv` paths; `--reports` removes only `results/report/`
+indexes, `static/` and `sbom/` reports) plus any legacy (pre-`results/`)
+paths, `findings/`, `FINDINGS.md` and `findings.csv`, at the top of a legacy
+work dir; `--reports` removes only `results/report/`
 (the `bhf report` snapshots), leaving the rest of `results/` intact.
 `--all` also removes the fuzz loop's scratch: `fuzz_inputs/`, `fuzz_shm/` and
 `fuzz_campaigns/`, and the `.tmp*` shared-map files an older `bhf fuzz` left

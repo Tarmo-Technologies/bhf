@@ -46,10 +46,10 @@ global installer generation on a newer host from raising the advertised floor.
 - [ ] Build-context invalidation is documented (GPR, `compile_commands.json`,
       IDL, `--project`, and the harness-affecting options).
 - [ ] `RELEASE_NOTES.md` documents the default work-directory/corpus ceilings,
-      non-destructive compaction, and the root-level `FINDINGS.md` handoff.
+      non-destructive compaction, and the `results/INDEX.md` handoff.
 - [ ] A smoke `auto` run leaves no private Rust Cargo `target/` tree, preserves
-      finding evidence through `bhf clean <work> --compact`, and writes both
-      root-level finding indexes.
+      finding evidence through `bhf clean <work> --compact`, and writes
+      `results/findings.json` and `results/findings.csv`.
 - [ ] No secrets or absolute host paths appear in the archive.
 
 ## Post-release

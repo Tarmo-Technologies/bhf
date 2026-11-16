@@ -45,6 +45,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The docs name the `results/` layout a run writes: `results/INDEX.md`,
+  `results/findings.json` and `.csv`, and `results/findings/<id>/`. auto,
+  install, cli, llm, the release checklist and the recommended sweep still
+  pointed at `<work>/FINDINGS.md`, `<work>/findings.csv` and
+  `<work>/findings/`, which no run has written since the results migration,
+  and auto.md's output tree listed `build/` and `findings/` at the top. A test
+  rejects the legacy names outside text about the legacy layout, and checks
+  auto.md's tree against a real run.
 - Hangs in the interpreted lanes are findings located in the target. A
   re-run of an input that hung had no stack there, because an interpreter
   answers no signal while its target loops: a Python `while True` gave a

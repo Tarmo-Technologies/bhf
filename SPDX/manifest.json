@@ -2895,6 +2895,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/m19_docs_layout.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/m19_docs_site.rs",
       "license": "Apache-2.0"
     },

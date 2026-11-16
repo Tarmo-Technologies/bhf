@@ -254,11 +254,12 @@ every plain `-D` and `-U`.
 
 ## Outputs and disk cleanup
 
-The primary human handoff is `<work>/FINDINGS.md`, ordered by impact with source
-locations, confidence, evidence links, remediation, and replay commands.
-`<work>/findings.csv` is the machine-readable root-cause index and
-`<work>/findings/` contains complete evidence bundles. Historical integrations
-can continue reading `<work>/auto/findings.csv`. Campaign mechanics and coverage
+The primary human handoff is `<work>/results/INDEX.md`, ordered by impact with
+source locations, confidence, evidence links, remediation, and replay commands.
+`<work>/results/findings.json` (`bhf.findings.v1`) and
+`<work>/results/findings.csv` are the machine-readable root-cause indexes,
+`results/findings.sarif` the SARIF log, and `<work>/results/findings/<id>/`
+holds each finding's complete evidence bundle. Campaign mechanics and coverage
 caveats remain in `auto/run.md`, `run.json`, and `summary.txt`.
 
 BHF deletes Rust Cargo `target/` trees as soon as their final replay harness
@@ -657,7 +658,8 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 │   ├── seeds.json                              # every seed the run used, with provenance
 │   ├── missing-deps.json                       # missing-dependency manifest (#418)
 │   ├── missing-deps.txt                        # same, human-readable
-│   └── blockers.json                           # what stopped each unfuzzed target, grouped
+│   ├── summary.txt                             # the summary the run printed
+│   └── blockers.json                           # what stopped each unfuzzed target, grouped (when one was)
 ├── harnesses/<harness-id>/
 │       ├── main.c | main.cpp | main.adb
 │       ├── Makefile | H_<id>.gpr
@@ -668,11 +670,18 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 │       │   └── auto_ada/…
 │       ├── result.json                         # per-target resume marker
 │       └── runtrace.jsonl                      # per-target shim events
-├── build/<harness-id>/
 ├── corpus/<harness-id>/queue/                  # persisted coverage-minimal corpus (#401)
 ├── corpus/<harness-id>/lineage.jsonl           # what each queue entry was mutated from
-├── findings/F-0001-…/
-└── fuzz_runs/<harness-id>-latest.json
+├── fuzz_runs/<harness-id>-latest.json
+├── discovery-cache.json                        # the discovery index a re-run reuses
+└── results/
+    ├── INDEX.md                                # start here
+    ├── findings.json                           # bhf.findings.v1
+    ├── findings.csv
+    ├── findings.sarif
+    ├── manifest.json                           # what each file holds, with digests
+    ├── attestation.json
+    └── findings/<finding-id>/                  # finding.json, testcase.bin, replay.py, ...
 ```
 
 ### `run.md`
