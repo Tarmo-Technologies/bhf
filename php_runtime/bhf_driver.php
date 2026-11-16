@@ -39,6 +39,9 @@ function bhf_fold_coverage(): void {
             continue;
         }
         foreach ($lines as $line => $hit) {
+            // pcov lists every executable line of a loaded file, -1 for one that
+            // did not run; only a line that ran is coverage.
+            if ($hit <= 0) continue;
             $covered["$file:$line"] = true;
             $idx = bhf_fnv($file, (int)$line);
             $v = ord($cov[$idx]);

@@ -361,3 +361,110 @@ fn cartography_refusing_a_requested_finding_exits_non_zero() {
         );
     }
 }
+
+/// `bhf snippet` over `source` then `bhf cartography`; the finding's card.
+fn snippet_card(name: &str, source: &str) -> serde_json::Value {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("bhf_work");
+    let src = root.path().join(name);
+    std::fs::write(&src, source).unwrap();
+    let snip = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["snippet", src.to_str().unwrap(), "--lang", "c"])
+        .args([
+            "--per-target-time",
+            "6",
+            "--work-dir",
+            work.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run snippet");
+    let fdir = find_finding(&work).unwrap_or_else(|| {
+        panic!(
+            "snippet produced no crash: {}",
+            String::from_utf8_lossy(&snip.stderr)
+        )
+    });
+    let carto = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("cartography")
+        .current_dir(root.path())
+        .output()
+        .expect("run cartography");
+    assert!(
+        carto.status.success(),
+        "{}",
+        String::from_utf8_lossy(&carto.stderr)
+    );
+    serde_json::from_slice(&std::fs::read(fdir.join("byte-control.json")).unwrap()).unwrap()
+}
+
+/// Copies of `data[0]` bytes capped at the input's length: minimization pins
+/// the size to the length, so no byte flip moves it, yet the input sizes the
+/// overflow and supplies what it writes.
+const STACK_COPY_C: &str = "\
+#include <string.h>
+int copy_record(const char *data, unsigned int len) {
+    char out[4];
+    if (len < 2) return 0;
+    unsigned int n = (unsigned char)data[0];
+    if (n > len - 1) n = len - 1;
+    memcpy(out, data + 1, n);
+    return out[0];
+}
+";
+
+const HEAP_COPY_C: &str = "\
+#include <stdlib.h>
+#include <string.h>
+int heap_copy(const char *data, unsigned int len) {
+    if (len < 2) return 0;
+    unsigned int n = (unsigned char)data[0];
+    if (n > len - 1) n = len - 1;
+    char *buf = malloc(16);
+    memcpy(buf, data + 1, n);
+    int r = buf[0];
+    free(buf);
+    return r;
+}
+";
+
+/// One byte stored one past an 8-byte block, whatever the input: a write no
+/// input byte or length moves.
+const FIXED_STORE_C: &str = "\
+#include <stdlib.h>
+int fixed_store(const char *data, unsigned int len) {
+    if (len < 2 || data[0] != 'Z') return 0;
+    char *buf = malloc(8);
+    buf[8] = data[1];
+    int r = buf[0];
+    free(buf);
+    return r;
+}
+";
+
+#[test]
+fn input_sized_memcpy_overflows_are_not_rated_fixed_writes() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    for (name, source) in [("copy.c", STACK_COPY_C), ("heap.c", HEAP_COPY_C)] {
+        let card = snippet_card(name, source);
+        let primitive = &card["primitive"];
+        assert_ne!(primitive["kind"], "fixed_write", "{name}: {card:#}");
+        assert!(
+            primitive["exploitability"] == "high" || primitive["exploitability"] == "medium",
+            "{name}: {card:#}"
+        );
+    }
+}
+
+#[test]
+fn a_write_no_input_moves_is_still_a_fixed_write() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let card = snippet_card("store.c", FIXED_STORE_C);
+    assert_eq!(card["primitive"]["kind"], "fixed_write", "{card:#}");
+    assert_eq!(card["primitive"]["exploitability"], "low", "{card:#}");
+}

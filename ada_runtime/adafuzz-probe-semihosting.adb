@@ -6,15 +6,14 @@
 --  semihosting host channel (fd 2). This is a coverage *emitter* only; it does
 --  not itself decode or transport coverage.
 --
---  Consumer (roadmap CC-2 / HDF-1, HDF-1b): the host-side reader that consumes
---  this channel is target_transport::coverage::SemihostingReader
---  (crates/target_transport/src/coverage.rs), and HDF-1b's transport fuzz loop
---  (crates/cli/src/transport_fuzz.rs, `bhf fuzz --target-transport`) drives it
---  through the TargetTransport seam. This emitter is therefore no longer a
---  dead-end: it is the target half of a wired reader path. The *live* channel is
---  DEPENDENCY-gated on a backend that surfaces the semihosting sink (a debug
---  probe / emulator); in-tree the reader is proven against captured / scripted
---  event streams.
+--  Consumer: none yet. target_transport::coverage::SemihostingReader
+--  (crates/target_transport/src/coverage.rs) decodes this stream in tests, but
+--  no transport reads it: `bhf fuzz --target-transport` over gdb or
+--  qemu-system reads the memory_buffer ring, and the gdb client keeps
+--  semihosting output only as stdout. A harness built with this backend
+--  therefore fuzzes without coverage. Reading it in the gdb and qemu-system
+--  transports is tracked as issue #292; use the memory_buffer backend with
+--  those transports until then.
 pragma Ada_95;
 with Ada.Streams;
 with Interfaces; use Interfaces;

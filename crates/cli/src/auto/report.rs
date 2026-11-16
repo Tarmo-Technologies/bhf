@@ -303,6 +303,59 @@ struct TargetEntry<'a> {
     /// not; omitted when none was attempted.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     lanes: std::collections::BTreeMap<String, crate::auto::lanes::LaneStatus>,
+    /// Whether the behavioral sink oracles (command injection, path control
+    /// and the other classes that raise no crash) ran on this target. `None`
+    /// (omitted) for a target that never fuzzed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behavioral_oracles: Option<BehavioralOracles>,
+}
+
+/// Which behavioral sink oracles a fuzzed target ran with, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BehavioralOracles {
+    /// `on` (the runtrace shim), `driver` (a few checks in the lane's own
+    /// driver) or `off`.
+    status: &'static str,
+    reason: String,
+}
+
+/// [`BehavioralOracles`] for a target that fuzzed. A native harness gets the
+/// runtrace shim unless it ran under an emulator or the shim is not on disk.
+fn target_behavioral_oracles(r: &AttemptResult) -> Option<BehavioralOracles> {
+    use crate::auto::attempt::LaneSinkOracles;
+    if !matches!(
+        r.outcome,
+        Outcome::BuiltAndFuzzed { .. } | Outcome::BuiltNotEntered { .. }
+    ) {
+        return None;
+    }
+    let (status, reason) = match crate::auto::attempt::lane_sink_oracles(r.candidate.lang) {
+        LaneSinkOracles::Shim => {
+            if crate::gate_evidence::recorded_runner(&r.harness_dir.join("main")).is_some() {
+                (
+                    "off",
+                    "the harness ran under an emulator, and the runtrace shim is not loaded \
+                     into one"
+                        .to_owned(),
+                )
+            } else if crate::auto::shim_path::locate().is_none() {
+                ("off", crate::auto::shim_path::unavailable_reason())
+            } else {
+                ("on", "runtrace shim".to_owned())
+            }
+        }
+        LaneSinkOracles::Driver(checks) => ("driver", checks.to_owned()),
+        LaneSinkOracles::None => (
+            "off",
+            format!(
+                "the {} lane has no sink oracles yet; only exceptions are reported",
+                crate::repro_lane::language_name(crate::auto::candidate::lang_tag(
+                    r.candidate.lang
+                ))
+            ),
+        ),
+    };
+    Some(BehavioralOracles { status, reason })
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -369,6 +422,7 @@ fn target_fidelity(
     }
     facts.sanitizers = names;
     facts.tsan_ran = tsan_ran;
+    facts.fuzzing_build_mode = harness_fuzzing_build_mode(&r.harness_dir);
     // A cross-built harness ran under the emulator recorded beside it: it
     // ran its own target, with only the sanitizers its build armed.
     let harness = r.harness_dir.join("main");
@@ -390,6 +444,23 @@ fn target_fidelity(
         facts.tsan_ran = facts.tsan_ran && facts.sanitizers.iter().any(|n| n == "tsan");
     }
     Some(actionability::Fidelity::from_facts(&facts))
+}
+
+/// Whether a C/C++ harness was built with `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`:
+/// its Makefile's `BHF_FUZZING_BUILD_MODE_FLAGS` defines it and this process did
+/// not turn it off for the build. `None` for a harness without that Makefile.
+fn harness_fuzzing_build_mode(harness_dir: &Path) -> Option<actionability::FuzzingBuildMode> {
+    use harness_gen::fuzzing_build_mode as mode;
+    let makefile = std::fs::read_to_string(harness_dir.join("Makefile")).ok()?;
+    let line = makefile
+        .lines()
+        .find(|line| line.trim_start().starts_with(mode::MAKE_VAR))?;
+    let defined = line.contains(&format!("-D{}", mode::MACRO)) && mode::enabled();
+    Some(if defined {
+        actionability::FuzzingBuildMode::On
+    } else {
+        actionability::FuzzingBuildMode::Off
+    })
 }
 
 /// The target triple a harness was built for, from its toolchain stamp
@@ -477,6 +548,7 @@ fn with_discovery_sanitizers(
 /// never aborting the report.
 fn annotate_findings_with_fidelity(
     work_dir: &Path,
+    source_root: Option<&Path>,
     results: &[AttemptResult],
     fidelities: &[Option<actionability::Fidelity>],
 ) {
@@ -533,10 +605,33 @@ fn annotate_findings_with_fidelity(
                 obj.remove("fidelity_caveat");
             }
         }
+        // A crash path through code the fuzz-build define switches may not
+        // reproduce in production; say which check it depends on.
+        let guard = (fidelity.fuzzing_build_mode == Some(actionability::FuzzingBuildMode::On))
+            .then(|| crate::auto::build_mode_guard::guard_note(&raw, source_root))
+            .flatten();
+        let Some(obj) = raw.as_object_mut() else {
+            continue;
+        };
+        match guard {
+            Some(note) => {
+                obj.insert(
+                    "fuzzing_build_mode_note".to_owned(),
+                    serde_json::Value::String(note),
+                );
+            }
+            None => {
+                obj.remove("fuzzing_build_mode_note");
+            }
+        }
         if raw == before {
             continue;
         }
-        corpus::finding::append_history(&mut raw, "auto", &["fidelity", "fidelity_caveat"]);
+        corpus::finding::append_history(
+            &mut raw,
+            "auto",
+            &["fidelity", "fidelity_caveat", "fuzzing_build_mode_note"],
+        );
         match serde_json::to_vec_pretty(&raw) {
             Ok(serialized) => {
                 if let Err(error) = atomic_write(&path, &serialized) {
@@ -1426,11 +1521,15 @@ pub fn write_reports_with_output_limit(
                 _ => Vec::new(),
             },
             lanes: crate::auto::lanes::read(&r.harness_dir),
+            behavioral_oracles: target_behavioral_oracles(r),
         })
         .collect();
 
+    // One format-string bug is one finding group (CWE-134), not a NULL
+    // dereference, a wild write and an oracle hit apart.
+    crate::auto::format_string_group::group_format_string_findings(work_dir);
     // CC-1: stamp every finding.json with its target's structured fidelity block.
-    annotate_findings_with_fidelity(work_dir, results, &target_fidelities);
+    annotate_findings_with_fidelity(work_dir, Some(source_root), results, &target_fidelities);
     // force-fuzz Phase 2: persist the forced floor onto each forced target's
     // findings so every renderer and importer floors them the same way the CSV
     // path does in memory.
@@ -3636,6 +3735,12 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
     {
         line.push_str(&format!("  [!] {caveat}"));
     }
+    if let Some(oracles) = &t.behavioral_oracles {
+        line.push_str(&format!(
+            "  [behavioral oracles: {} — {}]",
+            oracles.status, oracles.reason
+        ));
+    }
     line
 }
 
@@ -3890,8 +3995,8 @@ mod tests {
         )
         .unwrap();
         // Empty results -> every finding gets the "nothing executed" fidelity record.
-        annotate_findings_with_fidelity(work.path(), &[], &[]);
-        annotate_findings_with_fidelity(work.path(), &[], &[]);
+        annotate_findings_with_fidelity(work.path(), None, &[], &[]);
+        annotate_findings_with_fidelity(work.path(), None, &[], &[]);
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
         assert!(raw.get("fidelity").is_some());

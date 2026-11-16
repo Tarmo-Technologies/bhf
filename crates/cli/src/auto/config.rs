@@ -150,6 +150,8 @@ pub(crate) const EXPLICIT_CONFIG_KEYS: &[&str] = &[
 /// diagnostics switches, and the config file itself.
 #[cfg(test)]
 pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
+    // `BHF_FUZZING_BUILD_MODE=0` is its persistent form.
+    "no-fuzzing-build-mode",
     "work-dir",
     "discovery-cache",
     "config",

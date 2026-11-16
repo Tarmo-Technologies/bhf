@@ -528,21 +528,22 @@ pub fn extract_ruby_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<
                         && !lit.contains("#{")
                         && lit.chars().all(|ch| !ch.is_control())
                     {
-                        match seen.get(lit) {
-                            Some(&index) => {
-                                let lines = &mut out[index].1;
-                                if lines.len() < 3 && !lines.contains(&line) {
-                                    lines.push(line);
-                                }
-                            }
-                            None => {
-                                seen.insert(lit.to_owned(), out.len());
-                                out.push((lit.to_owned(), vec![line]));
-                            }
-                        }
+                        crate::auto::lit_scan::push_unique(
+                            &mut out,
+                            &mut seen,
+                            lit.to_owned(),
+                            line,
+                        );
                     }
                 }
                 i = j + 1;
+                continue;
+            }
+            if let Some((end, tok)) = crate::auto::lit_scan::number_literal_at(bytes, i) {
+                if let Some(tok) = tok {
+                    crate::auto::lit_scan::push_unique(&mut out, &mut seen, tok, line);
+                }
+                i = end;
                 continue;
             }
             i += 1;
@@ -554,6 +555,25 @@ pub fn extract_ruby_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_mines_integer_literals_outside_comments_and_identifiers() {
+        // `0x52` is an `R`, `76` an `L` and `48` a `0` once the dictionary writer
+        // adds each number's byte; the comment, the float and `v2` give nothing.
+        let toks = extract_ruby_dictionary_tokens(
+            "def parse(s)\n  return 0 unless s.getbyte(0) == 0x52 && s.getbyte(1) == 76\n  \
+             x = s.getbyte(3) - 48 # 99 sits in a comment\n  v2 = 2.5\n  100 / x\nend\n",
+        );
+        for want in ["0x52", "76", "48", "100"] {
+            assert!(toks.iter().any(|t| t == want), "{want} not mined: {toks:?}");
+        }
+        for unwanted in ["99", "98", "5"] {
+            assert!(
+                !toks.iter().any(|t| t == unwanted),
+                "{unwanted} mined: {toks:?}"
+            );
+        }
+    }
 
     #[test]
     fn located_dictionary_tokens_record_their_lines() {

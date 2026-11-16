@@ -453,10 +453,10 @@ from cross-execution matching, not per input, and capped per harness.
 These runtrace-derived findings — BHF-413, BHF-414, BHF-415, and BHF-405, together
 with the BHF-304 command-injection, BHF-417 insecure-temp, and BHF-305
 sensitive-environment behavioral/taint oracles — are produced by the LD_PRELOAD
-runtrace shim. It is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses
-and interposes the Python/Perl/Ruby/Lua/PHP interpreter processes. It is
-deliberately **not** loaded for Java, C#, or JavaScript/TypeScript and is not
-armed under cross-compiled or emulated (qemu/wine) runs. Those configurations
+runtrace shim. It is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses.
+It is **not** loaded into the Python, Perl, Ruby, Lua, PHP, Java, C# or
+JavaScript/TypeScript lanes and is not armed under cross-compiled or emulated
+(qemu/wine) runs. Those configurations
 still fuzz for their documented coverage/crash/exception signals; the
 LD_PRELOAD behavioral and taint findings are the unavailable layer.
 
@@ -961,7 +961,12 @@ and explain it — all offline and deterministic (no LLM):
   `controlled_address_read`/`_write`). When two identical replays fault on
   different addresses, the bytes are `unknown` (primitive `unattributed_crash`)
   rather than don't-care; a crash no byte gates is `uncontrolled_crash`, not
-  `gated_crash`. Turning randomization off needs the `personality(2)` system
+  `gated_crash`. Cartography maps the minimized and the original testcase and
+  keeps the stronger result, and it also replays the input one byte shorter
+  and eight bytes longer: an access whose size follows the input's length (a
+  copy of `min(data[0], len - 1)` bytes, which minimization pins so no byte
+  flip moves it) is `input_sized_linear_write` (high) or
+  `input_sized_linear_read` (medium), not a `fixed_write`. Turning randomization off needs the `personality(2)` system
   call, which a container's default seccomp profile refuses (Docker's, even
   with `--cap-add=SYS_PTRACE`). There, cartography prints a warning, and a
   wild pointer's bytes show as `unknown`; run the container with
@@ -1200,8 +1205,14 @@ when scheduling evidence is missing or jobs remain unassigned. Pass
 air-gapped handoff.
 
 `bhf list targets` prints each candidate's stable `harness_id` in table and
-JSON output. Use that id with `bhf auto --harness-id <ID>` to rerun one
-specific target when names collide across files.
+JSON output. The id is the one `bhf auto` uses for the same tree, however the
+root is spelled (`src/p1`, its absolute path, or `.` from inside it). Use it
+with `bhf auto --harness-id <ID>` to rerun one specific target when names
+collide across files. `bhf list targets` takes the same `--target`,
+`--harness-id` and `--target-file` selections as `bhf auto`. In both commands a
+selection that matches nothing prints `--harness-id '<ID>' matched no target;
+closest: ...` (likewise for the other two), and when nothing is left the
+command exits 2, `bhf auto --dry-run` and `--list-targets` included.
 
 `bhf fuzz` runs the built-in engine against a built harness under
 `bhf_work/build/<harness-id>/`. It accepts literal `--seed-input` values
@@ -1248,10 +1259,11 @@ so a run whose crashes were all known does not read as clean.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
-- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX`, `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. See [On-Target & Embedded](./on-target-fuzzing.md).
-- `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex). The `agent` transport carries coverage over its protocol and rejects this.
+- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. See [On-Target & Embedded](./on-target-fuzzing.md).
+- `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there. `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. Required with `--protocol-profile`.
+- The transport (`--target-transport`) and session (`--protocol-profile`) lanes run their own loops and refuse, with exit `2` and the flags named, a host-lane flag they do not wire rather than ignore it: `--workers`, `--grammar`, `--cmplog-log`, `--len-control`, `--rss-limit-mb`, the fork-server, qemu-user, extension, sanitizer, symbolic-seed, sandbox, runtime-oracle, structured-input, final-stats and collector flags. The transport lane also refuses the session flags; the session lane, whose seeds come from the profile, also refuses `--seed-input`, `--seed-file`, `--max-len`, `--timeout`, `--deadline` and `--transport-coverage-map`.
 - `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
 - `--max-session-messages <N>` — bounded cap on messages per session (default `64`); a sequence mutation that would exceed it fails with a diagnostic rather than growing unbounded.
 - `--rng-seed <N>` — deterministic RNG seed for built-in mutation.
@@ -1392,7 +1404,8 @@ the `AUTO_EXTRA_INCLUDES='-include <prelude>'` command.
 
 `bhf build` takes the toolchain from `--cc`/`--cxx`, `--target <triple>` (or
 `--toolchain <prefix>`: `<prefix>-gcc`/`<prefix>-g++`), `--sysroot`, `--cflags`,
-`--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`, or from the
+`--cxxflags`, `--ldflags`, `--define`, `--toolchain-include` and
+`--no-fuzzing-build-mode` (see [C/C++](c-cpp.md)), or from the
 `[toolchain]` table of `--config <file>` (the same table `bhf auto --config`
 reads; there the compilers come from `target` or `cc`/`cxx`, since
 `toolchain.ada.prefix` applies to Ada harnesses only). Flags are appended to

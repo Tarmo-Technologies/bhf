@@ -91,7 +91,10 @@ arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -nostdlib -nostartfiles -ffreestanding
   "$K/portable/GCC/ARM_CM3/port.c" "$K/portable/MemMang/heap_4.c"
 
 # 3. Discover symbols (bhf_input, adafuzz_probe_memory_buffer{,_write,_wrapped},
-#    harness_done, bhf_fault_flag, bhf_task_id) with `nm rtos.elf`.
+#    harness_done, bhf_fault_flag, bhf_task_id) with `nm rtos.elf`. nm prints
+#    a Thumb function's address with bit 0 set (harness_done at 0x189 is code
+#    at 0x188). bhf clears that bit for done= when done_kind is 2 (the default)
+#    and says so; a breakpoint at the odd address would never hit.
 
 # 4. Create the scratch disk savevm/loadvm needs (any small qcow2).
 qemu-img create -f qcow2 scratch.qcow2 16M
@@ -102,14 +105,13 @@ qemu-system-arm -M mps2-an385 -nographic -S -kernel rtos.elf \
   -drive if=none,file=scratch.qcow2,format=qcow2,id=sc0 &
 bhf fuzz bhf_work --harness freertos-queue \
   --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,snapshot=base,done=<harness_done>,fault=<bhf_fault_flag>" \
-  --transport-coverage-map "input=<bhf_input>,ring=<ring>,write=<write>,wrapped=<wrapped>,cap=512" \
-  --max-len 64
+  --transport-coverage-map "input=<bhf_input>,input_cap=64,ring=<ring>,write=<write>,wrapped=<wrapped>,cap=512"
 ```
 
-`--max-len 64` bounds a generated input to the 64-byte `bhf_input` staging buffer.
-The transport has no staging-capacity field and the CLI's default maximum is
-larger, so without this cap a longer input would be written past `bhf_input[64]`
-into adjacent guest memory. Keep `--max-len` ≤ the staging buffer size.
+`input_cap=64` is the size of the `bhf_input` staging buffer. bhf cuts
+`--max-len` to it and never writes an input past it; without it a longer input
+would overwrite the guest memory after `bhf_input[64]` (here `bhf_fault_flag`,
+so every such input would read as a fault).
 
 ## Gated tests
 

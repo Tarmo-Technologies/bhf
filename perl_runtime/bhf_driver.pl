@@ -28,9 +28,9 @@ require $harness;
 # Perl uses `die` as ordinary error handling — a plain string die is almost always
 # the program REJECTING bad input (the croak-on-bad-args convention), not a bug. So
 # (FP-avoidant, like the Python untyped policy) we report ONLY high-confidence
-# bug-class dies and suppress everything else. The behavioral/taint oracles (the
-# shim) catch the security classes regardless. Returns the CWE, or '' for a generic
-# die (= not a finding). A user can force-report a message via BHF_EXPECTED... no
+# bug-class dies and suppress everything else. This lane has no behavioral sink
+# oracles yet (the runtrace shim is not loaded into perl). Returns the CWE, or ''
+# for a generic die (= not a finding). A user can force-report a message via BHF_EXPECTED... no
 # — @EXPECTED here SUPPRESSES named messages (a target's known internal die text).
 sub bug_cwe {
     my ($msg) = @_;

@@ -204,18 +204,71 @@ fn parse_param_names(s: &str) -> Vec<String> {
         Some(v) => v,
         None => return Vec::new(),
     };
-    inner
-        .split(',')
-        .filter_map(|p| {
-            // Drop defaults / destructuring markers; take the leading identifier.
-            let p = p.trim().trim_start_matches("...");
-            let name: String = p
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect()
+    inner.split(',').filter_map(param_entry).collect()
+}
+
+/// One item of a parameter list as `name`, or `name:Type` when it carries a
+/// TypeScript annotation (`data?: string = ""` -> `data:string`). Defaults and
+/// a rest `...` are dropped; [`param_name`] and [`arg_kind_for`] read it back.
+fn param_entry(item: &str) -> Option<String> {
+    let item = item.trim().trim_start_matches("...");
+    let name: String = item
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let rest = item[name.len()..].trim_start().trim_start_matches('?');
+    let annotation = rest
+        .trim_start()
+        .strip_prefix(':')
+        .map(|ty| ty.split('=').next().unwrap_or_default().trim())
+        .filter(|ty| !ty.is_empty());
+    Some(match annotation {
+        Some(ty) => format!("{name}:{ty}"),
+        None => name,
+    })
+}
+
+/// The name of a [`param_entry`].
+fn param_name(entry: &str) -> &str {
+    entry.split(':').next().unwrap_or(entry)
+}
+
+/// How the fuzz bytes reach a first parameter: a file path for a path-like
+/// name, else what its TypeScript annotation says (`string` -> a string,
+/// `Buffer`/`Uint8Array` -> a Buffer), else, for untyped JavaScript or another
+/// type, [`infer_arg_kind`] from the name.
+fn arg_kind_for(entry: &str) -> JsArgKind {
+    let by_name = infer_arg_kind(param_name(entry));
+    if by_name == JsArgKind::FilePath {
+        return by_name;
+    }
+    annotated_arg_kind(entry).unwrap_or(by_name)
+}
+
+/// The argument kind a TypeScript annotation asks for, if it is one the
+/// driver can supply: any byte-array member wins (a `Buffer` also passes as
+/// a string to code that calls `toString`), and `string` alone is a string.
+fn annotated_arg_kind(entry: &str) -> Option<JsArgKind> {
+    let (_, ty) = entry.split_once(':')?;
+    let members: Vec<&str> = ty.split('|').map(str::trim).collect();
+    const BYTES: &[&str] = &[
+        "Buffer",
+        "Uint8Array",
+        "ArrayBuffer",
+        "Uint8ClampedArray",
+        "DataView",
+        "Readonly<Uint8Array>",
+    ];
+    if members.iter().any(|member| BYTES.contains(member)) {
+        return Some(JsArgKind::Buffer);
+    }
+    members
+        .iter()
+        .all(|member| matches!(*member, "string" | "String"))
+        .then_some(JsArgKind::Str)
 }
 
 /// The content of a balanced `(...)` starting at the first `(` of `s`.
@@ -356,20 +409,7 @@ fn function_params(rhs: &str) -> Option<Vec<String>> {
         if let Some(inner) = balanced(arrow) {
             let after_paren = &arrow[arrow.find(')').map(|i| i + 1).unwrap_or(arrow.len())..];
             if after_paren.trim_start().starts_with("=>") {
-                return Some(
-                    inner
-                        .split(',')
-                        .filter_map(|p| {
-                            let n: String = p
-                                .trim()
-                                .trim_start_matches("...")
-                                .chars()
-                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                                .collect();
-                            (!n.is_empty()).then_some(n)
-                        })
-                        .collect(),
-                );
+                return Some(inner.split(',').filter_map(param_entry).collect());
             }
         }
         return None;
@@ -434,7 +474,7 @@ pub fn parse_js(source: &str) -> Vec<JsFunction> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut push = |name: String, export_path: String, params: &[String], line: u32| {
         if params.is_empty()
-            || non_input_first_param(&params[0])
+            || non_input_first_param(param_name(&params[0]))
             || !seen.insert(export_path.clone())
         {
             return;
@@ -443,7 +483,7 @@ pub fn parse_js(source: &str) -> Vec<JsFunction> {
             name,
             export_path,
             line,
-            arg_kind: infer_arg_kind(&params[0]),
+            arg_kind: arg_kind_for(&params[0]),
         });
     };
 
@@ -555,7 +595,7 @@ pub fn parse_js(source: &str) -> Vec<JsFunction> {
     // no-arg-constructible classes qualify (mirrors the C# instance-method guard).
     let classes = collect_classes(&lines);
     let mut push_method = |export_path: &str, method: &ClassMethod, class_constructible: bool| {
-        if method.params.is_empty() || non_input_first_param(&method.params[0]) {
+        if method.params.is_empty() || non_input_first_param(param_name(&method.params[0])) {
             return;
         }
         // A static method is `Class.method` (no construction needed — resolved by the
@@ -579,7 +619,7 @@ pub fn parse_js(source: &str) -> Vec<JsFunction> {
             name: full.clone(),
             export_path: full,
             line: method.line,
-            arg_kind: infer_arg_kind(&method.params[0]),
+            arg_kind: arg_kind_for(&method.params[0]),
         });
     };
     for (idx, line) in lines.iter().enumerate() {
@@ -1027,6 +1067,64 @@ module.exports = { parse, helper };
         let parse = fns.iter().find(|f| f.name == "parse").unwrap();
         assert_eq!(parse.export_path, "parse");
         assert_eq!(parse.arg_kind, JsArgKind::Str); // "input" is text-like
+    }
+
+    #[test]
+    fn typescript_annotations_choose_the_argument_kind_over_the_name() {
+        let src = "\
+export function decode(data: string): number { return data.length; }
+export function parseText(text: Buffer): number { return text.length; }
+export function readRecord(input: Uint8Array): number { return input.length; }
+export function either(raw: string | Buffer): number { return raw.length; }
+export function optional(data?: string = \"\"): number { return data.length; }
+export function load(filePath: string): string { return filePath; }
+export const arrow = (payload: String) => payload.length;
+export function untyped(data) { return data.length; }
+export function counted(data: number): number { return data; }
+export class Reader {
+  static parse(chunk: string): number { return chunk.length; }
+}
+";
+        let kinds: std::collections::HashMap<String, JsArgKind> = parse_js(src)
+            .into_iter()
+            .map(|f| (f.export_path, f.arg_kind))
+            .collect();
+        let kind = |path: &str| {
+            *kinds
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} not discovered: {kinds:?}"))
+        };
+        assert_eq!(kind("decode"), JsArgKind::Str);
+        assert_eq!(kind("parseText"), JsArgKind::Buffer);
+        assert_eq!(kind("readRecord"), JsArgKind::Buffer);
+        assert_eq!(kind("either"), JsArgKind::Buffer);
+        assert_eq!(kind("optional"), JsArgKind::Str);
+        assert_eq!(kind("load"), JsArgKind::FilePath);
+        assert_eq!(kind("arrow"), JsArgKind::Str);
+        assert_eq!(kind("untyped"), JsArgKind::Buffer);
+        assert_eq!(kind("counted"), JsArgKind::Buffer);
+        assert_eq!(kind("Reader.parse"), JsArgKind::Str);
+    }
+
+    #[test]
+    fn param_entries_keep_the_annotation_and_drop_defaults_and_rest() {
+        assert_eq!(
+            param_entry(" data?: string = \"x\" ").as_deref(),
+            Some("data:string")
+        );
+        assert_eq!(
+            param_entry("...rest: Buffer[]").as_deref(),
+            Some("rest:Buffer[]")
+        );
+        assert_eq!(param_entry("plain = 3").as_deref(), Some("plain"));
+        assert_eq!(param_entry("{ a, b }"), None);
+        assert_eq!(param_name("data:string"), "data");
+        assert_eq!(
+            annotated_arg_kind("data:Readonly<Uint8Array>"),
+            Some(JsArgKind::Buffer)
+        );
+        assert_eq!(annotated_arg_kind("data:string | number"), None);
+        assert_eq!(annotated_arg_kind("data"), None);
     }
 
     #[test]

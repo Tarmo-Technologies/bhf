@@ -15,6 +15,123 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `--target-transport agent:serial:PATH` opens the port raw (8N1, no flow
+  control, echo, line editing or newline translation) and bounds every read by
+  `--timeout`, on Linux and Windows, and takes `,baud=N`. The tty stayed in its
+  cooked mode, which rewrote a frame's 0x0A bytes as 0x0D 0x0A and held the
+  agent's reply until a newline, and a silent device hung the run past
+  `--time`.
+- docs/site/on-target-fuzzing.md no longer claims Renode integration,
+  semihosting coverage or target-byte-order typed mutation; each names the
+  issue that tracks it. It documents the on-target agent's frame format and
+  says no target-side agent ships yet. The roadmap's §1a and CC-2 entries and
+  the semihosting emitter's header say the same.
+- The `gdb` and `qemu-system` transports take the staging buffer's size,
+  `input_cap=` in `--transport-coverage-map` (required), and an optional
+  `input_len=` word the firmware reads the input's length from. They wrote
+  each input whole, so with the default `--max-len 4096` an input past the
+  buffer overwrote the guest globals after it and, when that was the `fault=`
+  word, read as a CPU exception. `--max-len` is now cut to the capacity with a
+  note, no input is written past it, and each finding's
+  `transport_profile.json` records it; a profile from before replays its
+  input whole.
+- `bhf fuzz --target-transport` and `--protocol-profile` refuse, with exit 2
+  and each flag named, the host-lane flags their loops do not wire
+  (`--workers`, `--grammar`, `--cmplog-log`, the sandbox and sanitizer flags
+  and others, and the other lane's flags). They used to run without them, so
+  a `--workers 4 --grammar g.json` campaign was one blind mutator and a
+  missing grammar file went unnoticed.
+- `--target-transport qemu-system:...,done=` clears bit 0 of a Thumb
+  (`done_kind=2`) address with a note. `nm` prints a Thumb function's address
+  odd, the FreeRTOS runbook took `done=` from it, and the unaligned breakpoint
+  never hit: the run waited out every input and ended with `os error 11` and
+  0 executions. The runbook says so too.
+- `repro.adb` is written only into Ada findings; a report removes one an
+  earlier release wrote into a C, C++ or Python finding (and keeps one that
+  bhf did not write). `bhf explain` no longer lists the driver's own
+  `fuzz_inputs`/`fuzz_scratch` files as files the target opened.
+- `bhf cartography` rates a copy whose size the input's length sets (a
+  `memcpy` of `min(data[0], len - 1)` bytes into a small buffer) as an
+  `input_sized_linear_write` with high exploitability. Minimization pinned the
+  size to the length so no byte flip moved it, and the overflow was rated a
+  `fixed_write` with low exploitability. Cartography now also probes a shorter
+  and a longer input and maps the original testcase beside the minimized one.
+- An input-controlled printf format is reported as one CWE-134 finding group
+  at the call. Its crashes inside the C library (a `%n` write, a `%s` read of a
+  garbage argument) used to come out as NULL-dereference and wild-access
+  findings in groups of their own, beside a location-less format-string oracle
+  finding and a capability finding. A crash in a printf-family call whose
+  format is not a string literal (or in a harness the format-string oracle
+  fired for) is now BHF-408, keeps its own CWE second and its severity, and
+  shares one cluster with the oracle and capability findings, which point at
+  the call too.
+- A finding that gets past a check the fuzz-build define compiles out (a
+  signature or checksum under `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`),
+  or that runs code only fuzz builds compile, carries the caveat `reachable
+  only with the check under ... at <file>:<line> disabled`, so a triager knows
+  why a production build does not reproduce it.
+- Every C/C++ lane defines `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, as
+  OSS-Fuzz builds and AFL++'s compiler wrappers do. Only the AFL++ lane had
+  it, so a crash it found past a check the project compiles out of fuzz
+  builds did not reproduce in the sanitized `main`. Each target's (and
+  finding's) fidelity records `fuzzing_build_mode`, and
+  `--no-fuzzing-build-mode` or `BHF_FUZZING_BUILD_MODE=0` turns it off.
+- Every SARIF result has a location, so GitHub code scanning shows the
+  format-string, memory-limit and deadline oracle findings (BHF-408, BHF-209,
+  BHF-555) it used to drop. A finding with no crash frame points at the
+  fuzzed function's source line, which `bhf auto` now records in each fuzz
+  finding (results/findings.json gets that location too), and at the source
+  root when no line is known.
+- `run.json` and `run.md` say for each fuzzed target whether the behavioral
+  sink oracles ran (`behavioral_oracles`: `on`, `driver` or `off`, with the
+  reason). The docs and the Python, Perl and Ruby drivers said the runtrace
+  shim interposed the Python, Perl, Ruby, Lua and PHP interpreters, but it is
+  never loaded into them, so those lanes report exceptions only. The docs now
+  say so, and a test keeps vulnerability-coverage.md's lane lists in line with
+  the lanes that preload the shim.
+- The Ruby, Lua and PHP lanes mine integer literals into the fuzzing
+  dictionary, not only strings, so a byte check such as `getbyte(0) == 0x52`
+  or `ord($c) - 48` gets the byte it compares against. These lanes have no
+  CmpLog, and such checks were left to blind mutation. A float's fraction
+  is no longer mined as a separate number in any lane.
+- The PHP lane counts only the lines an input ran as coverage. pcov also
+  lists a loaded file's unexecuted lines (as -1), and counting those made
+  coverage the same for every input, so the fuzzer never saw a gate open; it
+  also filled each harness's `covered-lines.txt` with lines that never ran,
+  which could mark a static finding on them as fuzz-exercised.
+- A TypeScript function's first parameter gets the type its annotation names:
+  `decode(data: string)` is passed a string and `parse(text: Uint8Array)` a
+  Buffer. The kind used to come from the parameter name alone, so a
+  `data: string` got a Buffer and every input failed with a suppressed
+  `TypeError` before reaching the code under test.
+- The Java lane's javac fallback compiles a target in a package named like
+  example or test code (IntelliJ's `org.example`, Spring Initializr's
+  `com.example.demo`, a sibling `com.acme.testutil`). It used to skip those
+  package directories and report `no .java sources`; `src/test/java` and a
+  top-level `examples/` module are still left out.
+- Rust functions inside inline modules (`pub mod codec { pub fn decode() }`,
+  nested ones, and ones behind a private `mod hidden { }`) are called by their
+  full module path. They used to be called as if defined at the crate root and
+  failed to build with E0425.
+- `bhf auto` names the directories (and test- or tool-named files) its
+  default non-library filter leaves out, with file counts, and `bhf list
+  targets` marks the rows `auto` skips. docs/site/auto.md lists the whole
+  default set and `--include-dir`/`--exclude-dir`.
+- `bhf list targets` gives the harness ids `bhf auto` uses whatever the root
+  path's spelling (relative, absolute, `.`), and takes `auto`'s `--target`,
+  `--harness-id` and `--target-file` selections. A selection that matches
+  nothing names the closest targets, and when nothing is left both commands
+  exit 2 (`auto --dry-run` and `--list-targets` used to exit 0).
+- `bhf auto` with a work directory an earlier run used for a different source
+  tree moves that run to `<work>/archived/` before it starts, instead of
+  reporting the other tree's findings and source path as its own.
+- C/C++ discovery evaluates `#if` and `#elif` expressions as C does
+  (comparisons, arithmetic, shifts, bitwise operators, `?:`, every integer
+  constant form and character constants), and supports `#elif`. A gate such as
+  `#if API_LEVEL >= 2` used to read as false, so discovery listed the dead
+  `#else` branch and dropped the compiled-in function. An expression it still
+  cannot evaluate (a function-like macro) keeps every branch and is named in a
+  `bhf auto: note:` line.
 - Capsules and `bhf verify-poc` take a sanitizer signature from the report's
   `ERROR:` line: a leak is `LeakSanitizer:memory-leak` instead of the byte
   count on its summary line, and a class such as `memcpy-param-overlap` no

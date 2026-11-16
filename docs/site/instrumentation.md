@@ -146,10 +146,9 @@ runs under a persistent CPython held open by the framed fork-server protocol, an
 coverage is collected by `sys.monitoring` (3.12+) or a `sys.settrace` fallback,
 whose edge counters are written into the same file-backed `BHF_COV_SHM` map
 the engine reads for every other lane. This is **real coverage feedback**, not
-black-box. The LD_PRELOAD runtrace shim is armed
-for this lane (it interposes the interpreter process), so the behavioral/taint
-oracles run alongside coverage — unlike the Java lane, where the shim is not
-armed. Python uses this single edge map only; the hit-count-bucket and
+black-box. The LD_PRELOAD runtrace shim is not loaded into the interpreter,
+so this lane has no behavioral/taint sink oracles yet and reports exceptions
+only. Python uses this single edge map only; the hit-count-bucket and
 comparison-progress channels are not part of the lane.
 
 ## Perl instrumentation (interpreter tracer)
@@ -158,9 +157,9 @@ Perl harnesses are likewise instrumented at the **interpreter** level rather tha
 by source rewriting. The harness runs under `perl -d:BhfCov`, whose `DB::DB`
 hook records per-statement edge coverage into the shared `BHF_COV_SHM` map;
 the `perl -d` debugger path is what makes this the slowest of the tracer lanes,
-but the coverage feedback is real, not black-box. The LD_PRELOAD runtrace shim is
-armed here too (it interposes the `perl` process). Perl uses this single edge map
-only.
+but the coverage feedback is real, not black-box. As with Python, the runtrace
+shim is not loaded into `perl`, so the lane has no sink oracles yet. Perl uses
+this single edge map only.
 
 ## Go instrumentation
 
@@ -192,4 +191,5 @@ process. See the [C#](csharp.md) and
 Ruby uses `TracePoint`, Lua uses `debug.sethook`, and PHP uses `pcov` when the
 extension is available; all feed per-line/edge ids into the shared map from a
 persistent interpreter. PHP degrades to black-box execution when `pcov` is not
-available. These interpreter lanes do not use compiler SanitizerCoverage.
+available. These interpreter lanes do not use compiler SanitizerCoverage,
+and, like Python and Perl, they have no behavioral sink oracles yet.

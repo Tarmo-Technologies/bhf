@@ -962,6 +962,9 @@ pub fn run(args: AutoArgs) -> i32 {
         print!("{}", crate::list_fakes::render());
         return 0;
     }
+    if args.toolchain.c.no_fuzzing_build_mode {
+        harness_gen::fuzzing_build_mode::disable();
+    }
     // The auto sweep owns the terminal with a live progress line; silence the
     // per-harness "Generated ... harness at ..." banners so they don't interleave
     // with the in-place progress line and garble it (e.g.
@@ -1177,6 +1180,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A work dir reused for another source tree: set that run aside before this
+    // one writes anything, so it neither reports nor resumes the other tree's
+    // findings.
+    if let Some((archive, previous)) = crate::auto::work_state::archive_other_tree(&work, &path)
+        .with_context(|| format!("set aside an earlier run's state under {}", work.display()))?
+    {
+        bhfeprintln!(
+            "bhf auto: note: {} held a run over {previous}; moved it to {} so this run over {} \
+             starts clean",
+            work.display(),
+            archive.display(),
+            path.display()
+        );
+    }
     // A runtrace shim installed under a path with spaces is staged here.
     crate::auto::shim_path::set_staging_work_dir(&work);
     // Judged before this run writes any auto state of its own: whether the
@@ -1237,7 +1254,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(2);
         }
     }
-    let work_state = crate::auto::work_state::prepare(&work, args.resume)
+    let work_state = crate::auto::work_state::prepare(&work, args.resume, &path)
         .with_context(|| format!("prepare generated state under {}", work.display()))?;
     bhfeprintln!("bhf auto: work-directory state: {work_state}");
     // A plan-only run (--dry-run / --list-targets) fuzzes nothing, so it
@@ -1669,6 +1686,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.discovery_cache.as_deref(),
         args.preprocess,
     )?;
+    if let Some(note) =
+        default_skips_note(&crate::auto::discovery::default_skips(&path, &dir_filter))
+    {
+        bhfeprintln!("{note}");
+    }
     if let Err(error) =
         crate::support_report::checkpoint_discovery_cache_hit(&work, discovery_cache_hit)
     {
@@ -1698,23 +1720,62 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         }
     }
     if !args.harness_ids.is_empty() {
+        let discovered: Vec<String> = candidates.iter().map(|c| c.harness_id.clone()).collect();
+        for selected in &args.harness_ids {
+            if !discovered.contains(selected) {
+                bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note(
+                        "--harness-id",
+                        selected,
+                        &discovered
+                    )
+                );
+            }
+        }
         let selected: std::collections::HashSet<&str> =
             args.harness_ids.iter().map(String::as_str).collect();
         candidates.retain(|candidate| selected.contains(candidate.harness_id.as_str()));
     }
     if !args.target_files.is_empty() {
+        let canonical = |candidate: &crate::auto::candidate::Candidate| {
+            candidate
+                .source_path
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.source_path.clone())
+        };
+        let discovered: Vec<PathBuf> = candidates.iter().map(canonical).collect();
+        // Name each file under the root as the operator would type it. The
+        // files are canonical (`\\?\C:\...` on Windows), so the root is too.
+        let canonical_root = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let shown: Vec<String> = discovered
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&canonical_root)
+                    .or_else(|_| file.strip_prefix(&path))
+                    .unwrap_or(file)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        for target_file in &args.target_files {
+            if !discovered.contains(&normalize_target_file_filter(&path, target_file)) {
+                bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note(
+                        "--target-file",
+                        &target_file.display().to_string(),
+                        &shown
+                    )
+                );
+            }
+        }
         let selected: std::collections::HashSet<PathBuf> = args
             .target_files
             .iter()
             .map(|target_file| normalize_target_file_filter(&path, target_file))
             .collect();
-        candidates.retain(|candidate| {
-            let candidate_path = candidate
-                .source_path
-                .canonicalize()
-                .unwrap_or_else(|_| candidate.source_path.clone());
-            selected.contains(&candidate_path)
-        });
+        candidates.retain(|candidate| selected.contains(&canonical(candidate)));
     }
     // A fuzz driver that survived an explicit --target/--harness-id/--target-file
     // selection was asked for by name and is kept (it is harnessed as a
@@ -1722,6 +1783,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // drivers: say what was left out and how to pick one.
     let explicit_selection =
         !args.targets.is_empty() || !args.harness_ids.is_empty() || !args.target_files.is_empty();
+    // A selection that matched nothing is a usage error in every mode,
+    // `--dry-run` and `--list-targets` included: running on, or saying "would
+    // fuzz 0 target(s)" and exiting 0, hides a mistyped or stale id.
+    if explicit_selection && candidates.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --target/--harness-id/--target-file matched no target in {}",
+            path.display()
+        );
+        return Ok(2);
+    }
     if library_targets_present && !explicit_selection {
         let ignored = crate::auto::discovery::drop_shadowed_fuzz_drivers(&mut candidates);
         if let Some(note) = ignored_fuzz_drivers_note(&ignored, &path) {
@@ -5068,11 +5139,45 @@ fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> 
         .join(", ")
 }
 
+/// The console note naming what the default non-library filter left out of
+/// discovery, so a tree whose code lives in `app/` or `tools/` does not look
+/// empty for no reason.
+fn default_skips_note(skips: &crate::auto::discovery::DefaultSkips) -> Option<String> {
+    if skips.dirs.is_empty() && skips.files == 0 {
+        return None;
+    }
+    // Enough for a tree's usual layout; a tree with hundreds of nested test
+    // directories gets a count of the rest.
+    const SHOWN: usize = 20;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut parts: Vec<String> = skips
+        .dirs
+        .iter()
+        .take(SHOWN)
+        .map(|(dir, files)| format!("{dir}/ ({files} file{})", plural(*files)))
+        .collect();
+    if skips.dirs.len() > SHOWN {
+        parts.push(format!("{} more", skips.dirs.len() - SHOWN));
+    }
+    if skips.files > 0 {
+        parts.push(format!(
+            "{} test- or tool-named file{}",
+            skips.files,
+            plural(skips.files)
+        ));
+    }
+    Some(format!(
+        "bhf auto: skipped as non-library code by default: {}; keep a directory with \
+         --include-dir <name> (see docs/site/auto.md#discovery)",
+        parts.join(", ")
+    ))
+}
+
 /// The console note for a `--target` that selected nothing: the closest
 /// discovered names, and the spellings `--target` accepts.
 fn unmatched_target_note(selected: &str, discovered: &[String]) -> String {
     let closest = crate::target_filter::closest_matches(selected, discovered, |n| n, 5);
-    let mut note = format!("  --target '{selected}' matched no discovered target");
+    let mut note = format!("  --target '{selected}' matched no target");
     if !closest.is_empty() {
         let listed: Vec<&str> = closest.iter().map(|name| name.as_str()).collect();
         note.push_str(&format!("; closest: {}", listed.join(", ")));

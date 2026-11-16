@@ -478,7 +478,24 @@ and current limitations.
 
 Walks the source tree with the same exclusions the `scan` subcommand uses
 (`.git`, `target`, `build`, `bhf_work`, `harnesses`,
-`generated_harnesses`, `node_modules`). Per-file dispatch by extension:
+`generated_harnesses`, `node_modules`), and by default also skips code that is
+not the project's own library: `bhf scan` and `bhf list targets` include it, so
+`list targets` marks those rows `(bhf auto skips: ...)`. Skipped by default:
+
+- a directory named (case-insensitively) `t`, `test`, `tests`, `testing`, `testsuite`, `test-suite`, `unittest`, `unittests`, `gtest`, `googletest`, `spec`, `specs`, `example`, `examples`, `sample`, `samples`, `demo`, `demos`, `benchmark`, `benchmarks`, `bench`, `benches`, `fuzz`, `fuzzing`, `fuzzer`, `fuzzers`, `ossfuzz`, `oss-fuzz`, `tool`, `tools`, `dev-tools`, `devtools`, `dev_tools`, `program`, `programs`, `bin`, `cli`, `app`, `apps`, `regress`, `research`, `experimental`, `experiments`, `playground`, `sandbox`, `perf`, `script`, `scripts`, `snippet`, `snippets`, `contrib`, `third_party`, `thirdparty`, `third-party`, `3rdparty`, `3rd_party`, `vendor`, `vendored`, `extern`, `external`, `deps`, `dependencies`, `subprojects`, `doc`, `docs`, `documentation`;
+- any directory whose name contains `test` (`integration_tests`,
+  `jsontestrunner`; `latest`, `fastest`, `greatest`, `contest`, `protest` and
+  names containing `attest` are kept) or `fuzz` (`fuzz_targets`, `libfuzzer`);
+- a source file whose name marks a test runner or tool (`test_foo.c`,
+  `pngtest.c`, `runtest.c`, `foo_test.cc`, `ltests.c`).
+
+`--include-dir <name>` keeps a directory the defaults skip (repeatable, e.g.
+`--include-dir tools` for a project whose parser lives in `tools/`), and
+`--exclude-dir <name>` skips another. When the defaults leave anything out,
+`bhf auto` prints `bhf auto: skipped as non-library code by default: tests/ (3
+files), tools/ (1 file), ...` after discovery.
+
+Per-file dispatch by extension:
 
 | Extension | Parser | Ranker |
 |---|---|---|
@@ -602,11 +619,14 @@ explicit `--passes`/`--single-pass`, the shared deadline, or
 `--per-target-finding-count` can stop or skip remaining passes.
 
 The runtime-virtualisation shim that backs these passes is Linux-only. It is
-armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and interposes the
-Python/Perl/Ruby/Lua/PHP interpreters. It is deliberately off for Java, C#, and
-JavaScript/TypeScript (where managed-runtime startup activity would create false
-positives) and for cross-compiled or emulated (qemu/wine) targets. Those
-configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracles.
+armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. It is off for the
+interpreted and managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#,
+JavaScript/TypeScript), where the runtime's own startup activity would create
+false positives, and for cross-compiled or emulated (qemu/wine) targets. Those
+configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace
+oracles. Each fuzzed target's `behavioral_oracles` in `run.json` (and its
+`[behavioral oracles: …]` note in `run.md`) says `on`, `driver` (the Java and
+JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 
 ## Outputs
 
@@ -747,6 +767,14 @@ by default: an unchanged source/filter fingerprint reuses
 `<work>/discovery-cache.json`; a mismatch rebuilds the index, and
 `--fresh-discovery` forces that rebuild. Use `bhf clean --all <work>` to
 wipe state.
+
+A work directory belongs to one source tree. When `bhf auto` is pointed at a
+different tree with a work directory an earlier run used (the default
+`./bhf_work/`, say), it moves everything that run left, findings and corpus
+included, to `<work>/archived/<UTC time>-<tree name>/` and prints
+`bhf auto: note: <work> held a run over <other tree>; moved it to ...` before
+it starts, so `results/` and the console report only the current tree.
+Nothing is deleted, and a run over the same tree keeps its findings.
 
 The coverage-guided corpus is persisted to `corpus/<harness-id>/queue/`
 (content-hash-named, seeds included) at the end of each run (#401), so it
@@ -928,9 +956,9 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
   are single-state per resource — two threads reading the same fake fd race
   for bytes.
 - **Runtime virtualisation by lane.** The LD_PRELOAD behavioral/taint shim is
-  armed for native Ada/C/C++/Rust/Go/COBOL/Fortran and for the
-  Python/Perl/Ruby/Lua/PHP interpreter processes. It is not armed for Java, C#,
-  JavaScript/TypeScript, or cross/emulated targets. Those configurations retain
+  armed for native Ada/C/C++/Rust/Go/COBOL/Fortran harnesses. It is not armed
+  for the Python, Perl, Ruby, Lua, PHP, Java, C# or JavaScript/TypeScript lanes,
+  or for cross/emulated targets. Those configurations retain
   their documented fuzz coverage and crash/exception oracles;
   BHF-405/BHF-304/BHF-417/BHF-305 runtrace findings are the unavailable layer.
 - **C++ API lifecycle.** C++ harnesses cover both direct-call and

@@ -38,6 +38,22 @@ pub struct ListTargetsArgs {
     /// commits.
     #[arg(long, value_name = "GIT_REF")]
     pub changed_since: Option<String>,
+
+    /// Keep only targets with this name, as `bhf auto --target` accepts it.
+    /// Repeatable. A name that matches nothing is reported with the closest
+    /// names, and the command exits 2 when nothing is left.
+    #[arg(long = "target", value_name = "NAME")]
+    pub targets: Vec<String>,
+
+    /// Keep only the target with this harness id, as `bhf auto --harness-id`
+    /// takes it. Repeatable.
+    #[arg(long = "harness-id", value_name = "ID")]
+    pub harness_ids: Vec<String>,
+
+    /// Keep only targets defined in this file (relative to PATH, or absolute),
+    /// as `bhf auto --target-file` takes it. Repeatable.
+    #[arg(long = "target-file", value_name = "FILE")]
+    pub target_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -93,11 +109,23 @@ struct ListedTarget {
     breakdown: Option<ScoreBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<Value>,
+    /// Why `bhf auto` leaves this target out by default (a non-library
+    /// directory such as `tests/`, or a test- or tool-named file), if it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_skips: Option<String>,
 }
 
-pub fn run(args: ListTargetsArgs) -> Result<()> {
+/// List the ranked targets under `args.path`; the exit code is 2 when a
+/// `--target`, `--harness-id` or `--target-file` selection matched nothing.
+pub fn run(args: ListTargetsArgs) -> Result<i32> {
     let format = args.format;
+    let explicit_selection =
+        !args.targets.is_empty() || !args.harness_ids.is_empty() || !args.target_files.is_empty();
     let all_targets = ranked_targets(args)?;
+    if explicit_selection && all_targets.is_empty() {
+        crate::bhfeprintln!("bhf: --target/--harness-id/--target-file matched no target");
+        return Ok(2);
+    }
 
     match format {
         OutputFormat::Json => {
@@ -111,10 +139,98 @@ pub fn run(args: ListTargetsArgs) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(0)
 }
 
-fn ranked_targets(args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>> {
+/// Apply the `--target`, `--harness-id` and `--target-file` selections to
+/// `targets` (paths under the canonical `root`), printing a note naming the
+/// closest targets for each one that matched nothing.
+fn retain_selected(
+    targets: &mut Vec<(PathBuf, ListedTarget)>,
+    args: &ListTargetsArgs,
+    root: &Path,
+) {
+    if !args.targets.is_empty() {
+        let names: Vec<String> = targets.iter().map(|(_, t)| t.name.clone()).collect();
+        let matches = |name: &str, selected: &str, target: &ListedTarget| {
+            let fold = matches!(target.language, SourceLanguage::Ada);
+            name == selected
+                || crate::target_filter::qualified_exact_matches(name, selected, fold)
+                || crate::target_filter::qualified_suffix_matches(name, selected, fold)
+        };
+        for selected in &args.targets {
+            if !targets.iter().any(|(_, t)| matches(&t.name, selected, t)) {
+                crate::bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note("--target", selected, &names)
+                );
+            }
+        }
+        targets.retain(|(_, t)| {
+            args.targets
+                .iter()
+                .any(|selected| matches(&t.name, selected, t))
+        });
+    }
+    if !args.harness_ids.is_empty() {
+        let ids: Vec<String> = targets.iter().map(|(_, t)| t.harness_id.clone()).collect();
+        for selected in &args.harness_ids {
+            if !ids.contains(selected) {
+                crate::bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note("--harness-id", selected, &ids)
+                );
+            }
+        }
+        targets.retain(|(_, t)| args.harness_ids.contains(&t.harness_id));
+    }
+    if !args.target_files.is_empty() {
+        let wanted = |file: &Path| {
+            let file = if file.is_absolute() {
+                file.to_path_buf()
+            } else {
+                root.join(file)
+            };
+            file.canonicalize().unwrap_or(file)
+        };
+        let selected: Vec<PathBuf> = args.target_files.iter().map(|f| wanted(f)).collect();
+        let shown: Vec<String> = targets
+            .iter()
+            .map(|(path, _)| {
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        for (file, canonical) in args.target_files.iter().zip(&selected) {
+            if !targets.iter().any(|(path, _)| path == canonical) {
+                crate::bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note(
+                        "--target-file",
+                        &file.display().to_string(),
+                        &shown
+                    )
+                );
+            }
+        }
+        targets.retain(|(path, _)| selected.contains(path));
+    }
+}
+
+fn ranked_targets(mut args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>> {
+    // Walk the canonical root, as `bhf auto` does, so a harness id (a hash of
+    // the source path) is the same however the root is spelled (`src/p1`,
+    // its absolute path, `.` from inside it) and matches the id auto uses.
+    // Listed paths are shown under the root as the operator spelled it.
+    let spelled_root = args.path.clone();
+    args.path = crate::auto::cli::strip_verbatim_prefix(
+        args.path
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", args.path.display()))?,
+    );
+    let canonical_root = args.path.clone();
     let changed_set = match args.changed_since.as_deref() {
         Some(reference) => Some(compute_changed_set(reference)?),
         None => None,
@@ -363,6 +479,7 @@ fn ranked_targets(args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>>
                     line: Some(candidate.line),
                     breakdown: None,
                     metadata: None,
+                    auto_skips: None,
                 },
             ));
         }
@@ -376,7 +493,20 @@ fn ranked_targets(args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarget)>>
             .then_with(|| left.1.name.cmp(&right.1.name))
             .then_with(|| left.0.cmp(&right.0))
     });
+    retain_selected(&mut all_targets, &args, &canonical_root);
+    for (path, target) in &mut all_targets {
+        target.auto_skips = crate::auto::discovery::default_skip_reason(&canonical_root, path);
+    }
     all_targets.truncate(args.top);
+    for (path, _) in &mut all_targets {
+        if let Ok(relative) = path.strip_prefix(&canonical_root) {
+            *path = if relative.as_os_str().is_empty() {
+                spelled_root.clone()
+            } else {
+                spelled_root.join(relative)
+            };
+        }
+    }
     Ok(all_targets)
 }
 
@@ -526,6 +656,7 @@ fn ada_listed_target(
         line: Some(line),
         breakdown: Some(target.breakdown),
         metadata: Some(metadata),
+        auto_skips: None,
     }
 }
 
@@ -775,6 +906,7 @@ fn c_family_listed_target(
         line: Some(target.line),
         breakdown: None,
         metadata,
+        auto_skips: None,
     }
 }
 
@@ -799,6 +931,7 @@ fn non_c_listed_target(
         line: Some(line),
         breakdown: None,
         metadata: None,
+        auto_skips: None,
     }
 }
 
@@ -1002,9 +1135,14 @@ fn print_table<W: Write>(writer: &mut W, rows: &[(PathBuf, ListedTarget)]) -> Re
         "", "", "", "", ""
     )?;
     for (path, target) in rows {
+        let skipped = target
+            .auto_skips
+            .as_deref()
+            .map(|reason| format!("  (bhf auto skips: {reason})"))
+            .unwrap_or_default();
         writeln!(
             writer,
-            "{:<file_width$}  {:<harness_width$}  {:<lang_width$}  {:<target_width$}  {:>score_width$}",
+            "{:<file_width$}  {:<harness_width$}  {:<lang_width$}  {:<target_width$}  {:>score_width$}{skipped}",
             path.display(),
             target.harness_id,
             target.language.as_str(),
@@ -1047,6 +1185,7 @@ mod tests {
             line: None,
             breakdown: None,
             metadata: None,
+            auto_skips: None,
         }
     }
 
@@ -1090,6 +1229,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("C scan succeeds");
@@ -1126,6 +1268,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("Java+Rust scan succeeds");
@@ -1166,6 +1311,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("C++ scan succeeds");
@@ -1199,6 +1347,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("C++ scan succeeds");
@@ -1241,6 +1392,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("mixed scan succeeds");
@@ -1272,6 +1426,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("directory scan transcodes unsupported-encoding sources");
@@ -1304,6 +1461,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: vec!["tests".to_owned()],
             exclude: Vec::new(),
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("excluded paths are ignored before top-N truncation");
@@ -1341,6 +1501,9 @@ mod tests {
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
             exclude: vec![ExcludeCategory::Tools, ExcludeCategory::Examples],
+            targets: Vec::new(),
+            harness_ids: Vec::new(),
+            target_files: Vec::new(),
             changed_since: None,
         })
         .expect("preset categories are filtered");

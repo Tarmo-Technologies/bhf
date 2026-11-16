@@ -102,6 +102,46 @@ pub(crate) fn should_use_session(args: &FuzzArgs) -> bool {
     args.protocol_profile.is_some()
 }
 
+/// The `bhf fuzz` flags this lane does not wire: its seeds are the profile's
+/// legal sessions, and it bounds a run by `--iterations`/`--time` only.
+/// Remove a flag here when the lane starts honouring it.
+const UNSUPPORTED_FLAGS: &[&str] = &[
+    "--workers",
+    "--grammar",
+    "--cmplog-log",
+    "--len-control",
+    "--rss-limit-mb",
+    "--fork-server",
+    "--no-fork-server",
+    "--qemu-user",
+    "--qemu-arg",
+    "--extension",
+    "--sanitizers",
+    "--symbolic-seed-source",
+    "--sandbox",
+    "--sandbox-tool",
+    "--sandbox-strict",
+    "--runtime-oracles",
+    "--structured-inputs",
+    "--print-final-stats",
+    "--collector",
+    "--collector-window-ms",
+    "--seed-input",
+    "--seed-file",
+    "--max-len",
+    "--timeout",
+    "--deadline",
+    "--transport-coverage-map",
+];
+
+/// The flags this run gives that the session lane would ignore.
+pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
+    crate::fuzz::given_flags(args)
+        .into_iter()
+        .filter(|flag| UNSUPPORTED_FLAGS.contains(flag))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Transport spec parsing (pure, fully testable)
 // ---------------------------------------------------------------------------

@@ -2816,6 +2816,11 @@ mod tests {
     fn unsupported_preprocessor_directive_mentions_cpp_lite() {
         let error = crate::parse_idl("#if VENDOR_FLAG(1)\ninterface I {};\n#endif\n")
             .expect_err("CPP is rejected");
-        assert!(error.to_string().contains("unexpected trailing tokens"));
+        assert!(
+            error
+                .to_string()
+                .contains("function-like macro 'VENDOR_FLAG'"),
+            "{error}"
+        );
     }
 }

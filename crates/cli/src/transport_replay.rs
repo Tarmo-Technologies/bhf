@@ -109,6 +109,20 @@ fn transport_exit(exit: ExitKind, elapsed: Duration) -> crate::replay::ExitSumma
     )
 }
 
+/// `map` with `input_cap=<len>` added when it names no capacity: a campaign
+/// recorded before `input_cap` existed wrote every input whole.
+fn with_recorded_input_cap(map: &str, len: usize) -> String {
+    let named = map.split(',').any(|part| {
+        part.split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "input_cap")
+    });
+    if named {
+        map.to_owned()
+    } else {
+        format!("{map},input_cap={}", len.max(1))
+    }
+}
+
 /// Replay a transport finding: rebuild its transport, re-drive the recorded
 /// input and compare the fault identity (or, for a deadline finding, the
 /// timing predicate). An unreachable or unbuildable transport is an error.
@@ -158,6 +172,9 @@ pub(crate) fn replay_transport_outcome(
 
     // Rebuild the transport from the (possibly relocated) spec and re-drive the
     // input through it. Fail explicitly rather than host-executing.
+    // A profile from before the staging capacity was required wrote each input
+    // whole; replay it the same way.
+    let coverage_map = coverage_map.map(|map| with_recorded_input_cap(&map, input.len()));
     let plan = TransportPlan::parse(&spec, coverage_map.as_deref())
         .map_err(|error| format!("rebuild transport from profile: {error}"))?;
     let transport = plan
@@ -763,5 +780,27 @@ mod tests {
             relocate_endpoint("agent:tcp:h:1", None).unwrap(),
             "agent:tcp:h:1"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_cap_tests {
+    use super::with_recorded_input_cap;
+
+    /// A profile recorded before `input_cap` was required replays its input
+    /// whole, as its campaign wrote it; one that names a capacity keeps it.
+    #[test]
+    fn an_older_coverage_map_gets_the_testcase_length_as_its_capacity() {
+        let old = "input=0x1000,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        assert_eq!(
+            with_recorded_input_cap(old, 37),
+            format!("{old},input_cap=37")
+        );
+        assert_eq!(
+            with_recorded_input_cap(old, 0),
+            format!("{old},input_cap=1")
+        );
+        let new = "input=0x1000,input_cap=16,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        assert_eq!(with_recorded_input_cap(new, 37), new);
     }
 }

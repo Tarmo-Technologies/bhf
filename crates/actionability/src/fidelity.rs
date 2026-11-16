@@ -173,6 +173,19 @@ pub struct FidelityFacts {
     /// (`qemu-aarch64`), or `None` for one that ran natively. With a runner,
     /// the target's ISA and byte order ran, emulated, instead of the host's.
     pub runner: Option<String>,
+    /// Whether the C/C++ build defined `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`,
+    /// or `None` for a lane that has no such build.
+    pub fuzzing_build_mode: Option<FuzzingBuildMode>,
+}
+
+/// Whether a C/C++ harness was built with OSS-Fuzz's
+/// `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, under which a project may skip
+/// checks (a signature, a checksum) its production build runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzingBuildMode {
+    On,
+    Off,
 }
 
 impl FidelityFacts {
@@ -188,6 +201,7 @@ impl FidelityFacts {
             tsan_ran: false,
             target_triple: None,
             runner: None,
+            fuzzing_build_mode: None,
         }
     }
 }
@@ -213,6 +227,12 @@ pub struct Fidelity {
     /// Sanitizer instrumentation. `Exercised` when at least one sanitizer was
     /// armed and active for the run.
     pub sanitizers: FidelityDimension,
+    /// Whether the C/C++ build defined `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`
+    /// (`on`): code the project compiles out of fuzz builds did not run, so a
+    /// finding past such a check may not reproduce in production. Absent for a
+    /// lane without a C/C++ build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzing_build_mode: Option<FuzzingBuildMode>,
 }
 
 impl Fidelity {
@@ -253,6 +273,7 @@ impl Fidelity {
                 )),
                 concurrency,
                 sanitizers,
+                fuzzing_build_mode: facts.fuzzing_build_mode,
             },
             // A cross-built target run under user-mode emulation: its own ISA
             // and byte order ran (emulated), never the host's; a user-mode
@@ -280,6 +301,7 @@ impl Fidelity {
                     ),
                     concurrency,
                     sanitizers,
+                    fuzzing_build_mode: facts.fuzzing_build_mode,
                 }
             }
             // Native host target: the host IS the target, so arch and byte order
@@ -301,6 +323,7 @@ impl Fidelity {
                 ),
                 concurrency,
                 sanitizers,
+                fuzzing_build_mode: facts.fuzzing_build_mode,
             },
         }
     }
@@ -318,6 +341,7 @@ impl Fidelity {
             hardware_peripherals: dim(),
             concurrency: dim(),
             sanitizers: dim(),
+            fuzzing_build_mode: None,
         }
     }
 
@@ -386,6 +410,13 @@ impl Fidelity {
             hardware_peripherals: worst(&self.hardware_peripherals, &other.hardware_peripherals),
             concurrency: worst(&self.concurrency, &other.concurrency),
             sanitizers: worst(&self.sanitizers, &other.sanitizers),
+            // A build with the define strays furthest from production.
+            fuzzing_build_mode: match (self.fuzzing_build_mode, other.fuzzing_build_mode) {
+                (Some(FuzzingBuildMode::On), _) | (_, Some(FuzzingBuildMode::On)) => {
+                    Some(FuzzingBuildMode::On)
+                }
+                (left, right) => left.or(right),
+            },
         }
     }
 
@@ -411,6 +442,7 @@ mod tests {
             tsan_ran: false,
             target_triple: None,
             runner: None,
+            fuzzing_build_mode: None,
         }
     }
 

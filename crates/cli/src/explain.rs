@@ -1439,10 +1439,35 @@ fn harness_target_name(work_dir: &Path, harness_id: &str) -> Option<String> {
 /// Distinct env/resource interactions the shim virtualized, as narrative lines.
 /// Byte-origin taint (#422) is surfaced where present — it is the machine-checked
 /// link from an input byte to a sink operand.
-fn summarize_env(events: &[RuntraceEvent]) -> Vec<String> {
+/// The work dir's own input directories, whose files bhf's driver opens to
+/// hand the target each input: not the target's environment.
+const DRIVER_INPUT_DIRS: [&str; 2] = ["fuzz_inputs", "fuzz_scratch"];
+
+/// Whether `path` is a file bhf's driver opened to feed the target an input:
+/// one directly in the work dir's [`DRIVER_INPUT_DIRS`].
+fn is_driver_input(work_dir: &Path, path: &str) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Some(parent) = Path::new(path).parent() else {
+        return false;
+    };
+    let parent = canonical(parent);
+    DRIVER_INPUT_DIRS
+        .iter()
+        .any(|dir| parent == canonical(&work_dir.join(dir)))
+}
+
+fn summarize_env(work_dir: &Path, events: &[RuntraceEvent]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for ev in events {
+        if let RuntraceEvent::FileOpened { path, .. }
+        | RuntraceEvent::FileMissing { path, .. }
+        | RuntraceEvent::PathChecked { path, .. } = ev
+        {
+            if is_driver_input(work_dir, path) {
+                continue;
+            }
+        }
         let line = match ev {
             RuntraceEvent::EnvVarAccess { name, .. } => {
                 format!("getenv {name} → served (value withheld)")
@@ -2024,7 +2049,7 @@ fn environment(
         EnvDependence::NotServed | EnvDependence::Unknown => Vec::new(),
     };
     if let (Some(events), Some(capture)) = (&evidence.own_events, &evidence.capture) {
-        let mut lines = summarize_env(events);
+        let mut lines = summarize_env(work_dir, events);
         let source = format!(
             "observed while replaying {} with the runtrace shim",
             capture.summary.input
@@ -2055,7 +2080,7 @@ fn environment(
     } else {
         load_events(work_dir, harness_id)
     };
-    let mut lines = summarize_env(&events);
+    let mut lines = summarize_env(work_dir, &events);
     let campaign = "runtrace events of the harness's last fuzz pass, across all of its inputs, \
                     not only this one"
         .to_owned();
@@ -3170,11 +3195,14 @@ mod tests {
             lines[0].starts_with("  Oracle: format-string-runtime on printf\\x1b[1m"),
             "{lines:?}"
         );
-        let env = summarize_env(&[RuntraceEvent::FormatString {
-            api: "printf".into(),
-            format: "\u{1b}[2J%x\r\n%n\u{9b}\u{202e}".into(),
-            controlled: true,
-        }]);
+        let env = summarize_env(
+            Path::new("/work"),
+            &[RuntraceEvent::FormatString {
+                api: "printf".into(),
+                format: "\u{1b}[2J%x\r\n%n\u{9b}\u{202e}".into(),
+                controlled: true,
+            }],
+        );
         assert_eq!(
             env,
             ["format string (INPUT-CONTROLLED): \\x1b[2J%x\\r\\n%n\\u{9b}\\u{202e}"],
@@ -4507,11 +4535,35 @@ mod tests {
                 taint_offset: Some(5),
             },
         ];
-        let lines = summarize_env(&events);
+        let lines = summarize_env(Path::new("/work"), &events);
         assert!(lines.iter().any(|l| l.contains("getenv APP_MODE")));
         assert!(lines
             .iter()
             .any(|l| l.contains("/etc/passwd") && l.contains("input byte 5")));
+    }
+
+    /// The files bhf's driver opens to feed each input are not environment the
+    /// target touched; a file the target opened in the work dir still is.
+    #[test]
+    fn explain_environment_excludes_driver_input_files() {
+        let work = crate::test_support::TestDir::new("explain-driver-inputs");
+        std::fs::create_dir_all(work.join("fuzz_inputs")).unwrap();
+        let opened = |path: std::path::PathBuf| RuntraceEvent::FileOpened {
+            syscall: "fopen".into(),
+            fd: 3,
+            path: path.display().to_string(),
+            taint_offset: None,
+        };
+        let events = vec![
+            opened(work.join("fuzz_inputs/input-1-0.bin")),
+            opened(work.join("fuzz_scratch/input-2.bin")),
+            opened(work.join("data/config.ini")),
+            opened(std::path::PathBuf::from("/etc/passwd")),
+        ];
+        let lines = summarize_env(&work, &events);
+        assert!(!lines.iter().any(|l| l.contains("input-")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("config.ini")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("/etc/passwd")), "{lines:?}");
     }
 
     #[test]

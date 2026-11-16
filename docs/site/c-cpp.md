@@ -80,6 +80,21 @@ clang, the gcc retry and an operator's `--target-triple` sweep. They are left
 out, with a note, of a build whose compiler bhf picked in its place: a platform
 guard's cross lane (a host-only `-march=native` would fail the aarch64 build)
 and clang after an operator's compiler fails the `--sanitizers` check.
+
+Every lane compiles the target with `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1`,
+OSS-Fuzz's convention, which AFL++'s compiler wrappers also follow. A project
+tests it to skip checksum and signature checks or make randomness repeatable
+in a fuzz build, so the builtin, coverage, MemorySanitizer, ThreadSanitizer,
+differential and AFL++ lanes all fuzz the same program, and a reproducer
+capsule rebuilds it the same way. A finding past such a check may not reproduce
+in a production build; each fuzzed target's `fidelity.fuzzing_build_mode` in
+`run.json` (and each finding's) says `on` or `off`. A finding whose crash path
+gets past a check under `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` in
+the same function, or runs code under `#ifdef`, says so: its
+`fuzzing_build_mode_note` (a caveat in `results/findings.json` and INDEX.md)
+reads `reachable only with the check under ... at <file>:<line> disabled`. `--no-fuzzing-build-mode`
+(`bhf auto` and `bhf build`) or `BHF_FUZZING_BUILD_MODE=0` builds without it,
+and `make BHF_FUZZING_BUILD_MODE_FLAGS=` drops it from one hand-run build.
 The `main` binaries depend on a toolchain stamp (`bhf_toolchain.stamp`), and
 the MemorySanitizer, ThreadSanitizer, coverage and differential lanes on a lane
 stamp of their own (`bhf_lanes.stamp`), so changing a compiler or its flags in
@@ -110,7 +125,11 @@ does not do for a compiler the operator chose.
 
 ## Discovery
 
-`scan`, `list-targets`, and `auto` consider these files:
+`scan`, `list-targets`, and `auto` consider these files. `auto` also skips
+non-library directories such as `tests/`, `tools/` and `vendor/` by default (the
+full set, and `--include-dir`, are in [auto](auto.md#discovery)); `list
+targets` marks the rows it skips.
+
 
 | File kind | Handling |
 |---|---|
@@ -128,9 +147,24 @@ of the signature heuristics.
 `bhf auto` accepts `--preprocess auto|always|never` to control the built-in
 CPP-lite preprocessor used for discovery: `auto` (the default) preprocesses only
 files with heavy conditional compilation, `always` forces it on every C/C++
-file, and `never` parses raw source. Preprocessing resolves `#ifdef`/`#if`
-branches so conditionally compiled functions are not missed, and a line map
-keeps reported locations pointing at the original source.
+file, and `never` parses raw source. `auto` preprocesses a file when it has a
+project macro context (a compile database's `-D` flags) and five or more
+conditional directives. Preprocessing resolves `#ifdef`/`#ifndef`/`#if`/`#elif`/
+`#else` branches so conditionally compiled functions are not missed, and a line
+map keeps reported locations pointing at the original source.
+
+An `#if` or `#elif` expression is evaluated as C evaluates it: integer
+constants (decimal, octal, hex, binary, with `u`/`l` suffixes and `'`
+separators), character constants, `defined`, every arithmetic, shift,
+comparison, bitwise and logical operator, and `?:`. Object-like macros from the
+file and the compile database expand; an identifier no macro defines is 0, and
+an empty macro (`-DFLAG`) is 1. CPP-lite does not follow `#include` into
+headers, so a macro a header defines reads as 0, and it does not expand
+function-like macros. When an expression uses one, or anything else it cannot
+evaluate, discovery keeps every branch of that `#if` chain and prints
+`bhf auto: note: <file>: #if expression not evaluated at line N, every branch
+kept: ...`: a function the compiler drops may then be listed (and fail to
+build), but none that it compiles is hidden.
 
 ## Harness Generation
 
@@ -917,7 +951,12 @@ only noted. Printf-style format strings observed through `printf`,
 `fprintf`, `dprintf`, `sprintf`, or `snprintf` are promoted when the format
 is not a literal in the program's read-only data, the whole format, at least
 4 bytes long, occurs verbatim in the current fuzz input, and it contains a
-conversion marker. The same
+conversion marker. A sanitizer crash inside such a call (a `%n` write, a `%s`
+read of a garbage argument) is the same bug: when the faulting frames are the
+printf family's own and the call's format argument is not a string literal,
+or the format-string oracle fired for the harness, the crash is reported as
+BHF-408 (CWE-134, with the crash's own CWE second) at the call, in one finding
+group with the oracle and format-string capability findings. The same
 per-input runtrace stream now reports audited file descriptors that are opened
 and not closed before the harness execution exits. Successful `unlink`,
 `unlinkat`, or `remove` calls with parent-directory paths promote to
@@ -957,7 +996,11 @@ transformed execution and emits BHF-307 `metamorphic-relation-runtime` findings
 when the relation is violated.
 
 Ada-only findings such as swallowed exception breadcrumbs, Ada handler paths,
-and generated `repro.adb` files do not apply to C/C++ targets.
+and generated `repro.adb` files do not apply to C/C++ targets: a report writes
+`repro.adb` only into an Ada finding, and removes one an earlier release wrote
+into another finding. `bhf explain` leaves the files bhf's driver opens to feed
+each input (`<work>/fuzz_inputs`, `<work>/fuzz_scratch`) out of a finding's
+FAKED ENVIRONMENT.
 
 ### Reproducing a finding offline
 

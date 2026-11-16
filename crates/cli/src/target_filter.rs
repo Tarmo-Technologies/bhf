@@ -179,6 +179,48 @@ fn edit_distance(left: &str, right: &str) -> usize {
 /// (a typo), or contains it (a prefix or suffix of the real name). Ties break on
 /// the distance between the full names, then alphabetically. Comparison ignores
 /// ASCII case and parameter lists. Items with the same name are listed once.
+/// The console note for a selection filter (`--target`, `--harness-id`,
+/// `--target-file`) that matched no discovered target, naming the closest
+/// of `discovered`: by name for `--target`, by shared prefix for an id or a
+/// path, where a copied id usually differs only in its hash tail.
+pub(crate) fn unmatched_filter_note(flag: &str, selected: &str, discovered: &[String]) -> String {
+    let mut note = format!("  {flag} '{selected}' matched no target");
+    let closest: Vec<&str> = if flag == "--target" {
+        closest_matches(selected, discovered, |name| name, 5)
+            .into_iter()
+            .map(String::as_str)
+            .collect()
+    } else {
+        closest_by_prefix(selected, discovered, 3)
+    };
+    if !closest.is_empty() {
+        note.push_str("; closest: ");
+        note.push_str(&closest.join(", "));
+    }
+    note
+}
+
+/// Up to `limit` of `items`, the ones sharing the longest prefix with
+/// `selected` first (ties keep their order), without duplicates.
+fn closest_by_prefix<'a>(selected: &str, items: &'a [String], limit: usize) -> Vec<&'a str> {
+    let shared = |item: &str| {
+        selected
+            .chars()
+            .zip(item.chars())
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count()
+    };
+    let mut ranked: Vec<&str> = Vec::new();
+    for item in items {
+        if !ranked.contains(&item.as_str()) {
+            ranked.push(item);
+        }
+    }
+    ranked.sort_by_key(|item| std::cmp::Reverse(shared(item)));
+    ranked.truncate(limit);
+    ranked
+}
+
 pub(crate) fn closest_matches<'a, T>(
     selected: &str,
     items: &'a [T],
@@ -306,6 +348,34 @@ mod tests {
         assert!(!qualified_suffix_matches("Root.Pkg.Op", "pkg.op", false));
         assert!(qualified_suffix_matches("Root.Pkg.Op", "Pkg.Op", false));
         assert!(!qualified_suffix_matches("Root.Pkg.Op", "kg.Op", false));
+    }
+
+    #[test]
+    fn an_unmatched_filter_names_the_closest_targets() {
+        let ids = vec![
+            "H-C0005-9F8BF5B5".to_owned(),
+            "H-C0009-12345678".to_owned(),
+            "H-X0002-AAAAAAAA".to_owned(),
+        ];
+        let note = unmatched_filter_note("--harness-id", "H-C0005-4D137CA4", &ids);
+        assert!(
+            note.contains(
+                "--harness-id 'H-C0005-4D137CA4' matched no target; closest: H-C0005-9F8BF5B5"
+            ),
+            "{note}"
+        );
+        let files = vec!["src/parse.c".to_owned(), "src/table.c".to_owned()];
+        let note = unmatched_filter_note("--target-file", "src/pars.c", &files);
+        assert!(
+            note.contains("matched no target; closest: src/parse.c"),
+            "{note}"
+        );
+        let names = vec!["parse_record".to_owned(), "store".to_owned()];
+        let note = unmatched_filter_note("--target", "parse_recrd", &names);
+        assert!(
+            note.contains("matched no target; closest: parse_record"),
+            "{note}"
+        );
     }
 
     #[test]

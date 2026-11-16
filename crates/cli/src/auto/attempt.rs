@@ -3856,6 +3856,7 @@ fn run_attempt(
                             reach_label,
                             reach_basis,
                             shim_armed,
+                            Some(candidate),
                         ) {
                             bhfeprintln!("bhf auto: warning: stamp {fid} runtime_mode: {error}");
                         }
@@ -3963,6 +3964,7 @@ fn run_attempt(
                                         reach_label,
                                         reach_basis,
                                         false,
+                                        Some(candidate),
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -4067,6 +4069,7 @@ fn run_attempt(
                                         reach_label,
                                         reach_basis,
                                         false,
+                                        Some(candidate),
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -4998,20 +5001,68 @@ fn dependency_fallback_after_refused_source(
     (!repair_replaces_candidate_target(&fallback, candidate)).then_some(fallback)
 }
 
+/// The marker a lane's generated launcher script carries when the lane runs
+/// an interpreter or VM. Its language-aware driver owns coverage and finding
+/// classification, so the native runtrace shim is not preloaded into it.
+/// `None` for the native lanes, whose harness gets the shim.
+pub(crate) fn launcher_marker(lang: crate::auto::candidate::Lang) -> Option<&'static str> {
+    use crate::auto::candidate::Lang;
+    match lang {
+        Lang::Java => Some("BHF_JVM_LAUNCHER"),
+        Lang::CSharp => Some("BHF_CS_LAUNCHER"),
+        Lang::Js | Lang::Ts => Some("BHF_JS_LAUNCHER"),
+        Lang::Python => Some("BHF_PY_LAUNCHER"),
+        Lang::Perl => Some("BHF_PL_LAUNCHER"),
+        Lang::Ruby => Some("BHF_RB_LAUNCHER"),
+        Lang::Lua => Some("BHF_LUA_LAUNCHER"),
+        Lang::Php => Some("BHF_PHP_LAUNCHER"),
+        Lang::Ada | Lang::C | Lang::Cpp | Lang::Rust | Lang::Go | Lang::Cobol | Lang::Fortran => {
+            None
+        }
+    }
+}
+
+/// The sink checks a lane's fuzz passes run besides crash and exception
+/// detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneSinkOracles {
+    /// The runtrace shim's behavioral and taint oracles.
+    Shim,
+    /// A few sink checks in the lane's own driver, which the text names.
+    Driver(&'static str),
+    /// None yet.
+    None,
+}
+
+/// [`LaneSinkOracles`] for `lang`: the shim wherever it is preloaded, else
+/// what the lane's driver checks itself.
+pub(crate) fn lane_sink_oracles(lang: crate::auto::candidate::Lang) -> LaneSinkOracles {
+    use crate::auto::candidate::Lang;
+    if launcher_marker(lang).is_none() {
+        return LaneSinkOracles::Shim;
+    }
+    match lang {
+        Lang::Java => LaneSinkOracles::Driver(
+            "the JVM driver reports a reached deserialization, process, eval, SQL or LDAP sink",
+        ),
+        Lang::Js | Lang::Ts => LaneSinkOracles::Driver(
+            "the Node driver checks command injection and prototype pollution",
+        ),
+        _ => LaneSinkOracles::None,
+    }
+}
+
 /// An interpreter/VM launcher harness (`main` is a launcher script), whose
 /// language-aware driver owns coverage and finding classification, so the
 /// native runtrace shim is not preloaded into it.
 fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
+    use clap::ValueEnum as _;
     std::fs::read_to_string(harness_dir.join("main"))
         .map(|s| {
-            s.contains("BHF_JVM_LAUNCHER")
-                || s.contains("BHF_CS_LAUNCHER")
-                || s.contains("BHF_JS_LAUNCHER")
-                || s.contains("BHF_PY_LAUNCHER")
-                || s.contains("BHF_PL_LAUNCHER")
-                || s.contains("BHF_RB_LAUNCHER")
-                || s.contains("BHF_LUA_LAUNCHER")
-                || s.contains("BHF_PHP_LAUNCHER")
+            crate::auto::candidate::LangSelector::value_variants()
+                .iter()
+                .filter_map(|selector| launcher_marker(selector.to_lang()))
+                .any(|marker| s.contains(marker))
         })
         .unwrap_or(false)
 }
@@ -11004,6 +11055,7 @@ fn stamp_runtime_mode(
     input_reachability: Option<&str>,
     input_reachability_basis: Option<&target_rank::ReachabilityBasis>,
     shim_armed: bool,
+    target: Option<&Candidate>,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(finding_path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -11025,6 +11077,19 @@ fn stamp_runtime_mode(
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
+        // The fuzzed target's own source line: the location a report falls
+        // back to when the finding has no crash frame (an oracle, memory-limit
+        // or deadline finding). A finding that names its target keeps it.
+        if let Some(candidate) = target {
+            obj.entry("target").or_insert_with(|| {
+                serde_json::json!({
+                    "harness_id": candidate.harness_id,
+                    "subprogram": candidate.name,
+                    "source_path": candidate.source_path,
+                    "line": candidate.line,
+                })
+            });
+        }
         obj.insert(
             "runtime_mode".to_owned(),
             serde_json::json!({
@@ -12871,6 +12936,7 @@ mod stamp_tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -12914,6 +12980,7 @@ mod stamp_tests {
             Some("attacker_reachable"),
             Some(&basis),
             false,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -12934,6 +13001,7 @@ mod stamp_tests {
             Some("ipc_channel_reachable"),
             None,
             false,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -12955,6 +13023,81 @@ mod stamp_tests {
             "AFL skipped; H-C0001 was not fuzzed (make main_afl failed: afl-clang-fast: not found)"
         );
         assert!(!afl_only.contains("builtin results kept"));
+    }
+
+    /// Each launcher marker is the one its lane's build writes into `main`, so
+    /// [`launcher_marker`] decides the preload for exactly the lanes it names.
+    #[test]
+    fn each_launcher_marker_is_the_one_its_lane_writes() {
+        use crate::auto::candidate::Lang;
+        for (lang, build) in [
+            (Lang::Java, include_str!("java_build.rs")),
+            (Lang::CSharp, include_str!("csharp_build.rs")),
+            (Lang::Js, include_str!("js_build.rs")),
+            (Lang::Ts, include_str!("js_build.rs")),
+            (Lang::Python, include_str!("python_build.rs")),
+            (Lang::Perl, include_str!("perl_build.rs")),
+            (Lang::Ruby, include_str!("ruby_build.rs")),
+            (Lang::Lua, include_str!("lua_build.rs")),
+            (Lang::Php, include_str!("php_build.rs")),
+        ] {
+            let marker = super::launcher_marker(lang)
+                .unwrap_or_else(|| panic!("{lang:?} runs a launcher but has no marker"));
+            assert!(
+                build.contains(marker),
+                "{lang:?}'s build never writes {marker}"
+            );
+        }
+    }
+
+    /// docs/site/vulnerability-coverage.md names the lanes the shim is
+    /// preloaded into and the lanes with no sink oracles; both lists match
+    /// [`super::lane_sink_oracles`].
+    #[test]
+    fn vulnerability_coverage_names_the_lanes_with_and_without_sink_oracles() {
+        use super::LaneSinkOracles;
+        use clap::ValueEnum as _;
+        use std::collections::BTreeSet;
+        use std::path::Path;
+        let doc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/vulnerability-coverage.md"),
+        )
+        .unwrap();
+        let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let names = |list: &str| -> BTreeSet<String> {
+            list.replace(" and ", ", ")
+                .split(", ")
+                .map(|name| name.trim().to_owned())
+                .collect()
+        };
+        let preloaded = doc
+            .split_once("preloaded into native harnesses only: ")
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .map(|(list, _)| names(list))
+            .expect("vulnerability-coverage.md names the lanes the shim is preloaded into");
+        let without = doc
+            .split_once(" have no sink oracles yet")
+            .and_then(|(before, _)| before.rsplit_once(". "))
+            .map(|(_, list)| names(list))
+            .expect("vulnerability-coverage.md names the lanes with no sink oracles");
+        let lanes_with = |want: fn(LaneSinkOracles) -> bool| -> BTreeSet<String> {
+            crate::auto::candidate::LangSelector::value_variants()
+                .iter()
+                .map(|selector| selector.to_lang())
+                .filter(|lang| want(super::lane_sink_oracles(*lang)))
+                .map(|lang| {
+                    crate::repro_lane::language_name(crate::auto::candidate::lang_tag(lang))
+                })
+                .collect()
+        };
+        assert_eq!(
+            preloaded,
+            lanes_with(|oracles| oracles == LaneSinkOracles::Shim)
+        );
+        assert_eq!(
+            without,
+            lanes_with(|oracles| oracles == LaneSinkOracles::None)
+        );
     }
 
     #[test]
@@ -12982,10 +13125,70 @@ mod stamp_tests {
         assert!(!fuzz_pass_shim_armed(dir.path(), true));
     }
 
+    /// A fuzz finding records the fuzzed target's source line, where a report
+    /// points a finding with no crash frame; a finding that names its own
+    /// target keeps it.
+    #[test]
+    fn stamping_records_the_fuzzed_target_unless_the_finding_names_one() {
+        let candidate = crate::auto::candidate::Candidate {
+            harness_id: "H-C0004".to_owned(),
+            lang: crate::auto::candidate::Lang::C,
+            source_path: std::path::PathBuf::from("/src/log.c"),
+            line: 4,
+            name: "log_line".to_owned(),
+            score: 0,
+            is_static: false,
+            foreign_guard: None,
+            input_reachability: None,
+            input_reachability_basis: None,
+            dialect: None,
+        };
+        let (_dir, path) = tmp_finding();
+        stamp_runtime_mode(
+            &path,
+            Pass::FuzzDriven,
+            &[],
+            None,
+            None,
+            false,
+            Some(&candidate),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["target"],
+            serde_json::json!({
+                "harness_id": "H-C0004",
+                "subprogram": "log_line",
+                "source_path": "/src/log.c",
+                "line": 4,
+            })
+        );
+
+        let own = serde_json::json!({ "name": "other", "source_path": "/src/other.c", "line": 9 });
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "id": "F-0002-abc", "target": own })).unwrap(),
+        )
+        .unwrap();
+        stamp_runtime_mode(
+            &path,
+            Pass::FuzzDriven,
+            &[],
+            None,
+            None,
+            false,
+            Some(&candidate),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["target"], own);
+    }
+
     #[test]
     fn empty_env_injected_stamps_empty_object() {
         let (_dir, path) = tmp_finding();
-        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false).unwrap();
+        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
         assert_eq!(
@@ -13035,6 +13238,7 @@ mod stamp_tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

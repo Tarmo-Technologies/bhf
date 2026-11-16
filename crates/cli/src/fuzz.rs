@@ -507,7 +507,7 @@ pub struct FuzzArgs {
     /// Fuzz an off-host / on-target backend through the `target_transport` seam
     /// (HDF-1b) instead of the host libFuzzer/AFL lane. Additive: when this is
     /// absent the default host path runs byte-for-byte as before. Spec forms:
-    /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX` (on-target agent),
+    /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
     /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
@@ -516,11 +516,13 @@ pub struct FuzzArgs {
     #[arg(long = "target-transport", value_name = "SPEC")]
     pub target_transport: Option<String>,
 
-    /// Locate the on-target coverage ring for the memory-read transports (`gdb`,
-    /// `qemu-system`) as
-    /// `input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (each
-    /// `<addr>` is decimal or `0x`-hex). The `agent` transport carries coverage
-    /// over its protocol and rejects this option.
+    /// Locate the input staging buffer and the on-target coverage ring for the
+    /// memory-read transports (`gdb`, `qemu-system`) as
+    /// `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>`,
+    /// plus `input_len=<addr>` when the firmware reads the input's length from
+    /// a `u32` there (each value decimal or `0x`-hex). `input_cap` is the
+    /// staging buffer's size: no input is written past it. The `agent`
+    /// transport carries coverage over its protocol and rejects this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
 
@@ -1413,6 +1415,13 @@ pub fn run(args: FuzzArgs) -> i32 {
         bhfeprintln!("{error}");
         return 3;
     }
+    // Each lane names the flags it does not wire; a run that would silently
+    // drop them (a single blind mutator instead of the asked-for workers,
+    // grammar or CmpLog log) is refused instead.
+    if let Some(error) = lane_flag_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
     // HDF-1b: when a target transport is requested, drive the additive
     // transport-fuzz path (a separate loop over the `target_transport` seam) and
     // leave the host libFuzzer/AFL path below untouched.
@@ -2031,6 +2040,99 @@ fn afl_programmatic_args(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     }
+}
+
+/// Every `bhf fuzz` flag this run gives a value other than its default, by
+/// its command-line name. The transport and session lanes check theirs
+/// against the flags they wire ([`crate::transport_fuzz::unsupported_flags`],
+/// [`crate::session_fuzz::unsupported_flags`]).
+pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
+    use crate::collector_run::CollectorSpec;
+    use crate::runner::SandboxModeArg;
+    use crate::runtime_oracles::RuntimeOracleMode;
+    let given = [
+        ("--workers", args.workers.is_some()),
+        ("--grammar", args.grammar_file.is_some()),
+        ("--cmplog-log", args.cmplog_log.is_some()),
+        ("--len-control", args.len_control != DEFAULT_LEN_CONTROL),
+        ("--rss-limit-mb", args.rss_limit_mb != 0),
+        ("--fork-server", args.fork_server),
+        ("--no-fork-server", args.no_fork_server),
+        ("--qemu-user", args.qemu_user.is_some()),
+        ("--qemu-arg", !args.qemu_args.is_empty()),
+        ("--extension", args.extension.is_some()),
+        ("--sanitizers", !args.sanitizers.is_empty()),
+        (
+            "--symbolic-seed-source",
+            !args.symbolic_seed_sources.is_empty(),
+        ),
+        ("--sandbox", !matches!(args.sandbox, SandboxModeArg::Auto)),
+        ("--sandbox-tool", args.sandbox_tool.is_some()),
+        ("--sandbox-strict", args.sandbox_strict),
+        (
+            "--runtime-oracles",
+            !matches!(args.runtime_oracles, RuntimeOracleMode::Off),
+        ),
+        (
+            "--structured-inputs",
+            !matches!(args.structured_inputs, StructuredInputMode::Auto),
+        ),
+        ("--print-final-stats", args.print_final_stats),
+        ("--collector", !matches!(args.collector, CollectorSpec::Off)),
+        (
+            "--collector-window-ms",
+            args.collector_window_ms != crate::collector_run::DEFAULT_WINDOW_MS,
+        ),
+        ("--seed-input", !args.seed_inputs.is_empty()),
+        ("--seed-file", !args.seed_files.is_empty()),
+        ("--max-len", args.max_len != DEFAULT_MAX_LEN),
+        ("--timeout", args.timeout.is_some()),
+        ("--deadline", args.deadline.is_some()),
+        ("--target-transport", args.target_transport.is_some()),
+        (
+            "--transport-coverage-map",
+            args.transport_coverage_map.is_some(),
+        ),
+        ("--protocol-profile", args.protocol_profile.is_some()),
+        ("--session-transport", args.session_transport.is_some()),
+        (
+            "--session-reset",
+            args.session_reset != crate::session_fuzz::SessionResetMode::default(),
+        ),
+        ("--max-session-messages", args.max_session_messages != 64),
+    ];
+    given
+        .into_iter()
+        .filter_map(|(flag, set)| set.then_some(flag))
+        .collect()
+}
+
+/// Why this run's flags cannot all apply: the transport or session lane it
+/// dispatches to does not wire some of them.
+fn lane_flag_conflict(args: &FuzzArgs) -> Option<String> {
+    let (lane, ignored) = if crate::transport_fuzz::should_use_transport(args) {
+        (
+            "--target-transport",
+            crate::transport_fuzz::unsupported_flags(args),
+        )
+    } else if crate::session_fuzz::should_use_session(args) {
+        (
+            "--protocol-profile",
+            crate::session_fuzz::unsupported_flags(args),
+        )
+    } else {
+        return None;
+    };
+    (!ignored.is_empty()).then(|| {
+        format!(
+            "bhf fuzz {lane}: {} {} not apply to the {lane} lane, which would ignore {}; \
+             remove {}",
+            ignored.join(", "),
+            if ignored.len() == 1 { "does" } else { "do" },
+            if ignored.len() == 1 { "it" } else { "them" },
+            if ignored.len() == 1 { "it" } else { "them" },
+        )
+    })
 }
 
 /// Why `--engine` cannot run with `--target-transport` or

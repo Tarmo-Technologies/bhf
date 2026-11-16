@@ -138,6 +138,7 @@ pub fn preprocess_c_like_with_line_map(
         recovery: RecoveryMode::Recover,
         passthrough_includes: true,
         track_lines: true,
+        keep_unknown_branches: true,
         ..Preprocessor::default()
     };
     match preprocessor.process_source(source, None) {
@@ -155,6 +156,10 @@ pub fn preprocess_c_like_with_line_map(
 #[derive(Debug, Default)]
 struct Preprocessor {
     defines: HashMap<String, String>,
+    /// In recovering mode, a `#if`/`#elif` it cannot evaluate keeps every
+    /// branch of the chain (C/C++ discovery: a compiled-in function must not
+    /// vanish) instead of counting the branch as inactive (IDL).
+    keep_unknown_branches: bool,
     frames: Vec<ConditionalFrame>,
     include_stack: Vec<PathBuf>,
     include_dirs: Vec<PathBuf>,
@@ -184,12 +189,31 @@ struct ConditionalFrame {
     parent_active: bool,
     condition_active: bool,
     seen_else: bool,
+    /// A branch of this `#if`/`#elif` chain was taken, so later `#elif`s
+    /// and the `#else` are not.
+    taken: bool,
+    /// A condition of this chain could not be evaluated (recovering mode):
+    /// every later branch is kept too, since any of them may be compiled in.
+    unknown: bool,
+}
+
+impl ConditionalFrame {
+    fn decided(parent_active: bool, condition_active: bool) -> Self {
+        Self {
+            parent_active,
+            condition_active,
+            seen_else: false,
+            taken: condition_active,
+            unknown: false,
+        }
+    }
 }
 
 impl Preprocessor {
     fn with_defines(defines: &[(String, String)]) -> Self {
         Self {
             defines: defines.iter().cloned().collect(),
+            keep_unknown_branches: false,
             frames: Vec::new(),
             include_stack: Vec::new(),
             include_dirs: Vec::new(),
@@ -317,49 +341,101 @@ impl Preprocessor {
             "ifdef" => {
                 let name = parse_directive_identifier(payload, line_no)?;
                 let parent_active = self.is_active();
-                self.frames.push(ConditionalFrame {
+                self.frames.push(ConditionalFrame::decided(
                     parent_active,
-                    condition_active: self.defines.contains_key(name),
-                    seen_else: false,
-                });
+                    self.defines.contains_key(name),
+                ));
                 Ok(None)
             }
             "ifndef" => {
                 let name = parse_directive_identifier(payload, line_no)?;
                 let parent_active = self.is_active();
-                self.frames.push(ConditionalFrame {
+                self.frames.push(ConditionalFrame::decided(
                     parent_active,
-                    condition_active: !self.defines.contains_key(name),
-                    seen_else: false,
-                });
+                    !self.defines.contains_key(name),
+                ));
                 Ok(None)
             }
             "if" => {
                 let parent_active = self.is_active();
-                let condition_active = if parent_active {
-                    match eval_if_expression(strip_trailing_comment(payload), &self.defines) {
-                        Ok(active) => active,
-                        Err(error) if self.recovery == RecoveryMode::Recover => {
-                            self.frames.push(ConditionalFrame {
-                                parent_active,
-                                condition_active: false,
-                                seen_else: false,
-                            });
-                            return Ok(Some(warning_pragma(format!(
-                                "unsupported #if expression treated as inactive at line {line_no}: {error}"
-                            ))));
-                        }
-                        Err(error) => return Err(IdlParseError::new(error, line_span(line_no, 1))),
+                if !parent_active {
+                    self.frames.push(ConditionalFrame::decided(false, false));
+                    return Ok(None);
+                }
+                match eval_if_expression(strip_trailing_comment(payload), &self.defines) {
+                    Ok(active) => {
+                        self.frames
+                            .push(ConditionalFrame::decided(parent_active, active));
+                        Ok(None)
                     }
-                } else {
-                    false
-                };
-                self.frames.push(ConditionalFrame {
-                    parent_active,
-                    condition_active,
-                    seen_else: false,
-                });
-                Ok(None)
+                    Err(error) if self.recovery == RecoveryMode::Recover => {
+                        let keep = self.keep_unknown_branches;
+                        self.frames.push(ConditionalFrame {
+                            parent_active,
+                            condition_active: keep,
+                            seen_else: false,
+                            taken: false,
+                            unknown: keep,
+                        });
+                        Ok(Some(warning_pragma(if keep {
+                            format!(
+                                "#if expression not evaluated at line {line_no}, every branch kept: {error}"
+                            )
+                        } else {
+                            format!(
+                                "unsupported #if expression treated as inactive at line {line_no}: {error}"
+                            )
+                        })))
+                    }
+                    Err(error) => Err(IdlParseError::new(error, line_span(line_no, 1))),
+                }
+            }
+            "elif" => {
+                if self.frames.len() == frame_depth_at_entry {
+                    return Err(IdlParseError::new("unmatched #elif", line_span(line_no, 1)));
+                }
+                let recovering = self.recovery == RecoveryMode::Recover;
+                let keep = self.keep_unknown_branches;
+                let defines = &self.defines;
+                let frame = self
+                    .frames
+                    .last_mut()
+                    .expect("frame exists above entry depth");
+                if frame.seen_else {
+                    return Err(IdlParseError::new(
+                        "#elif after #else",
+                        line_span(line_no, 1),
+                    ));
+                }
+                if !frame.parent_active || (frame.taken && !frame.unknown) {
+                    frame.condition_active = false;
+                    return Ok(None);
+                }
+                if frame.unknown {
+                    frame.condition_active = true;
+                    return Ok(None);
+                }
+                match eval_if_expression(strip_trailing_comment(payload), defines) {
+                    Ok(active) => {
+                        frame.condition_active = active;
+                        frame.taken = active;
+                        Ok(None)
+                    }
+                    Err(error) if recovering => {
+                        frame.condition_active = keep;
+                        frame.unknown = keep;
+                        Ok(Some(warning_pragma(if keep {
+                            format!(
+                                "#elif expression not evaluated at line {line_no}, every branch kept: {error}"
+                            )
+                        } else {
+                            format!(
+                                "unsupported #elif expression treated as inactive at line {line_no}: {error}"
+                            )
+                        })))
+                    }
+                    Err(error) => Err(IdlParseError::new(error, line_span(line_no, 1))),
+                }
             }
             "else" => {
                 if !strip_trailing_comment(payload).trim().is_empty() {
@@ -379,7 +455,7 @@ impl Preprocessor {
                     return Err(IdlParseError::new("duplicate #else", line_span(line_no, 1)));
                 }
                 frame.seen_else = true;
-                frame.condition_active = !frame.condition_active;
+                frame.condition_active = frame.unknown || !frame.taken;
                 Ok(None)
             }
             "endif" => {
@@ -715,128 +791,244 @@ fn strip_trailing_comment(payload: &str) -> &str {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExprToken {
-    Ident(String),
     Number(i64),
+    Ident(String),
     Defined,
-    Not,
-    And,
-    Or,
-    LParen,
-    RParen,
+    /// An operator or punctuator: `! ~ * / % + - << >> < <= > >= == != & ^ | && || ? : ( )`.
+    Op(&'static str),
 }
 
+/// The value of a C `#if` expression: an integer, with `defined`, every
+/// arithmetic, shift, comparison, bitwise and logical operator, `?:`,
+/// integer and character constants, and object-like macros expanded (an
+/// identifier no macro defines is 0, as in C). An empty macro counts as 1,
+/// so `-DFLAG` and `#define FLAG` both test true. A function-like macro, or
+/// anything else this evaluator cannot read, is an error the caller decides
+/// about.
 fn eval_if_expression(expression: &str, defines: &HashMap<String, String>) -> Result<bool, String> {
+    eval_if_value(expression, defines, 0).map(|value| value != 0)
+}
+
+/// How deep object-like macros may expand into each other in one `#if`.
+const MAX_MACRO_DEPTH: usize = 32;
+
+fn eval_if_value(
+    expression: &str,
+    defines: &HashMap<String, String>,
+    depth: usize,
+) -> Result<i64, String> {
+    if depth > MAX_MACRO_DEPTH {
+        return Err("macro expansion too deep in #if expression".to_owned());
+    }
     let tokens = lex_expr(expression)?;
+    if tokens.is_empty() {
+        return Err("expected expression after #if".to_owned());
+    }
     let mut parser = ExprParser {
         tokens: &tokens,
         pos: 0,
         defines,
+        depth,
     };
-    let value = parser.parse_or()?;
+    let value = parser.parse_expr(0)?;
     if parser.pos != tokens.len() {
-        return Err("unexpected trailing tokens in #if expression".to_owned());
+        return Err(format!(
+            "unexpected {:?} in #if expression",
+            tokens[parser.pos]
+        ));
     }
     Ok(value)
 }
 
+const PUNCTUATORS: &[&str] = &[
+    "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "!", "~", "*", "/", "%", "+", "-", "<", ">",
+    "&", "^", "|", "?", ":", "(", ")",
+    // Only so a function-like macro's arguments lex and the error names the
+    // macro; no #if operator takes a comma.
+    ",",
+];
+
 fn lex_expr(expression: &str) -> Result<Vec<ExprToken>, String> {
     let mut tokens = Vec::new();
-    let mut chars = expression.char_indices().peekable();
-    while let Some((start, ch)) = chars.next() {
-        match ch {
-            ch if ch.is_whitespace() => {}
-            '!' => {
-                if chars.peek().is_some_and(|(_, next)| *next == '=') {
-                    return Err("operator '!=' is unsupported".to_owned());
-                }
-                tokens.push(ExprToken::Not);
-            }
-            '&' => {
-                if chars.next().is_some_and(|(_, next)| next == '&') {
-                    tokens.push(ExprToken::And);
-                } else {
-                    return Err("expected '&&' in #if expression".to_owned());
-                }
-            }
-            '|' => {
-                if chars.next().is_some_and(|(_, next)| next == '|') {
-                    tokens.push(ExprToken::Or);
-                } else {
-                    return Err("expected '||' in #if expression".to_owned());
-                }
-            }
-            '(' => tokens.push(ExprToken::LParen),
-            ')' => tokens.push(ExprToken::RParen),
-            ch if ch.is_ascii_digit() => {
-                let mut end = start + ch.len_utf8();
-                while let Some((idx, next)) = chars.peek().copied() {
-                    if next.is_ascii_hexdigit() || matches!(next, 'x' | 'X') {
-                        end = idx + next.len_utf8();
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let text = &expression[start..end];
-                let value = if let Some(hex) =
-                    text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
-                {
-                    i64::from_str_radix(hex, 16)
-                } else {
-                    text.parse::<i64>()
-                }
-                .map_err(|_| format!("invalid integer constant '{text}'"))?;
-                tokens.push(ExprToken::Number(value));
-            }
-            ch if is_identifier_start(ch) => {
-                let mut end = start + ch.len_utf8();
-                while let Some((idx, next)) = chars.peek().copied() {
-                    if is_identifier_continue(next) {
-                        end = idx + next.len_utf8();
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let ident = &expression[start..end];
-                if ident == "defined" {
-                    tokens.push(ExprToken::Defined);
-                } else {
-                    tokens.push(ExprToken::Ident(ident.to_owned()));
-                }
-            }
-            _ => return Err(format!("unsupported token '{ch}' in #if expression")),
+    let bytes = expression.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &expression[at..];
+        let ch = rest.chars().next().expect("non-empty");
+        if ch.is_whitespace() {
+            at += ch.len_utf8();
+            continue;
         }
+        if ch.is_ascii_digit() {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
+                .unwrap_or(rest.len());
+            tokens.push(ExprToken::Number(parse_integer(&rest[..end])?));
+            at += end;
+            continue;
+        }
+        if ch == '\'' {
+            let (value, len) = parse_char_constant(rest)?;
+            tokens.push(ExprToken::Number(value));
+            at += len;
+            continue;
+        }
+        if is_identifier_start(ch) {
+            let end = rest
+                .find(|c: char| !is_identifier_continue(c))
+                .unwrap_or(rest.len());
+            let ident = &rest[..end];
+            tokens.push(if ident == "defined" {
+                ExprToken::Defined
+            } else {
+                ExprToken::Ident(ident.to_owned())
+            });
+            at += end;
+            continue;
+        }
+        let Some(op) = PUNCTUATORS.iter().find(|op| rest.starts_with(**op)) else {
+            return Err(format!("unsupported token '{ch}' in #if expression"));
+        };
+        tokens.push(ExprToken::Op(op));
+        at += op.len();
     }
     Ok(tokens)
+}
+
+/// A C integer constant: decimal, octal (`017`), hex (`0x1F`) or binary
+/// (`0b101`), with digit separators (`1'000`) and `u`/`l`/`ll` suffixes.
+fn parse_integer(text: &str) -> Result<i64, String> {
+    let digits: String = text.chars().filter(|c| *c != '\'').collect();
+    let trimmed = digits.trim_end_matches(['u', 'U', 'l', 'L']);
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else if let Some(bin) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
+        u64::from_str_radix(bin, 2)
+    } else if trimmed.len() > 1 && trimmed.starts_with('0') {
+        u64::from_str_radix(&trimmed[1..], 8)
+    } else {
+        trimmed.parse::<u64>()
+    };
+    parsed
+        .map(|value| value as i64)
+        .map_err(|_| format!("invalid integer constant '{text}'"))
+}
+
+/// A character constant (`'A'`, `'\n'`, `'\x41'`, `'\0'`) and its length in
+/// bytes, prefix and quotes included.
+fn parse_char_constant(text: &str) -> Result<(i64, usize), String> {
+    let body = &text[1..];
+    let close = body
+        .find('\'')
+        .filter(|close| *close > 0)
+        .ok_or_else(|| "unterminated character constant in #if expression".to_owned())?;
+    // `'\''` closes after the escaped quote.
+    let close = if body.starts_with("\\'") { 2 } else { close };
+    let inner = &body[..close];
+    let value = match inner.strip_prefix('\\') {
+        None => {
+            let mut chars = inner.chars();
+            let ch = chars.next().unwrap_or('\0');
+            if chars.next().is_some() {
+                return Err(format!(
+                    "multi-character constant '{inner}' in #if expression"
+                ));
+            }
+            ch as i64
+        }
+        Some(escape) => match escape {
+            "n" => 10,
+            "t" => 9,
+            "r" => 13,
+            "0" => 0,
+            "a" => 7,
+            "b" => 8,
+            "f" => 12,
+            "v" => 11,
+            "\\" => 92,
+            "'" => 39,
+            "\"" => 34,
+            "?" => 63,
+            hex if hex.starts_with('x') => i64::from_str_radix(&hex[1..], 16)
+                .map_err(|_| format!("invalid escape '\\{hex}' in #if expression"))?,
+            oct if oct.chars().all(|c| c.is_digit(8)) => i64::from_str_radix(oct, 8)
+                .map_err(|_| format!("invalid escape '\\{oct}' in #if expression"))?,
+            other => return Err(format!("invalid escape '\\{other}' in #if expression")),
+        },
+    };
+    Ok((value, close + 2))
 }
 
 struct ExprParser<'a> {
     tokens: &'a [ExprToken],
     pos: usize,
     defines: &'a HashMap<String, String>,
+    depth: usize,
+}
+
+/// Binding power of a binary operator, lowest first, as C ranks them.
+fn binary_precedence(op: &str) -> Option<u8> {
+    Some(match op {
+        "||" => 1,
+        "&&" => 2,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" => 6,
+        "<" | "<=" | ">" | ">=" => 7,
+        "<<" | ">>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        _ => return None,
+    })
 }
 
 impl ExprParser<'_> {
-    fn parse_or(&mut self) -> Result<bool, String> {
-        let mut value = self.parse_and()?;
-        while self.consume(&ExprToken::Or) {
-            value = value || self.parse_and()?;
+    /// Precedence climbing over the binary operators, with `?:` (the lowest,
+    /// right-associative) at the top.
+    fn parse_expr(&mut self, min_precedence: u8) -> Result<i64, String> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            if min_precedence == 0 && self.consume_op("?") {
+                let then = self.parse_expr(0)?;
+                self.expect_op(":")?;
+                let otherwise = self.parse_expr(0)?;
+                lhs = if lhs != 0 { then } else { otherwise };
+                continue;
+            }
+            let Some(ExprToken::Op(op)) = self.tokens.get(self.pos) else {
+                break;
+            };
+            let Some(precedence) = binary_precedence(op) else {
+                break;
+            };
+            if precedence < min_precedence.max(1) {
+                break;
+            }
+            let op = *op;
+            self.pos += 1;
+            let rhs = self.parse_expr(precedence + 1)?;
+            lhs = apply_binary(op, lhs, rhs)?;
         }
-        Ok(value)
+        Ok(lhs)
     }
 
-    fn parse_and(&mut self) -> Result<bool, String> {
-        let mut value = self.parse_unary()?;
-        while self.consume(&ExprToken::And) {
-            value = value && self.parse_unary()?;
-        }
-        Ok(value)
-    }
-
-    fn parse_unary(&mut self) -> Result<bool, String> {
-        if self.consume(&ExprToken::Not) {
-            return Ok(!self.parse_unary()?);
+    fn parse_unary(&mut self) -> Result<i64, String> {
+        for (op, apply) in [
+            ("!", (|v: i64| (v == 0) as i64) as fn(i64) -> i64),
+            ("~", |v: i64| !v),
+            ("-", |v: i64| v.wrapping_neg()),
+            ("+", |v: i64| v),
+        ] {
+            if self.consume_op(op) {
+                return self.parse_unary().map(apply);
+            }
         }
         if self.consume(&ExprToken::Defined) {
             return self.parse_defined();
@@ -844,37 +1036,41 @@ impl ExprParser<'_> {
         self.parse_primary()
     }
 
-    fn parse_defined(&mut self) -> Result<bool, String> {
-        if self.consume(&ExprToken::LParen) {
+    fn parse_defined(&mut self) -> Result<i64, String> {
+        let name = if self.consume_op("(") {
             let name = self.expect_ident()?;
-            self.expect(&ExprToken::RParen)?;
-            Ok(self.defines.contains_key(&name))
+            self.expect_op(")")?;
+            name
         } else {
-            let name = self.expect_ident()?;
-            Ok(self.defines.contains_key(&name))
-        }
+            self.expect_ident()?
+        };
+        Ok(self.defines.contains_key(&name) as i64)
     }
 
-    fn parse_primary(&mut self) -> Result<bool, String> {
-        if self.consume(&ExprToken::LParen) {
-            let value = self.parse_or()?;
-            self.expect(&ExprToken::RParen)?;
+    fn parse_primary(&mut self) -> Result<i64, String> {
+        if self.consume_op("(") {
+            let value = self.parse_expr(0)?;
+            self.expect_op(")")?;
             return Ok(value);
         }
         match self.tokens.get(self.pos) {
             Some(ExprToken::Number(value)) => {
                 self.pos += 1;
-                Ok(*value != 0)
+                Ok(*value)
             }
             Some(ExprToken::Ident(name)) => {
                 self.pos += 1;
-                Ok(self
-                    .defines
-                    .get(name)
-                    .is_some_and(|value| macro_value_is_truthy(value)))
+                if matches!(self.tokens.get(self.pos), Some(ExprToken::Op("("))) {
+                    return Err(format!("function-like macro '{name}' in #if expression"));
+                }
+                match self.defines.get(name) {
+                    None => Ok(0),
+                    Some(value) if value.trim().is_empty() => Ok(1),
+                    Some(value) => eval_if_value(value, self.defines, self.depth + 1),
+                }
             }
-            Some(token) => Err(format!("unexpected token {token:?} in #if expression")),
-            None => Err("expected expression after #if".to_owned()),
+            Some(token) => Err(format!("unexpected {token:?} in #if expression")),
+            None => Err("expression ends early in #if".to_owned()),
         }
     }
 
@@ -887,11 +1083,20 @@ impl ExprParser<'_> {
         }
     }
 
-    fn expect(&mut self, expected: &ExprToken) -> Result<(), String> {
-        if self.consume(expected) {
+    fn consume_op(&mut self, op: &str) -> bool {
+        if matches!(self.tokens.get(self.pos), Some(ExprToken::Op(found)) if *found == op) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_op(&mut self, op: &str) -> Result<(), String> {
+        if self.consume_op(op) {
             Ok(())
         } else {
-            Err(format!("expected {expected:?} in #if expression"))
+            Err(format!("expected '{op}' in #if expression"))
         }
     }
 
@@ -906,15 +1111,29 @@ impl ExprParser<'_> {
     }
 }
 
-fn macro_value_is_truthy(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return value != 0;
-    }
-    true
+fn apply_binary(op: &str, lhs: i64, rhs: i64) -> Result<i64, String> {
+    Ok(match op {
+        "||" => (lhs != 0 || rhs != 0) as i64,
+        "&&" => (lhs != 0 && rhs != 0) as i64,
+        "|" => lhs | rhs,
+        "^" => lhs ^ rhs,
+        "&" => lhs & rhs,
+        "==" => (lhs == rhs) as i64,
+        "!=" => (lhs != rhs) as i64,
+        "<" => (lhs < rhs) as i64,
+        "<=" => (lhs <= rhs) as i64,
+        ">" => (lhs > rhs) as i64,
+        ">=" => (lhs >= rhs) as i64,
+        "<<" => lhs.wrapping_shl(rhs as u32),
+        ">>" => lhs.wrapping_shr(rhs as u32),
+        "+" => lhs.wrapping_add(rhs),
+        "-" => lhs.wrapping_sub(rhs),
+        "*" => lhs.wrapping_mul(rhs),
+        "/" | "%" if rhs == 0 => return Err("division by zero in #if expression".to_owned()),
+        "/" => lhs.wrapping_div(rhs),
+        "%" => lhs.wrapping_rem(rhs),
+        other => return Err(format!("unsupported operator '{other}' in #if expression")),
+    })
 }
 
 fn warning_pragma(message: impl AsRef<str>) -> String {
@@ -1119,11 +1338,136 @@ mod tests {
         assert!(!output.contains("interface Off {};"));
     }
 
+    fn if_value(expression: &str, defines: &[(&str, &str)]) -> Result<i64, String> {
+        let defines = defines
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        eval_if_value(expression, &defines, 0)
+    }
+
+    #[test]
+    fn if_expressions_evaluate_every_operator_class() {
+        for (expression, expected) in [
+            // comparison and equality
+            ("3 >= 2", 1),
+            ("2 >= 3", 0),
+            ("1 < 2", 1),
+            ("2 <= 2", 1),
+            ("3 > 4", 0),
+            ("4 == 4", 1),
+            ("4 != 4", 0),
+            // arithmetic, with C precedence
+            ("1 + 2 * 3", 7),
+            ("(1 + 2) * 3", 9),
+            ("10 / 3", 3),
+            ("10 % 3", 1),
+            ("7 - 2 - 1", 4),
+            ("-3 + 5", 2),
+            // shifts and bitwise
+            ("1 << 4", 16),
+            ("256 >> 4", 16),
+            ("6 & 3", 2),
+            ("6 | 1", 7),
+            ("6 ^ 3", 5),
+            ("~0", -1),
+            // logical, unary and the conditional
+            ("!0", 1),
+            ("1 && 0", 0),
+            ("0 || 2", 1),
+            ("1 ? 10 : 20", 10),
+            ("0 ? 10 : 0 ? 30 : 40", 40),
+            // constants
+            ("0x1F", 31),
+            ("017", 15),
+            ("0b101", 5),
+            ("201112L", 201112),
+            ("1'000", 1000),
+            ("'A'", 65),
+            ("'\\n'", 10),
+            ("'\\x41'", 65),
+        ] {
+            assert_eq!(if_value(expression, &[]), Ok(expected), "{expression}");
+        }
+    }
+
+    #[test]
+    fn if_expressions_expand_object_like_macros() {
+        let defines = [
+            ("API_LEVEL", "3"),
+            ("MIN_LEVEL", "API_LEVEL - 1"),
+            ("FLAG", ""),
+            ("STDC", "201112L"),
+        ];
+        assert_eq!(if_value("API_LEVEL >= 2", &defines), Ok(1));
+        assert_eq!(if_value("MIN_LEVEL == 2", &defines), Ok(1));
+        // An empty macro (`#define FLAG`, `-DFLAG`) tests true.
+        assert_eq!(if_value("FLAG", &defines), Ok(1));
+        assert_eq!(if_value("STDC >= 201112L", &defines), Ok(1));
+        // An identifier no macro defines is 0.
+        assert_eq!(if_value("MISSING", &defines), Ok(0));
+        assert_eq!(
+            if_value("defined(API_LEVEL) && !defined MISSING", &defines),
+            Ok(1)
+        );
+        // What the evaluator cannot read is an error, never a guess.
+        assert!(if_value("VERSION(2)", &defines).is_err());
+        assert!(if_value("1 / 0", &defines).is_err());
+        assert!(if_value("1 +", &defines).is_err());
+        let looping = [("A", "B"), ("B", "A")];
+        assert!(if_value("A", &looping).is_err());
+    }
+
+    #[test]
+    fn elif_chains_take_the_first_true_branch() {
+        let source = "#define API_LEVEL 2\n\
+                      #if API_LEVEL >= 3\nint v3;\n\
+                      #elif API_LEVEL >= 2\nint v2;\n\
+                      #elif API_LEVEL >= 1\nint v1;\n\
+                      #else\nint v0;\n#endif\n";
+        let (output, _) = preprocess_c_like_with_line_map(source, &[]);
+        assert!(output.contains("int v2;"), "{output}");
+        for dead in ["int v3;", "int v1;", "int v0;"] {
+            assert!(!output.contains(dead), "{dead} in {output}");
+        }
+    }
+
+    #[test]
+    fn c_discovery_keeps_every_branch_of_an_unevaluated_if() {
+        let source =
+            "#if VERSION(2)\nint parse_v2(void);\n#else\nint parse_legacy(void);\n#endif\n\
+                      int always(void);\n";
+        let (output, _) = preprocess_c_like_with_line_map(source, &[]);
+        assert!(output.contains("int parse_v2(void);"), "{output}");
+        assert!(output.contains("int parse_legacy(void);"), "{output}");
+        assert!(output.contains("int always(void);"), "{output}");
+        assert!(
+            output.contains("every branch kept") && output.contains("line 1"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn c_discovery_follows_a_comparison_gate() {
+        let source = "#define API_LEVEL 3\n\
+                      #if API_LEVEL >= 2\nint parse_v2(void);\n#else\nint parse_legacy(void);\n#endif\n\
+                      #if API_LEVEL != 0\nint checksum(void);\n#endif\n";
+        let (output, _) = preprocess_c_like_with_line_map(source, &[]);
+        assert!(output.contains("int parse_v2(void);"), "{output}");
+        assert!(output.contains("int checksum(void);"), "{output}");
+        assert!(!output.contains("int parse_legacy(void);"), "{output}");
+    }
+
     #[test]
     fn preprocess_rejects_unsupported_if_expression() {
         let error = preprocess_idl("#if VENDOR_FLAG(1)\ninterface I {};\n#endif\n")
             .expect_err("unsupported directive is rejected");
-        assert!(error.to_string().contains("unexpected trailing tokens"));
+        assert!(
+            error
+                .to_string()
+                .contains("function-like macro 'VENDOR_FLAG'"),
+            "{error}"
+        );
     }
 
     #[test]

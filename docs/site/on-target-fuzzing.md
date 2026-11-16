@@ -56,7 +56,7 @@ binary release.
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
 | An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. Kernel is bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
-| An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven |
+| An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 
 ---
@@ -106,11 +106,12 @@ The coverage channel compiled into the harness runtime:
 |---|---|---|
 | `host_file` (default) | host / qemu-user | event stream via host file I/O |
 | `memory_buffer` | on-target, no I/O | in-RAM ring buffer read back over the transport |
-| `semihosting` | emulator/probe with semihosting | events over the semihosting hook |
+| `semihosting` | emulator/probe with semihosting | events over the semihosting hook; **not read yet**: no transport decodes this output ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)), so a campaign over it runs without coverage |
 | `stub` | smoke build | result status only, no event stream |
 
 For the `gdb` and `qemu-system` transports use `memory_buffer` — the host reads
-the ring out of target memory (see the coverage-map spec below).
+the ring out of target memory (see the coverage-map spec below). It is the only
+backend a transport reads today.
 
 ### Vendor RTOS build systems
 
@@ -147,10 +148,18 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 (addresses are decimal or `0x`-hex, from your linker map / `nm`):
 
 ```
---transport-coverage-map input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
+--transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
 ```
 
 - `input`   — where BHF writes the fuzz input on the target
+- `input_cap` — the size in bytes of the staging buffer at `input`
+  (required). BHF never writes past it: `--max-len` is cut to it (with a
+  note), and an input longer than it (a seed) is written only up to it. An
+  input written past the buffer would overwrite the guest globals after it,
+  and when the next one is the `fault=` word every such input reads as a CPU
+  exception. Each finding's `transport_profile.json` records the capacity.
+- `input_len` — optional: the address of a little-endian `u32` the firmware
+  reads the input's length from. BHF writes it before the input each run.
 - `ring`    — base of the coverage ring
 - `write`   — the ring's write cursor
 - `wrapped` — the ring's wrapped flag
@@ -168,7 +177,7 @@ GDB server, or a `qemu-*` `-g` stub.
 # e.g. a qemu-user or qemu-system gdbstub on :3333, memory_buffer harness built at §2
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport gdb:127.0.0.1:3333 \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 ### 3b. Full-system emulator (`qemu-system:qmp=…,gdb=…[,snapshot=TAG]`)
@@ -205,22 +214,53 @@ qemu-system-arm -M mps2-an385 -kernel harness.elf -S \
 # done=/fault= are the harness_done and bhf_fault_flag addresses from `nm harness.elf`
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,snapshot=base,done=0x1a8,fault=0x20000100" \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
 `-kernel` boot) — the transport handles the rest.
 
-### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX`)
+### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
-For a device running a small BHF agent that receives inputs and streams edges +
+For a device running an agent that receives inputs and streams edges and
 faults back over TCP or serial. No coverage-map needed — coverage rides the
 agent protocol.
 
 ```sh
 bhf fuzz bhf_work --harness H-C0001 --target-transport agent:tcp:192.0.2.10:9000
-bhf fuzz bhf_work --harness H-C0001 --target-transport agent:serial:/dev/ttyUSB0
+bhf fuzz bhf_work --harness H-C0001 --target-transport agent:serial:/dev/ttyUSB0,baud=115200
 ```
+
+BHF opens a serial port raw: 8N1, no flow control, no echo, no line editing
+and no newline translation, so every frame byte crosses unchanged, at
+`baud=` when given and otherwise at the port's current rate. Each read ends at
+`--timeout`, so a silent device stops the run instead of hanging it. On Linux
+and macOS the device is a tty path; on Windows it is a COM port (`COM3`,
+`COM10`).
+
+BHF ships the host side of this lane only. No target-side agent ships yet: a
+reference agent in portable C ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), a FreeRTOS task running it
+([#290](https://github.com/Tarmo-Technologies/bhf/issues/290)) and Zephyr glue ([#291](https://github.com/Tarmo-Technologies/bhf/issues/291)) are tracked. Until then the
+agent is yours to write, to this frame format. Every integer is little-endian;
+one round trip per input:
+
+| Direction | Field | Size | Meaning |
+|---|---|---|---|
+| host → target | `len` | `u32` | input length in bytes |
+| host → target | `input` | `len` bytes | the input |
+| target → host | `status` | `u32` | `0` ran to completion, `1` crashed, `2` timed out; any other value is a protocol error |
+| target → host | `n_edges` | `u32` | number of coverage edges that follow |
+| target → host | `edges` | `n_edges` × `u32` | the edge ids this input hit |
+| target → host | `fault_present` | `u32` | `1` when a fault block follows, else `0` |
+| target → host | `kind` | `u32` | fault kind: `0` CPU exception, `1` memory protection, `2` watchdog, `3` assertion/panic, `4` stack overflow, `5` timeout; another value is kept as-is |
+| target → host | `addr` | `u64` | faulting address, `0` when none applies |
+| target → host | `detail_len` | `u32` | length of the detail text |
+| target → host | `detail` | `detail_len` bytes | a short description of the fault |
+
+The `kind`, `addr`, `detail_len` and `detail` fields are sent only when
+`fault_present` is `1`. The host refuses an input over 16 MiB, more than 2^20
+edges or a detail over 64 KiB before it allocates. The agent has no stdout
+channel.
 
 ---
 
@@ -260,11 +300,15 @@ is a defect. Off by default — unset, hang handling is byte-for-byte unchanged.
 
 ## 5. Big-endian & non-x86 fidelity
 
-BHF emits target-byte-order struct images and matches the target ABI, so a
-big-endian-only bug (e.g. a field byte-swapped only on PPC) is reachable under
-`qemu-ppc64` / a PPC gdbstub where it would be invisible on the little-endian
-host. Cross-build with a big-endian triple (`powerpc64-linux-gnu`, `mips-linux-gnu`)
-and run it through a transport from §3.
+A cross build runs the target's own byte order: a big-endian-only bug (a field
+byte-swapped only on PPC) is reachable under `qemu-ppc64` or a PPC gdbstub where
+it would be invisible on the little-endian host. Cross-build with a big-endian
+triple (`powerpc64-linux-gnu`, `mips-linux-gnu`) and run it through a transport
+from §3. BHF's mutator does **not** yet emit typed, target-byte-order values
+for a decoded argument: the typed spans that would carry an argument's layout
+are not fed to the builtin mutator ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)), and BHF's C decoder reads
+scalars little-endian on every target, so the mutation is byte-level on both
+byte orders.
 
 ## 6. Comparison-progress for format gates
 
@@ -299,7 +343,7 @@ BHF repository. In brief:
 ```sh
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport gdb:127.0.0.1:3333 \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 ---
@@ -336,7 +380,10 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   parses the spec (including the `done=`/`fault=` completion contract), bounds
   each connection/read/write (`--timeout`), and dials the resource on the first
   execution (a dead endpoint fails with a connection error, not
-  "unimplemented"). A gated end-to-end test (`transport_fuzz_qemu_cli`, present
+  "unimplemented"). It takes the seed, length, time, iteration, timeout,
+  deadline and RNG-seed flags; a host-lane flag it does not wire (`--workers`,
+  `--grammar`, `--cmplog-log` and the others [cli.md](cli.md) lists) is
+  refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
   when `qemu-system-arm` + `arm-none-eabi-gcc` are installed) drives the real
   mps2-an385 fixture through the shipped `bhf fuzz --target-transport
   qemu-system:…` binary and asserts it plants the breakpoint itself and persists
@@ -344,8 +391,13 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   or board remains the dependency-gated step you perform with the resource.
 - **Still gated (unproven until you run it against the resource):** a live
   physical board (`hil_board.rs` + `BHF_HIL_GDB`), the TCP/serial `agent`
-  transport, proprietary RTOS images / vendor toolchains (BHF ships none — bring
-  your own), and Renode.
+  transport (no target-side agent ships yet, [#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and proprietary
+  RTOS images / vendor toolchains (BHF ships none — bring your own).
+- **Not available yet:** a Renode full-system transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340));
+  `--target-transport` takes `agent`, `gdb` and `qemu-system` only. Renode's
+  gdbserver can be driven through `gdb:`, without snapshot reset. Semihosting
+  coverage ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)) and target-byte-order typed mutation
+  ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)) are not wired either.
 - **Non-goals:** BHF does not bundle or crack vendor toolchains, ship RTOS
-  images, or act as a full-system emulator (it integrates `qemu-system`/Renode,
-  it does not replace them).
+  images, or act as a full-system emulator (it drives `qemu-system`, it does
+  not replace it).

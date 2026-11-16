@@ -37,6 +37,8 @@ use std::process::Command;
 
 /// Cap the number of input bytes perturbed so a large min input can't stall.
 const MAX_BYTES: usize = 256;
+/// Bytes appended to probe whether the input's length sets an access size.
+const LENGTH_PROBE: usize = 8;
 
 /// `bhf cartography` — map which input bytes control which sink operand.
 #[derive(Debug, clap::Args)]
@@ -211,14 +213,62 @@ struct Primitive {
     controlling_bytes: Vec<usize>,
 }
 
+/// How strongly a primitive's exploitability ranks, for picking between the
+/// cards of the minimized and the original testcase.
+fn exploitability_rank(exploitability: &str) -> u8 {
+    match exploitability {
+        "high" => 3,
+        "medium" => 2,
+        "unknown" => 1,
+        _ => 0,
+    }
+}
+
+/// The card of the strongest primitive among the finding's crashing inputs.
+/// Minimization shrinks an input until its length pins a copy's size, so the
+/// minimized testcase alone can hide control the original shows; the
+/// minimized one wins a tie.
 fn map_finding(f: &FindingRef) -> Option<Card> {
-    let bin = &f.binary;
-    // The first input that still crashes is the baseline (must reproduce to map it).
-    let (input_path, input, baseline) = f.inputs.iter().find_map(|path| {
-        let input = std::fs::read(path).ok()?;
-        let facts = replay_facts(bin, &input)?;
-        Some((path, input, facts))
-    })?;
+    let mut best: Option<Card> = None;
+    for path in &f.inputs {
+        let Some(card) = map_input(&f.binary, path) else {
+            continue;
+        };
+        let stronger = best.as_ref().is_none_or(|best| {
+            exploitability_rank(card.primitive.exploitability)
+                > exploitability_rank(best.primitive.exploitability)
+        });
+        if stronger {
+            best = Some(card);
+        }
+    }
+    best
+}
+
+/// Whether the input's length sets the size of the crashing access: a longer
+/// or a shorter input still crashes the same way with a different access size
+/// (a copy of `min(data[0], len - 1)` bytes).
+fn length_controls_size(bin: &Path, input: &[u8], baseline: &CrashFacts) -> bool {
+    let Some(size) = baseline.size else {
+        return false;
+    };
+    let fill = input.last().copied().unwrap_or(b'A');
+    let mut longer = input.to_vec();
+    longer.extend(std::iter::repeat_n(fill, LENGTH_PROBE));
+    let shorter = input[..input.len().saturating_sub(1)].to_vec();
+    [longer, shorter].iter().any(|variant| {
+        replay_facts(bin, variant).is_some_and(|facts| {
+            facts.class == baseline.class
+                && facts.access == baseline.access
+                && facts.size.is_some_and(|other| other != size)
+        })
+    })
+}
+
+/// One input's card, or `None` when it does not crash.
+fn map_input(bin: &Path, input_path: &Path) -> Option<Card> {
+    let input = std::fs::read(input_path).ok()?;
+    let baseline = replay_facts(bin, &input)?;
     // A wild access names no relative operand, only the address it faulted on.
     // Compare addresses only when a second identical replay agrees on it.
     let address_stable =
@@ -238,7 +288,8 @@ fn map_finding(f: &FindingRef) -> Option<Card> {
             address_stable.unwrap_or(false),
         ));
     }
-    let primitive = classify_primitive(&baseline, &classes);
+    let length_sized = length_controls_size(bin, &input, &baseline);
+    let primitive = classify_primitive_with_length(&baseline, &classes, length_sized);
     let args = traced_args(bin, &input);
     Some(Card {
         input_name: input_path
@@ -567,7 +618,18 @@ fn parse_rel_offset(stderr: &str) -> Option<i64> {
 }
 
 /// Classify the exploit primitive from the baseline access + the per-byte control map.
+#[cfg(test)]
 fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive {
+    classify_primitive_with_length(baseline, classes, false)
+}
+
+/// [`classify_primitive`], knowing whether the input's length sets the access
+/// size ([`length_controls_size`]).
+fn classify_primitive_with_length(
+    baseline: &CrashFacts,
+    classes: &[ByteClass],
+    length_sized: bool,
+) -> Primitive {
     let controlling: Vec<usize> = classes
         .iter()
         .enumerate()
@@ -643,6 +705,31 @@ fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive
             summary: "the faulting address moved between identical replays, so which input \
                       bytes steer it could not be measured"
                 .to_owned(),
+            controlling_bytes: Vec::new(),
+        }
+    } else if length_sized {
+        let size = baseline
+            .size
+            .map(|size| format!(" ({size} bytes here)"))
+            .unwrap_or_default();
+        let (kind, cwe, exploitability, what) = if is_write {
+            ("input_sized_linear_write", "CWE-787", "high", "WRITE")
+        } else {
+            (
+                "input_sized_linear_read",
+                baseline_cwe(baseline),
+                "medium",
+                "READ",
+            )
+        };
+        Primitive {
+            kind,
+            cwe,
+            exploitability,
+            summary: format!(
+                "the input's length sets the size of an out-of-bounds {what}{size} — a \
+                 linear overflow as long as the input makes it"
+            ),
             controlling_bytes: Vec::new(),
         }
     } else if is_write {
@@ -962,6 +1049,41 @@ READ of size 1 at 0x502000000035 thread T0\n\
         assert_eq!(p.kind, "controlled_relative_write");
         assert_eq!(p.cwe, "CWE-787");
         assert_eq!(p.exploitability, "high");
+    }
+
+    /// A copy whose size the input's length sets is a linear overflow the
+    /// input sizes, not a fixed write, even though no single byte flip moves
+    /// it; without that, a write no byte controls stays a fixed write.
+    #[test]
+    fn a_write_sized_by_the_input_length_is_a_high_linear_overflow() {
+        let baseline = CrashFacts {
+            class: "stack-buffer-overflow".into(),
+            access: Some("WRITE".into()),
+            size: Some(46),
+            rel_offset: Some(0),
+            fault_address: None,
+        };
+        let classes = vec![ByteClass::Structural, ByteClass::DontCare];
+        let linear = classify_primitive_with_length(&baseline, &classes, true);
+        assert_eq!(linear.kind, "input_sized_linear_write");
+        assert_eq!(linear.cwe, "CWE-787");
+        assert_eq!(linear.exploitability, "high");
+        assert!(
+            linear.summary.contains("(46 bytes here)"),
+            "{}",
+            linear.summary
+        );
+        let fixed = classify_primitive_with_length(&baseline, &classes, false);
+        assert_eq!(fixed.kind, "fixed_write");
+        assert_eq!(fixed.exploitability, "low");
+        let read = CrashFacts {
+            access: Some("READ".into()),
+            ..baseline
+        };
+        assert_eq!(
+            classify_primitive_with_length(&read, &classes, true).exploitability,
+            "medium"
+        );
     }
 
     /// A SEGV on a wild pointer reports no region-relative offset: the

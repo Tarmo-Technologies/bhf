@@ -76,7 +76,8 @@ end
 # ---- Finding classification (FP-avoidant, like the Python/Perl/JS lanes). ----
 # Only high-confidence bug-class exceptions are findings; Ruby's normal input-
 # rejection errors (ArgumentError/TypeError/KeyError/IndexError/NoMethodError/...) are
-# suppressed. The behavioral/taint oracles (the shim) catch the security classes.
+# suppressed. This lane has no behavioral sink oracles yet (the runtrace shim is
+# not loaded into ruby), so an injection that raises nothing is not reported.
 def bhf_bug_cwe(err)
   case err
   when ZeroDivisionError then 'CWE-369'

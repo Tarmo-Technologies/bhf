@@ -788,6 +788,7 @@ pub fn generate_rust_existing_fuzz_target(
         impl_trait: None,
         is_trait_method: false,
         trait_supertrait: None,
+        inline_modules: Vec::new(),
     };
     generate_rust_direct_harness(&GenerateRustDirectArgs {
         call_path: entry_path.to_vec(),
@@ -859,6 +860,7 @@ mod tests {
             impl_trait: None,
             is_trait_method: false,
             trait_supertrait: None,
+            inline_modules: Vec::new(),
         }
     }
 

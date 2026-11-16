@@ -1973,7 +1973,15 @@ fn normalize_finding(
     let minimal_reproducer = string_at(&raw, &["minimal_reproducer"])
         .or_else(|| string_at(&raw, &["paths", "minimized"]));
     let raw_generated_repro_ada = string_at(&raw, &["generated_repro_ada"]);
-    let (generated_repro_ada, repro_ada_omitted_reason) = if generate_reproducers {
+    let ada = finding_is_ada(&raw);
+    let (generated_repro_ada, repro_ada_omitted_reason) = if !ada {
+        // An Ada program that writes the testcase back out means nothing to
+        // a C, C++ or Python developer; drop one an earlier release wrote.
+        if generate_reproducers {
+            remove_generated_repro_ada(finding_dir);
+        }
+        (None, None)
+    } else if generate_reproducers {
         repro_ada_status(finding_dir, &id, raw_generated_repro_ada.as_deref())
     } else if finding_dir.join("repro.adb").is_file() {
         (Some(finding_artifact_path(&id, "repro.adb")), None)
@@ -2187,6 +2195,44 @@ fn renders_ada_repro(finding: &FindingReport) -> bool {
     let has_sanitizer = string_at(&finding.raw, &["exception", "sanitizer"])
         .is_some_and(|sanitizer| !sanitizer.trim().is_empty());
     !has_sanitizer && finding.generated_repro_ada.is_some()
+}
+
+/// Whether a finding is an Ada target's: its dialect says Ada, or, with no
+/// dialect recorded (an older or hand-written record), it carries Ada
+/// exception evidence (a handler, a package) and no sanitizer report.
+fn finding_is_ada(raw: &Value) -> bool {
+    let dialect = string_at(raw, &["dialect"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if dialect.starts_with("ada") {
+        return true;
+    }
+    if !dialect.is_empty() {
+        return false;
+    }
+    let has_sanitizer = string_at(raw, &["exception", "sanitizer"])
+        .is_some_and(|sanitizer| !sanitizer.trim().is_empty());
+    !has_sanitizer
+        && (raw.pointer("/exception/handler").is_some()
+            || raw.get("handler").is_some()
+            || string_at(raw, &["target", "package"]).is_some()
+            || string_at(raw, &["generated_repro_ada"]).is_some())
+}
+
+/// Remove a `repro.adb` bhf generated for `finding_dir`'s testcase (its
+/// content is exactly what [`render_repro_ada`] writes), never one someone
+/// else put there.
+fn remove_generated_repro_ada(finding_dir: &Path) {
+    let repro = finding_dir.join("repro.adb");
+    let (Ok(existing), Ok(testcase)) = (
+        read_regular_no_follow(&repro),
+        read_regular_no_follow(&finding_dir.join("testcase.bin")),
+    ) else {
+        return;
+    };
+    if existing == render_repro_ada(&testcase).as_bytes() {
+        let _ = fs::remove_file(&repro);
+    }
 }
 
 fn repro_ada_status(
@@ -3550,7 +3596,56 @@ fn sarif_locations(finding: &FindingReport, root: Option<&Path>) -> Vec<Value> {
             locations.push(location);
         }
     }
+    // GitHub code scanning drops a result with no location. An oracle,
+    // memory-limit or deadline finding has no crash frame, so point it at the
+    // fuzzed target's own source line, else at the source root (`SRCROOT`
+    // when the run declares one).
+    if locations.is_empty() {
+        locations.push(
+            sarif_target_location(&finding.target, root).unwrap_or_else(|| {
+                let artifact = match root {
+                    Some(_) => json!({ "uri": ".", "uriBaseId": "SRCROOT" }),
+                    None => json!({ "uri": "." }),
+                };
+                json!({
+                    "physicalLocation": { "artifactLocation": artifact },
+                    "message": { "text": "No source location was recorded for this finding" },
+                })
+            }),
+        );
+    }
     locations
+}
+
+/// The fuzzed target's source line as a SARIF location: `target.location`
+/// (`path`/`line`) or `target.source_path`/`target.line`.
+fn sarif_target_location(target: &Value, root: Option<&Path>) -> Option<Value> {
+    let (file, line) = match string_at(target, &["location", "path"]) {
+        Some(path) => (path, target.pointer("/location/line")),
+        None => (string_at(target, &["source_path"])?, target.get("line")),
+    };
+    if file.trim().is_empty() {
+        return None;
+    }
+    let mut physical_location = serde_json::Map::new();
+    physical_location.insert(
+        "artifactLocation".to_owned(),
+        sarif_artifact_location(&file, root),
+    );
+    let line = line.and_then(|line| {
+        line.as_u64()
+            .or_else(|| line.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    if let Some(line) = line.filter(|line| *line > 0) {
+        physical_location.insert("region".to_owned(), json!({ "startLine": line }));
+    }
+    let name = string_at(target, &["subprogram"])
+        .or_else(|| string_at(target, &["name"]))
+        .unwrap_or_else(|| "the fuzzed target".to_owned());
+    Some(json!({
+        "physicalLocation": Value::Object(physical_location),
+        "message": { "text": format!("Fuzzed target {name}") },
+    }))
 }
 
 fn push_unique_sarif_location(locations: &mut Vec<Value>, location: Value) {
@@ -5416,6 +5511,73 @@ mod tests {
         }
     }
 
+    /// The Ada reproducer is an Ada program that writes the testcase back out:
+    /// only an Ada finding gets one, and one an earlier release wrote into a C
+    /// finding is removed, while a file someone else put there stays.
+    #[test]
+    fn repro_adb_is_written_only_for_ada_findings() {
+        let (_root_guard, root) = temp_dir("repro-adb-ada-only");
+        let cases = [
+            (
+                "F-0001-ada",
+                json!({"id": "F-0001-ada", "dialect": "ada2012",
+                "exception": {"name": "CONSTRAINT_ERROR"}}),
+            ),
+            (
+                "F-0002-c",
+                json!({"id": "F-0002-c", "dialect": "unknown",
+                "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan"}}),
+            ),
+            (
+                "F-0003-py",
+                json!({"id": "F-0003-py", "dialect": "python",
+                "exception": {"name": "IndexError"}}),
+            ),
+            (
+                "F-0004-legacy",
+                json!({"id": "F-0004-legacy",
+                "exception": {"name": "CONSTRAINT_ERROR", "handler": {"file": "p.adb", "line": 3}}}),
+            ),
+            (
+                "F-0005-stale",
+                json!({"id": "F-0005-stale", "dialect": "c",
+                "exception": {"name": "ASAN_SEGV", "sanitizer": "asan"}}),
+            ),
+            (
+                "F-0006-own",
+                json!({"id": "F-0006-own", "dialect": "c",
+                "exception": {"name": "ASAN_SEGV", "sanitizer": "asan"}}),
+            ),
+        ];
+        for (id, raw) in &cases {
+            let dir = root.join(id);
+            write_finding(&dir, raw.clone());
+            fs::write(dir.join("testcase.bin"), b"AB").unwrap();
+        }
+        fs::write(
+            root.join("F-0005-stale/repro.adb"),
+            super::render_repro_ada(b"AB"),
+        )
+        .unwrap();
+        fs::write(root.join("F-0006-own/repro.adb"), "-- mine\n").unwrap();
+
+        let findings = load_findings(&root).unwrap();
+        let by_id = |id: &str| findings.iter().find(|f| f.id == id).unwrap();
+        for id in ["F-0001-ada", "F-0004-legacy"] {
+            assert!(root.join(id).join("repro.adb").is_file(), "{id}");
+            assert!(by_id(id).generated_repro_ada.is_some(), "{id}");
+        }
+        for id in ["F-0002-c", "F-0003-py", "F-0005-stale"] {
+            assert!(!root.join(id).join("repro.adb").exists(), "{id}");
+            assert_eq!(by_id(id).generated_repro_ada, None, "{id}");
+            assert_eq!(by_id(id).repro_ada_omitted_reason, None, "{id}");
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("F-0006-own/repro.adb")).unwrap(),
+            "-- mine\n"
+        );
+    }
+
     #[test]
     fn bounded_loader_does_not_read_or_generate_large_auxiliary_reproducer() {
         let (_root_guard, root) = temp_dir("bounded-readonly");
@@ -6934,6 +7096,100 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Actionability fix location"));
+    }
+
+    /// GitHub code scanning drops a result without a location, so an oracle,
+    /// memory-limit or deadline finding with no crash frame points at the
+    /// fuzzed target's line, and one with nothing at all at the source root.
+    #[test]
+    fn every_sarif_result_has_a_location() {
+        let (_root_guard, root) = temp_dir("sarif-every-loc");
+        let src = root.join("src");
+        fs::create_dir_all(root.join("auto")).unwrap();
+        fs::write(
+            root.join("auto/run.json"),
+            serde_json::to_vec(&json!({ "source_root": src })).unwrap(),
+        )
+        .unwrap();
+        let findings = root.join("findings");
+        write_finding(
+            &findings.join("F-0001-fmt"),
+            json!({
+                "id": "F-0001-fmt",
+                "rule_id": "BHF-408",
+                "signature": "fmt-sig",
+                "harness_id": "H-C0001",
+                "target": {
+                    "harness_id": "H-C0001",
+                    "subprogram": "log_line",
+                    "source_path": src.join("log.c"),
+                    "line": 4
+                },
+                "exception": { "name": "format_string" }
+            }),
+        );
+        write_finding(
+            &findings.join("F-0002-rss"),
+            json!({
+                "id": "F-0002-rss",
+                "rule_id": "BHF-209",
+                "signature": "rss-sig",
+                "target": { "location": { "path": src.join("alloc.c"), "line": 17 } },
+                "exception": { "name": "rss_limit" }
+            }),
+        );
+        let deadline = json!({
+            "id": "F-0003-deadline",
+            "rule_id": "BHF-555",
+            "signature": "deadline-sig",
+            "harness_id": "H-C0003",
+            "exception": { "name": "deadline" }
+        });
+        write_finding(&findings.join("F-0003-deadline"), deadline.clone());
+        let document = build_report(&ReportOptions::new(&findings, root.join("reports"))).unwrap();
+        let sarif = render_sarif_report(&document);
+        validate_sarif_report(&sarif).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        let location_of = |sarif: &Value, rule: &str| {
+            let result = sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|result| result["ruleId"] == rule)
+                .unwrap_or_else(|| panic!("no {rule} result"))
+                .clone();
+            let locations = result["locations"].as_array().unwrap();
+            assert_eq!(locations.len(), 1, "{rule}: {locations:?}");
+            locations[0]["physicalLocation"].clone()
+        };
+        let srcroot = |uri: &str| json!({ "uri": uri, "uriBaseId": "SRCROOT" });
+        let fmt = location_of(&sarif, "BHF-408");
+        assert_eq!(fmt["artifactLocation"], srcroot("log.c"));
+        assert_eq!(fmt["region"]["startLine"], 4);
+        let rss = location_of(&sarif, "BHF-209");
+        assert_eq!(rss["artifactLocation"], srcroot("alloc.c"));
+        assert_eq!(rss["region"]["startLine"], 17);
+        assert_eq!(
+            location_of(&sarif, "BHF-555")["artifactLocation"],
+            srcroot(".")
+        );
+
+        // Without a recorded source root the fallback is a plain relative URI,
+        // since SRCROOT would be undeclared.
+        let (_bare_guard, bare) = temp_dir("sarif-every-loc-bare");
+        write_finding(&bare.join("findings/F-0003-deadline"), deadline);
+        let document = build_report(&ReportOptions::new(
+            bare.join("findings"),
+            bare.join("reports"),
+        ))
+        .unwrap();
+        let sarif = render_sarif_report(&document);
+        validate_sarif_report(&sarif).unwrap();
+        assert_eq!(
+            location_of(&sarif, "BHF-555")["artifactLocation"],
+            json!({ "uri": "." })
+        );
     }
 
     #[test]

@@ -630,12 +630,16 @@ fn write_idl_recovery_report(
         let (category, blocks_completeness) =
             if lower.contains("include") && lower.contains("not found") {
                 ("missing_include", true)
+            // Before the macro check: an `#if` that uses a function-like macro
+            // names the macro in its message, and is still a conditional.
+            } else if lower.contains("unsupported #if expression")
+                || lower.contains("unsupported #elif expression")
+            {
+                ("unsupported_conditional", true)
             } else if lower.contains("function-like macro")
                 || lower.contains("unsupported macro definition")
             {
                 ("unsupported_macro", true)
-            } else if lower.contains("unsupported #if expression") {
-                ("unsupported_conditional", true)
             } else if lower.contains("unsupported directive") {
                 ("unsupported_directive", true)
             } else if lower.contains("unknown idl pragma") {
