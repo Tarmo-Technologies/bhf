@@ -2726,7 +2726,15 @@ fn run_attempt(
             &candidate.harness_id,
             &source_root,
         ) {
-            crate::auto::cobol_build::CobolBuildResult::Built => {}
+            crate::auto::cobol_build::CobolBuildResult::Built => {
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "cobol",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
+            }
             crate::auto::cobol_build::CobolBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2766,7 +2774,15 @@ fn run_attempt(
             &candidate.harness_id,
             &source_root,
         ) {
-            crate::auto::fortran_build::FortranBuildResult::Built => {}
+            crate::auto::fortran_build::FortranBuildResult::Built => {
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "fortran",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
+            }
             crate::auto::fortran_build::FortranBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2923,6 +2939,13 @@ fn run_attempt(
                 // The binary now exists at harnesses/<id>/main; the repair loop's
                 // try_build sees it (try_build_rust returns Success) and runs the
                 // shared fuzz cascade. Fall through.
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "rust",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
             }
             crate::auto::rust_build::RustBuildResult::Failed { reason, skip } => {
                 if skip {

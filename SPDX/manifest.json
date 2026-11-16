@@ -2427,6 +2427,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_lane_generation_metadata.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_legacy_audit_fixes.rs",
       "license": "Apache-2.0"
     },

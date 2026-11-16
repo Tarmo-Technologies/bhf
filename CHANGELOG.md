@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Rust, Fortran and COBOL harnesses record their `generation-metadata.json`
+  (language, `harness_format_version`, target), as C, C++ and Ada ones do.
+  Without it their findings carried no harness format, so a later format
+  change could not be told on replay, and `bhf explain` said such a harness
+  was built "by an earlier bhf or some other way" even when this bhf built
+  it.
 - The Rizin, Ghidra and angr binary adapters say they run no analysis: with
   their tool present `bhf binary adapter` writes `status: not_implemented`
   and exits 3, and without it `status: skipped` and exits 1. They reported
