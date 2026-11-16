@@ -87,3 +87,71 @@ fn the_max_targets_row_is_a_fuzz_cap_with_backfill_and_max_attempts_has_one() {
     let max_attempts = row(&doc, "--max-attempts");
     assert!(max_attempts.contains("**inspected**"), "{max_attempts}");
 }
+
+/// The table's cells for `flag`: its default and its purpose, with `\|`
+/// kept inside a cell.
+fn cells(doc: &str, flag: &str) -> (String, String) {
+    let line = row(doc, flag).replace("\\|", "\u{1}");
+    let cells: Vec<String> = line
+        .split('|')
+        .map(|cell| cell.trim().replace('\u{1}', "|"))
+        .collect();
+    (cells[2].clone(), cells[3].clone())
+}
+
+/// `--flag` -> its `[default: V]` in `help`.
+fn help_defaults(help: &str) -> Vec<(String, String)> {
+    let mut current = None;
+    let mut defaults = Vec::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        if line.starts_with("  ") && trimmed.starts_with('-') {
+            current = flags(line).into_iter().next();
+        }
+        if let (Some(flag), Some((_, rest))) = (&current, line.split_once("[default: ")) {
+            let value = rest.split(']').next().unwrap_or("").to_owned();
+            defaults.push((flag.clone(), value));
+        }
+    }
+    defaults
+}
+
+#[test]
+fn the_table_defaults_match_the_help() {
+    let globals = flags(&help(&[]));
+    let doc = auto_md();
+    let defaults = help_defaults(&help(&["auto"]));
+    assert!(
+        defaults.iter().any(|(flag, _)| flag == "--per-target-time"),
+        "{defaults:?}"
+    );
+    let mut wrong = Vec::new();
+    for (flag, value) in &defaults {
+        if globals.contains(flag) {
+            continue;
+        }
+        let (default, _) = cells(&doc, flag);
+        // Computed from the host: the table gives the rule, not a number.
+        let rule = match flag.as_str() {
+            "--jobs" => Some("half the host's cores"),
+            "--rss-limit-mb" => Some("dynamic"),
+            _ => None,
+        };
+        let documented = match rule {
+            Some(rule) => default.contains(rule),
+            None => default.contains(value.as_str()),
+        };
+        if !documented {
+            wrong.push(format!("{flag}: help {value:?}, auto.md {default:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // Defaults the help states in prose.
+    let (sanitizers, _) = cells(&doc, "--sanitizers");
+    assert!(sanitizers.contains("address,undefined"), "{sanitizers}");
+    let (_, static_dynamic) = cells(&doc, "--static-dynamic");
+    assert!(
+        static_dynamic.starts_with("Deprecated, no effect"),
+        "{static_dynamic}"
+    );
+}

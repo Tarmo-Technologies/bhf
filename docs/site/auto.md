@@ -87,7 +87,7 @@ is to bound the recursion depth.
 | `--max-attempts <N>` | unset (as many as `--max-targets` needs) | Hard ceiling on the ranked candidates **inspected** (built or attempted), however many fuzz: bounds a huge legacy tree where most candidates are nonviable, so the `--max-targets` backfill cannot grind through all of it |
 | `--campaign-time <SECS>` | unset (run all) | Whole-**run** budget across all targets. Default: an OUTER wall-clock cap — once exceeded, `auto` stops STARTING new (ranked) targets (the in-flight one finishes) and reports how many of the N discovered were reached. With `--min-target-time`, switches to SPLIT mode (see below). Bounds *how long* a huge-tree sweep runs |
 | `--min-target-time <SECS>` | unset | SPLIT-mode floor, used **only** with `--campaign-time` (errors otherwise): divide the campaign budget across the N attempted targets — each gets `max(min, campaign / N)` of fuzz time, and only the top `floor(campaign / per_target)` ranked targets are attempted (the rest logged unfuzzed), never less than this floor. Overrides `--per-target-time` |
-| `--jobs <N>` / `-j <N>` | `1` (serial) | Build+fuzz up to N targets CONCURRENTLY via a bounded worker pool. Child allowance is `jobs × --rss-limit-mb`, but total peak also includes the parent declaration index/results, compilers, and the OS. Results aggregate deterministically regardless of completion order |
+| `--jobs <N>` / `-j <N>` | half the host's cores (at least 1, at most 8; `BHF_DEFAULT_JOBS` overrides) | Build+fuzz up to N targets CONCURRENTLY via a bounded worker pool; `--jobs 1` runs one at a time. Child allowance is `jobs × --rss-limit-mb`, so with both defaults (half the cores, a quarter of memory each) the children alone may reach well over half the host's memory; total peak also includes the parent declaration index/results, compilers, and the OS. Results aggregate deterministically regardless of completion order |
 | `--passes <SET>` | all (`empty,rng,fuzz`) | Restrict the per-target cascade to a comma list of passes (`empty`, `rng`, `fuzz`). E.g. `--passes fuzz` runs only the fuzz-driven pass — ~3× the throughput of the full 3-pass cascade. Mutually exclusive with `--single-pass` |
 | `--single-pass` | off | Convenience for `--passes fuzz`: run ONLY the fuzz-driven pass per target |
 | `--max-repair-rounds <N>` | `16` | Ceiling on build-fail → repair → retry rounds per target. The default covers all 95 successful clean/damaged samples in the strengthened 53-repository matrix (p95 6, p99/max 14 rounds); the no-progress early-break still applies, so it is a cap, not a fixed cost |
@@ -98,7 +98,7 @@ is to bound the recursion depth.
 | `--no-discovery-cache` | off | Disable the discovery cache entirely (never read or write it) |
 | `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results. A target whose lane's toolchain was missing (`missing_toolchain`), or whose sanitizer runtime could not start (`sanitizer_runtime_unavailable`), is always tried again, since the host may have been fixed since |
 | `--reuse-discovery` | — | Deprecated no-op (caching is now the default); accepted for back-compat |
-| `--sanitizers <asan,ubsan,msan,tsan,lsan \| none>` | none | Arm the named matrix for native C/C++ builds (the other lanes own their instrumentation). `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
+| `--sanitizers <asan,ubsan,msan,tsan,lsan \| none>` | `address,undefined` (ASan and UBSan) | Arm the named matrix for native C/C++ builds instead of the default (the other lanes own their instrumentation). The opt-out `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
 | `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++ only; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
 | `--winafl-path <DIR>` / `--dynamorio-path <DIR>` | `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on PATH / `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on PATH | WinAFL's directory (holding `afl-fuzz.exe` and `winafl.dll`) and DynamoRIO's install root (or its `bin64`) for `--engine winafl` (see [Windows](windows.md#installing-winafl-and-dynamorio)) |
@@ -141,7 +141,7 @@ is to bound the recursion depth.
 | `--sbom` | off | Write an evidence-graded SBOM and VEX bundle at the end of the run into `<work>/sbom/` (`sbom.json`, `cyclonedx.json`, `vulnerabilities.json`, `openvex.json`, `sbom.csv`). The tree's components are enriched with the run's `auto/run.json`, so libraries a harness drove are marked exercised. `bhf sbom` gives finer `--emit` and `--ecosystems` control |
 | `--sloc <FILE>` | unset | Write a per-language SLOC breakdown (files, total, comments, blanks, SLOC) of the tree, then run as usual. A relative path lands in `<work>/auto/`; a `.json` name writes JSON, anything else a text table |
 | `--force` / `--force-fuzz` | off | Adds a SECOND pass. The sweep first runs exactly as it would without the flag, then re-attempts only the targets that did not reach the fuzz phase — forced: a best-effort driver for opaque/function-pointer/unknown params, stubs for whatever the compiler reports undefined, and no hard failure (report-only is the floor). The managed lanes have their own force paths: Go drives an undrivable parameter as its type's zero value and calls a method on a zero receiver, and C# allocates a receiver whose type has no accessible parameterless constructor without running one. A forced retry may only ever *replace* a target's outcome by fuzzing it, so `--force` cannot lower the fuzzed count; it also cannot rescue a target whose parameters were never the problem. Findings from a forced build are floored to **Low** confidence with a `forced` note and counted separately — a forced crash may be a stub artifact, not a real defect. With `--resume` over a finished campaign it keeps every target that already fuzzed and forces only the rest, without repeating the unforced attempt. Persistence honors `--max-repair-rounds`; does not imply `--static` |
-| `--static-dynamic` | off | Run in static-dynamic mode: add a `scan_type` column to `findings.csv` labeling each row — `static-dynamic` for a static-scan result (bhf's static + fuzz-confirmation pipeline) and `dynamic` for a fuzzed result. Off by default so the CSV schema is unchanged unless requested |
+| `--static-dynamic` | — | Deprecated, no effect. `results/findings.csv` always tells a static-scan row from a fuzzed one, in its `kind` column, and says whether fuzzing confirmed it in `confirmation` |
 | `--install-deps` | off | After the sweep, fetch still-blocking deps from the manifest (apt-get / `alr get`). Opt-in and the only ONLINE part of `auto`; nothing is fatal |
 | `--list-fakes` | — | Print the fake-resource plugin inventory and exit |
 | `--languages <LIST>` (alias `--lang`) | all languages found | Restrict the sweep to a comma-separated subset of source languages. Accepts any of the sixteen fuzzable languages: `ada`, `c`, `cpp`, `rust`, `java`, `python`, `perl`, `go`, `cobol`, `fortran`, `csharp`, `javascript`, `typescript`, `ruby`, `lua`, `php`. Candidates in any other language are dropped **after** discovery (so one discovery cache serves every language subset) and **before** `--list-targets` and `--max-targets`, so the ranked list and the top-N both reflect the filter. Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust, `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive. The SBOM/SCA pass is unaffected — it always scans the whole tree across all ecosystems regardless of this fuzzing-lane filter |
@@ -826,9 +826,12 @@ harness driver or its `repairs/` stays a codegen defect. The manifest says
 
 ### Per-Finding Replay
 
-Each finding's `finding.json` records the pass, fuzz seed, env vars injected,
-and the active fake-resource list. `bhf replay --finding <F>` reuses the
-same mode and env.
+Each finding's `finding.json` records the pass it was found in and whether
+the runtrace shim was armed (`runtime_mode.pass`, `runtime_mode.shim_armed`),
+and the environment variables the run injected (`runtime_mode.env_injected`).
+`bhf replay --finding <F>` reuses that pass and environment. A fake resource
+in the `rng` pass serves bytes seeded from its own name, so the pass and the
+environment reproduce what it served.
 
 ## Re-Runs
 
@@ -1024,8 +1027,14 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
 - **Static linking.** LD_PRELOAD does not apply to static binaries. The
   build-time sweep still runs; the runtime audit falls back to a strace-style
   audit (no faking).
-- **Cross-arch.** Out of scope for `auto`. Use the manual flow with
-  `bhf build --target …` for cross compilation.
+- **Cross-arch.** A whole sweep builds for another architecture with
+  `--target-triple` and runs under `--runner` (see
+  [Whole-Sweep Cross Targets](cross-compilation.md#whole-sweep-cross-targets)),
+  coverage-guided with the compiler's SanitizerCoverage. ASan is not armed,
+  because its shadow memory does not survive qemu-user, so hard faults are
+  the crashes, and the runtrace shim and its behavioural oracles do not run
+  under the emulator (see
+  [Cross-compilation scope and oracle limitations](cross-compilation.md#cross-compilation-scope-and-oracle-limitations)).
 - **Multi-threaded targets.** The shim is thread-safe, but fake-data RNGs
   are single-state per resource — two threads reading the same fake fd race
   for bytes.

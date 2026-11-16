@@ -2728,7 +2728,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             // serial loop is kept only for a host that could never run a second
             // worker, where the pool would add threads and buy nothing.
             let results = if jobs_ceiling <= 1 {
-                // --jobs 1 (default): the historical serial sweep, byte-identical when no
+                // One worker (`--jobs 1`, or the default on a one- or two-core
+                // host): the historical serial sweep, byte-identical when no
                 // --campaign-time is set (the deadline check is a no-op while None).
                 let mut results = Vec::new();
                 // #94: count targets that reach the fuzz phase; stop once `success_cap` do,

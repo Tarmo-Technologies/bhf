@@ -45,6 +45,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- auto.md's defaults and limitations match the code: `--jobs` defaults to
+  half the host's cores (at most 8, `BHF_DEFAULT_JOBS` overrides), not 1,
+  which changes the memory sizing; `--sanitizers` defaults to
+  `address,undefined`, with `none` the opt-out; `--static-dynamic` is a
+  deprecated no-op (the `kind` and `confirmation` columns say what it
+  promised); a whole sweep does cross-build with `--target-triple` and
+  `--runner`, with the limits that has; and `finding.json` records the pass,
+  `shim_armed` and the injected environment, not a fuzz seed or fake list.
+  Docs tests compare the table's defaults with `bhf auto --help` and the
+  config-key list with the keys the code reads.
 - auto.md documents every `bhf auto` flag: `--max-attempts`, `--sbom`,
   `--sloc`, `--extra-source`, `--project`, `--preprocess`,
   `--no-minimize`, `--no-fuzzing-build-mode`, the WinAFL flags and the C and
