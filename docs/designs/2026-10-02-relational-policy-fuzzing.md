@@ -1,9 +1,14 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Coverage-guided relational policy fuzzing (#61)
 
-> Status: **design for review** — no implementation yet. Depends on #55
+> Status: **implemented** (92d99c1, `bhf relational`; the external-comparator
+> predicate in c5e57e5; draining and novelty fixes in 6aea67d). Depends on #55
 > (postcondition/semantic predicates) and #60 (runtime-event collector); builds
 > on the existing `bhf differential`.
+>
+> Not delivered: all four phases shipped; no follow-up is open. The collector
+> gaps that limit its effect-based predicates are tracked in the runtime-event
+> collector design.
 
 ## Problem
 

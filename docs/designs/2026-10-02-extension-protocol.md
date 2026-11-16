@@ -1,9 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Versioned out-of-process extension protocol (#57)
 
-> Status: **design for review** — no implementation yet. Largest of the five
-> private-target-integration specs; depends conceptually on #56 (profiles) to
-> declare which extensions a target trusts.
+> Status: **implemented** in part (1efe037, the `bhf.extension.v1` host and
+> `oracle.evaluate`; hardened in 3d344c6, 593f37b and 1f170ea). Largest of the
+> five private-target-integration specs; depends conceptually on #56
+> (profiles) to declare which extensions a target trusts.
+>
+> Not delivered:
+> - the codec in the builtin fuzz loop: [#373](https://github.com/Tarmo-Technologies/bhf/issues/373);
+> - extension mutators as a fuzz stage: [#314](https://github.com/Tarmo-Technologies/bhf/issues/314);
+> - lifecycle hooks around each case: [#374](https://github.com/Tarmo-Technologies/bhf/issues/374);
+> - `bhf extension session` against a real target (it drives the toy
+>   target only): [#313](https://github.com/Tarmo-Technologies/bhf/issues/313);
+> - the public extension protocol page: [#228](https://github.com/Tarmo-Technologies/bhf/issues/228).
 
 ## Problem
 

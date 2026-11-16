@@ -6,8 +6,16 @@ source-unavailable, policy-bound targets. The shipped features #47 (runner /
 target args), #59 (runtime sink oracles in manual + binary fuzz), and #55 (user
 postcondition oracles + fixture hooks) are the foundation these build on.
 
-Each spec is a **design for review** — no implementation has started. They are
-written so each can be prioritised and approved independently before any build.
+All five are implemented, three of them in part; each design's status line
+names its commits and links the open issues for what was not delivered:
+
+| Design | Status | Not delivered |
+|---|---|---|
+| #56 external project profiles | implemented (0b76dd0) | — (related: [#334](https://github.com/Tarmo-Technologies/bhf/issues/334)) |
+| #57 extension protocol | in part (1efe037) | [#373](https://github.com/Tarmo-Technologies/bhf/issues/373), [#314](https://github.com/Tarmo-Technologies/bhf/issues/314), [#374](https://github.com/Tarmo-Technologies/bhf/issues/374), [#313](https://github.com/Tarmo-Technologies/bhf/issues/313), [#228](https://github.com/Tarmo-Technologies/bhf/issues/228) |
+| #58 stateful protocol sessions | in part (c8c8fd0) | [#363](https://github.com/Tarmo-Technologies/bhf/issues/363), [#364](https://github.com/Tarmo-Technologies/bhf/issues/364), [#260](https://github.com/Tarmo-Technologies/bhf/issues/260), [#258](https://github.com/Tarmo-Technologies/bhf/issues/258), [#262](https://github.com/Tarmo-Technologies/bhf/issues/262), [#261](https://github.com/Tarmo-Technologies/bhf/issues/261), [#315](https://github.com/Tarmo-Technologies/bhf/issues/315), [#257](https://github.com/Tarmo-Technologies/bhf/issues/257) |
+| #60 runtime-event collector | in part (85e4781) | [#76](https://github.com/Tarmo-Technologies/bhf/issues/76), [#246](https://github.com/Tarmo-Technologies/bhf/issues/246), [#247](https://github.com/Tarmo-Technologies/bhf/issues/247), [#278](https://github.com/Tarmo-Technologies/bhf/issues/278) |
+| #61 relational policy fuzzing | implemented (92d99c1) | — |
 
 | Spec | Issue | Size | Depends on |
 |---|---|---|---|
