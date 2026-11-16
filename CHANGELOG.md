@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A TypeScript finding names the `.ts` file and line. Its frames pointed at
+  the `target.js` esbuild transpiled the source to in the work dir. The lane
+  now writes a source map and runs node with `--enable-source-maps`, so the
+  stack, `finding.json` and SARIF name `src/codec.ts:7`. Plain JavaScript
+  harnesses are unchanged.
 - The AFL++ lane of a C, C++ or sequence harness runs each input from a heap
   allocation of exactly its size, as the builtin lane does. It ran the target
   on AFL++'s 1 MiB testcase buffer with the tail poisoned, so a read one past

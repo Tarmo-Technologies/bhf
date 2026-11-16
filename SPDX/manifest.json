@@ -2575,6 +2575,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_ts_source_maps.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_ts_string_param.rs",
       "license": "Apache-2.0"
     },
