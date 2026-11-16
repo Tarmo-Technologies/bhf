@@ -1200,8 +1200,14 @@ when scheduling evidence is missing or jobs remain unassigned. Pass
 air-gapped handoff.
 
 `bhf list targets` prints each candidate's stable `harness_id` in table and
-JSON output. Use that id with `bhf auto --harness-id <ID>` to rerun one
-specific target when names collide across files.
+JSON output. The id is the one `bhf auto` uses for the same tree, however the
+root is spelled (`src/p1`, its absolute path, or `.` from inside it). Use it
+with `bhf auto --harness-id <ID>` to rerun one specific target when names
+collide across files. `bhf list targets` takes the same `--target`,
+`--harness-id` and `--target-file` selections as `bhf auto`. In both commands a
+selection that matches nothing prints `--harness-id '<ID>' matched no target;
+closest: ...` (likewise for the other two), and when nothing is left the
+command exits 2, `bhf auto --dry-run` and `--list-targets` included.
 
 `bhf fuzz` runs the built-in engine against a built harness under
 `bhf_work/build/<harness-id>/`. It accepts literal `--seed-input` values

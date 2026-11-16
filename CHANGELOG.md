@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf list targets` gives the harness ids `bhf auto` uses whatever the root
+  path's spelling (relative, absolute, `.`), and takes `auto`'s `--target`,
+  `--harness-id` and `--target-file` selections. A selection that matches
+  nothing names the closest targets, and when nothing is left both commands
+  exit 2 (`auto --dry-run` and `--list-targets` used to exit 0).
 - `bhf auto` with a work directory an earlier run used for a different source
   tree moves that run to `<work>/archived/` before it starts, instead of
   reporting the other tree's findings and source path as its own.

@@ -1712,23 +1712,58 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         }
     }
     if !args.harness_ids.is_empty() {
+        let discovered: Vec<String> = candidates.iter().map(|c| c.harness_id.clone()).collect();
+        for selected in &args.harness_ids {
+            if !discovered.contains(selected) {
+                bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note(
+                        "--harness-id",
+                        selected,
+                        &discovered
+                    )
+                );
+            }
+        }
         let selected: std::collections::HashSet<&str> =
             args.harness_ids.iter().map(String::as_str).collect();
         candidates.retain(|candidate| selected.contains(candidate.harness_id.as_str()));
     }
     if !args.target_files.is_empty() {
+        let canonical = |candidate: &crate::auto::candidate::Candidate| {
+            candidate
+                .source_path
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.source_path.clone())
+        };
+        let discovered: Vec<PathBuf> = candidates.iter().map(canonical).collect();
+        let shown: Vec<String> = discovered
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&path)
+                    .unwrap_or(file)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        for target_file in &args.target_files {
+            if !discovered.contains(&normalize_target_file_filter(&path, target_file)) {
+                bhfeprintln!(
+                    "{}",
+                    crate::target_filter::unmatched_filter_note(
+                        "--target-file",
+                        &target_file.display().to_string(),
+                        &shown
+                    )
+                );
+            }
+        }
         let selected: std::collections::HashSet<PathBuf> = args
             .target_files
             .iter()
             .map(|target_file| normalize_target_file_filter(&path, target_file))
             .collect();
-        candidates.retain(|candidate| {
-            let candidate_path = candidate
-                .source_path
-                .canonicalize()
-                .unwrap_or_else(|_| candidate.source_path.clone());
-            selected.contains(&candidate_path)
-        });
+        candidates.retain(|candidate| selected.contains(&canonical(candidate)));
     }
     // A fuzz driver that survived an explicit --target/--harness-id/--target-file
     // selection was asked for by name and is kept (it is harnessed as a
@@ -1736,6 +1771,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // drivers: say what was left out and how to pick one.
     let explicit_selection =
         !args.targets.is_empty() || !args.harness_ids.is_empty() || !args.target_files.is_empty();
+    // A selection that matched nothing is a usage error in every mode,
+    // `--dry-run` and `--list-targets` included: running on, or saying "would
+    // fuzz 0 target(s)" and exiting 0, hides a mistyped or stale id.
+    if explicit_selection && candidates.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --target/--harness-id/--target-file matched no target in {}",
+            path.display()
+        );
+        return Ok(2);
+    }
     if library_targets_present && !explicit_selection {
         let ignored = crate::auto::discovery::drop_shadowed_fuzz_drivers(&mut candidates);
         if let Some(note) = ignored_fuzz_drivers_note(&ignored, &path) {
@@ -5086,7 +5131,7 @@ fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> 
 /// discovered names, and the spellings `--target` accepts.
 fn unmatched_target_note(selected: &str, discovered: &[String]) -> String {
     let closest = crate::target_filter::closest_matches(selected, discovered, |n| n, 5);
-    let mut note = format!("  --target '{selected}' matched no discovered target");
+    let mut note = format!("  --target '{selected}' matched no target");
     if !closest.is_empty() {
         let listed: Vec<&str> = closest.iter().map(|name| name.as_str()).collect();
         note.push_str(&format!("; closest: {}", listed.join(", ")));

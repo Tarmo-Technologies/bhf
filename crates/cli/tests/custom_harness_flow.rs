@@ -628,31 +628,39 @@ mod linux {
                 command.push("--target".into());
                 command.push(target.into());
             }
-            let output = bhf(&command, &[], Duration::from_secs(120));
+            bhf(&command, &[], Duration::from_secs(120))
+        };
+        let listed = |work: &str, target: Option<&str>| {
+            let output = list(work, target);
             assert!(output.status.success(), "{}", text(&output));
             output
         };
 
         // Without a selection the driver is shadowed by the library, with a note.
-        let plain = text(&list("w-plain", None));
+        let plain = text(&listed("w-plain", None));
         assert!(plain.contains("widgets::Codec::decode"), "{plain}");
         assert!(!plain.contains("  LLVMFuzzerTestOneInput"), "{plain}");
         assert!(plain.contains("ignored 1 project fuzz driver"), "{plain}");
 
         // Naming the driver keeps it.
-        let driver = text(&list("w-driver", Some("LLVMFuzzerTestOneInput")));
+        let driver = text(&listed("w-driver", Some("LLVMFuzzerTestOneInput")));
         assert!(driver.contains("1 ranked target(s)"), "{driver}");
         assert!(driver.contains("LLVMFuzzerTestOneInput"), "{driver}");
 
         // A class-qualified suffix selects the namespaced method.
-        let suffix = text(&list("w-suffix", Some("Codec::decode")));
+        let suffix = text(&listed("w-suffix", Some("Codec::decode")));
         assert!(suffix.contains("1 ranked target(s)"), "{suffix}");
         assert!(suffix.contains("widgets::Codec::decode"), "{suffix}");
 
-        // A miss names the closest discovered target.
-        let miss = text(&list("w-miss", Some("Codec::decod")));
-        assert!(miss.contains("0 ranked target(s)"), "{miss}");
-        assert!(miss.contains("closest: widgets::Codec::decode"), "{miss}");
+        // A miss names the closest discovered target, and with nothing left
+        // the listing exits 2.
+        let output = list("w-miss", Some("Codec::decod"));
+        let miss = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{miss}");
+        assert!(
+            miss.contains("matched no target; closest: widgets::Codec::decode"),
+            "{miss}"
+        );
     }
 
     /// Split `VAR=value VAR='a b' bhf build <work> --harness <id>` into its

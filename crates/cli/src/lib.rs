@@ -515,7 +515,7 @@ where
         Some(Command::Relational(relational_args)) => relational::run(relational_args),
         Some(Command::List(list)) => match list.command {
             ListCommand::Targets(args) => match list_targets::run(args) {
-                Ok(()) => 0,
+                Ok(code) => code,
                 Err(error) => {
                     eprintln!("{error:#}");
                     1
@@ -596,7 +596,7 @@ where
         Some(Command::Llm(args)) => llm::run(args),
         Some(Command::ListOracles(args)) => list_oracles::run(args),
         Some(Command::ListTargets(list_args)) => match list_targets::run(list_args) {
-            Ok(()) => 0,
+            Ok(code) => code,
             Err(error) => {
                 eprintln!("{error:#}");
                 1
