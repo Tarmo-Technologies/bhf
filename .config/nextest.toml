@@ -17,15 +17,17 @@ test-group = 'heavy-bhf'
 # CI runs (ci.yml, integration-nightly.yml) use `--profile ci`:
 #  - a failing test is retried once; one that then passes is reported FLAKY,
 #    which scripts/ci/junit-summary.py lists in the job summary;
-#  - a test still running after 16 minutes (8 periods of 120s) is killed and
+#  - a test still running after 10 minutes (5 periods of 120s) is killed and
 #    reported as a TIMEOUT failure, so a hang names itself instead of using up
-#    the job's timeout;
+#    the job's timeout: a hang and its retry take 20 minutes, which leaves a
+#    40-minute nightly shard time for its other tests and the report. The
+#    slowest regular test takes about 5.5 minutes on a runner;
 #  - the JUnit report (target/nextest/ci/junit.xml, uploaded by each job)
 #    keeps every test's captured stdout and stderr, passing tests included.
 # Overrides of the default profile, such as the heavy-bhf group, apply here too.
 [profile.ci]
 retries = 1
-slow-timeout = { period = "120s", terminate-after = 8 }
+slow-timeout = { period = "120s", terminate-after = 5 }
 fail-fast = false
 failure-output = "immediate-final"
 # The nightly builds one archive (`cargo nextest archive --profile ci`) that
@@ -50,6 +52,14 @@ store-failure-output = true
 [[profile.ci.overrides]]
 filter = 'binary(=build_recovery) & test(=build_recovery_scenarios)'
 slow-timeout = { period = "300s", terminate-after = 10 }
+retries = 0
+
+# The nightly's `ignored` shard runs the long cold-solve discriminators (the
+# RedQueen one takes about 13 minutes on a runner): 25 minutes each, and no
+# retry, which would not fit in the shard's 40.
+[[profile.ci.overrides]]
+filter = 'binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)'
+slow-timeout = { period = "300s", terminate-after = 5 }
 retries = 0
 
 # The release-build extension tests in build-test, kept in a report of their own.

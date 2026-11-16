@@ -93,10 +93,13 @@ jobs:
           cargo build --locked --release -p bhf -p bhf_runtrace_shim
           cargo nextest archive --locked --workspace --profile ci --archive-file nightly-tests.tar.zst
 
+      # Named by the run alone: a rerun of a failed shard does not rebuild the
+      # archive and downloads this one; a rerun of this job replaces it.
       - name: Upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: nightly-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nightly-tests-${{ github.run_id }}
+          overwrite: true
           path: nightly-tests.tar.zst
           if-no-files-found: error
           retention-days: 1
@@ -244,7 +247,7 @@ jobs:
       - name: Download the test archive
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: nightly-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nightly-tests-${{ github.run_id }}
 
       # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
       # the heavy-bhf concurrency cap (.config/nextest.toml) limits concurrent

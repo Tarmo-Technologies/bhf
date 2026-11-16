@@ -273,9 +273,15 @@ class IntegrationNightlyArchiveTests(unittest.TestCase):
 
     def test_every_shard_runs_from_the_archive_the_build_job_uploads(self) -> None:
         self.assertIn("    needs: [gate, build]\n", self.job)
-        name = "nightly-tests-${{ github.run_id }}-${{ github.run_attempt }}"
-        self.assertIn(f"          name: {name}\n          path: nightly-tests.tar.zst\n", self.build_job)
+        # Named by the run alone, so a rerun of a failed shard, which does not
+        # rebuild the archive, still finds it; a rebuild replaces it.
+        name = "nightly-tests-${{ github.run_id }}"
+        self.assertIn(
+            f"          name: {name}\n          overwrite: true\n          path: nightly-tests.tar.zst\n",
+            self.build_job,
+        )
         self.assertIn(f"          name: {name}\n", self.job.split("Download the test archive", 1)[1])
+        self.assertNotIn("nightly-tests-${{ github.run_id }}-", self.build_job + self.job)
         env = step_env(shard_step(self.job))
         self.assertEqual(env["BHF_TEST_BIN"], "${{ github.workspace }}/target/release/bhf")
         self.assertNotIn("cargo build", self.job, "a shard builds nothing")
