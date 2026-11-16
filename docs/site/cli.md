@@ -1550,6 +1550,15 @@ scopes under the work directory. `--findings` removes `results/` (findings,
 indexes, `static/` and `sbom/` reports) plus any legacy `findings/`/
 `FINDINGS.md`/`findings.csv` paths; `--reports` removes only `results/report/`
 (the `bhf report` snapshots), leaving the rest of `results/` intact.
+`--all` also removes the fuzz loop's scratch: `fuzz_inputs/`, `fuzz_shm/` and
+`fuzz_campaigns/`, and the `.tmp*` shared-map files an older `bhf fuzz` left
+at the top of the work dir.
+
+`bhf fuzz` keeps its shared-memory maps (coverage, value profile, comparison
+operands) in `<work>/fuzz_shm/`, named `<pid>-<random>.shm`. They go when the
+run ends, when SIGINT, SIGTERM or SIGHUP stops it (the signal still ends the
+run), and, for a run killed with SIGKILL, when a later `bhf fuzz` in the same
+work dir finds their process gone, or with `bhf clean --all`.
 
 ## Auto
 

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
+mod shared_map;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
 
@@ -1261,11 +1262,11 @@ struct PreparedFuzzRun {
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
-    _local_coverage_map: Option<tempfile::TempPath>,
+    _local_coverage_map: Option<shared_map::SharedMapFile>,
     /// Keeps the RedQueen (#400) per-input cmplog operand map alive for the run.
-    _local_cmp_map: Option<tempfile::TempPath>,
+    _local_cmp_map: Option<shared_map::SharedMapFile>,
     /// Keeps the value-profile (#398) map alive for the run.
-    _local_vp_map: Option<tempfile::TempPath>,
+    _local_vp_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
@@ -3005,19 +3006,16 @@ fn structured_input_mode_arg_name(mode: StructuredInputMode) -> &'static str {
     }
 }
 
-/// Create a zero-filled, `bytes`-sized temp file inside `work_dir` to back a
-/// harness shared-memory channel, returning the RAII lifetime handle and its
+/// Create a zero-filled, `bytes`-sized file in `<work_dir>/fuzz_shm/` to back
+/// a harness shared-memory channel, returning the handle that keeps it and its
 /// path string (for the child's `*_SHM` env var). The file is unlinked when the
-/// returned `TempPath` drops, so it lives exactly as long as the prepared run.
-fn arm_shared_map(work_dir: &Path, bytes: usize) -> Result<(tempfile::TempPath, String), String> {
-    let file = tempfile::NamedTempFile::new_in(work_dir)
-        .map_err(|error| format!("create harness shared map: {error}"))?;
-    file.as_file()
-        .set_len(bytes as u64)
-        .map_err(|error| format!("size harness shared map: {error}"))?;
-    let path = file.into_temp_path();
-    let value = path.to_string_lossy().into_owned();
-    Ok((path, value))
+/// handle drops, so it lives exactly as long as the prepared run, or when a
+/// stopping signal ends the process ([`shared_map`]).
+fn arm_shared_map(
+    work_dir: &Path,
+    bytes: usize,
+) -> Result<(shared_map::SharedMapFile, String), String> {
+    shared_map::SharedMapFile::create(work_dir, bytes)
 }
 
 fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
@@ -3233,7 +3231,7 @@ fn prepare_with_runner(
         None
     };
     #[cfg(not(any(target_os = "linux", windows)))]
-    let local_cmp_map: Option<tempfile::TempPath> = None;
+    let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
     Ok(PreparedFuzzRun {
         work_dir,

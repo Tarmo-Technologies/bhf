@@ -1735,6 +1735,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/shared_map.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/winafl.rs",
       "license": "Apache-2.0"
     },
@@ -2796,6 +2800,10 @@
     },
     {
       "path": "crates/cli/tests/fuzz_cpu_contention.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_interrupt_cleanup.rs",
       "license": "Apache-2.0"
     },
     {

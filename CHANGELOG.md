@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An interrupted `bhf fuzz` leaves no shared-memory files behind. Its maps
+  were `.tmp*` files at the top of the work dir, which a killed run left there
+  and `bhf clean --all` kept; they now live in `<work>/fuzz_shm/` as
+  `<pid>-<random>.shm`, are unlinked on SIGINT, SIGTERM and SIGHUP before the
+  signal ends the run, and a later run removes those of a process that is
+  gone. `clean --all` removes `fuzz_shm/`, `fuzz_inputs/`, `fuzz_campaigns/`
+  and an older run's top-level `.tmp*` maps.
 - `bhf fuzz` prints a progress line on stderr while it runs (executions,
   exec/s, corpus entries, findings, edges, elapsed), 2s in and then at
   doubling intervals up to every 30s; `--quiet` (`-q`) prints none. It printed
