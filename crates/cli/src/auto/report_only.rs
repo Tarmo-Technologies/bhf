@@ -346,14 +346,9 @@ fn same_file(reported: &str, source: &Path, source_canon: Option<&Path>) -> bool
 mod tests {
     use super::*;
     use crate::auto::candidate::Lang;
-    use std::path::PathBuf;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("bhf-ro-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn temp_dir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("ro-{tag}"))
     }
 
     /// `--static` must not flag bhf's OWN generated harness: a `--work-dir`

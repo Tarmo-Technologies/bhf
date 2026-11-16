@@ -552,11 +552,8 @@ mod tests {
         serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("bhf-confirm-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("confirm-{tag}"))
     }
 
     /// Negative confirmation: a static finding whose exact line a covered-lines

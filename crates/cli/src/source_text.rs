@@ -87,7 +87,6 @@ pub(crate) fn decode_source_bytes(bytes: Vec<u8>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn valid_utf8_passes_through_unchanged() {
@@ -113,11 +112,8 @@ mod tests {
 
     #[test]
     fn read_source_text_transcodes_latin1_file() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("bhf-latin1-{nonce}.ads"));
+        let path_guard = crate::test_support::TestDir::new("latin1");
+        let path = path_guard.join("latin1.ads");
         let mut bytes = b"-- Copyright ".to_vec();
         bytes.push(0xA9); // (c) sign in Latin-1
         bytes.extend_from_slice(b"\nprocedure Demod is begin null; end Demod;\n");

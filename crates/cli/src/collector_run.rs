@@ -1399,14 +1399,7 @@ mod tests {
 
     #[test]
     fn replay_reproduces_finding_from_stored_evidence() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-collector-replay-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("collector-replay");
         let collector = mock_resolved(250);
         let set = sessions(&MockCollector::path_control(), "tc", 0);
         let outcome = collector.evaluate(&set, "/srv/sandbox");
@@ -1435,16 +1428,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn unique_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-select-replay-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn unique_dir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("select-replay-{tag}"))
     }
 
     /// Write a crash finding dir with a `testcase.bin` and a `finding.json` whose

@@ -3685,22 +3685,21 @@ fn gnat_accepts_ada2022() -> bool {
     use std::sync::OnceLock;
     static ACCEPTS: OnceLock<bool> = OnceLock::new();
     *ACCEPTS.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("bhf-gnat-probe-{}", std::process::id()));
-        if fs::create_dir_all(&dir).is_err() {
+        // Removed when `dir` drops, whatever the probe's outcome.
+        let Ok(dir) = tempfile::Builder::new().prefix("bhf-gnat-probe-").tempdir() else {
             return true;
-        }
-        let src = dir.join("bhf_probe.adb");
+        };
+        let src = dir.path().join("bhf_probe.adb");
         let wrote = fs::write(&src, "procedure Bhf_Probe is begin null; end Bhf_Probe;\n").is_ok();
         let accepts = wrote
             && std::process::Command::new("gcc")
                 .arg("-c")
                 .arg("-gnat2022")
                 .arg(&src)
-                .current_dir(&dir)
+                .current_dir(dir.path())
                 .output()
                 .map(|out| !String::from_utf8_lossy(&out.stderr).contains("invalid switch"))
                 .unwrap_or(true);
-        let _ = fs::remove_dir_all(&dir);
         accepts
     })
 }

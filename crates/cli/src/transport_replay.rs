@@ -506,14 +506,8 @@ mod tests {
         (port, received, handle)
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-transport-replay-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("transport-replay-{tag}"))
     }
 
     #[test]

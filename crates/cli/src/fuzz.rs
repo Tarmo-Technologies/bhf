@@ -9328,14 +9328,8 @@ mod exec_wait_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-exec-wait-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("exec-wait-{name}"))
     }
 
     fn script(dir: &Path, body: &str) -> PathBuf {
@@ -10137,12 +10131,7 @@ mod engine_list_tests {
 
     #[test]
     fn resolve_afl_fuzz_prefers_afl_path_then_falls_back() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-aflpath-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("aflpath");
         let bin = dir.join(if cfg!(windows) {
             "afl-fuzz.exe"
         } else {
@@ -10460,19 +10449,11 @@ mod entropic_tests {
 mod vp_tokens_tests {
     use super::read_vp_tokens;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_driver_value_profile_log() {
         // Layout the driver writes: [u32 cursor][ {u8 len}{len bytes} ... ].
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-vp-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("vp");
         let path = dir.join("vp.shm");
         let mut body = Vec::new();
         for tok in [b"{".as_slice(), b"true", &[0x50, 0x4b, 0x03, 0x04]] {
@@ -10530,7 +10511,6 @@ mod resolve_iterations_tests {
 mod coverage_tracker_tests {
     use super::{count_to_bucket, CoverageTracker, BHF_COV_BITS};
     use std::io::{Seek, SeekFrom, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     // Set one bitmap byte (an "edge") the way the driver's coverage runtime would.
     // A write() to the file shares the page cache with the tracker's MAP_SHARED
@@ -10554,14 +10534,7 @@ mod coverage_tracker_tests {
 
     #[test]
     fn coverage_tracker_keeps_only_coverage_increasing_inputs() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov");
         let path = dir.join("coverage.shm");
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
 
@@ -10616,14 +10589,7 @@ mod coverage_tracker_tests {
     // (modelled by `zero_counts`), so each call observes one exec's counts.
     #[test]
     fn coverage_tracker_buckets_register_transitions_not_within_bucket_noise() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-cnt-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov-cnt");
         let cov = dir.join("coverage.shm");
         let cnt = dir.join("coverage_cnt.shm");
         let env = vec![
@@ -10708,14 +10674,7 @@ mod coverage_tracker_tests {
     // by `zero_progress`), so each call observes one exec's per-site progress.
     #[test]
     fn coverage_tracker_progress_registers_new_leading_match_levels() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cmpp-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cmpp");
         let cov = dir.join("coverage.shm");
         let cmpp = dir.join("cmp_progress.shm");
         let env = vec![
@@ -10776,14 +10735,7 @@ mod coverage_tracker_tests {
     // trace-pc path), rather than fabricating novelty.
     #[test]
     fn coverage_tracker_without_progress_map_is_inert() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cmpp-absent-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cmpp-absent");
         let cov = dir.join("coverage.shm");
         // No BHF_CMP_PROGRESS_SHM: the progress channel must stay inert.
         let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
@@ -10801,14 +10753,7 @@ mod coverage_tracker_tests {
     // channel is inert (always false) rather than fabricating novelty.
     #[test]
     fn coverage_tracker_without_count_map_is_presence_only() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-nocnt-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov-nocnt");
         let cov = dir.join("coverage.shm");
         // No BHF_COV_CNT_SHM: the bucket channel must stay inert.
         let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
@@ -14487,12 +14432,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn collector_auto_without_shim_log_is_not_reported_clean() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let work = std::env::temp_dir().join(format!("bhf-fuzz-col-noobs-{nonce}"));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("fuzz-col-noobs");
 
         // No runtrace.jsonl is written (the shim was never armed).
         let prov = run_collector_for_fuzz(
@@ -14593,23 +14533,22 @@ mod redqueen_cmplog_tests {
     use super::{
         CmpShmReader, CoverageTracker, BHF_CMP_BYTES, BHF_CMP_CAP, BHF_CMP_OPMAX, BHF_CMP_REC,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_path(tag: &str) -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("bhf-rq-{tag}-{n}"))
+    /// A path for a shared-memory image, in a dir removed when the guard drops.
+    fn tmp_path(tag: &str) -> (crate::test_support::TestDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestDir::new(&format!("rq-{tag}"));
+        let path = dir.join("shm");
+        (dir, path)
     }
 
     /// Write a `BHF_CMP_SHM` image with the given (count, records) and the
-    /// usual header, then return the path + an env vec pointing `CmpShmReader` at it.
+    /// usual header, then return its dir's guard + an env vec pointing
+    /// `CmpShmReader` at it.
     fn write_cmp_image(
         tag: &str,
         count: u32,
         records: &[(u8, u8, Vec<u8>, Vec<u8>)],
-    ) -> (std::path::PathBuf, Vec<(String, String)>) {
+    ) -> (crate::test_support::TestDir, Vec<(String, String)>) {
         let mut buf = vec![0u8; BHF_CMP_BYTES];
         // header: [u32 armed=0][u32 count]
         buf[4..8].copy_from_slice(&count.to_le_bytes());
@@ -14623,10 +14562,10 @@ mod redqueen_cmplog_tests {
             buf[off + 2 + BHF_CMP_OPMAX..off + 2 + BHF_CMP_OPMAX + b_end]
                 .copy_from_slice(&b[..b_end]);
         }
-        let path = tmp_path(tag);
+        let (dir, path) = tmp_path(tag);
         std::fs::write(&path, &buf).unwrap();
         let env = vec![("BHF_CMP_SHM".to_owned(), path.display().to_string())];
-        (path, env)
+        (dir, env)
     }
 
     #[test]
@@ -14651,7 +14590,7 @@ mod redqueen_cmplog_tests {
             // both operands empty -> skipped
             (0, 0, vec![], vec![]),
         ];
-        let (path, env) = write_cmp_image("roundtrip", records.len() as u32, &records);
+        let (_dir, env) = write_cmp_image("roundtrip", records.len() as u32, &records);
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         let log = reader.read_log();
 
@@ -14675,7 +14614,6 @@ mod redqueen_cmplog_tests {
                 .any(|c| c.offset == 0 && c.replacement == vec![0x88, 0x77, 0x66, 0x55]),
             "splice candidate at the planted offset must be found"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -14688,7 +14626,7 @@ mod redqueen_cmplog_tests {
             vec![0x5A; BHF_CMP_OPMAX],
             vec![0xA5; BHF_CMP_OPMAX],
         )];
-        let (path, env) = write_cmp_image("clamp", (BHF_CMP_CAP as u32) + 9999, &records);
+        let (_dir, env) = write_cmp_image("clamp", (BHF_CMP_CAP as u32) + 9999, &records);
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         let log = reader.read_log();
         // Only one real record was written; the rest of the (clamped-to-CAP) range
@@ -14696,12 +14634,12 @@ mod redqueen_cmplog_tests {
         assert_eq!(log.entries.len(), 1);
         assert_eq!(log.entries[0].operand_a.len(), BHF_CMP_OPMAX);
         assert_eq!(log.entries[0].operand_b.len(), BHF_CMP_OPMAX);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn arm_zeroes_count_and_sets_armed_disarm_clears() {
-        let (path, env) = write_cmp_image("arm", 7, &[(2, 2, vec![1, 2], vec![3, 4])]);
+        let (dir, env) = write_cmp_image("arm", 7, &[(2, 2, vec![1, 2], vec![3, 4])]);
+        let path = dir.join("shm");
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         reader.arm();
         let after_arm = std::fs::read(&path).unwrap();
@@ -14714,7 +14652,6 @@ mod redqueen_cmplog_tests {
             &[0, 0, 0, 0],
             "armed cleared by disarm"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     /// The edge map of a GCC `trace-pc` harness is labelled with that
@@ -14786,7 +14723,7 @@ mod redqueen_cmplog_tests {
 
     #[test]
     fn coverage_tracker_snapshot_zero_restore_round_trips() {
-        let path = tmp_path("cov");
+        let (_dir, path) = tmp_path("cov");
         std::fs::write(&path, vec![0u8; crate::fuzz::BHF_COV_BITS]).unwrap();
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
         let tracker = CoverageTracker::new(&env).expect("map cov shm");

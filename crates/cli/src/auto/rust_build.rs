@@ -4846,10 +4846,9 @@ mod tests {
     /// runtime is not on every box). Gates the Rust libFuzzer e2e below.
     #[cfg(unix)]
     fn libfuzzer_runtime_available() -> bool {
-        let dir = std::env::temp_dir().join(format!("bhf-rust-lf-smoke-{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_err() {
+        let Ok(dir) = crate::test_support::TestDir::try_new("rust-lf-smoke") else {
             return false;
-        }
+        };
         let src = dir.join("s.c");
         let wrote = std::fs::write(
             &src,
@@ -4864,7 +4863,6 @@ mod tests {
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
-        std::fs::remove_dir_all(&dir).ok();
         ok
     }
 

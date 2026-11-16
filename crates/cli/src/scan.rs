@@ -437,8 +437,6 @@ impl ScanIndex {
 mod tests {
     use super::scan_path;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn scan_counts_c_function_definitions() {
@@ -561,13 +559,7 @@ mod tests {
         assert!(index.files[0].target_details.is_empty());
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-scan-{name}-{nonce}"));
-        fs::create_dir_all(&dir).expect("temporary directory is created");
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("scan-{name}"))
     }
 }

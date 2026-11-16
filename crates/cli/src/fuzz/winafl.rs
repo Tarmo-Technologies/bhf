@@ -2488,14 +2488,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn tmpdir(tag: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-winafl-{tag}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmpdir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("winafl-{tag}"))
     }
 
     fn touch(path: &Path) -> PathBuf {
@@ -2892,7 +2886,8 @@ mod tests {
 
     #[test]
     fn seeds_are_written_byte_for_byte() {
-        let dir = tmpdir("seeds").join("seeds");
+        let root = tmpdir("seeds");
+        let dir = root.join("seeds");
         let binary: Vec<u8> = (0..=255u8).rev().collect();
         let big = vec![7u8; MAX_SEED_BYTES + 10];
         let written = write_seed_dir(&[binary.clone(), Vec::new(), big], &dir).unwrap();
@@ -2903,7 +2898,7 @@ mod tests {
             fs::read(dir.join("seed-0002")).unwrap().len(),
             MAX_SEED_BYTES
         );
-        let none = tmpdir("seeds-none").join("seeds");
+        let none = root.join("none").join("seeds");
         assert_eq!(write_seed_dir(&[Vec::new()], &none).unwrap(), 0);
         assert_eq!(fs::read(none.join("seed-default")).unwrap(), b"AAAA");
     }
@@ -3808,7 +3803,10 @@ mod tests {
     /// input holding `BHF!`, its stand-in WinAFL build, and a stand-in
     /// afl-fuzz running `script` (after it records its argv).
     #[cfg(unix)]
-    fn stand_in_run(tag: &str, script: &str) -> (PathBuf, PathBuf, WinaflTools) {
+    fn stand_in_run(
+        tag: &str,
+        script: &str,
+    ) -> (crate::test_support::TestDir, PathBuf, WinaflTools) {
         use std::os::unix::fs::PermissionsExt;
         let root = tmpdir(tag);
         let build = root.join("work").join("build").join("H-WAF");
@@ -3857,7 +3855,8 @@ mod tests {
             dynamorio_bin: Some(root.join("DynamoRIO").join("bin64")),
             instrumentation: WinaflInstrumentation::Dynamorio,
         };
-        (root.clone(), root.join("work"), tools)
+        let work = root.join("work");
+        (root, work, tools)
     }
 
     #[cfg(unix)]

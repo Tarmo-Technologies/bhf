@@ -4777,16 +4777,10 @@ enum BuildOutcome {
 mod full_tu_gate_tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn precise_definition_sources_prevent_unrelated_full_library_sweep() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-full-tu-gate-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("full-tu-gate");
         let target = root.join("target.c");
         fs::write(&target, "int target(void) { return 0; }\n").unwrap();
         let mut errors = Vec::new();
@@ -4815,7 +4809,7 @@ mod full_tu_gate_tests {
             "a broad link failure made up of unmapped symbols may need the TU sweep"
         );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -5728,19 +5722,19 @@ mod hdf6_environment_tests {
         }
     }
 
-    fn write_src(tag: &str, body: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("bhf-hdf6-env-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// `t.c` holding `body`, in a dir removed when the guard drops.
+    fn write_src(tag: &str, body: &str) -> (crate::test_support::TestDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestDir::new(&format!("hdf6-env-{tag}"));
         let p = dir.join("t.c");
         std::fs::write(&p, body).unwrap();
-        p
+        (dir, p)
     }
 
     // A ChannelConsumer that reads an UNDEFINED, register-read-shaped accessor gets
     // a signature-matching peripheral reader in its environment model.
     #[test]
     fn channel_consumer_with_undefined_mmio_accessor_gets_peripheral_reader() {
-        let src = write_src(
+        let (_dir, src) = write_src(
             "mmio",
             "#include <stdint.h>\n\
              extern uint32_t mmio_read32(uintptr_t addr);\n\
@@ -5765,7 +5759,7 @@ mod hdf6_environment_tests {
     // no register accessor to synthesize.
     #[test]
     fn registered_entry_point_enables_fuzz_driven_callbacks() {
-        let src = write_src("isr", "void radar_isr(void *arg) { (void)arg; }\n");
+        let (_dir, src) = write_src("isr", "void radar_isr(void *arg) { (void)arg; }\n");
         let c = c_candidate(
             src,
             "radar_isr",
@@ -5779,7 +5773,7 @@ mod hdf6_environment_tests {
     // An ordinary attacker-reachable target is untouched (byte-for-byte unchanged).
     #[test]
     fn ordinary_target_gets_no_environment() {
-        let src = write_src(
+        let (_dir, src) = write_src(
             "plain",
             "#include <stddef.h>\nint parse(const char *d, size_t n){ (void)n; return d[0]; }\n",
         );
@@ -5795,7 +5789,7 @@ mod hdf6_environment_tests {
     // accessor) the consumer gets no environment.
     #[test]
     fn message_queue_consumer_is_left_to_the_shim() {
-        let src = write_src(
+        let (_dir, src) = write_src(
             "msgq",
             "extern int msgQReceive(void *q, char *buf, unsigned max, int to);\n\
              int drain(void *q) { char b[64]; return msgQReceive(q, b, sizeof b, -1); }\n",
@@ -5819,7 +5813,7 @@ mod hdf6_environment_tests {
     // A non-C target is never given a C environment model.
     #[test]
     fn non_c_target_gets_no_environment() {
-        let src = write_src("ada", "-- ada\n");
+        let (_dir, src) = write_src("ada", "-- ada\n");
         let mut c = c_candidate(src, "x", Some(InputReachability::ChannelConsumer));
         c.lang = Lang::Ada;
         assert!(hdf6_environment_model(&c).is_none());
@@ -6052,12 +6046,7 @@ mod c_auto_sequence_candidate_tests {
 
     #[test]
     fn returning_constructor_enables_opaque_handle_sequence() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-sequence-ctor-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-sequence-ctor");
         let source = dir.join("decode.c");
         std::fs::write(
             &source,
@@ -6087,17 +6076,12 @@ mod c_auto_sequence_candidate_tests {
             c_auto_sequence_candidate(&candidate, None, &[]),
             "the sequence harness must construct the opaque handle through DecoderCreateInstance"
         );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn public_in_place_lifecycle_enables_sequence_with_opaque_source_receiver() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-sequence-in-place-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-sequence-in-place");
         let source = dir.join("csv.c");
         std::fs::write(
             &source,
@@ -6124,17 +6108,12 @@ mod c_auto_sequence_candidate_tests {
             c_auto_sequence_candidate(&candidate, None, &[]),
             "an exact public init/free receiver pair is enough to request sequence generation"
         );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn private_static_lifecycle_helpers_do_not_enable_auto_sequence() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-sequence-private-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-sequence-private");
         let source = dir.join("session.c");
         std::fs::write(
             &source,
@@ -6161,17 +6140,12 @@ mod c_auto_sequence_candidate_tests {
             !c_auto_sequence_candidate(&candidate, None, &[]),
             "auto must not expose file-private lifecycle helpers by including the whole source"
         );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn destructor_only_output_contract_stays_direct() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-output-only-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-output-only");
         let source = dir.join("regex.c");
         std::fs::write(
             &source,
@@ -6198,17 +6172,12 @@ mod c_auto_sequence_candidate_tests {
             !c_auto_sequence_candidate(&candidate, None, &[]),
             "a destructor alone cannot prove an initially live sequence handle"
         );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn zero_parameter_target_stays_direct_without_panicking() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-zero-param-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-zero-param");
         let source = dir.join("clock.c");
         std::fs::write(&source, "unsigned clock_tick(void) { return 1; }\n").unwrap();
         let candidate = Candidate {
@@ -6225,19 +6194,14 @@ mod c_auto_sequence_candidate_tests {
             dialect: None,
         };
         assert!(!c_auto_sequence_candidate(&candidate, None, &[]));
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn static_operation_uses_proven_public_returning_lifecycle() {
         use harness_gen::c_generate::CHandleLifecycle;
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-c-static-sequence-ctor-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("c-static-sequence-ctor");
         let source = dir.join("reader.c");
         std::fs::write(
             &source,
@@ -6269,7 +6233,7 @@ mod c_auto_sequence_candidate_tests {
             c_auto_sequence_candidate(&candidate, None, &lifecycle),
             "a file-private operation can be sequenced when construction and destruction are proven public"
         );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -12044,7 +12008,6 @@ mod sanitizer_override_tests {
 #[cfg(test)]
 mod corpus_reseed_tests {
     use super::{reseed_from_corpus_queue, CORPUS_RESEED_CAP};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A work dir from an earlier release keeps its corpus but does not
     /// reseed it, once; a work dir with nothing from an earlier release is
@@ -12143,11 +12106,7 @@ mod corpus_reseed_tests {
 
     #[test]
     fn reseed_from_corpus_queue_loads_deduped_capped_inputs() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let work = std::env::temp_dir().join(format!("bhf-reseed-{nonce}"));
+        let work = crate::test_support::TestDir::new("reseed");
         let queue = work.join("corpus").join("H-RS").join("queue");
         std::fs::create_dir_all(&queue).unwrap();
         std::fs::write(queue.join("aaaa.bin"), b"coverage-input-1").unwrap();
@@ -12184,11 +12143,8 @@ mod corpus_reseed_tests {
         // earlier passes persisted. A queue entry that is not valid UTF-8 must be
         // run exactly as stored, not rewritten on its way back into the engine.
         use std::os::unix::fs::PermissionsExt;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-reseed-bytes-{nonce}"));
+        let root_guard = crate::test_support::TestDir::new("reseed-bytes");
+        let root = root_guard.join("root");
         let work = root.join("bhf_work");
         let mut entry: Vec<u8> = vec![0xab, 0xcd, 0xef, 0x99, 0x00, 0x80, 0xff];
         entry.extend((0x80..=0xffu8).rev());
@@ -12605,21 +12561,13 @@ mod corpus_format_tests {
 #[cfg(test)]
 mod source_dictionary_tests {
     use super::write_source_dictionary;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A managed lane's mined dictionary names the line of the target source
     /// each token came from; tokens bhf adds itself carry no location.
     #[test]
     fn source_dictionary_names_the_line_of_each_token() {
         use crate::auto::candidate::Lang;
-        let root = std::env::temp_dir().join(format!(
-            "bhf-source-dictionary-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_support::TestDir::new("source-dictionary");
         let harness_dir = root.join("H-PY");
         std::fs::create_dir_all(&harness_dir).unwrap();
         // The sources exist, as a harness's target source always does: the
@@ -12656,21 +12604,12 @@ mod source_dictionary_tests {
 #[cfg(test)]
 mod cmplog_accumulate_tests {
     use super::{append_cmplog_records, harvest_pass_cmplog};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// After a pass, its runtrace cmplog records reach cmplog.jsonl and the
     /// learned dictionary the next pass and later runs load.
     #[test]
     fn a_pass_harvest_writes_the_learned_dictionary() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-learned-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("learned");
         std::fs::write(
             dir.join("runtrace.jsonl"),
             "{\"e\":\"cmplog\",\"k\":\"strcmp\",\"s\":\"00000010.00000020\",\"a\":\"41\",\"b\":\"5747543100\"}\n\
@@ -12689,12 +12628,7 @@ mod cmplog_accumulate_tests {
 
     #[test]
     fn append_cmplog_records_accumulates_only_cmplog_lines() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cmplog-acc-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cmplog-acc");
         let runtrace = dir.join("runtrace.jsonl");
         let snapshot = dir.join("cmplog.jsonl");
 
@@ -12844,30 +12778,21 @@ mod stamp_tests {
     use crate::auto::pass::Pass;
     use crate::auto::runtrace::RuntraceEvent;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_finding() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-stamp-{n}.json"));
+    /// A `finding.json`, in a dir removed when the guard drops.
+    fn tmp_finding() -> (crate::test_support::TestDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestDir::new("stamp");
+        let p = dir.join("finding.json");
         fs::write(
             &p,
             r#"{"id":"F-0001-abc","exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW"}}"#,
         )
         .unwrap();
-        p
+        (dir, p)
     }
 
-    fn tmpdir(prefix: &str) -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-attempt-{prefix}-{n}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir(prefix: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("attempt-{prefix}"))
     }
 
     #[test]
@@ -12930,12 +12855,12 @@ mod stamp_tests {
         let mirrored = fs::read_to_string(generated.join("main.adb")).unwrap();
         assert!(mirrored.contains("New_Target"));
         assert!(!mirrored.contains("Old_Target"));
-        fs::remove_dir_all(work).ok();
+        fs::remove_dir_all(&work).ok();
     }
 
     #[test]
     fn stamps_pass_and_env_injected() {
-        let path = tmp_finding();
+        let (_dir, path) = tmp_finding();
         stamp_runtime_mode(
             &path,
             Pass::Rng,
@@ -12968,7 +12893,7 @@ mod stamp_tests {
     /// entry path carries it; a label without a basis drops a stale one.
     #[test]
     fn the_reachability_basis_is_stamped_with_its_label() {
-        let path = tmp_finding();
+        let (_dir, path) = tmp_finding();
         fs::write(
             &path,
             r#"{"id":"F-0001-abc","harness_id":"H-C0001","exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW"}}"#,
@@ -13059,7 +12984,7 @@ mod stamp_tests {
 
     #[test]
     fn empty_env_injected_stamps_empty_object() {
-        let path = tmp_finding();
+        let (_dir, path) = tmp_finding();
         stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
@@ -13076,7 +13001,7 @@ mod stamp_tests {
 
     #[test]
     fn stamp_runtime_mode_recomputes_actionability_for_env_prosthetics() {
-        let path = tmp_finding();
+        let (_dir, path) = tmp_finding();
         fs::write(
             &path,
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -14236,7 +14161,6 @@ mod single_header_impl_tests {
 mod platform_stub_tests {
     use super::*;
     use crate::auto::candidate::{Candidate, Lang};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cand(lang: Lang, guard: &str) -> Candidate {
         Candidate {
@@ -14254,14 +14178,8 @@ mod platform_stub_tests {
         }
     }
 
-    fn tmp(prefix: &str) -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-pstub-{prefix}-{n}"));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp(prefix: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("pstub-{prefix}"))
     }
 
     #[test]
@@ -14603,8 +14521,7 @@ mod platform_stub_tests {
             "host clang must arm a bounds trap for this test: {guards:?}"
         );
 
-        let dir = std::env::temp_dir().join(format!("bhf-bounds-guard-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("bounds-guard");
         let src = dir.join("oob.c");
         // A runtime index (derived from argc) the compiler cannot fold away, driven
         // out of bounds so `-fsanitize=bounds` fires at the store.
@@ -14755,7 +14672,6 @@ mod refused_repair_tracking_tests {
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn emitter_candidate() -> Candidate {
         Candidate {
@@ -14908,12 +14824,7 @@ mod refused_repair_tracking_tests {
 
     #[test]
     fn refused_self_source_dependency_falls_back_to_declaration_stub() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-self-source-fallback-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("self-source-fallback");
         fs::write(
             root.join("value.h"),
             "namespace Json {\n\
@@ -14989,7 +14900,7 @@ mod refused_repair_tracking_tests {
             "the selected fuzz target must never be replaced by a fallback stub"
         );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }
 

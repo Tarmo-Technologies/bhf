@@ -1565,8 +1565,7 @@ mod tests {
 
     #[test]
     fn assembly_name_from_csproj() {
-        let dir = std::env::temp_dir().join("bhf_cs_asmname_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::test_support::TestDir::new("cs-asmname");
         let csproj = dir.join("Foo.csproj");
         std::fs::write(
             &csproj,

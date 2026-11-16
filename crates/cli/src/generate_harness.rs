@@ -14552,7 +14552,6 @@ mod tests {
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// `path` as the inside of a JSON string: a Windows path's `\` escaped.
     fn json_text(path: &Path) -> String {
@@ -14658,7 +14657,7 @@ mod tests {
             .as_deref(),
             Some("yaml/api.h")
         );
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14694,7 +14693,7 @@ mod tests {
             &mut functions,
             &source_path,
             &["regexp.h".to_owned()],
-            std::slice::from_ref(&root),
+            std::slice::from_ref(&root.to_path_buf()),
         );
 
         let parse = functions
@@ -14704,7 +14703,7 @@ mod tests {
         assert!(parse.api.is_method);
         assert!(parse.is_static);
         assert_eq!(parse.api.member_access.as_deref(), Some("public"));
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14731,7 +14730,7 @@ mod tests {
             &mut functions,
             &source_path,
             &["parser.h".to_owned()],
-            std::slice::from_ref(&root),
+            std::slice::from_ref(&root.to_path_buf()),
         );
 
         let access = |namespace: &str, parameter: &str| {
@@ -14754,7 +14753,7 @@ mod tests {
             Some("public"),
             "{functions:#?}"
         );
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14967,7 +14966,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("nested.rsp"), "-DNESTED=2\n").unwrap();
         let entry = CompileCommandEntry {
-            directory: dir.clone(),
+            directory: dir.to_path_buf(),
             file: dir.join("t.c"),
             arguments: Some(
                 ["clang", "@flags.rsp", "-DINLINE=3", "-c", "t.c"]
@@ -15892,12 +15891,7 @@ mod tests {
         // `#define` bodies (hb-null.hh, hb-ot-face.hh). A continuation line that
         // happens to start with `namespace Namespace {` must not be mistaken for a
         // real top-level namespace (it produced a bogus `using namespace Namespace;`).
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-ns-macro-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("ns-macro");
         let header = dir.join("hb-algs.hh");
         fs::write(
             &header,
@@ -16031,12 +16025,12 @@ ABSL_NAMESPACE_BEGIN
         fs::write(root.join("liboptional.so.7"), "not a real library").unwrap();
         assert!(!super::bare_library_resolves_in(
             "optional",
-            std::slice::from_ref(&root)
+            std::slice::from_ref(&root.to_path_buf())
         ));
         fs::write(root.join("liboptional.so"), "linker name").unwrap();
         assert!(super::bare_library_resolves_in(
             "optional",
-            std::slice::from_ref(&root)
+            std::slice::from_ref(&root.to_path_buf())
         ));
     }
 
@@ -16104,11 +16098,7 @@ ABSL_NAMESPACE_BEGIN
         // byte-buffer decoder fires — not fall through to unsupported_params.
         // Regression for SweetAda modules/crc (Compute went 0 -> built_and_fuzzed
         // once the dep dir reached the harness analysis roots).
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-ada-dep-array-{nonce}"));
+        let root = crate::test_support::TestDir::new("ada-dep-array");
         let proj = root.join("modules").join("crc");
         let core = root.join("core");
         let out = root.join("out");
@@ -16180,11 +16170,7 @@ ABSL_NAMESPACE_BEGIN
         // a `word_t` parameter collapses to an opaque type and the target is
         // skipped. The collector must follow `#include`s across the project's
         // header closure.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-transitive-typedef-{nonce}"));
+        let root = crate::test_support::TestDir::new("transitive-typedef");
         let inc = root.join("include");
         fs::create_dir_all(&inc).unwrap();
         fs::write(
@@ -16386,12 +16372,7 @@ ABSL_NAMESPACE_BEGIN
         );
         assert_eq!(c_return_pointee_ident("int").as_deref(), Some("int"));
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-dealloc-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("dealloc");
         let source = root.join("toml.c");
         // The `.c` defines an INTERNAL static `xfree_tab` (matches the verb+type
         // shape) BEFORE the public `toml_free`. The harness must pick the public,
@@ -16441,8 +16422,7 @@ ABSL_NAMESPACE_BEGIN
         // Campaign fix: a refcount releaser taking a DOUBLE pointer
         // (libcbor `cbor_decref(cbor_item_t **)`) must pair with the owning return
         // of `cbor_load` and be called as `cbor_decref(&R)`.
-        let cbor_root = std::env::temp_dir().join(format!("bhf-cbor-{nonce}"));
-        fs::create_dir_all(&cbor_root).unwrap();
+        let cbor_root = crate::test_support::TestDir::new("cbor");
         let cbor_src = cbor_root.join("cbor.c");
         fs::write(&cbor_src, "#include \"cbor.h\"\n").unwrap();
         fs::write(
@@ -16470,14 +16450,9 @@ ABSL_NAMESPACE_BEGIN
         // via the structural existence of a prefix-matched type-specific deallocator
         // — while a self-returning/transform target (consumes the return type) and a
         // borrowing accessor stay unpaired to avoid an invalid/double free.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
 
         // yyjson: `read` verb + yyjson_doc_free.
-        let yroot = std::env::temp_dir().join(format!("bhf-yyjson-{nonce}"));
-        fs::create_dir_all(&yroot).unwrap();
+        let yroot = crate::test_support::TestDir::new("yyjson");
         let ysrc = yroot.join("yyjson.c");
         fs::write(&ysrc, "#include \"yyjson.h\"\n").unwrap();
         fs::write(
@@ -16507,8 +16482,7 @@ ABSL_NAMESPACE_BEGIN
 
         // mpc: a VERB-LESS combinator (mpc_or) paired by structural inference, but a
         // self-returning mutator (mpc_define consumes mpc_parser_t*) must NOT pair.
-        let mroot = std::env::temp_dir().join(format!("bhf-mpc-{nonce}"));
-        fs::create_dir_all(&mroot).unwrap();
+        let mroot = crate::test_support::TestDir::new("mpc");
         let msrc = mroot.join("mpc.c");
         fs::write(&msrc, "#include \"mpc.h\"\n").unwrap();
         fs::write(
@@ -17648,11 +17622,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn auto_detect_project_includes_finds_sibling_include_dir() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-incdir-{nonce}"));
+        let root = crate::test_support::TestDir::new("incdir");
         let src_dir = root.join("library");
         let inc_dir = root.join("include");
         fs::create_dir_all(&src_dir).unwrap();
@@ -17668,14 +17638,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn auto_detect_project_includes_skips_source_dir_itself() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         // Nest the source deep enough that the detector's 3-level upward walk
         // stays inside this unique root and never escapes into a shared parent
         // (e.g. /tmp) where an unrelated `include`/`inc` dir could exist.
-        let root = std::env::temp_dir().join(format!("bhf-incnone-{nonce}"));
+        let root = crate::test_support::TestDir::new("incnone");
         let src_dir = root.join("a").join("b").join("c");
         fs::create_dir_all(&src_dir).unwrap();
         let source = src_dir.join("foo.c");
@@ -17690,11 +17656,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     fn self_prefixed_include_roots_adds_parent_of_prefix_dir() {
         // libde265 shape: `.../libde265/de265.cc` does `#include "libde265/vps.h"`,
         // which only resolves with the dir CONTAINING `libde265/` on the path.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-selfinc-{nonce}"));
+        let root = crate::test_support::TestDir::new("selfinc");
         let src_dir = root.join("libde265");
         fs::create_dir_all(&src_dir).unwrap();
         let source = src_dir.join("de265.cc");
@@ -17705,7 +17667,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         .unwrap();
         let roots = self_prefixed_include_roots(&source);
         assert!(
-            roots.contains(&root),
+            roots.contains(&root.to_path_buf()),
             "expected the parent-of-prefix dir {root:?} in {roots:?}"
         );
     }
@@ -17714,11 +17676,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     fn self_prefixed_include_roots_ignores_plain_and_angle_includes() {
         // A bare `#include "foo.h"` (no prefix) and `#include <sys/x.h>` (angle)
         // must not add a self-prefixed root.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-selfinc2-{nonce}"));
+        let root = crate::test_support::TestDir::new("selfinc2");
         let src_dir = root.join("lib");
         fs::create_dir_all(&src_dir).unwrap();
         let source = src_dir.join("a.c");
@@ -17731,12 +17689,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn auto_detect_c_headers_includes_quoted_project_headers_from_source() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-source-headers-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("source-headers");
         let source = root.join("compress.c");
         fs::write(
             &source,
@@ -17792,11 +17745,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     #[test]
     fn harness_project_includes_picks_angle_project_headers_and_skips_partials() {
         use super::{harness_project_includes, is_partial_impl_header};
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-proj-inc-{nonce}"));
+        let root = crate::test_support::TestDir::new("proj-inc");
         let inc = root.join("include");
         fs::create_dir_all(inc.join("json")).unwrap();
         fs::write(inc.join("json/value.h"), "// public header\n").unwrap();
@@ -17843,12 +17792,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // `#ifdef _WIN32`; on Linux clang skips it, but a textual closure scan used
         // to pull it into the harness -> `<windows.h> file not found`. The host
         // `#else` include must still be kept.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-foreign-inc-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("foreign-inc");
         fs::write(root.join("win32cond.h"), "#include <windows.h>\n").unwrap();
         fs::write(root.join("posix_threads.h"), "int posix_marker;\n").unwrap();
         let source = "#ifdef _WIN32\n\
@@ -17856,7 +17800,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                       #else\n\
                       #include \"posix_threads.h\"\n\
                       #endif\n";
-        let got = harness_project_includes(source, std::slice::from_ref(&root));
+        let got = harness_project_includes(source, std::slice::from_ref(&root.to_path_buf()));
         assert!(
             !got.contains(&"win32cond.h".to_owned()),
             "Windows-only (#ifdef _WIN32) include must be skipped on the host: {got:?}"
@@ -17872,7 +17816,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                      #include \"shared.h\"\n\
                      #endif\n";
         assert!(
-            harness_project_includes(mixed, std::slice::from_ref(&root))
+            harness_project_includes(mixed, std::slice::from_ref(&root.to_path_buf()))
                 .contains(&"shared.h".to_owned()),
             "a mixed host/foreign guard must keep its includes"
         );
@@ -17881,11 +17825,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     #[test]
     fn harness_project_includes_pulls_transitive_deps_dependencies_first() {
         use super::harness_project_includes;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-trans-inc-{nonce}"));
+        let root = crate::test_support::TestDir::new("trans-inc");
         let common = root.join("common");
         fs::create_dir_all(&common).unwrap();
         // mavlink-shaped: the leaf message header is not self-contained — it needs
@@ -17927,7 +17867,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         )
         .unwrap();
 
-        let got = ordered_c_harness_headers(&source_path, &root, source, &[include, root.clone()]);
+        let got =
+            ordered_c_harness_headers(&source_path, &root, source, &[include, root.to_path_buf()]);
         let public = got.iter().position(|header| header == "api.h").unwrap();
         let internal = got
             .iter()
@@ -17960,19 +17901,19 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         )
         .unwrap();
 
-        let got =
-            ordered_c_harness_headers(&source_path, &root, source, std::slice::from_ref(&root));
+        let got = ordered_c_harness_headers(
+            &source_path,
+            &root,
+            source,
+            std::slice::from_ref(&root.to_path_buf()),
+        );
         assert_eq!(got, vec!["h2def.h".to_owned()]);
     }
 
     #[test]
     fn harness_project_includes_leaves_umbrella_only_children_to_the_umbrella() {
         use super::harness_project_includes;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-umbrella-inc-{nonce}"));
+        let root = crate::test_support::TestDir::new("umbrella-inc");
         let api = root.join("api");
         fs::create_dir_all(api.join("lzma")).unwrap();
         fs::write(
@@ -18001,19 +17942,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         .unwrap();
         fs::write(root.join("info.h"), "enum { SPR_MAN1, SPR_ACLO };\n").unwrap();
 
-        let got = harness_project_includes("#include \"h2def.h\"\n", &[root]);
+        let got = harness_project_includes("#include \"h2def.h\"\n", &[root.to_path_buf()]);
         assert_eq!(got, vec!["h2def.h".to_owned()]);
     }
 
     #[test]
     fn is_openmp_translation_unit_detects_omp_runtime_calls() {
         use super::is_openmp_translation_unit;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-omp-tu-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("omp-tu");
 
         // base64's lib_openmp.c shape: a `.c` TU that CALLS `omp_*` runtime
         // functions (the only thing that won't link without -fopenmp).
@@ -18080,12 +18016,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // pulled into the harness include set (it would `#include` a `.c` whose
         // `omp_get_num_threads()` calls are undeclared/unlinkable). The portable
         // companion header must still be carried.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-omp-headers-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("omp-headers");
         let source = root.join("lib.c");
         fs::write(
             &source,
@@ -18113,12 +18044,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     #[test]
     fn harness_project_includes_excludes_openmp_translation_unit() {
         use super::harness_project_includes;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-omp-proj-inc-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("omp-proj-inc");
         fs::write(
             root.join("lib_openmp.c"),
             "void w(void){\n#pragma omp parallel\n{ omp_set_num_threads(1); }\n}\n",
@@ -18127,7 +18053,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         fs::write(root.join("env.h"), "int env_marker;\n").unwrap();
         // A source whose closure references both a normal header and the OpenMP TU.
         let source = "#include \"env.h\"\n#include \"lib_openmp.c\"\n";
-        let got = harness_project_includes(source, std::slice::from_ref(&root));
+        let got = harness_project_includes(source, std::slice::from_ref(&root.to_path_buf()));
         assert!(
             !got.contains(&"lib_openmp.c".to_owned()),
             "OpenMP TU must be skipped by the project-include closure: {got:?}"
@@ -18140,12 +18066,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn cleanup_flag_overrides_auto_detect_in_emitted_harness() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-cleanup-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("cleanup");
         let source = root.join("custom.c");
         // Return type doesn't match any built-in pattern, but the user
         // tells us how to free it via --cleanup.
@@ -18191,12 +18112,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     /// unit-tested in `auto::attempt`.)
     #[test]
     fn environment_model_threads_through_run_to_the_c_harness() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-env-plumb-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("env-plumb");
         let source = root.join("periph.c");
         fs::write(
             &source,
@@ -18263,12 +18179,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     /// is not masked by the harness's by-value-struct type collection.)
     #[test]
     fn container_size_max_flag_shrinks_emitted_cpp_container_decode() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-ctrcap-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("ctrcap");
         let source = root.join("vec.cpp");
         fs::write(
             &source,
@@ -18382,12 +18293,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // A subprogram inside a generic package cannot be direct-called: GNAT
         // rejects `Gen_Pkg.Op` with "prefix must not be a generic package".
         // We must skip it cleanly rather than emit a harness that fails build.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-generic-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("generic");
         let source = root.join("gen_pkg.ads");
         fs::write(
             &source,
@@ -18427,12 +18333,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // A direct harness for a target in a private child package is reached
         // through a private-child-subprogram harness of the parent (a public
         // bridge can't `with` the private child to forward the call).
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-privchild-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("privchild");
         fs::write(root.join("parent.ads"), "package Parent is\nend Parent;\n").unwrap();
         let source = root.join("parent-secret.ads");
         fs::write(
@@ -18483,12 +18384,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // The target's signature uses a parent-private type, so a public bridge
         // can't re-export it; the harness is generated as a private child
         // subprogram of the parent (whose body sees the private part).
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-privtype-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("privtype");
         fs::write(
             root.join("pp.ads"),
             "package PP is\nprivate\n   type Secret_Ptr is access all Integer;\nend PP;\n",
@@ -18541,12 +18437,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     #[test]
     fn private_child_sequence_kind_is_still_blocked() {
         // Only the direct path bridges; other kinds still skip cleanly.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-privchild-seq-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("privchild-seq");
         let source = root.join("parent-secret.ads");
         fs::write(
             &source,
@@ -18598,12 +18489,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // A generic package with codec-shaped formals (a byte reader + a sink)
         // and a parameterless op must be instantiated - feeding fuzz bytes
         // through Read_Byte - rather than skipped.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-codec-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("codec");
         let source = root.join("codec.ads");
         fs::write(
             &source,
@@ -18659,12 +18545,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // only as `<instance>.Hints`. The harness must instantiate the generic,
         // qualify the record type with the instance name, and synthesise the
         // aggregate from fuzz bytes - not skip as `blocked_by_generic`.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-codec-rec-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("codec-rec");
         let source = root.join("codec.ads");
         fs::write(
             &source,
@@ -18730,12 +18611,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // a pure `out` parameter of a limited-private type is the result the
         // callee constructs, so the harness declares it bare rather than
         // skipping for lack of a constructor.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-outpriv-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("outpriv");
         let source = root.join("dec.ads");
         fs::write(
             &source,
@@ -18784,12 +18660,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     fn generic_encoder_subprogram_is_instantiated_and_called_with_defaults() {
         // The encoders are generic subprograms whose own parameters are all
         // defaulted: instantiate with fuzz callbacks, call with no arguments.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-enc-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("enc");
         let source = root.join("enc.ads");
         fs::write(
             &source,
@@ -18841,12 +18712,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         // `generic ... procedure Traverse (z : Zip_Info)`) cannot be called
         // until instantiated - skip it cleanly instead of emitting a harness
         // that fails to build.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-genproc-{nonce}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("genproc");
         let source = root.join("pkg.ads");
         fs::write(
             &source,
@@ -18937,16 +18803,11 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert_eq!(selected.id, SubprogramId(1));
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
         // Resolved, as generation resolves the paths it writes: Windows'
         // temp dir is often spelled with an 8.3 short name (`RUNNER~1`).
-        crate::workdir::plain_canonical(&dir)
+        crate::test_support::TestDir::new(&format!("cli-{name}"))
+            .spelled_as(crate::workdir::plain_canonical)
     }
 
     #[test]
@@ -18981,7 +18842,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         .unwrap();
         let source = fs::read_to_string(&target).unwrap();
 
-        let ast = build_harness_ast(&source, &target, std::slice::from_ref(&dir)).unwrap();
+        let ast =
+            build_harness_ast(&source, &target, std::slice::from_ref(&dir.to_path_buf())).unwrap();
         let names = ast
             .types
             .iter()
@@ -19028,7 +18890,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         )
         .unwrap();
         let includes = vec!["map.h".to_owned()];
-        let dirs = vec![dir.clone()];
+        let dirs = vec![dir.to_path_buf()];
 
         // Opaque in headers (body only in the `.c`) -> false.
         assert!(
@@ -19194,7 +19056,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             source: source.clone(),
             target: Some("Parse".to_owned()),
             target_line: None,
-            output: temp.clone(),
+            output: temp.to_path_buf(),
             id: Some("H-TEST".to_owned()),
             kind: "direct".to_owned(),
             source_roots: Vec::new(),
@@ -20297,12 +20159,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     /// it was on.
     #[test]
     fn generation_metadata_records_the_buffer_length_dimension() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-gen-dimension-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("gen-dimension-{}", line!()));
         let layout = |applied: bool| {
             harness_gen::arg_layout::ArgLayout::new("c", "direct", Vec::new())
                 .with_buffer_len_dimension(applied)
@@ -22566,7 +22423,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let result = preflight_header_includes(
             &["legacy.hpp".to_owned()],
-            std::slice::from_ref(&root),
+            std::slice::from_ref(&root.to_path_buf()),
             &[],
             true,
         );
@@ -23533,7 +23390,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let includes = super::harness_project_includes(
             "#include \"platform.h\"\n",
-            std::slice::from_ref(&temp),
+            std::slice::from_ref(&temp.to_path_buf()),
         );
         assert!(includes.iter().any(|header| header == "platform.h"));
         assert!(includes.iter().any(|header| header == "posix_impl.h"));
@@ -24562,7 +24419,7 @@ class basic_json
         fs::write(
             temp.join("compile_commands.json"),
             serde_json::to_vec_pretty(&serde_json::json!([{
-                "directory": temp,
+                "directory": temp.path(),
                 "file": owner,
                 "arguments": ["g++", "-std=gnu++17", "-c", owner]
             }]))

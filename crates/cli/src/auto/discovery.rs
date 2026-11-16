@@ -3917,8 +3917,7 @@ mod tests {
         // Discovery excludes them so a project's harness cannot out-rank its
         // parser — but excluding them also threw away the fact of their
         // existence, and they are the only expert baseline there is.
-        let root = std::env::temp_dir().join(format!("bhf-experts-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("experts");
         fs::create_dir_all(root.join("fuzz")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -4163,17 +4162,7 @@ mod tests {
         // decide whether a cached candidate list is still valid, so: identical for
         // an unchanged tree; different after a file edit, a new file, or a changed
         // dir-filter. (A no-op walk over the same bytes must reproduce the digest.)
-        // A collision-proof private dir (the shared `tmpdir()` keys only on nanos,
-        // which two parallel tests can collide on; this test writes+rereads several
-        // times so any interference would flake it).
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-fp-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("fp");
         fs::write(root.join("a.c"), "int parse(const char *p){return p[0];}\n").unwrap();
         fs::create_dir_all(root.join("lib")).unwrap();
         fs::write(root.join("lib/b.c"), "int f(int x){return x;}\n").unwrap();
@@ -4228,14 +4217,7 @@ mod tests {
         // #101: the build-context fingerprint busts on a GPR / compile_commands.json
         // / IDL / option change (so --resume re-attempts affected results), but NOT
         // on a README edit (docs never invalidate the build context).
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-bctx-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("bctx");
         fs::write(root.join("proj.gpr"), "project P is\nend P;\n").unwrap();
         fs::write(root.join("README.md"), "hello\n").unwrap();
 
@@ -4346,15 +4328,8 @@ mod tests {
         // --reuse-discovery misses for no reason). A same-LENGTH content edit —
         // which a size+mtime fingerprint could miss on a coarse-mtime fs — must
         // still be caught, because identity is the file's content hash.
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, SystemTime};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-fp-mtime-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("fp-mtime");
         let file = root.join("a.c");
         let body = "int parse(const char *p){return p[0];}\n";
         fs::write(&file, body).unwrap();

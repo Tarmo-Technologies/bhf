@@ -359,13 +359,7 @@ mod tests {
         // `dotnet tool install --global` writes to ~/.dotnet/tools, which is not
         // on PATH by default. Preflight used `which` alone and reported MISSING
         // for a host whose C# lane then built and fuzzed fine.
-        let home = std::env::temp_dir().join(format!(
-            "bhf-preflight-sharpfuzz-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let home = crate::test_support::TestDir::new("preflight-sharpfuzz");
         let tools = home.join(".dotnet").join("tools");
         std::fs::create_dir_all(&tools).unwrap();
 

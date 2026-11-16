@@ -589,8 +589,8 @@ mod tests {
 
     #[test]
     fn materialize_go_adds_module_and_package() {
-        let dir = std::env::temp_dir().join(format!("bhfsnip-go-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_guard = crate::test_support::TestDir::new("snip-go");
+        let dir = dir_guard.join("dir");
         materialize(LangSelector::Go, "func F(b []byte) {}\n", &dir).unwrap();
         let gomod = std::fs::read_to_string(dir.join("go.mod")).unwrap();
         assert!(gomod.contains("module snippet"));
@@ -601,8 +601,8 @@ mod tests {
 
     #[test]
     fn materialize_rust_adds_manifest() {
-        let dir = std::env::temp_dir().join(format!("bhfsnip-rs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir_guard = crate::test_support::TestDir::new("snip-rs");
+        let dir = dir_guard.join("dir");
         materialize(
             LangSelector::Rust,
             "fn parse(b: &[u8]) -> u8 { b[0] }\n",

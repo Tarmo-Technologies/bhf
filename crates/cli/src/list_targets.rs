@@ -1033,16 +1033,9 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf_{name}_{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(name)
     }
 
     fn ada_target(name: &str, score: i32) -> ListedTarget {
@@ -1092,7 +1085,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 10,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1128,7 +1121,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 50,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1168,7 +1161,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 10,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1201,7 +1194,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 10,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1243,7 +1236,7 @@ mod tests {
         fs::write(dir.join("util.c"), "void render(void) { }\n").unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 10,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1274,7 +1267,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 20,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),
@@ -1306,7 +1299,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 1,
             format: OutputFormat::Json,
             exclude_paths: vec!["tests".to_owned()],
@@ -1343,7 +1336,7 @@ mod tests {
         .unwrap();
 
         let rows = ranked_targets(ListTargetsArgs {
-            path: dir,
+            path: dir.to_path_buf(),
             top: 10,
             format: OutputFormat::Json,
             exclude_paths: Vec::new(),

@@ -802,9 +802,7 @@ mod tests {
     fn write_skips_clean_run_but_debug_writes_confirmation() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_issues();
-        let dir = std::env::temp_dir().join(format!("bhf-bugreport-a-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("bugreport-a");
         // Clean run, no --debug -> nothing written.
         init(false);
         assert_eq!(write(&dir, "2026-07-02T00:00:00Z", &[], false), 0);
@@ -825,9 +823,7 @@ mod tests {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_issues();
         init(false);
-        let dir = std::env::temp_dir().join(format!("bhf-bugreport-b-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("bugreport-b");
         let cstring = |file: &str| InternalIssue {
             category: IssueCategory::UnsupportedType,
             summary: "unsupported parameter type 'const CString &'".to_owned(),
@@ -878,9 +874,7 @@ mod tests {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_issues();
         init(false);
-        let dir = std::env::temp_dir().join(format!("bhf-bugreport-wai-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("bugreport-wai");
         let issue = |summary: &str| InternalIssue {
             category: IssueCategory::UnsupportedType,
             summary: summary.to_owned(),
@@ -954,9 +948,7 @@ mod tests {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_issues();
         init(false);
-        let dir = std::env::temp_dir().join(format!("bhf-bugreport-path-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("bugreport-path");
         let reason = harness_gen::build_safety::ensure_build_path_safe(
             "include dir",
             "/srv/build$tmp/include",

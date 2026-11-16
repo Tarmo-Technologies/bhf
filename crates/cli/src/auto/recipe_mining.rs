@@ -2849,8 +2849,7 @@ mod tests {
 
     #[test]
     fn mining_a_tree_reads_only_the_example_directories() {
-        let root = std::env::temp_dir().join(format!("bhf-mine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("mine");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(root.join("src/lib.cpp"), "Widget shipped(9);").unwrap();
@@ -3489,8 +3488,7 @@ mod tests {
         // libarchive, libexpat and zlib all ship real inputs beside their tests.
         // A parser reached through random bytes bounces off the header check;
         // the same harness given one real archive starts inside the format.
-        let root = std::env::temp_dir().join(format!("bhf-seedmine-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("seedmine");
         std::fs::create_dir_all(root.join("tests/testdata")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("tests/testdata/sample.tar"), b"ustar-ish bytes").unwrap();
@@ -3521,8 +3519,7 @@ mod tests {
     fn build_and_ide_artifacts_are_not_mined_as_seeds() {
         // Windows build trees keep project files and build outputs right next to
         // the test data. None of them is an input the target parses.
-        let root = std::env::temp_dir().join(format!("bhf-seedide-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("seedide");
         let data = root.join("tests/data");
         std::fs::create_dir_all(&data).unwrap();
         let artifacts = [
@@ -3559,8 +3556,7 @@ mod tests {
 
     #[test]
     fn an_oversized_or_empty_file_is_not_a_seed() {
-        let root = std::env::temp_dir().join(format!("bhf-seedcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("seedcap");
         std::fs::create_dir_all(root.join("tests/corpus")).unwrap();
         std::fs::write(root.join("tests/corpus/empty.bin"), b"").unwrap();
         std::fs::write(

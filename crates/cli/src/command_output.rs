@@ -510,12 +510,7 @@ mod tests {
         // moments later. Holding the writer open reproduces deterministically the
         // ETXTBSY a loaded host hits by accident, which used to surface as a hard
         // "failed to start" — and, in the sanitizer replays, as a silent zero.
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-etxtbsy-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("etxtbsy");
         let script = dir.join("fresh.sh");
         let mut writer = std::fs::File::create(&script).unwrap();
         writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();

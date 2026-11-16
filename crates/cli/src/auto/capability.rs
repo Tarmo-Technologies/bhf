@@ -821,8 +821,7 @@ mod tests {
 
     #[test]
     fn write_finding_has_no_sink_and_carries_cwe() {
-        let work = std::env::temp_dir().join(format!("bhf-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
+        let work = crate::test_support::TestDir::new("cap");
         let hdir = work.join("harnesses").join("H-C0001");
         std::fs::create_dir_all(&hdir).unwrap();
         std::fs::write(
@@ -935,8 +934,7 @@ mod tests {
         // sink at the system() CALL line (4) in run_cmd, a BHF-668 process-exec
         // finding must land on line 4 — the line the SAST scan reports — not
         // run_cmd's declaration line (3, from result.json).
-        let work = std::env::temp_dir().join(format!("bhf-cap-callsite-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
+        let work = crate::test_support::TestDir::new("cap-callsite");
         let hdir = work.join("harnesses").join("H-C0001");
         std::fs::create_dir_all(&hdir).unwrap();
         // The fuzz target run_cmd is DECLARED at line 3 (result.json).

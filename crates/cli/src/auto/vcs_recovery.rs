@@ -132,16 +132,9 @@ mod tests {
     use super::materialize_deleted_tracked_files;
     use std::path::Path;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir() -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("bhf-vcs-recovery-{unique}"));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn temp_dir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("vcs-recovery")
     }
 
     fn git(repo: &Path, args: &[&str]) -> bool {
@@ -195,6 +188,6 @@ mod tests {
         );
         assert!(!repo.join("src/dependency.h").exists());
 
-        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 }

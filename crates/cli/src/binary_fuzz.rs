@@ -2530,8 +2530,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-{}", nonce()));
         let script = dir.join("crasher.sh");
         {
             let mut f = fs::File::create(&script).unwrap();
@@ -2691,8 +2690,7 @@ mod tests {
     #[test]
     fn end_to_end_runner_and_target_arg_launched_recorded_and_replayable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-runner-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-runner-{}", nonce()));
         let script = dir.join("probe.sh");
         // Crash (SIGSEGV) only when launched with a "boom" argument.
         fs::write(
@@ -2773,8 +2771,7 @@ mod tests {
         // and the supervisor's bounded wait runs. The old inline write_all would
         // block here until the target exited, bypassing the replay deadline — so
         // under the old code this call would hang for the target's full lifetime.
-        let dir = std::env::temp_dir().join(format!("bhf-replay-noread-{}", nonce()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("replay-noread-{}", nonce()));
         let target = dir.join("sleeper.sh");
         std::fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
         let mut perms = std::fs::metadata(&target).unwrap().permissions();
@@ -2918,8 +2915,7 @@ mod afl_qemu_tests {
 
     #[test]
     fn trace_override_file_is_picked_first_else_skipped() {
-        let dir = std::env::temp_dir().join(format!("bhf-aqt-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("aqt-{}", nonce()));
         let real = dir.join("afl-qemu-trace");
         fs::write(&real, b"x").unwrap();
         // A real override file is selected first.
@@ -3016,8 +3012,7 @@ mod afl_qemu_tests {
             eprintln!("skipping binary-fuzz runtime-oracle e2e: shim/cc/Linux unavailable");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-oracle-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-oracle-{}", nonce()));
         let src = dir.join("sink.c");
         // Reads the input file (file mode) and passes it, unsanitized, into
         // system() — a clean-exit command injection the crash oracle cannot see.
@@ -3225,8 +3220,7 @@ mod afl_qemu_tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-collector-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-collector-{}", nonce()));
 
         // Positive target: fuzz-controlled input reaches exec / open / dlopen.
         let src = dir.join("sinks.c");
@@ -3339,8 +3333,7 @@ mod afl_qemu_tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-valgate-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-valgate-{}", nonce()));
 
         // Input-validating target: rejects any input whose first byte is not '{' (so
         // 6ba0795's bitwise-complement contrast never reaches the sinks), then loads a
@@ -3433,8 +3426,7 @@ mod afl_qemu_tests {
             eprintln!("skipping postcondition e2e: no POSIX sh");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-postc-{}", nonce()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new(&format!("binfuzz-postc-{}", nonce()));
         // Target: writes a file named by its input UNDER $BHF_CASE_DIR/share. With
         // a "../escaped" input it escapes the allowed root — and exits 0.
         let target = dir.join("writer.sh");

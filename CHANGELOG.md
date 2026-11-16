@@ -1900,6 +1900,10 @@
   `<temp>/bhf-<name>-<random>` and deletes it on drop. The six helpers that
   made most of the `bhf-*` directories left in the temp dir use it;
   `BHF_KEEP_TEST_DIRS=1` keeps the directories for inspection.
+- Every unit test in the `bhf` crate now makes its scratch directory with
+  `TestDir`. The GNAT `-gnat2022` probe and the replay directory of
+  `bhf corpus minimize` are `tempfile` directories, so they are also removed
+  when bhf panics.
 
 ### Added
 - Seed lineage: the built-in engine records what each input it keeps was
