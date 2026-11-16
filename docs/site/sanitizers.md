@@ -372,6 +372,33 @@ kernel raised. The handler covers SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGTRAP,
 and is installed only when no sanitizer runtime is linked and nothing else
 handles the signal. The offset is recorded as `exception.pc_offset`.
 
+## Hangs
+
+An execution of the builtin engine that runs past `--timeout` is killed, and
+its input is run once more in a fresh process with twice the timeout. If it
+hangs again, it is a hang finding, BHF-230 (CWE-835); if the re-run finishes,
+it was one slow execution and is only counted. Before killing a re-run that
+hangs, bhf sends it SIGABRT with `handle_abort=1` added to the sanitizer
+options, so a sanitizer runtime prints the stack the target was looping in.
+The finding's stack starts at the first frame below the coverage or
+comparison callback the signal interrupted, and two inputs that loop in the
+same functions are one finding. Without a sanitizer runtime (or on Windows)
+the finding has no stack, and the pass's hangs are one finding.
+
+A pass re-runs at most four hangs, and none it has less time left for than
+the re-run needs. `fuzz_runs/<harness>-latest.json` counts them under
+`hangs`:
+
+```json
+"hangs": { "timeout_ms": 200, "observed": 2, "confirmed": 2, "cleared": 0, "not_rerun": 0 }
+```
+
+`observed` executions were killed at the timeout, `confirmed` hung again
+(each is a finding, or a later hit of one), `cleared` finished when re-run,
+and `not_rerun` were past the four re-runs or the pass's time. With
+`--deadline`, an execution that overruns it is a response-deadline finding
+(BHF-555) instead.
+
 ## Custom allocators: the ASan poison bridge
 
 Legacy / RTOS C rarely uses `malloc`; it carves a static `uint8_t pool[N]` and

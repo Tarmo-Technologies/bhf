@@ -822,6 +822,28 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-230",
+        slug: "bhf.c/hang",
+        name: "Input hangs the target (per-input timeout)",
+        description: "A fuzz input kept the target running past the per-input timeout, and it hung again when re-run in a fresh process with twice that timeout, so it is not one slow execution on a loaded host. An input that never lets the target return is an infinite loop (a length or count field that never advances a cursor, a retry with no bound), unbounded recursion on a bounded stack's watchdog, or a deadlock. Each is a denial of service an attacker triggers with a single input. The finding records the input and, where a sanitizer runtime printed one, the stack the target was looping in when it was stopped. Make every loop advance toward its exit on every input: validate the length or count against what is left, bound the iterations, or fix the lock order.",
+        cwe: "CWE-835",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.3,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/835.html",
+            "https://cwe.mitre.org/data/definitions/400.html",
+            "https://cwe.mitre.org/data/definitions/833.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-555",
         slug: "bhf.timing/response-deadline-exceeded",
         name: "Response deadline exceeded (real-time timing oracle)",
@@ -5281,6 +5303,7 @@ mod tests {
             ("BHF-226", "CWE-758", "bhf.c/misaligned-access"),
             ("BHF-227", "CWE-119", "bhf.c/insufficient-object-size"),
             ("BHF-228", "CWE-758", "bhf.c/invalid-builtin-use"),
+            ("BHF-230", "CWE-835", "bhf.c/hang"),
         ] {
             let rule = by_id(id).unwrap_or_else(|| panic!("{id} must exist"));
             assert_eq!(rule.cwe, cwe, "{id}");

@@ -45,6 +45,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The builtin engine reports an input that hangs a C or C++ harness. An
+  execution killed at `--timeout` used to be dropped, so an infinite loop was
+  never a finding. Its input is now re-run in a fresh process with twice the
+  timeout; if it hangs again it is a hang finding (BHF-230, CWE-835). Before
+  that re-run is killed it gets SIGABRT, so a sanitizer runtime prints the
+  stack it was looping in, and two inputs looping in the same functions are
+  one finding. A re-run that finishes is one slow execution, not a finding.
+  `fuzz_runs/<harness>-latest.json` counts the pass's hangs under `hangs`.
 - `bhf auto` exits 3 when harnesses built but none ran because their sanitizer
   runtime does not start on this host, and says to re-run with
   `--sanitizers none`. It exited 1, as for nothing built, and the hint

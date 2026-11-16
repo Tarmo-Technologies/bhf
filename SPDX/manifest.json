@@ -2779,6 +2779,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/hang_findings_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/introspect_cli.rs",
       "license": "Apache-2.0"
     },
