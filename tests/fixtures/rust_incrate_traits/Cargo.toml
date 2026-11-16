@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# #217 fixture: trait-impl methods and an enum-taking function on types in a
+# PRIVATE module (`mod internal;`, not re-exported). Only the in-crate build
+# reaches them: `<crate::internal::Header as FromStr>::from_str`,
+# `<crate::internal::Packet as TryFrom<&[u8]>>::try_from`, and
+# `crate::internal::decode` with a `crate::internal::Mode` variant pick.
+
+[package]
+name = "rust_incrate_traits"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Detach from any ancestor workspace.
+[workspace]

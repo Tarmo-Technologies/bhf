@@ -5747,6 +5747,18 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "tests/fixtures/rust_incrate_traits/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_traits/src/internal.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_traits/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "tests/fixtures/rust_incrate_workspace/Cargo.toml",
       "license": "Apache-2.0"
     },

@@ -346,6 +346,10 @@ fn build_call_body(
     // only AFTER the front-partition decodes run).
     let mut arg_lines = Vec::new();
     let mut resource_arg_line: Option<String> = None;
+    // The rest channel takes what is left, so it is decoded after every other
+    // arg: decoded first, it left nothing for the args after it, and an enum
+    // pick or integer there was always its zero value (#217).
+    let mut rest_arg_line: Option<String> = None;
     let mut call_args = Vec::new();
     for (i, s) in slots.iter().enumerate() {
         let bind = format!("a{i}");
@@ -382,10 +386,13 @@ fn build_call_body(
         call_args.push(arg);
         if Some(i) == resource_param_index {
             resource_arg_line = Some(line);
+        } else if Some(i) == rest_idx {
+            rest_arg_line = Some(line);
         } else {
             arg_lines.push(line);
         }
     }
+    arg_lines.extend(rest_arg_line);
 
     let args = call_args.join(", ");
     // Receiver setup is decoded BEFORE the method args (so the method's rest
@@ -1600,6 +1607,11 @@ mod tests {
             "{}",
             h.harness_rs
         );
+        // #217: the pick reads its byte before the rest channel takes what is
+        // left; the other way round it always read 0, the first variant.
+        let pick = h.harness_rs.find("let mut a1 = ").unwrap();
+        let rest = h.harness_rs.find("let mut a0 = c.rest_string();").unwrap();
+        assert!(pick < rest, "{}", h.harness_rs);
     }
 
     #[test]

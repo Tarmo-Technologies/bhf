@@ -250,3 +250,52 @@ fn a_workspace_member_inheriting_its_dependencies_builds_and_fuzzes_in_crate() {
         "the workspace's lockfile is copied"
     );
 }
+
+/// #217: the in-crate lane refused trait-impl methods ("in-crate trait
+/// resolution is not yet supported") and took no parameter overrides. A
+/// private module's `impl FromStr` and `impl TryFrom<&[u8]>` are now called by
+/// UFCS, and a unit-enum parameter gets a `crate`-rooted variant pick; each
+/// planted bug is found.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn private_trait_impls_and_an_enum_parameter_fuzz_in_crate() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-traits");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_traits"), &tmp, "12", "6");
+    for (name, call) in [
+        (
+            "from_str",
+            "<crate::internal::Header as ::core::str::FromStr>::from_str(",
+        ),
+        (
+            "try_from",
+            "<crate::internal::Packet as ::core::convert::TryFrom<&[u8]>>::try_from(",
+        ),
+        (
+            "decode",
+            "match (c.u8() as usize) % 2 { 0 => crate::internal::Mode::Strict, \
+             _ => crate::internal::Mode::Fast }",
+        ),
+    ] {
+        let attempt = find_attempt(&json, name);
+        assert!(
+            attempt_findings(attempt, name) > 0,
+            "the planted bug behind `{name}` is found:\n{combined}"
+        );
+        let harness_id = attempt["harness_id"].as_str().unwrap();
+        let module = tmp
+            .join("harnesses")
+            .join(harness_id)
+            .join("incrate/src/__bhf_harness.rs");
+        let text = std::fs::read_to_string(&module).unwrap();
+        assert!(text.contains(call), "{name}:\n{text}");
+    }
+}

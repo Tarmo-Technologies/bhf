@@ -1738,15 +1738,28 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The fuzz-byte-indexed variant-pick expression for a unit enum, e.g.
-/// `[crate::E::A, crate::E::B][(c.u8() as usize) % 2]`. `path` is the enum's
+/// `match (c.u8() as usize) % 2 { 0 => crate::E::A, _ => crate::E::B }`. A
+/// `match`, not an array index: indexing `[E::A, E::B]` moves out of the
+/// array, which compiles only for a `Copy` enum (#217). `path` is the enum's
 /// reachable path segments; `variants` are its unit variant names (non-empty).
 /// An [`EnumWrap::Option`] param wraps the pick so the fuzzer reaches both the
 /// `None` and `Some(variant)` paths.
 fn build_enum_decoder_expr(path: &[String], variants: &[String], wrap: EnumWrap) -> String {
     let prefix = path.join("::");
-    let arms: Vec<String> = variants.iter().map(|v| format!("{prefix}::{v}")).collect();
-    let n = arms.len();
-    let pick = format!("[{}][(c.u8() as usize) % {n}]", arms.join(", "));
+    let n = variants.len();
+    let arms: Vec<String> = variants
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let pattern = if i + 1 == n {
+                "_".to_owned()
+            } else {
+                i.to_string()
+            };
+            format!("{pattern} => {prefix}::{v}")
+        })
+        .collect();
+    let pick = format!("match (c.u8() as usize) % {n} {{ {} }}", arms.join(", "));
     match wrap {
         EnumWrap::Bare => pick,
         // `Some(pick)` pins the `Option<Enum>` type so the `None` arm infers.
@@ -1759,7 +1772,9 @@ fn build_enum_decoder_expr(path: &[String], variants: &[String], wrap: EnumWrap)
 /// its variant names. Prefers a crate-root re-export façade over the defining
 /// module path (same rule as the call-path resolver); returns `None` when no such
 /// enum is reachable from a dependent crate (unfound, has data variants, private,
-/// or reached only through a private module).
+/// or reached only through a private module). With `crate_name` `crate` (the
+/// in-crate lane, #217) the path is resolved from inside the crate, where a
+/// private module is reachable.
 fn find_unit_enum_path(
     manifest_dir: &Path,
     crate_name: &str,
@@ -1785,7 +1800,9 @@ fn find_unit_enum_path(
         let mut path = vec![crate_name.to_owned()];
         if !crate_root_reexports(crate_root_src, enum_name) {
             let module = module_path(manifest_dir, &file);
-            if module_chain_has_private(manifest_dir, crate_root_src, &module) {
+            if crate_name != IN_CRATE_ROOT
+                && module_chain_has_private(manifest_dir, crate_root_src, &module)
+            {
                 continue; // unreachable through a private module link (E0603)
             }
             path.extend(module);
@@ -2041,6 +2058,8 @@ fn parse_trait_impl<'a>(line: &'a str, trait_leaf: &str) -> Option<&'a str> {
 /// module) so the emitted UFCS can't fail with a privacy error. `None` when the
 /// trait isn't an in-crate public trait (a std/external trait — leave the call
 /// non-UFCS, so it skips/fails as before rather than emitting a wrong path).
+/// With `crate_name` `crate` (the in-crate lane) a trait in a private module
+/// resolves too.
 fn resolve_in_crate_trait_path(
     manifest_dir: &Path,
     crate_name: &str,
@@ -2066,7 +2085,9 @@ fn resolve_in_crate_trait_path(
         let mut path = vec![crate_name.to_owned()];
         if !reexported {
             let module = module_path(manifest_dir, file);
-            if module_chain_has_private(manifest_dir, crate_root_src, &module) {
+            if crate_name != IN_CRATE_ROOT
+                && module_chain_has_private(manifest_dir, crate_root_src, &module)
+            {
                 continue;
             }
             path.extend(module);
@@ -2966,13 +2987,19 @@ fn trait_supertrait_is_reader(supertrait: Option<&str>) -> bool {
     })
 }
 
+/// The root of an in-crate harness's paths: the harness is a module of the
+/// crate, so `crate::…` reaches a private module (#217).
+const IN_CRATE_ROOT: &str = "crate";
+
 /// §27.10: resolve a `pub` target in a PRIVATE module (E0603 from an external
 /// dependent crate) to an IN-CRATE build. The call path is rooted at `crate` (which
 /// reaches the private module from inside the crate) rather than the external crate
 /// name. Supports the common shapes — a free fn, or an instance/associated method
-/// on a type with a no-override-needed receiver ctor. Param/ctor-arg OVERRIDES
-/// (enum picks, scratch consts) and trait-impl methods are NOT supported in-crate
-/// (they would need `crate`-rooted override paths); such a target skips cleanly.
+/// on a type with a no-override-needed receiver ctor. A trait-impl method is
+/// called by UFCS (`<crate::m::T as Trait>::from_str`) or with its trait
+/// imported, and the target's params take the external lane's overrides (enum
+/// picks, scratch consts, `Default` refs) with `crate`-rooted paths (#217).
+/// Receiver-ctor overrides are not supported in-crate.
 #[allow(clippy::too_many_arguments)]
 fn resolve_in_crate_target(
     source: &str,
@@ -2984,18 +3011,45 @@ fn resolve_in_crate_target(
     module: &[String],
     in_fuzz_target: bool,
 ) -> Result<ResolvedTarget, String> {
-    // A trait-impl method needs its trait in scope via a `crate`-rooted path we do
-    // not yet synthesise in-crate; skip cleanly rather than emit a wrong path.
-    if target.impl_trait.is_some() {
+    // #217: a STATIC trait-impl method is called by UFCS with a `crate`-rooted
+    // trait path (a trait of this crate, private modules included) or a std
+    // conversion trait (`FromStr`, `TryFrom<&[u8]>`); an INSTANCE one imports its
+    // trait so the method call resolves.
+    let ufcs_trait = if target.is_static {
+        target
+            .impl_trait
+            .as_deref()
+            .and_then(|tr| {
+                resolve_in_crate_trait_path(manifest_dir, IN_CRATE_ROOT, crate_root_src, tr)
+            })
+            .or_else(|| {
+                if enclosing_impl_type_is_generic(source, target.line) {
+                    None
+                } else {
+                    std_ufcs_trait_path(&target)
+                }
+            })
+    } else {
+        None
+    };
+    if target.is_static && target.impl_trait.is_some() && ufcs_trait.is_none() {
         return Err(format!(
-            "Rust target '{}' is a private-module trait-impl method — in-crate trait \
-             resolution is not yet supported; skipped",
+            "Rust target '{}' (in-crate) is a static method of a trait impl whose trait \
+             has no path from inside the crate; skipped",
             target.name
         ));
     }
+    let method_trait_import = if target.is_static {
+        None
+    } else {
+        target.impl_trait.as_deref().and_then(|tr| {
+            resolve_in_crate_trait_path(manifest_dir, IN_CRATE_ROOT, crate_root_src, tr)
+                .or_else(|| std_trait_path(tr, &target.name))
+        })
+    };
     // Root the path at `crate` so the private module is reachable from inside the
     // injected harness module.
-    let mut call_path = vec!["crate".to_owned()];
+    let mut call_path = vec![IN_CRATE_ROOT.to_owned()];
     call_path.extend(module.iter().cloned());
     let mut receiver = None;
     let mut receiver_ctor_params = Vec::new();
@@ -3066,9 +3120,15 @@ fn resolve_in_crate_target(
             ))
         }
     };
+    // The external lane's overrides, rooted at `crate`: an enum param picks a
+    // variant, a scratch slice and a `Default` ref are filled.
+    let param_decoders =
+        resolve_param_overrides(manifest_dir, IN_CRATE_ROOT, crate_root_src, &target.params);
     let mut resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe> = None;
     for (i, p) in classify_params.iter().enumerate() {
-        if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok() {
+        if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok()
+            || param_decoders.get(i).is_some_and(Option::is_some)
+        {
             continue;
         }
         match path_opener_recipe(&p.name, &p.ty) {
@@ -3107,12 +3167,10 @@ fn resolve_in_crate_target(
         receiver,
         receiver_ctor_params,
         receiver_unwrap,
-        // In-crate mode uses only native decoders + an optional path-resource recipe
-        // (no `crate`-rooted enum/const overrides).
-        param_decoders: Vec::new(),
+        param_decoders,
         receiver_ctor_param_decoders: Vec::new(),
-        ufcs_trait: None,
-        method_trait_import: None,
+        ufcs_trait,
+        method_trait_import,
         resource_recipe,
     })
 }
@@ -5859,17 +5917,21 @@ mod tests {
         ];
         assert_eq!(
             build_enum_decoder_expr(&path, &variants, EnumWrap::Bare),
-            "[ada_parser::ast::AdaStandard::Ada95, ada_parser::ast::AdaStandard::Ada2005, \
-             ada_parser::ast::AdaStandard::Ada2012, ada_parser::ast::AdaStandard::Ada2022]\
-             [(c.u8() as usize) % 4]"
+            "match (c.u8() as usize) % 4 { 0 => ada_parser::ast::AdaStandard::Ada95, \
+             1 => ada_parser::ast::AdaStandard::Ada2005, \
+             2 => ada_parser::ast::AdaStandard::Ada2012, \
+             _ => ada_parser::ast::AdaStandard::Ada2022 }"
         );
         // The Option form wraps the pick so both None and Some(variant) are reached.
         let opt = build_enum_decoder_expr(&path, &variants, EnumWrap::Option);
         assert!(
-            opt.starts_with("if c.u8() & 1 == 0 { None } else { Some(["),
+            opt.starts_with("if c.u8() & 1 == 0 { None } else { Some(match "),
             "{opt}"
         );
-        assert!(opt.ends_with("[(c.u8() as usize) % 4]) }"), "{opt}");
+        assert!(
+            opt.ends_with("_ => ada_parser::ast::AdaStandard::Ada2022 }) }"),
+            "{opt}"
+        );
     }
 
     #[test]
@@ -5912,10 +5974,11 @@ mod tests {
         assert_eq!(decoders[0], None, "&str param has no enum override");
         let (expr, _) = decoders[1].as_ref().expect("bare enum param resolved");
         assert!(
-            expr.starts_with("[ada_parser::ast::AdaStandard::Ada95,"),
+            expr.starts_with(
+                "match (c.u8() as usize) % 4 { 0 => ada_parser::ast::AdaStandard::Ada95,"
+            ),
             "{expr}"
         );
-        assert!(expr.ends_with("[(c.u8() as usize) % 4]"), "{expr}");
         let (opt, _) = decoders[2].as_ref().expect("Option<enum> param resolved");
         assert!(
             opt.starts_with("if c.u8() & 1 == 0 { None } else { Some("),

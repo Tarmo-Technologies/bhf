@@ -52,6 +52,18 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The in-crate Rust lane harnesses a trait-impl method of a type in a private
+  module, which it refused ("in-crate trait resolution is not yet
+  supported"): a static one is called by UFCS with a `crate`-rooted trait path
+  or a std conversion trait (`<crate::m::Header as FromStr>::from_str`), and an
+  instance one imports its trait. Its parameters take the overrides the
+  external lane gives them (an enum variant pick, a scratch slice, a `Default`
+  reference), rooted at `crate`.
+- A Rust harness reads a unit-enum parameter with a `match` on a fuzz byte:
+  indexing an array of the variants moved out of it, which compiled only for
+  a `Copy` enum. The parameter that takes the rest of the input is decoded
+  after the others; decoded first, it left nothing for them, so an enum pick
+  or integer after it was always zero.
 - The in-crate Rust lane builds a workspace member that inherits from its
   workspace. A dependency declared `dep.workspace = true` was refused ("the
   detached copy can't resolve it"); it is now resolved from the workspace's
