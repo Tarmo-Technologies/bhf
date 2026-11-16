@@ -14479,16 +14479,26 @@ fn link_flag_from_build_token(base_dir: &Path, token: &str) -> Option<String> {
 /// `-l<name>` without the development symlink or archive. Used to drop project-internal CMake
 /// targets that masquerade as link libraries (see `link_flag_from_build_token`).
 fn bare_library_resolves(name: &str) -> bool {
-    const LIB_DIRS: &[&str] = &[
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib64",
-        "/lib",
-        "/lib/x86_64-linux-gnu",
-        "/usr/local/lib",
-    ];
-    let dirs: Vec<PathBuf> = LIB_DIRS.iter().map(PathBuf::from).collect();
-    bare_library_resolves_in(name, &dirs)
+    bare_library_resolves_in(name, &system_library_dirs(std::env::consts::ARCH))
+}
+
+/// The system library directories of a host of `arch`, with its Debian
+/// multiarch ones (`/usr/lib/aarch64-linux-gnu` on an ARM64 host): only the
+/// x86_64 ones were searched, so on ARM64 even `libc` did not resolve.
+fn system_library_dirs(arch: &str) -> Vec<PathBuf> {
+    let multiarch = match arch {
+        "arm" => "arm-linux-gnueabihf".to_owned(),
+        "x86" => "i386-linux-gnu".to_owned(),
+        other => format!("{other}-linux-gnu"),
+    };
+    vec![
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/lib").join(&multiarch),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib").join(&multiarch),
+        PathBuf::from("/usr/local/lib"),
+    ]
 }
 
 fn bare_library_resolves_in(name: &str, dirs: &[PathBuf]) -> bool {
@@ -16090,6 +16100,26 @@ ABSL_NAMESPACE_BEGIN
             ..Default::default()
         };
         assert!(exact_public_c_sequence_cluster(&unrelated).is_none());
+    }
+
+    #[test]
+    fn system_library_dirs_include_the_hosts_multiarch_dirs() {
+        let arm = super::system_library_dirs("aarch64");
+        assert!(
+            arm.contains(&PathBuf::from("/usr/lib/aarch64-linux-gnu")),
+            "{arm:?}"
+        );
+        assert!(
+            arm.contains(&PathBuf::from("/lib/aarch64-linux-gnu")),
+            "{arm:?}"
+        );
+        let x64 = super::system_library_dirs("x86_64");
+        assert!(
+            x64.contains(&PathBuf::from("/usr/lib/x86_64-linux-gnu")),
+            "{x64:?}"
+        );
+        assert!(super::system_library_dirs("arm")
+            .contains(&PathBuf::from("/usr/lib/arm-linux-gnueabihf")));
     }
 
     #[test]

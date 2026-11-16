@@ -66,6 +66,9 @@
   finds a planted overflow; the CI acceptance gate requires it. No CI job had
   compiled the ARM64 build the docs describe. docker.md no longer says ARM64
   images are validated: only a run of the release workflow validates one.
+  On ARM64 a harness link now finds system libraries in the host's own
+  multiarch directories (`/usr/lib/aarch64-linux-gnu`); only the x86_64 ones
+  were searched, so a project's `-lc`-style libraries were dropped.
 - `--probe-build` builds outside the scanned tree, under
   `<work>/probe/<tree>-<hash>/`: CMake and Meson into a build directory there,
   Make and an intercepted `--build-command` in a copy of the tree there, whose

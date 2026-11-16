@@ -4673,8 +4673,12 @@ mod tests {
     #[test]
     fn probe_archives_are_rebuilt_for_a_cross_target() {
         let cross = "aarch64-linux-gnu-gcc";
-        if which::which(cross).is_err() || which::which("gcc").is_err() {
-            eprintln!("skip: {cross}/gcc unavailable");
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || which::which(cross).is_err()
+            || which::which("gcc").is_err()
+        {
+            eprintln!("skip: {cross}/gcc unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();
@@ -4767,11 +4771,13 @@ mod tests {
     #[test]
     fn a_make_tier_projects_archives_are_rebuilt_for_a_cross_target() {
         let cross = "aarch64-linux-gnu-gcc";
-        if ["make", "cc", "ar", cross]
-            .iter()
-            .any(|tool| which::which(tool).is_err())
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || ["make", "cc", "ar", cross]
+                .iter()
+                .any(|tool| which::which(tool).is_err())
         {
-            eprintln!("skip: make/cc/ar/{cross} unavailable");
+            eprintln!("skip: make/cc/ar/{cross} unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();
@@ -4824,8 +4830,12 @@ mod tests {
     #[test]
     fn same_named_members_are_rebuilt_from_their_own_translation_units() {
         let cross = "aarch64-linux-gnu-gcc";
-        if which::which(cross).is_err() || which::which("gcc").is_err() {
-            eprintln!("skip: {cross}/gcc unavailable");
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || which::which(cross).is_err()
+            || which::which("gcc").is_err()
+        {
+            eprintln!("skip: {cross}/gcc unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();
