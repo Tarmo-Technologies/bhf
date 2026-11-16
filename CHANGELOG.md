@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Ruby, Lua and PHP lanes mine integer literals into the fuzzing
+  dictionary, not only strings, so a byte check such as `getbyte(0) == 0x52`
+  or `ord($c) - 48` gets the byte it compares against. These lanes have no
+  CmpLog, and such checks were left to blind mutation. A float's fraction
+  is no longer mined as a separate number in any lane.
 - The PHP lane counts only the lines an input ran as coverage. pcov also
   lists a loaded file's unexecuted lines (as -1), and counting those made
   coverage the same for every input, so the fuzzer never saw a gate open; it

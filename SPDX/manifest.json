@@ -2283,6 +2283,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_interpreted_numeric_dictionary.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_java_builder.rs",
       "license": "Apache-2.0"
     },

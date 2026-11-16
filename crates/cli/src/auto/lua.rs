@@ -385,21 +385,22 @@ pub fn extract_lua_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<u
                 if j <= bytes.len() && j > start {
                     let lit = &raw[start..j.min(raw.len())];
                     if lit.len() >= 2 && lit.len() <= 64 && lit.chars().all(|ch| !ch.is_control()) {
-                        match seen.get(lit) {
-                            Some(&index) => {
-                                let lines = &mut out[index].1;
-                                if lines.len() < 3 && !lines.contains(&line) {
-                                    lines.push(line);
-                                }
-                            }
-                            None => {
-                                seen.insert(lit.to_owned(), out.len());
-                                out.push((lit.to_owned(), vec![line]));
-                            }
-                        }
+                        crate::auto::lit_scan::push_unique(
+                            &mut out,
+                            &mut seen,
+                            lit.to_owned(),
+                            line,
+                        );
                     }
                 }
                 i = j + 1;
+                continue;
+            }
+            if let Some((end, tok)) = crate::auto::lit_scan::number_literal_at(bytes, i) {
+                if let Some(tok) = tok {
+                    crate::auto::lit_scan::push_unique(&mut out, &mut seen, tok, line);
+                }
+                i = end;
                 continue;
             }
             i += 1;
@@ -411,6 +412,26 @@ pub fn extract_lua_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_mines_integer_literals_outside_comments_and_identifiers() {
+        // `0x52` is an `R`, `76` an `L` and `48` a `0` once the dictionary writer
+        // adds each number's byte; the comment, the float and `v2` give nothing.
+        let toks = extract_lua_dictionary_tokens(
+            "function parse(s)\n  if s:byte(1) ~= 0x52 or s:byte(2) ~= 76 then return 0 end\n  \
+             local x = s:byte(4) - 48 -- 99 sits in a comment\n  local v2 = 2.5\n  \
+             return 100 // x\nend\n",
+        );
+        for want in ["0x52", "76", "48", "100"] {
+            assert!(toks.iter().any(|t| t == want), "{want} not mined: {toks:?}");
+        }
+        for unwanted in ["99", "98", "5"] {
+            assert!(
+                !toks.iter().any(|t| t == unwanted),
+                "{unwanted} mined: {toks:?}"
+            );
+        }
+    }
 
     #[test]
     fn located_dictionary_tokens_record_their_lines() {

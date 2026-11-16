@@ -90,30 +90,11 @@ pub fn scan_literal_tokens_located(source: &str, backtick: bool) -> Vec<(String,
             i = j + 1;
             continue;
         }
-        // Integer / hex literal, when not part of an identifier.
-        if c.is_ascii_digit() && (i == 0 || !is_ident_byte(b[i - 1])) {
-            let start = i;
-            let mut j = i;
-            if b[j] == b'0' && j + 1 < n && (b[j + 1] | 0x20) == b'x' {
-                j += 2;
-                while j < n && (b[j].is_ascii_hexdigit() || b[j] == b'_') {
-                    j += 1;
-                }
-            } else {
-                while j < n && (b[j].is_ascii_digit() || b[j] == b'_') {
-                    j += 1;
-                }
+        if let Some((end, tok)) = number_literal_at(b, i) {
+            if let Some(tok) = tok {
+                push_unique(&mut out, &mut seen, tok, line_of(i));
             }
-            // Reject a float / identifier continuation (`1.5`, `0x1p`, `3f`).
-            let next = b.get(j).copied().unwrap_or(b' ');
-            if next != b'.' && !is_ident_byte(next) {
-                if let Ok(txt) = std::str::from_utf8(&b[start..j]) {
-                    if let Some(tok) = clean_number(txt) {
-                        push_unique(&mut out, &mut seen, tok, line_of(start));
-                    }
-                }
-            }
-            i = j;
+            i = end;
             continue;
         }
         i += 1;
@@ -121,11 +102,49 @@ pub fn scan_literal_tokens_located(source: &str, backtick: bool) -> Vec<(String,
     out
 }
 
+/// The number starting at `b[at]`, when it is not part of an identifier: the
+/// offset just past it (past the fraction of a float), and its dictionary
+/// token. The token is `None` for a float, an identifier continuation such as
+/// `0x1p` or `3f`, and a trivial 0/1. The lanes with their own string and
+/// comment scanners call this for numbers.
+pub(crate) fn number_literal_at(b: &[u8], at: usize) -> Option<(usize, Option<String>)> {
+    let n = b.len();
+    if !b.get(at)?.is_ascii_digit() || (at > 0 && is_ident_byte(b[at - 1])) {
+        return None;
+    }
+    let mut j = at;
+    if b[j] == b'0' && j + 1 < n && (b[j + 1] | 0x20) == b'x' {
+        j += 2;
+        while j < n && (b[j].is_ascii_hexdigit() || b[j] == b'_') {
+            j += 1;
+        }
+    } else {
+        while j < n && (b[j].is_ascii_digit() || b[j] == b'_') {
+            j += 1;
+        }
+    }
+    let next = b.get(j).copied().unwrap_or(b' ');
+    if next == b'.' && b.get(j + 1).is_some_and(u8::is_ascii_digit) {
+        // A float: step over its fraction too, so `2.5` gives no `5`.
+        j += 1;
+        while j < n && (b[j].is_ascii_digit() || b[j] == b'_') {
+            j += 1;
+        }
+        return Some((j, None));
+    }
+    let tok = (next != b'.' && !is_ident_byte(next))
+        .then(|| std::str::from_utf8(&b[at..j]).ok().and_then(clean_number))
+        .flatten();
+    Some((j, tok))
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-fn push_unique(
+/// Add `tok`, found on `line`, to `out`, or note the line on its earlier entry
+/// (the first [`MAX_TOKEN_LINES`] distinct lines).
+pub(crate) fn push_unique(
     out: &mut Vec<(String, Vec<u32>)>,
     seen: &mut std::collections::HashMap<String, usize>,
     tok: String,
@@ -251,6 +270,12 @@ mod tests {
         let src = "let sha256 = f(); let x = md5hash;";
         let toks = scan_literal_tokens(src, false);
         assert!(toks.is_empty()); // 256 is part of `sha256`, not a literal
+    }
+
+    #[test]
+    fn a_float_gives_no_token_for_either_part() {
+        let toks = scan_literal_tokens("let r = 2.75 * x + 3.5e2;", false);
+        assert!(toks.is_empty(), "{toks:?}");
     }
 
     #[test]

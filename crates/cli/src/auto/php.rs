@@ -491,7 +491,9 @@ fn parse_params(s: &str) -> Vec<PhpParam> {
         .collect()
 }
 
-/// Mine string literals as a fuzzing dictionary (magic values that gate coverage).
+/// Mine string and integer literals as a fuzzing dictionary (magic values that
+/// gate coverage); the dictionary writer adds a number's raw bytes, so a
+/// `ord($c) === 0x52` check gets an `R`.
 pub fn extract_php_dictionary_tokens(source: &str) -> Vec<String> {
     extract_php_dictionary_tokens_located(source)
         .into_iter()
@@ -534,21 +536,22 @@ pub fn extract_php_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<u
                         && !lit.contains("$")
                         && lit.chars().all(|ch| !ch.is_control())
                     {
-                        match seen.get(lit) {
-                            Some(&index) => {
-                                let lines = &mut out[index].1;
-                                if lines.len() < 3 && !lines.contains(&line) {
-                                    lines.push(line);
-                                }
-                            }
-                            None => {
-                                seen.insert(lit.to_owned(), out.len());
-                                out.push((lit.to_owned(), vec![line]));
-                            }
-                        }
+                        crate::auto::lit_scan::push_unique(
+                            &mut out,
+                            &mut seen,
+                            lit.to_owned(),
+                            line,
+                        );
                     }
                 }
                 i = j + 1;
+                continue;
+            }
+            if let Some((end, tok)) = crate::auto::lit_scan::number_literal_at(bytes, i) {
+                if let Some(tok) = tok {
+                    crate::auto::lit_scan::push_unique(&mut out, &mut seen, tok, line);
+                }
+                i = end;
                 continue;
             }
             i += 1;
@@ -560,6 +563,26 @@ pub fn extract_php_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_mines_integer_literals_outside_comments_and_identifiers() {
+        // `0x52` is an `R`, `76` an `L` and `48` a `0` once the dictionary writer
+        // adds each number's byte; the comment, the float and `v2` give nothing.
+        let toks = extract_php_dictionary_tokens(
+            "<?php\nfunction parse($s) {\n  if (ord($s[0]) !== 0x52 || ord($s[1]) !== 76) return 0;\n  \
+             $x = ord($s[3]) - 48; // 99 sits in a comment\n  $v2 = 2.5; # 98 too\n  \
+             return intdiv(100, $x);\n}\n",
+        );
+        for want in ["0x52", "76", "48", "100"] {
+            assert!(toks.iter().any(|t| t == want), "{want} not mined: {toks:?}");
+        }
+        for unwanted in ["99", "98", "5"] {
+            assert!(
+                !toks.iter().any(|t| t == unwanted),
+                "{unwanted} mined: {toks:?}"
+            );
+        }
+    }
 
     #[test]
     fn located_dictionary_tokens_record_their_lines() {
