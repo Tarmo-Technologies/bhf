@@ -961,7 +961,12 @@ and explain it — all offline and deterministic (no LLM):
   `controlled_address_read`/`_write`). When two identical replays fault on
   different addresses, the bytes are `unknown` (primitive `unattributed_crash`)
   rather than don't-care; a crash no byte gates is `uncontrolled_crash`, not
-  `gated_crash`. Turning randomization off needs the `personality(2)` system
+  `gated_crash`. Cartography maps the minimized and the original testcase and
+  keeps the stronger result, and it also replays the input one byte shorter
+  and eight bytes longer: an access whose size follows the input's length (a
+  copy of `min(data[0], len - 1)` bytes, which minimization pins so no byte
+  flip moves it) is `input_sized_linear_write` (high) or
+  `input_sized_linear_read` (medium), not a `fixed_write`. Turning randomization off needs the `personality(2)` system
   call, which a container's default seccomp profile refuses (Docker's, even
   with `--cap-add=SYS_PTRACE`). There, cartography prints a warning, and a
   wild pointer's bytes show as `unknown`; run the container with

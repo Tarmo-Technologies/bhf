@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf cartography` rates a copy whose size the input's length sets (a
+  `memcpy` of `min(data[0], len - 1)` bytes into a small buffer) as an
+  `input_sized_linear_write` with high exploitability. Minimization pinned the
+  size to the length so no byte flip moved it, and the overflow was rated a
+  `fixed_write` with low exploitability. Cartography now also probes a shorter
+  and a longer input and maps the original testcase beside the minimized one.
 - An input-controlled printf format is reported as one CWE-134 finding group
   at the call. Its crashes inside the C library (a `%n` write, a `%s` read of a
   garbage argument) used to come out as NULL-dereference and wild-access
