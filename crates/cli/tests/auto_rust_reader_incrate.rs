@@ -299,3 +299,38 @@ fn private_trait_impls_and_an_enum_parameter_fuzz_in_crate() {
         assert!(text.contains(call), "{name}:\n{text}");
     }
 }
+
+/// #216: a zoxide-shaped directory opener, `open_dir(data_dir: impl
+/// AsRef<Path>)` reading `<data_dir>/db.zo`, fuzzes in-crate. The path recipe
+/// took neither `impl AsRef<Path>` nor a seed name other than `db`, so the
+/// file the opener reads was never written.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn an_impl_asref_path_opener_fuzzes_with_the_file_it_joins() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-zoxide");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_zoxide"), &tmp, "12", "4");
+    let open_dir = find_attempt(&json, "open_dir");
+    assert!(
+        attempt_findings(open_dir, "open_dir") > 0,
+        "the planted out-of-bounds index behind the db.zo magic is found:\n{combined}"
+    );
+    let harness = tmp
+        .join("harnesses")
+        .join(open_dir["harness_id"].as_str().unwrap());
+    let module = std::fs::read_to_string(harness.join("incrate/src/__bhf_harness.rs")).unwrap();
+    assert!(
+        module.contains("__bhf_res_dir.join(\"db.zo\")"),
+        "the harness seeds db.zo:\n{module}"
+    );
+    let recipe = std::fs::read_to_string(harness.join("resource_recipe.json")).unwrap();
+    assert!(recipe.contains("`db.zo`"), "{recipe}");
+}

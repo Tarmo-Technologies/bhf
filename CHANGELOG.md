@@ -52,6 +52,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The in-crate Rust lane drives a directory opener that takes
+  `impl AsRef<Path>` (or `P: AsRef<Path>`, `Into<PathBuf>`), and seeds the file
+  the opener's body joins onto the directory (`data_dir.join("db.zo")` seeds
+  `db.zo`) instead of always `db`. A zoxide-shaped `Database::open_dir` was
+  unreachable twice over. An argument-position `impl AsRef<[u8]>`,
+  `impl AsRef<str>` or `impl Into<String>` parameter monomorphizes as a type
+  parameter with that bound does, in both Rust lanes.
 - The in-crate Rust lane harnesses a trait-impl method of a type in a private
   module, which it refused ("in-crate trait resolution is not yet
   supported"): a static one is called by UFCS with a `crate`-rooted trait path

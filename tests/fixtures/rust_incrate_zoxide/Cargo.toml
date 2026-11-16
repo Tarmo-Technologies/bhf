@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# #216 fixture, shaped like zoxide's database: `Database::open_dir` lives in a
+# private module, takes `impl AsRef<Path>`, and reads `<dir>/db.zo`. Only the
+# in-crate build reaches it, with a temp dir seeded at `db.zo`.
+
+[package]
+name = "rust_incrate_zoxide"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Detach from any ancestor workspace.
+[workspace]

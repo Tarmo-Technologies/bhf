@@ -3125,13 +3125,15 @@ fn resolve_in_crate_target(
     let param_decoders =
         resolve_param_overrides(manifest_dir, IN_CRATE_ROOT, crate_root_src, &target.params);
     let mut resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe> = None;
+    // The file a directory opener reads, from its body (`dir.join("db.zo")`).
+    let joined_file = joined_file_literal(source, target.line);
     for (i, p) in classify_params.iter().enumerate() {
         if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok()
             || param_decoders.get(i).is_some_and(Option::is_some)
         {
             continue;
         }
-        match path_opener_recipe(&p.name, &p.ty) {
+        match path_opener_recipe(&p.name, &p.ty, joined_file.as_deref()) {
             Some((arg_pass, seed_file)) => {
                 if resource_recipe.is_some() {
                     return Err(format!(
@@ -3177,13 +3179,16 @@ fn resolve_in_crate_target(
 
 /// If a parameter is a path-backed resource opener (`&Path`/`&PathBuf`/`PathBuf`),
 /// the [`ArgPass`](harness_gen::rust_decoders::ArgPass) it wants and the seed-file
-/// name to materialize. A DIRECTORY opener (param named like a dir) seeds `<dir>/db`
-/// and receives the DIRECTORY path; a FILE opener receives a seed FILE path written
-/// with the fuzz input directly. `None` for any non-path type (and for a bare owned
-/// `Path`, which is unsized and not constructible).
+/// name to materialize. A DIRECTORY opener seeds `<dir>/<joined>` and receives the
+/// DIRECTORY path: a function whose body joins a file name onto a path
+/// (`joined`, from `data_dir.join("db.zo")`, #216) is one, and so is a param
+/// named like a dir, which seeds `<dir>/db` without one. A FILE opener receives a
+/// seed FILE path written with the fuzz input directly. `None` for any non-path
+/// type (and for a bare owned `Path`, which is unsized and not constructible).
 fn path_opener_recipe(
     param_name: &str,
     ty: &str,
+    joined: Option<&str>,
 ) -> Option<(harness_gen::rust_decoders::ArgPass, Option<String>)> {
     use harness_gen::rust_decoders::ArgPass;
     // Erase a leading reference lifetime BEFORE collapsing whitespace, else the
@@ -3211,10 +3216,74 @@ fn path_opener_recipe(
     if leaf == "Path" && arg_pass != ArgPass::Ref {
         return None;
     }
+    if let Some(file) = joined {
+        return Some((arg_pass, Some(file.to_owned())));
+    }
     let name = param_name.to_ascii_lowercase();
     let is_dir = name.contains("dir") || name == "root" || name == "base";
     let seed_file = if is_dir { Some("db".to_owned()) } else { None };
     Some((arg_pass, seed_file))
+}
+
+/// The first file name the body of the function at `fn_line` joins onto a path
+/// (`data_dir.join("db.zo")` -> `db.zo`): the file a directory opener reads.
+/// Only a plain file name counts, so a `.join(", ")` of strings or a nested
+/// `"a/b"` does not.
+fn joined_file_literal(source: &str, fn_line: u32) -> Option<String> {
+    let body = function_body(source, fn_line)?;
+    let mut rest = body;
+    while let Some(at) = rest.find(".join(\"") {
+        let tail = &rest[at + ".join(\"".len()..];
+        let end = tail.find('"')?;
+        let literal = &tail[..end];
+        let file_name = !literal.is_empty()
+            && literal != "."
+            && literal != ".."
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if file_name {
+            return Some(literal.to_owned());
+        }
+        rest = &tail[end..];
+    }
+    None
+}
+
+/// The `{ ... }` body of the function defined at the 1-based `fn_line`,
+/// braces matched outside string literals.
+fn function_body(source: &str, fn_line: u32) -> Option<&str> {
+    let start = source
+        .split_inclusive('\n')
+        .take(fn_line.saturating_sub(1) as usize)
+        .map(str::len)
+        .sum::<usize>();
+    let text = source.get(start..)?;
+    let open = text.find('{')?;
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, c) in text[open..].char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(open..=open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Locate the `c_runtime` directory (which holds `bhf_driver.c` +
@@ -7112,44 +7181,77 @@ mod tests {
         );
     }
 
+    /// #216: the file a directory opener reads comes from its body; a
+    /// `.join` of strings, a nested path or another function's join does not
+    /// count.
+    #[test]
+    fn a_directory_opener_seeds_the_file_its_body_joins() {
+        let source = "impl Database {\n\
+            \x20   pub fn open_dir(data_dir: impl AsRef<Path>) -> Result<Self> {\n\
+            \x20       let label = [\"a\", \"b\"].join(\", \");\n\
+            \x20       let nested = data_dir.as_ref().join(\"sub/x\");\n\
+            \x20       let path = data_dir.as_ref().join(\"db.zo\");\n\
+            \x20       let brace = \"}\";\n\
+            \x20       Self::read(path)\n\
+            \x20   }\n\
+            \x20   fn other(d: &Path) { d.join(\"other.db\"); }\n\
+            }\n";
+        assert_eq!(joined_file_literal(source, 2).as_deref(), Some("db.zo"));
+        assert_eq!(joined_file_literal(source, 9).as_deref(), Some("other.db"));
+        assert_eq!(
+            joined_file_literal("fn f(p: &Path) { p.exists(); }\n", 1),
+            None
+        );
+        use harness_gen::rust_decoders::ArgPass;
+        assert_eq!(
+            path_opener_recipe("data_dir", "&Path", Some("db.zo")),
+            Some((ArgPass::Ref, Some("db.zo".to_owned())))
+        );
+        // A file-named param that joins a name is a directory too.
+        assert_eq!(
+            path_opener_recipe("path", "&Path", Some("config.toml")),
+            Some((ArgPass::Ref, Some("config.toml".to_owned())))
+        );
+    }
+
     #[test]
     fn path_opener_recipe_classifies_path_types_and_dir_vs_file() {
         use harness_gen::rust_decoders::ArgPass;
         // A directory param (name contains "dir") -> seed `<dir>/db`, pass the dir by
         // reference (`&Path` coerces from `&PathBuf`).
         assert_eq!(
-            path_opener_recipe("dir", "&Path"),
+            path_opener_recipe("dir", "&Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         assert_eq!(
-            path_opener_recipe("data_dir", "&std::path::Path"),
+            path_opener_recipe("data_dir", "&std::path::Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         // A lifetime on the reference is erased.
         assert_eq!(
-            path_opener_recipe("dir", "&'a Path"),
+            path_opener_recipe("dir", "&'a Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         // A FILE param (not a dir name) receives a seed file path directly.
         assert_eq!(
-            path_opener_recipe("path", "&Path"),
+            path_opener_recipe("path", "&Path", None),
             Some((ArgPass::Ref, None))
         );
         // Owned `PathBuf` is moved; `&PathBuf` is borrowed.
         assert_eq!(
-            path_opener_recipe("p", "PathBuf"),
+            path_opener_recipe("p", "PathBuf", None),
             Some((ArgPass::Move, None))
         );
         assert_eq!(
-            path_opener_recipe("p", "&PathBuf"),
+            path_opener_recipe("p", "&PathBuf", None),
             Some((ArgPass::Ref, None))
         );
         // A bare owned `Path` is unsized / not constructible -> not a recipe.
-        assert_eq!(path_opener_recipe("p", "Path"), None);
+        assert_eq!(path_opener_recipe("p", "Path", None), None);
         // Non-path types are never a recipe.
-        assert_eq!(path_opener_recipe("d", "&[u8]"), None);
-        assert_eq!(path_opener_recipe("s", "&str"), None);
-        assert_eq!(path_opener_recipe("n", "u32"), None);
+        assert_eq!(path_opener_recipe("d", "&[u8]", None), None);
+        assert_eq!(path_opener_recipe("s", "&str", None), None);
+        assert_eq!(path_opener_recipe("n", "u32", None), None);
     }
 
     /// Write a crate-root fixture with a `pub` type and a NON-PUB method, returning

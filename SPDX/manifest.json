@@ -5783,6 +5783,18 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "tests/fixtures/rust_incrate_zoxide/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_zoxide/src/db.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_zoxide/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "tests/fixtures/rust_output_buffer/Cargo.toml",
       "license": "Apache-2.0"
     },
