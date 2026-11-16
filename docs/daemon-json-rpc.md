@@ -62,9 +62,10 @@ return code `-32601`; invalid params return code `-32602`.
 
 The same executable supports newline-delimited MCP stdio with
 `bhf-daemon --mcp`. That is a separate protocol mode from the LSP-framed
-JSON-RPC service above. It exposes five read-only tools for Ada structure scan,
-Ada/C/C++ ranked targets, bounded finding loading, assistance-prompt preparation,
-and Ada/C/C++ structural harness preflight. Build, fuzz, replay, minimization,
+JSON-RPC service above. A default build exposes three read-only tools, for Ada
+structure scan, Ada/C/C++ ranked targets and bounded finding loading; a build
+with `--features llm` adds assistance-prompt preparation and Ada/C/C++
+structural harness preflight. Build, fuzz, replay, minimization,
 file editing, and shell execution are deliberately not MCP tools.
 
 The host model performs any reasoning, so BHF receives no host API token.

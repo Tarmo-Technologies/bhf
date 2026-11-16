@@ -17,10 +17,13 @@ LSP-framed. This mode lets a Codex or Claude host session use deterministic
 BHF tools without giving BHF an API token; see
 [LLM Assistance](../llm/).
 
-The MCP mode exposes five read-only tools: Ada structure scan, Ada/C/C++ ranked
-targets, bounded normalized-finding loading, task-prompt preparation, and an
-Ada/C/C++ structural harness preflight. It does not expose build, fuzz, replay,
-minimization, file editing, or shell execution. All five tools advertise
+The MCP mode of a default build, the release binaries included, exposes three
+read-only tools: `bhf_scan` (Ada structure scan), `bhf_list_targets` (ranked
+Ada/C/C++ targets) and `bhf_load_findings` (bounded normalized-finding
+loading). A build with `--features llm` adds two: `bhf_prepare_assistance`
+(task-prompt preparation) and `bhf_preflight_harness` (an Ada/C/C++
+structural harness preflight). It does not expose build, fuzz, replay,
+minimization, file editing, or shell execution. Every tool advertises
 read-only, non-destructive, idempotent, closed-world annotations. Target and
 finding defaults derive from the current MCP message budget; explicit positive
 `top` values override those breadth defaults, and responses report totals and

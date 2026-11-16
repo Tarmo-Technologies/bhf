@@ -1144,9 +1144,9 @@ provider choices are cached Codex/Claude CLI sessions, explicit-model OpenAI or
 Anthropic APIs, and an explicit-model local OpenAI-compatible endpoint. API
 keys are accepted only through environment variables.
 
-For interactive agent work, `bhf-daemon --mcp` exposes five read-only tools
-for bounded deterministic evidence, prompt preparation, and Ada/C/C++ harness
-preflight. It does not expose shell execution or long-running/mutating pipeline
+For interactive agent work, `bhf-daemon --mcp` exposes three read-only tools
+for bounded deterministic evidence, and a build with `--features llm` two more,
+for prompt preparation and Ada/C/C++ harness preflight. It does not expose shell execution or long-running/mutating pipeline
 steps. See [LLM Assistance](../llm/) for exact schemas, registration, provider
 privacy, root-cause workflows, memory controls, and the deterministic checks
 that must accept or reject model suggestions.
@@ -2084,4 +2084,4 @@ value).
 
 `bhf-daemon` is distributed beside `bhf` in release archives. Use the
 CLI for batch workflows, default daemon mode for editor JSON-RPC integrations,
-and `bhf-daemon --mcp` for the five read-only agent tools.
+and `bhf-daemon --mcp` for the read-only agent tools.

@@ -80,8 +80,8 @@ source-generated harnesses and a permissively licensed core.
   `--target-transport` seam (on-device agent, gdb-remote probe, full-system
   `qemu-system` snapshot), coverage-map setup, big-endian fidelity, HIL boards,
   and the emulator validation lane.
-- [Daemon](./daemon/) — IDE JSON-RPC plus the five read-only MCP tools for
-  bounded agent assistance.
+- [Daemon](./daemon/) — IDE JSON-RPC plus three read-only MCP tools (five
+  with the `llm` feature) for bounded agent assistance.
 - [Licensing](./licensing/) — policy profiles, SPDX metadata, and audits.
 - [Release Packaging](./release-packaging/) — distributed archives,
   checksums, and checksum-verified content packs.

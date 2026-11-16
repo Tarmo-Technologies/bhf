@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The daemon docs say `bhf-daemon --mcp` exposes three read-only tools in a
+  default build (`bhf_scan`, `bhf_list_targets`, `bhf_load_findings`) and
+  five with `--features llm`. They said five, but the release binaries
+  advertise three. A test compares daemon.md's list with `tools/list`.
 - A C# finding names its `.cs` file and line. SharpFuzz rewrites the target
   assembly without its debug symbols, so the frames of a finding had no line
   (`at Acme.Tlv.Parser.Pick(Byte[] data)`). bhf keeps the uninstrumented
