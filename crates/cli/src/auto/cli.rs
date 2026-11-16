@@ -118,7 +118,7 @@ pub struct AutoArgs {
     /// `winafl-path`, `dynamorio-path` and the `[toolchain]` table, require this
     /// explicit flag). Only these flags have a
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
-    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, grammar,
+    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
     /// engine, languages, project, ada-deps, passes, force, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
@@ -182,10 +182,18 @@ pub struct AutoArgs {
     #[arg(long = "max-len", default_value = "auto")]
     pub max_len: String,
 
-    /// Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a
-    /// hang/timeout. Default: the engine's 10s.
+    /// Per-execution timeout (e.g. `10s`, `500ms`). An execution past it is
+    /// killed, and an input that hangs again when re-run with twice the
+    /// timeout is a hang finding (BHF-230). Default: the engine's 10s.
     #[arg(long = "timeout", value_parser = crate::fuzz::parse_duration)]
     pub timeout: Option<std::time::Duration>,
+
+    /// Response deadline for every fuzzed target (e.g. `50ms`, `1s`), the
+    /// timing oracle: an input whose execution takes longer, in two of three
+    /// fresh re-runs too, is a response-deadline finding (BHF-555). Shorter
+    /// than `--timeout`. Off by default.
+    #[arg(long = "deadline", value_parser = crate::fuzz::parse_duration)]
+    pub deadline: Option<std::time::Duration>,
 
     /// Force the C++ standard for every harness build (e.g. `gnu++14`, `c++03`),
     /// pinning the dialect for legacy C++. Without it, `auto` builds C++ at the modern
@@ -1362,6 +1370,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
     if let Some(timeout) = args.timeout {
         std::env::set_var("BHF_EXEC_TIMEOUT", timeout.as_millis().to_string());
+    }
+    // --deadline arms the timing oracle for every target the same way.
+    if let Some(deadline) = args.deadline {
+        let timeout = args.timeout.unwrap_or(crate::fuzz::PER_INPUT_TIMEOUT);
+        if deadline.as_millis() == 0 || deadline >= timeout {
+            bhfeprintln!(
+                "error: --deadline must be at least 1ms and shorter than the per-input \
+                 timeout ({}), got {}",
+                crate::fuzz::duration_arg(timeout),
+                crate::fuzz::duration_arg(deadline)
+            );
+            return Ok(EXIT_NO_CANDIDATES);
+        }
+        std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
     }
     // --cxx-std pins the C++ dialect for every harness build (disabling the ladder).
     // Validate the shape so a typo fails fast rather than every C++ build silently.
@@ -7295,6 +7317,7 @@ mod tests {
                     elapsed_secs: 1.0,
                     executions_per_sec: 127.0,
                     findings: vec![],
+                    hangs: None,
                 },
                 PassRun {
                     pass: Pass::Rng,
@@ -7306,6 +7329,7 @@ mod tests {
                     elapsed_secs: 1.0,
                     executions_per_sec: 112.0,
                     findings: vec!["F-0001".to_owned()],
+                    hangs: None,
                 },
             ],
             runtrace_events: vec![],
@@ -7419,6 +7443,7 @@ mod tests {
                         elapsed_secs: 0.5,
                         executions_per_sec: 2.0,
                         findings: vec!["F-0001".to_owned(), "F-0002".to_owned()],
+                        hangs: None,
                     }],
                     runtrace_events: vec![],
                 },
@@ -7619,6 +7644,7 @@ mod tests {
                     // A crash produced WITHOUT target entry — a decode/stub
                     // artifact, not a target finding.
                     findings: vec!["F-9".to_owned()],
+                    hangs: None,
                 }],
                 per_pass_budget_secs: 60,
                 total_wall_budget_secs: 60,

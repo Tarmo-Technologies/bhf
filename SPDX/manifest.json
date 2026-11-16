@@ -2227,6 +2227,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_deadline_hangs.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_deep_source.rs",
       "license": "Apache-2.0"
     },

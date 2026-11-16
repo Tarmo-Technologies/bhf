@@ -121,7 +121,8 @@ is to bound the recursion depth.
 | `--cxx-std <STD>` | auto | Pin the C++ standard for every harness build (`gnu++14`, `c++03`, …) for legacy C++. By default `auto` builds C++ at the modern standard and, on a dialect failure, automatically retries successively older standards (`gnu++17`→`gnu++14`→…→`gnu++98`) until one builds — the chosen standard is cached per project, so no flag is needed for old code unless you want to override the search |
 | `--grammar <PATH>` | unset | JSON grammar describing the target's input format for structure-aware generation (a Nautilus-style grammar mutator), applied to every fuzzed target. Each rule maps a non-terminal to production strings where `{NAME}` references another rule; the start symbol is `START` or the first rule. Validated up front (a bad grammar fails the run fast) |
 | `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap. Seeds are kept whole up to this cap for both engines; with `--engine afl++` a fixed cap below AFL++'s 1 MiB default is also passed to afl-fuzz as `-G` when it has that option (AFL++ 4.00c or newer; an older afl-fuzz gets only the capped seeds, and a note on stderr) |
-| `--timeout <DUR>` | `10s` | Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a hang/timeout |
+| `--timeout <DUR>` | `10s` | Per-execution timeout (e.g. `10s`, `500ms`). An execution past it is killed, and an input that hangs again when re-run with twice the timeout is a hang finding (BHF-230; see [Sanitizers: Hangs](./sanitizers.md#hangs)). `run.md` and `run.json` count the hangs |
+| `--deadline <DUR>` | off | Response deadline for every fuzzed target (e.g. `50ms`, `1s`), the timing oracle: an input whose execution takes longer, in two of three fresh re-runs as well, is a response-deadline finding (BHF-555). It must be shorter than `--timeout`; `0` or a longer one is refused (exit 2). Config key `deadline` |
 | `--run-untrusted` | off | Consent umbrella for `--probe-build`, Ada (`alr build` / `gprbuild`) build probes, and Java Maven/Gradle project builds. Java project builds use Maven offline mode or Gradle `--offline`; stage target dependencies first. Bare Java source can still use `javac` without this flag. Implies `--probe-build`. EXECUTES untrusted scripts |
 | `--unsafe-search-and-run-build-commands` | off | UNSAFE convenience: search the tree for its own build entry point and EXECUTE it to recover flags, instead of you passing `--build-command`. Finds a custom build (build.sh, autotools bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the compiler-intercepting shim, and enables the `--probe-build` tiers (CMake/Meson/Make) + the Ada build probe. Runs sandboxed when available, but it executes UNTRUSTED code from the scanned tree — use only on sources you trust. An explicit `--build-command` overrides the search |
 | `--deps-only` | off | Build each target as far as possible, emit the missing-dependency manifest, and SKIP fuzzing — the fast "what does this tree need?" scan |
@@ -150,7 +151,8 @@ file means the same thing from any working directory. Only these keys exist,
 each spelled like its flag:
 
 - Run budget and limits: `per-target-time`, `max-targets`, `jobs`,
-  `rss-limit-mb`, `max-work-dir-mb`, `max-corpus-mb`, `max-len`, `timeout`.
+  `rss-limit-mb`, `max-work-dir-mb`, `max-corpus-mb`, `max-len`, `timeout`,
+  `deadline`.
 - Build inputs: `cxx-std`, `grammar`, `extra-include`, `extra-source`,
   `exclude-path`, `project`, `ada-deps`.
 - Seeds and selection: `seed-file`, `seed-dir`, `seed-mining = false` (the
@@ -683,7 +685,13 @@ follows with one line per target — every target, not a truncated top-N. Each
 built-and-fuzzed line shows the outcome label and a per-pass breakdown
 (`empty=4123execs/1000exec_s/0f rng=… fuzz_driven=…`) plus the total
 `cov=Nedges`; a `[!]` note marks a target whose fuzzed parameters are not an
-attacker-controlled input channel. The `Upstream delta` section is the
+attacker-controlled input channel. A target whose executions ran past
+`--timeout` shows `hangs=C/K`: C of its K killed executions hung again when
+re-run, each a BHF-230 finding or a later hit of one. The top section's
+`Hangs:` line totals them across targets: killed, hung again, finished when
+re-run, and not re-run (the pass had re-run four, or lacked the time). In
+`run.json` each pass carries the same counts as `hangs` (`timeout_ms`,
+`observed`, `confirmed`, `cleared`, `not_rerun`). The `Upstream delta` section is the
 prosthetic ledger described below.
 
 ### `blockers.json`

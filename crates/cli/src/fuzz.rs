@@ -6239,7 +6239,7 @@ fn is_instrumented_ada_harness(runner: &replay_min::HarnessRunner) -> bool {
 /// run indefinitely. 10s is generous - any well-behaved input
 /// completes in milliseconds, and the harness is invoked once per
 /// iteration so the overall fuzz budget caps total wall time anyway.
-const PER_INPUT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PER_INPUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A target controls its own diagnostics. Keep enough from both ends for a
 /// sanitizer header and final stack/summary, but never let a chatty execution
@@ -8373,20 +8373,20 @@ const MAX_HANG_CONFIRMATIONS: usize = 4;
 
 /// The executions of one builtin pass that were killed at the per-input
 /// timeout, and what their confirmation re-runs showed (#207).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct HangRunSummary {
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct HangRunSummary {
     /// The per-input timeout, in milliseconds.
-    pub(crate) timeout_ms: u64,
+    pub timeout_ms: u64,
     /// Executions killed at the per-input timeout.
-    pub(crate) observed: usize,
+    pub observed: usize,
     /// Hangs that hung again when re-run in a fresh process with twice the
     /// timeout. Each is a finding, or a later hit of one.
-    pub(crate) confirmed: usize,
+    pub confirmed: usize,
     /// Hangs whose re-run finished: one slow execution, not a finding.
-    pub(crate) cleared: usize,
+    pub cleared: usize,
     /// Hangs not re-run: the pass had already re-run
     /// [`MAX_HANG_CONFIRMATIONS`], or too little of its time was left.
-    pub(crate) not_rerun: usize,
+    pub not_rerun: usize,
 }
 
 /// What re-running a hung input showed.

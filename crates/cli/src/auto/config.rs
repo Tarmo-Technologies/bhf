@@ -36,6 +36,7 @@ pub struct AutoConfig {
     pub cxx_std: Option<String>,
     pub max_len: Option<String>,
     pub timeout: Option<String>,
+    pub deadline: Option<String>,
     pub grammar: Option<PathBuf>,
     pub extra_include: Option<Vec<PathBuf>>,
     pub extra_source: Option<Vec<PathBuf>>,
@@ -87,6 +88,7 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ("cxx-std", "cxx-std"),
     ("max-len", "max-len"),
     ("timeout", "timeout"),
+    ("deadline", "deadline"),
     ("grammar", "grammar"),
     ("extra-include", "extra-include"),
     ("extra-source", "extra-source"),
@@ -340,6 +342,11 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     if let Some(v) = &config.timeout {
         if args.timeout.is_none() {
             args.timeout = Some(crate::fuzz::parse_duration(v)?);
+        }
+    }
+    if let Some(v) = &config.deadline {
+        if args.deadline.is_none() {
+            args.deadline = Some(crate::fuzz::parse_duration(v)?);
         }
     }
     if let Some(v) = config.grammar {

@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf auto --deadline` (config key `deadline`) arms the response-deadline
+  oracle for every fuzzed target; it was reachable only through an
+  undocumented environment variable. A deadline that is not shorter than the
+  per-input timeout is refused (exit 2). `run.md` counts the executions
+  killed at the per-input timeout, per target (`hangs=C/K`) and in a `Hangs:`
+  line, and `run.json` carries the counts on each pass.
 - A response-deadline finding (BHF-555) is confirmed before it is reported.
   One run past `--deadline`, spawn time included, used to be a finding, so a
   run slowed by a loaded host was reported. The input is now re-run in up to
