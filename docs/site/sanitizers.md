@@ -186,6 +186,28 @@ the re-run reported no error, reported something else, reached its time limit,
 or was skipped because the pass's time had run out. `results/findings.json`
 carries `{check, used, reason}` as `fuzz.sanitizer_second_opinion`.
 
+Each AddressSanitizer report kind has its own rule too. The kind is read
+from the report's `ERROR:` line; a class ASan names with a phrase there
+(`out of memory`, `calloc parameters overflow`) takes the name its
+`SUMMARY:` line gives it (`out-of-memory`, `calloc-overflow`).
+
+| ASan report kind | Rule | CWE |
+|---|---|---|
+| `heap-buffer-overflow`, `global-buffer-overflow`, `container-overflow`, `intra-object-overflow`, `use-after-poison`, `negative-size-param` | BHF-201 | CWE-122 / CWE-125 / CWE-787 |
+| `heap-use-after-free` | BHF-202 | CWE-416 |
+| `stack-buffer-overflow`, `stack-buffer-underflow`, `dynamic-stack-buffer-overflow` | BHF-203 | CWE-121 |
+| `double-free`, `attempting free on address which was not malloc()-ed`, `alloc-dealloc-mismatch`, `new-delete-type-mismatch` | BHF-204 | CWE-415 |
+| `SEGV` (Windows: `access-violation`, `in-page-error`) | BHF-206 / BHF-223 (below) | CWE-476 / CWE-125 / CWE-787 / CWE-119 |
+| `stack-overflow` (unbounded recursion) | BHF-207 | CWE-674 |
+| `out-of-memory`, `allocation-size-too-big`, `calloc-overflow`, `reallocarray-overflow`, `pvalloc-overflow`, `rss-limit-exceeded` | BHF-209 | CWE-789 |
+| `stack-use-after-return`, `stack-use-after-scope` | BHF-211 | CWE-562 / CWE-825 |
+| `FPE` (Windows: `int-divide-by-zero`, `flt-divide-by-zero`) | BHF-222 | CWE-369 |
+| `memcpy-param-overlap`, `strcpy-param-overlap` and the other `*-param-overlap` copies | BHF-229 | CWE-475 |
+| `BUS`, `ILL`, `ABRT`, `TRAP` (Windows: `illegal-instruction`, `breakpoint`, ...) and any other kind | BHF-210 | CWE-119 |
+
+A kind bhf has no rule for, including one a newer compiler-rt adds, is a
+reachable crash (BHF-210), never a heap overflow.
+
 An ASan SEGV in the first memory page (ASan's "zero page" hint, or an address
 below `0x1000`) is a NULL dereference, BHF-206 / CWE-476. Any other SEGV is a
 wild or corrupted pointer, BHF-223: CWE-125 for a READ, CWE-787 for a WRITE,
@@ -205,8 +227,16 @@ overflow, division by zero and any "cannot be represented in type" report
 (a left shift included) were BHF-205, the load, store, member-access,
 reference-binding and NULL-argument or NULL-return reports BHF-206, an array
 index BHF-201, and every other check (a member call on NULL included)
-BHF-210. Every ASan SEGV was BHF-206, and a Windows access violation or
-in-page error BHF-201.
+BHF-210. Every ASan SEGV was BHF-206, and every other ASan kind without
+its own rule above (a Windows access violation or in-page error, a stack
+overflow, an arithmetic exception or other deadly signal, an overlapping
+copy, a refused allocation, `unknown-crash`, ...) BHF-201. They also took
+the kind from the first word of the `ERROR:` line (`out` for `out of
+memory`, `memcpy-param-overlap:` with its colon), which replay accepts too.
+In `results/`, SARIF, the report JSON and `bhf explain`, such a finding is
+grouped by the key this release gives its stored report, so it shares a
+root-cause group with the same crash found now; `finding.json` is not
+rewritten.
 
 ## How a sanitizer finding is identified
 
@@ -228,7 +258,13 @@ per crashing input.
   sanitizer-runtime and interceptor frames (`__memcmp_avx2_movbe`,
   `MemcmpInterceptorCommon`, `bcmp`, glibc component sources such as
   `sysdeps/`, `csu/`, `assert/` and `signal/`) are skipped, so the key starts
-  at the project code that made the call. A UBSan report keys on its site and
+  at the project code that made the call. So are C++ standard-library frames
+  (`std::` and `__gnu_cxx::` functions, and any frame in a standard-library
+  header under `include/c++/` or MSVC's `VC/Tools/MSVC/.../include/`; a
+  Rust `std::` frame is dropped by the same rule): two
+  out-of-bounds reads through `std::unique_ptr::get` in two project functions
+  are two groups. A crash with no other frame keeps its standard-library
+  frames. A UBSan report keys on its site and
   the function it is in: the same site reached from several harnesses is one
   group, two sites are two groups. A crash with neither a project frame nor a
   source site keys on its rule, kind, check name, the faulting pc offset when

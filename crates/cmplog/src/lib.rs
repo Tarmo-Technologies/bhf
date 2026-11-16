@@ -363,7 +363,12 @@ mod tests {
 
     #[test]
     fn ingest_from_jsonl_log_parses_cmplog_events() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-cmplog-ingest-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -557,7 +562,12 @@ not-json-just-noise\n\
     /// The driver names each record's site; the ingested entries carry it.
     #[test]
     fn ingest_reads_the_recorded_site() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-cmplog-site-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -592,7 +602,12 @@ not-json-just-noise\n\
 
     #[test]
     fn ingest_skips_unrelated_categories() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-cmplog-other-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

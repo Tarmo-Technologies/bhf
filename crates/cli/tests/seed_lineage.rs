@@ -28,7 +28,7 @@ fn make_executable(path: &Path) {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+    corpus::hex_lower(&Sha256::digest(bytes))
 }
 
 const ASAN_REPORT: &str = "\

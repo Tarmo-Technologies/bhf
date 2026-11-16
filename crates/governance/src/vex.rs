@@ -150,34 +150,62 @@ pub fn review_queue(report: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn context<'a>(rung: Option<EvidenceKind>, campaign: bool,
-        versions: &'a [String], harnesses: &'a [String]) -> AssessmentContext<'a> {
+    fn context<'a>(
+        rung: Option<EvidenceKind>,
+        campaign: bool,
+        versions: &'a [String],
+        harnesses: &'a [String],
+    ) -> AssessmentContext<'a> {
         AssessmentContext {
-            top_rung: rung, campaign_ran: campaign, advisory_fixed_versions: versions,
-            resolved_version: Some("2.0.0-rc1"), product_id: "pkg:generic/example@2.0.0-rc1",
-            evidence_summary: "inventory", harnesses,
+            top_rung: rung,
+            campaign_ran: campaign,
+            advisory_fixed_versions: versions,
+            resolved_version: Some("2.0.0-rc1"),
+            product_id: "pkg:generic/example@2.0.0-rc1",
+            evidence_summary: "inventory",
+            harnesses,
         }
     }
 
     #[test]
     fn every_component_rung_and_campaign_state_requires_vulnerability_review() {
-        for rung in [None, Some(EvidenceKind::Declared), Some(EvidenceKind::Resolved),
-            Some(EvidenceKind::SourceObserved), Some(EvidenceKind::Linked),
-            Some(EvidenceKind::RuntimeLoaded), Some(EvidenceKind::FuzzReached)] {
+        for rung in [
+            None,
+            Some(EvidenceKind::Declared),
+            Some(EvidenceKind::Resolved),
+            Some(EvidenceKind::SourceObserved),
+            Some(EvidenceKind::Linked),
+            Some(EvidenceKind::RuntimeLoaded),
+            Some(EvidenceKind::FuzzReached),
+        ] {
             for campaign in [false, true] {
                 let assessment = assess(&context(rung, campaign, &[], &[]));
                 assert_eq!(assessment.status.openvex(), "under_investigation");
                 assert!(assessment.justification.is_none());
-                assert!(assessment.impact_statement.contains("vulnerability-specific evidence"));
+                assert!(assessment
+                    .impact_statement
+                    .contains("vulnerability-specific evidence"));
             }
         }
     }
 
     #[test]
     fn even_matching_or_older_fixed_version_hints_never_prove_fixed() {
-        for version in ["1.0.0", "2.0.0", "2.0.0-rc1", "2.0.0+build", "1.0.0-r2", "unknown"] {
+        for version in [
+            "1.0.0",
+            "2.0.0",
+            "2.0.0-rc1",
+            "2.0.0+build",
+            "1.0.0-r2",
+            "unknown",
+        ] {
             let versions = vec![version.to_owned()];
-            let assessment = assess(&context(Some(EvidenceKind::Resolved), false, &versions, &[]));
+            let assessment = assess(&context(
+                Some(EvidenceKind::Resolved),
+                false,
+                &versions,
+                &[],
+            ));
             assert_eq!(assessment.status.openvex(), "under_investigation");
             assert!(assessment.impact_statement.contains(version));
             assert!(assessment.impact_statement.contains("not a verified fix"));
@@ -187,7 +215,12 @@ mod tests {
     #[test]
     fn multiple_fixed_branches_are_preserved_for_review_without_ordering() {
         let versions = vec!["1.5.9".to_owned(), "2.4.3".to_owned()];
-        let assessment = assess(&context(Some(EvidenceKind::FuzzReached), true, &versions, &[]));
+        let assessment = assess(&context(
+            Some(EvidenceKind::FuzzReached),
+            true,
+            &versions,
+            &[],
+        ));
         assert!(assessment.impact_statement.contains("1.5.9, 2.4.3"));
         assert_eq!(assessment.status.openvex(), "under_investigation");
     }
@@ -195,8 +228,18 @@ mod tests {
     #[test]
     fn notes_keep_product_rung_campaign_and_harness_evidence() {
         let harnesses = vec!["H-1".to_owned()];
-        let assessment = assess(&context(Some(EvidenceKind::FuzzReached), true, &[], &harnesses));
-        for expected in ["pkg:generic/example", "validated campaign evidence is present", "H-1", "inventory"] {
+        let assessment = assess(&context(
+            Some(EvidenceKind::FuzzReached),
+            true,
+            &[],
+            &harnesses,
+        ));
+        for expected in [
+            "pkg:generic/example",
+            "validated campaign evidence is present",
+            "H-1",
+            "inventory",
+        ] {
             assert!(assessment.impact_statement.contains(expected));
         }
     }
@@ -204,7 +247,9 @@ mod tests {
     #[test]
     fn missing_campaign_data_does_not_claim_that_no_campaign_ran() {
         let assessment = assess(&context(None, false, &[], &[]));
-        assert!(assessment.impact_statement.contains("no validated campaign evidence"));
+        assert!(assessment
+            .impact_statement
+            .contains("no validated campaign evidence"));
         assert!(!assessment.impact_statement.contains("no fuzz campaign ran"));
     }
 
@@ -238,9 +283,13 @@ mod tests {
 
     #[test]
     fn missing_or_malformed_assessments_remain_in_review() {
-        for vex in [Value::Null, json!({}), json!({"review_required": "false"}),
+        for vex in [
+            Value::Null,
+            json!({}),
+            json!({"review_required": "false"}),
             json!({"review_required": false, "status": "unknown"}),
-            json!({"review_required": false, "status": "under_investigation"})] {
+            json!({"review_required": false, "status": "under_investigation"}),
+        ] {
             let queue = review_queue(&json!({"matches": [{"id": "CVE-example", "vex": vex}]}));
             assert_eq!(queue["counts"]["requiring_review"], 1);
         }
@@ -253,7 +302,10 @@ mod tests {
             {"id": "CVE-example", "component_ref": "b", "vex": {"product_id": "pkg:generic/b@1"}}
         ]}));
         assert_eq!(queue["counts"]["requiring_review"], 2);
-        assert_ne!(queue["entries"][0]["product_id"], queue["entries"][1]["product_id"]);
+        assert_ne!(
+            queue["entries"][0]["product_id"],
+            queue["entries"][1]["product_id"]
+        );
     }
 
     #[test]

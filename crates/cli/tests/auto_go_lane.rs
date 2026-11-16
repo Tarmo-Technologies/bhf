@@ -11,6 +11,10 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/go_lane")
@@ -61,11 +65,11 @@ fn auto_builds_fuzzes_and_finds_index_oob_cwe125() {
         return;
     }
     // Run from a temp copy of the whole module (go.mod + package) outside the repo.
-    let src = std::env::temp_dir().join(format!("bhf_golane_it_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
+    let src_guard = TestDir::new("golane_it");
+    let src = src_guard.join("src");
     copy_dir(&fixture(), &src).expect("copy go fixture module");
-    let work = std::env::temp_dir().join(format!("bhf_golane_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("golane_w");
+    let work = work_guard.join("work");
 
     let out = Command::new(bhf_bin())
         .args([
@@ -107,11 +111,11 @@ fn go_coverage_instruments_the_target_module_not_just_the_harness() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
-    let src = std::env::temp_dir().join(format!("bhf go lane cov source {}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
+    let src_guard = TestDir::new("bhf go lane cov source ");
+    let src = src_guard.join("src");
     copy_dir(&fixture(), &src).expect("copy go fixture module");
-    let work = std::env::temp_dir().join(format!("bhf go lane cov work {}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("bhf go lane cov work ");
+    let work = work_guard.join("work");
 
     let out = Command::new(bhf_bin())
         .args([

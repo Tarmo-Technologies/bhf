@@ -20,13 +20,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Skip the nightly when the code hasn't changed: if the tip commit is older
-  # than a day there were no new commits since the last nightly. A manual
-  # dispatch always runs.
+  # Skip the nightly only when an earlier run at this commit ran every shard
+  # and all of them passed (scripts/ci/nightly-gate.py). A failed nightly
+  # runs again while the commit is unchanged, and a skip, which GitHub records
+  # as a success, never hides a failure. A manual dispatch always runs.
   gate:
-    name: Gate on new commits
+    name: Gate on an untested commit
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       changed: ${{ steps.check.outputs.changed }}
     steps:
@@ -34,26 +38,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Detect commits in the last day
+      - name: Look for a full successful run at this commit
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "manual dispatch: running"
-            exit 0
-          fi
-          head_ts="$(git log -1 --format=%ct)"
-          now="$(date +%s)"
-          age=$(( now - head_ts ))
-          # 25h window covers the daily cron plus scheduler jitter.
-          if [ "$age" -lt 90000 ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "tip commit is ${age}s old (< 25h): running"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "tip commit is ${age}s old (>= 25h): no new code, skipping"
-          fi
+          python3 scripts/ci/nightly-gate.py --repo "$GITHUB_REPOSITORY" \
+            --workflow integration-nightly.yml --sha "$GITHUB_SHA" \
+            --event "$EVENT_NAME" --run-id "$GITHUB_RUN_ID"
 
   integration:
     name: Integration tests (bhf)
@@ -86,28 +79,168 @@ jobs:
         with:
           toolchain: stable
 
+      # The lane tests skip, and pass, when their toolchain is missing; these
+      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C# and
+      # Cortex-M emulator lanes, and the skip-line check after the tests fails
+      # the shard if a test still skips (scripts/ci/allowed-skips.txt lists
+      # the lanes not installed yet: Ada, AFL++, COBOL, Wine and AArch64).
+      - name: Install the interpreter and emulator toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lua5.4 \
+            php-cli \
+            php-pcov \
+            ruby \
+            perl \
+            qemu-system-arm \
+            qemu-utils \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            gdb \
+            lldb \
+            llvm
+
+      - name: Install a JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # esbuild for the TypeScript lane, as the container image pins it; a
+      # nightly Rust for the Rust lane's sanitizer builds; the SharpFuzz tool
+      # whose SharpFuzz.Common.dll the C# capsule tests use.
+      - name: Install esbuild, a nightly Rust and SharpFuzz
+        run: |
+          npm install -g --no-fund --no-audit esbuild@0.28.2
+          rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+          dotnet tool install --global --version 2.3.0 SharpFuzz.CommandLine
+
+      - name: Check the installed toolchains
+        run: |
+          set -euo pipefail
+          for tool in lua5.4 php ruby perl java javac node esbuild qemu-system-arm qemu-img \
+                      arm-none-eabi-gcc nm gdb lldb llvm-symbolizer dotnet; do
+            command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
+          done
+          # The runner image's PHP ships the pcov module disabled; enable it for
+          # every installed PHP version and SAPI.
+          sudo phpenmod -v ALL -s ALL pcov 2>/dev/null || true
+          if ! php -m | grep -qix pcov; then
+            echo "php has no pcov extension" >&2
+            php --version >&2
+            php --ini >&2
+            ls /etc/php/*/mods-available 2>/dev/null | grep -i pcov >&2 || true
+            exit 1
+          fi
+          java -version 2>&1 | grep -q 'version "21' || { echo "java is not 21" >&2; exit 1; }
+          cargo +nightly --version
+          find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
+            -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
+
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      # bhf preloads the runtrace shim, and the compiler intercept, from beside
+      # itself (target/debug). Both are cdylibs, which nextest's build of the
+      # test binaries does not produce: without this step every fuzz ran with
+      # the runtime audit off and the env-capsule tests skipped as passes.
+      - name: Build the runtrace shim and compiler intercept
+        run: |
+          cargo build --locked -p bhf_runtrace_shim -p bhf_cc_intercept
+          test -f target/debug/libbhf_runtrace_shim.so
+          test -f target/debug/libbhf_cc_intercept.so
 
       # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
       # the heavy-bhf concurrency cap (.config/nextest.toml) limits concurrent
       # compile+fuzz tests so the C compiler doesn't thrash the runner.
       # `--partition hash:N/HASH_SHARDS` splits every bhf integration test but
       # the slowest across the numbered shards; the named shard builds and runs
-      # that one alone. --no-fail-fast matches `cargo test`.
+      # that one alone. --no-fail-fast matches `cargo test`. BHF_REQUIRE_TOOLS=1
+      # fails a test that finds the runtrace shim missing instead of skipping.
+      # The `ci` profile (.config/nextest.toml) retries a failure once (a pass
+      # then is FLAKY), kills a test that hangs, and writes the JUnit report,
+      # with every test's output, that the next steps summarize and upload.
       - name: Integration tests (shard ${{ matrix.shard }})
         env:
           RAYON_NUM_THREADS: "1"
+          BHF_REQUIRE_TOOLS: "1"
           SHARD: ${{ matrix.shard }}
           HASH_SHARDS: "12"
         run: |
           set -euo pipefail
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
-            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast -E "$slow"
+            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E "$slow"
           elif [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$HASH_SHARDS" ]; then
-            cargo nextest run --locked --workspace --no-fail-fast -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
+            cargo nextest run --locked --workspace --no-fail-fast --profile ci -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
           else
             echo "unknown shard: $SHARD" >&2
             exit 1
           fi
+
+      # A skip line in a test's output (kept in the JUnit report) means a lane
+      # that ran nothing; only those scripts/ci/allowed-skips.txt allows pass.
+      - name: Fail on unexpected skip lines
+        if: ${{ always() }}
+        run: python3 scripts/ci/check-no-skips.py --allowlist scripts/ci/allowed-skips.txt target/nextest/ci/junit.xml
+
+      - name: Summarize the nextest report
+        if: ${{ always() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: python3 scripts/ci/junit-summary.py --title "Shard $SHARD" target/nextest/ci/junit.xml
+
+      - name: Retain the nextest report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-nightly-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: warn
+          retention-days: 30
+
+  # A failed or timed-out shard opens one tracking issue for this branch, or
+  # updates the open one, and comments on it when a new commit fails. A run
+  # cancelled by a newer one reports nothing.
+  report-failure:
+    name: Report a failed nightly
+    needs: [gate, integration]
+    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/nightly-failure.md"
+          comment="$RUNNER_TEMP/nightly-failure-comment.md"
+          {
+            echo "The nightly integration suite failed on \`$GITHUB_REF_NAME\` at $GITHUB_SHA."
+            echo
+            echo "Last failing run: $RUN_URL ($EVENT_NAME)"
+            echo
+            echo "The nightly runs again every day until a run at the branch's tip passes"
+            echo "every shard. Close this issue once it does."
+          } > "$body"
+          echo "The nightly now fails at $GITHUB_SHA: $RUN_URL" > "$comment"
+          python3 scripts/ci/tracking-issue.py --repo "$GITHUB_REPOSITORY" \
+            --key "integration-nightly:$GITHUB_REF_NAME" --label integration-nightly \
+            --title "Integration nightly failing on $GITHUB_REF_NAME" \
+            --body-file "$body" --fingerprint "$GITHUB_SHA" --comment-file "$comment"

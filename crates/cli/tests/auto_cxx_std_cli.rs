@@ -10,6 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have_clang() -> bool {
     Command::new("clang++").arg("--version").output().is_ok()
         && Command::new("make").arg("--version").output().is_ok()
@@ -92,8 +96,7 @@ fn auto_cxx_std_ladder_builds_legacy_cpp_and_rejects_bogus() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-cxxstd-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("cxxstd");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     write_fixture(&src);
@@ -135,7 +138,7 @@ fn auto_cxx_std_ladder_builds_legacy_cpp_and_rejects_bogus() {
         String::from_utf8_lossy(&bad.stderr)
     );
 
-    let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -150,8 +153,7 @@ fn auto_builds_pre_cpp11_adjacent_format_macro_under_modern_clang() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-cxx-adjacent-literal-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("cxx-adjacent-literal");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     write_adjacent_literal_fixture(&src);

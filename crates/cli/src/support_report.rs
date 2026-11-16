@@ -1469,7 +1469,7 @@ fn render_report(
     }
 
     let digest = Sha256::digest(body.as_bytes());
-    let report_id = format!("{:x}", digest);
+    let report_id = corpus::hex_lower(&digest);
     let mut report = format!(
         "BHF SUPPORT REPORT (SCRUBBED)\nreport_id={}\n{body}END\n",
         &report_id[..16]
@@ -1753,7 +1753,6 @@ fn truncate_report(report: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extra_qualification_errors_have_a_path_free_shape() {
@@ -1769,17 +1768,8 @@ mod tests {
         );
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bhf-support-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn temp_dir(label: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("support-{label}"))
     }
 
     fn write_result(work: &Path, id: &str, value: Value) {
@@ -1861,7 +1851,7 @@ mod tests {
             assert!(!report.contains(secret), "leaked {secret}: {report}");
         }
         assert!(report.len() <= DEFAULT_MAX_BYTES);
-        fs::remove_dir_all(work).ok();
+        fs::remove_dir_all(&work).ok();
     }
 
     #[test]
@@ -1897,7 +1887,7 @@ mod tests {
         let report = render_report(&evidence, &WorkFacts::default(), 8, 6_000, false);
         assert!(report.contains("checkpoints=0 invalid=1"));
         assert!(!report.contains("SENSITIVE"));
-        fs::remove_dir_all(work).ok();
+        fs::remove_dir_all(&work).ok();
     }
 
     #[test]
@@ -2097,6 +2087,6 @@ mod tests {
             assert!(!report.contains(secret), "leaked {secret}:\n{report}");
         }
         assert!(report.len() <= 4_000);
-        fs::remove_dir_all(work).ok();
+        fs::remove_dir_all(&work).ok();
     }
 }

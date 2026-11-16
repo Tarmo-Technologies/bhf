@@ -3887,7 +3887,14 @@ end Pool;
     #[test]
     fn hardcoded_password_constant_is_reported() {
         // The generic BHF-429 assignment detector runs on Ada `:=`; this pins it.
-        let root = std::env::temp_dir().join(format!("bhf-ada-secret-{}", std::process::id()));
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp
+            .path()
+            .join(format!("bhf-ada-secret-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("cfg.adb"),

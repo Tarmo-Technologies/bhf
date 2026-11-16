@@ -3819,7 +3819,6 @@ fn ada_unit_from_filename(source: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// How an include line names `path`: with `/` on Windows.
     fn spelled(path: &Path) -> String {
@@ -3831,14 +3830,8 @@ mod tests {
         }
     }
 
-    fn tmpdir() -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-repair-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("repair")
     }
 
     #[test]
@@ -5758,7 +5751,6 @@ mod tests {
             "{:?}",
             plan("local.h")
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

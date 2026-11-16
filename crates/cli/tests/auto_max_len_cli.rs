@@ -10,6 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have_clang() -> bool {
     Command::new("clang").arg("--version").output().is_ok()
         && Command::new("make").arg("--version").output().is_ok()
@@ -69,8 +73,7 @@ fn auto_max_len_auto_grows_seedlessly_and_fixed_cap_bounds() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-auto-maxlen-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("auto-maxlen");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     write_fixture(&src);

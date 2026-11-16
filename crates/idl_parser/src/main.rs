@@ -28,8 +28,14 @@ mod tests {
 
     #[test]
     fn parse_path_reports_declaration_count() {
-        let root =
-            std::env::temp_dir().join(format!("bhf-idl-parser-{}-summary", std::process::id()));
+        // Removed when this scope ends.
+        let bhf_tmp1 = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = bhf_tmp1
+            .path()
+            .join(format!("bhf-idl-parser-{}-summary", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create fixture dir");
         fs::write(root.join("common.idl"), "interface Common {};\n").expect("write include");

@@ -11,14 +11,12 @@
 use std::path::Path;
 use std::process::Command;
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-legacy-audit-{tag}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("legacy-audit-{tag}"))
 }
 
 fn run_auto(root: &Path, work: &Path, extra: &[&str]) -> serde_json::Value {

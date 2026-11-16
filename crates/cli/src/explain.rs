@@ -138,9 +138,8 @@ fn render(work_dir: &Path, only: Option<&str>, all_members: bool) -> anyhow::Res
 }
 
 /// The root-cause group a finding belongs to: its `cluster_key_full`, the key
-/// the results reports group on (for a frame-less crash an earlier release
-/// keyed on one constant per rule, the key its stored report gets now), else
-/// the finding alone.
+/// the results reports group on (for a crash an earlier release keyed
+/// differently, the key its stored report gets now), else the finding alone.
 fn group_key(f: &Finding) -> String {
     corpus::cluster::legacy_fallback_cluster_key(&f.raw)
         .map(|key| key.full)

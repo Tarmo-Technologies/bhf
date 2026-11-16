@@ -2514,7 +2514,10 @@ fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
     fs::create_dir_all(&dir)
         .map_err(|error| format!("create seed dir '{}': {error}", dir.display()))?;
     for bytes in std::mem::take(&mut args.seed_bytes) {
-        let path = dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
+        let path = dir.join(format!(
+            "{}.bin",
+            corpus::hex_lower(&Sha256::digest(&bytes))
+        ));
         fs::write(&path, &bytes)
             .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
         args.campaign_seed_files.push(path);
@@ -4655,6 +4658,21 @@ fn run_builtin_with_progress(
             .saturating_div(32 * 1024)
             .clamp(50, 2048)
         });
+    // A shell command with shell syntax that ran without input bytes in it
+    // is a program constant, which BHF-304 does not report: the run notes it
+    // once.
+    {
+        let constants = sink_taint.constant_shell_commands();
+        if let Some((api, command)) = constants.first() {
+            let shown: String = command.chars().take(80).collect();
+            bhfeprintln!(
+                "bhf fuzz: note: {} shell command(s) with shell metacharacters ran without \
+                 fuzz-input bytes in them, such as {api}({shown:?}); a program constant is not \
+                 reported as command injection (BHF-304)",
+                constants.len()
+            );
+        }
+    }
     let dropped_sink_entries = sink_taint.dropped_entries();
     let sink_taint_limit = sink_taint.entry_limit();
     let confirmed_sinks = sink_taint.into_confirmed();
@@ -4663,23 +4681,24 @@ fn run_builtin_with_progress(
         if sink_subject_is_bhf_housekeeping(&confirmed, &prepared.work_dir) {
             continue;
         }
-        let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) else {
-            continue;
-        };
-        let key = oracle_hit_dedupe_key(&hit);
-        if !seen_oracle_hits.insert(key.clone()) {
-            note_duplicate_of_existing(
-                &mut duplicates_of_existing,
-                existing_findings.oracles.get(&key),
-            );
-            continue;
+        // A `system`/`popen` command with shell syntax is also the
+        // shell-metacharacter heuristic's (BHF-304).
+        for hit in crate::auto::runtrace::confirmed_sink_hits(&confirmed) {
+            let key = oracle_hit_dedupe_key(&hit);
+            if !seen_oracle_hits.insert(key.clone()) {
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings.oracles.get(&key),
+                );
+                continue;
+            }
+            let id = emitter
+                .emit_oracle_hit(&confirmed.input, &hit)
+                .map_err(|error| format!("emit oracle finding: {error}"))?;
+            let descent = lineage.of_bytes(&confirmed.input);
+            crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
+            finding_ids.push(id.0);
         }
-        let id = emitter
-            .emit_oracle_hit(&confirmed.input, &hit)
-            .map_err(|error| format!("emit oracle finding: {error}"))?;
-        let descent = lineage.of_bytes(&confirmed.input);
-        crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
-        finding_ids.push(id.0);
     }
     if confirmed_sinks_total > max_sink_taint_findings {
         bhfeprintln!(
@@ -9328,14 +9347,8 @@ mod exec_wait_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-exec-wait-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("exec-wait-{name}"))
     }
 
     fn script(dir: &Path, body: &str) -> PathBuf {
@@ -9603,12 +9616,7 @@ mod spawn_priority_windows_tests {
             eprintln!("skipping: the hosted runner changes priority classes itself");
             return;
         }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let work = std::env::temp_dir().join(format!("bhf-spawn-priority-{nonce}"));
-        fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("spawn-priority");
         let scratch = ensure_harness_scratch(&work).unwrap();
         // The script prints its own priority class `samples` times, 250 ms
         // apart.
@@ -9659,7 +9667,6 @@ mod spawn_priority_windows_tests {
             raised.is_some_and(|at| seen[at..].iter().all(|class| class == "Normal")),
             "the re-run was not returned to normal priority: {seen:?}"
         );
-        let _ = fs::remove_dir_all(&work);
     }
 }
 
@@ -10143,12 +10150,7 @@ mod engine_list_tests {
 
     #[test]
     fn resolve_afl_fuzz_prefers_afl_path_then_falls_back() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-aflpath-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("aflpath");
         let bin = dir.join(if cfg!(windows) {
             "afl-fuzz.exe"
         } else {
@@ -10466,19 +10468,11 @@ mod entropic_tests {
 mod vp_tokens_tests {
     use super::read_vp_tokens;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_driver_value_profile_log() {
         // Layout the driver writes: [u32 cursor][ {u8 len}{len bytes} ... ].
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-vp-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("vp");
         let path = dir.join("vp.shm");
         let mut body = Vec::new();
         for tok in [b"{".as_slice(), b"true", &[0x50, 0x4b, 0x03, 0x04]] {
@@ -10536,7 +10530,6 @@ mod resolve_iterations_tests {
 mod coverage_tracker_tests {
     use super::{count_to_bucket, CoverageTracker, BHF_COV_BITS};
     use std::io::{Seek, SeekFrom, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     // Set one bitmap byte (an "edge") the way the driver's coverage runtime would.
     // A write() to the file shares the page cache with the tracker's MAP_SHARED
@@ -10560,14 +10553,7 @@ mod coverage_tracker_tests {
 
     #[test]
     fn coverage_tracker_keeps_only_coverage_increasing_inputs() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov");
         let path = dir.join("coverage.shm");
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
 
@@ -10622,14 +10608,7 @@ mod coverage_tracker_tests {
     // (modelled by `zero_counts`), so each call observes one exec's counts.
     #[test]
     fn coverage_tracker_buckets_register_transitions_not_within_bucket_noise() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-cnt-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov-cnt");
         let cov = dir.join("coverage.shm");
         let cnt = dir.join("coverage_cnt.shm");
         let env = vec![
@@ -10714,14 +10693,7 @@ mod coverage_tracker_tests {
     // by `zero_progress`), so each call observes one exec's per-site progress.
     #[test]
     fn coverage_tracker_progress_registers_new_leading_match_levels() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cmpp-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cmpp");
         let cov = dir.join("coverage.shm");
         let cmpp = dir.join("cmp_progress.shm");
         let env = vec![
@@ -10782,14 +10754,7 @@ mod coverage_tracker_tests {
     // trace-pc path), rather than fabricating novelty.
     #[test]
     fn coverage_tracker_without_progress_map_is_inert() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cmpp-absent-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cmpp-absent");
         let cov = dir.join("coverage.shm");
         // No BHF_CMP_PROGRESS_SHM: the progress channel must stay inert.
         let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
@@ -10807,14 +10772,7 @@ mod coverage_tracker_tests {
     // channel is inert (always false) rather than fabricating novelty.
     #[test]
     fn coverage_tracker_without_count_map_is_presence_only() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-cov-nocnt-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("cov-nocnt");
         let cov = dir.join("coverage.shm");
         // No BHF_COV_CNT_SHM: the bucket channel must stay inert.
         let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
@@ -11171,16 +11129,9 @@ mod auto_path_tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmpdir() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-find-{n}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("find")
     }
 
     fn sanitizer_report(rule_id: &'static str, frames: Vec<&str>) -> corpus::SanitizerReport {
@@ -12654,7 +12605,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_rss_limit_only_when_set() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.rss_limit_mb = 0;
         assert!(!worker_passthrough_args(&args)
             .iter()
@@ -12668,7 +12620,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_timeout_only_when_set() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.timeout = None;
         assert!(
             !worker_passthrough_args(&args)
@@ -12685,7 +12638,8 @@ exit 0
 
     #[test]
     fn multicore_workers_receive_seed_bytes_as_byte_exact_seed_files() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         let seed = non_utf8_seed();
         args.seed_bytes = vec![seed.clone()];
         materialize_seed_bytes(&mut args).unwrap();
@@ -12820,7 +12774,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_len_control() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.len_control = 7;
         let passthrough = worker_passthrough_args(&args);
         assert!(passthrough
@@ -12848,7 +12803,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_includes_max_len() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         args.max_len = 128;
         let passthrough = worker_passthrough_args(&args);
         assert!(
@@ -12861,7 +12817,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_input_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Record);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Record);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12872,7 +12829,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_json_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Json);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Json);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12883,7 +12841,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_xml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Xml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Xml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12894,7 +12853,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_key_value_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Kv);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Kv);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12905,7 +12865,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_url_encoded_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Url);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Url);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12916,7 +12877,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_multipart_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Multipart);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Multipart);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12927,7 +12889,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_csv_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Csv);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Csv);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12938,7 +12901,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_http_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Http);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Http);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12949,7 +12913,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_ini_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Ini);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Ini);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12960,7 +12925,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_toml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Toml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Toml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -12971,7 +12937,8 @@ exit 0
 
     #[test]
     fn worker_passthrough_preserves_structured_yaml_mode() {
-        let args = fuzz_args_for_worker_passthrough(StructuredInputMode::Yaml);
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Yaml);
 
         let passthrough = worker_passthrough_args(&args);
 
@@ -13362,7 +13329,8 @@ exit 0
     /// engine only, which is the one that runs such a binary on one input.
     #[test]
     fn a_multicore_campaign_notes_a_libfuzzer_binary_once() {
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
         let dir = args.work_dir.join("build/H-X");
         fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("main");
@@ -13786,7 +13754,6 @@ exit 0
             pending.iter().any(|input| input == b"R1" || input == b"R2"),
             "the crasher left over is kept for the next pass: {pending:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14037,7 +14004,8 @@ exit 0
         write_scalars_first_layout(&harness);
         let seed_file = root.join("magic.bin");
         fs::write(&seed_file, b"MAGC").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-PREFIX".to_owned();
         args.seed_files = vec![seed_file];
@@ -14075,7 +14043,8 @@ exit 0
         write_scalars_first_layout(&harness);
         let seed_file = root.join("magic.bin");
         fs::write(&seed_file, b"MAGC").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-PREFIX-MC".to_owned();
         args.seed_files = vec![seed_file];
@@ -14119,7 +14088,8 @@ exit 0
         let queued = work_dir.join("corpus/H-OPERATOR/queue/entry.bin");
         fs::create_dir_all(queued.parent().unwrap()).unwrap();
         fs::write(&queued, b"ENTRY").unwrap();
-        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
         args.work_dir = work_dir.clone();
         args.harness = "H-OPERATOR".to_owned();
         args.seed_files = vec![seed_file.clone()];
@@ -14481,12 +14451,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn collector_auto_without_shim_log_is_not_reported_clean() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let work = std::env::temp_dir().join(format!("bhf-fuzz-col-noobs-{nonce}"));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("fuzz-col-noobs");
 
         // No runtrace.jsonl is written (the shim was never armed).
         let prov = run_collector_for_fuzz(
@@ -14520,9 +14485,12 @@ exit 0
         let _ = std::fs::remove_dir_all(&work);
     }
 
-    fn fuzz_args_for_worker_passthrough(structured_inputs: StructuredInputMode) -> FuzzArgs {
+    fn fuzz_args_for_worker_passthrough(
+        work_dir: &Path,
+        structured_inputs: StructuredInputMode,
+    ) -> FuzzArgs {
         FuzzArgs {
-            work_dir: tmpdir(),
+            work_dir: work_dir.to_path_buf(),
             harness: "H-X".to_owned(),
             engine: FuzzEngine::Builtin,
             afl_mode: AflMode::Native,
@@ -14584,23 +14552,22 @@ mod redqueen_cmplog_tests {
     use super::{
         CmpShmReader, CoverageTracker, BHF_CMP_BYTES, BHF_CMP_CAP, BHF_CMP_OPMAX, BHF_CMP_REC,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_path(tag: &str) -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("bhf-rq-{tag}-{n}"))
+    /// A path for a shared-memory image, in a dir removed when the guard drops.
+    fn tmp_path(tag: &str) -> (crate::test_support::TestDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestDir::new(&format!("rq-{tag}"));
+        let path = dir.join("shm");
+        (dir, path)
     }
 
     /// Write a `BHF_CMP_SHM` image with the given (count, records) and the
-    /// usual header, then return the path + an env vec pointing `CmpShmReader` at it.
+    /// usual header, then return its dir's guard + an env vec pointing
+    /// `CmpShmReader` at it.
     fn write_cmp_image(
         tag: &str,
         count: u32,
         records: &[(u8, u8, Vec<u8>, Vec<u8>)],
-    ) -> (std::path::PathBuf, Vec<(String, String)>) {
+    ) -> (crate::test_support::TestDir, Vec<(String, String)>) {
         let mut buf = vec![0u8; BHF_CMP_BYTES];
         // header: [u32 armed=0][u32 count]
         buf[4..8].copy_from_slice(&count.to_le_bytes());
@@ -14614,10 +14581,10 @@ mod redqueen_cmplog_tests {
             buf[off + 2 + BHF_CMP_OPMAX..off + 2 + BHF_CMP_OPMAX + b_end]
                 .copy_from_slice(&b[..b_end]);
         }
-        let path = tmp_path(tag);
+        let (dir, path) = tmp_path(tag);
         std::fs::write(&path, &buf).unwrap();
         let env = vec![("BHF_CMP_SHM".to_owned(), path.display().to_string())];
-        (path, env)
+        (dir, env)
     }
 
     #[test]
@@ -14642,7 +14609,7 @@ mod redqueen_cmplog_tests {
             // both operands empty -> skipped
             (0, 0, vec![], vec![]),
         ];
-        let (path, env) = write_cmp_image("roundtrip", records.len() as u32, &records);
+        let (_dir, env) = write_cmp_image("roundtrip", records.len() as u32, &records);
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         let log = reader.read_log();
 
@@ -14666,7 +14633,6 @@ mod redqueen_cmplog_tests {
                 .any(|c| c.offset == 0 && c.replacement == vec![0x88, 0x77, 0x66, 0x55]),
             "splice candidate at the planted offset must be found"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -14679,7 +14645,7 @@ mod redqueen_cmplog_tests {
             vec![0x5A; BHF_CMP_OPMAX],
             vec![0xA5; BHF_CMP_OPMAX],
         )];
-        let (path, env) = write_cmp_image("clamp", (BHF_CMP_CAP as u32) + 9999, &records);
+        let (_dir, env) = write_cmp_image("clamp", (BHF_CMP_CAP as u32) + 9999, &records);
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         let log = reader.read_log();
         // Only one real record was written; the rest of the (clamped-to-CAP) range
@@ -14687,12 +14653,12 @@ mod redqueen_cmplog_tests {
         assert_eq!(log.entries.len(), 1);
         assert_eq!(log.entries[0].operand_a.len(), BHF_CMP_OPMAX);
         assert_eq!(log.entries[0].operand_b.len(), BHF_CMP_OPMAX);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn arm_zeroes_count_and_sets_armed_disarm_clears() {
-        let (path, env) = write_cmp_image("arm", 7, &[(2, 2, vec![1, 2], vec![3, 4])]);
+        let (dir, env) = write_cmp_image("arm", 7, &[(2, 2, vec![1, 2], vec![3, 4])]);
+        let path = dir.join("shm");
         let reader = CmpShmReader::new(&env).expect("map cmp shm");
         reader.arm();
         let after_arm = std::fs::read(&path).unwrap();
@@ -14705,7 +14671,6 @@ mod redqueen_cmplog_tests {
             &[0, 0, 0, 0],
             "armed cleared by disarm"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     /// The edge map of a GCC `trace-pc` harness is labelled with that
@@ -14777,7 +14742,7 @@ mod redqueen_cmplog_tests {
 
     #[test]
     fn coverage_tracker_snapshot_zero_restore_round_trips() {
-        let path = tmp_path("cov");
+        let (_dir, path) = tmp_path("cov");
         std::fs::write(&path, vec![0u8; crate::fuzz::BHF_COV_BITS]).unwrap();
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
         let tracker = CoverageTracker::new(&env).expect("map cov shm");

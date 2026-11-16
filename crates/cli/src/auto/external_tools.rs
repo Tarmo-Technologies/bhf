@@ -517,8 +517,8 @@ mod tests {
     /// and the fuzz-confirmation join accept, tagged with the tool + CWE.
     #[test]
     fn write_finding_emits_static_record_with_tool_and_cwe() {
-        let work = std::env::temp_dir().join(format!("bhf-ext-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
+        let work_guard = crate::test_support::TestDir::new("ext");
+        let work = work_guard.join("work");
         let finding = ExtFinding {
             tool: "gosec".to_owned(),
             rule: "G204".to_owned(),

@@ -14,6 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -100,8 +104,8 @@ fn write_output_buffer_method_builds_fuzzes_without_empty_slice_panic_storm() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-outbuf-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("outbuf");
+    let tmp = tmp_guard.join("tmp");
     let (combined, json) = run_auto(&fixture("rust_output_buffer"), &tmp);
 
     // A write_* method built+fuzzed through the UFCS static-method lane.

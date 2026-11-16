@@ -829,7 +829,6 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn repeated_idl_warnings_collapse_to_one_line_each_plus_a_count() {
@@ -1192,13 +1191,7 @@ mod tests {
         assert!(dictionary.contains("\"66\""));
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-fake-corba-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("fake-corba-{name}"))
     }
 }

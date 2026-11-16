@@ -3780,7 +3780,6 @@ mod tests {
     use crate::auto::candidate::{Candidate, Lang};
     use crate::auto::dep_manifest::DepKind;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A cross build's triple is read off its toolchain stamp: a clang
     /// `--target=` or a prefixed cross compiler.
@@ -3904,13 +3903,8 @@ mod tests {
 
     #[test]
     fn disk_only_finding_ids_lists_every_disk_family() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bhf-tsf-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp_guard = crate::test_support::TestDir::new("tsf");
+        let tmp = tmp_guard.join("tmp");
         let findings = tmp.join("results").join("findings");
         for id in [
             "F-STATIC-0000",
@@ -4220,14 +4214,7 @@ mod tests {
 
     #[test]
     fn configure_template_hint_names_in_tree_template() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-tmpl-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("tmpl");
         std::fs::write(dir.join("ares_build.h.in"), "/* template */\n").unwrap();
         let hint = configure_template_hint(&dir, "ares_build.h").expect("template found");
         assert!(hint.contains("ares_build.h.in"), "{hint}");
@@ -4270,14 +4257,7 @@ mod tests {
         );
 
         // A real dangling symlink classifies as Symlink.
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-symtest-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("symtest");
         // Creating a symlink on Windows needs a privilege a test cannot assume.
         #[cfg(unix)]
         {
@@ -4293,14 +4273,7 @@ mod tests {
 
     #[test]
     fn required_gpr_externals_reports_only_no_default_vars() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-gprext-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("gprext");
         std::fs::write(
             dir.join("p.gpr"),
             "project P is\n\
@@ -4634,13 +4607,7 @@ mod tests {
         use crate::auto::pass::Pass;
         use crate::auto::repair::Repair;
 
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-fidelity-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work = crate::test_support::TestDir::new("report-fidelity");
         std::fs::create_dir_all(work.join("results").join("findings")).unwrap();
 
         // One finding from a host-stubbed VxWorks target, one from a plain native
@@ -4785,13 +4752,7 @@ mod tests {
         use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
         use crate::auto::pass::Pass;
 
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-phantom-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work = crate::test_support::TestDir::new("report-phantom");
         std::fs::create_dir_all(work.join("results").join("findings")).unwrap();
 
         // The empty pass emitted two crashes; attribution proved F-0000-dead a
@@ -4883,13 +4844,7 @@ mod tests {
 
     #[test]
     fn dependency_checkpoint_survives_before_final_report_and_is_atomic() {
-        let work = std::env::temp_dir().join(format!(
-            "bhf-dep-checkpoint-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work = crate::test_support::TestDir::new("dep-checkpoint");
         let source = work.join("src");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("generated.h.in"), "#define X 1\n").unwrap();
@@ -4943,20 +4898,12 @@ mod tests {
             .unwrap()
             .flatten()
             .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")));
-        let _ = std::fs::remove_dir_all(work);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]
     fn atomic_write_preserves_another_live_writers_temporary() {
-        let dir = std::env::temp_dir().join(format!(
-            "bhf-atomic-writer-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("atomic-writer");
         let destination = dir.join("missing-deps.txt");
         let live_temp = dir.join(format!(
             ".missing-deps.txt.tmp-{}-999999",
@@ -4968,19 +4915,12 @@ mod tests {
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"checkpoint");
         assert_eq!(std::fs::read(&live_temp).unwrap(), b"other writer");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resume_result_round_trips_full_outcome_for_reintegration() {
-        let work = std::env::temp_dir().join(format!(
-            "bhf-resume-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("resume");
 
         // Before any attempt: not complete, nothing to reload.
         assert!(!target_already_complete(&work, "H-C0009"));
@@ -5295,14 +5235,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report");
         write_reports(
             std::path::Path::new("/tmp"),
             &[r1, r2],
@@ -5353,14 +5286,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-cap-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-cap");
         // 5 ranked discovered, only 2 swept.
         write_reports(
             std::path::Path::new("/tmp"),
@@ -5406,13 +5332,8 @@ mod tests {
             },
             harness_dir: PathBuf::from("/h"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-operator-stop-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work_guard = crate::test_support::TestDir::new("report-operator-stop");
+        let work = work_guard.join("work");
         write_reports(
             Path::new("/src"),
             std::slice::from_ref(&r1),
@@ -5451,13 +5372,8 @@ mod tests {
             },
             harness_dir: PathBuf::from("/h"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-output-cap-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work_guard = crate::test_support::TestDir::new("report-output-cap");
+        let work = work_guard.join("work");
         write_reports_with_output_limit(
             Path::new("/src"),
             std::slice::from_ref(&result),
@@ -5513,14 +5429,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-ada-bare-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-ada-bare");
         write_reports(
             std::path::Path::new("/tmp"),
             std::slice::from_ref(&r1),
@@ -5576,14 +5485,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-win32-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-win32");
         write_reports(
             std::path::Path::new("/tmp"),
             std::slice::from_ref(&r1),
@@ -5643,14 +5545,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-ada-stubs-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-ada-stubs");
         write_reports(
             std::path::Path::new("/tmp"),
             std::slice::from_ref(&r1),
@@ -5846,14 +5741,7 @@ mod tests {
             },
             harness_dir: PathBuf::from("/tmp"),
         };
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-passes-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-passes");
         write_reports(
             std::path::Path::new("/tmp"),
             std::slice::from_ref(&result),
@@ -5951,14 +5839,7 @@ mod tests {
     /// command's results bracket) is the only findings index.
     #[test]
     fn write_reports_writes_no_legacy_findings_index() {
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-no-legacy-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-no-legacy");
         write_reports(
             std::path::Path::new("/tmp"),
             &[],
@@ -5994,13 +5875,8 @@ mod tests {
     /// sibling static finding with no runtime match stays `static`.
     #[test]
     fn write_reports_surfaces_fuzz_confirmed_static_finding() {
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-confirm-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work_guard = crate::test_support::TestDir::new("report-confirm");
+        let work = work_guard.join("work");
         // A confirmed static finding (as the join would have rewritten it) and a
         // plain static finding, both written straight to the findings dir the way
         // `emit_tree_static_findings` does (picked up via `disk_only_finding_ids`).
@@ -6171,14 +6047,7 @@ mod tests {
             },
         ];
 
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-stubonly-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&work).unwrap();
+        let work = crate::test_support::TestDir::new("report-stubonly");
         write_reports(
             std::path::Path::new("/tmp"),
             &results,
@@ -6236,13 +6105,8 @@ mod tests {
         use crate::auto::pass::Pass;
         use crate::auto::repair::Repair;
 
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-forced-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let work_guard = crate::test_support::TestDir::new("report-forced");
+        let work = work_guard.join("work");
         let fid = "F-FORCED-0001";
         let finding_dir = work.join("results").join("findings").join(fid);
         std::fs::create_dir_all(&finding_dir).unwrap();

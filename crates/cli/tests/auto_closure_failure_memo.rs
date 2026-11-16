@@ -5,18 +5,15 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-closure-memo-{prefix}-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("closure-memo-{prefix}"))
 }
 
 /// A source whose closure cannot be satisfied offline, carrying several entry

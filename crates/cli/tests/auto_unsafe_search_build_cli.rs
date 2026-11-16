@@ -10,6 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have_toolchain() -> bool {
     (Command::new("cc").arg("--version").output().is_ok()
         || Command::new("clang").arg("--version").output().is_ok())
@@ -55,8 +59,7 @@ fn unsafe_search_and_run_recovers_flags_from_build_sh() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-unsafe-search-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("unsafe-search");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     // The target only compiles when the define its build.sh sets is present, with
@@ -115,5 +118,5 @@ fn unsafe_search_and_run_recovers_flags_from_build_sh() {
         "--unsafe-search-and-run-build-commands should recover the flag from build.sh and build+fuzz"
     );
 
-    let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
 }

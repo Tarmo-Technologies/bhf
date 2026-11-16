@@ -145,6 +145,8 @@ pub fn connect_unix_retry(path: &Path, deadline: Duration) -> io::Result<UnixStr
 
 /// A temporary directory removed when the guard drops.
 pub struct TempDir {
+    // Removes the directory when the guard is dropped.
+    _root: tempfile::TempDir,
     path: PathBuf,
 }
 
@@ -155,9 +157,19 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        // Removed when this scope ends.
+        let path_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let path = path_tmp
+            .path()
+            .join(format!("{prefix}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            _root: path_tmp,
+            path,
+        })
     }
 
     pub fn path(&self) -> &Path {

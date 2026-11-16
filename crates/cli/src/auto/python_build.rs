@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn resolve_module_walks_packages() {
         // Build a temp tree: root/pkg/sub/mod.py with __init__.py in pkg and sub.
-        let tmp = std::env::temp_dir().join(format!("gfpytest_{}", std::process::id()));
+        let tmp = crate::test_support::TestDir::new("gfpytest");
         let sub = tmp.join("pkg").join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(tmp.join("pkg").join("__init__.py"), "").unwrap();
@@ -723,7 +723,7 @@ mod tests {
         let modf = sub.join("mod.py");
         std::fs::write(&modf, "def f(): pass\n").unwrap();
         let (root, module) = resolve_module(&modf, &tmp);
-        assert_eq!(root, tmp);
+        assert_eq!(root, tmp.path());
         assert_eq!(module, "pkg.sub.mod");
         let _ = std::fs::remove_dir_all(&tmp);
     }

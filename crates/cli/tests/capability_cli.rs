@@ -12,6 +12,10 @@ use std::process::Command;
 
 mod support;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
@@ -41,8 +45,8 @@ fn input_triggered_command_exec_is_profiled_as_capability() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-capability-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("capability");
+    let work = work_guard.join("work");
     let src = work.with_extension("src.c");
     std::fs::write(&src, GATED_EXEC_C).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_bhf"));

@@ -3917,8 +3917,7 @@ mod tests {
         // Discovery excludes them so a project's harness cannot out-rank its
         // parser — but excluding them also threw away the fact of their
         // existence, and they are the only expert baseline there is.
-        let root = std::env::temp_dir().join(format!("bhf-experts-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = crate::test_support::TestDir::new("experts");
         fs::create_dir_all(root.join("fuzz")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -4036,7 +4035,6 @@ mod tests {
             "H-C002A-144FE22B"
         );
     }
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn all_caps_macro_invocations_are_not_targets() {
@@ -4113,14 +4111,8 @@ mod tests {
         );
     }
 
-    fn tmpdir() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-discover-{n}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("discover")
     }
 
     #[test]
@@ -4162,7 +4154,6 @@ mod tests {
             !has(&cands, "harness_entry"),
             "work-dir contents excluded: {cands:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4171,17 +4162,7 @@ mod tests {
         // decide whether a cached candidate list is still valid, so: identical for
         // an unchanged tree; different after a file edit, a new file, or a changed
         // dir-filter. (A no-op walk over the same bytes must reproduce the digest.)
-        // A collision-proof private dir (the shared `tmpdir()` keys only on nanos,
-        // which two parallel tests can collide on; this test writes+rereads several
-        // times so any interference would flake it).
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-fp-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("fp");
         fs::write(root.join("a.c"), "int parse(const char *p){return p[0];}\n").unwrap();
         fs::create_dir_all(root.join("lib")).unwrap();
         fs::write(root.join("lib/b.c"), "int f(int x){return x;}\n").unwrap();
@@ -4236,14 +4217,7 @@ mod tests {
         // #101: the build-context fingerprint busts on a GPR / compile_commands.json
         // / IDL / option change (so --resume re-attempts affected results), but NOT
         // on a README edit (docs never invalidate the build context).
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-bctx-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("bctx");
         fs::write(root.join("proj.gpr"), "project P is\nend P;\n").unwrap();
         fs::write(root.join("README.md"), "hello\n").unwrap();
 
@@ -4354,15 +4328,8 @@ mod tests {
         // --reuse-discovery misses for no reason). A same-LENGTH content edit —
         // which a size+mtime fingerprint could miss on a coarse-mtime fs — must
         // still be caught, because identity is the file's content hash.
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, SystemTime};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bhf-fp-mtime-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestDir::new("fp-mtime");
         let file = root.join("a.c");
         let body = "int parse(const char *p){return p[0];}\n";
         fs::write(&file, body).unwrap();
@@ -4845,7 +4812,6 @@ mod tests {
             find("widgets::next_bit").input_reachability,
             Some(target_rank::InputReachability::AttackerReachable)
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A buffer spelled through a pointer typedef to bytes, a project's
@@ -4909,7 +4875,6 @@ mod tests {
                 .map(|b| b.rule.as_str()),
             Some("internal_linkage")
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5048,8 +5013,6 @@ mod tests {
         // bare identifier `main`, not substrings.
         assert!(has(&cands, "main_loop"), "main_loop kept: {cands:?}");
         assert!(has(&cands, "domain_parse"), "domain_parse kept: {cands:?}");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5151,8 +5114,6 @@ mod tests {
             !is_under_java_source_root(&root.join("src/test/java/tools")),
             "src/test/java/tools is NOT under src/main/java"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5301,8 +5262,6 @@ mod tests {
             !is_under_header_api_root(&root.join("tests")),
             "a top-level tests/ is NOT under a header root"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5439,8 +5398,6 @@ mod tests {
             Some("gov::parse_bytes"),
             "the first slot of even a cap=1 campaign must be viable"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5469,8 +5426,6 @@ mod tests {
             decode.is_static,
             "qualified internal-linkage metadata must not be lost"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5655,7 +5610,6 @@ mod tests {
             raw.iter().any(|c| c.name == "old_parse") && raw.iter().any(|c| c.name == "new_parse"),
             "raw parse sees both #ifdef branches: {raw:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5692,7 +5646,7 @@ mod tests {
         fs::write(
             root.join("compile_commands.json"),
             serde_json::json!([{
-                "directory": root,
+                "directory": root.path(),
                 "file": "heavy.c",
                 "arguments": ["clang", "-DHAVE_AVX2=1", "-DNDEBUG=1", "-c", "heavy.c"],
             }])
@@ -5708,7 +5662,6 @@ mod tests {
                 "{dropped} compiled out under Auto preprocessing: {cands:?}"
             );
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6175,9 +6128,6 @@ mod tests {
             gpr_main_sources(&empty, &DirFilter::default()).is_empty(),
             "no `for Main` → empty map → nothing skipped"
         );
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&empty);
     }
 
     #[test]

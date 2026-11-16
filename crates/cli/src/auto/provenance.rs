@@ -588,9 +588,7 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
 
     #[test]
     fn stub_artifact_reclassify_demotes_and_names_stub() {
-        let dir = std::env::temp_dir().join(format!("bhf-prov-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("prov");
         let fj = dir.join("finding.json");
         write_json(
             &fj,
@@ -619,9 +617,7 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
 
     #[test]
     fn real_defect_certify_raises_confidence() {
-        let dir = std::env::temp_dir().join(format!("bhf-prov-real-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("prov-real");
         let fj = dir.join("finding.json");
         write_json(
             &fj,

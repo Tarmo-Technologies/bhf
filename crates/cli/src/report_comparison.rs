@@ -257,7 +257,10 @@ fn group(snapshot: &Snapshot, side: &str) -> BTreeMap<String, Issue> {
                 )
             };
         let identity = json!([kind, signal, rule, class, target]).to_string();
-        let key = format!("bhf-issue-v1:{:x}", Sha256::digest(identity.as_bytes()));
+        let key = format!(
+            "bhf-issue-v1:{}",
+            corpus::hex_lower(&Sha256::digest(identity.as_bytes()))
+        );
         let severity = canonical_severity(&finding.severity);
         let entry = issues.entry(key.clone()).or_insert_with(|| Issue {
             issue_key: key,

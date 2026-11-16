@@ -28,3 +28,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "harness_gen"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

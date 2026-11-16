@@ -24,10 +24,13 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuzz_engine_builtin::crc32;
 use protocol_session::{FieldValue, MessageInstance, Profile, ProtocolModel, SessionTestcase};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// The checked-in profile that drives the toy service (single source of truth,
 /// reused from the `protocol_session` crate).
@@ -43,14 +46,8 @@ fn toy_profile_path() -> PathBuf {
         .join("../protocol_session/tests/fixtures/toy-open-write.toml")
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-session-cli-{tag}-{nanos}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("session-cli-{tag}"))
 }
 
 // ---------------------------------------------------------------------------

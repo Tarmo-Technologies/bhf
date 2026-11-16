@@ -7,16 +7,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-{name}"))
 }
 
 /// The exception name + remapped source line of every finding under `work_dir`.

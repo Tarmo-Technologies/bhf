@@ -18,9 +18,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// True when this host can build a C++ sanitizer target the way `bhf auto`
 /// does: clang++ present and a libstdc++ the linker can find. We deliberately do
@@ -52,14 +55,8 @@ fn cpp_toolchain_capable() -> bool {
     clang && libstdcxx
 }
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-cpp-amalg-{prefix}-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("cpp-amalg-{prefix}"))
 }
 
 /// A benign single-file C++ "amalgamation": one free function with a clear

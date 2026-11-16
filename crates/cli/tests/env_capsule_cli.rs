@@ -13,11 +13,79 @@ fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
 
+/// Whether the runtrace shim, which the env-capsule needs, is built beside
+/// the bhf under test (cargo's target dir). When it is not, the caller skips,
+/// with the reason printed; under `BHF_REQUIRE_TOOLS=1` this panics instead.
 fn shim_present() -> bool {
-    // The env-capsule needs the runtrace shim built beside the test binary.
     let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().and_then(|p| p.parent()).unwrap().to_path_buf();
-    dir.join("libbhf_runtrace_shim.so").is_file() || dir.join("libbhf_runtrace.so").is_file()
+    let dir = exe.parent().and_then(|p| p.parent()).unwrap();
+    let required = tools_required(std::env::var_os("BHF_REQUIRE_TOOLS").as_deref());
+    match shim_status(dir, required) {
+        Ok(()) => true,
+        Err(skip) => {
+            eprintln!("{skip}");
+            false
+        }
+    }
+}
+
+/// `BHF_REQUIRE_TOOLS=1` turns a missing tool into a test failure.
+fn tools_required(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+/// `Ok` when `dir` holds the runtrace shim; otherwise the skip line, or a
+/// panic when the tools are `required`.
+fn shim_status(dir: &Path, required: bool) -> Result<(), String> {
+    if dir.join("libbhf_runtrace_shim.so").is_file() || dir.join("libbhf_runtrace.so").is_file() {
+        return Ok(());
+    }
+    let missing = format!("runtrace shim not built in {}", dir.display());
+    assert!(
+        !required,
+        "BHF_REQUIRE_TOOLS=1 and the {missing}: build it first \
+         (`cargo build -p bhf_runtrace_shim`)"
+    );
+    Err(format!("skipping: {missing}"))
+}
+
+/// With `BHF_REQUIRE_TOOLS=1` (as the nightly suite sets), a missing shim is a
+/// failure rather than a skip that passes.
+#[test]
+#[should_panic(expected = "BHF_REQUIRE_TOOLS=1")]
+fn missing_shim_fails_when_tools_are_required() {
+    let empty = tempfile::tempdir().unwrap();
+    let _ = shim_status(empty.path(), true);
+}
+
+/// Without the variable, a missing shim still skips, and says why.
+#[test]
+fn missing_shim_skips_with_a_message_when_tools_are_not_required() {
+    let empty = tempfile::tempdir().unwrap();
+    let skip = shim_status(empty.path(), false).expect_err("no shim in an empty dir");
+    assert!(
+        skip.starts_with("skipping: runtrace shim not built")
+            && skip.contains(&empty.path().display().to_string()),
+        "{skip}"
+    );
+}
+
+#[test]
+fn a_built_shim_is_found_whether_or_not_tools_are_required() {
+    for name in ["libbhf_runtrace_shim.so", "libbhf_runtrace.so"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(name), b"").unwrap();
+        assert_eq!(shim_status(dir.path(), true), Ok(()), "{name}");
+        assert_eq!(shim_status(dir.path(), false), Ok(()), "{name}");
+    }
+}
+
+#[test]
+fn only_one_requires_the_tools() {
+    assert!(tools_required(Some("1".as_ref())));
+    for value in [None, Some(""), Some("0"), Some("true")] {
+        assert!(!tools_required(value.map(AsRef::as_ref)), "{value:?}");
+    }
 }
 
 /// Reads a faked config file's (fuzzed) content into a fixed buffer — overflow when
@@ -46,7 +114,6 @@ fn env_capsule_replays_environment_driven_crash() {
         return;
     }
     if !shim_present() {
-        eprintln!("skipping: runtrace shim not built");
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -236,7 +303,6 @@ fn env_capsule_replays_a_cpp_environment_driven_crash() {
         return;
     }
     if !shim_present() {
-        eprintln!("skipping: runtrace shim not built");
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -325,7 +391,6 @@ fn env_capsule_refusing_a_requested_finding_exits_non_zero() {
 #[test]
 fn env_capsule_that_captures_nothing_says_so_and_exits_non_zero() {
     if !shim_present() {
-        eprintln!("skipping: runtrace shim not built");
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -417,7 +482,6 @@ fn env_capsule_replays_an_ada_environment_driven_crash() {
         return;
     }
     if !shim_present() {
-        eprintln!("skipping: runtrace shim not built");
         return;
     }
     let root = tempfile::tempdir().unwrap();

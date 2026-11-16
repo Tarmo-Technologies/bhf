@@ -3,7 +3,10 @@
 use ada_parser::ast::TypeKind;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn access_param_fixture_is_present_and_parses() {
@@ -125,12 +128,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("temporary directory is created");
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-{name}"))
 }

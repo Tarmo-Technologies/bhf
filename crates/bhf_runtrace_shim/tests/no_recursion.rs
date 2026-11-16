@@ -100,7 +100,14 @@ fn at_syscall_hooks_do_not_hang_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-norec-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-norec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -167,7 +174,14 @@ fn env_hooks_log_secure_getenv_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-env-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-env-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -225,7 +239,14 @@ fn env_hooks_log_present_getenv_without_value_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-env-present-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-env-present-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -288,13 +309,25 @@ fn fs_hooks_log_open_close_lifecycle_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-lifecycle-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-lifecycle-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // The target file must live OUTSIDE the runtrace-log dir: that dir is the
     // engine-owned harness dir, and #403's self-exclusion (see policy.rs) keeps
     // the shim from auditing anything inside it. A real external open is what
     // this test exercises, so place it next to the dir, not within it.
-    let target = std::env::temp_dir().join(format!(
+    // Removed when this scope ends.
+    let target_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let target = target_tmp.path().join(format!(
         "bhf-shim-lifecycle-target-{}.txt",
         std::process::id()
     ));
@@ -368,7 +401,14 @@ fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-quiet-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-quiet-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
@@ -519,7 +559,14 @@ fn the_load_marker_leads_the_log_when_a_linked_library_reads_the_environment_fir
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-early-dep-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-early-dep-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     build_shared_library(cc, &dir, "probedep", GETENV_IN_CONSTRUCTOR_LIBRARY);
     let src = dir.join("probe.c");
@@ -557,7 +604,14 @@ fn the_load_marker_leads_the_log_when_a_later_preload_reads_the_environment_firs
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-early-preload-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-early-preload-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let dep = build_shared_library(cc, &dir, "probedep", GETENV_IN_CONSTRUCTOR_LIBRARY);
     let src = dir.join("probe.c");
@@ -591,7 +645,14 @@ fn the_load_marker_leads_the_log_of_an_openmp_program() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-early-omp-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-early-omp-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -646,7 +707,14 @@ fn the_shim_marks_a_log_another_writer_started_once() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-late-mark-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-late-mark-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
@@ -784,7 +852,14 @@ fn threads_racing_the_first_open_of_the_log_share_one_descriptor() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-race-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-race-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let c = dir.join("racedep.c");
@@ -934,7 +1009,14 @@ fn the_shim_leaves_errno_alone_when_its_log_cannot_be_read_back() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-errno-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-errno-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let plain = dir.join("plain");
@@ -1029,7 +1111,14 @@ fn process_hooks_log_system_commands_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-process-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-process-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -1083,7 +1172,14 @@ fn format_hooks_log_printf_formats_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-format-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-format-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -1149,8 +1245,14 @@ fn insecure_tempfile_oracle_excludes_engine_owned_shm_under_ld_preload() {
 
     // Mirror `bhf auto`: a per-harness dir UNDER /tmp (the #403 trigger),
     // holding the runtrace log + the coverage.shm bitmap the driver creates.
-    let harness_dir =
-        std::env::temp_dir().join(format!("bhf-shim-selfexcl-{}", std::process::id()));
+    // Removed when this scope ends.
+    let bhf_tmp15 = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let harness_dir = bhf_tmp15
+        .path()
+        .join(format!("bhf-shim-selfexcl-{}", std::process::id()));
     std::fs::create_dir_all(&harness_dir).unwrap();
     let owned_shm = harness_dir.join("coverage.shm");
     // A genuine attacker-racing temp file the target itself creates, OUTSIDE
@@ -1235,7 +1337,14 @@ fn assertion_hooks_log_assert_failures_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-assert-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-assert-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -1299,7 +1408,14 @@ fn fs_hooks_record_path_taint_under_ld_preload() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shim-taint-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-taint-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     // The "input" embeds a tainted path; the program publishes it to the
@@ -1396,7 +1512,14 @@ fn format_taint_ignores_literal_formats_found_in_the_input() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-fmt-taint-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-fmt-taint-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -1526,11 +1649,24 @@ fn fopen_events_are_logged(shim: &std::path::Path) {
         .and_then(|p| p.file_name())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let dir = std::env::temp_dir().join(format!("bhf-shim-fopen-{profile}-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-fopen-{profile}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Outside the runtrace-log dir: the shim records nothing inside it.
-    let present =
-        std::env::temp_dir().join(format!("bhf-shim-fopen-present-{}.cfg", std::process::id()));
+    // Removed when this scope ends.
+    let bhf_tmp20 = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let present = bhf_tmp20
+        .path()
+        .join(format!("bhf-shim-fopen-present-{}.cfg", std::process::id()));
     std::fs::write(&present, "widget=1\n").unwrap();
     let missing = format!("/nonexistent-bhf-{}/widget.cfg", std::process::id());
     let src = dir.join("probe.c");
@@ -1630,7 +1766,14 @@ fn dl_hooks_log_failed_dlopen_under_a_sanitizer() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-dlopen-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-dlopen-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let missing = format!("libbhf_missing_{}.so.7", std::process::id());
     let src = dir.join("probe.c");
@@ -1742,11 +1885,24 @@ fn fclose_logs_the_close_of_a_fopened_or_fdopened_stream() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-fclose-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-fclose-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Outside the runtrace-log dir: the shim records nothing inside it.
-    let present =
-        std::env::temp_dir().join(format!("bhf-shim-fclose-widget-{}.cfg", std::process::id()));
+    // Removed when this scope ends.
+    let bhf_tmp23 = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let present = bhf_tmp23
+        .path()
+        .join(format!("bhf-shim-fclose-widget-{}.cfg", std::process::id()));
     std::fs::write(&present, "widget=1\n").unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -1876,7 +2032,14 @@ fn format_hooks_log_printf_formats_under_sanitizers_and_fortify() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-vformat-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-vformat-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(
@@ -2022,7 +2185,14 @@ fn pseudo_paths_and_paths_opened_during_a_sanitizer_report_are_not_faked() {
         eprintln!("skipping: no C compiler");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("bhf-shim-nofake-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shim-nofake-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(

@@ -14,7 +14,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
@@ -24,14 +27,8 @@ fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/project_min")
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-project-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("temp dir is created");
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("project-cli-{name}"))
 }
 
 fn copy_tree(src: &Path, dst: &Path) {
@@ -50,7 +47,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 
 /// Stage the committed fixture into a fresh project dir outside the repo tree and
 /// drop the prebuilt harness at the manifest-relative `prebuilt/harness`.
-fn stage(name: &str) -> (PathBuf, PathBuf) {
+fn stage(name: &str) -> (TestDir, PathBuf) {
     let root = temp_dir(name);
     let project = root.join("project");
     copy_tree(&fixture_root(), &project);

@@ -18,6 +18,10 @@ use cli::auto::attempt::{attempt, AttemptOptions, FuzzEngine, Outcome};
 use cli::auto::candidate::{Candidate, Lang};
 use cli::auto::decl_index::DeclarationIndex;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/c_callbacks")
 }
@@ -86,15 +90,8 @@ fn assert_target_builds(name: &str) {
     let source = std::fs::read_to_string(&source_path).unwrap();
     let line = target_line(&source, name);
 
-    let work = std::env::temp_dir().join(format!(
-        "bhf-c-callbacks-{name}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&work).unwrap();
-    let work = std::fs::canonicalize(&work).unwrap();
+    let work_dir = TestDir::new(&format!("c-callbacks-{name}"));
+    let work = std::fs::canonicalize(&work_dir).unwrap();
 
     let candidate = Candidate {
         harness_id: format!("H-CB-{name}"),

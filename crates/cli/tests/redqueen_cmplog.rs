@@ -16,23 +16,20 @@
 //! it is slow and needs clang+make; run it on demand / nightly.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/engine_parity/redqueen_int/redqueen_int.c")
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-rq-cold-{tag}-{n}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("rq-cold-{tag}"))
 }
 
 /// Count findings that are real crashes (sanitizer/unhandled faults), excluding

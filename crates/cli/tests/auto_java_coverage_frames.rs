@@ -16,6 +16,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 /// A usable JDK (`javac` + `java`) — the native Java lane needs it; with none the
 /// agent never runs, so this test self-skips (the GNAT-less rule).
 fn has_jdk() -> bool {
@@ -80,8 +84,7 @@ fn coverage_agent_emits_valid_frames_for_uninitialized_stackmap() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-java-frames-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("java-frames");
     let src = tmp.join("src/bhffix");
     let out = tmp.join("out");
     std::fs::create_dir_all(&src).unwrap();

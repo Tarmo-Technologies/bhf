@@ -5753,7 +5753,7 @@ fn pack_items_signature_digest(items: &[Value]) -> String {
         }
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 fn parse_pack_item_spec(spec: &str) -> Result<(String, String), GovernanceError> {
@@ -5902,7 +5902,7 @@ fn missing(path: &Path, field: &'static str) -> GovernanceError {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
 }
 
 fn path_string(path: &Path) -> String {
@@ -8355,4 +8355,15 @@ mod findings_reader_tests {
             assert!(paths.iter().any(|p| p == want), "missing {want}: {paths:?}");
         }
     }
+}
+
+/// `bytes` as lowercase hex, two digits a byte (a digest's usual spelling).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }

@@ -163,11 +163,15 @@ const ALLOC_RUNTIME: &[&str] = &[
 ];
 
 /// Drop noise, strip toolchain decoration, strip C++ argument lists,
-/// and truncate to the top `TOP_FRAMES` frames. Returns an empty
-/// `Vec` when every frame was noise — callers fall back to the
-/// per-input signature in that case.
+/// and truncate to the top `TOP_FRAMES` frames. C++ standard-library
+/// frames ([`is_cpp_stdlib_frame`]) are dropped too, unless no other frame
+/// is left: every out-of-bounds read through `std::unique_ptr::get` or
+/// `std::vector::operator[]` shares them, whatever project code made the
+/// call. Returns an empty `Vec` when every frame was noise — callers fall
+/// back to the per-input signature in that case.
 pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut stdlib: Vec<String> = Vec::new();
     for frame in input {
         let stripped = strip_toolchain_decoration(frame.function.as_str());
         let trimmed = stripped.trim();
@@ -198,12 +202,66 @@ pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
         if actionability::is_runtime_noise_frame(trimmed, frame.file.as_deref()) {
             continue;
         }
+        if is_cpp_stdlib_frame(&no_args, frame.file.as_deref()) {
+            if stdlib.len() < TOP_FRAMES {
+                stdlib.push(no_args);
+            }
+            continue;
+        }
         out.push(no_args);
         if out.len() >= TOP_FRAMES {
             break;
         }
     }
-    out
+    if out.is_empty() {
+        stdlib
+    } else {
+        out
+    }
+}
+
+/// Namespaces of the C++ standard library and its runtime: libstdc++'s
+/// `std::` and `__gnu_cxx::` (libc++'s `std::__1::` is under `std::`), and
+/// the C++ ABI runtime.
+const CPP_STDLIB_NAMESPACES: &[&str] = &["std::", "__gnu_cxx::", "__gnu_debug::", "__cxxabiv1::"];
+
+/// Whether a frame (its function with the argument list stripped) is C++
+/// standard-library code: a function in one of [`CPP_STDLIB_NAMESPACES`],
+/// also when the demangler printed a template's return type first
+/// (`void std::vector<...>::_M_realloc_append<...>`), or any frame in a
+/// standard-library header (libstdc++'s and libc++'s `include/c++/`, MSVC's
+/// `VC/Tools/MSVC/<version>/include/`).
+fn is_cpp_stdlib_frame(function: &str, file: Option<&str>) -> bool {
+    let name = without_return_type(function);
+    if CPP_STDLIB_NAMESPACES
+        .iter()
+        .any(|namespace| name.starts_with(namespace))
+    {
+        return true;
+    }
+    file.is_some_and(|file| {
+        let path = file.replace('\\', "/").to_ascii_lowercase();
+        path.contains("/include/c++/")
+            || (path.contains("/vc/tools/msvc/") && path.contains("/include/"))
+    })
+}
+
+/// A demangled function name without the return type the demangler prints
+/// before a template function's name: the text after the last space outside
+/// `<...>` and `(...)`.
+fn without_return_type(function: &str) -> &str {
+    let mut depth = 0_i32;
+    let mut start = 0;
+    for (index, ch) in function.char_indices() {
+        match ch {
+            '<' | '(' => depth += 1,
+            // `operator->` closes nothing.
+            '>' | ')' => depth = (depth - 1).max(0),
+            ' ' if depth == 0 => start = index + 1,
+            _ => {}
+        }
+    }
+    &function[start..]
 }
 
 /// Runtime (`printf`/`fprintf`/`vfprintf`, the `str*`/`mem*` builtins, glibc
@@ -571,8 +629,9 @@ pub fn cluster_for_ada(testcase: &Testcase, handler: &HandlerEvent) -> ClusterKe
 
 /// Reconstruct a `ClusterKey` from a `finding.json` value. Order of
 /// precedence:
-/// 0. A frame-less sanitizer crash an earlier release keyed on its
-///    rule-wide signature: the key this release gives its stored report
+/// 0. A sanitizer crash an earlier release keyed differently (a frame-less
+///    crash on its rule-wide signature, an ASan report under the catch-all
+///    heap-overflow rule): the key this release gives its stored report
 ///    ([`legacy_fallback_cluster_key`]).
 /// 1. `cluster_key_full` + `cluster_normalized_frames` already on
 ///    the record — return them as-is.
@@ -675,61 +734,32 @@ pub fn cluster_from_finding_json(raw: &serde_json::Value) -> Option<ClusterKey> 
 }
 
 /// The root-cause key this release gives a sanitizer crash that an earlier
-/// release recorded with no informative frame, rebuilt from the report the
-/// finding stores.
+/// release keyed differently, rebuilt from the report the finding stores:
+/// a crash recorded with no informative frame
+/// ([`earlier_frameless_report`]), and an ASan report recorded under the
+/// heap-overflow rule an earlier release gave every kind it had no rule for
+/// ([`earlier_rule_report`]).
 ///
-/// Releases up to 0.3.0 keyed such a crash on its signature, which then hashed
-/// only the rule and the crash kind: one constant key per rule, so every
-/// frame-less UBSan report of a rule, at any site and in any harness, was one
-/// root cause, and so was every frame-less crash with no sanitizer report of a
-/// kind: a fatal signal (`FATAL_SIGNAL`, which 0.2.x named
-/// `ASAN_FATAL_SIGNAL` and tagged `asan`), a transport-reported fault
-/// (`TARGET_*`) and a transport deadline (`TRANSPORT_DEADLINE_EXCEEDED`). A
-/// finding is read as one of those when its `cluster_key_full` is its
-/// `signature`, marked `cluster_fallback`, with no normalized frames. A
-/// sanitizer report is parsed again from its stored message; a crash with no
-/// sanitizer report is rebuilt as the shared crash builder builds it now, with
-/// no sanitizer and a fatal signal as its check. The location, check name,
-/// crash stack (written later by `bhf report --backfill`) and pc offset the
-/// record holds take precedence, and the key is computed in the finding's
-/// harness scope as the emitter computes it ([`cluster_for_sanitizer_scoped`]).
+/// The location, check name, crash stack (written later by `bhf report
+/// --backfill`) and pc offset the record holds take precedence over the
+/// stored message, and the key is computed in the finding's harness scope as
+/// the emitter computes it ([`cluster_for_sanitizer_scoped`]).
 ///
 /// `None` for any other record: one this release keyed (whose fallback key is
 /// already scoped and sited), an oracle hit, a finding that is not a sanitizer
 /// crash, and one whose stored report gives no better key than the one it has.
 pub fn legacy_fallback_cluster_key(raw: &serde_json::Value) -> Option<ClusterKey> {
     use serde_json::Value;
-    if raw.get("oracle").is_some()
-        || raw.get("cluster_fallback").and_then(Value::as_bool) != Some(true)
-    {
+    if raw.get("oracle").is_some() {
         return None;
     }
     let persisted = raw
         .get("cluster_key_full")
         .and_then(Value::as_str)
         .filter(|full| !full.is_empty())?;
-    if raw.get("signature").and_then(Value::as_str) != Some(persisted) {
-        return None;
-    }
-    let framed = raw
-        .get("cluster_normalized_frames")
-        .and_then(Value::as_array)
-        .is_some_and(|frames| !frames.is_empty());
     let exception = raw.get("exception")?;
-    let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
-    let undiagnosed = undiagnosed_crash_kind(name);
-    let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
-        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
-            .iter()
-            .any(|prefix| name.starts_with(prefix));
-    if framed || !(sanitizer_crash || undiagnosed.is_some()) {
-        return None;
-    }
-    let message = exception.get("message").and_then(Value::as_str)?;
-    let mut report = match undiagnosed {
-        Some(kind) => earlier_undiagnosed_crash_report(raw, exception, kind, message)?,
-        None => crate::sanitizer::parse_sanitizer_report(message)?,
-    };
+    let mut report = earlier_frameless_report(raw, exception, persisted)
+        .or_else(|| earlier_rule_report(raw, exception))?;
     if let Some(location) = exception
         .get("location")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
@@ -768,6 +798,74 @@ pub fn legacy_fallback_cluster_key(raw: &serde_json::Value) -> Option<ClusterKey
     let harness = raw.get("harness_id").and_then(Value::as_str).unwrap_or("");
     let key = cluster_for_sanitizer_scoped(&report, &crash_scope(harness, None));
     (!key.is_placeholder() && key.full != persisted).then_some(key)
+}
+
+/// The report of a crash an earlier release recorded with no informative
+/// frame. Releases up to 0.3.0 keyed such a crash on its signature, which then
+/// hashed only the rule and the crash kind: one constant key per rule, so
+/// every frame-less UBSan report of a rule, at any site and in any harness,
+/// was one root cause, and so was every frame-less crash with no sanitizer
+/// report of a kind: a fatal signal (`FATAL_SIGNAL`, which 0.2.x named
+/// `ASAN_FATAL_SIGNAL` and tagged `asan`), a transport-reported fault
+/// (`TARGET_*`) and a transport deadline (`TRANSPORT_DEADLINE_EXCEEDED`). A
+/// finding is read as one of those when its `cluster_key_full` (`persisted`)
+/// is its `signature`, marked `cluster_fallback`, with no normalized frames. A
+/// sanitizer report is parsed again from its stored message; a crash with no
+/// sanitizer report is rebuilt as the shared crash builder builds it now, with
+/// no sanitizer and a fatal signal as its check.
+fn earlier_frameless_report(
+    raw: &serde_json::Value,
+    exception: &serde_json::Value,
+    persisted: &str,
+) -> Option<SanitizerReport> {
+    use serde_json::Value;
+    if raw.get("cluster_fallback").and_then(Value::as_bool) != Some(true)
+        || raw.get("signature").and_then(Value::as_str) != Some(persisted)
+    {
+        return None;
+    }
+    let framed = raw
+        .get("cluster_normalized_frames")
+        .and_then(Value::as_array)
+        .is_some_and(|frames| !frames.is_empty());
+    let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
+    let undiagnosed = undiagnosed_crash_kind(name);
+    let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
+        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    if framed || !(sanitizer_crash || undiagnosed.is_some()) {
+        return None;
+    }
+    let message = exception.get("message").and_then(Value::as_str)?;
+    match undiagnosed {
+        Some(kind) => earlier_undiagnosed_crash_report(raw, exception, kind, message),
+        None => crate::sanitizer::parse_sanitizer_report(message),
+    }
+}
+
+/// The report of an ASan crash an earlier release recorded under its
+/// catch-all heap-overflow rule, BHF-201, which this release gives a rule of
+/// its own (a stack overflow, an arithmetic exception or other deadly signal,
+/// an overlapping copy, a refused allocation, ...;
+/// [`crate::sanitizer::legacy_rule_id`]). Parsed again from its stored
+/// message, it takes this release's rule and kind, so the finding groups with
+/// the same crash found now. A Windows access violation or in-page error,
+/// whose rule depends on the access the record stores, keeps its key.
+fn earlier_rule_report(
+    raw: &serde_json::Value,
+    exception: &serde_json::Value,
+) -> Option<SanitizerReport> {
+    use serde_json::Value;
+    if raw.get("rule_id").and_then(Value::as_str) != Some("BHF-201") {
+        return None;
+    }
+    let message = exception.get("message").and_then(Value::as_str)?;
+    let report = crate::sanitizer::parse_sanitizer_report(message)?;
+    (report.sanitizer == Some(Sanitizer::AddressSanitizer)
+        && !crate::sanitizer::is_memory_fault_kind(&report.kind)
+        && crate::sanitizer::legacy_rule_id(&report) == Some("BHF-201"))
+    .then_some(report)
 }
 
 /// The kind of a crash with no sanitizer report, read from the name an
@@ -2088,7 +2186,12 @@ mod tests {
     /// that is not a sanitizer crash.
     #[test]
     fn records_this_release_keys_are_not_rekeyed() {
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-cluster-rekey-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

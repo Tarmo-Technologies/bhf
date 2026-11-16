@@ -108,11 +108,17 @@ impl BugOracle for SsrfAda {
     }
 }
 
-pub struct CommandInjectionAda;
+/// Shell syntax in a fuzz-controlled `system`/`popen` command (BHF-304), in
+/// any lane. It reads the same cross-execution confirmation as
+/// [`CommandInjectionRuntime`] (BHF-431): a command that carried fuzz-input
+/// bytes on one execution and never ran without them. A command that runs
+/// without input bytes in it is a program constant, never a finding, whatever
+/// shell syntax it holds, so a raw per-execution command event is not enough.
+pub struct CommandInjection;
 
-impl BugOracle for CommandInjectionAda {
+impl BugOracle for CommandInjection {
     fn name(&self) -> &'static str {
-        "command-injection-ada"
+        "command-injection"
     }
     fn rule_id(&self) -> &'static str {
         "BHF-304"
@@ -130,21 +136,36 @@ impl BugOracle for CommandInjectionAda {
         ]
     }
     fn describe(&self) -> &'static str {
-        "Detect controlled argv/cmdline reaching Ada process-spawn APIs without quoting"
+        "Detect input-derived command strings with shell metacharacters reaching process-spawn APIs"
     }
 
     fn evaluate(&self, event: &OracleRuntimeEvent) -> Option<OracleHit> {
-        let OracleRuntimeEvent::Command { api, command } = event else {
+        let OracleRuntimeEvent::TaintedCommand {
+            api,
+            command,
+            taint_offset,
+        } = event
+        else {
             return None;
         };
-        if !looks_like_shell_injection(command) {
+        // `system`/`popen` hand the string to `/bin/sh -c`; an exec-family
+        // program and argv reach no shell.
+        if !matches!(api.as_str(), "system" | "popen") || !has_shell_metacharacters(command) {
             return None;
         }
         Some(OracleHit::from_oracle(
             self,
             api,
-            "shell metacharacters observed in a runtime command string",
-            vec![OracleEvidence::new("command", command)],
+            "shell metacharacters in a runtime command string derived from the fuzz input",
+            vec![
+                OracleEvidence::new("command", command),
+                OracleEvidence::new("controlled", "true"),
+                // Bytes at this input offset flowed into the command string.
+                OracleEvidence::new(
+                    "taint_path",
+                    format!("fuzz_input[{taint_offset}..] → {api}(command)"),
+                ),
+            ],
         ))
     }
 }
@@ -711,7 +732,8 @@ impl BugOracle for PathControlledOpenRuntime {
 /// their whole argument to `/bin/sh -c`, so any attacker-controlled span is
 /// shell-interpreted — this is OS command injection by construction.
 /// Distinct from the shell-metacharacter heuristic (BHF-304,
-/// `CommandInjectionAda`): this one is gated on dynamic taint, so a
+/// [`CommandInjection`]), which reads the same confirmation and also needs
+/// shell syntax in the command: this one reports any controlled span, so a
 /// hardcoded command with metacharacters (or a sanitized/allow-listed
 /// argument that severs the byte-origin match) reports nothing.
 pub struct CommandInjectionRuntime;
@@ -1284,7 +1306,7 @@ pub static ORACLE_REGISTRY: &[&'static dyn BugOracle] = &[
     &PathTraversalAda,
     &SqlInjectionAda,
     &SsrfAda,
-    &CommandInjectionAda,
+    &CommandInjection,
     &SensitiveEnvAda,
     &ResourceLeakAda,
     &ResourceLeak,
@@ -1328,7 +1350,9 @@ fn looks_like_network_destination(address: &str) -> bool {
     !address.is_empty() && !address.starts_with('/')
 }
 
-fn looks_like_shell_injection(command: &str) -> bool {
+/// Whether `command` holds shell syntax: a command separator, a pipe,
+/// a redirection, a substitution or a line break.
+pub fn has_shell_metacharacters(command: &str) -> bool {
     let command = command.trim();
     if command.is_empty() {
         return false;
@@ -1584,15 +1608,15 @@ mod tests {
         use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
 
         // A raw (uncorrelated) Command event never confirms BHF-431 — only a
-        // cross-execution-confirmed TaintedCommand does. The shell-metacharacter
-        // heuristic (BHF-304) still handles the untainted case; this taint-gated
-        // oracle stays off constant commands (no FP) and off the per-input path.
-        assert!(super::CommandInjectionRuntime
-            .evaluate(&OracleRuntimeEvent::Command {
-                api: "system".to_owned(),
-                command: "ls -la | grep foo".to_owned(),
-            })
-            .is_none());
+        // cross-execution-confirmed TaintedCommand does. This taint-gated
+        // oracle stays off constant commands (no FP) and off the per-input
+        // path, as does the shell-metacharacter heuristic (BHF-304).
+        let plain = OracleRuntimeEvent::Command {
+            api: "system".to_owned(),
+            command: "ls -la | grep foo".to_owned(),
+        };
+        assert!(super::CommandInjectionRuntime.evaluate(&plain).is_none());
+        assert!(super::CommandInjection.evaluate(&plain).is_none());
     }
 
     #[test]
@@ -1625,32 +1649,58 @@ mod tests {
     }
 
     #[test]
-    fn command_injection_oracle_matches_shell_metachar_command() {
+    fn command_injection_oracle_matches_input_derived_shell_metachar_command() {
         use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
 
-        let hit = super::CommandInjectionAda
-            .evaluate(&OracleRuntimeEvent::Command {
+        let hit = super::CommandInjection
+            .evaluate(&OracleRuntimeEvent::TaintedCommand {
                 api: "system".to_owned(),
                 command: "echo ok; id".to_owned(),
+                taint_offset: 8,
             })
-            .expect("shell metacharacters should trip the command oracle");
+            .expect("input-derived shell metacharacters should trip the command oracle");
 
-        assert_eq!(hit.oracle_name, "command-injection-ada");
+        assert_eq!(hit.oracle_name, "command-injection");
         assert_eq!(hit.rule_id, "BHF-304");
         assert_eq!(hit.api, "system");
         assert_eq!(hit.evidence_value("command"), Some("echo ok; id"));
+        assert_eq!(hit.evidence_value("controlled"), Some("true"));
+        assert_eq!(
+            hit.evidence_value("taint_path"),
+            Some("fuzz_input[8..] → system(command)")
+        );
     }
 
     #[test]
-    fn command_injection_oracle_ignores_plain_executable_name() {
+    fn command_injection_oracle_ignores_a_constant_command() {
         use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
 
-        let hit = super::CommandInjectionAda.evaluate(&OracleRuntimeEvent::Command {
-            api: "system".to_owned(),
-            command: "/usr/bin/true".to_owned(),
+        let hit = super::CommandInjection.evaluate(&OracleRuntimeEvent::Command {
+            api: "popen".to_owned(),
+            command: "echo ok; id | tee /dev/null".to_owned(),
         });
 
         assert_eq!(hit, None);
+    }
+
+    /// Shell syntax is the heuristic's signal: a controlled command without
+    /// it, or an exec-family program (no shell reads its argv), is BHF-431's
+    /// alone.
+    #[test]
+    fn command_injection_oracle_needs_shell_syntax_in_a_shell_command() {
+        use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
+
+        for (api, command) in [
+            ("system", "/usr/bin/true AAAA"),
+            ("execve", "/usr/bin/convert a;b"),
+        ] {
+            let hit = super::CommandInjection.evaluate(&OracleRuntimeEvent::TaintedCommand {
+                api: api.to_owned(),
+                command: command.to_owned(),
+                taint_offset: 0,
+            });
+            assert_eq!(hit, None, "{api}({command})");
+        }
     }
 
     #[test]

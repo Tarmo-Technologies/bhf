@@ -39,7 +39,7 @@ pub const ORACLE_MANIFEST: &[OracleManifestEntry] = &[
         describe: "Detect controlled URL/hostname reaching Ada network-egress APIs",
     },
     OracleManifestEntry {
-        name: "command-injection-ada",
+        name: "command-injection",
         rule_id: "BHF-304",
         category: OracleCategory::LogicBug,
         dangerous_apis: &[
@@ -49,7 +49,7 @@ pub const ORACLE_MANIFEST: &[OracleManifestEntry] = &[
             "system",
             "popen",
         ],
-        describe: "Detect controlled argv/cmdline reaching Ada process-spawn APIs without quoting",
+        describe: "Detect input-derived command strings with shell metacharacters reaching process-spawn APIs",
     },
     OracleManifestEntry {
         name: "sensitive-env-ada",

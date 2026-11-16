@@ -15,6 +15,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/js_unconstructible")
@@ -53,15 +57,12 @@ fn an_unconstructible_receiver_skips_with_its_reason_and_its_sibling_still_fuzze
 
     // Copy outside the repo: the fixture lives under `tests/`, which discovery
     // excludes as a non-library directory when it is not the scan root.
-    let src = std::env::temp_dir().join(format!("bhf_js_unconstructible_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
-    std::fs::create_dir_all(&src).unwrap();
+    let src = TestDir::new("js_unconstructible");
     for entry in std::fs::read_dir(fixture()).unwrap().flatten() {
         std::fs::copy(entry.path(), src.join(entry.file_name())).unwrap();
     }
-    let work =
-        std::env::temp_dir().join(format!("bhf_js_unconstructible_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("js_unconstructible_w");
+    let work = work_guard.join("work");
 
     let out = Command::new(&bin)
         .args([

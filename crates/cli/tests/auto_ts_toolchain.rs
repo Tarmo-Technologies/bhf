@@ -10,20 +10,17 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 const TARGET: &str = "export function parseRecord(data: Uint8Array): number {\n  \
                       return data.length > 0 ? data[0] : 0;\n}\n";
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("bhf-ts-toolchain-{prefix}-{n}"));
-    fs::create_dir_all(&path).unwrap();
-    path.canonicalize().unwrap()
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("ts-toolchain-{prefix}")).spelled_as(|path| path.canonicalize().unwrap())
 }
 
 /// `bin` holding a `node` link, then every inherited PATH dir that holds no

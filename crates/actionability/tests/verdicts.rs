@@ -668,8 +668,15 @@ fn single_value_enum_assertion_is_not_demoted() {
 
 /// A generated harness source with `statement` at line 76 of `main.c` in a
 /// fresh directory, and the path of that file.
-fn generated_main(tag: &str, statements: &[&str]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("bhf-actionability-{tag}-{}", std::process::id()));
+fn generated_main(tag: &str, statements: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-actionability-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut lines = vec![
         "/* SPDX-License-Identifier: Apache-2.0 */".to_owned(),
@@ -689,7 +696,7 @@ fn generated_main(tag: &str, statements: &[&str]) -> std::path::PathBuf {
     lines.push("}".to_owned());
     let path = dir.join("main.c");
     std::fs::write(&path, lines.join("\n")).unwrap();
-    path
+    (dir_tmp, path)
 }
 
 /// A heap overflow of a buffer allocated at `alloc_function` in `alloc_file`
@@ -729,7 +736,8 @@ const LENGTHLESS_COPY: &str = "size_t _bhf_cap_tag = (size_t)Size + 1; if (_bhf_
 /// input, even on an entry whose signature takes a byte buffer.
 #[test]
 fn overflow_of_a_harness_sized_buffer_is_precondition_dependent() {
-    let main = generated_main("lengthless", &[LENGTHLESS_COPY, "int R = read_tag(tag);"]);
+    let (_main_guard, main) =
+        generated_main("lengthless", &[LENGTHLESS_COPY, "int R = read_tag(tag);"]);
     let main = main.to_str().unwrap().to_owned();
     for (function, file, line, buffer) in [
         (
@@ -795,7 +803,7 @@ fn overflow_of_a_harness_buffer_passed_with_its_length_stays_reachable() {
             ],
         ),
     ] {
-        let main = generated_main(tag, &statements);
+        let (_main_guard, main) = generated_main(tag, &statements);
         let raw = harness_sized_overflow_at("bhf_run_one", main.to_str().unwrap(), 76);
         assert!(
             !actionability::is_harness_sized_buffer_overflow(&raw),
@@ -820,8 +828,14 @@ fn overflow_of_a_project_or_driver_buffer_is_not_precondition_dependent() {
     // harness passes together with its length), or a harness whose source is
     // not a generated one or cannot be read: nothing shows a length-less
     // parameter.
-    let custom =
-        std::env::temp_dir().join(format!("bhf-actionability-custom-{}", std::process::id()));
+    // Removed when this scope ends.
+    let bhf_tmp2 = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let custom = bhf_tmp2
+        .path()
+        .join(format!("bhf-actionability-custom-{}", std::process::id()));
     std::fs::create_dir_all(&custom).unwrap();
     let mut source = vec![String::new(); 75];
     source.push("    char *s = malloc(size + 1);".to_owned());

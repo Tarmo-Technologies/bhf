@@ -61,6 +61,13 @@ via `dotnet` + SharpFuzz IL instrumentation, JavaScript/TypeScript under a warm
 Node process (TypeScript transpiled with esbuild), and Ruby, Lua, and PHP under
 their own interpreters with in-process edge coverage.
 
+An interpreter (Python, Perl, Ruby, Lua, PHP, Node) killed by SIGSEGV with no
+error of its own, as PHP 8.3 is by deep recursion with no stack limit set,
+reports under BHF-210 with CWE-674 (uncontrolled recursion), not as an
+invalid-memory access (CWE-119): code the interpreter runs cannot corrupt
+memory, so its native stack ran out. The explanation says so and the fix hint
+is to bound the recursion depth.
+
 ## Flags
 
 | Flag | Default | Purpose |

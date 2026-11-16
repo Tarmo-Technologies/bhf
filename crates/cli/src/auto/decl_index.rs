@@ -2569,7 +2569,6 @@ fn is_excluded_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extracts_global_variable_definitions_not_other_constructs() {
@@ -2694,14 +2693,8 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
         assert!(names.contains(&"_cbor_free".to_owned()), "{names:?}");
     }
 
-    fn tmpdir() -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-declidx-{nonce}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("declidx")
     }
 
     #[test]
@@ -3303,7 +3296,6 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
         // A whole-project run borrows nothing.
         let idx = DeclarationIndex::build_indexed(&root, &root).unwrap();
         assert!(!idx.is_borrowed_include_dir(&sibling));
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A header recovered from the checkout's history (deleted from the work
@@ -3348,8 +3340,6 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
                 peer.display()
             );
         }
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -3360,7 +3350,7 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
         fs::create_dir_all(root.join(".git")).unwrap();
         let sub = root.join("src/lib/parameters");
         fs::create_dir_all(&sub).unwrap();
-        assert_eq!(super::project_index_root(&sub), root);
+        assert_eq!(super::project_index_root(&sub), root.path());
 
         let plain = tmpdir();
         let inner = plain.join("a/b");
@@ -3704,7 +3694,7 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
         // Before indexing the dep dir, the library symbol is unknown (-> StubBlind).
         assert!(idx.lookup_c_definition_source("cJSON_Parse").is_none());
 
-        idx.add_definition_search_roots(std::slice::from_ref(&dep))
+        idx.add_definition_search_roots(&[dep.to_path_buf()])
             .unwrap();
 
         assert_eq!(

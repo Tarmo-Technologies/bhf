@@ -1028,51 +1028,11 @@ fn parse_rust_panic(stderr: &str) -> Option<SanitizerReport> {
 }
 
 fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
-    let needle = "ERROR: AddressSanitizer:";
-    let pos = stderr.find(needle)?;
+    let pos = stderr.find(ASAN_ERROR_MARKER)?;
     let rest = &stderr[pos..];
     let line = rest.lines().next()?;
-    let after_marker = line[needle.len()..].trim_start();
-    // Real ASan double-free output is "attempting double-free on 0x... in thread
-    // T0:" (and "attempting free on address which was not malloc()-ed"): strip the
-    // leading "attempting " so the kind token is the real class (`double-free` /
-    // `free`), not `attempting`. The hyphenated `attempting-double-free` arm below
-    // never matched — ASan emits a space, not a hyphen (#37).
-    let after_marker = after_marker
-        .strip_prefix("attempting ")
-        .unwrap_or(after_marker);
-    let kind = after_marker.split_whitespace().next()?.to_owned();
-    let rule_id = match kind.as_str() {
-        "heap-buffer-overflow" => "BHF-201",
-        "heap-use-after-free" | "use-after-free" => "BHF-202",
-        // Spatial stack errors (a fixed on-stack buffer overrun) — CWE-121.
-        "stack-buffer-overflow" | "stack-buffer-underflow" | "dynamic-stack-buffer-overflow" => {
-            "BHF-203"
-        }
-        // Temporal stack errors (a stale/expired stack pointer) are a DISTINCT
-        // weakness — CWE-825/562, not the spatial CWE-121 — so route them to their
-        // own rule instead of lumping them into BHF-203 (#29).
-        "stack-use-after-return" | "stack-use-after-scope" => "BHF-211",
-        // "double-free" (was "attempting double-free") and "free on address which
-        // was not malloc()-ed" (kind token "free") are both the free-of-invalid-
-        // pointer class — CWE-415 (#37).
-        "double-free" | "free" => "BHF-204",
-        // A SEGV is a NULL dereference (BHF-206) only when it faults in the
-        // first page; anything else is a wild pointer (BHF-223). Decided below,
-        // once the address and ASan's hint about it are parsed. Windows ASan
-        // names the same fault by its exception (see `is_memory_fault_kind`).
-        kind if is_memory_fault_kind(kind) => "BHF-223",
-        // Global / static buffers and intra-object are all "OOB writes/reads"
-        // at the rule-catalog level - one heuristic, same CWE-787.
-        "global-buffer-overflow"
-        | "container-overflow"
-        | "intra-object-overflow"
-        | "negative-size-param" => "BHF-201",
-        // Mismatched allocator/deallocator (new/delete vs malloc/free) - same
-        // exploitability class as double-free for the rule catalog.
-        "alloc-dealloc-mismatch" | "new-delete-type-mismatch" | "bad-free" => "BHF-204",
-        _ => "BHF-201",
-    };
+    let kind = asan_kind(&line[ASAN_ERROR_MARKER.len()..])?;
+    let rule_id = asan_rule(&kind);
     // Enrich the message with the access kind — an OOB READ (info disclosure /
     // DoS) vs WRITE (memory corruption / potential RCE) drives severity and is on
     // a SEPARATE line of the report ("READ of size 4 at 0x...", "WRITE of size 8
@@ -1126,6 +1086,131 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         access,
         pc_offset: None,
     })
+}
+
+/// The text that opens the `ERROR:` line of an AddressSanitizer report.
+const ASAN_ERROR_MARKER: &str = "ERROR: AddressSanitizer:";
+
+/// Report classes AddressSanitizer names with a phrase on its `ERROR:` line,
+/// each with the kind its `SUMMARY:` line gives it. Every other class is the
+/// first word of the line.
+pub const ASAN_PHRASE_KINDS: &[(&str, &str)] = &[
+    ("requested allocation size", "allocation-size-too-big"),
+    ("calloc parameters overflow", "calloc-overflow"),
+    ("reallocarray parameters overflow", "reallocarray-overflow"),
+    ("pvalloc parameters overflow", "pvalloc-overflow"),
+    ("out of memory", "out-of-memory"),
+    ("allocator is out of memory", "out-of-memory"),
+    ("specified RSS limit exceeded", "rss-limit-exceeded"),
+    (
+        "invalid allocation alignment",
+        "invalid-allocation-alignment",
+    ),
+    (
+        "invalid alignment requested in aligned_alloc",
+        "invalid-aligned-alloc-alignment",
+    ),
+    (
+        "invalid alignment requested in posix_memalign",
+        "invalid-posix-memalign-alignment",
+    ),
+    ("to call malloc_usable_size()", "bad-malloc_usable_size"),
+    (
+        "to call __sanitizer_get_allocated_size()",
+        "bad-__sanitizer_get_allocated_size",
+    ),
+    (
+        "bad parameters to __sanitizer_annotate_contiguous_container",
+        "bad-__sanitizer_annotate_contiguous_container",
+    ),
+    // A signal (POSIX) or an exception (Windows) ASan has no name for.
+    ("UNKNOWN SIGNAL", "unknown-signal"),
+    ("unknown exception", "unknown-exception"),
+];
+
+/// The report class on an AddressSanitizer `ERROR:` line, from the text after
+/// the `AddressSanitizer:` marker. Double-free output is "attempting
+/// double-free on 0x... in thread T0:" (and "attempting free on address which
+/// was not malloc()-ed"), so a leading "attempting " is skipped: the kind is
+/// `double-free` / `free`, not `attempting` (#37). A phrase-named class takes
+/// its `SUMMARY:` name ([`ASAN_PHRASE_KINDS`]), and the colon that follows a
+/// class such as `memcpy-param-overlap:` is not part of it.
+pub fn asan_kind(after_marker: &str) -> Option<String> {
+    let text = after_marker.trim_start();
+    let text = text.strip_prefix("attempting ").unwrap_or(text);
+    if let Some((_, kind)) = ASAN_PHRASE_KINDS
+        .iter()
+        .find(|(phrase, _)| text.starts_with(phrase))
+    {
+        return Some((*kind).to_owned());
+    }
+    let kind = text.split_whitespace().next()?.trim_end_matches(':');
+    (!kind.is_empty()).then(|| kind.to_owned())
+}
+
+/// The rule of an AddressSanitizer report of `kind`. A kind with no rule of
+/// its own is a reachable crash (BHF-210), never a heap overflow.
+fn asan_rule(kind: &str) -> &'static str {
+    match kind {
+        "heap-buffer-overflow" => "BHF-201",
+        "heap-use-after-free" | "use-after-free" => "BHF-202",
+        // Spatial stack errors (a fixed on-stack buffer overrun) — CWE-121.
+        "stack-buffer-overflow" | "stack-buffer-underflow" | "dynamic-stack-buffer-overflow" => {
+            "BHF-203"
+        }
+        // Temporal stack errors (a stale/expired stack pointer) are a DISTINCT
+        // weakness — CWE-825/562, not the spatial CWE-121 — so route them to their
+        // own rule instead of lumping them into BHF-203 (#29).
+        "stack-use-after-return" | "stack-use-after-scope" => "BHF-211",
+        // "double-free" (was "attempting double-free") and "free on address which
+        // was not malloc()-ed" (kind token "free") are both the free-of-invalid-
+        // pointer class — CWE-415 (#37).
+        "double-free" | "free" => "BHF-204",
+        // A SEGV is a NULL dereference (BHF-206) only when it faults in the
+        // first page; anything else is a wild pointer (BHF-223). Decided by the
+        // caller, once the address and ASan's hint about it are parsed. Windows
+        // ASan names the same fault by its exception (see `is_memory_fault_kind`).
+        kind if is_memory_fault_kind(kind) => "BHF-223",
+        // Global / static buffers, intra-object and poisoned memory (a custom
+        // allocator's redzone, see `c_runtime/bhf_asan.h`) are all "OOB
+        // writes/reads" at the rule-catalog level - one heuristic, same CWE-787.
+        "global-buffer-overflow"
+        | "container-overflow"
+        | "intra-object-overflow"
+        | "use-after-poison"
+        | "negative-size-param" => "BHF-201",
+        // Mismatched allocator/deallocator (new/delete vs malloc/free) - same
+        // exploitability class as double-free for the rule catalog.
+        "alloc-dealloc-mismatch" | "new-delete-type-mismatch" | "bad-free" => "BHF-204",
+        // The thread stack ran out: unbounded recursion (ASan reports a
+        // stack-buffer overrun as `stack-buffer-overflow`).
+        "stack-overflow" => "BHF-207",
+        // The arithmetic exception of an integer division by zero: `FPE` on
+        // POSIX, the exception's name on Windows.
+        "FPE" | "int-divide-by-zero" | "flt-divide-by-zero" | "float-divide-by-zero" => "BHF-222",
+        // `memcpy-param-overlap`, `strcpy-param-overlap`, `strncat-param-overlap`, ...
+        kind if kind.ends_with("-param-overlap") => "BHF-229",
+        // An allocation ASan refused: past its size limit, a size computation
+        // that overflows, or more memory than the process may have.
+        "allocation-size-too-big"
+        | "calloc-overflow"
+        | "reallocarray-overflow"
+        | "pvalloc-overflow"
+        | "out-of-memory"
+        | "rss-limit-exceeded" => "BHF-209",
+        // Any other deadly signal (`BUS`, `ILL`, `ABRT`, `TRAP`; on Windows
+        // `illegal-instruction`, `breakpoint`, ...) and every kind with no rule
+        // of its own.
+        _ => "BHF-210",
+    }
+}
+
+/// Whether `report` is an AddressSanitizer report parsed from its `ERROR:`
+/// line. The language lanes' findings are tagged AddressSanitizer too, with
+/// a message of their own.
+fn is_asan_banner(report: &SanitizerReport) -> bool {
+    report.sanitizer == Some(Sanitizer::AddressSanitizer)
+        && report.message.starts_with(ASAN_ERROR_MARKER)
 }
 
 /// Whether a `runtime error:` line really came from UBSan, as opposed to another
@@ -1507,8 +1592,11 @@ fn faults_in_null_page(access: &MemoryAccess) -> bool {
 /// The rule an earlier bhf release recorded for this report, where it differs
 /// from today's. Earlier releases classified a UBSan report by five shapes of
 /// the text after `runtime error:` ([`earlier_ubsan_rule`]), gave every ASan
-/// SEGV BHF-206, and gave a Windows ASan access violation or in-page error the
-/// catch-all heap-overflow rule BHF-201. `None` when the rule did not change.
+/// SEGV BHF-206, and gave every other ASan kind they had no rule for (a
+/// Windows access violation or in-page error, a stack overflow, an arithmetic
+/// exception or other deadly signal, an overlapping copy, a refused
+/// allocation, ...) the catch-all heap-overflow rule BHF-201
+/// ([`earlier_asan_catch_all`]). `None` when the rule did not change.
 pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
     let legacy = match report.sanitizer {
         Some(Sanitizer::UndefinedBehaviorSanitizer) => {
@@ -1520,9 +1608,56 @@ pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
         }
         Some(Sanitizer::AddressSanitizer) if report.kind == "SEGV" => "BHF-206",
         Some(Sanitizer::AddressSanitizer) if is_memory_fault_kind(&report.kind) => "BHF-201",
+        Some(Sanitizer::AddressSanitizer)
+            if is_asan_banner(report) && earlier_asan_catch_all(&report.kind) =>
+        {
+            "BHF-201"
+        }
         _ => return None,
     };
     (legacy != report.rule_id).then_some(legacy)
+}
+
+/// Whether earlier releases gave an ASan report of `kind` their catch-all
+/// rule, BHF-201: every kind but the ones they mapped by name.
+fn earlier_asan_catch_all(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "heap-buffer-overflow"
+            | "heap-use-after-free"
+            | "use-after-free"
+            | "stack-buffer-overflow"
+            | "stack-buffer-underflow"
+            | "dynamic-stack-buffer-overflow"
+            | "stack-use-after-return"
+            | "stack-use-after-scope"
+            | "double-free"
+            | "free"
+            | "SEGV"
+            | "global-buffer-overflow"
+            | "container-overflow"
+            | "intra-object-overflow"
+            | "negative-size-param"
+            | "alloc-dealloc-mismatch"
+            | "new-delete-type-mismatch"
+            | "bad-free"
+    )
+}
+
+/// The kind an earlier bhf release recorded for this report, where it differs
+/// from today's. Earlier releases took an ASan report's kind from the first
+/// word of its `ERROR:` line, so a class ASan names with a phrase was that
+/// word (`out` for `out of memory`, `calloc`, `requested`), and a class
+/// followed by a colon kept it (`memcpy-param-overlap:`). `None` when the
+/// kind did not change.
+pub fn legacy_kind(report: &SanitizerReport) -> Option<String> {
+    if !is_asan_banner(report) {
+        return None;
+    }
+    let after = report.message[ASAN_ERROR_MARKER.len()..].trim_start();
+    let after = after.strip_prefix("attempting ").unwrap_or(after);
+    let earlier = after.split_whitespace().next()?;
+    (earlier != report.kind).then(|| earlier.to_owned())
 }
 
 /// The rule earlier releases gave a UBSan report, from the text after

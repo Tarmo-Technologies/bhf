@@ -87,7 +87,14 @@ fn shm_open_is_virtualized_to_private_memory_under_a_fuzz_pass() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shm-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shm-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("probe.c");
     std::fs::write(&src, PROBE).unwrap();
@@ -187,7 +194,14 @@ fn sysv_shmget_is_virtualized_to_private_memory_under_a_fuzz_pass() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-sysv-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-sysv-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("sysv.c");
     std::fs::write(&src, SYSV_PROBE).unwrap();
@@ -294,7 +308,14 @@ fn anonymous_map_shared_is_privatized_under_a_fuzz_pass() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-anonmmap-vtest-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-anonmmap-vtest-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("anon.c");
     std::fs::write(&src, ANON_MMAP_PROBE).unwrap();
@@ -389,7 +410,14 @@ fn shm_content_is_fuzz_driven_under_a_content_bearing_pass() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("bhf-shm-content-{}", std::process::id()));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-shm-content-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("content.c");
     std::fs::write(&src, SHM_CONTENT_PROBE).unwrap();

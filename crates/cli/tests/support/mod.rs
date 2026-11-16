@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Serializes fuzz-bearing tests inside one test binary.
 ///
@@ -125,24 +124,24 @@ pub fn libfuzzer_toolchain_available(prefix: &str) -> bool {
 }
 
 pub fn libfuzzer_toolchain_available_with(compiler: &str, prefix: &str) -> bool {
-    let dir = std::env::temp_dir().join(format!(
-        "bhf-{prefix}-toolchain-probe-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    if fs::create_dir_all(&dir).is_err() {
+    // Removed when the probe returns.
+    let Ok(scratch) = tempfile::Builder::new()
+        .prefix(&format!("bhf-{prefix}-toolchain-probe-"))
+        .tempdir()
+    else {
         return false;
-    }
+    };
+    let dir = scratch.path();
     let src = dir.join("p.c");
     if fs::write(
         &src,
-        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n){return (int)n;}\n",
+        // `extern "C"` when a C++ driver (clang++) compiles it as C++: a
+        // mangled name would leave libFuzzer's main without its entry point.
+        "#ifdef __cplusplus\nextern \"C\"\n#endif\n\
+         int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n){return (int)n;}\n",
     )
     .is_err()
     {
-        let _ = fs::remove_dir_all(&dir);
         return false;
     }
     let bin = dir.join("p");
@@ -153,12 +152,9 @@ pub fn libfuzzer_toolchain_available_with(compiler: &str, prefix: &str) -> bool 
         libstdcxx_search_path().as_deref(),
     ));
 
-    let ok = cmd
-        .output()
+    cmd.output()
         .map(|output| output.status.success())
-        .unwrap_or(false);
-    let _ = fs::remove_dir_all(&dir);
-    ok
+        .unwrap_or(false)
 }
 
 pub fn libfuzzer_probe_args(bin: &Path, src: &Path, libstdcxx_dir: Option<&Path>) -> Vec<OsString> {
@@ -211,21 +207,17 @@ where
 /// and trace-pc-guard, no libFuzzer), so it is the correct guard for
 /// builtin-engine C++ integration tests.
 pub fn cpp_stdlib_toolchain_available(compiler: &str) -> bool {
-    let dir = std::env::temp_dir().join(format!(
-        "bhf-cpp-stdlib-probe-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    if fs::create_dir_all(&dir).is_err() {
+    // Removed when the probe returns.
+    let Ok(scratch) = tempfile::Builder::new()
+        .prefix("bhf-cpp-stdlib-probe-")
+        .tempdir()
+    else {
         return false;
-    }
+    };
+    let dir = scratch.path();
     let src = dir.join("p.cpp");
-    let ok = fs::write(&src, "#include <cstddef>\n#include <cstdlib>\nint d;\n").is_ok()
-        && cxx_compiles_std_headers(compiler, &src);
-    let _ = fs::remove_dir_all(&dir);
-    ok
+    fs::write(&src, "#include <cstddef>\n#include <cstdlib>\nint d;\n").is_ok()
+        && cxx_compiles_std_headers(compiler, &src)
 }
 
 fn cxx_compiles_std_headers(compiler: &str, src: &Path) -> bool {

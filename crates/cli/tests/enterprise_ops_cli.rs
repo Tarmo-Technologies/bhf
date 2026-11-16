@@ -5,7 +5,10 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn policy_validate_writes_governance_summary() {
@@ -1690,7 +1693,7 @@ fn read_json(path: &Path) -> serde_json::Value {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    corpus::hex_lower(&hasher.finalize())
 }
 
 fn pack_items_signature(items: &[serde_json::Value]) -> String {
@@ -1702,19 +1705,13 @@ fn pack_items_signature(items: &[serde_json::Value]) -> String {
         }
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    corpus::hex_lower(&hasher.finalize())
 }
 
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-enterprise-ops-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("enterprise-ops-{name}"))
 }

@@ -312,22 +312,18 @@ fn is_ada_identifier(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn tmp_toml(name: &str, body: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-alire-cfg-{name}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// `alire.toml` holding `body`, in a dir removed when the guard drops.
+    fn tmp_toml(name: &str, body: &str) -> (crate::test_support::TestDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestDir::new(&format!("alire-cfg-{name}"));
         let path = dir.join("alire.toml");
         std::fs::write(&path, body).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn generates_usb_embedded_config_with_integer_and_boolean_defaults() {
         // usb_embedded's exact [configuration.variables].
-        let toml = tmp_toml(
+        let (_dir, toml) = tmp_toml(
             "usb",
             "name = \"usb_embedded\"\n\
              [[depends-on]]\nhal = \"^1.0.0\"\n\
@@ -373,22 +369,20 @@ mod tests {
             "{}",
             pkg.source
         );
-        let _ = std::fs::remove_dir_all(toml.parent().unwrap());
     }
 
     #[test]
     fn no_configuration_variables_yields_none() {
-        let toml = tmp_toml(
+        let (_dir, toml) = tmp_toml(
             "plain",
             "name = \"libkeccak\"\n[[depends-on]]\ngnat = \">=11\"\n",
         );
         assert!(generate_config_package(&toml).is_none());
-        let _ = std::fs::remove_dir_all(toml.parent().unwrap());
     }
 
     #[test]
     fn handles_string_and_enum_variables() {
-        let toml = tmp_toml(
+        let (_dir, toml) = tmp_toml(
             "mix",
             "name = \"my_crate\"\n\
              [configuration.variables]\n\
@@ -411,6 +405,5 @@ mod tests {
             "{}",
             pkg.source
         );
-        let _ = std::fs::remove_dir_all(toml.parent().unwrap());
     }
 }

@@ -12,9 +12,13 @@
 //! default suite.
 
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 mod support;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// Parse a `run.json` value into `(built_and_fuzzed, executions, findings)`
 /// summed across the run's targets/passes — the per-fixture parity measurement.
@@ -67,14 +71,8 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/engine_parity")
 }
 
-fn tmpdir(case: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-parity-{case}-{n}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(case: &str) -> TestDir {
+    TestDir::new(&format!("parity-{case}"))
 }
 
 /// Cold-solve sweep: runs the built-in engine on each planted-bug fixture and

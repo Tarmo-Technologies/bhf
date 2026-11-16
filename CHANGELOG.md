@@ -4,7 +4,22 @@
 
 ## Unreleased
 
+### Changed
+- sha2 0.11. Ids, signatures and file names derived from SHA-256 digests
+  keep their lowercase-hex spelling.
+- A development build reports `v<version>-dev+<commit>` and no longer rebuilds
+  when another worktree of the same clone fetches, packs refs or adds a tag.
+  Release builds (`BHF_RELEASE_VERSION`) still report `v<version>`.
+- Tests in every crate make their scratch directories with a guard that
+  removes them when the test ends, including when it fails, and a lint
+  (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
+
 ### Fixed
+- Capsules and `bhf verify-poc` take a sanitizer signature from the report's
+  `ERROR:` line: a leak is `LeakSanitizer:memory-leak` instead of the byte
+  count on its summary line, and a class such as `memcpy-param-overlap` no
+  longer keeps its trailing colon. Capsules packaged by earlier releases
+  still verify.
 - `bhf replay` and `bhf minimize` symbolize a crash without the network
   debuginfod client, as fuzz children already did. On a host whose
   `DEBUGINFOD_URLS` names a server, ASan's symbolizer could wait on it past
@@ -1241,6 +1256,41 @@
   reporting under the heap-buffer-overflow rule BHF-201 (in SARIF `ruleId`
   and the `bhf explain` header). `bhf replay` still matches findings recorded
   under BHF-201.
+- Every ASan report kind has its own rule instead of the CRITICAL
+  heap-buffer-overflow rule BHF-201: `stack-overflow` is BHF-207 (CWE-674),
+  `FPE` and Windows `int-divide-by-zero`/`flt-divide-by-zero` BHF-222,
+  `out of memory`, `requested allocation size`, `calloc parameters overflow`
+  and the other refused allocations BHF-209, `BUS`/`ILL`/`ABRT`/`TRAP`, the
+  other Windows exceptions and any unknown kind BHF-210, and
+  `memcpy-param-overlap`/`strcpy-param-overlap` the new BHF-229 (overlapping
+  copy arguments, CWE-475). A phrase-named kind takes its `SUMMARY:` name
+  (`out-of-memory`, not `out`). `bhf replay` still matches findings recorded
+  under BHF-201 and the earlier kind, and `results/` groups them with the
+  same crash found now.
+- Stack exhaustion is CWE-674 (uncontrolled recursion) in every lane: ASan's
+  `stack-overflow`, the JS/Go/C# stack-overflow kinds, V8's `Maximum call
+  stack size exceeded`, and an interpreter (PHP, Python, Perl, Ruby, Lua,
+  Node) killed by SIGSEGV with no error of its own, which was CWE-121 or
+  CWE-119 with a buffer-overflow or bad-pointer narrative. A V8 builtin frame
+  (`<anonymous>`, `native`, `node:internal/...`) is no longer the sink or fix
+  location. A command-injection finding (CWE-78) is explained as one, never
+  as a crash or from words in the injected command, and a runtime oracle's
+  finding is not described as a fault.
+- C++ standard-library frames (`std::`/`__gnu_cxx::` functions, Rust's
+  `std::` too, and frames in `include/c++/` or MSVC STL headers) are no
+  longer part of the root-cause
+  key, so independent out-of-bounds reads through one STL accessor
+  (`std::unique_ptr::get`, `std::vector::operator[]`) in different project
+  functions are separate groups instead of one that hid the second in
+  INDEX.md. A stack with no other frame keeps them. Findings written by an
+  earlier release keep their stored key.
+- BHF-304 (shell metacharacters in a runtime command) fires only for a
+  fuzz-controlled `system`/`popen` command, confirmed at the end of the run
+  as BHF-431 is (input bytes in the command on one execution, never run
+  without them). A constant command with `;`, `$` or `|` in it was a CRITICAL
+  attacker-reachable CWE-78 finding; the run now prints a note naming it
+  instead. The oracle is `command-injection` (exception
+  `ORACLE_COMMAND_INJECTION`) in every lane, not `command-injection-ada`.
 - C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
   `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
   the C++ lane too, so the length can no longer overrun the buffer. A buffer
@@ -1647,6 +1697,36 @@
   been given.
 
 ### Changed
+- The nightly integration suite installs the Lua, PHP (with pcov), Ruby,
+  Perl, Java, TypeScript (esbuild), Rust-nightly, C# (SharpFuzz) and Cortex-M
+  QEMU toolchains, whose lane tests used to skip and pass there, and fails a
+  shard when a test prints a skip line that `scripts/ci/allowed-skips.txt`
+  does not allow (it starts with the Ada, AFL++, COBOL, Wine and AArch64
+  lanes).
+- CI's nextest runs use a new `ci` profile: a failing test is retried once
+  and reported FLAKY in the job summary if it then passes, a test running
+  past 16 minutes is killed and reported, and each job uploads a JUnit report
+  that keeps every test's output.
+- Pull request CI runs the release and docs contract tests (`m19_*`,
+  `offline_dist_scripts`, `release_bundle_manifest` and the guide checks),
+  which used to run only nightly; a documentation-only change runs them in
+  a new `doc-contracts` job, which `CI acceptance` requires for
+  `PASS_DOCS_ONLY`.
+- The nightly integration suite skips a commit only after a run at that
+  commit passed every shard, instead of whenever the tip commit was over 25
+  hours old: a failed nightly runs again the next day, and a skipped run no
+  longer reports success over a failure. A failed nightly opens or updates
+  one `integration-nightly` tracking issue.
+- The nightly integration suite builds the runtrace shim and the compiler
+  intercept before its tests, which used to fuzz with the runtime audit off
+  and skip the env-capsule tests. With the new `BHF_REQUIRE_TOOLS=1`, which
+  the nightly sets, a test that finds the shim missing fails instead of
+  skipping.
+- Container image CVE blockers no longer fail pull request or branch push
+  CI: the scan still runs and reports them (`release-review.json` gains
+  `enforcement`), and tag, release and container-release runs still fail on
+  them. A daily image scan opens or updates one `image-scan` tracking issue
+  when it finds blockers.
 - `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
   now exits `3` with an error, as `--engine winafl` does: those flags run the
   builtin engine's own loops, so such a run used to fuzz with the builtin
@@ -1895,6 +1975,15 @@
 - `fixture_path` in new `finding.json` records is relative to the work dir
   when the harness is inside it (an absolute path otherwise). Readers accept
   both forms.
+- Test scratch directories are removed when the test ends, including when it
+  fails: the new `TestDir` guard (`crates/cli/src/test_support.rs`) makes
+  `<temp>/bhf-<name>-<random>` and deletes it on drop. The six helpers that
+  made most of the `bhf-*` directories left in the temp dir use it;
+  `BHF_KEEP_TEST_DIRS=1` keeps the directories for inspection.
+- Every unit test in the `bhf` crate now makes its scratch directory with
+  `TestDir`. The GNAT `-gnat2022` probe and the replay directory of
+  `bhf corpus minimize` are `tempfile` directories, so they are also removed
+  when bhf panics.
 
 ### Added
 - Seed lineage: the built-in engine records what each input it keeps was

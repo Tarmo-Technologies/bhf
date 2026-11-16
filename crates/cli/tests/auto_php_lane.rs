@@ -11,6 +11,10 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/php_lane")
@@ -61,12 +65,10 @@ fn auto_builds_fuzzes_and_finds_divide_by_zero_cwe369() {
         eprintln!("skipping: no php on PATH (GNAT-less rule)");
         return;
     }
-    let src = std::env::temp_dir().join(format!("bhf_phplane_it_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
-    std::fs::create_dir_all(&src).unwrap();
+    let src = TestDir::new("phplane_it");
     std::fs::copy(fixture().join("parser.php"), src.join("parser.php")).unwrap();
-    let work = std::env::temp_dir().join(format!("bhf_phplane_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("phplane_w");
+    let work = work_guard.join("work");
 
     let out = Command::new(bhf_bin())
         .args([

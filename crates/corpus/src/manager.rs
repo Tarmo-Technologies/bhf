@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn record_new_signature_returns_new_class() {
-        let root = temp_dir("new-class");
+        let (_root_guard, root) = temp_dir("new-class");
         let mut manager = CorpusManager::new(root);
 
         let records = manager
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn record_duplicate_signature_returns_duplicate_class() {
-        let root = temp_dir("duplicate-class");
+        let (_root_guard, root) = temp_dir("duplicate-class");
         let mut manager = CorpusManager::new(root);
         let events = swallowed_events(1);
 
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn record_writes_input_to_queue_directory() {
-        let root = temp_dir("queue");
+        let (_root_guard, root) = temp_dir("queue");
         let mut manager = CorpusManager::new(root.clone());
 
         let records = manager
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn record_swallowed_classification_also_writes_swallowed_directory() {
-        let root = temp_dir("swallowed");
+        let (_root_guard, root) = temp_dir("swallowed");
         let mut manager = CorpusManager::new(root.clone());
 
         let records = manager
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn record_explicit_raise_classification_does_not_write_swallowed() {
-        let root = temp_dir("explicit");
+        let (_root_guard, root) = temp_dir("explicit");
         let mut manager = CorpusManager::new(root.clone());
 
         let records = manager
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn record_creates_directory_tree_if_missing() {
-        let root = temp_dir("dirs");
+        let (_root_guard, root) = temp_dir("dirs");
         let mut manager = CorpusManager::new(root.clone());
 
         manager
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn persist_coverage_corpus_writes_content_hashed_dedups_and_skips_empty() {
-        let root = temp_dir("persist");
+        let (_root_guard, root) = temp_dir("persist");
         let mut manager = CorpusManager::new(root.clone());
 
         // Two distinct inputs + a duplicate of the first + an empty input.
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn retention_limit_bounds_event_and_coverage_queue_together() {
-        let root = temp_dir("bounded");
+        let (_root_guard, root) = temp_dir("bounded");
         let mut manager = CorpusManager::new(root.clone()).with_retention_limits(1, 1024 * 1024);
 
         let first = manager
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn record_includes_unhandled_top_level_escape_as_new_signature() {
-        let root = temp_dir("unhandled");
+        let (_root_guard, root) = temp_dir("unhandled");
         let mut manager = CorpusManager::new(root.clone());
 
         let records = manager
@@ -629,13 +629,20 @@ mod tests {
         ]
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-corpus-manager-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-corpus-manager-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 }

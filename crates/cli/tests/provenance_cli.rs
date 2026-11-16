@@ -12,6 +12,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
@@ -93,8 +97,8 @@ fn stub_fabricated_crash_is_demoted_to_lab_only() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-prov-artifact-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("prov-artifact");
+    let work = work_guard.join("work");
     let stderr = run_snippet(STUB_ARTIFACT_C, &work);
     let provs = provenances(&work);
     assert!(
@@ -114,8 +118,8 @@ fn stub_independent_crash_is_certified_real_defect() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-prov-real-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("prov-real");
+    let work = work_guard.join("work");
     let stderr = run_snippet(REAL_DEFECT_C, &work);
     let provs = provenances(&work);
     assert!(

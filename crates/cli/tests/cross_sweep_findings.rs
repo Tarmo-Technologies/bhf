@@ -276,7 +276,7 @@ fn an_emulated_sanitized_replay_finishes_quickly_and_matches() {
     };
     let sha256 = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(std::fs::read(&harness).unwrap()))
+        corpus::hex_lower(&Sha256::digest(std::fs::read(&harness).unwrap()))
     };
     let id = corpus::FindingEmitter::with_metadata(
         work.clone(),

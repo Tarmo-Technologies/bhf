@@ -9,6 +9,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn run_auto(root: &Path, work: &Path) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("auto")
@@ -31,14 +35,8 @@ fn run_auto(root: &Path, work: &Path) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("parse run.json")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-werror-{tag}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("werror-{tag}"))
 }
 
 fn fuzzed(run: &serde_json::Value) -> bool {

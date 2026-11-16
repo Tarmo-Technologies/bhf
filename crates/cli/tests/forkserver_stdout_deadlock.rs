@@ -18,11 +18,15 @@
 //! `auto` runs it to completion under a wall-clock deadline. Pre-fix this hangs
 //! and trips the deadline (test failure); post-fix it finishes and fuzzes.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod support;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// The driver build needs clang (the SanitizerCoverage runtime) + make. Skip
 /// cleanly when absent — a missing toolchain is not a regression.
@@ -44,14 +48,8 @@ fn c_driver_toolchain() -> bool {
     clang && make
 }
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-fs-stdout-{prefix}-{n}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("fs-stdout-{prefix}"))
 }
 
 /// A passthrough libFuzzer target that writes >256 KB to stdout per input.

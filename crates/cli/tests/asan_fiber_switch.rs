@@ -22,7 +22,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn have_clang() -> bool {
     Command::new("clang")
@@ -41,14 +44,8 @@ fn c_runtime_dir() -> PathBuf {
         .join("c_runtime")
 }
 
-fn tmpdir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-asan-fiber-{n}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir() -> TestDir {
+    TestDir::new("asan-fiber")
 }
 
 const PROGRAM: &str = r#"

@@ -8,6 +8,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn run_auto_outcome(root: &Path, work: &Path, extra: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("auto")
@@ -36,14 +40,8 @@ fn run_auto_outcome(root: &Path, work: &Path, extra: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-dtor-{tag}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("dtor-{tag}"))
 }
 
 fn write_fixture(root: &Path) {

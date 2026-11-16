@@ -309,7 +309,12 @@ mod tests {
     #[test]
     fn write_project_writes_to_disk_and_round_trips_through_render() {
         let spec = spec_named("Bhf_Build");
-        let path = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let path_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let path = path_tmp.path().join(format!(
             "bhf-project-synth-test-{}-{}.gpr",
             std::process::id(),
             "write_project"

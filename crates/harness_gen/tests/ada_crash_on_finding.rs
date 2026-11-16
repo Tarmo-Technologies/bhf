@@ -26,7 +26,14 @@ fn bhf_crash_on_finding_aborts_only_when_set() {
         .join("../../ada_runtime")
         .canonicalize()
         .expect("ada_runtime dir");
-    let tmp = std::env::temp_dir().join(format!("bhf-ada-cof-{}", std::process::id()));
+    // Removed when this scope ends.
+    let tmp_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let tmp = tmp_tmp
+        .path()
+        .join(format!("bhf-ada-cof-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 

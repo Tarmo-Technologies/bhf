@@ -310,14 +310,19 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-bridge-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-bridge-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     fn write_file(dir: &Path, name: &str, contents: &[u8]) {
@@ -332,7 +337,7 @@ mod tests {
 
     #[test]
     fn detect_format_recognises_afl_queue() {
-        let dir = temp_dir("detect-afl");
+        let (_dir_guard, dir) = temp_dir("detect-afl");
         write_file(&dir, &afl(0, "seed1"), b"input-a");
         write_file(&dir, &afl(1, "seed2"), b"input-b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Afl);
@@ -342,7 +347,7 @@ mod tests {
     /// every host, and an export continues its numbering.
     #[test]
     fn windows_safe_afl_names_are_read_and_continued() {
-        let dir = temp_dir("detect-afl-simple");
+        let (_dir_guard, dir) = temp_dir("detect-afl-simple");
         write_file(&dir, "id_000000,orig_seed1", b"input-a");
         write_file(&dir, "id_000001", b"input-b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Afl);
@@ -351,7 +356,7 @@ mod tests {
 
     #[test]
     fn detect_format_recognises_libfuzzer_sha1_names() {
-        let dir = temp_dir("detect-libfuzzer");
+        let (_dir_guard, dir) = temp_dir("detect-libfuzzer");
         write_file(&dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", b"a");
         write_file(&dir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", b"b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Libfuzzer);
@@ -359,7 +364,7 @@ mod tests {
 
     #[test]
     fn detect_format_recognises_honggfuzz_fuzz_suffix() {
-        let dir = temp_dir("detect-honggfuzz");
+        let (_dir_guard, dir) = temp_dir("detect-honggfuzz");
         write_file(&dir, "seed1.fuzz", b"a");
         write_file(&dir, "seed2.fuzz", b"b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Honggfuzz);
@@ -367,7 +372,7 @@ mod tests {
 
     #[test]
     fn detect_format_returns_unknown_for_arbitrary_names() {
-        let dir = temp_dir("detect-unknown");
+        let (_dir_guard, dir) = temp_dir("detect-unknown");
         write_file(&dir, "alpha", b"a");
         write_file(&dir, "beta", b"b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Unknown);
@@ -375,8 +380,8 @@ mod tests {
 
     #[test]
     fn import_dir_copies_unique_files() {
-        let src = temp_dir("import-unique-src");
-        let dst = temp_dir("import-unique-dst");
+        let (_src_guard, src) = temp_dir("import-unique-src");
+        let (_dst_guard, dst) = temp_dir("import-unique-dst");
         write_file(&src, &afl(0, "a"), b"aaa");
         write_file(&src, &afl(1, "b"), b"bbb");
         write_file(&src, &afl(2, "c"), b"ccc");
@@ -390,8 +395,8 @@ mod tests {
 
     #[test]
     fn import_dir_deduplicates_by_content_hash() {
-        let src = temp_dir("import-dedup-src");
-        let dst = temp_dir("import-dedup-dst");
+        let (_src_guard, src) = temp_dir("import-dedup-src");
+        let (_dst_guard, dst) = temp_dir("import-dedup-dst");
         write_file(&src, &afl(0, "a"), b"aaa");
         write_file(&src, &afl(1, "b"), b"aaa"); // duplicate content
         write_file(&src, &afl(2, "c"), b"ccc");
@@ -403,8 +408,8 @@ mod tests {
 
     #[test]
     fn export_dir_writes_libfuzzer_40_char_hex_names() {
-        let src = temp_dir("export-libfuzzer-src");
-        let dst = temp_dir("export-libfuzzer-dst");
+        let (_src_guard, src) = temp_dir("export-libfuzzer-src");
+        let (_dst_guard, dst) = temp_dir("export-libfuzzer-dst");
         write_file(&src, "input1.bin", b"aaa");
         write_file(&src, "input2.bin", b"bbb");
         let summary = export_dir(&src, &dst, Format::Libfuzzer).unwrap();
@@ -418,8 +423,8 @@ mod tests {
 
     #[test]
     fn export_dir_writes_afl_sequential_ordinals() {
-        let src = temp_dir("export-afl-src");
-        let dst = temp_dir("export-afl-dst");
+        let (_src_guard, src) = temp_dir("export-afl-src");
+        let (_dst_guard, dst) = temp_dir("export-afl-dst");
         write_file(&src, "input1.bin", b"aaa");
         write_file(&src, "input2.bin", b"bbb");
         write_file(&src, "input3.bin", b"ccc");
@@ -443,9 +448,9 @@ mod tests {
 
     #[test]
     fn merge_dirs_deduplicates_across_inputs() {
-        let src1 = temp_dir("merge-src1");
-        let src2 = temp_dir("merge-src2");
-        let dst = temp_dir("merge-dst");
+        let (_src1_guard, src1) = temp_dir("merge-src1");
+        let (_src2_guard, src2) = temp_dir("merge-src2");
+        let (_dst_guard, dst) = temp_dir("merge-dst");
         write_file(&src1, "input1.bin", b"aaa");
         write_file(&src1, "input2.bin", b"bbb");
         write_file(&src2, "input3.bin", b"aaa"); // duplicate of src1
@@ -457,9 +462,9 @@ mod tests {
 
     #[test]
     fn merge_dirs_reports_first_input_format() {
-        let src1 = temp_dir("merge-fmt-src1");
-        let src2 = temp_dir("merge-fmt-src2");
-        let dst = temp_dir("merge-fmt-dst");
+        let (_src1_guard, src1) = temp_dir("merge-fmt-src1");
+        let (_src2_guard, src2) = temp_dir("merge-fmt-src2");
+        let (_dst_guard, dst) = temp_dir("merge-fmt-dst");
         write_file(&src1, &afl(0, "a"), b"a");
         write_file(&src2, "input1.bin", b"b");
         let summary = merge_dirs(&[src1, src2], &dst).unwrap();

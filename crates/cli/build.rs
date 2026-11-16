@@ -7,6 +7,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "build_support/git_watch.rs"]
+mod git_watch;
+
 fn main() {
     // Windows gives a process's main thread a 1 MiB stack, Linux 8 MiB. The
     // CLI dispatcher (one match over every subcommand) needs more than 1 MiB in
@@ -60,8 +63,9 @@ fn main() {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
     };
-    // Refresh the version/commit stamp when HEAD, its current branch ref, or
-    // tags move. Resolve these paths through Git so linked worktrees and a
+    // Refresh the commit stamp when HEAD or its current branch ref moves (not
+    // when shared refs such as tags or packed-refs change; see
+    // `build_support/git_watch.rs`). Resolve these paths through Git so linked worktrees and a
     // .git file pointing elsewhere work as well as a normal .git directory.
     // Watching only HEAD misses commits because symbolic HEAD usually continues
     // to contain the same `ref: refs/heads/<branch>` text as the branch moves.
@@ -83,7 +87,7 @@ fn main() {
         // loose ref when the current branch is stored only in packed-refs.
         println!("cargo:rerun-if-changed={}", watched.display());
     };
-    for git_path in ["HEAD", "packed-refs", "refs/tags"] {
+    for git_path in git_watch::watched_git_paths() {
         if let Some(path) = git(&["rev-parse", "--git-path", git_path]) {
             watch_git_path(&path);
         }
@@ -107,7 +111,12 @@ fn main() {
     let version_full = if env::var_os("BHF_RELEASE_VERSION").is_some() {
         format!("v{package_version}")
     } else {
-        git(&["describe", "--tags", "--always", "--dirty"]).unwrap_or(package_version)
+        // Not `git describe`: that depends on tags, which live in the git
+        // directory every worktree shares (see `build_support/git_watch.rs`).
+        git_watch::dev_version(
+            &package_version,
+            git(&["rev-parse", "--short", "HEAD"]).as_deref(),
+        )
     };
     println!("cargo:rustc-env=BHF_VERSION_FULL={version_full}");
 

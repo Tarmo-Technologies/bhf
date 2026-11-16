@@ -144,7 +144,8 @@ mod tests {
 
     #[test]
     fn read_reached_kinds_dedupes_across_spawns() {
-        let tmp = std::env::temp_dir().join(format!("bhf-sink-read-{}", std::process::id()));
+        let tmp_guard = crate::test_support::TestDir::new("sink-read");
+        let tmp = tmp_guard.join("tmp");
         let _ = std::fs::create_dir_all(&tmp);
         let report = tmp.join("sink_report.txt");
         // Appended by three JVM spawns; kind 1 seen twice.
@@ -159,8 +160,7 @@ mod tests {
 
     #[test]
     fn run_sink_oracle_emits_one_finding_per_reached_kind() {
-        let tmp = std::env::temp_dir().join(format!("bhf-sink-oracle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::test_support::TestDir::new("sink-oracle");
         let hdir = tmp.join("harnesses").join("H-J0001");
         std::fs::create_dir_all(&hdir).unwrap();
         // Deserialization (1) and SQL (4) reached.

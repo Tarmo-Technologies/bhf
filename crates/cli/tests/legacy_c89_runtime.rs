@@ -11,6 +11,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn c_runtime_dir() -> PathBuf {
     // crates/cli -> repo root -> c_runtime
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -42,8 +46,7 @@ fn decode_runtime_compiles_strict_c89() {
         header.display()
     );
 
-    let dir = std::env::temp_dir().join(format!("bhf-c89-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("c89");
     let tu = dir.join("c89_tu.c");
     // Exercise the decode API a real harness uses, including the cursor open that
     // used to be a non-constant compound initializer.
@@ -89,8 +92,7 @@ fn trace_runtime_compiles_strict_c89() {
         return;
     }
     let rt = c_runtime_dir();
-    let dir = std::env::temp_dir().join(format!("bhf-c89-trace-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("c89-trace");
     let tu = dir.join("c89_trace.c");
     std::fs::write(
         &tu,

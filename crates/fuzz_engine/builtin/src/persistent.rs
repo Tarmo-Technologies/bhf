@@ -276,7 +276,8 @@ mod tests {
 
     #[test]
     fn queue_file_round_trips_ordered_testcases() {
-        let path = temp_dir("queue-round-trip").join("queue.gvfq");
+        let (_scratch12, scratch12) = temp_dir("queue-round-trip");
+        let path = scratch12.join("queue.gvfq");
         let entries = vec![
             PersistentQueueEntry::new(7, b"alpha".to_vec()),
             PersistentQueueEntry::new(8, vec![0, 1, 2, 3]),
@@ -292,7 +293,8 @@ mod tests {
 
     #[test]
     fn queue_reader_rejects_bad_magic() {
-        let path = temp_dir("queue-bad-magic").join("queue.gvfq");
+        let (_scratch11, scratch11) = temp_dir("queue-bad-magic");
+        let path = scratch11.join("queue.gvfq");
         fs::write(&path, b"not-a-bhf-queue").unwrap();
 
         assert!(matches!(
@@ -303,7 +305,8 @@ mod tests {
 
     #[test]
     fn queue_reader_rejects_truncated_frame() {
-        let path = temp_dir("queue-truncated").join("queue.gvfq");
+        let (_scratch10, scratch10) = temp_dir("queue-truncated");
+        let path = scratch10.join("queue.gvfq");
         let mut bytes = b"GVFQ1\0".to_vec();
         bytes.extend_from_slice(&7_u64.to_le_bytes());
         bytes.extend_from_slice(&4_u32.to_le_bytes());
@@ -318,7 +321,8 @@ mod tests {
 
     #[test]
     fn queue_reader_rejects_oversized_testcase() {
-        let path = temp_dir("queue-oversized").join("queue.gvfq");
+        let (_scratch9, scratch9) = temp_dir("queue-oversized");
+        let path = scratch9.join("queue.gvfq");
         let entries = [PersistentQueueEntry::new(1, b"abcd".to_vec())];
         let config = PersistentLoopConfig {
             max_testcase_len: 3,
@@ -335,7 +339,8 @@ mod tests {
 
     #[test]
     fn persistent_loop_runs_all_entries_on_one_child() {
-        let path = temp_dir("persistent-loop-all").join("queue.gvfq");
+        let (_scratch8, scratch8) = temp_dir("persistent-loop-all");
+        let path = scratch8.join("queue.gvfq");
         let entries = vec![
             PersistentQueueEntry::new(1, b"a".to_vec()),
             PersistentQueueEntry::new(2, b"bb".to_vec()),
@@ -360,7 +365,8 @@ mod tests {
 
     #[test]
     fn persistent_loop_stops_on_child_failure() {
-        let path = temp_dir("persistent-loop-failure").join("queue.gvfq");
+        let (_scratch7, scratch7) = temp_dir("persistent-loop-failure");
+        let path = scratch7.join("queue.gvfq");
         let entries = vec![
             PersistentQueueEntry::new(1, b"a".to_vec()),
             PersistentQueueEntry::new(2, b"bb".to_vec()),
@@ -403,16 +409,21 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!(
             "bhf-persistent-{name}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("temp dir is created");
-        dir
+        (dir_tmp, dir)
     }
 }

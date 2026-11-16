@@ -611,9 +611,7 @@ mod tests {
 
     #[test]
     fn counts_world_resources() {
-        let dir = std::env::temp_dir().join(format!("bhf-envcap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("envcap");
         let w = dir.join("w.jsonl");
         std::fs::write(&w, "6161:4142\n6262:4344\ngarbage\n").unwrap();
         assert_eq!(count_world_resources(&w), 2);

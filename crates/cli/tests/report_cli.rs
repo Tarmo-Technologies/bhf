@@ -2,8 +2,11 @@
 
 use serde_json::json;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn report_subcommand_writes_json_and_markdown_reports() {
@@ -314,14 +317,8 @@ fn write_finding(finding_dir: &Path, finding: serde_json::Value) {
     .unwrap();
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-report-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-report-{name}"))
 }
 
 #[test]

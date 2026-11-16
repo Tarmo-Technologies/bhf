@@ -454,7 +454,14 @@ mod tests {
 
     #[test]
     fn parse_idl_file_parses_declarations_from_includes() {
-        let root = std::env::temp_dir().join(format!("bhf-idl-parse-file-{}", std::process::id()));
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp
+            .path()
+            .join(format!("bhf-idl-parse-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         std::fs::write(root.join("common.idl"), "interface Common {};\n").expect("write include");
@@ -470,7 +477,12 @@ mod tests {
 
     #[test]
     fn parse_idl_file_searches_configured_include_dirs() {
-        let root = std::env::temp_dir().join(format!(
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp.path().join(format!(
             "bhf-idl-parse-file-include-dir-{}",
             std::process::id()
         ));
@@ -492,8 +504,14 @@ mod tests {
 
     #[test]
     fn parse_idl_file_parses_include_inside_active_ifdef() {
-        let root =
-            std::env::temp_dir().join(format!("bhf-idl-active-include-{}", std::process::id()));
+        // Removed when this scope ends.
+        let bhf_tmp3 = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = bhf_tmp3
+            .path()
+            .join(format!("bhf-idl-active-include-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         std::fs::write(root.join("common.idl"), "interface Common {};\n").expect("write include");

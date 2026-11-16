@@ -1725,8 +1725,7 @@ int main(int argc, char **argv) {
     return (magic == 0xDEADBEEFu) ? 42 : 7;
 }
 "#;
-        let dir = std::env::temp_dir().join(format!("bhf-hdf3-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("hdf3");
         let src = dir.join("be_parse.c");
         std::fs::write(&src, FIXTURE).unwrap();
         let input = dir.join("input.bin");
@@ -1962,8 +1961,7 @@ int main(int argc, char **argv) {
             bhfeprintln!("skipping crt-compat compile: clang not on PATH");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("bhf-crt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("crt");
         std::fs::write(dir.join("_bhf_crt_compat.h"), CRT_COMPAT_STUB).unwrap();
         // A TU that force-includes the compat header, THEN hijacks `vsnprintf` the
         // way frozen does, then calls the MSVC underscore name inside its wrapper.
@@ -2033,8 +2031,7 @@ int main(int argc, char **argv) {
             bhfeprintln!("skipping crt-compat C++ compile: clang++ not on PATH");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("bhf-crt-cpp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("crt-cpp");
         // Toolchain probe: this box (and some CI images) ship a clang++ that can't
         // locate libstdc++/libc++ headers unaided. If a bare `#include <cstddef>`
         // won't compile, the toolchain isn't C++-ready — self-skip rather than

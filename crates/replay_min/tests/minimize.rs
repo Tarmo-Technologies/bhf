@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn minimize_finding_bytes_uses_signature_match_predicate() {
-    let finding_dir = write_finding(b"prefix-crash-suffix", canonical_signature());
+    let (_finding_dir_guard, finding_dir) =
+        write_finding(b"prefix-crash-suffix", canonical_signature());
 
     let result = minimize_finding_bytes(&finding_dir, fake_harness()).unwrap();
 
@@ -22,7 +23,8 @@ fn minimize_finding_bytes_uses_signature_match_predicate() {
 
 #[test]
 fn minimize_finding_bytes_treats_candidate_replay_failures_as_non_reproducing() {
-    let finding_dir = write_finding(b"boom-crash-tail", canonical_signature());
+    let (_finding_dir_guard, finding_dir) =
+        write_finding(b"boom-crash-tail", canonical_signature());
 
     let result = minimize_finding_bytes(&finding_dir, fake_harness()).unwrap();
 
@@ -31,7 +33,8 @@ fn minimize_finding_bytes_treats_candidate_replay_failures_as_non_reproducing() 
 
 #[test]
 fn minimize_finding_bytes_rejects_non_reproducing_original() {
-    let finding_dir = write_finding(b"does-not-reproduce", canonical_signature());
+    let (_finding_dir_guard, finding_dir) =
+        write_finding(b"does-not-reproduce", canonical_signature());
 
     let error = minimize_finding_bytes(&finding_dir, fake_harness()).unwrap_err();
 
@@ -40,7 +43,7 @@ fn minimize_finding_bytes_rejects_non_reproducing_original() {
 
 #[test]
 fn minimize_finding_typed_values_collapses_decoded_spans() {
-    let finding_dir = write_finding(b"AAAAcrashBBBB", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding(b"AAAAcrashBBBB", canonical_signature());
     write_decoded_spans(
         &finding_dir,
         &[
@@ -58,7 +61,7 @@ fn minimize_finding_typed_values_collapses_decoded_spans() {
 
 #[test]
 fn minimize_finding_typed_values_without_decoded_spans_is_noop() {
-    let finding_dir = write_finding(b"AAAAcrashBBBB", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding(b"AAAAcrashBBBB", canonical_signature());
 
     let result = minimize_finding_typed_values(&finding_dir, fake_harness()).unwrap();
 
@@ -69,7 +72,7 @@ fn minimize_finding_typed_values_without_decoded_spans_is_noop() {
 
 #[test]
 fn load_decoded_typed_spans_rejects_unknown_kind() {
-    let finding_dir = write_finding(b"AAAAcrashBBBB", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding(b"AAAAcrashBBBB", canonical_signature());
     write_decoded_spans(
         &finding_dir,
         &[serde_json::json!({ "start": 0, "end": 4, "kind": "record" })],
@@ -85,7 +88,7 @@ fn load_decoded_typed_spans_rejects_unknown_kind() {
 
 #[test]
 fn load_decoded_typed_spans_rejects_overlapping_spans() {
-    let finding_dir = write_finding(b"AAAAcrashBBBB", canonical_signature());
+    let (_finding_dir_guard, finding_dir) = write_finding(b"AAAAcrashBBBB", canonical_signature());
     write_decoded_spans(
         &finding_dir,
         &[
@@ -130,8 +133,9 @@ fn testcase_with_handler_line(handler_line: u32) -> Testcase {
     }
 }
 
-fn write_finding(input: &[u8], signature: Signature) -> PathBuf {
-    let finding_dir = temp_dir("minimize").join("findings/F-0000-test");
+fn write_finding(input: &[u8], signature: Signature) -> (tempfile::TempDir, PathBuf) {
+    let (_scratch5, scratch5) = temp_dir("minimize");
+    let finding_dir = scratch5.join("findings/F-0000-test");
     fs::create_dir_all(&finding_dir).unwrap();
     fs::write(finding_dir.join("testcase.bin"), input).unwrap();
     fs::write(
@@ -139,7 +143,7 @@ fn write_finding(input: &[u8], signature: Signature) -> PathBuf {
         serde_json::to_vec(&serde_json::json!({ "signature": signature })).unwrap(),
     )
     .unwrap();
-    finding_dir
+    (_scratch5, finding_dir)
 }
 
 fn write_decoded_spans(finding_dir: &Path, spans: &[serde_json::Value]) {
@@ -154,7 +158,7 @@ fn fake_harness() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_fake_harness"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
+fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -164,7 +168,14 @@ fn temp_dir(name: &str) -> PathBuf {
     // and two tests sharing a dir overwrite each other's finding.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("bhf-minimize-{name}-{nonce}-{next}"));
+    // Removed when this scope ends.
+    let dir_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let dir = dir_tmp
+        .path()
+        .join(format!("bhf-minimize-{name}-{nonce}-{next}"));
     fs::create_dir_all(&dir).unwrap();
-    dir
+    (dir_tmp, dir)
 }

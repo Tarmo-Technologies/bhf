@@ -15,6 +15,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/c_private_handle")
@@ -37,16 +41,13 @@ fn an_opaque_handle_defined_only_in_the_target_tu_is_drivable() {
 
     // Copy outside the repo: the fixture lives under `tests/`, which discovery
     // excludes as a non-library directory when it is not the scan root.
-    let src = std::env::temp_dir().join(format!("bhf_c_private_handle_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
-    std::fs::create_dir_all(&src).unwrap();
+    let src = TestDir::new("c_private_handle");
     for entry in std::fs::read_dir(fixture()).unwrap().flatten() {
         std::fs::copy(entry.path(), src.join(entry.file_name())).unwrap();
     }
-    let work = std::env::temp_dir().join(format!("bhf_c_private_handle_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    let seeds = std::env::temp_dir().join(format!("bhf_c_private_handle_s_{}", std::process::id()));
-    std::fs::create_dir_all(&seeds).unwrap();
+    let work_guard = TestDir::new("c_private_handle_w");
+    let work = work_guard.join("work");
+    let seeds = TestDir::new("c_private_handle_s");
     std::fs::write(seeds.join("trigger"), b"G\x00\x00\x00\x00\x00\x00\x00").unwrap();
 
     let out = Command::new(&bin)

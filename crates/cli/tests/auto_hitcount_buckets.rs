@@ -34,9 +34,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// Size (bytes) of the driver's shared edge bitmap AND the #420 count map. MUST
 /// match `BHF_COV_BITS` in the driver templates and the CoverageTracker
@@ -87,14 +90,8 @@ fn count_to_bucket(count: u32) -> u8 {
     }
 }
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-hitcount-{prefix}-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("hitcount-{prefix}"))
 }
 
 /// A benign passthrough libFuzzer target whose ONLY interesting behavior is an

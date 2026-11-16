@@ -252,7 +252,14 @@ mod tests {
 
     #[test]
     fn load_parses_sidecars_from_dir() {
-        let dir = std::env::temp_dir().join(format!("bhf-linemap-{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-linemap-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         fs::write(
             dir.join("p.adb.bhf-lines.json"),

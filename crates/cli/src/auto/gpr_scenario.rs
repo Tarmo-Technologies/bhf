@@ -552,14 +552,8 @@ fn case_branch_selection(toks: &[Tok], case_pos: usize, value: &str) -> usize {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-gpr-{name}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("gpr-{name}"))
     }
 
     #[test]

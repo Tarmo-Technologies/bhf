@@ -9,6 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 #[test]
 fn offline_dist_packager_advertises_binary_only_content_pack_flow() {
     let root = repo_root();
@@ -928,7 +932,7 @@ fn offline_dist_installer_defaults_to_all_languages_and_honors_subset() {
             }
         }
     }
-    fs::remove_dir_all(bundle).unwrap();
+    fs::remove_dir_all(&bundle).unwrap();
 }
 
 #[test]
@@ -1527,46 +1531,11 @@ fn assert_success(output: std::process::Output, context: &str) {
     );
 }
 
-/// RAII temporary working directory: created on construction and recursively
-/// removed on drop (including panic/assert unwind), so these dist tests — one of
-/// which copies the multi-hundred-MB `bhf` binary — do not leak ~GB directories
-/// under `/tmp` on every run. Derefs to `Path` and implements `AsRef<Path>` so
-/// existing `dir.join(..)` / `&dir` call sites keep compiling unchanged.
-struct TempWork(PathBuf);
-
-impl std::ops::Deref for TempWork {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for TempWork {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl AsRef<std::ffi::OsStr> for TempWork {
-    fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_os_str()
-    }
-}
-
-impl Drop for TempWork {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn temp_dir(prefix: &str) -> TempWork {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-{prefix}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    TempWork(dir)
+/// A working directory removed on drop, including on a failing test's unwind,
+/// so these dist tests (one copies the multi-hundred-MB `bhf` binary) do not
+/// leave gigabytes under the temp dir.
+fn temp_dir(prefix: &str) -> TestDir {
+    TestDir::new(prefix)
 }
 
 fn create_minimal_bundle(root: &Path) {

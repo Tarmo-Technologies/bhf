@@ -85,7 +85,12 @@ fn static_ruleset_meets_precision_floor() {
         return;
     }
 
-    let work = std::env::temp_dir().join(format!(
+    // Removed when this scope ends.
+    let work_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let work = work_tmp.path().join(format!(
         "bhf-static-bench-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

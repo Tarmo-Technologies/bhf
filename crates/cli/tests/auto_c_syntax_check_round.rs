@@ -6,19 +6,16 @@
 //! — which a syntax-only pass cannot see — must still be found by the real build.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 mod support;
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-syntaxcheck-{prefix}-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("syntaxcheck-{prefix}"))
 }
 
 fn run_auto(root: &Path, src: &Path, work: &Path) -> String {

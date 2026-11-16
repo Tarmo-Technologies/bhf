@@ -12,7 +12,7 @@ enterprise readiness.
 | Decision | Meaning | Full CI evidence? |
 | --- | --- | --- |
 | `PASS_FULL_CI` | The classifier, policy tests, and every required build/test/platform job succeeded. | Yes, for the recorded commit and this workflow's scope only. |
-| `PASS_DOCS_ONLY` | Classification explicitly permitted documentation-only skips; mandatory policy checks succeeded and no listed job failed or was cancelled. | No. |
+| `PASS_DOCS_ONLY` | Classification explicitly permitted documentation-only skips; mandatory policy checks and the release and docs contract tests (`doc-contracts`) succeeded and no listed job failed or was cancelled. | No. |
 | `BLOCKED` | A required result is missing, unsuccessful, malformed, or incompatible with the selected scope. | No. |
 
 A successful job label, an empty result set, or an unrelated earlier commit
@@ -37,10 +37,77 @@ as potentially executable/test-relevant input. Unknown files select full CI.
 A failed or partial `git diff` also selects full CI. Documentation and website
 exemptions remain narrowly enumerated in `should-run-heavy-ci.sh`.
 
+The release and docs contract tests (the `m19_*`, `offline_dist_scripts` and
+`release_bundle_manifest` binaries, and the tests that check a guide against
+the code) read `README.md`, `INSTALL.md` and `docs/site/*.md` and take
+seconds. `build-test` runs them on every code change. A documentation-only
+change, which skips the heavy jobs, runs them in the `doc-contracts` job, and
+`PASS_DOCS_ONLY` requires that job to pass; a full run may skip it.
+
 Each Windows native test command is immediately followed by an exit-code check,
 so a later successful test cannot conceal an earlier failed command. CI Cargo
 commands use `--locked`, runner jobs have time limits, and checkouts do not
 persist credentials.
+
+## Container image vulnerability gate
+
+The `container-core` and `container-full` jobs scan the image they built with
+grype and review the scan with `scripts/ci/review-image-scan.py`. Critical,
+High and unknown-severity matches, and Medium matches that have a fix, are
+blockers. On pull requests and branch pushes the review is **report-only**: it
+writes `release-review.json` with `"enforcement": "report-only"`, annotates the
+blockers in the job log and summary, and exits 0, so a CVE published upstream
+after a change does not turn `CI acceptance` red for that change. Tag runs,
+`release` events, and runs of `release.yml` or `container-release.yml`
+(including the CI run they call) **enforce** the gate and fail on any blocker,
+whatever mode was requested; so does a manual or scheduled run, and any run
+outside GitHub Actions. `--mode` (or `BHF_IMAGE_SCAN_MODE`) selects `auto`, the
+default, `enforce` or `report-only`. A scan that did not run, or ran against an
+invalid database or one built more than seven days earlier, fails in every
+mode.
+
+`.github/workflows/image-scan.yml` scans the core, Ada and full images daily.
+When it finds blockers it opens one issue labelled `image-scan`, or updates the
+open one, and comments on it when the blocker list changes. A manual run with
+`seed_blocker` adds a synthetic blocker named `SEEDED-IMAGE-SCAN-BLOCKER`, to
+check that a first run opens the issue and a second run updates it; close the
+issue afterwards.
+
+## Nightly integration suite
+
+`.github/workflows/integration-nightly.yml` runs every bhf integration test in
+13 shards. Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
+when an earlier run at the same commit ran every shard and all of them passed;
+a skipped run, which GitHub records as a success, does not count. A nightly
+that failed therefore runs again each day while the commit is unchanged, and a
+manual dispatch always runs. A failed or timed-out shard opens one issue
+labelled `integration-nightly` for the branch, or updates the open one, and
+comments on it when a new commit fails; close it once a nightly passes.
+
+Each shard builds the runtrace shim and installs the interpreter, JVM,
+TypeScript, Rust-nightly, C# and Cortex-M emulator toolchains (Lua 5.4, PHP
+with pcov, Ruby, Perl, JDK 21, Node 24 with esbuild, a nightly Rust, the
+SharpFuzz tool, `qemu-system-arm` with `gcc-arm-none-eabi`, gdb, lldb and LLVM)
+and runs its tests with `BHF_REQUIRE_TOOLS=1`. A test that finds its tool
+missing prints a skip line (one starting with `skip`, `skipping`, `skipped` or
+`SKIP`) and passes; `scripts/ci/check-no-skips.py` reads those lines from the
+JUnit report and fails the shard on any that `scripts/ci/allowed-skips.txt`
+does not allow. The allowlist names the lanes the nightly does not install yet
+(Ada, AFL++, COBOL, Wine and AArch64) and the few tests another workflow runs;
+each entry gives its reason.
+
+## Test reports, retries and hangs
+
+CI's nextest runs (`build-test`, `doc-contracts` and every nightly shard) use
+the `ci` profile in `.config/nextest.toml`. A failing test is retried once; a
+test that then passes is reported FLAKY, listed in the job summary by
+`scripts/ci/junit-summary.py` and annotated as a warning, rather than hidden. A
+test still running after 16 minutes (8 slow-timeout periods of 120 s; 50
+minutes for `build_recovery_scenarios`) is killed and reported as a TIMEOUT
+failure. Each job uploads its JUnit report (`junit-*` artifacts, from
+`target/nextest/<profile>/junit.xml`), which keeps every test's captured
+stdout and stderr, passing tests included, even when the job fails. Run
+`cargo nextest run --profile ci ...` to reproduce a CI run's behavior locally.
 
 ## Running and consuming the checks
 

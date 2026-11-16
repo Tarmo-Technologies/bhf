@@ -1230,15 +1230,8 @@ mod tests {
         }
     }
 
-    fn tmp_work_dir(tag: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        dir.push(format!("bhf-session-fuzz-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_work_dir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("session-fuzz-{tag}"))
     }
 
     fn config(model: &ProtocolModel, work_dir: PathBuf, iterations: usize) -> SessionFuzzConfig {
@@ -1349,7 +1342,7 @@ mod tests {
         // while the CODE channel stays an honestly-reported, distinct zero.
         let model = toy_model();
         let work_dir = tmp_work_dir("separate-novelty");
-        let mut cfg = config(&model, work_dir.clone(), 3000);
+        let mut cfg = config(&model, work_dir.to_path_buf(), 3000);
         cfg.seeds = vec![SessionTestcase::from_messages(
             model.profile_sha256(),
             vec![protocol_session::MessageInstance::from_seed(
@@ -1377,7 +1370,7 @@ mod tests {
     fn summary_records_profile_hash_and_reset_fidelity() {
         let model = toy_model();
         let work_dir = tmp_work_dir("hash-fidelity");
-        let cfg = config(&model, work_dir.clone(), 200);
+        let cfg = config(&model, work_dir.to_path_buf(), 200);
 
         let mut service = ToyService::new();
         let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
@@ -1396,7 +1389,7 @@ mod tests {
 
         // A zero-time budget stops before any execution.
         let work_dir = tmp_work_dir("zero-budget");
-        let mut cfg = config(&model, work_dir.clone(), 10_000);
+        let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.time_budget = Some(Duration::from_secs(0));
         let mut service = ToyService::new();
         let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
@@ -1406,7 +1399,7 @@ mod tests {
 
         // Stop as soon as the first distinct finding lands.
         let work_dir = tmp_work_dir("stop-after");
-        let mut cfg = config(&model, work_dir.clone(), 10_000);
+        let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.stop_after_findings = Some(1);
         let mut service = ToyService::new();
         let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
@@ -1426,7 +1419,7 @@ mod tests {
         // evidence plus the replay/minimize metadata sidecar.
         let model = toy_model();
         let work_dir = tmp_work_dir("artifact");
-        let mut cfg = config(&model, work_dir.clone(), 8000);
+        let mut cfg = config(&model, work_dir.to_path_buf(), 8000);
         cfg.transport_label = "tcp:127.0.0.1:0".to_owned();
         cfg.transport_kind = "tcp".to_owned();
         cfg.stop_after_findings = Some(1);

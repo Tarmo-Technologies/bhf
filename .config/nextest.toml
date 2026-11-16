@@ -13,3 +13,35 @@ heavy-bhf = { max-threads = 2 }
 [[profile.default.overrides]]
 filter = 'package(bhf) & kind(test)'
 test-group = 'heavy-bhf'
+
+# CI runs (ci.yml, integration-nightly.yml) use `--profile ci`:
+#  - a failing test is retried once; one that then passes is reported FLAKY,
+#    which scripts/ci/junit-summary.py lists in the job summary;
+#  - a test still running after 16 minutes (8 periods of 120s) is killed and
+#    reported as a TIMEOUT failure, so a hang names itself instead of using up
+#    the job's timeout;
+#  - the JUnit report (target/nextest/ci/junit.xml, uploaded by each job)
+#    keeps every test's captured stdout and stderr, passing tests included.
+# Overrides of the default profile, such as the heavy-bhf group, apply here too.
+[profile.ci]
+retries = 1
+slow-timeout = { period = "120s", terminate-after = 8 }
+fail-fast = false
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
+
+# build_recovery_scenarios runs a dozen build-recovery fixtures in sequence
+# and takes 16-21 minutes in CI; it runs alone in a shard with a 55-minute
+# timeout, so it gets 50 minutes, and no retry, which would not fit.
+[[profile.ci.overrides]]
+filter = 'binary(=build_recovery) & test(=build_recovery_scenarios)'
+slow-timeout = { period = "300s", terminate-after = 10 }
+retries = 0
+
+# The release-build extension tests in build-test, kept in a report of their own.
+[profile.ci-release]
+inherits = "ci"

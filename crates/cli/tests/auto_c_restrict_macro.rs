@@ -20,6 +20,10 @@ use cli::auto::attempt::{attempt, AttemptOptions, FuzzEngine, Outcome};
 use cli::auto::candidate::{Candidate, Lang};
 use cli::auto::decl_index::DeclarationIndex;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/c_restrict_macro")
 }
@@ -89,14 +93,7 @@ fn restrict_qualifier_macro_param_builds() {
     let source = std::fs::read_to_string(&source_path).unwrap();
     let line = target_line(&source, "mix_bytes");
 
-    let work = std::env::temp_dir().join(format!(
-        "bhf-c-restrict-macro-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&work).unwrap();
+    let work = TestDir::new("c-restrict-macro");
     let work = std::fs::canonicalize(&work).unwrap();
 
     let candidate = Candidate {
@@ -146,14 +143,7 @@ fn restrict_qualifier_macro_param_builds_cpp() {
     let source = std::fs::read_to_string(&source_path).unwrap();
     let line = target_line(&source, "cpp_mix_bytes");
 
-    let work = std::env::temp_dir().join(format!(
-        "bhf-cpp-restrict-macro-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&work).unwrap();
+    let work = TestDir::new("cpp-restrict-macro");
     let work = std::fs::canonicalize(&work).unwrap();
 
     let candidate = Candidate {

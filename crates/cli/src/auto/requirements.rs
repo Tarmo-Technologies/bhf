@@ -801,17 +801,8 @@ mod tests {
     use crate::auto::candidate::Candidate;
     use crate::auto::preflight::{LaneStatus, PreflightReport};
 
-    fn tmpdir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bhf-requirements-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("requirements")
     }
 
     #[test]
@@ -840,7 +831,7 @@ mod tests {
         let critical = text.find("Required toolchains").unwrap();
         let ordinary = text.find("Other blocking").unwrap_or(text.len());
         assert!(critical < ordinary, "{text}");
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -877,7 +868,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("CMakeLists.txt"));
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -935,7 +926,7 @@ mod tests {
                 .any(|entry| entry.kind == DepKind::GeneratedSource),
             "completed CMake configuration satisfies declared binary-tree outputs: {after:?}"
         );
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -967,7 +958,7 @@ mod tests {
             available.entries.is_empty(),
             "installed cross tools and runtimes must not be reported as missing"
         );
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1006,6 +997,6 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Could NOT find"));
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

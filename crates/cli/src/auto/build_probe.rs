@@ -3961,16 +3961,9 @@ fn run_build(
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmpdir() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("bhf-probe-{nonce}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmpdir() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("probe")
     }
 
     #[test]
@@ -3984,7 +3977,6 @@ mod tests {
             "alpha.gpr",
             "lexicographically first for determinism"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4003,7 +3995,6 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "ZLIB");
         assert!(loaded[0].evidence.contains("Could NOT find"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4011,7 +4002,6 @@ mod tests {
         // No alire.toml / .gpr -> must not panic, just skip.
         let root = tmpdir();
         probe_ada_build(&root, None);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4099,7 +4089,6 @@ mod tests {
         assert!(wrapper.contains("re2::re2"), "{wrapper}");
         assert!(wrapper.contains("set(RE2_INSTALL OFF"), "{wrapper}");
         assert!(source.join("bhf-re2-link-probe.cc").is_file());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4179,7 +4168,6 @@ mod tests {
                 "{flag}"
             );
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A GCC toolchain's probe archives are built by that GCC with its own
@@ -4442,9 +4430,9 @@ mod tests {
         archive("libextra.a", &["obj/extra.o"]);
         // One entry in bhf's `arguments` spelling, one in CMake's `command`.
         let db = serde_json::json!([
-            {"directory": root, "file": root.join("util.c"),
+            {"directory": root.path(), "file": root.join("util.c"),
              "arguments": ["/usr/bin/clang", "-fsanitize=address", "-c", "util.c", "-o", "util.o"]},
-            {"directory": root, "file": root.join("parse.c"),
+            {"directory": root.path(), "file": root.join("parse.c"),
              "command": "/usr/bin/clang -DWIDGET_LEVEL=2 -O1 -o obj/parse.c.o -c parse.c",
              "output": "obj/parse.c.o"},
         ]);
@@ -4479,7 +4467,6 @@ mod tests {
         // Run again: the output is rebuilt from scratch, never stale.
         let again = rebuild_probe_archives(&root, &toolchain, &out);
         assert_eq!(again.rebuilt, report.rebuilt);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The Make tier leaves the archives the project builds in the tree, beside
@@ -4536,7 +4523,6 @@ mod tests {
         let symbols = index_static_library_symbols(std::slice::from_ref(&rebuilt));
         assert!(symbols[&rebuilt].contains("parse_record"), "{symbols:?}");
         assert!(symbols[&rebuilt].contains("widget_scale"), "{symbols:?}");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Two libraries that each compile a `util.c` of their own put members of
@@ -4646,7 +4632,6 @@ mod tests {
                 "{reason}"
             );
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4702,7 +4687,6 @@ mod tests {
         assert!(!libraries_from_cmake_link_text(&link, &cwd, &archive)
             .iter()
             .any(|path| path.to_string_lossy().starts_with(r"\\?\")));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4723,7 +4707,6 @@ mod tests {
             &multicore_fuzz::SanitizerSelection::None
         )
         .is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4745,7 +4728,6 @@ mod tests {
             vec![archive.clone()]
         );
         assert!(discover_static_libraries(&wrapper).contains(&archive));
-        let _ = fs::remove_dir_all(wrapper);
     }
 
     // The probe reuses `lib*.a` archives; an MSVC-ABI CMake build on Windows
@@ -4832,7 +4814,6 @@ mod tests {
             Some(coverage_archive.as_path()),
             "the exact coverage target is cached"
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4873,7 +4854,6 @@ mod tests {
             content,
             "the user's compile_commands.json content must survive the probe"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4881,7 +4861,6 @@ mod tests {
         let root = tmpdir();
         fs::write(root.join("meson.build"), "project('x', 'c')\n").unwrap();
         assert_eq!(detect_build_system(&root), BuildSystem::Meson);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4889,7 +4868,6 @@ mod tests {
         let root = tmpdir();
         fs::write(root.join("build.ninja"), "rule cc\n  command = cc\n").unwrap();
         assert_eq!(detect_build_system(&root), BuildSystem::Ninja);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4912,7 +4890,6 @@ mod tests {
         fs::write(n.join("Makefile"), "all:\n").unwrap();
         fs::write(n.join("build.ninja"), "rule cc\n").unwrap();
         assert_eq!(detect_build_system(&n), BuildSystem::Make);
-        let _ = fs::remove_dir_all(&n);
     }
 
     #[test]
@@ -4984,7 +4961,6 @@ mod tests {
             None,
             "an ambiguous monorepo needs an explicit scan root"
         );
-        let _ = fs::remove_dir_all(&wrapper);
     }
 
     #[test]
@@ -5191,7 +5167,6 @@ mod tests {
             compile_output_name(&["clang".to_owned(), "-ofoo.o".to_owned()]).as_deref(),
             Some("foo.o")
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A Windows capture shim records cl's invocation with MSBuild's UTF-16
@@ -5363,7 +5338,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let (kept, skipped) = harness_link_libraries(&inputs, std::slice::from_ref(&lib));
+        let (kept, skipped) = harness_link_libraries(&inputs, &[lib.to_path_buf()]);
         assert_eq!(kept, vec!["ws2_32.lib"]);
         let skipped: Vec<&str> = skipped.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
@@ -5621,7 +5596,6 @@ Call Stack (most recent call first):
             !libs.iter().any(|p| p.extension().is_some_and(|e| e == "o")),
             "object files are not archives: {libs:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5650,6 +5624,5 @@ Call Stack (most recent call first):
             !dirs.iter().any(|p| p.ends_with("CMakeFiles")),
             "CMakeFiles must be skipped: {dirs:?}"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 }

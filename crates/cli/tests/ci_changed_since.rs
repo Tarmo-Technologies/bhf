@@ -10,6 +10,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have(tool: &str) -> bool {
     Command::new(tool)
         .arg("--version")
@@ -41,15 +45,8 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     out
 }
 
-fn tempdir(name: &str) -> std::path::PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-ci-e2e-{name}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir(name: &str) -> TestDir {
+    TestDir::new(&format!("ci-e2e-{name}"))
 }
 
 fn write(path: &Path, contents: &str) {

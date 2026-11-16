@@ -47,6 +47,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": ".github/workflows/image-scan.yml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".github/workflows/integration-nightly.yml",
       "license": "Apache-2.0"
     },
@@ -1267,6 +1271,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/build_support/git_watch.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/ada_bridge.rs",
       "license": "Apache-2.0"
     },
@@ -1939,6 +1947,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/test_support.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/toolchain.rs",
       "license": "Apache-2.0"
     },
@@ -2116,6 +2128,10 @@
     },
     {
       "path": "crates/cli/tests/auto_config_guard.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_constant_shell_command.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2463,6 +2479,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/build_git_watch.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/build_recovery.rs",
       "license": "Apache-2.0"
     },
@@ -2627,6 +2647,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/lint_adhoc_tmp_dirs.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/list_fakes_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2776,6 +2800,10 @@
     },
     {
       "path": "crates/cli/tests/support/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/test_dir_guard.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2951,11 +2979,27 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/tests/asan_report_kinds.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/tests/cluster_e2e.rs",
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/tests/digest_ids.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/tests/end_to_end_swallowed_ce.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/tests/interpreter_findings.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/tests/stl_frames_cluster.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3960,6 +4004,10 @@
     },
     {
       "path": "crates/results/tests/golden.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/tests/stl_frame_groups.rs",
       "license": "Apache-2.0"
     },
     {

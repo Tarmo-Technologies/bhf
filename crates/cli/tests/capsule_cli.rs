@@ -8,6 +8,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
@@ -78,10 +82,7 @@ fn build_capsule(work: &Path, tar: bool) -> String {
 /// verify-poc runs, so nothing the capsule did not ship can be reached, and
 /// put back afterwards for the tests that reuse them.
 fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
-    let scratch =
-        std::env::temp_dir().join(format!("bhf-cap-scratch-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
+    let scratch = TestDir::new(&format!("cap-scratch-{tag}"));
     let dest = scratch.join(capsule_src.file_name().unwrap());
     // Copy the capsule tree into the scratch area.
     copy_tree(capsule_src, &dest);
@@ -114,7 +115,6 @@ fn verify_from_scratch(capsule_src: &Path, tag: &str) -> (bool, String) {
     let out = out.expect("run bhf verify-poc");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let pass = out.status.success() && stdout.contains("PASS");
-    let _ = std::fs::remove_dir_all(&scratch);
     (pass, stdout)
 }
 
@@ -159,8 +159,8 @@ fn self_contained_crash_capsule_reproduces_offline() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-cap-plain-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("cap-plain");
+    let work = work_guard.join("work");
     snippet_into(OVERFLOW_C, &work);
     let stdout = build_capsule(&work, false);
     assert!(
@@ -188,8 +188,8 @@ fn stub_dependent_crash_capsule_ships_stubs_and_reproduces() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-cap-stub-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("cap-stub");
+    let work = work_guard.join("work");
     snippet_into(STUB_DEP_C, &work);
     let stdout = build_capsule(&work, false);
     assert!(
@@ -232,8 +232,7 @@ fn capsule_of_a_source_file_named_with_a_space_reproduces_offline() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let root = std::env::temp_dir().join(format!("bhf-cap-spaced-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = TestDir::new("cap-spaced");
     let tree = root.join("proj");
     let work = root.join("work");
     std::fs::create_dir_all(&tree).unwrap();

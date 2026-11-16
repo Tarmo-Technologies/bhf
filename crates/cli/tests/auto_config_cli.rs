@@ -6,8 +6,12 @@
 // config is passed explicitly with `--config`. Safe knobs apply either way. Uses
 // `--dry-run` so the test is fast and never actually builds.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
@@ -21,8 +25,7 @@ fn auto_loaded_config_ignores_build_executing_keys_but_explicit_config_honors_th
         eprintln!("skip: bhf binary not built");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-config-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("config");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
@@ -63,7 +66,7 @@ fn auto_loaded_config_ignores_build_executing_keys_but_explicit_config_honors_th
         "an explicit --config must honor build-command:\n{explicit}"
     );
 
-    let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// A config `jobs` key sets the job count whatever the host's default is, and

@@ -108,6 +108,10 @@ mod static_scan;
 mod stub;
 mod support_report;
 mod target_filter;
+/// Self-cleaning scratch directories for the tests (the integration tests
+/// include the file by path).
+#[cfg(test)]
+mod test_support;
 mod toolchain;
 pub mod transport_fault;
 mod transport_fuzz;
@@ -783,7 +787,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1957,14 +1960,8 @@ mod tests {
         work_dir
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-        fs::create_dir_all(&dir).expect("temporary directory is created");
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("cli-{name}"))
     }
 
     #[cfg(unix)]

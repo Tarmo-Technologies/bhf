@@ -9,6 +9,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
@@ -33,9 +37,7 @@ fn snippet_from_file_fuzzes_a_bare_c_function() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-snippet-file-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = TestDir::new("snippet-file");
     let snippet = tmp.join("fn.c");
     std::fs::write(&snippet, BUGGY_C).unwrap();
     let work = tmp.join("work");
@@ -80,9 +82,7 @@ fn snippet_from_stdin_detects_language() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-snippet-stdin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = TestDir::new("snippet-stdin");
     let work = tmp.join("work");
 
     let mut child = bhf()

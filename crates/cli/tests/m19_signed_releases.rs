@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 
+// The installer tests that use it run on Unix only.
+#[cfg(unix)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+#[cfg(unix)]
+use test_support::TestDir;
+
 #[test]
 fn release_workflow_disables_unavailable_github_attestations() {
     let root = repo_root();
@@ -133,10 +140,7 @@ fn release_workflow_fixes_library_installer_chmod_path() {
     assert!(workflow.contains("bhf_cc_intercept-installer.sh"));
     assert!(fixer_text.contains("$_lib_install_temp/$_lib_name"));
 
-    let tmp =
-        std::env::temp_dir().join(format!("bhf-library-installer-fix-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create installer test directory");
+    let tmp = TestDir::new("library-installer-fix");
     let installer = tmp.join("library-installer.sh");
     fs::write(&installer, "chmod +x \"$_lib_install_dir/$_lib_name\"\n")
         .expect("write generated library installer fixture");
@@ -166,12 +170,7 @@ fn release_workflow_makes_powershell_installers_noninteractive_safe() {
     assert!(workflow.contains("bhf-installer.ps1"));
     assert!(workflow.contains("bhf-daemon-installer.ps1"));
 
-    let tmp = std::env::temp_dir().join(format!(
-        "bhf-powershell-installer-fix-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create PowerShell installer test directory");
+    let tmp = TestDir::new("powershell-installer-fix");
     let installer = tmp.join("installer.ps1");
     fs::write(
         &installer,
@@ -214,9 +213,7 @@ fn release_shell_installers_check_for_xz() {
         assert!(workflow.contains(installer));
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-shell-installer-fix-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create shell installer test directory");
+    let tmp = TestDir::new("shell-installer-fix");
     let installer = tmp.join("installer.sh");
     fs::write(&installer, "    need_cmd tar\n    need_cmd grep\n")
         .expect("write generated shell installer fixture");
@@ -307,12 +304,7 @@ fn ci_enforces_the_current_supported_os_matrix() {
 #[test]
 fn augmented_installer_prints_actionable_rhel7_prerequisites() {
     let root = repo_root();
-    let tmp = std::env::temp_dir().join(format!(
-        "bhf-release-installer-guidance-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).expect("create installer test directory");
+    let tmp = TestDir::new("release-installer-guidance");
     let installer = tmp.join("bhf-installer.sh");
     let os_release = tmp.join("os-release");
     fs::write(

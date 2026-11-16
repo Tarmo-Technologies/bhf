@@ -121,9 +121,10 @@ clap = { version = "4.5", features = ["derive"] }
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tera = "2"
-tempfile = "3"
+# 3.20 added `TempDir::disable_cleanup`, which `cli::test_support::TestDir` uses.
+tempfile = "3.20"
 thiserror = "2.0"
 toml = "1.1"
 # Floor at 0.26.9: 0.26.8 had a subtree-machinery regression that corrupted a

@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn check_rejects_rust_file_without_spdx_header() {
-        let root = test_root("missing");
+        let (_root_guard, root) = test_root("missing");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn missing() {}\n").unwrap();
 
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn check_rejects_c_file_without_spdx_header() {
-        let root = test_root("missing-c");
+        let (_root_guard, root) = test_root("missing-c");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/shim.c"), "int main(void) { return 0; }\n").unwrap();
 
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn check_skips_vendor_c_files() {
-        let root = test_root("vendor-c");
+        let (_root_guard, root) = test_root("vendor-c");
         fs::create_dir_all(root.join("vendor/tree-sitter-ada/src")).unwrap();
         fs::write(
             root.join("vendor/tree-sitter-ada/src/parser.c"),
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn check_rejects_tera_template_without_spdx_header() {
-        let root = test_root("missing-tera");
+        let (_root_guard, root) = test_root("missing-tera");
         fs::create_dir_all(root.join("templates")).unwrap();
         fs::write(
             root.join("templates/main.adb.tera"),
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn check_audits_root_third_party_md_without_header() {
-        let root = test_root("third-party-root");
+        let (_root_guard, root) = test_root("third-party-root");
         fs::write(root.join("THIRD_PARTY.md"), "# Third party\n\nNo header.\n").unwrap();
 
         let err = check(&root).expect_err("THIRD_PARTY.md without SPDX header must fail check");
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn check_skips_root_license_and_notice() {
-        let root = test_root("license-notice-root");
+        let (_root_guard, root) = test_root("license-notice-root");
         fs::write(root.join("LICENSE"), "Apache 2.0 verbatim text.\n").unwrap();
         fs::write(root.join("NOTICE"), "Notice without header.\n").unwrap();
 
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn manifest_orders_paths_deterministically() {
-        let root = test_root("manifest");
+        let (_root_guard, root) = test_root("manifest");
         fs::create_dir_all(root.join("b")).unwrap();
         fs::create_dir_all(root.join("a")).unwrap();
         fs::write(
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn manifest_trims_block_comment_suffix_from_license_expression() {
-        let root = test_root("manifest-block-comment");
+        let (_root_guard, root) = test_root("manifest-block-comment");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("src/shim.c"),
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn manifest_skips_generated_bhf_work_dirs() {
-        let root = test_root("manifest-generated-work");
+        let (_root_guard, root) = test_root("manifest-generated-work");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("bhf_work/auto/H-C0001")).unwrap();
         fs::write(
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn manifest_skips_generated_engine_comparison_runs() {
-        let root = test_root("manifest-engine-comparison-results");
+        let (_root_guard, root) = test_root("manifest-engine-comparison-results");
         fs::create_dir_all(root.join("benchmarks/engine-comparison/results/run-runs/source"))
             .unwrap();
         fs::create_dir_all(root.join("benchmarks/engine-comparison")).unwrap();
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn manifest_skips_ignored_internal_design_docs() {
-        let root = test_root("manifest-internal-design-docs");
+        let (_root_guard, root) = test_root("manifest-internal-design-docs");
         fs::create_dir_all(root.join("docs/site")).unwrap();
         fs::create_dir_all(root.join("docs/superpowers/plans")).unwrap();
         fs::write(
@@ -370,13 +370,18 @@ mod tests {
         assert_eq!(manifest.files[0].path, "docs/site/install.md");
     }
 
-    fn test_root(name: &str) -> PathBuf {
+    fn test_root(name: &str) -> (tempfile::TempDir, PathBuf) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("bhf-spdx-{name}-{unique}"));
+        // Removed when this scope ends.
+        let root_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let root = root_tmp.path().join(format!("bhf-spdx-{name}-{unique}"));
         fs::create_dir_all(&root).unwrap();
-        root
+        (root_tmp, root)
     }
 }

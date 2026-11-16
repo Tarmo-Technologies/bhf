@@ -522,8 +522,8 @@ mod tests {
 
     #[test]
     fn top_findings_ranks_by_severity_with_replay_command() {
-        let tmp = std::env::temp_dir().join(format!("bhf-triage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_guard = crate::test_support::TestDir::new("triage");
+        let tmp = tmp_guard.join("tmp");
         let findings = tmp.join("results").join("findings");
         for (id, sev, rule) in [("F-1", "low", "BHF-100"), ("F-2", "high", "BHF-200")] {
             let d = findings.join(id);

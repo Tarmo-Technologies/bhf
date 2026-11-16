@@ -51,7 +51,6 @@ mod tests {
     use clap::Parser;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Parser)]
     struct InstrumentOnly {
@@ -128,13 +127,7 @@ mod tests {
         source
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cli-instrument-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("cli-instrument-{name}"))
     }
 }

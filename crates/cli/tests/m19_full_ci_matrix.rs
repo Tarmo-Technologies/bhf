@@ -7,7 +7,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn full_ci_fixture_pipelines_cover_active_matrix_cell() {
@@ -619,17 +622,10 @@ fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
 
-fn temp_dir(name: &str, cell: &MatrixCell) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "bhf-m19-{}-{}-{}-{nonce}",
-        name,
+fn temp_dir(name: &str, cell: &MatrixCell) -> TestDir {
+    TestDir::new(&format!(
+        "m19-{name}-{}-{}",
         cell.dialect.env_value(),
         cell.profile().replace('-', "_")
-    ));
-    fs::create_dir_all(&dir).expect("temporary directory is created");
-    dir
+    ))
 }

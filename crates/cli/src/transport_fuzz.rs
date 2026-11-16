@@ -1690,15 +1690,8 @@ mod tests {
         (Box::new(transport), received)
     }
 
-    fn tmp_work_dir(tag: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        dir.push(format!("bhf-transport-fuzz-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_work_dir(tag: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("transport-fuzz-{tag}"))
     }
 
     fn config(work_dir: PathBuf, seeds: Vec<Vec<u8>>, iterations: usize) -> TransportFuzzConfig {
@@ -1741,7 +1734,7 @@ mod tests {
 
         let work_dir = tmp_work_dir("e2e");
         // 1 seed + 2 mutations == 3 scripted responses.
-        let config = config(work_dir.clone(), vec![b"seed".to_vec()], 3);
+        let config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 3);
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
 
@@ -1800,7 +1793,7 @@ mod tests {
         // so the mock needs no script entries).
         let (transport, received) = mock_agent_transport(vec![]);
         let work_dir = tmp_work_dir("zero-budget");
-        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1_000);
+        let mut config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 1_000);
         config.time_budget = Some(Duration::from_secs(0));
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
@@ -1851,7 +1844,7 @@ mod tests {
         // the transport-lane deadline oracle (#70).
         let (transport, _received) = mock_agent_transport(vec![ScriptedResponse::ok(vec![1, 2])]);
         let work_dir = tmp_work_dir("deadline");
-        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1);
+        let mut config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 1);
         config.deadline = Some(Duration::from_secs(0));
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
@@ -1888,7 +1881,7 @@ mod tests {
         ];
         let (transport, _received) = mock_agent_transport(script);
         let work_dir = tmp_work_dir("stop-after");
-        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 2);
+        let mut config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 2);
         config.stop_after_findings = Some(1);
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
@@ -1911,7 +1904,7 @@ mod tests {
         ];
         let (transport, _received) = mock_agent_transport(script);
         let work_dir = tmp_work_dir("dedup");
-        let config = config(work_dir.clone(), vec![b"seed".to_vec()], 2);
+        let config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 2);
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
 
@@ -1952,7 +1945,7 @@ mod tests {
         ];
         let (transport, _received) = mock_agent_transport(script);
         let work_dir = tmp_work_dir("distinct-sites");
-        let config = config(work_dir.clone(), vec![b"seed".to_vec()], 2);
+        let config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 2);
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
 
@@ -1999,7 +1992,7 @@ mod tests {
         let (transport, _received) =
             mock_agent_transport(vec![ScriptedResponse::crash(vec![1], fault)]);
         let work_dir = tmp_work_dir("profile");
-        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1);
+        let mut config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], 1);
         config.spec = "agent:tcp:127.0.0.1:9000".to_owned();
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
@@ -2039,7 +2032,7 @@ mod tests {
         let n = script.len();
         let (transport, _received) = mock_agent_transport(script);
         let work_dir = tmp_work_dir("capped");
-        let config = config(work_dir.clone(), vec![b"seed".to_vec()], n);
+        let config = config(work_dir.to_path_buf(), vec![b"seed".to_vec()], n);
 
         let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
 
@@ -2066,7 +2059,7 @@ mod tests {
         use target_transport::RunOutcome;
         let work_dir = tmp_work_dir("unlocalized");
         let emitter = FindingEmitter::with_metadata(
-            work_dir.clone(),
+            work_dir.to_path_buf(),
             "H-transport".to_owned(),
             "transport".to_owned(),
             "mock".to_owned(),
@@ -2144,7 +2137,7 @@ mod tests {
         use target_transport::RunOutcome;
         let work_dir = tmp_work_dir("unlocalized-dedup");
         let emitter = FindingEmitter::with_metadata(
-            work_dir.clone(),
+            work_dir.to_path_buf(),
             "H-transport".to_owned(),
             "transport".to_owned(),
             "mock".to_owned(),

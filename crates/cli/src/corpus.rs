@@ -183,7 +183,7 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
     let mut saw_coverage = false;
     let total = inputs.len();
     let selection = select_coverage_minimal(&inputs, |bytes| {
-        match crate::fuzz::replay_input_testcases(&runner, &work_dir, bytes) {
+        match crate::fuzz::replay_input_testcases(&runner, work_dir.path(), bytes) {
             Ok(testcases) => {
                 if !testcases.is_empty() {
                     saw_coverage = true;
@@ -198,7 +198,7 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
             }
         }
     });
-    let _ = std::fs::remove_dir_all(&work_dir);
+    drop(work_dir);
 
     let kept = match selection {
         Ok(kept) => kept,
@@ -265,18 +265,12 @@ fn copy_selected(
     Ok(())
 }
 
-fn scratch_work_dir() -> Result<PathBuf, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "bhf-corpus-minimize-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create work dir {}: {e}", dir.display()))?;
-    Ok(dir)
+/// A scratch dir for the replays, removed when it drops, a panic included.
+fn scratch_work_dir() -> Result<tempfile::TempDir, String> {
+    tempfile::Builder::new()
+        .prefix("bhf-corpus-minimize-")
+        .tempdir()
+        .map_err(|e| format!("create work dir in {}: {e}", std::env::temp_dir().display()))
 }
 
 fn print_summary(verb: &str, summary: &ImportSummary) {
@@ -341,6 +335,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_minimize_scratch_dir_is_named_for_bhf_and_removed_on_drop() {
+        let dir = scratch_work_dir().unwrap();
+        let path = dir.path().to_path_buf();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("bhf-corpus-minimize-"), "{name}");
+        assert!(path.is_dir());
+        std::fs::write(path.join("replay.bin"), b"x").unwrap();
+        drop(dir);
+        assert!(!path.exists(), "{}", path.display());
+    }
 
     fn testcase_with_crumbs(crumbs: Vec<u32>) -> Testcase {
         Testcase {

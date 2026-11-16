@@ -384,8 +384,7 @@ mod tests {
 
     #[test]
     fn write_then_load_with_matching_fingerprint_returns_candidates() {
-        let dir = std::env::temp_dir().join(format!("bhf-disccache-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("disccache");
         let cands = vec![candidate("parse", Lang::C, None)];
         let cache = DiscoveryCache::build(Path::new("/src"), "fp-match".to_owned(), &cands);
         let file = cache_path(&dir);
@@ -406,9 +405,7 @@ mod tests {
 
     #[test]
     fn load_rejects_cache_from_a_different_bhf_producer_or_semantics() {
-        let dir =
-            std::env::temp_dir().join(format!("bhf-disccache-producer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("disccache-producer");
         let file = cache_path(&dir);
         let cands = vec![candidate("parse", Lang::C, None)];
 
@@ -432,8 +429,7 @@ mod tests {
     /// so a build that cannot tell itself apart by commit must not reuse them.
     #[test]
     fn a_cache_ranked_without_typedef_resolution_is_not_reused() {
-        let dir = std::env::temp_dir().join(format!("bhf-disccache-v2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("disccache-v2");
         let file = cache_path(&dir);
         let cands = vec![candidate("parse", Lang::C, None)];
         let mut cache = DiscoveryCache::build(Path::new("/src"), "fp".to_owned(), &cands);
@@ -446,8 +442,7 @@ mod tests {
 
     #[test]
     fn load_is_a_miss_when_no_cache_file_exists() {
-        let dir = std::env::temp_dir().join(format!("bhf-disccache-none-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestDir::new("disccache-none");
         // No file written.
         assert!(load_if_valid(&cache_path(&dir), Path::new("/src"), "anything").is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -465,8 +460,7 @@ mod tests {
 
     #[test]
     fn explicit_cache_file_is_written_and_loaded_independent_of_work_dir() {
-        let base =
-            std::env::temp_dir().join(format!("bhf-disccache-override-{}", std::process::id()));
+        let base = crate::test_support::TestDir::new("disccache-override");
         let work = base.join("work");
         let custom = base.join("nested/elsewhere/cache.json");
         std::fs::create_dir_all(&work).unwrap();

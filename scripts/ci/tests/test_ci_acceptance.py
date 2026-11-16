@@ -21,11 +21,12 @@ SHA = "1234567890abcdef1234567890abcdef12345678"
 
 
 def observation(heavy: str = "true") -> dict:
+    """A passing run: a full run skips the documentation lane, and a
+    documentation-only run skips the heavy jobs."""
     jobs = {job: {"result": "success", "outputs": {}} for job in GATE.EXPECTED_JOBS}
     jobs["changes"]["outputs"]["heavy"] = heavy
-    if heavy == "false":
-        for job in GATE.HEAVY_JOBS:
-            jobs[job]["result"] = "skipped"
+    for job in GATE.HEAVY_JOBS if heavy == "false" else GATE.DOCS_LANE_JOBS:
+        jobs[job]["result"] = "skipped"
     return jobs
 
 
@@ -59,6 +60,7 @@ class PolicyTests(unittest.TestCase):
     def test_docs_scope_does_not_infer_full_pass_from_successes(self):
         jobs = observation()
         jobs["changes"]["outputs"]["heavy"] = "false"
+        jobs["doc-contracts"]["result"] = "success"
         self.assertEqual(self.evaluate(jobs)["decision"], "PASS_DOCS_ONLY")
 
     def test_full_requirement_rejects_docs(self):
@@ -69,7 +71,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.evaluate(observation(), event="workflow_dispatch")["decision"], "PASS_FULL_CI")
 
     def test_every_required_job_blocks_on_failure_cancel_or_skip(self):
-        for job in GATE.EXPECTED_JOBS:
+        for job in GATE.EXPECTED_JOBS - set(GATE.DOCS_LANE_JOBS):
             for result in ("failure", "cancelled", "skipped"):
                 with self.subTest(job=job, result=result):
                     jobs = observation()
@@ -83,6 +85,31 @@ class PolicyTests(unittest.TestCase):
                     jobs = observation("false")
                     jobs[job]["result"] = result
                     self.assert_blocked(jobs)
+
+    def test_docs_require_the_documentation_contract_lane(self):
+        # The docs-only lane runs the tests that read README.md and
+        # docs/site/*.md; a documentation change must pass them.
+        self.assertEqual(GATE.DOCS_LANE_JOBS, ("doc-contracts",))
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(result=result):
+                jobs = observation("false")
+                jobs["doc-contracts"]["result"] = result
+                self.assert_blocked(jobs)
+        jobs = observation("false")
+        self.assertEqual(jobs["doc-contracts"]["result"], "success")
+        self.assertEqual(self.evaluate(jobs)["decision"], "PASS_DOCS_ONLY")
+
+    def test_a_full_run_covers_the_documentation_lane_in_build_test(self):
+        for result in ("skipped", "success"):
+            with self.subTest(result=result):
+                jobs = observation()
+                jobs["doc-contracts"]["result"] = result
+                self.assertEqual(self.evaluate(jobs)["decision"], "PASS_FULL_CI")
+        for result in ("failure", "cancelled"):
+            with self.subTest(result=result):
+                jobs = observation()
+                jobs["doc-contracts"]["result"] = result
+                self.assert_blocked(jobs)
 
     def test_docs_require_successful_classifier_and_policy_tests(self):
         for job in GATE.ALWAYS_REQUIRED:

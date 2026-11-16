@@ -6574,7 +6574,7 @@ mod tests {
 
     #[test]
     fn load_seed_inputs_reads_files_and_dir_entries_and_skips_missing() {
-        let base = std::env::temp_dir().join(format!("bhf-seeds-{}", std::process::id()));
+        let base = crate::test_support::TestDir::new("seeds");
         let dir = base.join("seeds");
         std::fs::create_dir_all(&dir).unwrap();
         let file = base.join("one.bin");
@@ -6598,8 +6598,7 @@ mod tests {
 
     #[test]
     fn load_seed_inputs_truncates_oversized_seeds_to_max_len() {
-        let base = std::env::temp_dir().join(format!("bhf-bigseed-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestDir::new("bigseed");
         // A seed far larger than the mutator's max input length: keeping it whole
         // would make every pass replay/mutate a huge buffer and collapse
         // throughput, so it must be truncated to the cap (bytes past it are never
@@ -6633,8 +6632,7 @@ mod tests {
 
     #[test]
     fn load_seed_inputs_preserves_complete_seed_up_to_adaptive_cap() {
-        let base = std::env::temp_dir().join(format!("bhf-adaptive-seed-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestDir::new("adaptive-seed");
         let archive = base.join("fixture.zip");
         let mut bytes = vec![0x41; crate::fuzz::DEFAULT_MAX_LEN * 4];
         bytes.extend_from_slice(b"PK\x05\x06"); // ZIP directory trailer at EOF.
@@ -6689,14 +6687,8 @@ mod tests {
         assert_eq!(seeds[2].file_size, odd.len() as u64);
     }
 
-    fn alire_tmp(name: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-alire-{name}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn alire_tmp(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("alire-{name}"))
     }
 
     #[test]

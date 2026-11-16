@@ -14,6 +14,9 @@ C/C++, a JDK for Java, `python3`/`perl`/`go` for those lanes. See the
 [README](./README.md#prerequisites) for the full list; install only the lanes you touch.
 Tests that need a missing toolchain skip themselves, so a passing run on a partial
 toolchain does **not** exercise every lane — don't mistake a skip for a pass.
+With `BHF_REQUIRE_TOOLS=1` a test fails instead of skipping when the runtrace shim
+is not built beside the `bhf` under test (`cargo build -p bhf_runtrace_shim`); the
+nightly integration suite sets it.
 
 ```sh
 cargo build --workspace     # also produces libbhf_runtrace_shim.so next to the binaries
@@ -52,6 +55,13 @@ cargo run -p spdx_check -- generate       # update SPDX/manifest.json after addi
 - Library crates test in-file (`#[cfg(test)]` at the bottom of `src/lib.rs`); CLI
   integration tests live in `crates/cli/tests/` and shell the binary or call `auto`
   internals against `tests/fixtures/`.
+- Tests write scratch files under a directory that removes itself, never a
+  `temp_dir().join(format!("bhf-..."))` built by hand: `TestDir::new("name")`
+  from `crates/cli/src/test_support.rs` in the `bhf` crate (an integration test
+  includes it with `#[path = "../src/test_support.rs"] mod test_support;`), or
+  `tempfile` in the other crates. A failing test then leaves nothing behind; set
+  `BHF_KEEP_TEST_DIRS=1` to keep a `TestDir` for inspection (its path is printed
+  when the test ends).
 - `ROADMAP.md` is the engineering source of truth (license matrix, milestone criteria);
   user-facing behavior docs live in `docs/site/`. Keep both honest when behavior
   changes — README/docs drift is treated as a bug.

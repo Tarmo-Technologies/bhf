@@ -13,6 +13,10 @@ use std::process::Command;
 
 use cli::auto::sink_oracle::run_sink_oracle;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -72,8 +76,7 @@ fn agent_records_deserialization_sink_and_oracle_emits_finding() {
         eprintln!("skip: no JDK");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-jsink-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("jsink");
     let classes = tmp.join("classes");
     let src = tmp.join("src").join("t");
     std::fs::create_dir_all(&classes).unwrap();

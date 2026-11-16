@@ -11,6 +11,10 @@ use std::process::Command;
 
 mod support;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn clang_available() -> bool {
     which::which("clang").is_ok()
 }
@@ -43,8 +47,8 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
         eprintln!("skipping: clang not installed");
         return;
     }
-    let work = std::env::temp_dir().join(format!("bhf-explain-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("explain");
+    let work = work_guard.join("work");
     let src = work.with_extension("src.c");
     std::fs::write(&src, GATED_C).unwrap();
     let out = bhf()

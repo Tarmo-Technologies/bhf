@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// The Python interpreter: Windows' installer provides `python`, not `python3`.
 const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
@@ -488,15 +491,8 @@ fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    path.push(format!("bhf-{name}-{unique}"));
-    fs::create_dir_all(&path).unwrap();
-    path
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(name)
 }
 
 fn read_json(path: &Path) -> serde_json::Value {

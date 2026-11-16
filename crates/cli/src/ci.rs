@@ -870,16 +870,9 @@ fn severity_for_name(name: &str) -> Option<Severity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tempdir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-ci-{name}-{nonce}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempdir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("ci-{name}"))
     }
 
     fn write_finding(work_dir: &Path, id: &str, rule_id: &str, severity: &str) {

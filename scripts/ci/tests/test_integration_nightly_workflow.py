@@ -152,7 +152,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
                 calls = run_shard(self.script, self.env, shard)
                 self.assertEqual(len(calls), 1, calls)
                 call = calls[0]
-                self.assertTrue(call.startswith("nextest run --locked --workspace --no-fail-fast "), call)
+                self.assertTrue(call.startswith("nextest run --locked --workspace --no-fail-fast --profile ci "), call)
                 self.assertIn(f"-E package(bhf) & kind(test) & !({SLOW})", call)
                 self.assertTrue(call.endswith(f" --partition hash:{shard}/{count}"), call)
 
@@ -160,7 +160,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         calls = run_shard(self.script, self.env, DEDICATED)
         self.assertEqual(
             calls,
-            [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast -E {SLOW}"],
+            [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E {SLOW}"],
         )
 
     def test_an_unknown_shard_fails_instead_of_running_nothing(self) -> None:
@@ -176,6 +176,68 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         )
         self.assertIn("\n      fail-fast: false\n", self.job)
         self.assertIn('RAYON_NUM_THREADS: "1"', self.step)
+
+
+class IntegrationNightlyShimTests(unittest.TestCase):
+    """Every shard builds the runtrace shim and the compiler intercept, which
+    nextest's build of the test binaries does not produce (both are cdylibs),
+    before it runs a test: bhf preloads them from beside itself, and without
+    them each fuzz runs with the runtime audit off and the env-capsule tests
+    skip."""
+
+    STEP = "Build the runtrace shim and compiler intercept"
+
+    def setUp(self) -> None:
+        self.job = integration_job()
+        steps = re.findall(r"(?m)^      - name: (.+)$", self.job)
+        self.assertIn(self.STEP, steps)
+        self.assertLess(steps.index(self.STEP), steps.index("Integration tests (shard ${{ matrix.shard }})"))
+        self.step = self.job.split(f"      - name: {self.STEP}\n", 1)[1].split("\n      - name:", 1)[0]
+
+    def build(self, *, produce: tuple[str, ...]) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
+        """Run the build step with a stand-in cargo that writes `produce`."""
+        with tempfile.TemporaryDirectory() as scratch:
+            work = Path(scratch)
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            log = work / "cargo.log"
+            stub = bin_dir / "cargo"
+            stub.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, pathlib, sys\n"
+                "with open(os.environ['CARGO_LOG'], 'a') as log:\n"
+                "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "for name in os.environ['PRODUCE'].split():\n"
+                "    path = pathlib.Path('target/debug', name)\n"
+                "    path.parent.mkdir(parents=True, exist_ok=True)\n"
+                "    path.write_bytes(b'')\n"
+            )
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", step_script(self.step)],
+                cwd=work, capture_output=True, text=True, timeout=30,
+                env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                     "CARGO_LOG": str(log), "PRODUCE": " ".join(produce)},
+            )
+            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            return result, calls
+
+    def test_each_shard_builds_both_libraries_before_its_tests(self) -> None:
+        self.assertNotRegex(self.step, r"(?m)^        if:")
+        result, calls = self.build(produce=("libbhf_runtrace_shim.so", "libbhf_cc_intercept.so"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [["build", "--locked", "-p", "bhf_runtrace_shim", "-p", "bhf_cc_intercept"]])
+
+    def test_a_build_that_leaves_a_library_out_fails_the_shard(self) -> None:
+        for produced in (("libbhf_runtrace_shim.so",), ("libbhf_cc_intercept.so",)):
+            with self.subTest(produced=produced):
+                result, _ = self.build(produce=produced)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_the_tests_require_the_shim(self) -> None:
+        # BHF_REQUIRE_TOOLS=1 turns a test's "runtrace shim not built" skip
+        # into a failure.
+        self.assertEqual(step_env(shard_step(self.job)).get("BHF_REQUIRE_TOOLS"), "1")
 
 
 

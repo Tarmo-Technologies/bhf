@@ -11,14 +11,21 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn tempdir(prefix: &str) -> PathBuf {
+fn tempdir(prefix: &str) -> (tempfile::TempDir, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("bhf-cluster-e2e-{prefix}-{nonce}"));
+    // Removed when this scope ends.
+    let path_tmp = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let path = path_tmp
+        .path()
+        .join(format!("bhf-cluster-e2e-{prefix}-{nonce}"));
     fs::create_dir_all(&path).unwrap();
-    path
+    (path_tmp, path)
 }
 
 fn report_for(target_fn: &str) -> SanitizerReport {
@@ -50,7 +57,7 @@ fn report_for(target_fn: &str) -> SanitizerReport {
 
 #[test]
 fn three_findings_across_two_target_frames_produce_two_clusters() {
-    let root = tempdir("two-clusters");
+    let (_root_guard, root) = tempdir("two-clusters");
     let emitter = FindingEmitter::new(root.clone());
 
     emitter
@@ -63,7 +70,7 @@ fn three_findings_across_two_target_frames_produce_two_clusters() {
         .emit_sanitizer_crash(b"b-1", &report_for("parse_b"))
         .unwrap();
 
-    let out_dir = tempdir("two-clusters-out");
+    let (_out_dir_guard, out_dir) = tempdir("two-clusters-out");
     let document = build_report(&ReportOptions::new(
         root.join("results").join("findings"),
         out_dir,

@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_resolves_quoted_include_relative_to_parent() {
-        let root = temp_dir("include_relative");
+        let (_root_guard, root) = temp_dir("include_relative");
         let _ = std::fs::remove_dir_all(&root);
         let child_dir = root.join("idl");
         std::fs::create_dir_all(&child_dir).expect("create fixture dir");
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_allows_comments_after_include_path() {
-        let root = temp_dir("include_comment");
+        let (_root_guard, root) = temp_dir("include_comment");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         std::fs::write(root.join("common.idl"), "interface Common {};\n").expect("write include");
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_resolves_quoted_include_from_include_dir() {
-        let root = temp_dir("include_dir_quoted");
+        let (_root_guard, root) = temp_dir("include_dir_quoted");
         let _ = std::fs::remove_dir_all(&root);
         let include_dir = root.join("shared");
         std::fs::create_dir_all(&include_dir).expect("create include dir");
@@ -1242,7 +1242,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_resolves_angle_include_from_include_dir() {
-        let root = temp_dir("include_dir_angle");
+        let (_root_guard, root) = temp_dir("include_dir_angle");
         let _ = std::fs::remove_dir_all(&root);
         let include_dir = root.join("shared");
         std::fs::create_dir_all(&include_dir).expect("create include dir");
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_recovering_skips_missing_include_with_warning_pragma() {
-        let root = temp_dir("recover_missing_include");
+        let (_root_guard, root) = temp_dir("recover_missing_include");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         let root_file = root.join("root.idl");
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[test]
     fn preprocess_recovering_treats_unsupported_if_expression_as_inactive() {
-        let root = temp_dir("recover_unsupported_if");
+        let (_root_guard, root) = temp_dir("recover_unsupported_if");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         let root_file = root.join("root.idl");
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_detects_include_cycles() {
-        let root = temp_dir("include_cycle");
+        let (_root_guard, root) = temp_dir("include_cycle");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         let a = root.join("a.idl");
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_skips_include_inside_inactive_ifdef_without_reading_file() {
-        let root = temp_dir("inactive_include");
+        let (_root_guard, root) = temp_dir("inactive_include");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         let root_file = root.join("root.idl");
@@ -1334,7 +1334,7 @@ mod tests {
 
     #[test]
     fn preprocess_file_errors_for_missing_endif_inside_include() {
-        let root = temp_dir("include_missing_endif");
+        let (_root_guard, root) = temp_dir("include_missing_endif");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture dir");
         let included = root.join("common.idl");
@@ -1352,7 +1352,15 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove fixture dir");
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("bhf-idl-{name}-{}", std::process::id()))
+    /// A path under a directory that is removed when the guard is dropped.
+    fn temp_dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let guard = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let path = guard
+            .path()
+            .join(format!("bhf-idl-{name}-{}", std::process::id()));
+        (guard, path)
     }
 }

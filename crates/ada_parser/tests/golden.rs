@@ -416,7 +416,7 @@ statements = 2
 
 #[test]
 fn count_fixtures_per_dialect_returns_zero_for_empty_dir() {
-    let tmp = test_temp_dir("empty");
+    let (_tmp_guard, tmp) = test_temp_dir("empty");
 
     let counts = count_fixtures_per_dialect(&tmp);
 
@@ -430,7 +430,7 @@ fn count_fixtures_per_dialect_returns_zero_for_empty_dir() {
 
 #[test]
 fn count_fixtures_per_dialect_counts_manifest_files() {
-    let tmp = test_temp_dir("manifests");
+    let (_tmp_guard, tmp) = test_temp_dir("manifests");
     fs::create_dir_all(tmp.join("ada2012/scenario_a")).unwrap();
     fs::write(tmp.join("ada2012/scenario_a/manifest.toml"), "").unwrap();
     fs::create_dir_all(tmp.join("ada2012/scenario_b")).unwrap();
@@ -444,19 +444,25 @@ fn count_fixtures_per_dialect_counts_manifest_files() {
     fs::remove_dir_all(tmp).unwrap();
 }
 
-fn test_temp_dir(name: &str) -> PathBuf {
+fn test_temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("bhf-golden-{name}-{}-{unique}", std::process::id()));
+    // Removed when this scope ends.
+    let bhf_tmp1 = tempfile::Builder::new()
+        .prefix("bhf-")
+        .tempdir()
+        .expect("create test dir");
+    let path = bhf_tmp1
+        .path()
+        .join(format!("bhf-golden-{name}-{}-{unique}", std::process::id()));
 
     if path.exists() {
         fs::remove_dir_all(&path).unwrap();
     }
     fs::create_dir_all(&path).unwrap();
-    path
+    (bhf_tmp1, path)
 }
 
 #[derive(Default)]

@@ -187,12 +187,8 @@ fn project_fingerprint(work_dir: &Path, force: bool) -> String {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("bhf-closure-memo-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmpdir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("closure-memo-{name}"))
     }
 
     fn missing_header(path: &str) -> BuildErrorKind {

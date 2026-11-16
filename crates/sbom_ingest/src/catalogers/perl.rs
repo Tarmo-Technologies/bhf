@@ -275,7 +275,14 @@ mod tests {
 
     #[test]
     fn parses_cpanfile_requires() {
-        let dir = std::env::temp_dir().join(format!("bhf_cpan_{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf_cpan_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let p = write(
             &dir,
@@ -295,7 +302,14 @@ mod tests {
 
     #[test]
     fn parses_meta_json_prereqs() {
-        let dir = std::env::temp_dir().join(format!("bhf_cpanmeta_{}", std::process::id()));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf_cpanmeta_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let p = write(
             &dir,

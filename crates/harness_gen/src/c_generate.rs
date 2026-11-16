@@ -5745,7 +5745,7 @@ mod tests {
     /// buffers never get the same bytes.
     #[test]
     fn built_c_harness_gives_each_buffer_of_a_call_its_own_bytes() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "merge_records",
             &[
                 ("a", "const uint8_t *"),
@@ -5790,7 +5790,7 @@ mod tests {
         }
         fs::remove_dir_all(&out).ok();
 
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "compare_heads",
             &[("a", "const uint8_t *"), ("b", "const uint8_t *")],
             "#include <stdint.h>\n\
@@ -5813,7 +5813,7 @@ mod tests {
 
         // A paired buffer's slice is a copy of exactly its bytes: reading one
         // past it is a heap overflow, not a read of the next buffer's bytes.
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "peek_past",
             &[
                 ("a", "const uint8_t *"),
@@ -5852,7 +5852,7 @@ mod tests {
     /// static decode still gives what the trace prints.
     #[test]
     fn built_c_harness_keeps_a_lone_buffer_as_large_as_the_input() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "same_prefix",
             &[
                 ("a", "const uint8_t *"),
@@ -5884,7 +5884,7 @@ mod tests {
         }
         fs::remove_dir_all(&out).ok();
 
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "xor_into",
             &[
                 ("dst", "uint8_t *"),
@@ -5912,7 +5912,7 @@ mod tests {
     /// reaches `data` byte for byte while the context is left empty.
     #[test]
     fn built_c_harness_prefixed_seed_reaches_the_buffer_after_a_context_slice() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "parse_record",
             &[
                 ("ctx", "void *"),
@@ -5990,7 +5990,7 @@ mod tests {
             ),
         ];
         for (name, params, body) in cases {
-            let Some(out) = build_c_harness(
+            let Some((_out_guard, out)) = build_c_harness(
                 name,
                 &params,
                 &format!("#include <stdint.h>\n#include <stddef.h>\n{body}"),
@@ -6052,7 +6052,7 @@ mod tests {
                  }\n",
             ),
         ] {
-            let Some(out) = build_c_harness_in(
+            let Some((_out_guard, out)) = build_c_harness_in(
                 name,
                 &params,
                 &format!("#include \"widget.h\"\n{body}"),
@@ -6478,14 +6478,19 @@ mod tests {
         );
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-cgen-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp.path().join(format!("bhf-cgen-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        (dir_tmp, dir)
     }
 
     fn cfunction(name: &str) -> CFunction {
@@ -6527,7 +6532,14 @@ mod tests {
     /// (compiler-rt `fuzzer`) is not present on every box, so the e2e test below
     /// skips cleanly when a trivial `-fsanitize=fuzzer` link fails.
     fn libfuzzer_toolchain_available() -> bool {
-        let smoke = std::env::temp_dir().join(format!("bhf-lf-smoke-{}", std::process::id()));
+        // Removed when this scope ends.
+        let smoke_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let smoke = smoke_tmp
+            .path()
+            .join(format!("bhf-lf-smoke-{}", std::process::id()));
         if fs::create_dir_all(&smoke).is_err() {
             return false;
         }
@@ -6569,7 +6581,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("c_quoted_define");
+        let (_out_guard, out) = temp_dir("c_quoted_define");
         let marker = out.join("injected");
         let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
         let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
@@ -6653,7 +6665,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("c_driver_reuse");
+        let (_out_guard, out) = temp_dir("c_driver_reuse");
         let mut args = direct_args("parse_record", out.clone());
         args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
@@ -6858,7 +6870,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("c_section_ldflags");
+        let (_out_guard, out) = temp_dir("c_section_ldflags");
         let mut args = direct_args("parse_record", out.clone());
         args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
@@ -6932,7 +6944,7 @@ mod tests {
             eprintln!("skip: make unavailable");
             return;
         }
-        let out = temp_dir("c_exe_suffix");
+        let (_out_guard, out) = temp_dir("c_exe_suffix");
         let mut args = direct_args("parse_record", out.clone());
         args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
@@ -6994,7 +7006,7 @@ mod tests {
             eprintln!("skipping make_libfuzzer e2e: clang+libFuzzer+make unavailable");
             return;
         }
-        let out = temp_dir("libfuzzer_e2e");
+        let (_out_guard, out) = temp_dir("libfuzzer_e2e");
         let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
             .canonicalize()
@@ -7092,7 +7104,7 @@ mod tests {
             );
             return;
         }
-        let out = temp_dir("c_passthrough_libfuzzer");
+        let (_out_guard, out) = temp_dir("c_passthrough_libfuzzer");
         let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
             .canonicalize()
@@ -7186,7 +7198,7 @@ mod tests {
             eprintln!("skipping spaced-path e2e: clang/make unavailable");
             return;
         }
-        let root = temp_dir("spaced paths");
+        let (_root_guard, root) = temp_dir("spaced paths");
         let src_dir = root.join("My Proj (copy)/src lib");
         let inc_dir = root.join("My Proj (copy)/include dir");
         let runtime = root.join("tool's runtime/c_runtime");
@@ -7262,7 +7274,7 @@ mod tests {
 
     #[test]
     fn generated_c_harness_names_its_input_format_version() {
-        let out = temp_dir("format_version");
+        let (_out_guard, out) = temp_dir("format_version");
         let mut args = direct_args("parse_record", out.clone());
         args.params = vec![CParameter {
             name: "flags".to_owned(),
@@ -7277,7 +7289,11 @@ mod tests {
 
     /// Build a direct C harness for `name(params)` defined in `source`, or
     /// `None` (skipping) when clang or make is missing.
-    fn build_c_harness(name: &str, params: &[(&str, &str)], source: &str) -> Option<PathBuf> {
+    fn build_c_harness(
+        name: &str,
+        params: &[(&str, &str)],
+        source: &str,
+    ) -> Option<(tempfile::TempDir, PathBuf)> {
         build_c_harness_in(name, params, source, None)
     }
 
@@ -7288,7 +7304,7 @@ mod tests {
         params: &[(&str, &str)],
         source: &str,
         header: Option<&str>,
-    ) -> Option<PathBuf> {
+    ) -> Option<(tempfile::TempDir, PathBuf)> {
         let tools = ["make", "clang"].iter().all(|tool| {
             Command::new(tool)
                 .arg("--version")
@@ -7299,7 +7315,7 @@ mod tests {
             eprintln!("skipping {name} build: clang/make unavailable");
             return None;
         }
-        let out = temp_dir(name);
+        let (_out_guard, out) = temp_dir(name);
         let target_c = out.join("target.c");
         fs::write(&target_c, source).unwrap();
         let mut args = direct_args(name, out.clone());
@@ -7335,7 +7351,7 @@ mod tests {
             String::from_utf8_lossy(&build.stderr),
             fs::read_to_string(out.join("main.c")).unwrap_or_default()
         );
-        Some(out)
+        Some((_out_guard, out))
     }
 
     /// The traced harness source must not add a warning a project's
@@ -7403,7 +7419,7 @@ mod tests {
              int widget_parse(const unsigned char *data, u32_t bit_index, bool strict,\n\
              \x20                int8_t bias, unsigned short width, enum widget_mode mode,\n\
              \x20                const char *label, uint64_t big, double scale);\n";
-        let Some(out) = build_c_harness_in(
+        let Some((_out_guard, out)) = build_c_harness_in(
             "widget_parse",
             &[
                 ("data", "const unsigned char *"),
@@ -7480,7 +7496,7 @@ mod tests {
     /// parameter the harness gives a constant decodes to that constant.
     #[test]
     fn built_c_harness_strings_and_constants_decode_like_its_argument_trace() {
-        let Some(out) = build_c_harness_in(
+        let Some((_out_guard, out)) = build_c_harness_in(
             "parse_flags",
             &[
                 ("flags", "unsigned int"),
@@ -7561,7 +7577,7 @@ mod tests {
     /// Without the variable it prints nothing.
     #[test]
     fn built_c_harness_traces_each_decoded_argument() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_scan",
             &[
                 ("data", "const unsigned char *"),
@@ -7624,7 +7640,7 @@ mod tests {
     /// the length as the input size; a scalar after it reads the cursor.
     #[test]
     fn built_c_harness_traces_a_paired_buffer() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_parse",
             &[
                 ("buf", "const unsigned char *"),
@@ -7657,7 +7673,7 @@ mod tests {
     /// scalars decoded with it, never their bytes again.
     #[test]
     fn built_c_harness_gives_a_lone_buffer_the_bytes_after_the_scalars() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_bits",
             &[
                 ("data", "const uint8_t *"),
@@ -7706,7 +7722,7 @@ mod tests {
     fn the_length_dimension_is_recorded_only_where_it_sizes_a_buffer() {
         let _dimension = crate::scoped_buffer_len_dimension(true);
         let generate = |name: &str, params: &[(&str, &str)]| {
-            let out = temp_dir(name);
+            let (_out_guard, out) = temp_dir(name);
             let mut args = direct_args(name, out.clone());
             args.params = params
                 .iter()
@@ -7740,7 +7756,7 @@ mod tests {
     #[test]
     fn built_c_harness_with_the_length_dimension_sizes_a_lone_buffer_from_the_input() {
         let _dimension = crate::scoped_buffer_len_dimension(true);
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_sized",
             &[("data", "const uint8_t *"), ("bit_index", "uint32_t")],
             "#include <stdint.h>\n\
@@ -7792,7 +7808,7 @@ mod tests {
                  \x20   return s;\n\
                  }}\n"
             );
-            let Some(out) = build_c_harness(name, &params, &source) else {
+            let Some((_out_guard, out)) = build_c_harness(name, &params, &source) else {
                 return;
             };
             let main = fs::read_to_string(out.join("main.c")).unwrap();
@@ -7828,7 +7844,7 @@ mod tests {
                       \x20   return 0;\n\
                       }\n\
                       int widget_close(widget_t *w) { w->total = 0; return 0; }\n";
-        let Some((out, control_len)) = build_widget_sequence_harness(
+        let Some((_out_guard, out, control_len)) = build_widget_sequence_harness(
             "seq-one-past",
             header,
             source,
@@ -7861,7 +7877,7 @@ mod tests {
             crate::standalone_driver::AFL_PROBE_BODY
         );
         let params = [("buf", "const uint8_t *"), ("len", "size_t")];
-        let Some(out) = build_c_harness("probe", &params, &source) else {
+        let Some((_out_guard, out)) = build_c_harness("probe", &params, &source) else {
             return;
         };
         let main = fs::read_to_string(out.join("main.c")).unwrap();
@@ -7904,7 +7920,7 @@ mod tests {
              int widget_close(widget_t *w) {{ w->total = 0; return 0; }}\n",
             crate::standalone_driver::AFL_PROBE_BODY
         );
-        let Some((out, control_len)) = build_widget_sequence_harness(
+        let Some((_out_guard, out, control_len)) = build_widget_sequence_harness(
             "seq-afl-probe",
             header,
             &source,
@@ -8009,7 +8025,8 @@ mod tests {
             ),
         ];
         for (name, params, reached, clean) in cases {
-            let Some(out) = build_c_harness_in(name, &params, source, Some(header)) else {
+            let Some((_out_guard, out)) = build_c_harness_in(name, &params, source, Some(header))
+            else {
                 return;
             };
             let run = |input: &[u8]| {
@@ -8106,7 +8123,8 @@ mod tests {
             ),
         ];
         for (name, params, reached, clean) in cases {
-            let Some(out) = build_c_harness_in(name, &params, source, Some(header)) else {
+            let Some((_out_guard, out)) = build_c_harness_in(name, &params, source, Some(header))
+            else {
                 return;
             };
             let run = |input: &[u8]| {
@@ -8173,7 +8191,8 @@ mod tests {
                 body.replace("A[", &format!("{array}["))
                     .replace(" N;", &format!(" {count};"))
             );
-            let Some(out) = build_c_harness_in(name, &params, &source, Some(&header)) else {
+            let Some((_out_guard, out)) = build_c_harness_in(name, &params, &source, Some(&header))
+            else {
                 return;
             };
             let run = |input: &[u8]| {
@@ -8211,7 +8230,7 @@ mod tests {
     #[test]
     fn built_c_harness_reports_a_read_one_past_a_buffer_that_views_the_input() {
         let params = [("buf", "const uint8_t *"), ("len", "size_t")];
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "sum_incl",
             &params,
             "#include <stdint.h>\n#include <stddef.h>\n\
@@ -8249,7 +8268,7 @@ mod tests {
         );
         fs::remove_dir_all(&out).ok();
 
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "sum_excl",
             &params,
             "#include <stdint.h>\n#include <stddef.h>\n\
@@ -8288,7 +8307,7 @@ mod tests {
         let _dimension = crate::scoped_buffer_len_dimension(true);
         // 4 bytes for `a`, the 4-byte slice length 1, then the slice.
         let one_byte = [0, 0, 0, 0, 1, 0, 0, 0, 0xaa];
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "read_word",
             &[("p", "const uint8_t *"), ("a", "uint32_t")],
             "#include <stdint.h>\n#include <string.h>\n\
@@ -8315,7 +8334,7 @@ mod tests {
         );
         fs::remove_dir_all(&out).ok();
 
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "peek",
             &[("p", "const uint8_t *"), ("a", "uint32_t")],
             "#include <stdint.h>\n\
@@ -8341,7 +8360,7 @@ mod tests {
     /// positions, so a `-Wall -Werror` build stays clean.
     #[test]
     fn built_c_harness_without_cursor_parameters_traces_cleanly() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_feed",
             &[("buf", "const unsigned char *"), ("len", "size_t")],
             "#include <stddef.h>\n\
@@ -8366,7 +8385,7 @@ mod tests {
     /// of its own) is decoded and traced after it, and the harness builds.
     #[test]
     fn built_c_harness_traces_a_reverse_output_pair_after_a_scalar() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_decode",
             &[
                 ("level", "int"),
@@ -8403,7 +8422,7 @@ mod tests {
         let header =
             "typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;\n\
                       int widget_check(const widget_hdr *hdr, int level);\n";
-        let Some(out) = build_c_harness_in(
+        let Some((_out_guard, out)) = build_c_harness_in(
             "widget_check",
             &[("hdr", "const widget_hdr *"), ("level", "int")],
             "#include \"widget.h\"\n\
@@ -8431,7 +8450,7 @@ mod tests {
     /// (`s` and `size_t`) still gives the scalars after it their own bytes.
     #[test]
     fn built_c_harness_keeps_a_short_buffer_name_apart_from_the_scalars() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "widget_sum",
             &[("s", "const unsigned char *"), ("stride", "size_t")],
             "#include <stddef.h>\n\
@@ -8481,7 +8500,7 @@ mod tests {
                  }\n",
             ),
         ] {
-            let Some(out) = build_c_harness_in(
+            let Some((_out_guard, out)) = build_c_harness_in(
                 name,
                 &params,
                 &format!("#include \"widget.h\"\n{body}"),
@@ -8517,7 +8536,7 @@ mod tests {
             eprintln!("skipping sequence trace e2e: clang/make unavailable");
             return;
         }
-        let out = temp_dir("seq-trace");
+        let (_out_guard, out) = temp_dir("seq-trace");
         let header = "typedef struct widget_t { int total; } widget_t;\n\
                       int widget_open(widget_t *w);\n\
                       int widget_push(widget_t *w, int value);\n\
@@ -8615,7 +8634,7 @@ mod tests {
         header: &str,
         source: &str,
         ops: &[(&str, &[(&str, &str)])],
-    ) -> Option<(PathBuf, usize)> {
+    ) -> Option<(tempfile::TempDir, PathBuf, usize)> {
         let tools = ["make", "clang"].iter().all(|tool| {
             Command::new(tool)
                 .arg("--version")
@@ -8626,7 +8645,7 @@ mod tests {
             eprintln!("skipping {name} build: clang/make unavailable");
             return None;
         }
-        let out = temp_dir(name);
+        let (_out_guard, out) = temp_dir(name);
         fs::write(out.join("widget.h"), header).unwrap();
         fs::write(out.join("widget.c"), source).unwrap();
         let step = |name: &str, params: Vec<CParameter>| CLifecycleStep {
@@ -8696,7 +8715,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(out.join(SEQUENCE_LAYOUT_FILE)).unwrap())
                 .unwrap();
         let control_len = layout["control_len"].as_u64().unwrap() as usize;
-        Some((out, control_len))
+        Some((_out_guard, out, control_len))
     }
 
     /// In a sequence harness, an operation whose parameters all use the input
@@ -8724,7 +8743,7 @@ mod tests {
                       \x20   return 0;\n\
                       }\n\
                       int widget_close(widget_t *w) { w->total = 0; return 0; }\n";
-        let Some((out, control_len)) = build_widget_sequence_harness(
+        let Some((_out_guard, out, control_len)) = build_widget_sequence_harness(
             "seq-layout",
             header,
             source,
@@ -8784,7 +8803,7 @@ mod tests {
             eprintln!("skipping unsigned range e2e: clang/make unavailable");
             return;
         }
-        let out = temp_dir("unsigned_range_e2e");
+        let (_out_guard, out) = temp_dir("unsigned_range_e2e");
         let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
             .canonicalize()
@@ -8850,7 +8869,7 @@ mod tests {
     /// drive (an advancing fuzz cursor feeding the accessor), not a constant.
     #[test]
     fn peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence() {
-        let out = temp_dir("periph_seq");
+        let (_out_guard, out) = temp_dir("periph_seq");
         let mut args = direct_args("radar_status_poll", out.clone());
         args.return_type = "int".to_owned();
         args.environment = Some(CEnvironmentModel {
@@ -8902,7 +8921,7 @@ mod tests {
     #[test]
     fn environment_model_fuzz_drives_the_callback_trampoline() {
         let cb_target = |fuzz_driven_callbacks: bool, tag: &str| -> String {
-            let out = temp_dir(tag);
+            let (_out_guard, out) = temp_dir(tag);
             let mut args = direct_args("dispatch_with_cb", out);
             args.params = vec![CParameter {
                 name: "cb".to_owned(),
@@ -8944,7 +8963,7 @@ mod tests {
     /// unchanged from before HDF-5).
     #[test]
     fn no_environment_model_emits_no_peripheral_machinery() {
-        let out = temp_dir("periph_none");
+        let (_out_guard, out) = temp_dir("periph_none");
         let mut args = direct_args("plain_target", out);
         args.params = vec![CParameter {
             name: "data".to_owned(),
@@ -8968,7 +8987,7 @@ mod tests {
     #[test]
     fn direct_harness_writes_its_argument_layout() {
         use crate::arg_layout::{ArgLayout, LayoutStep};
-        let out = temp_dir("arg_layout_c");
+        let (_out_guard, out) = temp_dir("arg_layout_c");
         let defs = c_parser::parse_c_type_defs(
             "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n",
         )
@@ -9030,7 +9049,7 @@ mod tests {
 
     #[test]
     fn a_buffer_length_pair_is_recorded_as_paired_in_the_layout() {
-        let out = temp_dir("arg_layout_pair");
+        let (_out_guard, out) = temp_dir("arg_layout_pair");
         let mut args = direct_args("parse_record", out.clone());
         args.params = vec![
             CParameter {
@@ -9069,7 +9088,7 @@ mod tests {
         // bhf_c_format_string (which strips `%`), NOT bhf_c_string — the harness
         // passes no matching varargs, so a fuzzed `%s` would crash vfprintf (a
         // harness format/argument mismatch FALSE POSITIVE).
-        let out = temp_dir("vararg_fmt");
+        let (_out_guard, out) = temp_dir("vararg_fmt");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9118,7 +9137,7 @@ mod tests {
         // string. Decoded as a random bhf_c_string it ENOENTs and the parser never
         // runs (hollow false-clean). Route it through the tempfile content decoder so
         // the file's CONTENT is the fuzz input.
-        let out = temp_dir("loadfile_path");
+        let (_out_guard, out) = temp_dir("loadfile_path");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9163,7 +9182,7 @@ mod tests {
         // (`bytes[(*p)++]`). Fuzzing `*p` full-range against the Size-bounded buffer
         // is a guaranteed heap-OOB on short/0-byte input. The index storage must be
         // pinned to 0 (the caller's seed), not a fuzzed value.
-        let out = temp_dir("idx_ptr");
+        let (_out_guard, out) = temp_dir("idx_ptr");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9214,7 +9233,7 @@ mod tests {
         // the NEW live pointer). Freeing the stale `s` param after the realloc is a
         // UAF/double-free. The harness must free the RETURN value via the known
         // destructor and SUPPRESS the consumed param's free.
-        let out = temp_dir("sds_builder");
+        let (_out_guard, out) = temp_dir("sds_builder");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9278,7 +9297,7 @@ mod tests {
         // redis `sdsnewlen(const void *, size_t) -> sds` returns a fresh handle
         // with a known lifecycle destructor. Even though it does not consume an
         // existing sds param, dropping R leaks on every successful input.
-        let out = temp_dir("sds_ctor_return");
+        let (_out_guard, out) = temp_dir("sds_ctor_return");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9332,7 +9351,7 @@ mod tests {
         // capture `<IncompleteType> R = ...;` is rejected by the compiler. The
         // generator must skip it with a precise UnsupportedParamType reason instead
         // of emitting an uncompilable harness.
-        let out = temp_dir("incomplete_ret");
+        let (_out_guard, out) = temp_dir("incomplete_ret");
         let type_defs = vec![c_parser::CTypeDefs {
             structs: vec![c_parser::CStructDef {
                 name: "stb_cfg_st".to_owned(),
@@ -9387,7 +9406,7 @@ mod tests {
         // The guard must NOT skip a target returning a POINTER to an incomplete
         // type (stb's typical `stb_cfg *stb_new_cfg(...)`) — a pointer to an
         // incomplete type is a legal local declaration.
-        let out = temp_dir("incomplete_ret_ptr");
+        let (_out_guard, out) = temp_dir("incomplete_ret_ptr");
         let type_defs = vec![c_parser::CTypeDefs {
             structs: vec![c_parser::CStructDef {
                 name: "stb_cfg_st".to_owned(),
@@ -9437,7 +9456,7 @@ mod tests {
         // A fixed-arity function's trailing `const char *name` is an ordinary
         // string and must keep the plain bhf_c_string decoder (no over-trigger of
         // the variadic-format heuristic).
-        let out = temp_dir("plain_str");
+        let (_out_guard, out) = temp_dir("plain_str");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9479,7 +9498,7 @@ mod tests {
         // cJSON_CreateStringArray(const char *const *strings, int count): the array
         // and count must agree — allocate `count` strings, not one cursor + an
         // independently-fuzzed count (which over-reads strings[1..count]).
-        let out = temp_dir("strarr");
+        let (_out_guard, out) = temp_dir("strarr");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9603,7 +9622,9 @@ mod tests {
         // parameter, the const input buffer must be a NUL-terminated COPY.
         let defs = c_parser::parse_c_type_defs("typedef enum { OPT_NULLTERM, OPT_STABLE } opt_t;")
             .unwrap();
-        let mk = |with_enum: bool| {
+        let (_with_guard, with_dir) = temp_dir("nullterm");
+        let (_without_guard, without_dir) = temp_dir("nullterm");
+        let mk = |with_enum: bool, output_dir: PathBuf| {
             let mut params = vec![
                 CParameter {
                     name: "str".to_owned(),
@@ -9627,7 +9648,7 @@ mod tests {
                 lifecycle: Vec::new(),
                 drive_plan: None,
                 harness_id: "H-NT".to_owned(),
-                output_dir: temp_dir("nullterm"),
+                output_dir,
                 source_path: PathBuf::from("/tmp/u.c"),
                 target: cfunction("u_map"),
                 params,
@@ -9644,7 +9665,7 @@ mod tests {
         };
 
         // With the NULLTERM-mode enum: NUL-terminated copy, never raw `(...)Data`.
-        let with = generate_c_direct_harness(mk(true)).unwrap();
+        let with = generate_c_direct_harness(mk(true, with_dir.clone())).unwrap();
         let m = fs::read_to_string(&with.main_c).unwrap();
         assert!(
             m.contains("char *_bhf_ntbuf_str = (char *)malloc(_bhf_ntlen_str + 1)")
@@ -9659,7 +9680,7 @@ mod tests {
 
         // Without it (no NULLTERM-mode enum): keep the zero-copy, ASan-redzone-
         // backed raw span so real over-reads past the length are still caught.
-        let without = generate_c_direct_harness(mk(false)).unwrap();
+        let without = generate_c_direct_harness(mk(false, without_dir.clone())).unwrap();
         let m2 = fs::read_to_string(&without.main_c).unwrap();
         assert!(
             m2.contains("const char * str = (const char *)Data"),
@@ -9677,7 +9698,7 @@ mod tests {
         // if that TU has its own `int main` (tinyexpr repl.c), the harness driver's
         // `main` collides ("redefinition of 'main'"). The source include must be
         // wrapped so the TU's `main` is renamed; a plain .h include is not.
-        let out = temp_dir("tu-main");
+        let (_out_guard, out) = temp_dir("tu-main");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9730,7 +9751,7 @@ mod tests {
 
     #[test]
     fn rejects_command_injection_in_compile_flags() {
-        let out = temp_dir("inject-flag");
+        let (_out_guard, out) = temp_dir("inject-flag");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -9900,7 +9921,7 @@ mod tests {
 
     #[test]
     fn status_constructed_output_uses_delete_only_lifecycle_after_success() {
-        let out = temp_dir("status-output-cleanup");
+        let (_out_guard, out) = temp_dir("status-output-cleanup");
         let defs =
             c_parser::parse_c_type_defs("typedef struct { void *code; int flags; } regex_t;")
                 .unwrap();
@@ -9983,7 +10004,7 @@ mod tests {
         // A constructor returning an opaque handle (`plm_t *`) must, after
         // building the handle, pump the decode siblings so the deep decoder is
         // exercised, then destroy — all under one `if (R)` guard.
-        let out = temp_dir("drive");
+        let (_out_guard, out) = temp_dir("drive");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10068,7 +10089,7 @@ mod tests {
     fn byte_stream_decoder_emits_per_byte_loop() {
         // PX4 st24_decode(uint8_t byte, uint8_t *rssi, ...): the harness must feed
         // the whole input one byte at a time, not make a single fuzzed call.
-        let out = temp_dir("bytestream");
+        let (_out_guard, out) = temp_dir("bytestream");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10126,7 +10147,7 @@ mod tests {
 
     #[test]
     fn rejects_command_injection_in_source_path() {
-        let out = temp_dir("inject-src");
+        let (_out_guard, out) = temp_dir("inject-src");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10158,7 +10179,7 @@ mod tests {
 
     #[test]
     fn generate_c_direct_harness_emits_main_and_makefile() {
-        let out = temp_dir("emit");
+        let (_out_guard, out) = temp_dir("emit");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10296,7 +10317,7 @@ mod tests {
 
     #[test]
     fn build_context_link_flags_reach_every_c_link_line_not_the_compile_flags() {
-        let out = temp_dir("ldflags");
+        let (_out_guard, out) = temp_dir("ldflags");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10362,7 +10383,7 @@ mod tests {
         // ANGLED self-include (`#include <cwalk.h>`, a common `src/`+`include/`
         // convention) still resolves — searched AFTER the system dirs, so a real
         // system header of the same name still wins (no shadowing).
-        let out = temp_dir("iquote");
+        let (_out_guard, out) = temp_dir("iquote");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10415,7 +10436,7 @@ mod tests {
 
     #[test]
     fn generate_c_direct_harness_handles_void_return() {
-        let out = temp_dir("emit-void");
+        let (_out_guard, out) = temp_dir("emit-void");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10449,7 +10470,7 @@ mod tests {
 
     #[test]
     fn existing_libfuzzer_entrypoint_is_not_wrapped_recursively() {
-        let out = temp_dir("c-existing-libfuzzer");
+        let (_out_guard, out) = temp_dir("c-existing-libfuzzer");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10538,7 +10559,7 @@ mod tests {
 
     #[test]
     fn buffer_length_pair_emits_coherent_data_size_decoder() {
-        let out = temp_dir("emit-pair");
+        let (_out_guard, out) = temp_dir("emit-pair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10601,7 +10622,7 @@ mod tests {
         // walks `for (; start != end; start++)`. Two independent allocations make
         // that walk leave one heap block toward an unrelated address, which ASan
         // reports as a heap-buffer-overflow in correct library code.
-        let out = temp_dir("emit-begin-end");
+        let (_out_guard, out) = temp_dir("emit-begin-end");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10664,7 +10685,7 @@ mod tests {
     /// and the static decode gives what the trace prints.
     #[test]
     fn built_c_harness_traces_the_end_of_a_sliced_begin_end_pair() {
-        let Some(out) = build_c_harness(
+        let Some((_out_guard, out)) = build_c_harness(
             "match_span",
             &[
                 ("begin", "const char *"),
@@ -10713,7 +10734,7 @@ mod tests {
         // `Data` span, so the parser read past the end — a systematic ASan
         // heap-buffer-overflow FALSE POSITIVE). Instead the string must use the
         // NUL-terminating `bhf_c_string` decoder and `error` an out-param scratch.
-        let out = temp_dir("emit-cstring-outparam");
+        let (_out_guard, out) = temp_dir("emit-cstring-outparam");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10776,7 +10797,7 @@ mod tests {
         // Size, so a %s-print of `file` ran off the end (heap-buffer-overflow
         // FALSE POSITIVE). Neither name is buffer- nor length-shaped, so both
         // must use the standalone NUL-terminating string + scalar decoders.
-        let out = temp_dir("emit-file-line-nopair");
+        let (_out_guard, out) = temp_dir("emit-file-line-nopair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10841,7 +10862,7 @@ mod tests {
         // `srclen` count-shaped, a genuine (buffer, length) pair — it must STILL
         // bind to (Data, Size) so the callee reads exactly the input span (the
         // name-gate must not over-correct and break real pairs).
-        let out = temp_dir("emit-src-srclen-pair");
+        let (_out_guard, out) = temp_dir("emit-src-srclen-pair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10890,7 +10911,7 @@ mod tests {
         // (`void const*`) must pair like West-const so `size` mirrors `Size`. Without
         // this, `size` was an INDEPENDENT bhf_bounded_length and the callee read far
         // past the real buffer — a spurious OOB (id3tag read 16k from a 23-byte input).
-        let out = temp_dir("emit-east-const");
+        let (_out_guard, out) = temp_dir("emit-east-const");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10940,7 +10961,7 @@ mod tests {
         // bound to the actual buffer size; an independent fuzzed `*pSource_len`
         // larger than the buffer drove a spurious heap-buffer-overflow in miniz's
         // tinfl_decompress (the harness lied about the source length).
-        let out = temp_dir("emit-inbuf-lenptr");
+        let (_out_guard, out) = temp_dir("emit-inbuf-lenptr");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -10992,7 +11013,7 @@ mod tests {
         // BrotliDecoderDecompressStream shape. Both count/cursor pairs must share
         // real storage boundaries; independent scalar and pointer decoders would
         // manufacture an overread or overwrite in the harness itself.
-        let out = temp_dir("emit-stream-cursors");
+        let (_out_guard, out) = temp_dir("emit-stream-cursors");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11066,7 +11087,7 @@ mod tests {
         // `out` was a single stack float while `element_size` was fuzzed huge -> a
         // spurious stack-buffer-overflow. The registry-aware count check must pair
         // them so `out` is calloc'd to `element_size` elements.
-        let work = temp_dir("emit-typed-array-typedef-count");
+        let (_work_guard, work) = temp_dir("emit-typed-array-typedef-count");
         let header_source = r#"
             #include <stddef.h>
             typedef float cgltf_float;
@@ -11128,7 +11149,7 @@ mod tests {
         // parse(data, size, T **out) entry harnesses at all — previously the `T **`
         // was rejected as not-drivable and the whole parser was skipped. `cgltf_size`
         // (a size_t typedef) must also be recognized so (data, size) pairs.
-        let work = temp_dir("emit-dptr-handle");
+        let (_work_guard, work) = temp_dir("emit-dptr-handle");
         let header_source = r#"
             #include <stddef.h>
             typedef size_t cgltf_size;
@@ -11199,7 +11220,7 @@ mod tests {
         // bytes made cgltf allocate ~55 GB (CWE-789) before parsing a byte — a
         // harness artifact, not a target bug. Beside a (data, size) buffer the
         // config struct must be a zeroed default (library behaviour), NOT fuzzed.
-        let work = temp_dir("emit-cfg-zero");
+        let (_work_guard, work) = temp_dir("emit-cfg-zero");
         let header_source = r#"
             #include <stddef.h>
             typedef size_t cgltf_size;
@@ -11268,7 +11289,7 @@ mod tests {
         // free the handle after the call — otherwise every valid input that parses
         // successfully leaks the result, a CWE-401 false positive on the canonical
         // parser shape.
-        let work = temp_dir("emit-out-handle-free");
+        let (_work_guard, work) = temp_dir("emit-out-handle-free");
         let header_source = r#"
             #include <stddef.h>
             typedef size_t cgltf_size;
@@ -11338,7 +11359,7 @@ mod tests {
         // "finding" of hands-off libde265/cgltf runs. The pair must allocate
         // `count` elements so array and length agree. (`int *` element so the
         // registry resolves it to a non-byte scalar without a struct def.)
-        let out = temp_dir("emit-typed-array");
+        let (_out_guard, out) = temp_dir("emit-typed-array");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11629,7 +11650,7 @@ mod tests {
         // `(int *out, int flags)` — the second int is a bitmap, not a count, so the
         // typed-array pairing must NOT fire (no `_bhf_n_out`); the params fall to the
         // standalone decoders.
-        let out = temp_dir("emit-no-mispair");
+        let (_out_guard, out) = temp_dir("emit-no-mispair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11674,7 +11695,7 @@ mod tests {
         // The non-const buffer must NOT alias libFuzzer's const `Data` — writing
         // to it aborts the run ("fuzz target overwrites its const input"). It
         // gets a writable, fuzz-seeded allocation that is freed.
-        let out = temp_dir("emit-out-buf");
+        let (_out_guard, out) = temp_dir("emit-out-buf");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11733,7 +11754,7 @@ mod tests {
 
     #[test]
     fn buffer_with_non_length_neighbor_falls_back_to_individual_decoders() {
-        let out = temp_dir("emit-no-pair");
+        let (_out_guard, out) = temp_dir("emit-no-pair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11779,7 +11800,7 @@ mod tests {
 
     #[test]
     fn zlib_style_output_and_input_buffers_are_supported() {
-        let out = temp_dir("emit-zlib-compress");
+        let (_out_guard, out) = temp_dir("emit-zlib-compress");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11854,7 +11875,7 @@ mod tests {
 
     #[test]
     fn reverse_size_buffer_pairs_match_brotli_one_shot_contract() {
-        let out = temp_dir("emit-brotli-decompress");
+        let (_out_guard, out) = temp_dir("emit-brotli-decompress");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -11923,7 +11944,7 @@ mod tests {
 
     #[test]
     fn scalar_output_capacity_does_not_consume_input_buffer_pair() {
-        let out = temp_dir("emit-output-capacity-and-input-pair");
+        let (_out_guard, out) = temp_dir("emit-output-capacity-and-input-pair");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -12025,7 +12046,7 @@ mod tests {
 
     #[test]
     fn buffer_length_pair_uses_registry_for_const_byte_typedefs() {
-        let work = temp_dir("emit-byte-typedef-pair");
+        let (_work_guard, work) = temp_dir("emit-byte-typedef-pair");
         let header_source = r#"
             #include <stddef.h>
             typedef unsigned char mz_uint8;
@@ -12093,7 +12114,7 @@ mod tests {
 
     #[test]
     fn generate_c_direct_harness_drives_file_pointer_with_fmemopen() {
-        let work = temp_dir("emit-file-pointer");
+        let (_work_guard, work) = temp_dir("emit-file-pointer");
         let header = work.join("target.h");
         let header_source = r#"
             #include <stdio.h>
@@ -12178,7 +12199,7 @@ mod tests {
             eprintln!("skipping stream round trip: clang not on PATH");
             return;
         }
-        let work = temp_dir("fmemopen-round-trip");
+        let (_work_guard, work) = temp_dir("fmemopen-round-trip");
         let source = work.join("stream.c");
         fs::write(
             &source,
@@ -12224,7 +12245,7 @@ int main(void) {
 
     #[test]
     fn generate_c_direct_harness_drives_miniz_file_macro_pointer() {
-        let work = temp_dir("emit-mz-file-pointer");
+        let (_work_guard, work) = temp_dir("emit-mz-file-pointer");
         let header = work.join("target.h");
         let header_source = r#"
             #include <stdio.h>
@@ -12300,7 +12321,7 @@ int main(void) {
 
     #[test]
     fn generate_c_direct_harness_drives_standalone_void_pointer() {
-        let work = temp_dir("emit-void-pointer");
+        let (_work_guard, work) = temp_dir("emit-void-pointer");
         let header = work.join("target.h");
         let header_source = r#"
             int parse_opaque(void *opaque);
@@ -12440,7 +12461,7 @@ int main(void) {
 
     #[test]
     fn generate_c_direct_harness_emits_callback_trampoline() {
-        let work = temp_dir("emit-callback");
+        let (_work_guard, work) = temp_dir("emit-callback");
         let header = work.join("target.h");
         let header_source = r#"
             typedef int (*visit_cb)(void *opaque, const char *name);
@@ -12526,7 +12547,7 @@ int main(void) {
         // though the target's header is included (`target_declared_in_header:
         // true`). Previously the typedef was stripped as "redundant", leaving
         // `_bhf_cb_process_output` undeclared (failed_build).
-        let work = temp_dir("emit-inline-callback");
+        let (_work_guard, work) = temp_dir("emit-inline-callback");
         let header = work.join("target.h");
         let header_source = r#"
             int md_html(const char* input, unsigned input_size,
@@ -12626,7 +12647,7 @@ int main(void) {
         params: Vec<CParameter>,
         expect_substrings: &[&str],
     ) {
-        let work = temp_dir(case);
+        let (_work_guard, work) = temp_dir(case);
         let header = work.join("target.h");
         fs::write(&header, header_source).unwrap();
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
@@ -12769,7 +12790,7 @@ int main(void) {
         // funcptr declarator (`void * (*alloc_func_ptr)(void = calloc(...)`) — a
         // syntax error that failed the build. It must instead synthesize a typedef
         // + a no-op trampoline returning NULL and pass that as a single argument.
-        let work = temp_dir("emit-ptr-ret-funcptr");
+        let (_work_guard, work) = temp_dir("emit-ptr-ret-funcptr");
         let header = work.join("target.h");
         let header_source = r#"
             void *json_parse_ex(const void *src, unsigned src_size,
@@ -12893,7 +12914,7 @@ int main(void) {
 
     #[test]
     fn generate_c_direct_harness_rejects_unsupported_param_type() {
-        let out = temp_dir("emit-unsupported");
+        let (_out_guard, out) = temp_dir("emit-unsupported");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -12929,7 +12950,7 @@ int main(void) {
         // proves is skipped WITHOUT force. Under `force: true` the parameter gets
         // a best-effort compiling driver, so the target is harnessed instead of
         // erroring out `unsupported_params`.
-        let out = temp_dir("emit-force-opaque");
+        let (_out_guard, out) = temp_dir("emit-force-opaque");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -12981,7 +13002,7 @@ int main(void) {
             eprintln!("skip: clang unavailable");
             return;
         }
-        let out = temp_dir("emit-force-tag-scope");
+        let (_out_guard, out) = temp_dir("emit-force-tag-scope");
         let mut args = direct_args("widget_feed", out.clone());
         args.force = true;
         args.params = vec![
@@ -13068,7 +13089,7 @@ int main(void) {
         // constructor is in-place (not a returning constructor), there is nothing to
         // synthesize, so the target is cleanly SKIPPED (UnsupportedParamType) instead
         // of emitting un-compilable code that fails the build.
-        let out = temp_dir("emit-lifecycle-incomplete");
+        let (_out_guard, out) = temp_dir("emit-lifecycle-incomplete");
         let args = GenerateCDirectArgs {
             environment: None,
             decoder_limits: Default::default(),
@@ -13126,7 +13147,7 @@ int main(void) {
         // struct resolves to a concrete shape and is driven through field synthesis;
         // the point of this guard is that a header-complete lifecycle target still
         // produces a buildable harness rather than a spurious skip.)
-        let work = temp_dir("emit-lifecycle-complete");
+        let (_work_guard, work) = temp_dir("emit-lifecycle-complete");
         let header = work.join("box.h");
         let header_source = r#"
             #include <stddef.h>
@@ -13212,7 +13233,7 @@ int main(void) {
         // `gizmo_t *gizmo_new(void)` returns the opaque handle; the harness must
         // build it from the return value, pass it by value, and free it
         // directly — then compile cleanly against the header.
-        let work = temp_dir("emit-lifecycle-returning");
+        let (_work_guard, work) = temp_dir("emit-lifecycle-returning");
         let header = work.join("gizmo.h");
         fs::write(
             &header,
@@ -13322,7 +13343,7 @@ int main(void) {
 
     #[test]
     fn generate_c_direct_harness_compiles_struct_enum_array_decoder() {
-        let work = temp_dir("emit-struct-compile");
+        let (_work_guard, work) = temp_dir("emit-struct-compile");
         let header = work.join("target.h");
         let header_source = r#"
             #include <stddef.h>
@@ -13427,7 +13448,7 @@ int main(void) {
 
     #[test]
     fn mined_protocol_keeps_stream_then_finalize_calls_and_safe_literals() {
-        let out = temp_dir("seq-mined-protocol");
+        let (_out_guard, out) = temp_dir("seq-mined-protocol");
         let parse_step = CLifecycleStep {
             name: "XML_Parse".to_owned(),
             params: vec![
@@ -13675,7 +13696,7 @@ int main(void) {
         // stream is NULL, so an unconditional op-loop + teardown fclose(NULL)s ->
         // SEGV, and a self-closed handle double-frees. The op-loop AND the end-step
         // teardown must run only when the constructor succeeded (status == 0).
-        let out = temp_dir("seq-guard");
+        let (_out_guard, out) = temp_dir("seq-guard");
         let header_source = r#"
             typedef struct mtar_t { void *stream; int pos; } mtar_t;
             int mtar_open(mtar_t *tar, const char *filename, const char *mode);
@@ -13781,7 +13802,7 @@ int main(void) {
         // performs that step only by luck, so most executions never reach the
         // code the target exists to run. Measured on expat, installing handlers
         // was worth +323 library lines.
-        let out = temp_dir("seq-config");
+        let (_out_guard, out) = temp_dir("seq-config");
         let header_source = r#"
             typedef struct arc { int fmt; } arc;
             typedef void (*arc_handler)(void *opaque);
@@ -13936,7 +13957,7 @@ int main(void) {
 
     #[test]
     fn libarchive_memory_reader_uses_the_expert_nested_drain_protocol() {
-        let out = temp_dir("seq-libarchive-pump");
+        let (_out_guard, out) = temp_dir("seq-libarchive-pump");
         let header_source = r#"
             struct archive;
             struct archive_entry;
@@ -14140,7 +14161,7 @@ int main(void) {
         // reachable only through that child. In the ablation this was worth +594
         // library lines on expat — more than any other single technique — and
         // without it the harness only ever drives the object it constructed.
-        let out = temp_dir("seq-derived");
+        let (_out_guard, out) = temp_dir("seq-derived");
         let header_source = r#"
             typedef struct parser { int depth; } parser;
             int parser_init(parser *p);
@@ -14246,7 +14267,7 @@ int main(void) {
         // index bugs need the sequence to CONSUME a value it produced. With every
         // argument decoded fresh from the input, that whole class is unreachable
         // by construction.
-        let out = temp_dir("seq-thread");
+        let (_out_guard, out) = temp_dir("seq-thread");
         let header_source = r#"
             typedef struct pool { int n; } pool;
             typedef unsigned long pool_id;
@@ -14351,7 +14372,7 @@ int main(void) {
         // Keeping it as an op — gated on liveness — reaches close/reopen and
         // re-init-over-live-state without ever driving an ordinary op on a
         // closed handle, which would be API misuse rather than a library bug.
-        let out = temp_dir("seq-cycle");
+        let (_out_guard, out) = temp_dir("seq-cycle");
         let header_source = r#"
             typedef struct arc { void *stream; int pos; } arc;
             int arc_new(arc *a);
@@ -14449,7 +14470,7 @@ int main(void) {
 
     #[test]
     fn generate_c_sequence_harness_emits_init_loop_and_end() {
-        let work = temp_dir("emit-c-sequence");
+        let (_work_guard, work) = temp_dir("emit-c-sequence");
         let header = work.join("session.h");
         let source = work.join("session.c");
         let header_source = r#"
@@ -14582,7 +14603,7 @@ int main(void) {
 
     #[test]
     fn returning_opaque_handle_sequence_constructs_drives_and_destroys_values() {
-        let work = temp_dir("emit-c-returning-sequence");
+        let (_work_guard, work) = temp_dir("emit-c-returning-sequence");
         let header = work.join("parser.h");
         let header_source = r#"
             typedef struct parser_impl *parser_t;
@@ -14700,7 +14721,7 @@ int main(void) {
 
     #[test]
     fn out_parameter_handle_sequence_opens_drives_and_closes_pointer_value() {
-        let work = temp_dir("emit-c-out-handle-sequence");
+        let (_work_guard, work) = temp_dir("emit-c-out-handle-sequence");
         let header = work.join("db.h");
         let header_source = r#"
             #include <stddef.h>
@@ -14811,7 +14832,7 @@ int main(void) {
 
     #[test]
     fn jpeg_header_reader_uses_public_error_and_scanline_protocol() {
-        let work = temp_dir("emit-c-jpeg-sequence");
+        let (_work_guard, work) = temp_dir("emit-c-jpeg-sequence");
         let header = work.join("jpeglib.h");
         let header_source = r#"
             #include <stddef.h>
@@ -14957,7 +14978,7 @@ int main(void) {
 
     #[test]
     fn sqlite_prepare_uses_nul_terminated_multi_statement_vm_protocol() {
-        let work = temp_dir("emit-c-sqlite-sequence");
+        let (_work_guard, work) = temp_dir("emit-c-sqlite-sequence");
         // The canonical repository target is declared through sqliteInt.h;
         // installed consumers use sqlite3.h. Exercise the source-tree spelling
         // that the real auto-harness selection sees.
@@ -15081,7 +15102,7 @@ int main(void) {
         // the harness does not include. Stack-allocating `struct hashmap _bhf_handle;`
         // is an illegal incomplete-type declaration, so the sequence harness must be
         // SKIPPED (UnsupportedParamType) rather than emit code that fails the build.
-        let work = temp_dir("emit-c-sequence-incomplete");
+        let (_work_guard, work) = temp_dir("emit-c-sequence-incomplete");
         let header = work.join("map.h");
         let header_source = r#"
             struct hashmap;
@@ -15143,7 +15164,7 @@ int main(void) {
 
     #[test]
     fn generate_c_sequence_harness_skips_unsupported_secondary_ops() {
-        let work = temp_dir("emit-c-sequence-skip-op");
+        let (_work_guard, work) = temp_dir("emit-c-sequence-skip-op");
         let header = work.join("session.h");
         let header_source = r#"
             struct session { int seed; int total; };

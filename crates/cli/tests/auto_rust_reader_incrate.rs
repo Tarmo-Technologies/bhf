@@ -11,6 +11,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -109,8 +113,8 @@ fn reader_trait_method_builds_fuzzes_and_finds_planted_crash() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-reader-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("reader");
+    let tmp = tmp_guard.join("tmp");
     let (combined, json) = run_auto(&fixture("rust_reader_trait"), &tmp, "8", "4");
 
     // The reader-trait methods built+fuzzed through the synthesised Cursor receiver.
@@ -163,8 +167,8 @@ fn private_module_target_builds_and_fuzzes_in_crate() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-incrate-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("incrate");
+    let tmp = tmp_guard.join("tmp");
     let (combined, json) = run_auto(&fixture("rust_incrate"), &tmp, "12", "4");
 
     assert!(

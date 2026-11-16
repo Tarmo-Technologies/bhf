@@ -12,6 +12,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have(tool: &str) -> bool {
     Command::new(tool)
         .arg("--version")
@@ -20,15 +24,8 @@ fn have(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn tempdir(name: &str) -> std::path::PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-diff-e2e-{name}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir(name: &str) -> TestDir {
+    TestDir::new(&format!("diff-e2e-{name}"))
 }
 
 /// Read every finding.json under `<work>/results/findings/` and return the parsed values.
@@ -114,7 +111,8 @@ fn auto_differential_accepts_a_compiler_path_with_spaces() {
         eprintln!("skip: gcc not on PATH");
         return;
     };
-    let tools = tempdir("tools").join("gnu tools");
+    let tools_root = tempdir("tools");
+    let tools = tools_root.join("gnu tools");
     std::fs::create_dir_all(&tools).unwrap();
     let spaced_gcc = tools.join("gcc");
     std::os::unix::fs::symlink(&gcc, &spaced_gcc).unwrap();

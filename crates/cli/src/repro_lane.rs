@@ -1446,15 +1446,19 @@ pub(crate) fn lane_for(tag: &str) -> Option<&'static dyn Lane> {
 /// error class (`stack-buffer-overflow`, `heap-use-after-free`, `SEGV`, …) or a
 /// UBSan `runtime error`. `None` when the replay did not crash.
 pub(crate) fn sanitizer_signature(stderr: &str, status: &ExitStatus) -> Option<String> {
-    // ASan: `==NN==ERROR: AddressSanitizer: <class> on/at ...`
-    if let Some(pos) = stderr.find("AddressSanitizer: ") {
-        let rest = &stderr[pos + "AddressSanitizer: ".len()..];
-        let class: String = rest
-            .split(|c: char| c.is_whitespace())
-            .next()
-            .unwrap_or("")
-            .to_owned();
-        if !class.is_empty() {
+    // The class is on the report's `ERROR:` line, never the `SUMMARY:` line
+    // after it: a leak's summary is `AddressSanitizer: <bytes> byte(s)
+    // leaked`, whose first word is a byte count.
+    if stderr.contains("ERROR: LeakSanitizer:") {
+        return Some("LeakSanitizer:memory-leak".to_owned());
+    }
+    // ASan: `==NN==ERROR: AddressSanitizer: <class> on/at ...`. A class ASan
+    // names with a phrase (`attempting double-free`, `out of memory`) takes
+    // the name its summary gives it, and the colon after a class such as
+    // `memcpy-param-overlap:` is not part of it.
+    const ASAN_ERROR: &str = "ERROR: AddressSanitizer:";
+    if let Some(pos) = stderr.find(ASAN_ERROR) {
+        if let Some(class) = corpus::sanitizer::asan_kind(&stderr[pos + ASAN_ERROR.len()..]) {
             return Some(format!("AddressSanitizer:{class}"));
         }
     }
@@ -1466,6 +1470,32 @@ pub(crate) fn sanitizer_signature(stderr: &str, status: &ExitStatus) -> Option<S
         return Some("signal:crash".to_owned());
     }
     None
+}
+
+/// Whether `earlier`, a signature an earlier bhf release recorded in a
+/// capsule, names the class `now` names. Earlier releases took the first word
+/// after `AddressSanitizer: ` anywhere in the output: a leak's byte count from
+/// its summary line, a class with its trailing colon, or the first word of a
+/// class ASan names with a phrase (`attempting`, `out`, `calloc`).
+pub(crate) fn is_earlier_signature(earlier: &str, now: &str) -> bool {
+    let Some(old) = earlier.strip_prefix("AddressSanitizer:") else {
+        return false;
+    };
+    if !old.is_empty() && old.bytes().all(|b| b.is_ascii_digit()) {
+        return now == "LeakSanitizer:memory-leak";
+    }
+    let Some(new) = now.strip_prefix("AddressSanitizer:") else {
+        return false;
+    };
+    if old.strip_suffix(':') == Some(new) {
+        return true;
+    }
+    if old == "attempting" {
+        return matches!(new, "double-free" | "free");
+    }
+    corpus::sanitizer::ASAN_PHRASE_KINDS
+        .iter()
+        .any(|(phrase, kind)| *kind == new && phrase.split_whitespace().next() == Some(old))
 }
 
 /// The signature of a finding a language runtime's driver reported (`== bhf
@@ -4263,6 +4293,126 @@ mod tests {
             env.get(std::ffi::OsStr::new("ASAN_OPTIONS")),
             Some(&std::ffi::OsStr::new("abort_on_error=1:handle_abort=1"))
         );
+    }
+
+    /// A LeakSanitizer report as clang 18 prints it for a `leak_record(n)`
+    /// that leaked `n` bytes (paths shortened).
+    fn leak_report(bytes: usize) -> String {
+        format!(
+            "\n=================================================================\n\
+             ==546950==ERROR: LeakSanitizer: detected memory leaks\n\
+             \n\
+             Direct leak of {bytes} byte(s) in 1 object(s) allocated from:\n\
+             \x20   #0 0x5e052deae1b3 in malloc (/src/widget/records+0xc71b3)\n\
+             \x20   #1 0x5e052deece24 in leak_record /src/widget/records.c:15:48\n\
+             \x20   #2 0x5e052deecc18 in parse_record /src/widget/records.c:35:30\n\
+             \n\
+             SUMMARY: AddressSanitizer: {bytes} byte(s) leaked in 1 allocation(s).\n"
+        )
+    }
+
+    /// A leak's class is on its `ERROR: LeakSanitizer:` line, not in the
+    /// `SUMMARY: AddressSanitizer: <bytes> byte(s) leaked` line after it: two
+    /// leaks of different sizes are the same class.
+    #[test]
+    fn leak_signature_is_read_from_the_error_line() {
+        let three = sanitizer_signature(&leak_report(3), &ok_status());
+        let twenty = sanitizer_signature(&leak_report(20), &ok_status());
+        assert_eq!(three.as_deref(), Some("LeakSanitizer:memory-leak"));
+        assert_eq!(three, twenty);
+        // The finding's stored message is the ERROR line alone.
+        assert_eq!(
+            sanitizer_signature(
+                "ERROR: LeakSanitizer: detected memory leaks",
+                &failed_status().unwrap()
+            )
+            .as_deref(),
+            Some("LeakSanitizer:memory-leak")
+        );
+    }
+
+    /// The class on the `ERROR:` line, without the colon that follows it in a
+    /// copy-overlap report, and with the name ASan's summary gives a class it
+    /// names with a phrase.
+    #[test]
+    fn param_overlap_signature_has_no_trailing_colon() {
+        let overlap = "=================================================================\n\
+            ==546767==ERROR: AddressSanitizer: memcpy-param-overlap: memory ranges [0x7e6395200030,0x7e639520003a) and [0x7e6395200032, 0x7e639520003c) overlap\n\
+            \x20   #0 0x5ee08a4a7ee4 in __asan_memcpy (/src/widget/records+0xc4ee4)\n\
+            \x20   #1 0x5ee08a4e8d7c in shift_buffer /src/widget/records.c:11:59\n\
+            SUMMARY: AddressSanitizer: memcpy-param-overlap (/src/widget/records+0xc4ee4)\n";
+        assert_eq!(
+            sanitizer_signature(overlap, &ok_status()).as_deref(),
+            Some("AddressSanitizer:memcpy-param-overlap")
+        );
+        let double_free = "==1==ERROR: AddressSanitizer: attempting double-free on 0x602000000010 in thread T0:\n\
+            SUMMARY: AddressSanitizer: double-free (/src/widget/records+0xc71b3) in free\n";
+        assert_eq!(
+            sanitizer_signature(double_free, &ok_status()).as_deref(),
+            Some("AddressSanitizer:double-free")
+        );
+        let oom = "==546834==ERROR: AddressSanitizer: out of memory: allocator is trying to allocate 0x8000000000 bytes\n\
+            SUMMARY: AddressSanitizer: out-of-memory (/src/widget/records+0xc71b3)\n";
+        assert_eq!(
+            sanitizer_signature(oom, &ok_status()).as_deref(),
+            Some("AddressSanitizer:out-of-memory")
+        );
+        // A SUMMARY line alone names no class.
+        assert_eq!(
+            sanitizer_signature(
+                "SUMMARY: AddressSanitizer: 3 byte(s) leaked in 1 allocation(s).\n",
+                &ok_status()
+            ),
+            None
+        );
+    }
+
+    /// A capsule an earlier release packaged recorded the signature it read
+    /// then: a leak's byte count, a class with its colon, the first word of a
+    /// phrase. Each still names the class the replay shows now.
+    #[test]
+    fn earlier_signatures_name_the_same_class() {
+        for (earlier, now) in [
+            ("AddressSanitizer:3", "LeakSanitizer:memory-leak"),
+            ("AddressSanitizer:20", "LeakSanitizer:memory-leak"),
+            (
+                "AddressSanitizer:memcpy-param-overlap:",
+                "AddressSanitizer:memcpy-param-overlap",
+            ),
+            (
+                "AddressSanitizer:attempting",
+                "AddressSanitizer:double-free",
+            ),
+            ("AddressSanitizer:out", "AddressSanitizer:out-of-memory"),
+            (
+                "AddressSanitizer:calloc",
+                "AddressSanitizer:calloc-overflow",
+            ),
+            (
+                "AddressSanitizer:requested",
+                "AddressSanitizer:allocation-size-too-big",
+            ),
+        ] {
+            assert!(is_earlier_signature(earlier, now), "{earlier} ~ {now}");
+        }
+        for (earlier, now) in [
+            (
+                "AddressSanitizer:3",
+                "AddressSanitizer:heap-buffer-overflow",
+            ),
+            (
+                "AddressSanitizer:heap-buffer-overflow",
+                "AddressSanitizer:double-free",
+            ),
+            ("AddressSanitizer:out", "AddressSanitizer:calloc-overflow"),
+            ("AddressSanitizer:x", "LeakSanitizer:memory-leak"),
+            (
+                "UndefinedBehaviorSanitizer:runtime-error",
+                "AddressSanitizer:FPE",
+            ),
+        ] {
+            assert!(!is_earlier_signature(earlier, now), "{earlier} !~ {now}");
+        }
     }
 
     #[test]

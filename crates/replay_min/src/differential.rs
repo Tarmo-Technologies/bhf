@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn differential_runner_executes_two_harnesses_and_reports_mismatch() {
-        let root = temp_dir("runner-mismatch");
+        let (_root_guard, root) = temp_dir("runner-mismatch");
         let left_path = compile_line_harness(&root, "left", 9);
         let right_path = compile_line_harness(&root, "right", 10);
 
@@ -227,13 +227,20 @@ fn push_string(bytes: &mut Vec<u8>, value: &str) {{
         harness_path
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time is after unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bhf-differential-{name}-{nonce}"));
+        // Removed when this scope ends.
+        let dir_tmp = tempfile::Builder::new()
+            .prefix("bhf-")
+            .tempdir()
+            .expect("create test dir");
+        let dir = dir_tmp
+            .path()
+            .join(format!("bhf-differential-{name}-{nonce}"));
         std::fs::create_dir_all(&dir).expect("temporary directory is created");
-        dir
+        (dir_tmp, dir)
     }
 }

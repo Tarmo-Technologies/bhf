@@ -22,6 +22,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/cpp_owner_tu")
@@ -48,16 +52,13 @@ fn a_target_in_a_non_self_contained_header_builds_via_its_owner_tu() {
 
     // Copy outside the repo: the fixture lives under `tests/`, which discovery
     // excludes as a non-library directory when it is not the scan root.
-    let src = std::env::temp_dir().join(format!("bhf_cpp_owner_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
-    std::fs::create_dir_all(&src).unwrap();
+    let src = TestDir::new("cpp_owner");
     for entry in std::fs::read_dir(fixture()).unwrap().flatten() {
         std::fs::copy(entry.path(), src.join(entry.file_name())).unwrap();
     }
-    let work = std::env::temp_dir().join(format!("bhf_cpp_owner_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    let seeds = std::env::temp_dir().join(format!("bhf_cpp_owner_s_{}", std::process::id()));
-    std::fs::create_dir_all(&seeds).unwrap();
+    let work_guard = TestDir::new("cpp_owner_w");
+    let work = work_guard.join("work");
+    let seeds = TestDir::new("cpp_owner_s");
     std::fs::write(seeds.join("trigger"), b"G\x00\x00\x00\x00\x00\x00\x00").unwrap();
 
     let out = Command::new(&bin)

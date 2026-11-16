@@ -81,7 +81,7 @@ impl RuntimeOracles {
             .map_err(|e| anyhow!("read runtrace shim {}: {e}", shim.display()))?;
         Ok(Self {
             ld_preload: shim_path::ld_preload_value(&shim),
-            shim_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            shim_sha256: corpus::hex_lower(&Sha256::digest(&bytes)),
             mode_label: mode_label.to_owned(),
         })
     }

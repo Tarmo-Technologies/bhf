@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 use cli::auto::tsan::run_tsan_replay;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 /// The racy target: two writes to one global, from two threads, with no
 /// happens-before between them.
 ///
@@ -47,7 +51,10 @@ const RACE_C: &str = "#include <pthread.h>\n\
      }\n";
 
 fn clang_has_tsan() -> bool {
-    let probe = std::env::temp_dir().join(format!("bhf-tsan-probe-{}", std::process::id()));
+    let Ok(probe_dir) = TestDir::try_new("tsan-probe") else {
+        return false;
+    };
+    let probe = probe_dir.join("probe");
     let probe_log = probe.with_extension("log");
     let ok = Command::new("clang")
         .args(["-fsanitize=thread", "-pthread", "-x", "c", "-", "-o"])
@@ -69,10 +76,7 @@ fn clang_has_tsan() -> bool {
     // high-entropy ASLR lets that probe exit but makes the runtime hang as soon
     // as instrumented threads touch shared state. Require the canonical race to
     // produce an actual report, with a short wall-clock bound.
-    let ok = ok && tsan_probe_reports_race(&probe, &probe_log);
-    let _ = std::fs::remove_file(&probe);
-    let _ = std::fs::remove_file(&probe_log);
-    ok
+    ok && tsan_probe_reports_race(&probe, &probe_log)
 }
 
 fn tsan_probe_reports_race(probe: &Path, log: &Path) -> bool {
@@ -154,9 +158,7 @@ fn the_fixture_race_is_reported_on_every_run() {
         eprintln!("skip: clang has no working ThreadSanitizer");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-tsan-every-run-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = TestDir::new("tsan-every-run");
     let source = tmp.join("race_main.c");
     std::fs::write(
         &source,
@@ -196,8 +198,8 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-tsan-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("tsan-e2e");
+    let tmp = tmp_guard.join("tmp");
     let work = tmp.join("work");
     let hdir = work.join("harnesses").join("H-C0001");
     let queue = work.join("corpus").join("H-C0001").join("queue");
@@ -360,8 +362,8 @@ fn a_race_tsan_misses_on_the_first_run_is_found_by_the_rerun() {
         eprintln!("skip: clang has no working ThreadSanitizer");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-tsan-rerun-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("tsan-rerun");
+    let tmp = tmp_guard.join("tmp");
     let work = tmp.join("work");
     let hdir = work.join("harnesses").join("H-C0001");
     let queue = work.join("corpus").join("H-C0001").join("queue");

@@ -871,7 +871,7 @@ fn short_digest(bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    corpus::hex_lower(&hasher.finalize())
         .chars()
         .take(16)
         .collect()

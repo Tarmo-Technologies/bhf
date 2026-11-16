@@ -520,7 +520,9 @@ mod tests {
     use super::*;
     use crate::executor::FnExecutor;
     use crate::finding::{FindingKind, RelationFinding};
-    use crate::observation::{EffectEvent, Observation, ProfileStatus, SemanticHit, SemanticVerdict};
+    use crate::observation::{
+        EffectEvent, Observation, ProfileStatus, SemanticHit, SemanticVerdict,
+    };
     use crate::predicate::{evaluate_one, Violation};
     use crate::schema::Profile;
 
@@ -857,7 +859,10 @@ name = "viewer"
     fn semantic_shape_key_separates_rule_and_verdict() {
         let none = {
             let mut m = BTreeMap::new();
-            m.insert("v".to_string(), Observation::ready("v", ProfileStatus::Allowed));
+            m.insert(
+                "v".to_string(),
+                Observation::ready("v", ProfileStatus::Allowed),
+            );
             m
         };
         let finding = {

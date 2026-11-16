@@ -9,6 +9,10 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn run_auto(root: &Path, work: &Path, extra: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bhf"));
     command
@@ -23,14 +27,8 @@ fn run_auto(root: &Path, work: &Path, extra: &[&str]) -> Output {
     command.output().expect("spawn bhf auto")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-resume-bctx-{tag}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("resume-bctx-{tag}"))
 }
 
 fn have_c_compiler() -> bool {

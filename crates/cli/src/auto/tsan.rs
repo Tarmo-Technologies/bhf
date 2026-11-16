@@ -474,9 +474,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn recovers_after_more_than_legacy_mapping_retry_streak() {
-        let tmp =
-            std::env::temp_dir().join(format!("bhf-tsan-mapping-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::test_support::TestDir::new("tsan-mapping-retry");
         let work = tmp.join("work");
         let hdir = work.join("harnesses").join("H-C0001");
         let queue = work.join("corpus").join("H-C0001").join("queue");
@@ -528,12 +526,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_reported_race_with_no_symbolized_frame_is_counted_not_dropped() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bhf-tsan-unsym-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::test_support::TestDir::new("tsan-unsym");
         let work = tmp.join("work");
         let hdir = work.join("harnesses").join("H-C0001");
         let queue = work.join("corpus").join("H-C0001").join("queue");
@@ -585,12 +578,7 @@ EOF\nexit 86\n",
         // dropped the input and returned a bare 0 — indistinguishable from
         // "ran fine, no race", which is a false clean on a target that was never
         // actually examined.
-        let tmp = std::env::temp_dir().join(format!(
-            "bhf-tsan-timeout-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::test_support::TestDir::new("tsan-timeout");
         let work = tmp.join("work");
         let hdir = work.join("harnesses").join("H-C0001");
         let queue = work.join("corpus").join("H-C0001").join("queue");
@@ -636,12 +624,7 @@ EOF\nexit 86\n",
     #[test]
     #[cfg(unix)]
     fn harness_timeout_budget_stops_the_remaining_corpus() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bhf-tsan-harness-timeout-budget-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = crate::test_support::TestDir::new("tsan-harness-timeout-budget");
         let work = tmp.join("work");
         let hdir = work.join("harnesses").join("H-C0001");
         let queue = work.join("corpus").join("H-C0001").join("queue");

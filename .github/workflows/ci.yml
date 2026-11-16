@@ -141,16 +141,21 @@ jobs:
       # covered by the dedicated `--doc` step below.
       # Per-PR gate = the ~5700 fast unit/light tests PLUS a small smoke subset of
       # the heavy build+fuzz integration tests (one representative per language +
-      # build-recovery + the runtime-oracle capability path). The FULL heavy suite
+      # build-recovery + the runtime-oracle capability path) PLUS the release and
+      # docs contract tests (m19_*, offline_dist_scripts, release_bundle_manifest
+      # and the guide checks), which take seconds; doc-contracts runs those for a
+      # documentation-only change. The FULL heavy suite
       # (~110 build+fuzz tests, ~40min) runs in integration-nightly.yml — running
       # all of it on every PR is what pushed this job past its timeout.
       # RAYON_NUM_THREADS=1 + the heavy-bhf concurrency cap (.config/nextest.toml)
       # keep the smoke tests from oversubscribing; --no-fail-fast matches
-      # `cargo test` (nextest is fail-fast by default).
+      # `cargo test` (nextest is fail-fast by default). The `ci` profile
+      # retries a failure once (a pass then is FLAKY), kills a test that runs
+      # past 16 minutes, and writes a JUnit report with every test's output.
       - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=project_build_consent) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
+        run: cargo nextest run --locked --workspace --no-fail-fast --profile ci -E 'not (package(bhf) & kind(test)) | binary(=project_build_consent) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash)) | binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/))'
 
       # #57 AC: the out-of-tree extension fixture must also be exercised by a
       # RELEASE-build integration test — the debug nextest above only covers it in
@@ -160,7 +165,7 @@ jobs:
       - name: Test extension e2e (release build)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --release --no-fail-fast -E 'binary(=extension_cli) | (package(extension_host) & kind(test))'
+        run: cargo nextest run --locked --release --no-fail-fast --profile ci-release -E 'binary(=extension_cli) | (package(extension_host) & kind(test))'
 
       - name: Test doctests
         run: cargo test --locked --workspace --doc
@@ -187,12 +192,74 @@ jobs:
           cargo check --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
           cargo test --locked -p bhf-daemon --features llm --lib
 
+      - name: Summarize the nextest reports
+        if: ${{ always() }}
+        run: python3 scripts/ci/junit-summary.py --title "build-test" target/nextest/ci/junit.xml target/nextest/ci-release/junit.xml
+
+      - name: Retain the nextest reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-build-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The release and docs contract tests read README.md, INSTALL.md and
+  # docs/site/*.md, which a documentation-only change can break. build-test
+  # runs them with everything else; this lane runs them when the classifier
+  # skipped the heavy jobs, and CI acceptance requires it to pass then.
+  doc-contracts:
+    name: Release and docs contract tests
+    needs: changes
+    if: needs.changes.outputs.heavy == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Test the release and docs contracts
+        env:
+          RAYON_NUM_THREADS: "1"
+        # Builds only the contract binaries (and the library tests), not
+        # every bhf integration test.
+        run: cargo nextest run --locked -p bhf --lib --test 'm19_*' --test offline_dist_scripts --test release_bundle_manifest --test custom_harness_flow --no-fail-fast --profile ci -E 'binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/)) | (kind(lib) & test(/::the_docs_list_every_config_key$|::the_help_and_docs_list_every_cross_lane$/))'
+
+      - name: Summarize the nextest report
+        if: ${{ always() }}
+        run: python3 scripts/ci/junit-summary.py --title "doc-contracts" target/nextest/ci/junit.xml
+
+      - name: Retain the nextest report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-doc-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
   container-core:
     name: Core container build and run
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Image blockers (a CVE published upstream since the change, as often as
+    # not) only annotate pull request and branch push runs; a release caller
+    # (force_full) or a tag run fails on them. See review-image-scan.py.
+    env:
+      BHF_IMAGE_SCAN_MODE: ${{ (inputs.force_full || github.ref_type == 'tag') && 'enforce' || 'auto' }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -219,6 +286,11 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Image blockers (a CVE published upstream since the change, as often as
+    # not) only annotate pull request and branch push runs; a release caller
+    # (force_full) or a tag run fails on them. See review-image-scan.py.
+    env:
+      BHF_IMAGE_SCAN_MODE: ${{ (inputs.force_full || github.ref_type == 'tag') && 'enforce' || 'auto' }}
     steps:
       - name: Checkout exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -614,6 +686,7 @@ jobs:
     needs:
       - changes
       - ci-policy
+      - doc-contracts
       - minimum-rust
       - build-test
       - container-core

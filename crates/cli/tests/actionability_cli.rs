@@ -4,7 +4,10 @@ use cli::run_from;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn fuzz_accepts_attacking_mode_and_stamps_findings() {
@@ -396,14 +399,8 @@ fn only_finding_dir(work_dir: &Path) -> PathBuf {
     findings[0].clone()
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-actionability-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("actionability-cli-{name}"))
 }
 
 fn write_stale_real_with_stubbed_dependency(dir: &Path) {
