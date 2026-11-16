@@ -3386,6 +3386,210 @@ fn is_excluded_dir(path: &Path, filter: &DirFilter) -> bool {
     false
 }
 
+/// What the default non-library filter leaves out of a walk of a tree: each
+/// directory it skips by name, relative to the root, with the number of
+/// targetable source files under it, and the number of test- or tool-named
+/// source files (`pngtest.c`, `test_foo.c`) it skips elsewhere.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DefaultSkips {
+    pub dirs: Vec<(String, usize)>,
+    pub files: usize,
+}
+
+/// [`DefaultSkips`] for `root` under `filter`: only directories it skips by
+/// name (the default set, or `--exclude-dir`), not build or VCS directories or
+/// the work dir. A directory-entry walk, bounded like the other censuses.
+pub fn default_skips(root: &Path, filter: &DirFilter) -> DefaultSkips {
+    const BUDGET: usize = 200_000;
+    let mut skips = DefaultSkips::default();
+    let mut seen = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            seen += 1;
+            if seen > BUDGET {
+                return skips;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if !is_excluded_dir(&path, filter) {
+                    stack.push(path);
+                } else if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| filter.skips(name))
+                {
+                    let files = count_targetable_files(&path, BUDGET);
+                    if files > 0 {
+                        let relative = path.strip_prefix(root).unwrap_or(&path);
+                        skips
+                            .dirs
+                            .push((relative.to_string_lossy().replace('\\', "/"), files));
+                    }
+                }
+            } else if file_type.is_file()
+                && has_targetable_extension_only(&path)
+                && is_test_or_tool_source_file(&path)
+            {
+                skips.files += 1;
+            }
+        }
+    }
+    skips.dirs.sort();
+    skips
+}
+
+/// Targetable source files under `dir`, at most `limit`.
+fn count_targetable_files(dir: &Path, limit: usize) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(t) if t.is_file() && has_targetable_extension_only(&entry.path()) => {
+                    count += 1;
+                    if count >= limit {
+                        return count;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
+/// Whether bhf auto, with no `--include-dir`, leaves `path` (under `root`)
+/// out of discovery, and why: a directory on the way named like non-library
+/// code, or a test- or tool-named file. `bhf list targets` labels such rows.
+pub(crate) fn default_skip_reason(root: &Path, path: &Path) -> Option<String> {
+    let filter = DirFilter::default();
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            if let Some(name) = component.as_os_str().to_str() {
+                if filter.skips(name) {
+                    return Some(format!("in {name}/"));
+                }
+            }
+        }
+    }
+    is_test_or_tool_source_file(path).then(|| "test- or tool-named file".to_owned())
+}
+
+/// Directory names skipped by default (matched case-insensitively on the
+/// exact path component): tests, examples and demos, benchmarks, fuzz drivers,
+/// tools and programs, scratch and contrib code, bundled third-party
+/// dependencies, docs. Any name that CONTAINS `test` (bar a few English words)
+/// or `fuzz` is skipped too ([`is_default_non_library_dir`]). docs/site/auto.md
+/// lists every one.
+pub(crate) const DEFAULT_NON_LIBRARY_DIRS: &[&str] = &[
+    // The Perl/CPAN `t/` convention: a one-letter directory of `*_t.c` files
+    // that link against a TAP framework (libtap `plan`/`ok`/`cmp_ok`/
+    // `done_testing`). C projects adopt it too (libmaxminddb), where those
+    // entry points out-rank the real API and then fail to link on the missing
+    // test-framework symbols. `--include-dir t` restores it.
+    "t",
+    "test",
+    "tests",
+    "testing",
+    "testsuite",
+    "test-suite",
+    "unittest",
+    "unittests",
+    "gtest",
+    "googletest",
+    // RSpec's conventional test directories. Without these, helpers such
+    // as `spec/factories/yaml_load` can out-rank the production parser
+    // they merely call, and then fail on test-only gems/FactoryBot.
+    "spec",
+    "specs",
+    "example",
+    "examples",
+    "sample",
+    "samples",
+    "demo",
+    "demos",
+    "benchmark",
+    "benchmarks",
+    "bench",
+    // Cargo's standard benchmark directory is the PLURAL `benches/`
+    // (smallvec, most Rust crates) — criterion/bench harnesses, not the
+    // library under test. `--include-dir benches` restores it.
+    "benches",
+    // Fuzz-harness dirs hold driver glue (libFuzzer/AFL `LLVMFuzzerTestOneInput`
+    // entry points, OSS-Fuzz build scripts), not the library under test — the
+    // same category as tests/examples. `--include-dir fuzz` restores them.
+    "fuzz",
+    "fuzzing",
+    "fuzzer",
+    "fuzzers",
+    "ossfuzz",
+    "oss-fuzz",
+    // Command-line tools / example programs / regression drivers — not the
+    // library under test. Their `main`/CLI code otherwise out-ranks the real
+    // entry points (aws's `wsdl2aws.main` #1, s2n's `bin/`, mbedtls's
+    // `programs/`, harfbuzz's `util/`, brotli's `research/`, libzip's
+    // `regress/`, wuffs's `snippet/`+`script/`, pcre2/zydis `tools/`).
+    "tool",
+    "tools",
+    // Developer-tooling dirs (libde265 `dev-tools/` rd-curves, build/CI
+    // helpers) — auxiliary code, not the library under test.
+    "dev-tools",
+    "devtools",
+    "dev_tools",
+    "program",
+    "programs",
+    "bin",
+    "cli",
+    "app",
+    "apps",
+    "regress",
+    "research",
+    // Exploratory / non-stable alternative implementations the author has
+    // fenced off from the shipping API (tinyobjloader's `experimental/`
+    // stream + opt loaders, whose `parseObj`/`parseLine`/`LoadMtl` otherwise
+    // out-rank the stable `ObjReader::ParseFromString`). Same category as
+    // `research`; `--include-dir experimental` restores them.
+    "experimental",
+    "experiments",
+    "playground",
+    "sandbox",
+    "perf",
+    "script",
+    "scripts",
+    "snippet",
+    "snippets",
+    "contrib",
+    "third_party",
+    "thirdparty",
+    "third-party",
+    "3rdparty",
+    "3rd_party",
+    "vendor",
+    "vendored",
+    "extern",
+    "external",
+    "deps",
+    "dependencies",
+    "subprojects",
+    "doc",
+    "docs",
+    "documentation",
+];
+
 /// A directory whose contents are not the project's own fuzzable library code:
 /// tests, examples/demos, benchmarks, bundled/vendored third-party deps, docs.
 /// Matched case-insensitively on the exact path component so a legitimate module
@@ -3412,101 +3616,7 @@ fn is_default_non_library_dir(name: &str) -> bool {
     if n.contains("fuzz") {
         return true;
     }
-    matches!(
-        n.as_str(),
-        // The Perl/CPAN `t/` convention: a one-letter directory of `*_t.c` files
-        // that link against a TAP framework (libtap `plan`/`ok`/`cmp_ok`/
-        // `done_testing`). C projects adopt it too (libmaxminddb), where those
-        // entry points out-rank the real API and then fail to link on the missing
-        // test-framework symbols. `--include-dir t` restores it.
-        "t"
-            | "test"
-            | "tests"
-            | "testing"
-            | "testsuite"
-            | "test-suite"
-            | "unittest"
-            | "unittests"
-            | "gtest"
-            | "googletest"
-            // RSpec's conventional test directories. Without these, helpers such
-            // as `spec/factories/yaml_load` can out-rank the production parser
-            // they merely call, and then fail on test-only gems/FactoryBot.
-            | "spec"
-            | "specs"
-            | "example"
-            | "examples"
-            | "sample"
-            | "samples"
-            | "demo"
-            | "demos"
-            | "benchmark"
-            | "benchmarks"
-            | "bench"
-            // Cargo's standard benchmark directory is the PLURAL `benches/`
-            // (smallvec, most Rust crates) — criterion/bench harnesses, not the
-            // library under test. `--include-dir benches` restores it.
-            | "benches"
-            // Fuzz-harness dirs hold driver glue (libFuzzer/AFL `LLVMFuzzerTestOneInput`
-            // entry points, OSS-Fuzz build scripts), not the library under test — the
-            // same category as tests/examples. `--include-dir fuzz` restores them.
-            | "fuzz"
-            | "fuzzing"
-            | "fuzzer"
-            | "fuzzers"
-            | "ossfuzz"
-            | "oss-fuzz"
-            // Command-line tools / example programs / regression drivers — not the
-            // library under test. Their `main`/CLI code otherwise out-ranks the real
-            // entry points (aws's `wsdl2aws.main` #1, s2n's `bin/`, mbedtls's
-            // `programs/`, harfbuzz's `util/`, brotli's `research/`, libzip's
-            // `regress/`, wuffs's `snippet/`+`script/`, pcre2/zydis `tools/`).
-            | "tool"
-            | "tools"
-            // Developer-tooling dirs (libde265 `dev-tools/` rd-curves, build/CI
-            // helpers) — auxiliary code, not the library under test.
-            | "dev-tools"
-            | "devtools"
-            | "dev_tools"
-            | "program"
-            | "programs"
-            | "bin"
-            | "cli"
-            | "app"
-            | "apps"
-            | "regress"
-            | "research"
-            // Exploratory / non-stable alternative implementations the author has
-            // fenced off from the shipping API (tinyobjloader's `experimental/`
-            // stream + opt loaders, whose `parseObj`/`parseLine`/`LoadMtl` otherwise
-            // out-rank the stable `ObjReader::ParseFromString`). Same category as
-            // `research`; `--include-dir experimental` restores them.
-            | "experimental"
-            | "experiments"
-            | "playground"
-            | "sandbox"
-            | "perf"
-            | "script"
-            | "scripts"
-            | "snippet"
-            | "snippets"
-            | "contrib"
-            | "third_party"
-            | "thirdparty"
-            | "third-party"
-            | "3rdparty"
-            | "3rd_party"
-            | "vendor"
-            | "vendored"
-            | "extern"
-            | "external"
-            | "deps"
-            | "dependencies"
-            | "subprojects"
-            | "doc"
-            | "docs"
-            | "documentation"
-    )
+    DEFAULT_NON_LIBRARY_DIRS.contains(&n.as_str())
 }
 
 /// A source FILE whose name marks it as a test harness or CLI/example tool rather
@@ -5785,6 +5895,73 @@ mod tests {
             decode_count, 2,
             "differing signatures are distinct targets: {cands:?}"
         );
+    }
+
+    #[test]
+    fn auto_md_lists_every_default_skip() {
+        let doc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/auto.md"),
+        )
+        .unwrap();
+        for name in DEFAULT_NON_LIBRARY_DIRS {
+            assert!(
+                doc.contains(&format!("`{name}`")),
+                "auto.md does not list `{name}`"
+            );
+        }
+        for flag in ["--include-dir", "--exclude-dir"] {
+            assert!(doc.contains(flag), "auto.md does not document {flag}");
+        }
+    }
+
+    #[test]
+    fn default_skips_name_each_skipped_dir_with_its_file_count() {
+        let root = tmpdir();
+        for dir in [
+            "src",
+            "latest",
+            "attestation",
+            "tests",
+            "tools",
+            "vendor/zlib",
+            "app",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("lib.c"), "int f(int x) { return x; }\n").unwrap();
+        }
+        fs::write(root.join("tests/extra.c"), "int g(int x) { return x; }\n").unwrap();
+        fs::write(root.join("src/pngtest.c"), "int h(int x) { return x; }\n").unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/x.c"), "int k(int x) { return x; }\n").unwrap();
+
+        let skips = default_skips(&root, &DirFilter::default());
+        assert_eq!(
+            skips.dirs,
+            vec![
+                ("app".to_owned(), 1),
+                ("tests".to_owned(), 2),
+                ("tools".to_owned(), 1),
+                ("vendor".to_owned(), 1),
+            ],
+            "{skips:?}"
+        );
+        assert_eq!(skips.files, 1);
+        // --include-dir keeps one; --exclude-dir adds one.
+        let kept = default_skips(
+            &root,
+            &DirFilter::new(&["latest".into()], &["tests".into()]),
+        );
+        let names: Vec<&str> = kept.dirs.iter().map(|(dir, _)| dir.as_str()).collect();
+        assert_eq!(names, ["app", "latest", "tools", "vendor"]);
+        assert_eq!(
+            default_skip_reason(&root, &root.join("tests/extra.c")).as_deref(),
+            Some("in tests/")
+        );
+        assert_eq!(
+            default_skip_reason(&root, &root.join("src/pngtest.c")).as_deref(),
+            Some("test- or tool-named file")
+        );
+        assert_eq!(default_skip_reason(&root, &root.join("latest/lib.c")), None);
     }
 
     #[test]

@@ -15,6 +15,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf auto` names the directories (and test- or tool-named files) its
+  default non-library filter leaves out, with file counts, and `bhf list
+  targets` marks the rows `auto` skips. docs/site/auto.md lists the whole
+  default set and `--include-dir`/`--exclude-dir`.
 - `bhf list targets` gives the harness ids `bhf auto` uses whatever the root
   path's spelling (relative, absolute, `.`), and takes `auto`'s `--target`,
   `--harness-id` and `--target-file` selections. A selection that matches

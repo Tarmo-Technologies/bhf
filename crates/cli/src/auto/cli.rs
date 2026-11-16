@@ -1683,6 +1683,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.discovery_cache.as_deref(),
         args.preprocess,
     )?;
+    if let Some(note) =
+        default_skips_note(&crate::auto::discovery::default_skips(&path, &dir_filter))
+    {
+        bhfeprintln!("{note}");
+    }
     if let Err(error) =
         crate::support_report::checkpoint_discovery_cache_hit(&work, discovery_cache_hit)
     {
@@ -5125,6 +5130,40 @@ fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> 
         .map(|(_, name)| *name)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The console note naming what the default non-library filter left out of
+/// discovery, so a tree whose code lives in `app/` or `tools/` does not look
+/// empty for no reason.
+fn default_skips_note(skips: &crate::auto::discovery::DefaultSkips) -> Option<String> {
+    if skips.dirs.is_empty() && skips.files == 0 {
+        return None;
+    }
+    // Enough for a tree's usual layout; a tree with hundreds of nested test
+    // directories gets a count of the rest.
+    const SHOWN: usize = 20;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut parts: Vec<String> = skips
+        .dirs
+        .iter()
+        .take(SHOWN)
+        .map(|(dir, files)| format!("{dir}/ ({files} file{})", plural(*files)))
+        .collect();
+    if skips.dirs.len() > SHOWN {
+        parts.push(format!("{} more", skips.dirs.len() - SHOWN));
+    }
+    if skips.files > 0 {
+        parts.push(format!(
+            "{} test- or tool-named file{}",
+            skips.files,
+            plural(skips.files)
+        ));
+    }
+    Some(format!(
+        "bhf auto: skipped as non-library code by default: {}; keep a directory with \
+         --include-dir <name> (see docs/site/auto.md#discovery)",
+        parts.join(", ")
+    ))
 }
 
 /// The console note for a `--target` that selected nothing: the closest

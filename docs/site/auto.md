@@ -478,7 +478,24 @@ and current limitations.
 
 Walks the source tree with the same exclusions the `scan` subcommand uses
 (`.git`, `target`, `build`, `bhf_work`, `harnesses`,
-`generated_harnesses`, `node_modules`). Per-file dispatch by extension:
+`generated_harnesses`, `node_modules`), and by default also skips code that is
+not the project's own library: `bhf scan` and `bhf list targets` include it, so
+`list targets` marks those rows `(bhf auto skips: ...)`. Skipped by default:
+
+- a directory named (case-insensitively) `t`, `test`, `tests`, `testing`, `testsuite`, `test-suite`, `unittest`, `unittests`, `gtest`, `googletest`, `spec`, `specs`, `example`, `examples`, `sample`, `samples`, `demo`, `demos`, `benchmark`, `benchmarks`, `bench`, `benches`, `fuzz`, `fuzzing`, `fuzzer`, `fuzzers`, `ossfuzz`, `oss-fuzz`, `tool`, `tools`, `dev-tools`, `devtools`, `dev_tools`, `program`, `programs`, `bin`, `cli`, `app`, `apps`, `regress`, `research`, `experimental`, `experiments`, `playground`, `sandbox`, `perf`, `script`, `scripts`, `snippet`, `snippets`, `contrib`, `third_party`, `thirdparty`, `third-party`, `3rdparty`, `3rd_party`, `vendor`, `vendored`, `extern`, `external`, `deps`, `dependencies`, `subprojects`, `doc`, `docs`, `documentation`;
+- any directory whose name contains `test` (`integration_tests`,
+  `jsontestrunner`; `latest`, `fastest`, `greatest`, `contest`, `protest` and
+  names containing `attest` are kept) or `fuzz` (`fuzz_targets`, `libfuzzer`);
+- a source file whose name marks a test runner or tool (`test_foo.c`,
+  `pngtest.c`, `runtest.c`, `foo_test.cc`, `ltests.c`).
+
+`--include-dir <name>` keeps a directory the defaults skip (repeatable, e.g.
+`--include-dir tools` for a project whose parser lives in `tools/`), and
+`--exclude-dir <name>` skips another. When the defaults leave anything out,
+`bhf auto` prints `bhf auto: skipped as non-library code by default: tests/ (3
+files), tools/ (1 file), ...` after discovery.
+
+Per-file dispatch by extension:
 
 | Extension | Parser | Ranker |
 |---|---|---|

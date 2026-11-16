@@ -110,7 +110,11 @@ does not do for a compiler the operator chose.
 
 ## Discovery
 
-`scan`, `list-targets`, and `auto` consider these files:
+`scan`, `list-targets`, and `auto` consider these files. `auto` also skips
+non-library directories such as `tests/`, `tools/` and `vendor/` by default (the
+full set, and `--include-dir`, are in [auto](auto.md#discovery)); `list
+targets` marks the rows it skips.
+
 
 | File kind | Handling |
 |---|---|

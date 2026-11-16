@@ -109,6 +109,10 @@ struct ListedTarget {
     breakdown: Option<ScoreBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<Value>,
+    /// Why `bhf auto` leaves this target out by default (a non-library
+    /// directory such as `tests/`, or a test- or tool-named file), if it does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_skips: Option<String>,
 }
 
 /// List the ranked targets under `args.path`; the exit code is 2 when a
@@ -475,6 +479,7 @@ fn ranked_targets(mut args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarge
                     line: Some(candidate.line),
                     breakdown: None,
                     metadata: None,
+                    auto_skips: None,
                 },
             ));
         }
@@ -489,6 +494,9 @@ fn ranked_targets(mut args: ListTargetsArgs) -> Result<Vec<(PathBuf, ListedTarge
             .then_with(|| left.0.cmp(&right.0))
     });
     retain_selected(&mut all_targets, &args, &canonical_root);
+    for (path, target) in &mut all_targets {
+        target.auto_skips = crate::auto::discovery::default_skip_reason(&canonical_root, path);
+    }
     all_targets.truncate(args.top);
     for (path, _) in &mut all_targets {
         if let Ok(relative) = path.strip_prefix(&canonical_root) {
@@ -648,6 +656,7 @@ fn ada_listed_target(
         line: Some(line),
         breakdown: Some(target.breakdown),
         metadata: Some(metadata),
+        auto_skips: None,
     }
 }
 
@@ -897,6 +906,7 @@ fn c_family_listed_target(
         line: Some(target.line),
         breakdown: None,
         metadata,
+        auto_skips: None,
     }
 }
 
@@ -921,6 +931,7 @@ fn non_c_listed_target(
         line: Some(line),
         breakdown: None,
         metadata: None,
+        auto_skips: None,
     }
 }
 
@@ -1124,9 +1135,14 @@ fn print_table<W: Write>(writer: &mut W, rows: &[(PathBuf, ListedTarget)]) -> Re
         "", "", "", "", ""
     )?;
     for (path, target) in rows {
+        let skipped = target
+            .auto_skips
+            .as_deref()
+            .map(|reason| format!("  (bhf auto skips: {reason})"))
+            .unwrap_or_default();
         writeln!(
             writer,
-            "{:<file_width$}  {:<harness_width$}  {:<lang_width$}  {:<target_width$}  {:>score_width$}",
+            "{:<file_width$}  {:<harness_width$}  {:<lang_width$}  {:<target_width$}  {:>score_width$}{skipped}",
             path.display(),
             target.harness_id,
             target.language.as_str(),
@@ -1169,6 +1185,7 @@ mod tests {
             line: None,
             breakdown: None,
             metadata: None,
+            auto_skips: None,
         }
     }
 
