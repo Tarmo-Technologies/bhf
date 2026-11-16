@@ -5,6 +5,8 @@
 ## Unreleased
 
 ### Changed
+- CI runs bhf's `llm`-feature unit tests (`cargo test -p bhf --features llm
+  --lib llm::`); it only type-checked the feature.
 - The nightly's `ignored` shard runs the RedQueen/cmplog cold-solve
   discriminators and the engine-parity cold-solve sweep, `#[ignore]`d tests
   no workflow ran; `cold_gate_needs_redqueen` checks both arms at a fixed seed
