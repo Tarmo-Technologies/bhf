@@ -35,6 +35,7 @@ pub mod differential_post;
 pub mod discovery;
 pub mod discovery_cache;
 pub mod external_tools;
+pub(crate) mod format_string_group;
 pub mod fortran;
 pub mod fortran_build;
 pub mod go_build;

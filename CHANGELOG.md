@@ -15,6 +15,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An input-controlled printf format is reported as one CWE-134 finding group
+  at the call. Its crashes inside the C library (a `%n` write, a `%s` read of a
+  garbage argument) used to come out as NULL-dereference and wild-access
+  findings in groups of their own, beside a location-less format-string oracle
+  finding and a capability finding. A crash in a printf-family call whose
+  format is not a string literal (or in a harness the format-string oracle
+  fired for) is now BHF-408, keeps its own CWE second and its severity, and
+  shares one cluster with the oracle and capability findings, which point at
+  the call too.
 - A finding that gets past a check the fuzz-build define compiles out (a
   signature or checksum under `#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`),
   or that runs code only fuzz builds compile, carries the caveat `reachable

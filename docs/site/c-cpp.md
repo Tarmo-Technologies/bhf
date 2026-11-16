@@ -951,7 +951,12 @@ only noted. Printf-style format strings observed through `printf`,
 `fprintf`, `dprintf`, `sprintf`, or `snprintf` are promoted when the format
 is not a literal in the program's read-only data, the whole format, at least
 4 bytes long, occurs verbatim in the current fuzz input, and it contains a
-conversion marker. The same
+conversion marker. A sanitizer crash inside such a call (a `%n` write, a `%s`
+read of a garbage argument) is the same bug: when the faulting frames are the
+printf family's own and the call's format argument is not a string literal,
+or the format-string oracle fired for the harness, the crash is reported as
+BHF-408 (CWE-134, with the crash's own CWE second) at the call, in one finding
+group with the oracle and format-string capability findings. The same
 per-input runtrace stream now reports audited file descriptors that are opened
 and not closed before the harness execution exits. Successful `unlink`,
 `unlinkat`, or `remove` calls with parent-directory paths promote to

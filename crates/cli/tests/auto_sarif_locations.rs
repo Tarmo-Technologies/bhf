@@ -3,7 +3,8 @@
 //! GitHub code scanning drops a SARIF result with no location. A format-string
 //! oracle finding (BHF-408) has no crash frame of its own, and both
 //! results/findings.sarif and results/findings.json gave it none; it now points
-//! at the fuzzed target's source line.
+//! at the format's call site (from a crash of the same bug), else at the
+//! fuzzed target's source line.
 #![cfg(unix)]
 
 use std::process::Command;
@@ -49,18 +50,34 @@ fn every_result_of_a_run_has_a_location_and_the_oracle_one_names_the_target() {
         let locations = result["locations"].as_array().unwrap();
         assert!(!locations.is_empty(), "no location: {result:#}");
     }
-    let oracle = results.iter().find(|r| r["ruleId"] == "BHF-408").unwrap();
-    let physical = &oracle["locations"][0]["physicalLocation"];
-    assert_eq!(physical["artifactLocation"]["uri"], "fmt.c", "{oracle:#}");
-    assert_eq!(physical["region"]["startLine"], 4, "{oracle:#}");
-
+    // The oracle finding has no stack; a crash of the same bug gives the call.
     let findings = read("findings.json");
-    let row = findings["findings"]
+    let oracle_id = findings["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["rule"]["id"] == "BHF-408")
+        .find(|f| {
+            f["rule"]["id"] == "BHF-408"
+                && f["kind"] == "fuzz"
+                && f["stack"] == serde_json::json!([])
+        })
+        .and_then(|f| f["id"].as_str())
+        .map(str::to_owned)
+        .expect("the format-string oracle finding, which has no stack");
+    for row in findings["findings"].as_array().unwrap() {
+        if row["rule"]["id"] != "BHF-408" {
+            continue;
+        }
+        assert_eq!(row["location"]["file"], "fmt.c", "{row:#}");
+        let line = row["location"]["line"].as_u64().unwrap();
+        assert!(line == 4 || line == 6, "the function or the call: {row:#}");
+    }
+    let oracle = results
+        .iter()
+        .find(|r| r["properties"]["bhfFindingId"] == oracle_id.as_str())
         .unwrap();
-    assert_eq!(row["location"]["file"], "fmt.c", "{row:#}");
-    assert_eq!(row["location"]["line"], 4, "{row:#}");
+    let physical = &oracle["locations"][0]["physicalLocation"];
+    assert_eq!(physical["artifactLocation"]["uri"], "fmt.c", "{oracle:#}");
+    let line = physical["region"]["startLine"].as_u64().unwrap();
+    assert!(line == 4 || line == 6, "{oracle:#}");
 }

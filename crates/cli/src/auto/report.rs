@@ -1525,6 +1525,9 @@ pub fn write_reports_with_output_limit(
         })
         .collect();
 
+    // One format-string bug is one finding group (CWE-134), not a NULL
+    // dereference, a wild write and an oracle hit apart.
+    crate::auto::format_string_group::group_format_string_findings(work_dir);
     // CC-1: stamp every finding.json with its target's structured fidelity block.
     annotate_findings_with_fidelity(work_dir, Some(source_root), results, &target_fidelities);
     // force-fuzz Phase 2: persist the forced floor onto each forced target's

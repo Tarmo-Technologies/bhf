@@ -1411,6 +1411,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/format_string_group.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/fortran.rs",
       "license": "Apache-2.0"
     },
@@ -2256,6 +2260,10 @@
     },
     {
       "path": "crates/cli/tests/auto_force_win32.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_format_string_group.rs",
       "license": "Apache-2.0"
     },
     {
