@@ -55,6 +55,8 @@ jobs:
         run: python3 -m pip install --user --break-system-packages "jsonschema==4.25.1"
       - name: Test fail-closed CI policy and path classification
         run: python3 -m unittest discover -s scripts/ci/tests -v
+      - name: Check that every download retries and is checked
+        run: bash scripts/ci/check-network-fetches.sh
 
   minimum-rust:
     name: Rust 1.88 source compatibility
@@ -132,7 +134,7 @@ jobs:
         run: cargo test --locked -p continuous_daemon --lib
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        run: bash scripts/ci/install-nextest.sh
 
       # nextest runs all tests across every binary in one global parallel pool.
       # `cargo test` runs the ~290 test binaries one at a time, which took the
@@ -228,7 +230,7 @@ jobs:
           toolchain: 1.99.0
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        run: bash scripts/ci/install-nextest.sh
 
       - name: Test the release and docs contracts
         env:
@@ -322,11 +324,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned rustup-init and dist tarball the container fetches.
+      - name: Cache the pinned downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/fetch-cache
+          key: bhf-fetch-${{ hashFiles('scripts/ci/install-*.sh') }}
+
       - name: Build and test on the RHEL 7 ABI
         run: |
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io" \
             --workdir /io \
+            --env BHF_FETCH_CACHE=/io/target/fetch-cache \
             --env CARGO_HOME=/tmp/cargo \
             --env RUSTUP_HOME=/tmp/rustup \
             --env CARGO_TARGET_DIR=/io/target/rhel7 \
@@ -339,7 +349,7 @@ jobs:
               export BHF_RELEASE_VERSION=1
               BHF_VCS_REF="$(git rev-parse HEAD)"
               export BHF_VCS_REF
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              bash scripts/ci/install-rustup.sh -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               test -x /opt/python/cp312-cp312/bin/python3
               export PATH="/opt/python/cp312-cp312/bin:$PATH"
@@ -352,7 +362,7 @@ jobs:
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
               scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
-              curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+              bash scripts/ci/install-cargo-dist.sh
               dist build --artifacts=local --target=x86_64-unknown-linux-gnu --output-format=json > /io/target/component-local-manifest.json
               dist build --artifacts=global --output-format=json > /io/target/component-global-manifest.json
               artifact_dir="$CARGO_TARGET_DIR/distrib"

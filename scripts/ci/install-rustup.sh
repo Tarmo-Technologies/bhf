@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Install rustup from the pinned rustup-init (the one the Dockerfile uses),
+# checked against its SHA-256, then a toolchain: the arguments go to
+# rustup-init (x86_64 Linux containers).
+set -euo pipefail
+version=1.28.2
+sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+[ "$(uname -sm)" = "Linux x86_64" ] || { echo "install-rustup.sh: x86_64 Linux only" >&2; exit 1; }
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+"$here/fetch.sh" \
+  "https://static.rust-lang.org/rustup/archive/$version/x86_64-unknown-linux-gnu/rustup-init" \
+  "$sha256" "$tmp/rustup-init"
+chmod +x "$tmp/rustup-init"
+"$tmp/rustup-init" "$@"

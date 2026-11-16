@@ -144,7 +144,7 @@ jobs:
             -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        run: bash scripts/ci/install-nextest.sh
 
       # bhf preloads the runtrace shim, and the compiler intercept, from beside
       # itself (target/debug). Both are cdylibs, which nextest's build of the

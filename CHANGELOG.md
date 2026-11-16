@@ -5,6 +5,15 @@
 ## Unreleased
 
 ### Changed
+- Every download in the Dockerfile and the workflows retries transient
+  failures and checks a pinned digest: the CA bootstrap is fetched with
+  `curl --retry` in a digest-pinned `buildpack-deps:noble-curl` stage instead
+  of BuildKit's `ADD`, which cannot retry; the Dockerfile's other `curl`s retry;
+  nextest, rustup-init and cargo-dist come from pinned release files through
+  `scripts/ci/fetch.sh` (retry, SHA-256 check, a cache the RHEL 7 job keeps)
+  instead of `curl | sh` installers. `scripts/ci/check-network-fetches.sh`
+  fails CI on a `curl` or `wget` without retry and checksum, or an `ADD` of a
+  URL.
 - CI runs bhf's `llm`-feature unit tests (`cargo test -p bhf --features llm
   --lib llm::`); it only type-checked the feature.
 - The nightly's `ignored` shard runs the RedQueen/cmplog cold-solve
