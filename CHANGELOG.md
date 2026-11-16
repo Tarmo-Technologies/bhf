@@ -5,6 +5,13 @@
 ## Unreleased
 
 ### Changed
+- The unused workspace crates `discovery`, `semantic`, `fork_server`,
+  `fuzz_engine_nyx_adapter`, `fuzz_engine_libfuzzer_adapter` and
+  `fuzz_engine_afl_adapter` are removed: nothing depended on them (the AFL++
+  lane runs `afl-fuzz` on the harness templates' AFL++ blocks, not through
+  `afl_adapter`). `fuzz_engine_libafl_adapter`, `iiop` and
+  `continuous_daemon` stay. The cmplog crate's doc no longer names a
+  `cmplog-runtime` feature that does not exist.
 - The nightly installs AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross
   compilers, and qemu-user with the AArch64 cross compilers, and runs those
   lanes' tests, which skipped as passes; the skip allowlist no longer names a

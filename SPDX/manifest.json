@@ -3311,18 +3311,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/discovery/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/discovery/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/discovery/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/event_log/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3455,30 +3443,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/fork_server/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fork_server/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/c/bhf_afl_persistent_shim.c",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/fuzz_engine/builtin/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3544,26 +3508,6 @@
     },
     {
       "path": "crates/fuzz_engine/libafl_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/nyx_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/nyx_adapter/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4512,18 +4456,6 @@
     },
     {
       "path": "crates/sbom_ingest/tests/fixtures/python/pyproject.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/semantic/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/semantic/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/semantic/src/main.rs",
       "license": "Apache-2.0"
     },
     {

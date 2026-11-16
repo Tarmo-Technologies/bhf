@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! CmpLog / RedQueen-style magic-byte extraction scaffold.
-//!
-//! Tracks issue #294. v0.1 ships the data model + entry-point fn
-//! signatures; the real instrumentation pass (LD_PRELOAD-style
-//! intercepts of memcmp/strcmp/Ada.Strings.Equals plus an
-//! offset-matching splicer) lands behind the `cmplog-runtime`
-//! feature in a follow-up.
+//! CmpLog / RedQueen-style comparison log: the comparisons a harness run
+//! recorded (bhf's C driver and the runtrace shim write them as JSON lines,
+//! see [`ingest_from_jsonl_log`]), and the splice candidates and dictionary
+//! tokens the builtin engine derives from them. There is no feature to turn
+//! on: the recording lives in the drivers and the shim, not in this crate.
 
 /// Set in a [`CmpEntry::site_id`] whose record named no site (a log line
 /// without `"s"`): the low bits are then only the record's position.
