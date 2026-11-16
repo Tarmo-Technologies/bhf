@@ -135,22 +135,28 @@ fn profile_one(
         }
     }
 
-    // Fuzz population: the coverage-guided corpus queue.
+    // Fuzz population: the coverage-guided corpus queue, with what each
+    // entry reached, so a finding can ship one that reaches its capability.
     let queue = work_dir.join("corpus").join(harness_id).join("queue");
     let mut fuzz_caps: BTreeSet<Capability> = BTreeSet::new();
+    let mut reached: Vec<(PathBuf, BTreeSet<Capability>)> = Vec::new();
     let mut replayed = 0usize;
     if let Ok(inputs) = std::fs::read_dir(&queue) {
-        for input in inputs.flatten() {
+        let mut inputs: Vec<PathBuf> = inputs.flatten().map(|entry| entry.path()).collect();
+        inputs.sort();
+        for p in inputs {
             if replayed >= MAX_CORPUS || Instant::now() >= deadline {
                 break;
             }
-            let p = input.path();
             if p.is_file() {
                 replayed += 1;
-                if !replay_into(&bin, &p, ld_preload, hdir, &mut fuzz_caps) {
+                let mut caps = BTreeSet::new();
+                if !replay_into(&bin, &p, ld_preload, hdir, &mut caps) {
                     let _ = std::fs::remove_dir_all(&scratch);
                     return None;
                 }
+                fuzz_caps.extend(caps.iter().cloned());
+                reached.push((p, caps));
             }
         }
     }
@@ -178,7 +184,13 @@ fn profile_one(
         }
         let id = format!("F-CAP-{:04}", *index);
         *index += 1;
-        if write_capability_finding(work_dir, &id, hdir, harness_id, kind, caps, static_sinks) {
+        let testcase = representative_input(&reached, caps);
+        let site = FindingSite {
+            hdir,
+            harness_id,
+            bin: &bin,
+        };
+        if write_capability_finding(work_dir, &id, &site, kind, caps, testcase, static_sinks) {
             findings_written += 1;
         }
     }
@@ -194,6 +206,42 @@ fn profile_one(
         json: profile,
         findings_written,
     })
+}
+
+/// The corpus entry that reached the most of `caps` (the first, on a tie), with
+/// the operands of `caps` it reached: the testcase a capability finding ships.
+fn representative_input<'a>(
+    reached: &'a [(PathBuf, BTreeSet<Capability>)],
+    caps: &[&Capability],
+) -> Option<(&'a Path, Vec<String>)> {
+    let mut best: Option<(&Path, Vec<String>)> = None;
+    for (input, input_caps) in reached {
+        let operands: Vec<String> = caps
+            .iter()
+            .filter(|cap| input_caps.contains(cap))
+            .map(|cap| cap.operand.clone())
+            .collect();
+        if operands.len() > best.as_ref().map_or(0, |(_, best)| best.len()) {
+            best = Some((input, operands));
+        }
+    }
+    best
+}
+
+/// The operands of capability `kind` that a run of the harness on `input`
+/// reached, from that run's runtrace: what `bhf replay` compares with the
+/// operands a capability finding's testcase reached.
+pub(crate) fn operands_reached(
+    events: &[RuntraceEvent],
+    input: &Path,
+    kind: &str,
+) -> BTreeSet<String> {
+    let mut caps = BTreeSet::new();
+    fold_capabilities(events, input, &mut caps);
+    caps.into_iter()
+        .filter(|cap| cap.kind == kind)
+        .map(|cap| cap.operand)
+        .collect()
 }
 
 /// Replay one input through the harness under the shim, folding its runtrace into
@@ -390,18 +438,34 @@ fn human_kind(kind: &str) -> &'static str {
     }
 }
 
+/// The harness a capability finding is filed against.
+struct FindingSite<'a> {
+    hdir: &'a Path,
+    harness_id: &'a str,
+    /// The `main` that ran the corpus, which `bhf replay` runs.
+    bin: &'a Path,
+}
+
 /// Write one clustered BHF-668 finding for a `(harness, kind)` with a non-empty
 /// input-triggered operand set. Deliberately carries NO `actionability.sink` so the
-/// fuzz-confirmation join does not index it as a crash site.
+/// fuzz-confirmation join does not index it as a crash site. `testcase` is a
+/// corpus entry that reached the capability, with the operands it reached: it
+/// is saved as the finding's `testcase.bin`, so `bhf replay` can show the
+/// capability again.
 fn write_capability_finding(
     work: &Path,
     id: &str,
-    hdir: &Path,
-    harness_id: &str,
+    site: &FindingSite<'_>,
     kind: &str,
     caps: &[&Capability],
+    testcase: Option<(&Path, Vec<String>)>,
     static_sinks: &[StaticSink],
 ) -> bool {
+    let FindingSite {
+        hdir,
+        harness_id,
+        bin,
+    } = *site;
     let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
@@ -466,13 +530,36 @@ fn write_capability_finding(
             "confidence": if tainted { "high" } else { "medium" }
         },
     });
-    crate::fuzz_lineage::insert(
-        &mut record,
-        &corpus::lineage::FindingLineage::unknown(
+    // The finding folds what the whole corpus reached; its testcase is one
+    // queue entry, whose descent it carries.
+    let lineage = match &testcase {
+        Some((input, _)) => {
+            crate::fuzz_lineage::ReplayedQueue::open(work, harness_id)
+                .entry(input)
+                .lineage
+        }
+        None => corpus::lineage::FindingLineage::unknown(
             "the capability profile folds the operands the whole corpus reached into one \
              finding, so no single queue entry is its input",
         ),
-    );
+    };
+    crate::fuzz_lineage::insert(&mut record, &lineage);
+    record["fixture_path"] = json!(corpus::finding::stored_fixture_path(
+        work,
+        &bin.display().to_string()
+    ));
+    if let Some(format) = crate::fuzz::harness_format_for(bin, work, harness_id) {
+        record["harness_format_version"] = json!(format.version);
+    }
+    let mut paths = serde_json::Map::new();
+    paths.insert("finding".to_owned(), json!("finding.json"));
+    if let Some((input, operands)) = testcase {
+        if std::fs::copy(input, dir.join("testcase.bin")).is_ok() {
+            paths.insert("testcase".to_owned(), json!("testcase.bin"));
+            record["capability"]["testcase_operands"] = json!(operands);
+        }
+    }
+    record["paths"] = Value::Object(paths);
     corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
@@ -838,10 +925,10 @@ mod tests {
         assert!(write_capability_finding(
             &work,
             "F-CAP-0000",
-            &hdir,
-            "H-C0001",
+            &site(&hdir),
             "process-exec",
             &[&cap],
+            None,
             &[],
         ));
         let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();
@@ -961,10 +1048,10 @@ mod tests {
         assert!(write_capability_finding(
             &work,
             "F-CAP-0000",
-            &hdir,
-            "H-C0001",
+            &site(&hdir),
             "process-exec",
             &[&cap],
+            None,
             &static_sinks,
         ));
         let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();
@@ -978,6 +1065,70 @@ mod tests {
         let fix = actionability::select_fix_location(&raw, None).expect("a fix location");
         assert_eq!(fix.line, Some(4), "SARIF startLine must be the call site");
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    fn site(hdir: &Path) -> FindingSite<'_> {
+        FindingSite {
+            hdir,
+            harness_id: "H-C0001",
+            bin: Path::new("main"),
+        }
+    }
+
+    /// A capability finding saves the queue entry that reached the most of
+    /// its operands as its testcase, names the operands it reached, points
+    /// replay at the harness that ran it, and carries the entry's lineage.
+    #[test]
+    fn a_capability_finding_ships_the_entry_that_reached_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().to_path_buf();
+        let hdir = work.join("harnesses").join("H-C0001");
+        let queue = work.join("corpus/H-C0001/queue");
+        std::fs::create_dir_all(&hdir).unwrap();
+        std::fs::create_dir_all(&queue).unwrap();
+        let exec = |operand: &str| Capability {
+            kind: "process-exec",
+            operand: operand.into(),
+            tainted: false,
+        };
+        let (id, ls) = (exec("id"), exec("ls"));
+        std::fs::write(queue.join("a"), b"one").unwrap();
+        std::fs::write(queue.join("b"), b"both").unwrap();
+        let reached = vec![
+            (queue.join("a"), BTreeSet::from([id.clone()])),
+            (queue.join("b"), BTreeSet::from([id.clone(), ls.clone()])),
+        ];
+        let caps = [&id, &ls];
+        let testcase = representative_input(&reached, &caps);
+        assert_eq!(
+            testcase.as_ref().map(|(path, _)| *path),
+            Some(&*queue.join("b"))
+        );
+        let bin = hdir.join("main");
+        let site = FindingSite {
+            hdir: &hdir,
+            harness_id: "H-C0001",
+            bin: &bin,
+        };
+        assert!(write_capability_finding(
+            &work,
+            "F-CAP-0000",
+            &site,
+            "process-exec",
+            &caps,
+            testcase,
+            &[],
+        ));
+        let finding = work.join("results/findings/F-CAP-0000");
+        assert_eq!(
+            std::fs::read(finding.join("testcase.bin")).unwrap(),
+            b"both"
+        );
+        let raw = read_json(&finding.join("finding.json")).unwrap();
+        assert_eq!(raw["paths"]["testcase"], "testcase.bin");
+        assert_eq!(raw["capability"]["testcase_operands"], json!(["id", "ls"]));
+        assert_eq!(raw["fixture_path"], "harnesses/H-C0001/main");
+        assert_eq!(raw["lineage"]["origin"], "corpus", "{raw}");
     }
 
     /// A capability is the operand set the whole corpus reached, not one
@@ -996,10 +1147,10 @@ mod tests {
         assert!(write_capability_finding(
             &work,
             "F-CAP-0000",
-            &hdir,
-            "H-C0001",
+            &site(&hdir),
             "process-exec",
             &[&cap],
+            None,
             &[],
         ));
         let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();

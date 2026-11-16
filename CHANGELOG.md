@@ -15,6 +15,18 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf replay` confirms runtime-oracle, assertion and capability findings
+  from what the replay did: the runtrace shim records the run, and the
+  finding is a `MATCH` when the oracle registry reports the same rule, API and
+  site again (an assertion's source and expression), or, for an input-triggered
+  capability (BHF-668), when the replay reaches the same kind of capability
+  with an operand its testcase reached. An assertion the runtrace did not record
+  is read from the glibc, Microsoft C runtime, BSD or musl assertion message
+  (new `corpus::assertion` parsers). A crash filed as the format-string bug
+  compares as the crash its sanitizer reported, and else is confirmed by the
+  format-string oracle at its call. Each of them used to replay as MISMATCH;
+  an assertion as `no crash: signal 6 (SIGABRT)`. A capability finding saves
+  the corpus entry that reached it as its `testcase.bin`.
 - An uninitialized-memory finding from the MSan corpus replay ships the queue
   entry as `testcase.bin`, MSan's report as `sanitizer.log`, the function from
   the report's frame and the `main_msan` build as its fixture, so `bhf replay`

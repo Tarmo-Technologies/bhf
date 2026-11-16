@@ -1835,6 +1835,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/replay_oracle.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/report.rs",
       "license": "Apache-2.0"
     },
@@ -2819,6 +2823,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/replay_oracle_findings.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/report_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2996,6 +3004,10 @@
     },
     {
       "path": "crates/corpus/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/src/assertion.rs",
       "license": "Apache-2.0"
     },
     {

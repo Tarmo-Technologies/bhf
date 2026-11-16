@@ -508,6 +508,24 @@ MATCH
   Rules and kinds earlier releases gave the same report still match. A hang
   is reported as `actual=<timeout>` after 10 s, a clean exit as
   `actual=<none>` with its exit status.
+- **Oracle, assertion and capability findings.** A finding that is not a
+  sanitizer crash replays with the runtrace shim recording what the harness
+  did. A runtime-oracle finding (`classification: "oracle_hit"`, such as a
+  failed assertion, BHF-415, or a fuzz-controlled format string, BHF-408) is a
+  `MATCH` when the oracle registry, run over the replay's runtrace, reports
+  the same rule at the same API with the same site evidence (an assertion's
+  `source` and `expression`). An assertion the runtrace did not record (the
+  shim did not run in the harness) is read from the message the C runtime
+  printed: glibc's `` Assertion `expr' failed. ``, the Microsoft C runtime's
+  `Assertion failed: expr, file f, line n`, or the BSD or musl form; its
+  expression must be the same and its source the same file and line. An
+  input-triggered capability finding (BHF-668) is a `MATCH` when the replay of
+  its testcase (a corpus entry that reached the capability) reaches the same
+  kind of capability with an operand that entry reached. A crash `bhf auto`
+  filed as the format-string bug compares as the crash its sanitizer reported
+  (`format_string.crash_rule_id`); when that crash does not come back (the
+  format reads whatever is in the argument area), the format-string oracle
+  firing at the recorded call is the `MATCH`, and a note says so.
 - **Unverified.** A replayed report that names no function and no source
   position (an unsymbolized one) is not another site, but it is not a
   reproduction either: the verdict is `UNVERIFIED ... not_compared=sink`

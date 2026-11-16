@@ -1988,7 +1988,7 @@ pub(crate) fn replay_c(
         return report_error(&output, finding_dir, &error);
     };
     let testcase_path = finding_dir.join("testcase.bin");
-    let trace_env: Vec<(String, String)> = if output.show_args {
+    let mut trace_env: Vec<(String, String)> = if output.show_args {
         vec![(
             corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
             "1".to_owned(),
@@ -1996,6 +1996,23 @@ pub(crate) fn replay_c(
     } else {
         Vec::new()
     };
+    // An oracle, assertion or capability finding is shown again by what the
+    // replay does, which the runtrace shim records.
+    let recorded_oracle = crate::replay_oracle::Recorded::from_finding(&raw);
+    let runtrace_log = match recorded_oracle
+        .as_ref()
+        .map(|_| crate::replay_oracle::RuntraceLog::create())
+        .transpose()
+    {
+        Ok(log) => log,
+        Err(error) => return report_error(&output, finding_dir, &error),
+    };
+    if let Some(log) = &runtrace_log {
+        trace_env.push((
+            "BHF_RUNTRACE_LOG".to_owned(),
+            log.path().display().to_string(),
+        ));
+    }
     let run = match run_c_testcase_with_env(
         &raw,
         runner,
@@ -2045,16 +2062,47 @@ pub(crate) fn replay_c(
             comparison = comparison_again;
         }
     }
-    let verdict = if report.is_some() {
+    let crash_verdict = if report.is_some() {
         comparison.verdict()
     } else {
         crash_identity::Verdict::Mismatch
     };
+    // A finding that is not a crash is the oracle hit or capability it
+    // records; a crash filed as the format-string bug is its crash, or else
+    // the format-string oracle at its call.
+    let observed = recorded_oracle.as_ref().and_then(|recorded| {
+        let events = runtrace_log
+            .as_ref()
+            .map(crate::replay_oracle::RuntraceLog::events)
+            .unwrap_or_default();
+        let observed = crate::replay_oracle::observe(
+            recorded,
+            &events,
+            &String::from_utf8_lossy(&run.stderr),
+            &testcase_path,
+        );
+        let decides = !recorded.is_crash()
+            || (crash_verdict == crash_identity::Verdict::Mismatch && observed.reproduced());
+        decides.then_some(observed)
+    });
+    let verdict = match &observed {
+        Some(observed) if observed.reproduced() => crash_identity::Verdict::Match,
+        Some(_) => crash_identity::Verdict::Mismatch,
+        None => crash_verdict,
+    };
+    if let Some(observed) = &observed {
+        comparison = crash_identity::Comparison {
+            checks: observed.checks.clone(),
+            same_binary,
+        };
+        notes.extend(observed.note.clone());
+    }
     let reproduced = verdict == crash_identity::Verdict::Match;
-    let actual = match (&report, run.timed_out) {
-        (Some(report), _) => report.rule_id.to_owned(),
-        (None, true) => "<timeout>".to_owned(),
-        (None, false) => "<none>".to_owned(),
+    let actual = match (observed.as_ref().map(|o| o.actual.as_deref()), &report) {
+        (Some(Some(rule)), _) => rule.to_owned(),
+        (None, Some(report)) => report.rule_id.to_owned(),
+        _ if run.timed_out => "<timeout>".to_owned(),
+        _ => "<none>".to_owned(),
     };
     let status_line = match verdict {
         crash_identity::Verdict::Match => "MATCH".to_owned(),
@@ -2062,7 +2110,7 @@ pub(crate) fn replay_c(
             "UNVERIFIED recorded={recorded_rule} actual={actual} not_compared={}",
             comparison.not_compared_fields()
         ),
-        crash_identity::Verdict::Mismatch if report.is_some() => format!(
+        crash_identity::Verdict::Mismatch if report.is_some() || observed.is_some() => format!(
             "MISMATCH recorded={recorded_rule} actual={actual} differs={}",
             comparison.differing_fields()
         ),
@@ -2071,7 +2119,7 @@ pub(crate) fn replay_c(
         }
     };
     let mut differences = comparison.difference_lines();
-    if report.is_none() {
+    if report.is_none() && observed.is_none() {
         differences.push(if run.timed_out {
             format!(
                 "no crash: the harness was still running after {}s and was killed",

@@ -891,8 +891,10 @@ first showed the site, which its oracle evidence names by `input_sha256`
 (left out, with the reason in the lineage, when the entry could not be read
 back), and `bhf explain` prints that lineage under the entry's sha256. An
 MSan finding also saves that entry as its `testcase.bin`. The capability profile folds what the whole corpus
-reached into one finding, so its lineage is `unknown` and the reason says
-so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
+reached into one finding, and saves as its `testcase.bin` the queue entry
+that reached the most of the finding's operands (named in
+`capability.testcase_operands`), so its lineage is that entry's; with no
+such entry it is `unknown` and the reason says so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
 the operator's inputs as they are: `user_seed`, depth `0`, with the file's
 path (`generated` for the empty input `bhf binary-fuzz` runs when it is given
 no seed). Findings saved before lineage was kept, and those of lanes that
