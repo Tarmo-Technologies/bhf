@@ -103,9 +103,26 @@ pub struct VerifyPocArgs {
     pub capsule: PathBuf,
 }
 
+/// `println!`, with the line made [`terminal_safe`]: a capsule's report and
+/// verdict quote what the target printed and what its manifest recorded.
+///
+/// [`terminal_safe`]: crate::terminal_text::terminal_safe
+macro_rules! safe_println {
+    ($($arg:tt)*) => {
+        println!("{}", crate::terminal_text::terminal_safe(&format!($($arg)*)))
+    };
+}
+
+/// `bhfeprintln!`, made terminal-safe as [`safe_println!`] is.
+macro_rules! safe_eprintln {
+    ($($arg:tt)*) => {
+        bhfeprintln!("{}", crate::terminal_text::terminal_safe(&format!($($arg)*)))
+    };
+}
+
 pub fn run(args: CapsuleArgs) -> i32 {
     if let Err(error) = crate::workdir::prepare(&args.work_dir) {
-        bhfeprintln!("error: {error:#}");
+        safe_eprintln!("error: {error:#}");
         return 1;
     }
     let requested = args.finding_id.is_some();
@@ -113,12 +130,12 @@ pub fn run(args: CapsuleArgs) -> i32 {
         match repro_lane::select(&args.work_dir, args.finding_id.as_deref(), Tool::Capsule) {
             Ok(selection) => selection,
             Err(error) => {
-                bhfeprintln!("error: {error}");
+                safe_eprintln!("error: {error}");
                 return 1;
             }
         };
     if selection.considered == 0 {
-        bhfeprintln!(
+        safe_eprintln!(
             "bhf capsule: no runtime crash findings in {}",
             args.work_dir.display()
         );
@@ -128,7 +145,7 @@ pub fn run(args: CapsuleArgs) -> i32 {
     let selection_refused = selection.refused.len();
     if selection.eligible.is_empty() {
         if !requested {
-            bhfeprintln!(
+            safe_eprintln!(
                 "bhf capsule: nothing packaged: none of the {} runtime finding(s) in {} can be \
                  packaged",
                 selection.considered,
@@ -149,7 +166,7 @@ pub fn run(args: CapsuleArgs) -> i32 {
     for (record, eligible) in selection.eligible {
         let Some(harness_dir) = eligible.harness_dir else {
             failed += 1;
-            bhfeprintln!(
+            safe_eprintln!(
                 "  {} failed: no dir of harness {} to package",
                 record.id,
                 eligible.harness_id
@@ -185,21 +202,21 @@ pub fn run(args: CapsuleArgs) -> i32 {
                     ),
                     (false, _) => format!("⚠ not reproduced: {}", report.not_reproduced_reason),
                 };
-                println!(
+                safe_println!(
                     "  {} {}  ({})",
                     report.finding_id,
                     report.capsule_path.display(),
                     mark
                 );
-                println!("      input: {}", report.input_note);
+                safe_println!("      input: {}", report.input_note);
                 if args.verbose {
-                    println!("      signature: {}", report.signature);
+                    safe_println!("      signature: {}", report.signature);
                     if let Some(compared) = &report.compared {
-                        println!("      compared: {compared}");
+                        safe_println!("      compared: {compared}");
                     }
                 }
                 for warning in &report.warnings {
-                    bhfeprintln!("  {} warning: {warning}", report.finding_id);
+                    safe_eprintln!("  {} warning: {warning}", report.finding_id);
                 }
             }
             Err(e) => match e.downcast_ref::<PlanRefusal>() {
@@ -215,12 +232,12 @@ pub fn run(args: CapsuleArgs) -> i32 {
                         finding.harness_id,
                     );
                     if requested {
-                        bhfeprintln!(
+                        safe_eprintln!(
                             "bhf capsule: cannot package {}: {reason}",
                             finding.finding_id
                         );
                     } else {
-                        bhfeprintln!("bhf capsule: {} skipped: {reason}", finding.finding_id);
+                        safe_eprintln!("bhf capsule: {} skipped: {reason}", finding.finding_id);
                     }
                     let record = repro_lane::FindingRecord {
                         id: finding.finding_id.clone(),
@@ -236,12 +253,12 @@ pub fn run(args: CapsuleArgs) -> i32 {
                     if let Some(alternative) =
                         repro_lane::alternative(&finding.work_dir, &record, &refusal)
                     {
-                        bhfeprintln!("  reproduce it with: {alternative}");
+                        safe_eprintln!("  reproduce it with: {alternative}");
                     }
                 }
                 None => {
                     failed += 1;
-                    bhfeprintln!("  {} failed: {e:#}", finding.finding_id);
+                    safe_eprintln!("  {} failed: {e:#}", finding.finding_id);
                 }
             },
         }
@@ -260,7 +277,7 @@ pub fn run(args: CapsuleArgs) -> i32 {
         0 => String::new(),
         n => format!("; {n} failed"),
     };
-    println!(
+    safe_println!(
         "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to \
          reproduce{skipped}{failures})",
         out_root.display()
@@ -1485,14 +1502,14 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     let (root, _scratch) = match resolve_capsule(&args.capsule) {
         Ok(v) => v,
         Err(e) => {
-            bhfeprintln!("error: {e}");
+            safe_eprintln!("error: {e}");
             return 1;
         }
     };
     let manifest = match read_json(&root.join("manifest.json")) {
         Some(m) => m,
         None => {
-            bhfeprintln!(
+            safe_eprintln!(
                 "error: not a bhf capsule (missing manifest.json): {}. `bhf capsule` writes \
                  the manifest last, so a dir without one was never finished; package the \
                  finding again",
@@ -1516,7 +1533,7 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     // Capsules written before lanes existed are C capsules.
     let tag = manifest.get("lang").and_then(Value::as_str).unwrap_or("c");
     let Some(lane) = repro_lane::lane_for(tag) else {
-        bhfeprintln!(
+        safe_eprintln!(
             "error: this capsule is for the `{tag}` lane, which this bhf cannot verify \
              (it verifies {} capsules); rebuild it by hand with `sh build.sh`",
             repro_lane::supported_language_names()
@@ -1536,13 +1553,13 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     };
     let missing: Vec<String> = requires.iter().filter_map(Requirement::missing).collect();
     if !missing.is_empty() {
-        println!(
+        safe_println!(
             "verify-poc: FAIL — cannot rebuild the {} capsule here; it needs {}:",
             lane.name(),
             repro_lane::describe_requirements(&requires)
         );
         for line in missing {
-            println!("  - {line}");
+            safe_println!("  - {line}");
         }
         return 1;
     }
@@ -1577,11 +1594,12 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     if let (false, Some(mismatch), Some(identity)) = (reproduced, &verification.mismatch, identity)
     {
         // It crashed, but not with the finding's crash.
-        println!(
+        safe_println!(
             "verify-poc: MISMATCH — {} (finding {finding}): {} differs",
-            mismatch.signature, mismatch.fields
+            mismatch.signature,
+            mismatch.fields
         );
-        println!(
+        safe_println!(
             "  expected: {}",
             describe_identity(
                 identity,
@@ -1589,7 +1607,7 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
             )
         );
         for difference in &mismatch.differences {
-            println!("  differs:  {difference}");
+            safe_println!("  differs:  {difference}");
         }
         return 1;
     }
@@ -1609,16 +1627,16 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         if packaged_reproducing {
-            println!("verify-poc: FAIL — the capsule did not rebuild+crash as expected");
-            println!("  finding:  {finding}");
-            println!("  expected: {expected}");
+            safe_println!("verify-poc: FAIL — the capsule did not rebuild+crash as expected");
+            safe_println!("  finding:  {finding}");
+            safe_println!("  expected: {expected}");
             match &verification.build_error {
                 Some(error) if !verification.built => {
-                    println!("  observed: the rebuild failed: {error}");
+                    safe_println!("  observed: the rebuild failed: {error}");
                 }
                 _ => match &verification.oracle_differences {
-                    Some(differences) => println!("  observed: {differences}"),
-                    None => println!("  observed: <no crash>"),
+                    Some(differences) => safe_println!("  observed: {differences}"),
+                    None => safe_println!("  observed: <no crash>"),
                 },
             }
         } else if manifest.get("rebuilt").and_then(Value::as_bool) == Some(false) {
@@ -1632,30 +1650,30 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                 .map(|error| format!(": {error}"))
                 .unwrap_or_default();
             if verification.built {
-                println!(
+                safe_println!(
                     "verify-poc: NOT REPRODUCIBLE — the capsule rebuilds here, but its input \
                      did not crash"
                 );
-                println!("  finding:  {finding}");
-                println!(
+                safe_println!("  finding:  {finding}");
+                safe_println!(
                     "  packaged: the crash was never replayed; the rebuild failed \
                      then{packaged_error}"
                 );
-                println!(
+                safe_println!(
                     "  note:     package the finding again where its harness builds to \
                      record whether its capsule reproduces it; `bhf explain --finding-id \
                      {finding}` shows what the fuzzing run depended on"
                 );
             } else {
-                println!(
+                safe_println!(
                     "verify-poc: NOT REPRODUCIBLE — the capsule's rebuild failed when it was \
                      packaged{packaged_error}"
                 );
-                println!("  finding:  {finding}");
+                safe_println!("  finding:  {finding}");
                 if let Some(error) = &verification.build_error {
-                    println!("  observed: the rebuild fails here too: {error}");
+                    safe_println!("  observed: the rebuild fails here too: {error}");
                 }
-                println!(
+                safe_println!(
                     "  fix:      the build, not the crash: run `{}` here to see the error, \
                      fix what the harness build needs (for example the flags its build \
                      recipe records), then package the finding again",
@@ -1667,13 +1685,13 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                 );
             }
         } else {
-            println!(
+            safe_println!(
                 "verify-poc: NOT REPRODUCIBLE — this capsule was recorded as \
                  non-reproducing when it was packaged, so there is nothing for it \
                  to verify"
             );
-            println!("  finding:  {finding}");
-            println!(
+            safe_println!("  finding:  {finding}");
+            safe_println!(
                 "  note:     the finding fired during fuzzing but not on a standalone \
                  replay (a warm fork-server state, an environment the shim faked, or \
                  a timing-dependent crash). `bhf explain --finding-id {finding}` \
@@ -1687,7 +1705,7 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     // (any sanitizer crash counts when it recorded none).
     let matched =
         identity.is_some() || expected.is_empty() || signature_matches(&expected, &observed);
-    println!(
+    safe_println!(
         "verify-poc: {} — {} (finding {finding})",
         if matched { "PASS" } else { "MISMATCH" },
         observed,
@@ -1697,8 +1715,8 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         .as_ref()
         .or(verification.oracle.as_ref())
     {
-        Some(check) if check.verdict == "match" => println!("  compared: {}", check.line),
-        Some(check) => println!("  note:     {}", check.line),
+        Some(check) if check.verdict == "match" => safe_println!("  compared: {}", check.line),
+        Some(check) => safe_println!("  note:     {}", check.line),
         None if lane.compares_identity() && matched => {
             let comparison = manifest.get("identity_comparison");
             let verdict = comparison
@@ -1709,9 +1727,9 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
                     .and_then(|comparison| comparison.get("reason"))
                     .and_then(Value::as_str)
                     .unwrap_or(NO_IDENTITY_REASON);
-                println!("  note:     {reason}");
+                safe_println!("  note:     {reason}");
             } else {
-                println!(
+                safe_println!(
                     "  note:     this capsule records no finding identity (packaged by an \
                      older bhf), so only the sanitizer class was compared"
                 );
@@ -1721,17 +1739,19 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     }
     if let Some(problems) = manifest.get("portability").and_then(Value::as_array) {
         if let Some(first) = problems.first().and_then(Value::as_str) {
-            println!("  note:     not portable when packaged: {first}");
+            safe_println!("  note:     not portable when packaged: {first}");
         }
     }
     if !matched {
-        println!("  expected: {expected}");
+        safe_println!("  expected: {expected}");
         let packaged = manifest
             .get("expected_signature")
             .and_then(Value::as_str)
             .filter(|packaged| *packaged != expected && !packaged.is_empty());
         if let Some(packaged) = packaged {
-            println!("  packaged: {packaged} (what the rebuilt PoC showed when it was packaged)");
+            safe_println!(
+                "  packaged: {packaged} (what the rebuilt PoC showed when it was packaged)"
+            );
         }
         return 1;
     }

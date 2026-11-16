@@ -26,6 +26,13 @@ Run `bhf --help` for the live top-level inventory and `bhf <command>
 particular, `auto` is the sixteen-lane entry point; `scan`, `list targets`,
 `generate-harness`, and the structured LLM/MCP harness helpers are narrower.
 
+Text a target controls (its report, an exception message, its own output, the
+fuzz input quoted in them) is printed with every control character other than
+tab and line breaks written as an escape: `\x1b`, `\x07`, `\u{9b}`, and
+`\u{202e}` for a bidirectional override. An escape sequence in a finding
+cannot retitle or clear the terminal it is shown in. The JSON outputs and the
+files under the work dir keep the text as it was.
+
 ## Common Flow
 
 ```sh

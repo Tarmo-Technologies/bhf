@@ -1674,6 +1674,8 @@ fn emit(summary: &ReplaySummary, output: OutputMode, captured: Result<(&[u8], &[
         lines.extend(session.lines());
     }
     for line in &lines {
+        // The replayed report and the finding quote what the target printed.
+        let line = crate::terminal_text::terminal_safe(line);
         if summary.verdict == "match" {
             println!("{line}");
         } else {
@@ -1694,7 +1696,7 @@ fn print_harness_output(stdout: &[u8], stderr: &[u8]) {
             continue;
         }
         bhfeprintln!("--- harness {name} ---");
-        let text = String::from_utf8_lossy(bytes);
+        let text = crate::terminal_text::terminal_safe_block(&String::from_utf8_lossy(bytes));
         bhfeprint!("{text}");
         if !text.ends_with('\n') {
             bhfeprintln!();

@@ -85,6 +85,9 @@ impl Console {
     }
 
     fn write_through(&self, text: &str, newline: bool) {
+        // What bhf prints quotes the targets it ran: their escape sequences
+        // are shown as escapes, never sent to the terminal.
+        let text = crate::terminal_text::terminal_safe_block(text);
         let mut inner = self.inner.lock().unwrap();
         let mut err = std::io::stderr().lock();
         erase(&mut err, inner.sticky.len());
@@ -166,7 +169,7 @@ pub fn set_active(console: Arc<Console>) {
 pub fn emit_line(line: &str) {
     match ACTIVE.get() {
         Some(console) => console.println(line),
-        None => eprintln!("{line}"),
+        None => eprintln!("{}", crate::terminal_text::terminal_safe_block(line)),
     }
 }
 
@@ -174,7 +177,7 @@ pub fn emit_line(line: &str) {
 pub fn emit(text: &str) {
     match ACTIVE.get() {
         Some(console) => console.print(text),
-        None => eprint!("{text}"),
+        None => eprint!("{}", crate::terminal_text::terminal_safe_block(text)),
     }
 }
 
@@ -200,7 +203,8 @@ fn draw(err: &mut impl Write, lines: &[String], tty: bool) {
         // Truncate rather than let the terminal wrap: a wrapped line occupies two
         // rows, and the erase above counts rows, so one wrap permanently
         // desynchronises the block from the scrollback.
-        let _ = writeln!(err, "\x1b[2K{}", truncate(line, width));
+        let line = crate::terminal_text::terminal_safe(line);
+        let _ = writeln!(err, "\x1b[2K{}", truncate(&line, width));
     }
 }
 

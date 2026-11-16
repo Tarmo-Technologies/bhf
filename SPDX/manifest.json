@@ -1979,6 +1979,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/terminal_text.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/test_support.rs",
       "license": "Apache-2.0"
     },
@@ -2560,6 +2564,10 @@
     },
     {
       "path": "crates/cli/tests/auto_target_filter.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_terminal_escapes.rs",
       "license": "Apache-2.0"
     },
     {

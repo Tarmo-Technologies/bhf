@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Console output escapes control characters in text a target controls. `bhf
+  auto`'s top findings printed a finding's message raw, so an escape sequence
+  in it could retitle or clear the operator's terminal. Every line bhf prints
+  to stderr, `bhf replay` and `bhf capsule`/`verify-poc` output, and `bhf
+  explain` now write C0 and C1 controls other than tab and line breaks as
+  escapes (`\x1b`, `\u{9b}`), with one shared formatter.
 - `bhf auto --deadline` (config key `deadline`) arms the response-deadline
   oracle for every fuzzed target; it was reachable only through an
   undocumented environment variable. A deadline that is not shorter than the
