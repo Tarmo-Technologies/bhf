@@ -168,11 +168,85 @@ pub struct RawEtwEvent<'a> {
 #[derive(Debug, Default)]
 pub struct EtwDecoder {
     file_objects: BTreeMap<u64, String>,
+    devices: DeviceMap,
+}
+
+/// The drive letter each NT volume device is mounted as. The kernel providers
+/// name files and images by device (`\Device\HarddiskVolume3\Windows\...`);
+/// the records carry the drive-letter path (`C:\Windows\...`) that the root,
+/// the taint matching and the path rules are written in.
+#[derive(Debug, Default, Clone)]
+pub struct DeviceMap {
+    /// `(device, drive)`: `\Device\HarddiskVolume3` and `C:`.
+    volumes: Vec<(String, String)>,
+}
+
+impl DeviceMap {
+    pub fn new(volumes: impl IntoIterator<Item = (String, String)>) -> Self {
+        DeviceMap {
+            volumes: volumes.into_iter().collect(),
+        }
+    }
+
+    /// The host's mounted drives, from `QueryDosDeviceW` on each drive letter.
+    #[cfg(windows)]
+    pub fn from_system() -> Self {
+        use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+        let mut volumes = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            let name: Vec<u16> = drive.encode_utf16().chain([0]).collect();
+            let mut target = [0u16; 1024];
+            // SAFETY: `name` is NUL-terminated and `target` is writable for the
+            // length passed.
+            let len =
+                unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+            if len == 0 {
+                continue;
+            }
+            // A multi-string: the first entry is the current mapping.
+            let first = target.split(|&unit| unit == 0).next().unwrap_or_default();
+            if !first.is_empty() {
+                volumes.push((String::from_utf16_lossy(first), drive));
+            }
+        }
+        DeviceMap { volumes }
+    }
+
+    /// `path` with its device spelled as the drive letter, and the `\??\`
+    /// and `\\?\` prefixes dropped; any other path unchanged.
+    pub fn to_dos(&self, path: &str) -> String {
+        for prefix in ["\\??\\", "\\\\?\\"] {
+            if let Some(rest) = path.strip_prefix(prefix) {
+                if rest.as_bytes().get(1) == Some(&b':') {
+                    return rest.to_owned();
+                }
+            }
+        }
+        for (device, drive) in &self.volumes {
+            let Some(head) = path.get(..device.len()) else {
+                continue;
+            };
+            let rest = &path[device.len()..];
+            if head.eq_ignore_ascii_case(device) && (rest.is_empty() || rest.starts_with('\\')) {
+                return format!("{drive}{rest}");
+            }
+        }
+        path.to_owned()
+    }
 }
 
 impl EtwDecoder {
     pub fn new() -> Self {
         EtwDecoder::default()
+    }
+
+    /// A decoder that spells device paths with `devices`' drive letters.
+    pub fn with_devices(devices: DeviceMap) -> Self {
+        EtwDecoder {
+            devices,
+            ..EtwDecoder::default()
+        }
     }
 
     /// Decode one ETW event into a [`WinRawRecord`], or `None` when the event is
@@ -181,7 +255,7 @@ impl EtwDecoder {
     pub fn decode(&mut self, ev: &RawEtwEvent<'_>) -> Option<WinRawRecord> {
         match ev.provider {
             EtwProvider::Process => self.decode_process(ev),
-            EtwProvider::Image => decode_image(ev),
+            EtwProvider::Image => decode_image(ev, &self.devices),
             EtwProvider::FileIo => self.decode_fileio(ev),
             EtwProvider::Other => None,
         }
@@ -211,7 +285,7 @@ impl EtwDecoder {
             OP_FILE_NAME | OP_FILE_FILE_CREATE | OP_FILE_FILE_DELETE | OP_FILE_FILE_RUNDOWN => {
                 let mut c = Cursor::new(ev.user_data, ev.pointer_size);
                 let file_object = c.ptr()?;
-                let path = c.utf16z()?;
+                let path = self.devices.to_dos(&c.utf16z()?);
                 if !path.is_empty() {
                     self.file_objects.insert(file_object, path.clone());
                 }
@@ -248,7 +322,7 @@ impl EtwDecoder {
                 let create_options = c.u32()?;
                 c.skip(4)?; // FileAttributes
                 c.skip(4)?; // ShareAccess
-                let path = c.utf16z()?;
+                let path = self.devices.to_dos(&c.utf16z()?);
                 if path.is_empty() {
                     return None;
                 }
@@ -339,7 +413,7 @@ fn decode_process_start(ev: &RawEtwEvent<'_>) -> Option<WinRawRecord> {
 /// `Image_Load` decode (pointer-size and version aware). Only the fields the
 /// collector needs — acting pid and image path — are surfaced; the rest of the
 /// MOF record is skipped by width.
-fn decode_image(ev: &RawEtwEvent<'_>) -> Option<WinRawRecord> {
+fn decode_image(ev: &RawEtwEvent<'_>, devices: &DeviceMap) -> Option<WinRawRecord> {
     if !matches!(ev.opcode, OP_IMAGE_LOAD | OP_IMAGE_DC_START) {
         // Unload and other image opcodes are not an observed "load".
         let _ = OP_IMAGE_UNLOAD;
@@ -359,7 +433,7 @@ fn decode_image(ev: &RawEtwEvent<'_>) -> Option<WinRawRecord> {
     }
     c.skip(ev.pointer_size.bytes())?; // DefaultBase
     c.skip(4 * 4)?; // Reserved1..4
-    let path = c.utf16z()?;
+    let path = devices.to_dos(&c.utf16z()?);
     if path.is_empty() {
         return None;
     }
@@ -1131,6 +1205,78 @@ mod tests {
     }
 
     // --- Class 4: LoadLibrary* / image-load. ---
+
+    /// A device path is spelled with its volume's drive letter; the match is
+    /// on the whole device name, and other paths pass through.
+    #[test]
+    fn device_paths_take_their_drive_letter() {
+        let devices = DeviceMap::new([
+            (r"\Device\HarddiskVolume3".to_owned(), "C:".to_owned()),
+            (r"\Device\HarddiskVolume30".to_owned(), "E:".to_owned()),
+        ]);
+        assert_eq!(
+            devices.to_dos(r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll"),
+            r"C:\Windows\System32\kernel32.dll"
+        );
+        assert_eq!(
+            devices.to_dos(r"\device\harddiskvolume30\data\in.bin"),
+            r"E:\data\in.bin"
+        );
+        assert_eq!(devices.to_dos(r"\??\C:\Temp\x.dll"), r"C:\Temp\x.dll");
+        assert_eq!(devices.to_dos(r"\\?\D:\x.dll"), r"D:\x.dll");
+        for unchanged in [r"\Device\Mup\server\share\x.dll", r"C:\x.dll", "x.dll"] {
+            assert_eq!(devices.to_dos(unchanged), unchanged);
+        }
+    }
+
+    /// The decoder hands on image and file paths with drive letters.
+    #[test]
+    fn decoded_paths_use_drive_letters() {
+        let devices = DeviceMap::new([(r"\Device\HarddiskVolume2".to_owned(), "C:".to_owned())]);
+        let image = Buf::new(PointerSize::Eight)
+            .ptr(0x7FF0_0000) // ImageBase
+            .ptr(0x20000) // ImageSize
+            .u32(1000) // ProcessId
+            .u32(0) // ImageChecksum
+            .u32(0) // TimeDateStamp
+            .u32(0) // Reserved0 (v2)
+            .ptr(0x7FF0_0000) // DefaultBase
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .utf16z("\\Device\\HarddiskVolume2\\plugins\\evil.dll")
+            .done();
+        let mut d = EtwDecoder::with_devices(devices);
+        match d.decode(&ev(
+            EtwProvider::Image,
+            OP_IMAGE_LOAD,
+            2,
+            PointerSize::Eight,
+            1000,
+            &image,
+        )) {
+            Some(WinRawRecord::ImageLoad { path, .. }) => {
+                assert_eq!(path, r"C:\plugins\evil.dll");
+            }
+            other => panic!("expected ImageLoad, got {other:?}"),
+        }
+        let name = Buf::new(PointerSize::Eight)
+            .ptr(0xAA)
+            .utf16z("\\Device\\HarddiskVolume2\\sandbox\\new.bin")
+            .done();
+        match d.decode(&ev(
+            EtwProvider::FileIo,
+            OP_FILE_FILE_CREATE,
+            2,
+            PointerSize::Eight,
+            1000,
+            &name,
+        )) {
+            Some(WinRawRecord::FileOp { path, .. }) => assert_eq!(path, r"C:\sandbox\new.bin"),
+            other => panic!("expected FileOp, got {other:?}"),
+        }
+    }
 
     #[test]
     fn decodes_image_load_64bit_v2() {

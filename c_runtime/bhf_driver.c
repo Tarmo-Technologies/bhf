@@ -347,8 +347,27 @@ BHF_NOCOV static int bhf_ev_site(const void *pc, uint32_t *site) {
         return 1;
     }
 #endif
+#if defined(_WIN32)
+    {
+        /* The image the process started: a compare from the C runtime or
+         * another DLL is not the program's. */
+        static uintptr_t base = 0, end = 0;
+        if (!base) {
+            const unsigned char *image = (const unsigned char *)GetModuleHandleA(NULL);
+            const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)image;
+            const IMAGE_NT_HEADERS *nt =
+                (const IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
+            end = (uintptr_t)image + nt->OptionalHeader.SizeOfImage;
+            base = (uintptr_t)image;
+        }
+        if (at < base || at >= end) return 0;
+        *site = (uint32_t)(at - base);
+        return 1;
+    }
+#else
     *site = (uint32_t)(at - (uintptr_t)&bhf_ev_open);
     return 1;
+#endif
 }
 /* The return addresses of the frames above `pc` on this thread's stack, as
  * executable offsets (0 for none or outside it). `pc` is a return address a
@@ -455,10 +474,13 @@ BHF_NOCOV static void bhf_ev_buf(unsigned kind, const void *pc, const void *s1, 
 static int bhf_cmplog_fd = -2;
 static uint32_t bhf_cmplog_written = 0;
 static uint64_t bhf_cmplog_seen[4096];
-BHF_NOCOV static void bhf_cmplog_open(void) {
 #ifdef _WIN32
-    bhf_cmplog_fd = -1;
-#else
+/* On Windows the log is opened for FILE_APPEND_DATA alone, which makes each
+ * WriteFile an atomic append, as O_APPEND is on POSIX: the harness and the
+ * fresh processes the engine starts beside it write the same log. */
+static HANDLE bhf_cmplog_handle = INVALID_HANDLE_VALUE;
+#endif
+BHF_NOCOV static void bhf_cmplog_open(void) {
     const char *on, *path;
     if (bhf_cmplog_fd != -2) return;
     bhf_cmplog_fd = -1;
@@ -466,6 +488,12 @@ BHF_NOCOV static void bhf_cmplog_open(void) {
     path = getenv("BHF_RUNTRACE_LOG");
     /* No strcmp here: under ASan it would call this driver's own weak hook. */
     if (!on || on[0] != '1' || on[1] != 0 || !path || !*path) return;
+#ifdef _WIN32
+    bhf_cmplog_handle = CreateFileA(path, FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (bhf_cmplog_handle != INVALID_HANDLE_VALUE) bhf_cmplog_fd = 0;
+#else
     bhf_cmplog_fd = bhf_open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
 #if defined(BHF_EV_BACKTRACE)
     if (bhf_cmplog_fd >= 0) {
@@ -524,7 +552,14 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t
 #undef BHF_CL_PUT
     if (bhf_cmplog_written + len > BHF_CMPLOG_MAX_BYTES) return;
     bhf_cmplog_written += len;
+#ifdef _WIN32
+    {
+        DWORD wrote = 0;
+        (void)WriteFile(bhf_cmplog_handle, line, (DWORD)len, &wrote, NULL);
+    }
+#else
     if (bhf_write(bhf_cmplog_fd, line, len) < 0) return;
+#endif
 }
 BHF_NOCOV static void bhf_cmplog_buf(const char *kind, const void *pc, const void *s1,
                                      const void *s2, size_t n, int stop_at_nul) {

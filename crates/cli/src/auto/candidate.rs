@@ -190,6 +190,28 @@ pub(crate) fn lang_tag(lang: Lang) -> &'static str {
     }
 }
 
+/// The language's name in prose ("Python", "C#").
+pub(crate) fn lang_name(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ada => "Ada",
+        Lang::C => "C",
+        Lang::Cpp => "C++",
+        Lang::Rust => "Rust",
+        Lang::Java => "Java",
+        Lang::Python => "Python",
+        Lang::Perl => "Perl",
+        Lang::Go => "Go",
+        Lang::Cobol => "COBOL",
+        Lang::Fortran => "Fortran",
+        Lang::CSharp => "C#",
+        Lang::Js => "JavaScript",
+        Lang::Ts => "TypeScript",
+        Lang::Ruby => "Ruby",
+        Lang::Lua => "Lua",
+        Lang::Php => "PHP",
+    }
+}
+
 /// A discovered, fuzz-eligible target. Constructed by
 /// `discovery::discover()` and consumed by `attempt::attempt()`.
 /// The `harness_id` is stable across runs (derived from source path,

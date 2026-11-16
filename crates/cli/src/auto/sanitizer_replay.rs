@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The bounds the post-fuzz MemorySanitizer and ThreadSanitizer corpus replays
+//! share, and the log of what each replayed run did.
+//!
+//! Each replayed input runs at most `min(--timeout, 30 s)`, and a run that
+//! times out is not retried: the input is a hang under that sanitizer, and an
+//! input that hung under one is not replayed under the other. A harness's
+//! replay stops at its per-target budget (`--per-target-time`). Every run is a
+//! line of `auto/sanitizer-replay.jsonl`.
+
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// The longest one replayed input may run, whatever `--timeout` says.
+pub(crate) const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The file every replayed run is logged to, under the work dir.
+pub(crate) const REPLAY_LOG: &str = "auto/sanitizer-replay.jsonl";
+
+/// The per-input run timeout for a replay: `--timeout`, capped at
+/// [`MAX_RUN_TIMEOUT`], which is also the default.
+pub(crate) fn run_timeout(timeout: Option<Duration>) -> Duration {
+    timeout
+        .map_or(MAX_RUN_TIMEOUT, |timeout| timeout.min(MAX_RUN_TIMEOUT))
+        .max(Duration::from_millis(1))
+}
+
+/// What one replayed run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunOutcome {
+    /// It ran to its end: clean, a report, or another exit.
+    Completed,
+    /// It ran past the run timeout and was killed.
+    TimedOut,
+    /// It did not start.
+    SpawnFailed,
+    /// It was not run: the input hung under another sanitizer.
+    SkippedKnownHang,
+}
+
+impl RunOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Completed => "completed",
+            RunOutcome::TimedOut => "timeout",
+            RunOutcome::SpawnFailed => "spawn_failed",
+            RunOutcome::SkippedKnownHang => "skipped_known_hang",
+        }
+    }
+}
+
+/// The bounds of one `bhf auto` run's sanitizer replays.
+pub struct ReplayBounds {
+    pub(crate) run_timeout: Duration,
+    /// How long one harness's replay may take, per sanitizer.
+    pub(crate) per_harness: Duration,
+    /// SHA-256 of each input that timed out under a sanitizer.
+    hangs: Mutex<HashSet<[u8; 32]>>,
+    log: Option<PathBuf>,
+}
+
+impl ReplayBounds {
+    /// Bounds for the replays: runs of `min(timeout, 30 s)`, `per_harness` per
+    /// harness and sanitizer, logged under `work_dir` when given.
+    pub fn new(timeout: Option<Duration>, per_harness: Duration, work_dir: Option<&Path>) -> Self {
+        let log = work_dir.map(|dir| dir.join(REPLAY_LOG));
+        if let Some(log) = &log {
+            let _ = std::fs::remove_file(log);
+        }
+        Self {
+            run_timeout: run_timeout(timeout),
+            per_harness,
+            hangs: Mutex::new(HashSet::new()),
+            log,
+        }
+    }
+
+    /// Bounds with `run_timeout`, no per-harness budget and no log.
+    #[cfg(test)]
+    pub(crate) fn unbounded(run_timeout: Duration) -> Self {
+        Self {
+            run_timeout,
+            per_harness: Duration::MAX,
+            hangs: Mutex::new(HashSet::new()),
+            log: None,
+        }
+    }
+
+    pub(crate) fn is_known_hang(&self, input: &[u8]) -> bool {
+        self.hangs
+            .lock()
+            .is_ok_and(|hangs| hangs.contains(&digest(input)))
+    }
+
+    pub(crate) fn note_hang(&self, input: &[u8]) {
+        if let Ok(mut hangs) = self.hangs.lock() {
+            hangs.insert(digest(input));
+        }
+    }
+
+    /// Append one run to the replay log.
+    pub(crate) fn log_run(
+        &self,
+        sanitizer: &str,
+        harness_id: &str,
+        input: &Path,
+        elapsed: Duration,
+        outcome: RunOutcome,
+    ) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let line = serde_json::json!({
+            "sanitizer": sanitizer,
+            "harness": harness_id,
+            "input": input.file_name().map(|name| name.to_string_lossy()),
+            "elapsed_ms": elapsed.as_millis() as u64,
+            "timeout_ms": self.run_timeout.as_millis() as u64,
+            "outcome": outcome.as_str(),
+        });
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn digest(input: &[u8]) -> [u8; 32] {
+    Sha256::digest(input).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_run_timeout_is_the_timeout_capped_at_30_seconds() {
+        assert_eq!(run_timeout(None), Duration::from_secs(30));
+        assert_eq!(
+            run_timeout(Some(Duration::from_secs(1))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            run_timeout(Some(Duration::from_secs(120))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(run_timeout(Some(Duration::ZERO)), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn an_input_that_hung_once_is_a_known_hang() {
+        let bounds = ReplayBounds::unbounded(Duration::from_secs(1));
+        assert!(!bounds.is_known_hang(b"spin"));
+        bounds.note_hang(b"spin");
+        assert!(bounds.is_known_hang(b"spin"));
+        assert!(!bounds.is_known_hang(b"other"));
+    }
+
+    #[test]
+    fn each_run_is_a_line_of_the_replay_log() {
+        let dir = crate::test_support::TestDir::new("sanitizer-replay-log");
+        let bounds = ReplayBounds::new(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(60),
+            Some(dir.path()),
+        );
+        bounds.log_run(
+            "tsan",
+            "H-1",
+            Path::new("queue/id-1"),
+            Duration::from_millis(1004),
+            RunOutcome::TimedOut,
+        );
+        let text = std::fs::read_to_string(dir.join(REPLAY_LOG)).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(line["sanitizer"], "tsan");
+        assert_eq!(line["input"], "id-1");
+        assert_eq!(line["elapsed_ms"], 1004);
+        assert_eq!(line["timeout_ms"], 1000);
+        assert_eq!(line["outcome"], "timeout");
+        // A new run starts a new log.
+        let _again = ReplayBounds::new(None, Duration::from_secs(60), Some(dir.path()));
+        assert!(!dir.join(REPLAY_LOG).exists());
+    }
+}

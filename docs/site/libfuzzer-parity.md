@@ -27,7 +27,7 @@ coming from `clang -fsanitize=fuzzer` know what to reach for.
 | `-use_value_profile=1` | cmplog / RedQueen (`--cmplog-log`) | See below. |
 | `inline-8bit-counters` / AFL `COUNT` buckets | always on (C/C++ driver) | Edge hit counts are bucketed (`1, 2, 3, 4-7, 8-15, …`) so a deeper loop or recursion is new coverage, not just edge presence (#420). |
 | laf-intel comparison split | `auto --comparison-progress` | Opt-in leading-byte-match gradient on multi-byte gates (#421); an `auto`-only flag. See below. |
-| `-merge=1` | `bhf corpus merge` (content duplicate handling) / `bhf corpus minimize --harness` (coverage-minimal) | `merge` handles duplicates by content; `minimize` replays each input and keeps only those that add a new corpus signature. |
+| `-merge=1` | `bhf corpus merge` (content duplicate handling) / `bhf corpus minimize --harness` (coverage-minimal, Ada harnesses only) | `merge` handles duplicates by content; `minimize` replays each input and keeps only those that add a new corpus signature, which only an Ada harness records. With any other harness it copies every input through, names the harness's lane and exits `2`, so it is not a coverage merge for C, C++ or the other lanes. |
 | `-minimize_crash=1` | `bhf minimize` | Shrink a crashing input by binary search while preserving the finding. |
 | `-seed_inputs` / corpus dir | `--seed-input` / `--seed-file` | Seed corpus. |
 | `-detect_leaks=1` | `--sanitizers lsan` | Part of the sanitizer matrix (asan/msan/ubsan/tsan/lsan). Native C/C++ harnesses only; every other language lane owns its instrumentation. Cross-compiled/emulated targets run without host sanitizer instrumentation (ASan's shadow memory does not survive qemu-user/wine), so the matrix is ignored and the run uses its portable feedback path. |
@@ -71,7 +71,10 @@ coverage signal. Comparison operands are captured two ways and fed to the mutato
 - **String / buffer gates** (`memcmp`, `strcmp`, `strncmp`, …): the generated
   driver defines the ASan `__sanitizer_weak_hook_*` family, which ASan's
   interceptors call with both operands (no libFuzzer runtime required); the
-  LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`.
+  LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`, in the
+  harness's own processes only (`BHF_TARGET_EXE`), not in a shell it runs.
+  When the driver's site-tagged records are present, the shim's untagged ones
+  add no dictionary tokens.
 - **Scalar / character gates** (`*c == '{'`, integer `==`, `switch`): the driver
   is compiled with `-fsanitize-coverage=trace-cmp` and its `trace_cmp*` /
   `trace_switch` callbacks record the integer operand pairs.

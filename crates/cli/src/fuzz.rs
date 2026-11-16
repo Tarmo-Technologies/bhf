@@ -563,9 +563,12 @@ pub struct FuzzArgs {
     pub max_session_messages: usize,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the harness performs even on a clean exit (#60). `auto` picks the
-    /// built-in provider for this platform (native Windows ETW; inactive on
-    /// Linux); a PATH runs an external sidecar that speaks the
+    /// effects the harness performs even on a clean exit (#60). `auto` selects the
+    /// built-in provider for the platform: the native Windows ETW provider
+    /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
+    /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
+    /// off` it writes no runtime-oracle findings) and stays inactive only when the
+    /// shim is unavailable. A PATH runs an external sidecar that speaks the
     /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
     /// collected semantic violation becomes a `binary_semantic` finding (no crash
     /// needed), with the raw collector session stored for deterministic replay.
@@ -1218,6 +1221,9 @@ struct PreparedFuzzRun {
     harness_id: String,
     harness_path: PathBuf,
     runner: replay_min::HarnessRunner,
+    /// Whether the loop reads the runtrace log for runtime-oracle findings:
+    /// false when only `--collector auto` armed the shim.
+    runtrace_oracles: bool,
     seeds: Vec<Vec<u8>>,
     /// sha256 (and path, for a file) of each seed this `bhf fuzz` was given
     /// (`--seed-input`, `--seed-file`), which its lineage names as user seeds.
@@ -1462,6 +1468,10 @@ pub fn run(args: FuzzArgs) -> i32 {
         }
     }
     if multicore_requested(&args) {
+        if let Some(error) = multicore_flag_conflict(&args) {
+            bhfeprintln!("{error}");
+            return 2;
+        }
         return run_multicore_campaign(args);
     }
 
@@ -1479,6 +1489,13 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     };
+    // The runtrace log this run armed and truncated, if any: the collector
+    // reads that one, never a log an earlier run left in the work dir.
+    let runtrace_log = prepared
+        .extra_env
+        .iter()
+        .find(|(key, _)| key == "BHF_RUNTRACE_LOG")
+        .map(|(_, value)| PathBuf::from(value));
 
     let result = match prepared.engine {
         FuzzEngine::Builtin => run_builtin(prepared),
@@ -1502,6 +1519,7 @@ pub fn run(args: FuzzArgs) -> i32 {
                 collector_window_ms,
                 &collector_work_dir,
                 &collector_harness,
+                runtrace_log.as_deref(),
             ) {
                 Ok(provenance) => {
                     value["collector"] = provenance;
@@ -1562,6 +1580,7 @@ fn run_collector_for_fuzz(
     window_ms: u64,
     work_dir: &Path,
     harness_id: &str,
+    runtrace_log: Option<&Path>,
 ) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context;
     let Some(resolved) = crate::collector_run::resolve(spec, window_ms)? else {
@@ -1585,45 +1604,52 @@ fn run_collector_for_fuzz(
         // behaviour or re-running the harness. This log spans the WHOLE campaign, so
         // the observation is labeled AGGREGATE (not a per-testcase replay) and never
         // fabricates a per-case testcase/pid (#76).
-        let log = work_dir.join("runtrace.jsonl");
-        if !log.is_file() {
+        match runtrace_log.filter(|log| log.is_file()) {
+            None =>
             // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
             // off`), so the collector observed nothing this run. Record a degraded,
             // not-observed run rather than evaluating an empty stream and claiming a
             // clean collector assurance over coverage it never had.
-            (
-                resolved.not_observed("runtime_shim_not_armed"),
-                crate::collector_run::ObservationMode::Aggregate,
-                Vec::new(),
-            )
-        } else {
-            let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
-            crate::auto::runtrace::dedupe_in_place(&mut events);
-            // Route sink confirmation through the SAME cross-execution correlation
-            // #59 uses: the aggregated log spans every execution, so the gate's
-            // never-untainted / constant-suppression applies across the whole run
-            // and no sink is single-run taint-confirmed.
-            let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
-            let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                testcase: "campaign-aggregate".to_owned(),
-                worker: 0,
-                // Synthetic anchor for the aggregate event tree; the shim events
-                // carry the real pids. Not a per-case OS pid claim.
-                root_pid: 1,
-            };
-            let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
-                &events,
-                &adapter_ctx,
-                harness_id,
-                &gate,
-            );
-            (
-                resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string()),
-                crate::collector_run::ObservationMode::Aggregate,
-                // Aggregate: no single triggering input, so the finding is
-                // campaign-level (its `coverage` says so), not reproducible from one.
-                Vec::new(),
-            )
+            {
+                (
+                    resolved.not_observed("runtime_shim_not_armed"),
+                    crate::collector_run::ObservationMode::Aggregate,
+                    Vec::new(),
+                )
+            }
+            Some(log) => {
+                let mut events = crate::auto::runtrace::parse_log(log).unwrap_or_default();
+                crate::auto::runtrace::dedupe_in_place(&mut events);
+                // Route sink confirmation through the SAME cross-execution correlation
+                // #59 uses: the aggregated log spans every execution, so the gate's
+                // never-untainted / constant-suppression applies across the whole run
+                // and no sink is single-run taint-confirmed.
+                let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
+                let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                    testcase: "campaign-aggregate".to_owned(),
+                    worker: 0,
+                    // Synthetic anchor for the aggregate event tree; the shim events
+                    // carry the real pids. Not a per-case OS pid claim.
+                    root_pid: 1,
+                };
+                let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                    &events,
+                    &adapter_ctx,
+                    harness_id,
+                    &gate,
+                );
+                (
+                    resolved.evaluate_aggregate_jsonl(
+                        &jsonl,
+                        &work_dir.display().to_string(),
+                        &oracle_lane_rules(&findings_dir, harness_id),
+                    ),
+                    crate::collector_run::ObservationMode::Aggregate,
+                    // Aggregate: no single triggering input, so the finding is
+                    // campaign-level (its `coverage` says so), not reproducible from one.
+                    Vec::new(),
+                )
+            }
         }
     } else {
         // Sidecar provider on the generic `fuzz` (harness) path: an honest replay
@@ -1644,17 +1670,33 @@ fn run_collector_for_fuzz(
         )
     };
     let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
+    // An aggregate observation is one session, the whole campaign: written
+    // once, beside the findings, for all of them.
+    let shared_evidence = match (observation, outcome.findings.first()) {
+        (crate::collector_run::ObservationMode::Aggregate, Some(first)) => {
+            use sha2::Digest;
+            let digest = corpus::hex_lower(&sha2::Sha256::digest(first.session_jsonl.as_bytes()));
+            let name = format!("aggregate-{}.jsonl", &digest[..16]);
+            let dir = findings_dir.with_file_name("collector");
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            std::fs::write(dir.join(&name), first.session_jsonl.as_bytes())
+                .with_context(|| format!("write {}", dir.join(&name).display()))?;
+            Some(format!("../../collector/{name}"))
+        }
+        _ => None,
+    };
     let mut ids = Vec::new();
     for finding in &outcome.findings {
         let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
         let dir = findings_dir.join(&id);
-        crate::collector_run::write_finding(
+        crate::collector_run::write_finding_with_evidence(
             &dir,
             &id,
             target.clone(),
             finding,
             &finding_input,
             observation,
+            shared_evidence.as_deref(),
         )?;
         ids.push(id);
     }
@@ -1662,6 +1704,26 @@ fn run_collector_for_fuzz(
     observation.stamp(&mut provenance);
     provenance["findings"] = serde_json::json!(ids);
     Ok(provenance)
+}
+
+/// The rules of the runtime-oracle findings already written for `harness_id`
+/// in `findings_dir`: the oracle lane's own findings, with their testcases, so
+/// the campaign-aggregate collector view does not repeat them.
+fn oracle_lane_rules(findings_dir: &Path, harness_id: &str) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(findings_dir) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path().join("finding.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|raw| {
+            raw["classification"] == "oracle_hit"
+                && raw.get("collector").is_none()
+                && raw["harness_id"] == harness_id
+        })
+        .filter_map(|raw| raw["rule_id"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Programmatic fuzz entry used by `bhf auto`. Builds a
@@ -2168,6 +2230,62 @@ fn engine_lane_conflict(args: &FuzzArgs) -> Option<String> {
     ))
 }
 
+/// The flags a multi-worker or sanitizer-matrix run carries out: its own, and
+/// those [`worker_passthrough_args`] gives every worker.
+const MULTICORE_FLAGS: &[&str] = &[
+    "--workers",
+    "--sanitizers",
+    "--grammar",
+    "--dict",
+    "--cmplog-log",
+    "--len-control",
+    "--rss-limit-mb",
+    "--fork-server",
+    "--no-fork-server",
+    "--qemu-user",
+    "--qemu-arg",
+    "--symbolic-seed-source",
+    "--sandbox",
+    "--sandbox-tool",
+    "--sandbox-strict",
+    "--runtime-oracles",
+    "--structured-inputs",
+    "--seed-input",
+    "--seed-file",
+    "--max-len",
+    "--timeout",
+    "--deadline",
+];
+
+/// Why a multi-worker or sanitizer-matrix run cannot carry out every flag it
+/// was given. Its workers are single-worker runs in their own work dirs, and
+/// the parent merges only their findings: a collector's evidence and
+/// provenance, an extension's verdicts or a final-stats line would stay in a
+/// worker's dir or log.
+fn multicore_flag_conflict(args: &FuzzArgs) -> Option<String> {
+    let dropped: Vec<&str> = given_flags(args)
+        .into_iter()
+        .filter(|flag| !MULTICORE_FLAGS.contains(flag))
+        .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    let lane = if args.sanitizers.len() > 1 {
+        "a sanitizer matrix (several --sanitizers)"
+    } else {
+        "--workers"
+    };
+    let one = dropped.len() == 1;
+    Some(format!(
+        "bhf fuzz: {} {} not apply to {lane}, whose workers would ignore {}; remove {}, or run \
+         one worker with one sanitizer",
+        dropped.join(", "),
+        if one { "does" } else { "do" },
+        if one { "it" } else { "them" },
+        if one { "it" } else { "them" },
+    ))
+}
+
 fn multicore_requested(args: &FuzzArgs) -> bool {
     if args.sanitizers.len() > 1 {
         return true;
@@ -2191,6 +2309,15 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
     // says about the harness is said here, once.
     for note in multicore_harness_notes(&args, &harness_path) {
         bhfeprintln!("note: {note}");
+    }
+    // Every worker loads the runtime oracles it is given; one it cannot load
+    // fails here, once, as a single-worker run does, before any worker starts.
+    let mode_label = args.mode.to_string().to_ascii_lowercase();
+    if let Err(error) =
+        crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+    {
+        bhfeprintln!("{error}");
+        return 3;
     }
     let (harness_dirs, harness_executable) =
         worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
@@ -2250,6 +2377,7 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
                 campaign_duplicates_of_existing(&config.work_dir, &summary, merge.as_ref());
             let printed = MulticoreRunSummary {
                 summary: &summary,
+                runtime_oracles: runtime_oracle_mode_arg_name(args.runtime_oracles),
                 merged_findings: merge.map(|merge| merge.merged).unwrap_or_default(),
                 duplicates_of_existing,
                 duplicate_crashes_of_existing,
@@ -2343,6 +2471,9 @@ fn multicore_harness_notes(args: &FuzzArgs, harness: &Path) -> Vec<String> {
 struct MulticoreRunSummary<'a> {
     #[serde(flatten)]
     summary: &'a multicore_fuzz::MulticoreSummary,
+    /// The `--runtime-oracles` mode every worker ran with; their oracle
+    /// findings are among `merged_findings`.
+    runtime_oracles: &'static str,
     /// Parent ids the workers' new findings were merged under.
     merged_findings: Vec<String>,
     /// Findings recorded before the campaign that its crashes matched (sorted
@@ -2726,7 +2857,36 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
             out.push(format!("--qemu-arg={arg}"));
         }
     }
+    if let Some(deadline) = args.deadline {
+        out.push("--deadline".to_owned());
+        out.push(format!("{}s", deadline.as_secs()));
+    }
+    if args.fork_server {
+        out.push("--fork-server".to_owned());
+    }
+    if args.no_fork_server {
+        out.push("--no-fork-server".to_owned());
+    }
+    if let Some(grammar) = &args.grammar_file {
+        out.push("--grammar".to_owned());
+        out.push(grammar.display().to_string());
+    }
+    if let Some(dict) = &args.dict_file {
+        out.push("--dict".to_owned());
+        out.push(dict.display().to_string());
+    }
+    out.push("--runtime-oracles".to_owned());
+    out.push(runtime_oracle_mode_arg_name(args.runtime_oracles).to_owned());
     out
+}
+
+fn runtime_oracle_mode_arg_name(mode: crate::runtime_oracles::RuntimeOracleMode) -> &'static str {
+    use crate::runtime_oracles::RuntimeOracleMode;
+    match mode {
+        RuntimeOracleMode::Auto => "auto",
+        RuntimeOracleMode::On => "on",
+        RuntimeOracleMode::Off => "off",
+    }
 }
 
 fn engine_arg_name(engine: FuzzEngine) -> &'static str {
@@ -2907,15 +3067,41 @@ fn prepare_with_runner(
     // The builtin loop already reads BHF_RUNTRACE_LOG, evaluates the oracle
     // registry + cross-execution taint tracker, and emits oracle findings — we
     // only supply the env that was missing on this path.
-    if !extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG") {
+    //
+    // Without them, `--collector auto` on Linux is the runtrace adapter, which
+    // reads the same log: arm the shim for it alone, and keep the runtime
+    // oracles' findings off, as `--runtime-oracles off` asks.
+    let mut runtrace_oracles = extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG");
+    if !runtrace_oracles {
         let mode_label = args.mode.to_string().to_ascii_lowercase();
-        if let Some(oracles) =
+        let oracles =
             crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                .map_err(|e| e.to_string())?;
+        runtrace_oracles = oracles.is_some();
+        let shim = match oracles {
+            Some(oracles) => Some(oracles),
+            None if !cfg!(windows)
+                && matches!(args.collector, crate::collector_run::CollectorSpec::Auto) =>
+            {
+                crate::runtime_oracles::RuntimeOracles::resolve(
+                    crate::runtime_oracles::RuntimeOracleMode::Auto,
+                    &mode_label,
+                )
                 .map_err(|e| e.to_string())?
-        {
+            }
+            None => None,
+        };
+        if let Some(shim) = shim {
             let oracle_log = work_dir.join("runtrace.jsonl");
             let _ = std::fs::write(&oracle_log, b"");
-            extra_env.extend(oracles.env_pairs(&oracle_log));
+            extra_env.extend(shim.env_pairs(&oracle_log));
+        }
+    }
+    // The shim records comparisons (`BHF_CMPLOG`) only in the harness's image,
+    // not in a shell or tool the harness runs.
+    if !extra_env.iter().any(|(key, _)| key == TARGET_EXE_ENV) {
+        if let Some(target) = native_target_exe(&harness_path) {
+            extra_env.push((TARGET_EXE_ENV.to_owned(), target.display().to_string()));
         }
     }
     // Only the standalone bhf-framed C/C++ driver carries the runtime that
@@ -2974,6 +3160,7 @@ fn prepare_with_runner(
         harness_id: args.harness,
         harness_path,
         runner,
+        runtrace_oracles,
         seeds,
         operator_seeds,
         iterations,
@@ -3969,7 +4156,11 @@ fn run_builtin_with_progress(
     };
     let mut productive_since_ceiling_raise = false;
     let mut execs_since_new_signature = 0_usize;
-    let mut runtrace_cursor = RuntraceLogCursor::from_extra_env(&prepared.extra_env);
+    let mut runtrace_cursor = if prepared.runtrace_oracles {
+        RuntraceLogCursor::from_extra_env(&prepared.extra_env)
+    } else {
+        RuntraceLogCursor::none()
+    };
     // #422: unified cross-execution byte-origin taint correlation for every
     // taint-confirmed sink oracle (path-open BHF-405, process-exec BHF-431, SSRF
     // BHF-433, library-load BHF-435, SQL BHF-441, destructive-fs BHF-440). Fed each
@@ -5057,6 +5248,14 @@ struct RuntraceLogCursor {
 }
 
 impl RuntraceLogCursor {
+    /// A cursor that reads no events.
+    fn none() -> Self {
+        Self {
+            path: None,
+            offset: 0,
+        }
+    }
+
     fn from_extra_env(extra_env: &[(String, String)]) -> Self {
         let path = extra_env
             .iter()
@@ -7451,6 +7650,24 @@ fn write_input_frame(stdin: &mut impl std::io::Write, input: &[u8]) -> std::io::
     let capped = input.len().min(FRAMED_INPUT_CAP);
     stdin.write_all(&(capped as u32).to_le_bytes())?;
     stdin.write_all(&input[..capped])
+}
+
+/// The variable naming the image the runtrace shim records comparisons in.
+const TARGET_EXE_ENV: &str = "BHF_TARGET_EXE";
+
+/// `harness` as an absolute path when it is a native executable (ELF), the
+/// image its process runs; `None` for a script or launcher, whose process
+/// runs an interpreter.
+fn native_target_exe(harness: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(harness)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .ok()?;
+    if magic != *b"\x7fELF" {
+        return None;
+    }
+    std::path::absolute(harness).ok()
 }
 
 /// The directory of the `BHF_RUNTRACE_LOG` path in `extra_env`, if set, so
@@ -12798,6 +13015,111 @@ exit 0
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
     }
 
+    /// A native executable is named as the shim's target image, by absolute
+    /// path; a script, whose process runs an interpreter, is not.
+    #[test]
+    fn native_target_exe_names_only_an_elf_harness() {
+        let dir = tmpdir();
+        let elf = dir.join("main");
+        fs::write(&elf, b"\x7fELF\x02\x01\x01").unwrap();
+        let script = dir.join("run.sh");
+        fs::write(&script, b"#!/bin/sh\nexec ./main\n").unwrap();
+        assert_eq!(native_target_exe(&elf), Some(elf.clone()));
+        assert!(native_target_exe(&elf).unwrap().is_absolute());
+        assert_eq!(native_target_exe(&script), None);
+        assert_eq!(native_target_exe(&dir.join("missing")), None);
+    }
+
+    /// Every flag a multi-worker run accepts, but the two the parent carries
+    /// out itself, reaches its workers.
+    #[test]
+    fn every_flag_a_multicore_run_accepts_reaches_its_workers() {
+        use crate::runner::SandboxModeArg;
+        use crate::runtime_oracles::RuntimeOracleMode;
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Json);
+        args.grammar_file = Some(args_dir.join("grammar.json"));
+        args.dict_file = Some(args_dir.join("tokens.dict"));
+        args.cmplog_log = Some(args_dir.join("cmplog.txt"));
+        args.len_control = DEFAULT_LEN_CONTROL + 1;
+        args.rss_limit_mb = 64;
+        args.fork_server = true;
+        args.no_fork_server = true;
+        args.qemu_user = Some(PathBuf::from("qemu-arm"));
+        args.qemu_args = vec!["-L".to_owned()];
+        args.symbolic_seed_sources = vec![args_dir.join("p.adb")];
+        args.sandbox = SandboxModeArg::None;
+        args.sandbox_tool = Some(PathBuf::from("fj"));
+        args.sandbox_strict = true;
+        args.runtime_oracles = RuntimeOracleMode::On;
+        args.seed_inputs = vec!["A".to_owned()];
+        args.seed_files = vec![args_dir.join("seed.bin")];
+        args.max_len = DEFAULT_MAX_LEN + 1;
+        args.timeout = Some(Duration::from_secs(1));
+        args.deadline = Some(Duration::from_secs(2));
+
+        let given = given_flags(&args);
+        let passthrough = worker_passthrough_args(&args);
+        for flag in MULTICORE_FLAGS
+            .iter()
+            .filter(|flag| !matches!(**flag, "--workers" | "--sanitizers"))
+        {
+            assert!(given.contains(flag), "this test does not set {flag}");
+            assert!(
+                passthrough
+                    .iter()
+                    .any(|arg| arg == flag || arg.starts_with(&format!("{flag}="))),
+                "{flag} does not reach the workers: {passthrough:?}"
+            );
+        }
+        for (flag, value) in [
+            ("--runtime-oracles", "on"),
+            ("--deadline", "2s"),
+            (
+                "--dict",
+                &*args_dir.join("tokens.dict").display().to_string(),
+            ),
+        ] {
+            assert!(
+                passthrough
+                    .windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "{flag} {value}: {passthrough:?}"
+            );
+        }
+        assert!(multicore_flag_conflict(&args).is_none());
+    }
+
+    /// A flag whose output the merge would not carry back is refused, by
+    /// name, for a multi-worker run and a sanitizer matrix.
+    #[test]
+    fn a_multicore_run_refuses_the_flags_its_workers_would_ignore() {
+        use crate::runtime_oracles::RuntimeOracleMode;
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
+        args.workers = Some(FuzzWorkerCount::Fixed(2));
+        args.runtime_oracles = RuntimeOracleMode::On;
+        assert_eq!(multicore_flag_conflict(&args), None);
+
+        args.collector = crate::collector_run::parse_collector_spec("auto").unwrap();
+        let error = multicore_flag_conflict(&args).expect("--collector is refused");
+        assert!(
+            error.starts_with("bhf fuzz: --collector does not apply to --workers"),
+            "{error}"
+        );
+
+        args.print_final_stats = true;
+        args.workers = None;
+        args.sanitizers = vec!["asan".to_owned(), "ubsan".to_owned()];
+        let error = multicore_flag_conflict(&args).expect("both are refused");
+        assert!(
+            error.starts_with(
+                "bhf fuzz: --print-final-stats, --collector do not apply to a sanitizer matrix"
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn multicore_workers_receive_seed_bytes_as_byte_exact_seed_files() {
         let args_dir = tmpdir();
@@ -14615,12 +14937,19 @@ exit 0
     fn collector_auto_without_shim_log_is_not_reported_clean() {
         let work = crate::test_support::TestDir::new("fuzz-col-noobs");
 
-        // No runtrace.jsonl is written (the shim was never armed).
+        // This run armed no shim. An earlier run's runtrace.jsonl is still in
+        // the work dir, and the collector must not read it as this run's.
+        std::fs::write(
+            work.join("runtrace.jsonl"),
+            "{\"e\":\"exec\",\"c\":\"/bin/sh -c id\",\"t\":0}\n",
+        )
+        .unwrap();
         let prov = run_collector_for_fuzz(
             &crate::collector_run::CollectorSpec::Auto,
             crate::collector_run::DEFAULT_WINDOW_MS,
             &work,
             "harness",
+            None,
         )
         .expect("collector provenance");
 

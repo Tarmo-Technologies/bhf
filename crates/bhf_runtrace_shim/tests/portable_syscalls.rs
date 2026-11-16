@@ -24,6 +24,9 @@ const PORTABLE_SYSCALLS: &[&str] = &[
     // semantics — the generic mmap, not the 32-bit-only page-offset mmap2. Used by
     // the #443 mmap interposer's raw passthrough (avoids dlsym-bootstrap recursion).
     "SYS_mmap",
+    // x86_64 (262) and aarch64 (79): the cmplog gate's stat of the running
+    // image and of BHF_TARGET_EXE, which must not reach the shim's stat hooks.
+    "SYS_newfstatat",
     "SYS_getpid",
     "SYS_getppid",
     "SYS_getuid",

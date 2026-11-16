@@ -64,8 +64,22 @@ Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
 version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
 producer-history entries; `manifest.json` keeps the last 1000), `counts`
 (`{total, by_kind, by_severity, by_confirmation}`), `findings[]`, `groups[]`
-(`{key, representative, members}`), and `errors[]` (`{path, reason}` for
-records that failed to load — a bad record never aborts the rebuild).
+(`{key, representative, members, observations}`), and `errors[]` (`{path,
+reason}` for records that failed to load — a bad record never aborts the
+rebuild).
+
+A root-cause group is the findings of one defect. A fuzz or runtime finding
+belongs to its **sink**: its first project frame (`location`, file and line)
+and its bug family. The families are out-of-bounds (CWE-119 to 127, 129, 131,
+787, 788, 823 and the like), null dereference, lifetime (use after free,
+double free), integer overflow, divide by zero, uninitialized memory, leak,
+race and format string; any other CWE is a family of its own. So one
+out-of-bounds read reached through two call stacks, or reported by ASan and
+by UBSan, is one group, keyed `sink-<hex>`. Findings that share a crash
+cluster, or the key a grouping pass gave the findings of one bug, stay in one
+group too. A sink group reached through more than one call stack lists them
+in `observations[]` (`{key, members}`, one per stack of functions, files and
+lines). INDEX.md says "Reached through N call stacks".
 
 ### Finding fields
 

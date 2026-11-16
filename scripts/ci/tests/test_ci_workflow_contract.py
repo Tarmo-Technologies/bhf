@@ -142,10 +142,8 @@ class WorkflowContractTests(unittest.TestCase):
         # Their end-to-end tests skip when GNU make is not on PATH, and the
         # runner image has none: it is installed before they run.
         steps = re.findall(r"(?m)^      - name: (.+)$", self.jobs["windows-build"])
-        self.assertLess(
-            steps.index("Install GNU make"),
-            steps.index("Test the Windows integration suites"),
-        )
+        for suite in ("Test the standalone harness drivers", "Test the Windows integration suites"):
+            self.assertLess(steps.index("Install GNU make"), steps.index(suite), suite)
         install = self.windows_step("Install GNU make").splitlines()
         commands = [index for index, line in enumerate(install) if line.strip().startswith("choco install make ")]
         self.assertEqual(len(commands), 1)

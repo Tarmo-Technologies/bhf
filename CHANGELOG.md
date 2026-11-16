@@ -45,6 +45,129 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The native Windows ETW collector no longer reports every DLL a target loads
+  as BHF-413. ETW names files and images by NT device
+  (`\Device\HarddiskVolume3\...`), which the check read as a search-path
+  load. The collector now spells them with the drive letter, and the check
+  treats `C:\Windows` and Program Files as system directories and Temp and
+  `C:\Users\Public` as writable ones. A process's own `.exe` image is no
+  longer a library load.
+- The native Windows ETW collector honours the host's replay handshake: it
+  roots its attribution at the PID the host writes to `BHF_COLLECTOR_TARGET_PID`
+  (events received before the handoff included) and traces until
+  `BHF_COLLECTOR_DONE`. It rooted at PID 0 and slept a fixed window, so every
+  `bhf binary fuzz --collector auto` replay on Windows degraded to
+  `replayed_process_not_observed`. A live Windows control (ShellExecute of the
+  input found, a constant command not) runs in CI, and windows.md and cli.md
+  claim native ETW findings only as far as it shows.
+- A C++ declaration of an unqualified standard type (`vector<int> items;` in a
+  pre-standard header) gets clang's `unknown type name 'vector'`, with its
+  source line, from bhf's cl front end, so the std-prelude repair works with
+  `--cc cl`. cl reports it as C2143, C4430, C3646, C2146 or C2238, which
+  name no type, and the target failed unclassified.
+- The C driver's runtime cmplog works on Windows: a native Windows harness
+  appends its `{"e":"cmplog",…}` records to the run's log through a
+  `FILE_APPEND_DATA` handle, so `bhf auto` writes a learned dictionary for
+  it, WinAFL campaigns included. It was compiled out. A comparison's site is
+  now limited to the executable's own image there, as on ELF.
+- A standalone Windows C harness built at `-O0` no longer faults on every
+  input in `bhf_cmp_buf`: the driver's runtime callbacks (`BHF_NOINSTR`) are
+  not address-checked on Windows, as `BHF_NOCOV`'s already were, since ASan's
+  interceptors reach them before its shadow memory is set up.
+- Without a compile database, a C harness gets the `-D`/`-U` defines a
+  non-executing scan of the project's CMakeLists.txt or Makefile finds,
+  labelled statically recovered in the harness Makefile. Only a few
+  header-capability macros used to apply, so code behind `#ifdef ENABLE_X`
+  that the build turns on was compiled out and its bugs missed. run.md's
+  fabricated-build-context warning names `--probe-build`.
+- `results/` groups fuzz and runtime findings by sink: their first project
+  frame and bug family. One out-of-bounds read in `tlv_decode`, reached
+  through two call stacks and reported by ASan and UBSan, was three findings
+  in three root-cause groups. It is now one group whose `observations` are
+  the two call stacks (new in `bhf.findings.v1`; INDEX.md says "Reached
+  through 2 call stacks").
+- A UBSan "applying non-zero offset N to null pointer" is an out-of-range
+  pointer (BHF-219, CWE-823), and inside a standard container's element
+  access an unvalidated index into an empty container (CWE-129). It was
+  labelled a NULL dereference. A finding recorded under the old rule still
+  replays as a match.
+- C# harness builds write every project's `obj/` and `bin/` under the
+  harness, not into the source tree. Two harnesses of one project, built at
+  once, raced on the project's `obj/` (MSB4018 in GenerateDepsFile, CS2012),
+  so with the default `--jobs` most targets of a project failed; all build
+  now. A failed build's report leads with its error lines, not the end of an
+  exception's stack. `--probe-build` no longer leaves an empty `.bhf-build`
+  in a tree it found no build system in.
+- C# preflight checks NuGet's global packages folder for the SharpFuzz 2.3.0
+  package the harness restores (offline only), and reports the lane MISSING it
+  when it is absent. Every target used to fail instead, with NU1101 filed as an
+  unrecognised error and C/C++ advice. A NuGet NU1101 or NU1102 is now a
+  `language_package` entry named with its version (`SharpFuzz 2.3.0`), with
+  staging steps; csharp.md documents them.
+- An installed bhf stages its embedded harness runtimes once, atomically, in
+  `<user cache>/bhf/runtime-<sha256>/` and reuses them. It wrote them to a
+  temporary directory it never removed, which generated Makefiles and
+  capsules named, so those no longer built once `/tmp` was cleaned. A cache
+  directory that cannot be written (a read-only container image) falls back
+  to a temporary directory, with a note.
+- The post-fuzz MSan and TSan corpus replays run each input for at most
+  `min(--timeout, 30 s)`, once if it times out. An input that hung under one
+  replay is skipped by the other, and a harness's replay stops at its
+  `--per-target-time`. They ran each input up to 30 s whatever `--timeout`
+  said, and TSan retried a timed-out run four times. Every run is a line of
+  `auto/sanitizer-replay.jsonl`.
+- A compile error in the project's own source (an undeclared identifier in
+  `bad.c`) is a `source_error` entry in `missing-deps.json`/`.txt` and a
+  `[failed-build]` in `bug-report.md`. It left the manifest empty, which then
+  said "the tree built against its own sources", and was filed as a bhf
+  `[codegen-bug]`. That sentence now appears only when every target built. A
+  lookup error counts as bhf's code generation only when it is located in the
+  generated driver or its repairs.
+- The blocker histogram (`auto/blockers.json`, run.md) keeps the identifier
+  each diagnostic names and a dialect's version: it turned every quoted name
+  into `X` and `Python 2` into `Python N`, so a row could not say what to
+  install or fix. Locations, other numbers and host paths are still
+  normalized.
+- `bhf corpus minimize` with a harness that records no corpus coverage (any
+  but an Ada harness) copies every input to `--out`, names the harness's lane
+  and exits 2. It kept no input, wrote an empty `--out` and exited 0.
+- `bhf generate-harness` refuses a source in a language other than C, C++
+  and Ada, naming the language and `bhf auto --target`; it parsed a `.py`,
+  `.rb` or `.go` file as Ada and reported that the subprogram was not found.
+- A shell or tool the target runs (`system`, `popen`, `exec`) no longer
+  records comparisons into the cmplog log: it inherited `LD_PRELOAD` and
+  `BHF_CMPLOG`, so most records were the shell's keyword lookups, and its
+  keywords became dictionary tokens. bhf names a native harness in
+  `BHF_TARGET_EXE`, and the shim records only in processes running that file,
+  fork-server children included. The shim records each distinct comparison
+  once per process and stops at 8 MiB of log across every process writing it;
+  `cmplog.jsonl` keeps each record once and stops at 8 MiB. Records without a
+  site add no dictionary tokens when site-tagged ones are present.
+- `bhf fuzz --collector auto` on Linux arms the runtrace shim it reads, so
+  the collector observes the run without `--runtime-oracles`; it reported
+  `runtime_shim_not_armed` and nothing else. With `--runtime-oracles off` the
+  run still writes no runtime-oracle findings. The `--collector` help of
+  `bhf fuzz` and `bhf binary fuzz` said `auto` is inactive on Linux; it now
+  says what the docs say.
+- A multi-worker or sanitizer-matrix `bhf fuzz` gives every worker
+  `--runtime-oracles`, `--grammar`, `--dict`, `--deadline` and the fork-server
+  switch, which it dropped, so its workers ran crash-only and a sink the
+  runtime oracles find went unreported. The summary records the
+  `runtime_oracles` mode. `--collector`, `--collector-window-ms`,
+  `--extension` and `--print-final-stats`, whose output would stay in a
+  worker's dir, are refused with exit 2 instead of ignored.
+- The Linux `--collector auto` view reads only the runtrace log the current
+  run armed; it re-read an earlier run's `runtrace.jsonl` left in the work dir.
+  `bhf replay` of a collector finding with no input reports UNVERIFIED (exit
+  4) instead of MATCH, and records no match.
+- `bhf fuzz --collector auto` on Linux writes at most one COL finding per rule,
+  oracle and API of its aggregate campaign view, none for a rule the
+  runtime-oracle lane already reported, at medium confidence and with no clean
+  assurance, and stores the campaign session once in `results/collector/`. It
+  deduplicated on a signature that held each input's command, so one fuzzed
+  `system()` wrote 240 high-confidence, clean-assurance findings with 0-byte
+  inputs, each with its own copy of the session. Linux effects carry their
+  POSIX API names (`execve`, `dlopen`).
 - `bhf build --target <triple>` of an Ada harness after a host build of the
   same harness compiles its runtime library again. It could link the host
   build's `adafuzz_cov.o` into the cross archive ("Relocations in generic

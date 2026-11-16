@@ -3,6 +3,10 @@
   "version": 1,
   "files": [
     {
+      "path": ".bhf.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".config/nextest.toml",
       "license": "Apache-2.0"
     },
@@ -1171,6 +1175,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/cmplog_target.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/determinism.rs",
       "license": "Apache-2.0"
     },
@@ -1568,6 +1576,10 @@
     },
     {
       "path": "crates/cli/src/auto/rust_build.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/auto/sanitizer_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2123,6 +2135,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_c_static_defines.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_c_syntax_check_round.rs",
       "license": "Apache-2.0"
     },
@@ -2131,7 +2147,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_cl_std_prelude.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_closure_failure_memo.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_cmplog_shell_children.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2192,6 +2216,10 @@
     },
     {
       "path": "crates/cli/tests/auto_cpp_producer_graph.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_csharp_isolation.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2491,6 +2519,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_sanitizer_replay_bounds.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_sarif_locations.rs",
       "license": "Apache-2.0"
     },
@@ -2500,6 +2532,10 @@
     },
     {
       "path": "crates/cli/tests/auto_sink_oracles_confirm.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_source_error_manifest.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2540,6 +2576,10 @@
     },
     {
       "path": "crates/cli/tests/auto_win32_scalars.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_windows_cmplog.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2599,6 +2639,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/collector_aggregate_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/collector_help.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/collector_mock.rs",
       "license": "Apache-2.0"
     },
@@ -2607,7 +2655,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/collector_win_live.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/corpus_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/corpus_minimize_lanes.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2632,6 +2688,10 @@
     },
     {
       "path": "crates/cli/tests/driver_inline_counters.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/embedded_runtime_cache.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2700,6 +2760,14 @@
     },
     {
       "path": "crates/cli/tests/fuzz_lane_flag_conflicts.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_multicore_flags.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/generate_harness_languages.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4128,6 +4196,10 @@
     },
     {
       "path": "crates/results/tests/golden.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/tests/sink_groups.rs",
       "license": "Apache-2.0"
     },
     {

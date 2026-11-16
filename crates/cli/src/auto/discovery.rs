@@ -598,7 +598,7 @@ fn languages_lost_to_exclusions(
 /// the file's contents (a `.h` can be either C or C++) or its full path (a
 /// `.d.ts` declares types and has no runtime code). A bare `.h` is deliberately
 /// absent here, since a header alone does not establish that C code exists.
-fn extension_lang_hint(path: &Path) -> Option<Lang> {
+pub(crate) fn extension_lang_hint(path: &Path) -> Option<Lang> {
     let ext = path.extension().and_then(|e| e.to_str())?;
     if ext == "C" {
         return Some(Lang::Cpp);

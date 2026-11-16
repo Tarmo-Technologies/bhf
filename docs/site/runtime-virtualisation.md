@@ -168,7 +168,8 @@ in the parent shell.
 | `BHF_FUZZ_INPUT_LEN` | harness | shim | Length of the fuzz input in the shared memfd |
 | `BHF_DISABLE_DLOPEN_FAKE` | user | shim | Opt out of synthetic `dlopen` / `dlsym` handles when a target uses struct-return-by-value through `dlsym` |
 | `BHF_FAKE_IDENTITY` | auto (replay) | shim | Enable deterministic `getpid`/`getuid`/`getgid`/`getppid` constants |
-| `BHF_CMPLOG` | auto | shim, C/C++ driver | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) into `BHF_RUNTRACE_LOG` |
+| `BHF_CMPLOG` | auto | shim, C/C++ driver | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) into `BHF_RUNTRACE_LOG`. The shim records each distinct comparison once per process, and none once the log holds 8 MiB |
+| `BHF_TARGET_EXE` | bhf (native harnesses) | shim | The harness executable. With it set, only a process running that file (the same device and inode as `/proc/self/exe`) records comparisons: the harness and the children it forks, such as the fork server's, but not a shell or tool it runs through `system`, `popen` or `exec` |
 | `BHF_CMP_EVIDENCE` | bhf (capture replays) | C/C++ driver | File the driver records every comparison of one run into, for the comparison evidence of a finding's input; unset during fuzzing |
 | `LD_PRELOAD` | auto | dynamic linker | Always includes the absolute path to `libbhf_runtrace.so`. Pre-existing values are preserved. |
 

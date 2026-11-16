@@ -87,7 +87,7 @@
         "primary": "c0ffee00c0ffee00",
         "signature": "aa11bb22"
       },
-      "group": "c0ffee00c0ffee00",
+      "group": "sink-260e750c873bfc20",
       "occurrences": 1,
       "first_seen": "2026-10-01T11:20:00Z",
       "last_seen": "2026-10-01T11:20:00Z",
@@ -789,7 +789,7 @@
   ],
   "groups": [
     {
-      "key": "c0ffee00c0ffee00",
+      "key": "sink-260e750c873bfc20",
       "representative": "F-0000-1a2b3c4d",
       "members": [
         "F-0000-1a2b3c4d"

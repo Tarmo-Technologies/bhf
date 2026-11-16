@@ -180,7 +180,12 @@ manually controlled layout. You do **not** need every asset for every install.
 The CLI archive carries every harness-runtime source tree. The CLI executable
 also embeds the same sources and stages a private copy automatically when it was
 installed by the shell or PowerShell installer, so prebuilt installs do not
-need a bhf source checkout.
+need a bhf source checkout. The copy goes to the user's cache,
+`$XDG_CACHE_HOME/bhf/runtime-<sha256>/` (else `~/.cache/bhf/…`, and
+`%LOCALAPPDATA%\bhf\…` on Windows), named by the content's digest. It stays
+there: generated harness Makefiles name it, and every later run of the same
+release reuses it. Set `BHF_FORCE_EMBEDDED_RUNTIMES=1` to use the embedded copy
+even when runtime directories sit beside the executable.
 
 ### Choose release assets by task
 

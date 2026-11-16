@@ -388,12 +388,18 @@ bug-oracle registry as the runtime oracles, so a controlled process execution
 load (BHF-435) becomes a `kind: binary_semantic` finding **with no crash**. Unlike
 `--runtime-oracles` (the in-process Linux `LD_PRELOAD` layer), the collector is a
 decoupled provider addressed by the JSONL wire format, so an out-of-repo provider
-can implement it: `auto` selects the built-in provider for the platform — the
+can implement it: `auto` selects the built-in provider for the platform: the
 native Windows ETW provider `bhf-collector-win`, or on Linux the in-process
-`LD_PRELOAD` runtrace adapter that re-expresses the shim's effect events as the
-collector contract (it stays inactive only when the runtrace shim is unavailable).
+`LD_PRELOAD` runtrace adapter, which arms the runtrace shim for the run (with
+`--runtime-oracles off` it writes no runtime-oracle findings) and stays inactive
+only when the shim is unavailable. The adapter re-expresses the shim's effect
+events as the collector contract.
 A PATH runs an external sidecar that speaks the protocol, and `none` (default)
-disables it, leaving behaviour unchanged. The collector is an *additional*,
+disables it, leaving behaviour unchanged. On Windows, `bhf binary fuzz` replays a
+retained input under the native sidecar, which roots its attribution at the PID
+the host hands it. The live controls show a controlled process execution
+(BHF-431) found through `ShellExecuteEx`, and no finding for a constant command;
+see [Windows](windows.md). `bhf fuzz` does not replay a harness under a sidecar. The collector is an *additional*,
 collector-shaped view over the same shim events `--runtime-oracles` uses, so
 enabling it does not change `--runtime-oracles` behaviour.
 A collector finding stores its raw `CollectorSession` evidence next to
@@ -408,6 +414,18 @@ scope, the observation window, the backend's declared **supported event classes*
 (kept distinct from the classes actually **observed** firing this run), and the
 fidelity limitations. `bhf minimize` on a collector finding is a no-op (the provider-captured
 evidence does not vary with the testcase bytes) that re-confirms reproduction.
+On Linux, `bhf fuzz --collector auto` reads the whole campaign's runtrace as one
+*aggregate* session: it keeps one finding per rule, oracle and API (a fuzzed
+`system()` runs a different command for each input, which the replay view would
+count as distinct violations), writes none for a rule the runtime-oracle lane
+already reported with its testcase, labels the effects with their POSIX APIs
+(`execve`, `dlopen`), records them at `medium` confidence with no clean
+assurance, and stores the session once, in `results/collector/`, which each
+finding's `paths.collector_evidence` names. It reads the runtrace log this run
+armed (and emptied when it armed it), never one an earlier run left in the work
+dir. Such a finding has no input, so `bhf replay` reports it `UNVERIFIED`
+(exit `4`) when its evidence still produces its signature: nothing replayed an
+input of it.
 
 `bhf binary fuzz` also accepts **user-defined postcondition oracles** with
 per-case fixture hooks: `--setup-command` runs before each testcase (prepare a
@@ -1328,6 +1346,13 @@ counting those crashes), with the same one-line note on stderr. That covers a
 worker's copy the merge finds to duplicate a recorded finding and a crash a
 worker skipped because its tree still holds such a copy from an earlier
 campaign (`per_worker[].duplicates_of_existing` names that copy).
+Every worker gets the run's `--runtime-oracles` mode (the summary's
+`runtime_oracles`), so its oracle findings merge with its crashes; `on` without
+a usable runtrace shim exits `3` before any worker starts. Every worker also
+gets `--grammar`, `--dict`, `--deadline` and the fork-server switch. A flag
+whose output stays in a worker's own dir or log is refused, with exit `2` and
+the flag named: `--collector`, `--collector-window-ms`, `--extension` and
+`--print-final-stats`. Run those with one worker and one sanitizer.
 When every worker exits non-zero (or is killed by a signal), `bhf fuzz` exits
 non-zero (the workers' shared exit code, else `1`). Workers stopped at the time
 limit fuzzed until then: when they recorded findings, the campaign keeps its
@@ -1437,6 +1462,10 @@ name, a `::`-qualified suffix (`Parser::parse`), the fully qualified name as
 exact spelling wins over a suffix, a leading `::` names the global namespace
 only, and a miss lists the closest definitions. The generated harness is Makefile-based, so
 `bhf build` runs `make` and stages `build/<harness-id>/main`.
+`bhf generate-harness` writes C, C++ and Ada harnesses only: a source in
+another language `bhf auto` fuzzes (Python, Ruby, Go, Java, Rust and the
+rest) is refused with its language named, and `bhf auto <dir> --target
+<function>` builds that harness instead.
 
 ```sh
 bhf generate-harness src/parser.cpp --target Parser::parse --output bhf_work/harnesses

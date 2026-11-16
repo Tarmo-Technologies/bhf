@@ -454,8 +454,10 @@ race whose report names a frame in the target's own source becomes a BHF-556
 (CWE-362) finding.
 The run summary says what the replay could not conclude:
 
-- **unmeasured:** inputs whose TSan run never completed (a timeout or a failed
-  start), after retries. They are not race-free, only unexamined.
+- **unmeasured:** inputs whose TSan run never completed (a timeout, or a
+  start that failed on every retry), inputs that hung under the MSan replay,
+  and the rest of a corpus whose replay reached the harness's budget. They are
+  not race-free, only unexamined.
 - **unattributed:** races TSan reported with no symbolized frame. They are real
   but unlocated. Install `llvm-symbolizer` or keep debug info to locate them.
 - **run again:** inputs whose first run exited cleanly with no report. Each such
@@ -468,6 +470,16 @@ The run summary says what the replay could not conclude:
   run brings that to about one in four hundred. The extra run uses the same
   per-run timeout and timeout budget as every other replay run. If it does not
   finish, the input keeps the clean result of its first run.
+
+### Bounds of the MSan and TSan replays
+
+Each replayed input runs for at most `--timeout`, or 30 s, whichever is less.
+A run past it is a hang under that sanitizer: it is not run again, and the
+replay that comes next (TSan, after MSan) skips that input. A harness's replay
+stops when it has taken the harness's `--per-target-time`. Every run is a line
+of `auto/sanitizer-replay.jsonl`: the sanitizer, harness, input, `elapsed_ms`,
+`timeout_ms` and the outcome (`completed`, `timeout`, `spawn_failed` or
+`skipped_known_hang`).
 
 ## When to use which
 

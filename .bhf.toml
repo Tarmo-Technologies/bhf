@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Run options `bhf auto` and `bhf ci` load when they scan this repository.
+#
+# bhf's language drivers and runtimes (c_runtime/, python_runtime/,
+# crates/rust_runtime/, ...) are the code its harnesses run in, not fuzz
+# targets: a harness of a driver function includes the driver twice.
+exclude-path = ["_runtime/"]

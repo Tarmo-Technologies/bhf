@@ -1410,6 +1410,13 @@ mod tests {
             &bin_dir.join("aarch64-linux-gnu-gnat"),
             fake_raw_gnat_canary_script(),
         );
+        // A prefixed gnatmake, when there is one, runs the canary instead of
+        // gnat; fake that too, so a host with a real AArch64 GNAT on PATH
+        // does not run its own.
+        write_executable(
+            &bin_dir.join("aarch64-linux-gnu-gnatmake"),
+            fake_raw_gnat_canary_script(),
+        );
         let build_log_path = temp.join("build-args.log");
         let gnat_log_path = temp.join("raw-gnat.log");
         let _path = PathEnvGuard::prepend(&bin_dir);

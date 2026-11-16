@@ -172,9 +172,11 @@ pub(crate) mod standalone_driver {
     use std::process::{Command, ExitStatus, Stdio};
 
     /// Compile `out/<main>` and `sources` with `compiler` and
-    /// AddressSanitizer at `-O1`, as the generated Makefile builds a harness,
-    /// using the harness's own driver, into `out/standalone`. `None` (the
-    /// test skips) when `compiler` is missing.
+    /// AddressSanitizer, using the harness's own driver, into
+    /// `out/standalone`. `None` (the test skips) when `compiler` is missing.
+    /// At `-O0`, which inlines nothing: the driver's runtime callbacks
+    /// (`bhf_cmp_buf`) are then real calls, as in a debug build of a harness,
+    /// and must not be address-checked before ASan's shadow is set up.
     pub(crate) fn build(
         out: &Path,
         compiler: &str,
@@ -194,7 +196,7 @@ pub(crate) mod standalone_driver {
         let mut command = Command::new(compiler);
         command.args([
             "-g",
-            "-O1",
+            "-O0",
             "-fsanitize=address",
             "-D_GNU_SOURCE",
             "-D_DEFAULT_SOURCE",

@@ -311,21 +311,37 @@ pub(crate) fn auto_iteration_cap(explicit: Option<usize>) -> usize {
     }
 }
 
+/// The most bytes of records the per-target cmplog snapshot holds.
+pub(crate) const MAX_CMPLOG_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+
 /// #378: append the `{"e":"cmplog",...}` records from a pass's runtrace log to
 /// the per-target cmplog snapshot, so comparison operands accumulate across
 /// passes and feed the next pass's mutator (libFuzzer-style cmplog/RedQueen).
 /// Runtrace event lines (non-cmplog) are skipped; absent/unreadable logs are a
-/// no-op.
+/// no-op. A record the snapshot already holds is not added again, and the
+/// snapshot stops growing at [`MAX_CMPLOG_SNAPSHOT_BYTES`].
 pub(crate) fn append_cmplog_records(runtrace_log: &std::path::Path, snapshot: &std::path::Path) {
+    if std::fs::metadata(snapshot).is_ok_and(|held| held.len() >= MAX_CMPLOG_SNAPSHOT_BYTES as u64)
+    {
+        return;
+    }
     let Ok(contents) = std::fs::read_to_string(runtrace_log) else {
         return;
     };
+    let held = std::fs::read_to_string(snapshot).unwrap_or_default();
+    let mut seen: std::collections::HashSet<&str> = held.lines().collect();
+    let mut size = held.len();
     let mut records = String::new();
     for line in contents.lines() {
-        if line.contains("\"e\":\"cmplog\"") {
-            records.push_str(line);
-            records.push('\n');
+        if !line.contains("\"e\":\"cmplog\"") || !seen.insert(line) {
+            continue;
         }
+        if size + line.len() + 1 > MAX_CMPLOG_SNAPSHOT_BYTES {
+            break;
+        }
+        size += line.len() + 1;
+        records.push_str(line);
+        records.push('\n');
     }
     if records.is_empty() {
         return;
@@ -2762,12 +2778,14 @@ fn run_attempt(
                 });
             }
             crate::auto::csharp_build::CSharpBuildResult::Failed(reason) => {
+                let mut last_errors = build_classifier::classify(&reason);
+                crate::auto::csharp_build::fill_package_versions(&mut last_errors, &harness_dir);
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
                     outcome: Outcome::FailedBuild {
                         repairs: Vec::new(),
                         retries: 0,
-                        last_errors: build_classifier::classify(&reason),
+                        last_errors,
                     },
                     harness_dir,
                 });
@@ -12668,7 +12686,7 @@ mod source_dictionary_tests {
 
 #[cfg(test)]
 mod cmplog_accumulate_tests {
-    use super::{append_cmplog_records, harvest_pass_cmplog};
+    use super::{append_cmplog_records, harvest_pass_cmplog, MAX_CMPLOG_SNAPSHOT_BYTES};
 
     /// After a pass, its runtrace cmplog records reach cmplog.jsonl and the
     /// learned dictionary the next pass and later runs load.
@@ -12724,6 +12742,36 @@ mod cmplog_accumulate_tests {
         );
         assert!(lines.iter().all(|l| l.contains("\"e\":\"cmplog\"")));
         assert!(!acc.contains("getenv") && !acc.contains("open"));
+    }
+
+    /// A record the snapshot holds, or one a pass logged twice, is added once,
+    /// and the snapshot stops at its cap.
+    #[test]
+    fn append_cmplog_records_dedupes_and_caps_the_snapshot() {
+        let dir = crate::test_support::TestDir::new("cmplog-dedupe");
+        let runtrace = dir.join("runtrace.jsonl");
+        let snapshot = dir.join("cmplog.jsonl");
+        let record = |n: usize| {
+            format!("{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{n:08x}\",\"b\":\"00\"}}")
+        };
+        let pass = [record(1), record(2), record(1)].join("\n");
+        std::fs::write(&runtrace, &pass).unwrap();
+        append_cmplog_records(&runtrace, &snapshot);
+        append_cmplog_records(&runtrace, &snapshot);
+        let acc = std::fs::read_to_string(&snapshot).unwrap();
+        assert_eq!(acc, format!("{}\n{}\n", record(1), record(2)));
+
+        let line = record(0).len() + 1;
+        let many: Vec<String> = (0..MAX_CMPLOG_SNAPSHOT_BYTES / line + 10)
+            .map(record)
+            .collect();
+        std::fs::write(&runtrace, many.join("\n")).unwrap();
+        append_cmplog_records(&runtrace, &snapshot);
+        let size = std::fs::metadata(&snapshot).unwrap().len() as usize;
+        assert!(size <= MAX_CMPLOG_SNAPSHOT_BYTES, "{size}");
+        assert!(size > MAX_CMPLOG_SNAPSHOT_BYTES - line, "{size}");
+        append_cmplog_records(&runtrace, &snapshot);
+        assert_eq!(std::fs::metadata(&snapshot).unwrap().len() as usize, size);
     }
 }
 

@@ -13,6 +13,14 @@
 //! malloc / Box / Vec / String from inside the hooks. Operands
 //! are emitted as base64-of-hex pairs via the existing
 //! jsonl::Builder fixed-buffer path.
+//!
+//! Only the target records. A shell or tool it runs (`system`, `popen`, an
+//! `exec`) inherits `LD_PRELOAD` and `BHF_CMPLOG`, and its comparisons are
+//! not the target's: when `BHF_TARGET_EXE` names the harness, a process
+//! whose image is another file records nothing. A forked child, such as a
+//! fork server's, runs the same image and records. A process records each
+//! distinct comparison once, and none once the log holds
+//! [`MAX_CMPLOG_LOG_BYTES`], however many processes write it.
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::missing_transmute_annotations)]
@@ -23,7 +31,18 @@ use crate::reentrancy::HookGuard;
 use crate::sdk::FakeResource;
 
 const ENV_VAR: &[u8] = b"BHF_CMPLOG\0";
+const TARGET_EXE_VAR: &[u8] = b"BHF_TARGET_EXE\0";
 const MAX_OPERAND_BYTES: usize = 64;
+
+/// Comparisons stop being recorded once the shared log holds this many
+/// bytes.
+const MAX_CMPLOG_LOG_BYTES: u64 = 8 * 1024 * 1024;
+/// Records a process writes between two looks at the log's size.
+const SIZE_CHECK_EVERY: u32 = 256;
+/// Slots of the per-process table of comparisons already recorded.
+const SEEN_SLOTS: usize = 4096;
+/// Slots a comparison's hash probes before it is recorded unseen.
+const SEEN_PROBES: usize = 8;
 
 static REAL_STRCMP: ResolvedFn = ResolvedFn::new(b"strcmp\0");
 static REAL_STRNCMP: ResolvedFn = ResolvedFn::new(b"strncmp\0");
@@ -38,9 +57,129 @@ pub fn env_enabled() -> bool {
     }
     let value = unsafe { libc::getenv(ENV_VAR.as_ptr() as *const libc::c_char) };
     let enabled = !value.is_null()
-        && crate::reentrancy::bytes_eq(unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes(), b"1");
+        && crate::reentrancy::bytes_eq(unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes(), b"1")
+        && process_is_target();
     CACHED.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
     enabled
+}
+
+/// Whether this process runs the image `BHF_TARGET_EXE` names: the same file
+/// (device and inode) as `/proc/self/exe`, so a symlink or a sandbox's bind
+/// mount of the harness still matches. True when the variable is unset or
+/// either file cannot be looked at.
+fn process_is_target() -> bool {
+    let target = unsafe { libc::getenv(TARGET_EXE_VAR.as_ptr() as *const libc::c_char) };
+    if target.is_null() || unsafe { *target } == 0 {
+        return true;
+    }
+    match (file_id(c"/proc/self/exe".as_ptr()), file_id(target)) {
+        (Some(running), Some(target)) => running == target,
+        _ => true,
+    }
+}
+
+/// The device and inode of the file at `path`, through the raw `newfstatat`
+/// syscall: the shim hooks `stat`, and a comparison hook must not log one.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn file_id(path: *const libc::c_char) -> Option<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `path` is NUL-terminated and `stat` is a writable `struct stat`,
+    // the layout the kernel's newfstatat fills on these architectures.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            libc::AT_FDCWD,
+            path,
+            stat.as_mut_ptr(),
+            0,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: the syscall succeeded and filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Some((stat.st_dev, stat.st_ino))
+}
+
+/// Elsewhere the shim does not tell the target's image apart.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn file_id(_path: *const libc::c_char) -> Option<(libc::dev_t, libc::ino_t)> {
+    None
+}
+
+/// FNV-1a over a comparison's kind and operands, never 0 (an empty slot).
+fn comparison_hash(kind: &[u8], a: &[u8], b: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for part in [kind, a, b] {
+        for byte in part {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // A separator, so moving bytes between operands changes the hash.
+        hash = (hash ^ 0xff).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+/// Whether this process has not recorded the comparison with `hash` yet;
+/// marks it recorded. A comparison that finds every probed slot taken by
+/// others counts as new.
+fn first_time(hash: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: AtomicU64 = AtomicU64::new(0);
+    static SEEN: [AtomicU64; SEEN_SLOTS] = [EMPTY; SEEN_SLOTS];
+    let start = (hash as usize) % SEEN_SLOTS;
+    for probe in 0..SEEN_PROBES {
+        let slot = &SEEN[(start + probe) % SEEN_SLOTS];
+        match slot.compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(held) if held == hash => return false,
+            Err(_) => {}
+        }
+    }
+    true
+}
+
+/// Records since this process last looked at the log's size; it starts, and
+/// a forked child restarts, due for a look.
+static SINCE_SIZE_CHECK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SIZE_CHECK_EVERY);
+static LOG_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the shared log has room for comparisons: its size, which every
+/// process writing it adds to, is looked at on a process's first record and
+/// every [`SIZE_CHECK_EVERY`] records after.
+fn log_has_room() -> bool {
+    use std::sync::atomic::Ordering;
+    if LOG_FULL.load(Ordering::Relaxed) {
+        return false;
+    }
+    if SINCE_SIZE_CHECK.fetch_add(1, Ordering::Relaxed) + 1 >= SIZE_CHECK_EVERY {
+        SINCE_SIZE_CHECK.store(0, Ordering::Relaxed);
+        if crate::jsonl::log_len().is_some_and(|len| len >= MAX_CMPLOG_LOG_BYTES) {
+            LOG_FULL.store(true, Ordering::Relaxed);
+            return false;
+        }
+    }
+    true
+}
+
+/// A forked child looks at the log's size on its first record: a fork
+/// server's children each start from the server's count.
+extern "C" fn restart_size_checks_in_child() {
+    SINCE_SIZE_CHECK.store(SIZE_CHECK_EVERY, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[used]
+#[link_section = ".init_array"]
+static REGISTER_FORK_HANDLER: extern "C" fn() = register_fork_handler;
+
+extern "C" fn register_fork_handler() {
+    // SAFETY: registers a handler that only stores to an atomic.
+    unsafe {
+        libc::pthread_atfork(None, None, Some(restart_size_checks_in_child));
+    }
 }
 
 pub struct CmpLog;
@@ -82,6 +221,9 @@ fn records_comparison() -> bool {
 
 fn emit_cmp(kind: &[u8], a: &[u8], b_bytes: &[u8]) {
     if let Some(_g) = HookGuard::acquire() {
+        if !first_time(comparison_hash(kind, a, b_bytes)) || !log_has_room() {
+            return;
+        }
         let mut buf_a = [0u8; MAX_OPERAND_BYTES * 2];
         let mut buf_b = [0u8; MAX_OPERAND_BYTES * 2];
         let hex_a = hex_into(a, &mut buf_a);

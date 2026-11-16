@@ -13,6 +13,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use cli::auto::sanitizer_replay::ReplayBounds;
 use cli::auto::tsan::run_tsan_replay;
 
 #[path = "../src/test_support.rs"]
@@ -243,7 +244,7 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
     // Any corpus input drives the (unconditional) race.
     std::fs::write(queue.join("seed"), b"anything").unwrap();
 
-    let replay = run_tsan_replay(&work);
+    let replay = run_tsan_replay(&work, &ReplayBounds::new(None, Duration::MAX, None));
     let written = replay.findings;
     if written == 0 {
         let binary = hdir.join("main_tsan");
@@ -406,7 +407,7 @@ fn a_race_tsan_misses_on_the_first_run_is_found_by_the_rerun() {
     .unwrap();
     std::fs::write(queue.join("seed"), b"anything").unwrap();
 
-    let replay = run_tsan_replay(&work);
+    let replay = run_tsan_replay(&work, &ReplayBounds::new(None, Duration::MAX, None));
     if replay.unmeasured > 0 {
         eprintln!("skip: ThreadSanitizer never completed a replay run: {replay:?}");
         let _ = std::fs::remove_dir_all(&tmp);

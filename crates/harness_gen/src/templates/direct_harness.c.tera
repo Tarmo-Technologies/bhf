@@ -289,7 +289,16 @@ extern int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
  * callback and recurse forever, and self-edges would pollute the bitmap. */
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(BHF_WINDOWS_CRT)
+/* As BHF_NOCOV: on Windows AddressSanitizer's interceptors reach these
+ * callbacks (bhf_cmp_buf, from the comparison hooks) before its shadow
+ * memory is set up, so an address-checked one faulted on every input of an
+ * -O0 build, where it is not inlined away. They read only what the
+ * compare read. */
+#define BHF_NOINSTR __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOINSTR __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOINSTR __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)

@@ -73,6 +73,7 @@ pub mod ruby;
 pub mod ruby_build;
 pub mod run_status;
 pub mod runtrace;
+pub mod sanitizer_replay;
 pub mod rust_build;
 pub mod script_load_roots;
 pub(crate) mod seed_manifest;

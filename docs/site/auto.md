@@ -653,7 +653,8 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 │   ├── run.json                                # machine report
 │   ├── seeds.json                              # every seed the run used, with provenance
 │   ├── missing-deps.json                       # missing-dependency manifest (#418)
-│   └── missing-deps.txt                        # same, human-readable
+│   ├── missing-deps.txt                        # same, human-readable
+│   └── blockers.json                           # what stopped each unfuzzed target, grouped
 ├── harnesses/<harness-id>/
 │       ├── main.c | main.cpp | main.adb
 │       ├── Makefile | H_<id>.gpr
@@ -683,6 +684,17 @@ built-and-fuzzed line shows the outcome label and a per-pass breakdown
 `cov=Nedges`; a `[!]` note marks a target whose fuzzed parameters are not an
 attacker-controlled input channel. The `Upstream delta` section is the
 prosthetic ledger described below.
+
+### `blockers.json`
+
+A sweep that leaves targets unfuzzed writes one row per language, outcome and
+cause, with the number of targets that share it, most common first. The cause
+is the diagnostic's first informative line with its per-instance noise
+removed: a leading `file:line:col:`, other free-standing numbers (they become
+`N`) and host paths (`PATH`). The identifier it names stays, in double quotes
+(`unknown type name "pcap_t"`), as does a dialect's version (`Python 2`,
+`Ada 95`). So one missing type that blocks twenty targets is one row of
+twenty, and two missing types are two rows.
 
 ### `run.json`
 
@@ -768,6 +780,15 @@ guaranteed at least one entry (#418). A missing configure/cmake-generated header
 project's configure step, or `--probe-build`) instead of a dead-end apt-file
 hint. `--deps-only` writes this manifest without paying for the fuzz phase;
 `--install-deps` fetches the still-blocking entries.
+
+A compile error the compiler reports in a file of the project's own tree, such
+as an undeclared identifier in `src/bad.c`, is a `source_error` entry named by
+the file, line and message (`bad.c:3: use of undeclared identifier 'x'`). It is
+counted apart from the external dependencies ("1 compile error in the
+project's own source"), and `bug-report.md` files the target as a
+`[failed-build]`, not a bhf `[codegen-bug]`. A lookup error in the generated
+harness driver or its `repairs/` stays a codegen defect. The manifest says
+"the tree built against its own sources" only when no target failed to build.
 
 ### Per-Finding Replay
 

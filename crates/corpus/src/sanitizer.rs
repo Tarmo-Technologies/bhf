@@ -1292,6 +1292,14 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         // panic and report it as C undefined behaviour.
         return None;
     }
+    // A non-zero offset applied to a null pointer inside a container's element
+    // access is an index into an empty container.
+    let stack = report_stack(after_line);
+    let kind = finding_rules::ubsan::refine_for_container(
+        kind,
+        after,
+        stack.first().map(|frame| frame.function.as_str()),
+    );
     // An unrecognised check is still UNDEFINED BEHAVIOUR that UBSan localized to
     // a file and line: it is reported generically (the message carries the exact
     // check), never dropped as an input rejection.
@@ -1301,7 +1309,7 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::UndefinedBehaviorSanitizer),
         kind,
         rule_id,
-        stack: report_stack(after_line),
+        stack,
         message: line.to_owned(),
         location: ubsan_location(line),
         check,
@@ -2437,7 +2445,7 @@ called `Option::unwrap()` on a `None` value
         for message in [
             "null pointer passed as argument 1, which is declared to never be null",
             "null pointer returned from function declared to never return null",
-            "applying non-zero offset 8 to null pointer",
+            "applying zero offset to null pointer",
         ] {
             let stderr = format!(
                 "/src/snippet.c:5:12: runtime error: {message}\n\
@@ -2448,6 +2456,35 @@ called `Option::unwrap()` on a `None` value
             assert_eq!(report.rule_id, "BHF-206", "{message}");
             assert_eq!(report.kind, "null-pointer-dereference", "{message}");
         }
+    }
+
+    /// A non-zero offset applied to a null pointer is an out-of-range pointer
+    /// (BHF-219, CWE-823), and inside a container's element access an
+    /// unvalidated index into an empty container (CWE-129): never a NULL
+    /// dereference.
+    #[test]
+    fn a_null_plus_offset_is_an_out_of_range_pointer_or_an_index() {
+        let plain = parse_sanitizer_report(
+            "/src/tlv.c:9:17: runtime error: applying non-zero offset 8 to null pointer\n\
+             SUMMARY: UndefinedBehaviorSanitizer: nullptr-with-nonzero-offset /src/tlv.c:9:17\n",
+        )
+        .unwrap();
+        assert_eq!(plain.kind, "pointer-overflow");
+        assert_eq!(plain.rule_id, "BHF-219");
+        let in_vector = parse_sanitizer_report(
+            "/usr/include/c++/14/bits/stl_vector.h:1130:34: runtime error: applying non-zero \
+             offset 4 to null pointer\n\
+             \x20   #0 0x55d1 in std::vector<unsigned char, std::allocator<unsigned char> >::operator[](unsigned long) /usr/include/c++/14/bits/stl_vector.h:1130:34\n\
+             \x20   #1 0x55d2 in tlv_decode(std::vector<unsigned char, std::allocator<unsigned char> > const&) /src/tlv.cpp:12:9\n\
+             \n\
+             SUMMARY: UndefinedBehaviorSanitizer: nullptr-with-nonzero-offset /usr/include/c++/14/bits/stl_vector.h:1130:34\n",
+        )
+        .unwrap();
+        assert_eq!(in_vector.kind, "out-of-bounds-access");
+        assert_eq!(
+            finding_rules::by_id(in_vector.rule_id).unwrap().cwe,
+            "CWE-129"
+        );
     }
 
     /// UBSan has ~20 checks. Failing closed on the ones this parser does not name
@@ -3384,7 +3421,8 @@ SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:
                 ub("member call on null pointer of type 'Widget'"),
                 Some("BHF-210"),
             ),
-            (ub("applying non-zero offset 8 to null pointer"), None),
+            // A non-zero offset to a null pointer was a NULL dereference.
+            (ub("applying non-zero offset 8 to null pointer"), Some("BHF-206")),
             (segv("0x7f0000001000 ", "WRITE", ""), Some("BHF-206")),
         ] {
             assert_eq!(legacy_rule_id(&report), legacy, "{}", report.message);

@@ -3063,8 +3063,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // separate MSan build to surface uninitialized-memory reads (CWE-457) that
     // ASan/UBSan miss — no second fuzz loop. Runs before the confirmation join so an
     // MSan crash can also confirm a static finding at the same site.
+    // Both replays run each input for at most `min(--timeout, 30 s)`, once if
+    // it times out, skip an input that hung under the other, and stop a
+    // harness's corpus at its per-target budget.
+    let replay_bounds = crate::auto::sanitizer_replay::ReplayBounds::new(
+        args.timeout,
+        options.per_target_time,
+        Some(&work),
+    );
     let msan = if sanitizer_replay_enabled(&options.sanitizers, multicore_fuzz::Sanitizer::Msan) {
-        crate::auto::msan::run_msan_replay(&work)
+        crate::auto::msan::run_msan_replay(&work, &replay_bounds)
     } else {
         0
     };
@@ -3078,7 +3086,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // separate TSan build to surface data races (CWE-362) that ASan/UBSan miss — no
     // second fuzz loop. Only targets that spawn threads per input surface a race.
     let tsan = if sanitizer_replay_enabled(&options.sanitizers, multicore_fuzz::Sanitizer::Tsan) {
-        crate::auto::tsan::run_tsan_replay(&work)
+        crate::auto::tsan::run_tsan_replay(&work, &replay_bounds)
     } else {
         crate::auto::tsan::TsanReplay::default()
     };
@@ -3094,13 +3102,22 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     if tsan.unmeasured > 0 {
         bhfeprintln!(
             "bhf auto: ThreadSanitizer — {} corpus input(s) never completed a replay run \
-             (timeout); those inputs are UNMEASURED for data races, not clean",
+             (it timed out, here or under MemorySanitizer); those inputs are UNMEASURED for \
+             data races, not clean",
             tsan.unmeasured
         );
     }
     // Same principle, different cause: here the run DID complete and TSan DID
     // report a race — we just could not read where it was. Reporting only the
     // finding count let that read as a clean result.
+    if tsan.budget_stopped > 0 {
+        bhfeprintln!(
+            "bhf auto: ThreadSanitizer — {} harness(es) reached their per-target budget \
+             (--per-target-time) before their whole corpus was replayed; the inputs left are \
+             UNMEASURED for data races",
+            tsan.budget_stopped
+        );
+    }
     if tsan.unattributed > 0 {
         bhfeprintln!(
             "bhf auto: ThreadSanitizer — {} data race(s) were REPORTED but could not be \
@@ -5804,6 +5821,7 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
             format!("undeclared function '{name}' at {file}:{line}")
         }
         MissingSharedLib { name } => format!("missing shared library '{name}'"),
+        MissingPackage { name, .. } => format!("missing package '{name}'"),
         MissingAdaWith { unit } => format!("missing Ada unit '{unit}'"),
         MissingAdaSymbol { unit, symbol } => format!("missing Ada symbol '{unit}.{symbol}'"),
         MissingAdaPackageBody { unit } => format!("missing Ada package body '{unit}'"),

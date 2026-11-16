@@ -224,6 +224,9 @@ pub fn run(args: GenerateHarnessArgs) -> Result<()> {
         Some(CFamilySource::Cpp) => return run_cpp_direct(&args),
         None => {}
     }
+    if let Some(error) = unsupported_language(&args.source) {
+        bail!(error);
+    }
 
     let source = crate::source_text::read_source_text(&args.source)
         .with_context(|| format!("read Ada source {}", args.source.display()))?;
@@ -2466,6 +2469,21 @@ fn fnv1a(hash: u64, byte: u8) -> u64 {
 enum CFamilySource {
     C,
     Cpp,
+}
+
+/// Why `source` cannot get a harness here: it is in a language other than C,
+/// C++ or Ada, which the Ada front end would otherwise parse and report as
+/// having no such subprogram.
+fn unsupported_language(source: &Path) -> Option<String> {
+    use crate::auto::candidate::{lang_name, Lang};
+    let lang = crate::auto::discovery::extension_lang_hint(source)
+        .filter(|lang| !matches!(lang, Lang::Ada | Lang::C | Lang::Cpp))?;
+    let name = lang_name(lang);
+    Some(format!(
+        "{} is {name} source; bhf generate-harness writes C, C++ and Ada harnesses only. \
+         `bhf auto <dir> --target <function>` builds and fuzzes a {name} target",
+        source.display()
+    ))
 }
 
 fn detect_c_family_source(path: &Path) -> Result<Option<CFamilySource>> {
@@ -7762,9 +7780,13 @@ pub(crate) fn compile_database_flags_for_source(source_path: &Path) -> Vec<Strin
 }
 
 /// Recover C compile flags from the strongest available project evidence.
-/// A checked-in/probe compile database remains authoritative. Without one, only
-/// portable standard-header capability macros are safe to infer from CMake;
-/// optional project features remain diagnostic-driven repairs.
+/// A checked-in/probe compile database remains authoritative. Without one, the
+/// `-D`/`-U` defines a non-executing scan of the project's CMakeLists.txt or
+/// Makefile finds apply, labelled statically recovered: a feature the build
+/// turns on (`add_compile_definitions(ENABLE_TLV=1)`, `CFLAGS += -DENABLE_TLV`)
+/// is compiled in, not fabricated or left out. CMake target-scoped defines
+/// apply only when the target owning the source is known, so mutually
+/// exclusive targets' defines are never combined.
 fn c_build_flags_for_source(source_path: &Path) -> Vec<String> {
     let mut flags = compile_database_flags_for_source(source_path);
     if !flags.is_empty() {
@@ -7780,28 +7802,66 @@ fn c_build_flags_for_source(source_path: &Path) -> Vec<String> {
     }
     if let Some(cmake) = find_upward_build_file(source_path, &["CMakeLists.txt"]) {
         let mut flags = infer_cmake_c_build_context(source_path, &cmake).compile_flags;
-        flags.retain(|flag| {
-            matches!(
-                flag.as_str(),
-                "-DHAVE_STDBOOL_H"
-                    | "-DHAVE__BOOL"
-                    | "-DHAVE_STDINT_H"
-                    | "-DHAVE_INTTYPES_H"
-                    | "-DHAVE_STRUCT_TIMEVAL"
-                    | "-DHAVE_STRUCT_SOCKADDR_IN6"
-                    | "-DHAVE_STRUCT_SOCKADDR_IN6_SIN6_SCOPE_ID"
-            )
-        });
+        flags.retain(|flag| is_define_flag(flag));
         for flag in cmake_checked_host_capability_flags(source_path) {
             push_unique_string(&mut flags, flag);
         }
         for flag in cmake_config_template_host_capability_flags(source_path) {
             push_unique_string(&mut flags, flag);
         }
-        flags.push(format!("{BUILD_CONTEXT_PROVENANCE_PREFIX}cmake"));
+        flags.push(format!(
+            "{BUILD_CONTEXT_PROVENANCE_PREFIX}{STATICALLY_RECOVERED_CMAKE}"
+        ));
+        return flags;
+    }
+    if let Some(makefile) =
+        find_upward_build_file(source_path, &["GNUmakefile", "makefile", "Makefile"])
+    {
+        let mut flags = make_c_defines(&makefile);
+        flags.push(format!(
+            "{BUILD_CONTEXT_PROVENANCE_PREFIX}{STATICALLY_RECOVERED_MAKEFILE}"
+        ));
         return flags;
     }
     vec![format!("{BUILD_CONTEXT_PROVENANCE_PREFIX}none")]
+}
+
+/// The build-context provenance of defines a C harness took from a static
+/// scan of the project's CMakeLists.txt.
+pub(crate) const STATICALLY_RECOVERED_CMAKE: &str = "cmake_statically_recovered";
+
+/// The same, from the project's Makefile.
+pub(crate) const STATICALLY_RECOVERED_MAKEFILE: &str = "makefile_statically_recovered";
+
+fn is_define_flag(flag: &str) -> bool {
+    flag.len() > 2 && (flag.starts_with("-D") || flag.starts_with("-U"))
+}
+
+/// The `-D`/`-U` defines a Makefile gives C compiles: in `CPPFLAGS`,
+/// `CFLAGS`, `DEFS` and `DEFINES` assignments (`=`, `+=`, `:=`), read without
+/// running make. A define whose value names a make variable or command
+/// (`-DVERSION=$(VERSION)`) is left out: only make would know it.
+fn make_c_defines(makefile: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(makefile) else {
+        return Vec::new();
+    };
+    let mut defines = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, value)) = split_make_assignment(line) else {
+            continue;
+        };
+        let key = key.trim_start_matches("override ").trim();
+        if !matches!(key, "CPPFLAGS" | "CFLAGS" | "DEFS" | "DEFINES") {
+            continue;
+        }
+        for token in split_build_tokens(value) {
+            if is_define_flag(&token) && !token.contains('$') && !token.contains('`') {
+                push_unique_string(&mut defines, token);
+            }
+        }
+    }
+    defines
 }
 
 /// Materialize a small set of native host capabilities that an ancestor CMake
@@ -14544,6 +14604,9 @@ mod tests {
     use super::{
         split_compile_command, write_c_per_tu_context, write_cpp_per_tu_context,
         PerTuCompileContext,
+    };
+    use super::{
+        BUILD_CONTEXT_PROVENANCE_PREFIX, STATICALLY_RECOVERED_CMAKE, STATICALLY_RECOVERED_MAKEFILE,
     };
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
     use ada_parser::ast::{
@@ -22649,7 +22712,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     }
 
     #[test]
-    fn c_build_flags_infer_portable_cmake_capabilities_without_a_database() {
+    fn c_build_flags_apply_cmake_definitions_without_a_database() {
         let root = temp_dir("cmake-c-global-definitions");
         let src = root.join("src");
         fs::create_dir_all(&src).unwrap();
@@ -22664,15 +22727,45 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         .unwrap();
 
         let flags = c_build_flags_for_source(&source);
-        for expected in ["-DHAVE_STDBOOL_H", "-DHAVE__BOOL"] {
+        for expected in ["-DHAVE_STDBOOL_H", "-DHAVE__BOOL", "-DPACKAGE_NAME=legacy"] {
             assert!(
                 flags.iter().any(|flag| flag == expected),
                 "missing {expected}: {flags:?}"
             );
         }
         assert!(
-            !flags.iter().any(|flag| flag.contains("PACKAGE_NAME")),
-            "project metadata/features require an authoritative compile DB: {flags:?}"
+            flags.contains(&format!(
+                "{BUILD_CONTEXT_PROVENANCE_PREFIX}{STATICALLY_RECOVERED_CMAKE}"
+            )),
+            "{flags:?}"
+        );
+    }
+
+    /// A Makefile's defines for C compiles apply, read without running make;
+    /// one whose value only make could compute does not.
+    #[test]
+    fn c_build_flags_apply_makefile_defines_without_a_database() {
+        let root = temp_dir("make-c-defines");
+        let source = root.join("tlv.c");
+        fs::write(&source, "int parse(void) { return 0; }\n").unwrap();
+        fs::write(
+            root.join("Makefile"),
+            "VERSION := $(shell git describe)\n\
+             CFLAGS = -O2 -Wall -DENABLE_TLV=1 # the TLV decoder\n\
+             CPPFLAGS += -DUSE_CRC -UNDEBUG\n\
+             DEFS = -DBUILD_VERSION=$(VERSION)\n\
+             LDFLAGS = -lz\n",
+        )
+        .unwrap();
+        let flags = c_build_flags_for_source(&source);
+        assert_eq!(
+            flags,
+            [
+                "-DENABLE_TLV=1".to_owned(),
+                "-DUSE_CRC".to_owned(),
+                "-UNDEBUG".to_owned(),
+                format!("{BUILD_CONTEXT_PROVENANCE_PREFIX}{STATICALLY_RECOVERED_MAKEFILE}"),
+            ]
         );
     }
 

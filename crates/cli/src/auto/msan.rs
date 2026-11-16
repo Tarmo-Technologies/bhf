@@ -20,15 +20,18 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::auto::sanitizer_replay::{ReplayBounds, RunOutcome};
 
 /// Cap the number of corpus inputs replayed per harness so a huge queue can't
 /// stall the run; the coverage-diverse queue front is what matters for MSan.
 const MAX_INPUTS: usize = 2000;
 
 /// Replay every C harness's corpus through its MSan build, writing a BHF-212 finding
-/// per distinct uninitialized-read site. Returns the number of findings written.
-pub fn run_msan_replay(work_dir: &Path) -> usize {
+/// per distinct uninitialized-read site, within `bounds`. Returns the number of
+/// findings written.
+pub fn run_msan_replay(work_dir: &Path, bounds: &ReplayBounds) -> usize {
     let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
         return 0;
     };
@@ -43,12 +46,18 @@ pub fn run_msan_replay(work_dir: &Path) -> usize {
         else {
             continue;
         };
-        written += replay_one(work_dir, &hdir, &harness_id, &mut index);
+        written += replay_one(work_dir, &hdir, &harness_id, &mut index, bounds);
     }
     written
 }
 
-fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize) -> usize {
+fn replay_one(
+    work_dir: &Path,
+    hdir: &Path,
+    harness_id: &str,
+    index: &mut usize,
+    bounds: &ReplayBounds,
+) -> usize {
     if !hdir.join("Makefile").is_file() {
         return 0;
     }
@@ -72,23 +81,54 @@ fn replay_one(work_dir: &Path, hdir: &Path, harness_id: &str, index: &mut usize)
     // Each site, with the first queue entry that showed it.
     let mut sites: BTreeMap<(String, u64), (PathBuf, String)> = BTreeMap::new();
     let mut replayed = 0usize;
+    let started = Instant::now();
     for input in inputs.flatten() {
-        if replayed >= MAX_INPUTS {
+        if replayed >= MAX_INPUTS || started.elapsed() >= bounds.per_harness {
             break;
         }
         let path = input.path();
         if !path.is_file() {
             continue;
         }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         replayed += 1;
-        // The bhf C driver replays a single input passed as argv[1].
-        let Ok(out) = crate::command_output::output_with_timeout(
+        if bounds.is_known_hang(&bytes) {
+            bounds.log_run(
+                "msan",
+                harness_id,
+                &path,
+                Duration::ZERO,
+                RunOutcome::SkippedKnownHang,
+            );
+            continue;
+        }
+        // The bhf C driver replays a single input passed as argv[1]. One run:
+        // an input past the run timeout hangs under MSan, and a hang is no
+        // uninitialized read.
+        let run_started = Instant::now();
+        let run = crate::command_output::output_with_timeout_flagged(
             Command::new(&bin)
                 .arg(&path)
                 .env("MSAN_OPTIONS", "halt_on_error=1:exitcode=86:print_stats=0"),
-            Duration::from_secs(30),
-        ) else {
-            continue;
+            bounds.run_timeout,
+        );
+        let elapsed = run_started.elapsed();
+        let out = match run {
+            Ok((out, false)) => {
+                bounds.log_run("msan", harness_id, &path, elapsed, RunOutcome::Completed);
+                out
+            }
+            Ok((_, true)) => {
+                bounds.log_run("msan", harness_id, &path, elapsed, RunOutcome::TimedOut);
+                bounds.note_hang(&bytes);
+                continue;
+            }
+            Err(_) => {
+                bounds.log_run("msan", harness_id, &path, elapsed, RunOutcome::SpawnFailed);
+                continue;
+            }
         };
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !stderr.contains("MemorySanitizer") {
@@ -351,7 +391,10 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert_eq!(run_msan_replay(work), 1);
+        assert_eq!(
+            run_msan_replay(work, &ReplayBounds::unbounded(Duration::from_secs(30))),
+            1
+        );
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(work.join("results/findings/F-MSAN-0000/finding.json")).unwrap(),
         )

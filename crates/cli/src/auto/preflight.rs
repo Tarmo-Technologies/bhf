@@ -80,6 +80,7 @@ fn have(tool: &str) -> bool {
     // MISSING that then builds fine teaches operators to ignore the banner.
     match tool {
         "sharpfuzz" => crate::auto::csharp_build::locate_sharpfuzz().is_some(),
+        SHARPFUZZ_NUGET => crate::auto::csharp_build::sharpfuzz_package_cached(),
         _ => which::which(tool).is_ok(),
     }
 }
@@ -111,6 +112,10 @@ fn lane_has(tool: &str, targets: &[&Candidate], scan_root: Option<&Path>) -> boo
         _ => have(tool),
     }
 }
+
+/// The SharpFuzz NuGet package the C# harness restores, as preflight names it
+/// when NuGet's global packages folder lacks it.
+const SHARPFUZZ_NUGET: &str = "the SharpFuzz 2.3.0 NuGet package";
 
 /// The C# lane's install hint.
 ///
@@ -153,7 +158,7 @@ fn requirements(
         Lang::Go => ("Go", &[&["go"]]),
         Lang::Cobol => ("COBOL", &[&["cobc"]]),
         Lang::Fortran => ("Fortran", &[&["gfortran"]]),
-        Lang::CSharp => ("C#", &[&["dotnet"], &["sharpfuzz"]]),
+        Lang::CSharp => ("C#", &[&["dotnet"], &["sharpfuzz"], &[SHARPFUZZ_NUGET]]),
         Lang::Js => ("JavaScript", &[&["node"]]),
         Lang::Ts => ("TypeScript", &[&["node"], &["esbuild"]]),
         Lang::Ruby => ("Ruby", &[&["ruby"]]),
@@ -389,6 +394,42 @@ mod tests {
             None => std::env::remove_var("PATH"),
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// With dotnet and the sharpfuzz tool present but an empty NuGet package
+    /// cache, the C# lane is MISSING the package, with the hint that says how
+    /// to stage it: the harness restores offline, so every target would fail.
+    #[test]
+    fn an_empty_nuget_cache_is_missing_the_sharpfuzz_package() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = crate::test_support::TestDir::new("preflight-nuget");
+        let old = std::env::var_os("NUGET_PACKAGES");
+        std::env::set_var("NUGET_PACKAGES", cache.path());
+        assert!(!have(SHARPFUZZ_NUGET));
+        let package = cache.join("sharpfuzz").join("2.3.0");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join(".nupkg.metadata"), b"{}").unwrap();
+        assert!(have(SHARPFUZZ_NUGET));
+        match old {
+            Some(value) => std::env::set_var("NUGET_PACKAGES", value),
+            None => std::env::remove_var("NUGET_PACKAGES"),
+        }
+
+        let lane = LaneStatus {
+            lang: "C#",
+            targets: 2,
+            missing: vec![SHARPFUZZ_NUGET],
+            install_hint: CSHARP_HINT,
+            unsupported: None,
+        };
+        let rendered = PreflightReport { lanes: vec![lane] }.render();
+        assert!(
+            rendered.contains("MISSING the SharpFuzz 2.3.0 NuGet package"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("NUGET_PACKAGES"), "{rendered}");
+        let (_, groups, _) = requirements(Lang::CSharp);
+        assert!(groups.iter().any(|group| group == &[SHARPFUZZ_NUGET]));
     }
 
     #[test]

@@ -751,28 +751,42 @@ cmplog, and ASan all work natively on Windows.
   that path. Crash detection and coverage-guided fuzzing are unaffected.
 - The **runtime-event collector** (`--collector`, #60) is the native-Windows path
   to clean-exit semantic findings. `--collector auto` selects the native ETW
-  provider (`bhf-collector-win`), which starts the NT Kernel Logger real-time
-  session with the process / file-I/O / image-load flags and runs `ProcessTrace`
-  over it, emitting the platform-neutral `bhf.collector-event.v1` JSONL contract.
-  Each live `EVENT_RECORD` is decoded by the pure `win_etw_decode` module — the
-  **complete** MOF decode of the three kernel providers (pointer-size and event-
-  version aware, with `FileObject → path` matching for read/write/rename/delete,
-  create-vs-open disposition classification, and `UserSID` rendering):
-    - `CreateProcess*` process creation (`Process_TypeGroup1`) and the descendant
-      tree — a `ShellExecuteEx` call surfaces at the kernel level as the resulting
-      process creation, which the descendant-tree attribution captures;
-    - file create/open/write/rename/delete with resolved paths (`FileIo_Create`,
-      `FileIo_Name`/rundown mapping, `FileIo_ReadWrite`, `FileIo_Info`);
-    - `LoadLibrary*`/image-load (`Image_Load`).
-  Each event is attributed to the testcase's descendant process tree, so a
-  controlled process execution (BHF-431), a path escaping the allowed root
-  (BHF-405), or a controlled library load (BHF-435) becomes a `binary_semantic`
-  finding even on a clean exit, feeding the same oracle registry as the Linux shim.
-  Starting an ETW session needs session rights; when the provider lacks them it
-  records `fidelity.permission_denied` rather than reporting a silent clean run. The
-  full decode logic is unit-tested on every platform against synthetic ETW-shaped
-  records (`win_etw_decode` covers all five classes and their fields); the live ETW
-  run is validated on the Windows CI runner under `BHF_WIN_LIVE=1`.
+  provider (`bhf-collector-win`). It starts a BHF-owned system-logger real-time
+  session (never the global NT Kernel Logger) with the process, file-I/O and
+  image-load flags, runs `ProcessTrace` over it, and emits the
+  platform-neutral `bhf.collector-event.v1` JSONL contract.
+  - **Decoding.** Each live `EVENT_RECORD` is decoded by the pure
+    `win_etw_decode` module, the MOF decode of the three kernel providers:
+    - process creation and the descendant tree (a `ShellExecuteEx` call shows
+      up as the process it creates);
+    - file create, open, write, rename and delete, with resolved paths;
+    - image load.
+  - **Replay.** `bhf binary fuzz --collector auto` replays a retained input
+    under the sidecar.
+    1. The host waits for the sidecar's readiness ack.
+    2. It launches the target and writes its PID to the file
+       `BHF_COLLECTOR_TARGET_PID` names.
+    3. When the target has exited and the post-exit window has passed, it
+       creates `BHF_COLLECTOR_DONE`.
+
+    The sidecar holds every event until the PID arrives, then attributes the
+    events of that process and its descendants, those received before the
+    handoff included. It traces until `BHF_COLLECTOR_DONE` (at most 300 s), not
+    for a fixed window. A sidecar that never gets the PID records
+    `target_pid_not_received` and attributes nothing.
+  - **What the live controls show.** These run on the Windows CI runner under
+    `BHF_WIN_LIVE=1` (`collector_win_live`):
+    - a target that runs `cmd.exe` through `ShellExecuteEx` with its input in
+      the command line gets a controlled-process-execution finding (BHF-431);
+    - the same target with a constant command line is observed and gets none.
+
+    The file and image-load classes are decoded and unit-tested against
+    ETW-shaped records, but no live control covers a BHF-405 or BHF-435
+    finding yet. The `bhf fuzz` harness path does not replay under the sidecar
+    (`harness_sidecar_replay_unsupported`).
+  - **Rights.** Starting an ETW session needs session rights (an elevated
+    prompt). Without them the provider records `fidelity.permission_denied`
+    instead of reporting a silent clean run.
 - The native-Windows harness build uses GNU `make` + clang (same as Linux), or
   cl through `bhf-cl` with `--cc cl`; the drive-letter colon + backslash quirks
   are handled by emitting forward-slash paths into the recipe.

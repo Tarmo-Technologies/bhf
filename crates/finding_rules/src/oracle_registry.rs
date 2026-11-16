@@ -1399,7 +1399,10 @@ fn dynamic_library_load_reason(library: &str) -> Option<&'static str> {
     if contains_parent_directory_component(library) {
         return Some("parent-directory");
     }
-    if !library.starts_with('/') && !looks_like_windows_absolute_path(library) {
+    if let Some(rooted) = windows_rooted_path(library) {
+        return windows_library_load_reason(&rooted);
+    }
+    if !library.starts_with('/') {
         return Some("relative-or-search-path");
     }
     if starts_with_any(library, &["/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/"]) {
@@ -1422,6 +1425,53 @@ fn dynamic_library_load_reason(library: &str) -> Option<&'static str> {
 
 fn starts_with_any(value: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| value.starts_with(prefix))
+}
+
+/// A Windows library path's directories from the volume root, lowercased
+/// with `\` separators (`\windows\system32\kernel32.dll`): for a drive path
+/// (`C:\...`), the `\\?\` and `\??\` spellings of one, and an NT device
+/// path (`\Device\HarddiskVolume3\...`, as ETW names an image whose volume
+/// has no drive letter). `None` for any other path.
+fn windows_rooted_path(library: &str) -> Option<String> {
+    let path = library.replace('/', "\\");
+    let path = path
+        .strip_prefix("\\\\?\\")
+        .or_else(|| path.strip_prefix("\\??\\"))
+        .unwrap_or(&path);
+    let rooted = if looks_like_windows_absolute_path(path) {
+        &path[2..]
+    } else {
+        let device = path
+            .get(..8)
+            .filter(|head| head.eq_ignore_ascii_case("\\device\\"))?;
+        let rest = &path[device.len()..];
+        &rest[rest.find('\\')?..]
+    };
+    Some(rooted.to_ascii_lowercase())
+}
+
+/// [`dynamic_library_load_reason`] for a Windows path from the volume root
+/// ([`windows_rooted_path`]). The Windows and Program Files directories are
+/// writable only by administrators; the temporary directories and
+/// `C:\Users\Public` by any user.
+fn windows_library_load_reason(rooted: &str) -> Option<&'static str> {
+    if rooted.starts_with("\\windows\\temp\\")
+        || rooted.starts_with("\\users\\public\\")
+        || rooted.contains("\\appdata\\local\\temp\\")
+    {
+        return Some("temporary-writable-directory");
+    }
+    if starts_with_any(
+        rooted,
+        &[
+            "\\windows\\",
+            "\\program files\\",
+            "\\program files (x86)\\",
+        ],
+    ) {
+        return None;
+    }
+    Some("non-system-absolute-path")
 }
 
 fn looks_like_windows_absolute_path(path: &str) -> bool {
@@ -1837,6 +1887,50 @@ mod tests {
         });
 
         assert_eq!(hit, None);
+    }
+
+    /// A Windows load is judged by the directory it came from, however the
+    /// path is spelled: a drive path, its `\\?\` form, or the NT device path
+    /// ETW reports.
+    #[test]
+    fn windows_library_loads_are_judged_by_their_directory() {
+        use crate::oracle_sdk::{BugOracle, OracleRuntimeEvent};
+
+        let reason = |library: &str| {
+            super::DynamicLibraryLoadRuntime
+                .evaluate(&OracleRuntimeEvent::Library {
+                    api: "LoadLibrary".to_owned(),
+                    library: library.to_owned(),
+                })
+                .and_then(|hit| hit.evidence_value("reason").map(str::to_owned))
+        };
+        for system in [
+            r"C:\Windows\System32\kernel32.dll",
+            r"c:\WINDOWS\SysWOW64\user32.dll",
+            r"\\?\C:\Windows\WinSxS\x86_comctl32\comctl32.dll",
+            r"\Device\HarddiskVolume3\Windows\System32\combase.dll",
+            r"D:\Program Files\Vendor\codec.dll",
+            r"C:\Program Files (x86)\Vendor\codec.dll",
+        ] {
+            assert_eq!(reason(system), None, "{system}");
+        }
+        for (library, expected) in [
+            (
+                r"C:\Users\me\AppData\Local\Temp\bhf-run\version.dll",
+                "temporary-writable-directory",
+            ),
+            (
+                r"\Device\HarddiskVolume3\Windows\Temp\x.dll",
+                "temporary-writable-directory",
+            ),
+            (r"C:\Users\Public\plugins\p.dll", "temporary-writable-directory"),
+            (r"C:\tools\app\plugin.dll", "non-system-absolute-path"),
+            (r"C:\Windows\System32\..\..\evil.dll", "parent-directory"),
+            ("version.dll", "relative-or-search-path"),
+            (r"plugins\p.dll", "relative-or-search-path"),
+        ] {
+            assert_eq!(reason(library).as_deref(), Some(expected), "{library}");
+        }
     }
 
     #[test]

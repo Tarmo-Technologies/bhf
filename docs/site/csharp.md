@@ -25,7 +25,12 @@ A `public` method taking a byte buffer (`byte[]`, `ReadOnlySpan<byte>`,
    `ProjectReference` to the owning `.csproj`, alongside a generated
    `BhfEntry.Run(byte[])` shim that decodes the fuzz bytes to the parameter's
    exact static type (`byte[]` straight through, `string` via UTF-8, `Stream` via
-   a `MemoryStream`, spans via the matching wrapper).
+   a `MemoryStream`, spans via the matching wrapper). Every project of that
+   build, the target's own included, writes its `obj/` and `bin/` under the
+   harness (`harnesses/<id>/build/`), through a props file passed as
+   `DirectoryBuildPropsPath` that imports the project's own
+   `Directory.Build.props` first. The source tree is left as it was, and the
+   harnesses of one project build side by side under any `--jobs`.
 3. **Instruments** the target assembly's IL with
    [SharpFuzz](https://github.com/Metalnem/sharpfuzz) (`sharpfuzz <dll>`, Apache-2.0),
    which rewrites every basic block to record edge coverage.
@@ -115,6 +120,28 @@ protobuf-net, SharpZipLib, ML.NET, and more:
 
 - **.NET SDK** on the host — [install](https://dotnet.microsoft.com/download).
 - **SharpFuzz.CommandLine**: `dotnet tool install --global SharpFuzz.CommandLine`.
+- **The SharpFuzz 2.3.0 NuGet package**, and every package the target's project
+  references, in NuGet's global packages folder (`$NUGET_PACKAGES`, else
+  `~/.nuget/packages`). The harness build restores from that folder only, never
+  from a network feed. Preflight reports the C# lane as MISSING the package when
+  the folder has no `sharpfuzz/2.3.0`, and a target whose build fails with NuGet
+  NU1101 or NU1102 gets a `language_package` entry in `missing-deps`, such as
+  `SharpFuzz 2.3.0`.
+
+### Staging the NuGet packages offline
+
+On a connected host with the same .NET SDK:
+
+```sh
+dotnet new classlib -o stage && cd stage
+dotnet add package SharpFuzz --version 2.3.0
+# and each PackageReference of the target's .csproj
+dotnet restore
+```
+
+Then copy `~/.nuget/packages/sharpfuzz/2.3.0` (and the other restored package
+directories) to the same place under the offline host's `NUGET_PACKAGES`, or
+`~/.nuget/packages`.
 - SharpFuzz and SharpFuzz.Common are **Apache-2.0** and link into the *user's*
   harness assembly, never into bhf. The .NET runtime is MIT. No GPL is
   involved; the lane keeps bhf's permissive-core policy intact.

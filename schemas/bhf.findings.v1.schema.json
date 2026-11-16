@@ -33,7 +33,21 @@
         "properties": {
           "key": { "type": "string", "minLength": 1 },
           "representative": { "type": "string", "minLength": 1 },
-          "members": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          "members": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "observations": {
+            "description": "For a group of fuzz or runtime findings at one sink (its first project frame and bug family): each call stack the sink was reached through, with its members. Absent when there is one.",
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "members"],
+              "properties": {
+                "key": { "type": "string", "minLength": 1 },
+                "members": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+              }
+            }
+          }
         }
       }
     },

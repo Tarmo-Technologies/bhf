@@ -187,6 +187,27 @@ definitions, bhf picks the first, prints all of them, and `--target-line N`
 selects one. A spelling that matches nothing fails with the closest
 definitions in the file. `bhf auto --target` accepts the same spellings.
 
+### Build defines without a compile database
+
+A compile database (a checked-in `compile_commands.json`, or the one
+`--probe-build` records by running the project's build) gives each file its
+exact flags. Without one, bhf reads the nearest `CMakeLists.txt`, else
+`Makefile`, without running it, and gives a C harness the `-D` and `-U`
+defines it finds:
+
+- **CMake:** `add_definitions`, `add_compile_definitions`, and the
+  `target_compile_definitions` of the target that owns the file. Another
+  target's defines are never combined with them.
+- **Makefile:** `CPPFLAGS`, `CFLAGS`, `DEFS` and `DEFINES` assignments.
+
+A define whose value only the build could compute (`-DVERSION=$(VERSION)`,
+a generator expression) is left out. The harness Makefile records
+`BUILD_CONTEXT_PROVENANCE = cmake_statically_recovered` (or
+`makefile_statically_recovered`). So code behind `#ifdef ENABLE_TLV`, which
+the build turns on, is compiled and fuzzed rather than left out. When a
+harness still needed made-up headers or macro values, run.md's "Fabricated
+build context" section names `--probe-build`.
+
 Useful flags:
 
 | Flag | Purpose |

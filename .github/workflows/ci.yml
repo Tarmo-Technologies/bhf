@@ -577,6 +577,14 @@ jobs:
           choco install make --version=4.4.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # harness_gen's standalone-driver unit tests build a harness with make
+      # too, so they skipped in the library step above: run them with it.
+      - name: Test the standalone harness drivers
+        shell: pwsh
+        run: |
+          cargo test --locked -p harness_gen --lib standalone
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
       # paths, capsules, explain, cartography and provenance, plus every
@@ -609,6 +617,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Dependency-gated live ETW fixtures (ignored unless BHF_WIN_LIVE=1).
           cargo test --locked -p bhf_collector_win --test live_windows -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The ShellExecute positive and constant-command clean controls,
+          # replayed under the sidecar by `bhf binary fuzz --collector auto`.
+          cargo test --locked -p bhf --test collector_win_live -- --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Windows release artifacts
