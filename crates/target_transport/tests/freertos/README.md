@@ -26,7 +26,8 @@ live here.
   against the FreeRTOS guest. It passed clean → fault → clean with a retained
   crash finding and a `bhf replay` MATCH. Each CLI invocation boots a fresh
   stopped guest; an existing guest parked at `harness_done` is not a valid new
-  baseline.
+  baseline. `cli_freertos_hang_times_out_and_the_reset_clears_state` runs the
+  timeout and state-contamination controls below.
 - The operator's arbitrary FreeRTOS project, physical-board path, and retained
   production campaign are separate acceptance work. This reference profile covers
   one cooperative Cortex-M3 image under QEMU.
@@ -51,6 +52,13 @@ fails if it cannot obtain or verify that revision.
   than a silent clean pass.
 - **Deterministic reset** via QMP `savevm`/`loadvm`: the same input reproduces
   the same outcome after a fresh restore.
+- **A timeout control**: input `0xD0` loops without reaching `harness_done`,
+  so the run ends at `--timeout` as a timeout finding (BHF-555).
+- **A state-contamination control**: input `0xC5` sets `bhf_carryover`, which
+  lives in `.noinit`, so startup does not clear it, and a `0x42` that sees it
+  set faults. Run after a `0xC5` in one session, the `0x42` is clean only
+  because the snapshot restore reset the guest's memory; after a plain
+  `system_reset` it faults.
 
 ## Determinism / fidelity limitations (declared, not implied)
 

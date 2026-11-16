@@ -29,6 +29,10 @@ static void emit_crumb(uint32_t id){
 volatile uint8_t  bhf_input[64] __attribute__((section(".noinit")));
 volatile uint32_t bhf_fault_flag = 0;   /* #72 fault-status word (zero-init per run: no inherited fault) */
 volatile uint32_t bhf_task_id    = 0;   /* #84 current-task identity observation */
+/* State one input leaves for the next (#249). It is in .noinit, so startup
+ * does not clear it: only the transport's snapshot reset does. If a reset ever
+ * leaked it, the 0x42 after a 0xC5 would fault. */
+volatile uint32_t bhf_carryover __attribute__((section(".noinit")));
 /* The kernel's version string, kept in the image so `firmware=` can record
  * which kernel the target runs (#248). */
 __attribute__((used)) const char bhf_kernel_version[] = "FreeRTOS Kernel " tskKERNEL_VERSION_NUMBER;
@@ -60,8 +64,13 @@ static void consumer(void *p){ (void)p;
   bhf_task_id = (uint32_t)(uintptr_t)xTaskGetCurrentTaskHandle();
   emit_crumb(0x75C0);                              /* task-identity marker: consumer */
   emit_crumb(0x100); emit_crumb(0x101);           /* prologue edges */
+  if (bhf_carryover == 0xC5u && b == 0x42){ emit_crumb(0x2C6); __asm volatile("udf #0"); }
   if (b == 0xF7){ emit_crumb(0x1FA); __asm volatile("udf #0"); emit_crumb(0x1FB); }
   else if (b == 0x42){ emit_crumb(0x200); emit_crumb(0x201); }
+  /* A hang: never reaches harness_done, so the run ends at the deadline. */
+  else if (b == 0xD0){ emit_crumb(0x2D0); for(;;){ __asm volatile("nop"); } }
+  /* Leaves state behind for the next input (see bhf_carryover). */
+  else if (b == 0xC5){ emit_crumb(0x2C5); bhf_carryover = 0xC5u; }
   else { emit_crumb(0x300); }
   harness_done();
 }

@@ -473,20 +473,9 @@ fn an_unreadable_firmware_image_is_reported() {
     }
 }
 
-/// Actual FreeRTOS CLI acceptance, separate from the bare-metal Cortex-M test.
-/// Opt in because it obtains a pinned upstream kernel unless BHF_RTOS_KERNEL is
-/// supplied. Each CLI invocation opens a fresh transport session on one guest.
-#[test]
-fn cli_freertos_clean_fault_clean() {
-    if std::env::var("BHF_RTOS_CLI").ok().as_deref() != Some("1") {
-        eprintln!("SKIP cli_freertos_clean_fault_clean: set BHF_RTOS_CLI=1");
-        return;
-    }
-    for tool in [CC, QEMU, QEMU_IMG, NM, "git"] {
-        assert!(tool_present(tool), "BHF_RTOS_CLI=1 requires {tool}");
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+/// The pinned FreeRTOS kernel: `BHF_RTOS_KERNEL`, or a fetch of the pinned
+/// commit into `dir`.
+fn freertos_kernel(dir: &Path) -> PathBuf {
     let kernel = if let Some(path) = std::env::var_os("BHF_RTOS_KERNEL") {
         PathBuf::from(path)
     } else {
@@ -532,6 +521,20 @@ fn cli_freertos_clean_fault_clean() {
         "8be86d4a24fd4091f8f4192018423ab590f408db",
         "FreeRTOS CLI validation requires the pinned kernel"
     );
+    kernel
+}
+
+/// Build the FreeRTOS reference profile into `dir/rtos.elf`, or `None` (a
+/// skip line printed) unless `BHF_RTOS_CLI=1`.
+fn build_freertos(test: &str, dir: &Path) -> Option<PathBuf> {
+    if std::env::var("BHF_RTOS_CLI").ok().as_deref() != Some("1") {
+        eprintln!("SKIP {test}: set BHF_RTOS_CLI=1");
+        return None;
+    }
+    for tool in [CC, QEMU, QEMU_IMG, NM, "git"] {
+        assert!(tool_present(tool), "BHF_RTOS_CLI=1 requires {tool}");
+    }
+    let kernel = freertos_kernel(dir);
     let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target_transport/tests/freertos");
     let inc_port = kernel.join("portable/GCC/ARM_CM3");
     let elf = dir.join("rtos.elf");
@@ -569,32 +572,21 @@ fn cli_freertos_clean_fault_clean() {
         "FreeRTOS compile: {}",
         String::from_utf8_lossy(&built.stderr)
     );
+    Some(elf)
+}
 
-    let symbol = |name, thumb| nm_symbol(&elf, name, thumb);
-    // #248: the findings record the image they were found on.
-    let spec_base = format!(
-        "done={:#x},done_kind=2,fault={:#x},firmware={}",
-        symbol("harness_done", true),
-        symbol("bhf_fault_flag", false),
-        elf.display()
-    );
-    let elf_sha256 = {
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(std::fs::read(&elf).unwrap());
-        digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
-    let map = format!(
-        "input={:#x},input_cap=64,ring={:#x},write={:#x},wrapped={:#x},cap=512",
-        symbol("bhf_input", false),
-        symbol("adafuzz_probe_memory_buffer", false),
-        symbol("adafuzz_probe_memory_buffer_write", false),
-        symbol("adafuzz_probe_memory_buffer_wrapped", false)
-    );
-    for (i, byte, expect_crash) in [(0, 0x42_u8, false), (1, 0xF7, true), (2, 0x42, false)] {
-        let scratch = dir.join(format!("scratch-{i}.qcow2"));
+/// A stopped `qemu-system-arm` guest running `elf`, killed on drop.
+struct RtosGuest {
+    _guard: ChildGuard,
+    qmp_port: u16,
+    gdb_port: u16,
+}
+
+impl RtosGuest {
+    /// Boot `elf` stopped, with a scratch drive for `savevm`, on fresh ports
+    /// (or `ports`, to replay at the recorded endpoints).
+    fn boot(elf: &Path, dir: &Path, tag: &str, ports: Option<(u16, u16)>) -> Self {
+        let scratch = dir.join(format!("scratch-{tag}.qcow2"));
         assert!(Command::new(QEMU_IMG)
             .args(["create", "-f", "qcow2"])
             .arg(&scratch)
@@ -603,11 +595,10 @@ fn cli_freertos_clean_fault_clean() {
             .unwrap()
             .status
             .success());
-        let qmp_port = free_port();
-        let gdb_port = free_port();
+        let (qmp_port, gdb_port) = ports.unwrap_or_else(|| (free_port(), free_port()));
         let child = Command::new(QEMU)
             .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
-            .arg(&elf)
+            .arg(elf)
             .arg("-gdb")
             .arg(format!("tcp::{gdb_port}"))
             .arg("-drive")
@@ -619,37 +610,96 @@ fn cli_freertos_clean_fault_clean() {
             .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
             .spawn()
             .unwrap();
-        let _guard = ChildGuard(child);
+        let guest = Self {
+            _guard: ChildGuard(child),
+            qmp_port,
+            gdb_port,
+        };
         assert!(wait_port(qmp_port, Duration::from_secs(45)));
         assert!(wait_port(gdb_port, Duration::from_secs(45)));
-        let spec =
-            format!("qemu-system:qmp=127.0.0.1:{qmp_port},gdb=127.0.0.1:{gdb_port},{spec_base}");
-        let seed = dir.join(format!("seed-{i}.bin"));
-        std::fs::write(&seed, [byte]).unwrap();
-        let work = dir.join(format!("work-{i}"));
-        let out = Command::new(bhf_bin())
-            .args([
-                "fuzz",
-                "--target-transport",
-                &spec,
-                "--transport-coverage-map",
-                &map,
-                "--harness",
-                "freertos-queue",
-                "--seed-file",
-            ])
-            .arg(&seed)
-            .args(["--iterations", "1", "--time", "30s", "--max-len", "64"])
-            .arg(&work)
+        guest
+    }
+
+    /// The `--target-transport` spec for this guest, and the
+    /// `--transport-coverage-map` for `elf`.
+    fn spec_and_map(&self, elf: &Path) -> (String, String) {
+        let symbol = |name, thumb| nm_symbol(elf, name, thumb);
+        // #248: the findings record the image they were found on.
+        let spec = format!(
+            "qemu-system:qmp=127.0.0.1:{},gdb=127.0.0.1:{},done={:#x},done_kind=2,fault={:#x},\
+             firmware={}",
+            self.qmp_port,
+            self.gdb_port,
+            symbol("harness_done", true),
+            symbol("bhf_fault_flag", false),
+            elf.display()
+        );
+        let map = format!(
+            "input={:#x},input_cap=64,ring={:#x},write={:#x},wrapped={:#x},cap=512",
+            symbol("bhf_input", false),
+            symbol("adafuzz_probe_memory_buffer", false),
+            symbol("adafuzz_probe_memory_buffer_write", false),
+            symbol("adafuzz_probe_memory_buffer_wrapped", false)
+        );
+        (spec, map)
+    }
+
+    /// `bhf fuzz` of this guest with one seed file per byte of `seeds`.
+    fn fuzz(&self, elf: &Path, work: &Path, seeds: &[u8], extra: &[&str]) -> serde_json::Value {
+        let (spec, map) = self.spec_and_map(elf);
+        let mut cmd = Command::new(bhf_bin());
+        cmd.args([
+            "fuzz",
+            "--target-transport",
+            &spec,
+            "--transport-coverage-map",
+            &map,
+            "--harness",
+            "freertos-queue",
+        ]);
+        for (i, byte) in seeds.iter().enumerate() {
+            let seed = work.with_extension(format!("seed-{i}.bin"));
+            std::fs::write(&seed, [*byte]).unwrap();
+            cmd.arg("--seed-file").arg(seed);
+        }
+        let out = cmd
+            .args(["--iterations", &seeds.len().to_string(), "--time", "60s"])
+            .args(["--max-len", "64"])
+            .args(extra)
+            .arg(work)
             .output()
             .unwrap();
         assert!(
             out.status.success(),
-            "FreeRTOS CLI {i}: {}\n{}",
+            "FreeRTOS CLI: {}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+}
+
+fn sha256_of(path: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(std::fs::read(path).unwrap());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Actual FreeRTOS CLI acceptance, separate from the bare-metal Cortex-M test.
+/// Opt in because it obtains a pinned upstream kernel unless BHF_RTOS_KERNEL is
+/// supplied. Each CLI invocation opens a fresh transport session on one guest.
+#[test]
+fn cli_freertos_clean_fault_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let Some(elf) = build_freertos("cli_freertos_clean_fault_clean", dir) else {
+        return;
+    };
+    let elf_sha256 = sha256_of(&elf);
+    for (i, byte, expect_crash) in [(0, 0x42_u8, false), (1, 0xF7, true), (2, 0x42, false)] {
+        let guest = RtosGuest::boot(&elf, dir, &i.to_string(), None);
+        let work = dir.join(format!("work-{i}"));
+        let summary = guest.fuzz(&elf, &work, &[byte], &[]);
         assert_eq!(
             summary["crashes"].as_u64().unwrap_or(0) > 0,
             expect_crash,
@@ -678,33 +728,9 @@ fn cli_freertos_clean_fault_clean() {
 
             // Replay must start from reset, at the recorded QMP/GDB endpoints.
             // A daemon parked at harness_done would snapshot a completed run.
-            drop(_guard);
-            let replay_scratch = dir.join("replay.qcow2");
-            assert!(Command::new(QEMU_IMG)
-                .args(["create", "-f", "qcow2"])
-                .arg(&replay_scratch)
-                .arg("16M")
-                .output()
-                .unwrap()
-                .status
-                .success());
-            let replay_guest = Command::new(QEMU)
-                .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
-                .arg(&elf)
-                .arg("-gdb")
-                .arg(format!("tcp::{gdb_port}"))
-                .arg("-drive")
-                .arg(format!(
-                    "if=none,file={},format=qcow2,id=sc0",
-                    replay_scratch.display()
-                ))
-                .arg("-qmp")
-                .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
-                .spawn()
-                .unwrap();
-            let _replay_guard = ChildGuard(replay_guest);
-            assert!(wait_port(qmp_port, Duration::from_secs(45)));
-            assert!(wait_port(gdb_port, Duration::from_secs(45)));
+            let ports = (guest.qmp_port, guest.gdb_port);
+            drop(guest);
+            let _replay_guest = RtosGuest::boot(&elf, dir, "replay", Some(ports));
             let replay = Command::new(bhf_bin())
                 .arg("replay")
                 .arg(&finding)
@@ -719,4 +745,48 @@ fn cli_freertos_clean_fault_clean() {
             assert!(String::from_utf8_lossy(&replay.stdout).contains("MATCH"));
         }
     }
+}
+
+/// #249: the reference profile's timeout and state-contamination controls.
+/// `0xD0` never reaches `harness_done`, so its run ends at `--timeout` as a
+/// timeout finding (BHF-555). `0xC5` leaves `bhf_carryover` set where startup
+/// does not clear it, and a `0x42` that saw it would fault: run after it in
+/// the same session, the `0x42` is clean only because the snapshot reset
+/// restored the guest's memory.
+#[test]
+fn cli_freertos_hang_times_out_and_the_reset_clears_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let Some(elf) = build_freertos(
+        "cli_freertos_hang_times_out_and_the_reset_clears_state",
+        dir,
+    ) else {
+        return;
+    };
+    let guest = RtosGuest::boot(&elf, dir, "hang", None);
+    let started = Instant::now();
+    let work = dir.join("work-hang");
+    let summary = guest.fuzz(&elf, &work, &[0xD0], &["--timeout", "2s"]);
+    assert!(started.elapsed() < Duration::from_secs(45), "{summary}");
+    let findings = summary["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{summary}");
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            work.join("results/findings")
+                .join(findings[0].as_str().unwrap())
+                .join("finding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["rule_id"], "BHF-555", "{raw:#}");
+    drop(guest);
+
+    let guest = RtosGuest::boot(&elf, dir, "reset", None);
+    let summary = guest.fuzz(&elf, &dir.join("work-reset"), &[0xC5, 0x42], &[]);
+    assert_eq!(summary["executions"], 2, "{summary}");
+    assert_eq!(
+        summary["crashes"], 0,
+        "the 0x42 after a 0xC5 is clean: {summary}"
+    );
 }

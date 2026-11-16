@@ -52,6 +52,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The FreeRTOS reference profile has a timeout and a state-contamination
+  control, and a CLI test runs both. Input `0xD0` never reaches
+  `harness_done`, so the run ends at `--timeout` as a timeout finding.
+  Input `0xC5` sets a word that startup does not clear, and a `0x42` that
+  sees it faults. In one session, `0xC5` then `0x42` is clean, which shows
+  the snapshot reset restores the guest's memory between inputs.
 - An on-target finding records the firmware it was found on: `firmware=PATH`
   on a `qemu-system:` or `gdb:` transport names the ELF, and `finding.json` and
   `transport_profile.json` record its SHA-256, size, architecture, build-id,
