@@ -653,7 +653,8 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
 │   ├── run.json                                # machine report
 │   ├── seeds.json                              # every seed the run used, with provenance
 │   ├── missing-deps.json                       # missing-dependency manifest (#418)
-│   └── missing-deps.txt                        # same, human-readable
+│   ├── missing-deps.txt                        # same, human-readable
+│   └── blockers.json                           # what stopped each unfuzzed target, grouped
 ├── harnesses/<harness-id>/
 │       ├── main.c | main.cpp | main.adb
 │       ├── Makefile | H_<id>.gpr
@@ -683,6 +684,17 @@ built-and-fuzzed line shows the outcome label and a per-pass breakdown
 `cov=Nedges`; a `[!]` note marks a target whose fuzzed parameters are not an
 attacker-controlled input channel. The `Upstream delta` section is the
 prosthetic ledger described below.
+
+### `blockers.json`
+
+A sweep that leaves targets unfuzzed writes one row per language, outcome and
+cause, with the number of targets that share it, most common first. The cause
+is the diagnostic's first informative line with its per-instance noise
+removed: a leading `file:line:col:`, other free-standing numbers (they become
+`N`) and host paths (`PATH`). The identifier it names stays, in double quotes
+(`unknown type name "pcap_t"`), as does a dialect's version (`Python 2`,
+`Ada 95`). So one missing type that blocks twenty targets is one row of
+twenty, and two missing types are two rows.
 
 ### `run.json`
 

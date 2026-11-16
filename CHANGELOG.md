@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The blocker histogram (`auto/blockers.json`, run.md) keeps the identifier
+  each diagnostic names and a dialect's version: it turned every quoted name
+  into `X` and `Python 2` into `Python N`, so a row could not say what to
+  install or fix. Locations, other numbers and host paths are still
+  normalized.
 - `bhf corpus minimize` with a harness that records no corpus coverage (any
   but an Ada harness) copies every input to `--out`, names the harness's lane
   and exits 2. It kept no input, wrote an empty `--out` and exited 0.

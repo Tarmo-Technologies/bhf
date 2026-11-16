@@ -27,11 +27,13 @@ pub(crate) struct BlockerKey {
     pub(crate) detail: String,
 }
 
-/// Collapse a diagnostic into something that GROUPS. Raw compiler text names the
-/// specific type, unit, or symbol at fault, so a hundred instances of one class
-/// of failure look like a hundred distinct problems and the histogram says
-/// nothing. Quoted and backticked spans become `X` and bare integers become `N`,
-/// which is what the hand-rolled `sed 's/"[^"]*"/"X"/g'` pipeline did.
+/// Collapse a diagnostic into something that GROUPS without losing what makes
+/// it actionable. The per-instance noise goes: a leading `file:line:col:`
+/// location, free-standing numbers (line and column numbers, counts, offsets)
+/// become `N`, and host paths become `PATH`. The identifier a diagnostic names
+/// stays, in double quotes whichever quote style the tool used: "missing module
+/// `werkzeug`" is a row an operator can act on, "missing module X" is not. A
+/// language dialect label keeps its version (`Python 2`, `Ada 95`).
 pub(crate) fn normalize_detail(raw: &str) -> String {
     // Usually the first line carries the proximate cause; GNAT and clang both
     // continue with context lines that vary per instance. Some build tools lead
@@ -83,7 +85,9 @@ pub(crate) fn normalize_detail(raw: &str) -> String {
                 while scan < chars.len() && !closes(&chars, scan) {
                     scan += 1;
                 }
-                out.push_str("\"X\"");
+                out.push('"');
+                out.extend(&chars[index + 1..scan]);
+                out.push('"');
                 index = (scan + 1).min(chars.len());
             }
             _ if ch.is_ascii_digit() => {
@@ -102,6 +106,18 @@ pub(crate) fn normalize_detail(raw: &str) -> String {
                     scan += 1;
                 }
                 if glued_to_word {
+                    out.extend(&chars[index..scan]);
+                } else if follows_dialect_name(&out) {
+                    // A dialect's version, dotted parts included (`Lua 5.4`).
+                    while scan + 1 < chars.len()
+                        && chars[scan] == '.'
+                        && chars[scan + 1].is_ascii_digit()
+                    {
+                        scan += 1;
+                        while scan < chars.len() && chars[scan].is_ascii_digit() {
+                            scan += 1;
+                        }
+                    }
                     out.extend(&chars[index..scan]);
                 } else {
                     out.push('N');
@@ -132,6 +148,36 @@ pub(crate) fn normalize_detail(raw: &str) -> String {
     } else {
         collapsed
     }
+}
+
+/// Languages whose dialects a diagnostic names by number (`Python 2`,
+/// `Ada 2005`, `Perl 5`).
+const DIALECT_NAMES: &[&str] = &[
+    "ada",
+    "cobol",
+    "ecmascript",
+    "fortran",
+    "java",
+    "lua",
+    "perl",
+    "php",
+    "python",
+    "ruby",
+];
+
+/// Whether `out` ends with a language name and one space, so a number next
+/// is that language's dialect.
+fn follows_dialect_name(out: &str) -> bool {
+    let Some(head) = out.strip_suffix(' ') else {
+        return false;
+    };
+    let word = head
+        .rsplit(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    DIALECT_NAMES
+        .iter()
+        .any(|name| word.eq_ignore_ascii_case(name))
 }
 
 /// Whether the apostrophe at `at` sits between two letters — an English
@@ -431,40 +477,73 @@ mod tests {
     use super::*;
     use crate::auto::candidate::Lang;
 
-    /// A backtick pair must be redacted as one span. Closing only on an
+    /// A backtick pair is one span whichever way it closes. Closing only on an
     /// apostrophe made the span run past its end to the next apostrophe on the
-    /// line, so the name leaked out and every distinct package or symbol became
-    /// its own histogram row instead of grouping.
+    /// line.
     #[test]
-    fn a_backtick_pair_redacts_as_one_span_whichever_way_it_closes() {
+    fn a_backtick_pair_is_one_span_whichever_way_it_closes() {
         let modern = normalize_detail(
             "target `flask.cli` is not loadable: missing module `werkzeug` (not installed) \
              — ModuleNotFoundError: No module named 'werkzeug'",
         );
-        assert!(
-            !modern.contains("werkzeug"),
-            "the package name must not leak into the key: {modern}"
-        );
-        assert!(
-            modern.contains("missing module \"X\""),
-            "the marker must survive redaction so the row is readable: {modern}"
+        assert_eq!(
+            modern,
+            "missing module \"werkzeug\" (not installed) — ModuleNotFoundError: No module \
+             named \"werkzeug\""
         );
 
-        // Two different packages must produce the SAME key — that is the point.
-        let other = normalize_detail(
-            "target `django.apps` is not loadable: missing module `asgiref` (not installed) \
-             — ModuleNotFoundError: No module named 'asgiref'",
-        );
-        assert_eq!(modern, other, "distinct packages must group into one row");
-
-        // GNAT/GCC's `foo' form still redacts as one span.
+        // GNAT/GCC's `foo' form is one span too.
         let gnat = normalize_detail("error: `Foo' is undefined here");
-        assert_eq!(gnat, "error: \"X\" is undefined here");
+        assert_eq!(gnat, "error: \"Foo\" is undefined here");
 
-        // rustc's backtick pairs group across identifiers too.
+        // rustc's backtick pairs keep their identifier.
         assert_eq!(
             normalize_detail("error[E0425]: cannot find value `alpha` in this scope"),
-            normalize_detail("error[E0425]: cannot find value `beta` in this scope"),
+            "error[E0425]: cannot find value \"alpha\" in this scope"
+        );
+    }
+
+    /// The identifier a diagnostic names is what an operator acts on: two
+    /// missing modules are two rows, and one module missing from two targets is
+    /// one row of two.
+    #[test]
+    fn unknown_identifier_is_kept_in_histogram_bucket() {
+        let results = vec![
+            unsupported_result(Lang::C, "a.c:3:9: error: unknown type name 'pcap_t'"),
+            unsupported_result(Lang::C, "b.c:41:2: error: unknown type name 'pcap_t'"),
+            unsupported_result(Lang::C, "c.c:7:1: error: unknown type name 'z_stream'"),
+        ];
+        let histogram = BlockerHistogram::from_results(&results);
+        let rows = histogram.rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0.detail, "unknown type name \"pcap_t\"");
+        assert_eq!(rows[0].1, 2);
+        assert_eq!(rows[1].0.detail, "unknown type name \"z_stream\"");
+    }
+
+    /// A dialect label is not numeric noise: `Python 2` code and `Python 3`
+    /// code are blocked for different reasons.
+    #[test]
+    fn dialect_labels_survive_histogram_normalization() {
+        for (raw, kept) in [
+            (
+                "legacy dialect: Python 2 syntax (print statement)",
+                "legacy dialect: Python 2 syntax (print statement)",
+            ),
+            ("needs Ada 2005 or later", "needs Ada 2005 or later"),
+            ("Perl 5 module", "Perl 5 module"),
+            (
+                "written for Lua 5.1, not Lua 5.4",
+                "written for Lua 5.1, not Lua 5.4",
+            ),
+            ("python 3 only", "python 3 only"),
+        ] {
+            assert_eq!(normalize_detail(raw), kept, "{raw}");
+        }
+        // Other numbers still collapse.
+        assert_eq!(
+            normalize_detail("Python 2 file has 14 errors at line 7"),
+            "Python 2 file has N errors at line N"
         );
     }
 
@@ -488,13 +567,13 @@ mod tests {
         // …and it must not close a backtick span early either: everything
         // between the backticks is one span, contraction or not.
         let early = normalize_detail("module `Foo::Bar` isn't installed");
-        assert_eq!(early, "module \"X\" isn't installed");
+        assert_eq!(early, "module \"Foo::Bar\" isn't installed");
 
         // GNAT's `Foo' form still closes — its apostrophe is followed by a
         // space, not a letter.
         assert_eq!(
             normalize_detail("error: `Foo' is undefined here"),
-            "error: \"X\" is undefined here"
+            "error: \"Foo\" is undefined here"
         );
 
         // An Ada attribute reads the same way as a contraction and gets the
@@ -591,18 +670,25 @@ mod tests {
     }
 
     #[test]
-    fn quoted_spans_and_numbers_collapse_so_instances_group() {
-        let a = normalize_detail("expected type \"Spat.Subject_Name\" found type \"Duration\"");
-        let b = normalize_detail("expected type \"Foo.Bar\" found type \"Integer\"");
+    fn locations_and_numbers_collapse_so_instances_group() {
+        let a = normalize_detail(
+            "pkg.adb:31:07: expected type \"Spat.Subject_Name\" found type \"Duration\" (2 places)",
+        );
+        let b = normalize_detail(
+            "other.adb:9:12: expected type \"Spat.Subject_Name\" found type \"Duration\" (5 places)",
+        );
         assert_eq!(a, b, "two instances of one class must share a key");
-        assert_eq!(a, "expected type \"X\" found type \"X\"");
+        assert_eq!(
+            a,
+            "expected type \"Spat.Subject_Name\" found type \"Duration\" (N places)"
+        );
     }
 
     #[test]
     fn a_source_location_prefix_is_stripped() {
         assert_eq!(
             normalize_detail("main.adb:31:04: error: \"GNATCOLL\" is not visible"),
-            "\"X\" is not visible"
+            "\"GNATCOLL\" is not visible"
         );
     }
 
@@ -627,7 +713,7 @@ mod tests {
         // Truncated compiler tails are common; the span just ends at the line end.
         assert_eq!(
             normalize_detail("cannot find \"widget"),
-            "cannot find \"X\""
+            "cannot find \"widget\""
         );
     }
 
@@ -636,7 +722,7 @@ mod tests {
         let detail = build_error_detail(&build_classifier::BuildErrorKind::Other {
             tail: "x.adb:9:1: error: operator for type \"P\" not directly visible".to_owned(),
         });
-        assert_eq!(detail, "operator for type \"X\" not directly visible");
+        assert_eq!(detail, "operator for type \"P\" not directly visible");
     }
 
     #[test]
@@ -656,8 +742,8 @@ mod tests {
     #[test]
     fn rows_are_ordered_by_descending_count_within_a_language() {
         let results = vec![
-            unsupported_result(Lang::Ada, "cannot drive param of type \"A\""),
-            unsupported_result(Lang::Ada, "cannot drive param of type \"B\""),
+            unsupported_result(Lang::Ada, "a.adb:3:1: cannot drive param of type \"A\""),
+            unsupported_result(Lang::Ada, "b.adb:9:4: cannot drive param of type \"A\""),
             report_only_result(Lang::Ada, "legacy dialect"),
         ];
         let histogram = BlockerHistogram::from_results(&results);
