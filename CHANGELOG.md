@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The nightly runs the WinAFL end-to-end tests, which no workflow ran: a
+  Windows job builds the pinned WinAFL and DynamoRIO with
+  `scripts/ci/build-winafl.ps1` (the DynamoRIO zip's SHA-256 checked), caches
+  the build under the pinned versions and the script's hash so a cache hit
+  skips it, and runs `winafl_engine`'s ignored campaigns, with and without
+  PageHeap.
 - CI builds and tests bhf natively on ARM64. A new `arm64-build` job on an
   `ubuntu-24.04-arm` runner builds the workspace and runtrace shim, runs every
   test outside bhf's heavy integration suites, and checks that `bhf auto`

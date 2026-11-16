@@ -261,6 +261,11 @@ cmake --build . --config Release
 # -> build64\bin\Release\afl-fuzz.exe, winafl.dll, winaflpt-debug.exe
 ```
 
+`scripts/ci/build-winafl.ps1 -Root C:\tools\bhf-winafl` does all of this at
+the pinned versions, checking the DynamoRIO zip's SHA-256, and leaves
+`<Root>\DynamoRIO-Windows-11.91.20763` and the `<Root>\winafl` checkout for
+`BHF_DYNAMORIO_PATH` and `BHF_WINAFL_PATH`; run again, it skips what is built.
+
 bhf finds them from `--winafl-path` (the directory holding `afl-fuzz.exe` and
 `winafl.dll`, or the checkout holding `build64\bin\Release`), then
 `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on `PATH`; and DynamoRIO from
@@ -467,14 +472,17 @@ mode.
 - Only native targets: a cross-compiled harness runs the builtin engine.
 - `--target-transport` and `--protocol-profile` run the builtin engine's own
   loops, so `bhf fuzz` refuses them with `--engine winafl` (or `afl++`).
-- WinAFL is not installed on the GitHub Windows runners, so the end-to-end
-  tests (`crates/cli/tests/winafl_engine.rs`: `bhf auto --engine winafl` on a
-  planted heap overflow, with and without PageHeap, nonzero WinAFL coverage,
-  then `replay`, `explain`, `capsule` and `verify-poc`) are `#[ignore]`d and
-  listed as ignored there; CI runs the test's refusal checks. Run them on a
-  machine with WinAFL and DynamoRIO, from an elevated shell, with
-  `BHF_WINAFL_PATH` and `BHF_DYNAMORIO_PATH` set: `cargo test -p bhf --test
-  winafl_engine -- --ignored`. Without the tools they fail instead of passing.
+- The end-to-end tests (`crates/cli/tests/winafl_engine.rs`: `bhf auto
+  --engine winafl` on a planted heap overflow, with and without PageHeap,
+  nonzero WinAFL coverage, then `replay`, `explain`, `capsule` and
+  `verify-poc`) need WinAFL and DynamoRIO, which the GitHub Windows runners do
+  not have, so they are `#[ignore]`d; PR CI runs the test's refusal checks.
+  The nightly's `Integration tests (bhf) (WinAFL, Windows)` job builds the
+  pinned pair with `scripts/ci/build-winafl.ps1`, caches it under the pinned
+  versions and the script's hash (a cache hit skips the build), and runs them.
+  Locally, run them from an elevated shell with `BHF_WINAFL_PATH` and
+  `BHF_DYNAMORIO_PATH` set: `cargo test -p bhf --test winafl_engine --
+  --ignored`. Without the tools they fail instead of passing.
 
 ## Visual Studio solutions (.sln / .vcxproj)
 
