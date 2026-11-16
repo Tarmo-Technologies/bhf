@@ -1462,6 +1462,10 @@ pub fn run(args: FuzzArgs) -> i32 {
         }
     }
     if multicore_requested(&args) {
+        if let Some(error) = multicore_flag_conflict(&args) {
+            bhfeprintln!("{error}");
+            return 2;
+        }
         return run_multicore_campaign(args);
     }
 
@@ -2220,6 +2224,62 @@ fn engine_lane_conflict(args: &FuzzArgs) -> Option<String> {
     ))
 }
 
+/// The flags a multi-worker or sanitizer-matrix run carries out: its own, and
+/// those [`worker_passthrough_args`] gives every worker.
+const MULTICORE_FLAGS: &[&str] = &[
+    "--workers",
+    "--sanitizers",
+    "--grammar",
+    "--dict",
+    "--cmplog-log",
+    "--len-control",
+    "--rss-limit-mb",
+    "--fork-server",
+    "--no-fork-server",
+    "--qemu-user",
+    "--qemu-arg",
+    "--symbolic-seed-source",
+    "--sandbox",
+    "--sandbox-tool",
+    "--sandbox-strict",
+    "--runtime-oracles",
+    "--structured-inputs",
+    "--seed-input",
+    "--seed-file",
+    "--max-len",
+    "--timeout",
+    "--deadline",
+];
+
+/// Why a multi-worker or sanitizer-matrix run cannot carry out every flag it
+/// was given. Its workers are single-worker runs in their own work dirs, and
+/// the parent merges only their findings: a collector's evidence and
+/// provenance, an extension's verdicts or a final-stats line would stay in a
+/// worker's dir or log.
+fn multicore_flag_conflict(args: &FuzzArgs) -> Option<String> {
+    let dropped: Vec<&str> = given_flags(args)
+        .into_iter()
+        .filter(|flag| !MULTICORE_FLAGS.contains(flag))
+        .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    let lane = if args.sanitizers.len() > 1 {
+        "a sanitizer matrix (several --sanitizers)"
+    } else {
+        "--workers"
+    };
+    let one = dropped.len() == 1;
+    Some(format!(
+        "bhf fuzz: {} {} not apply to {lane}, whose workers would ignore {}; remove {}, or run \
+         one worker with one sanitizer",
+        dropped.join(", "),
+        if one { "does" } else { "do" },
+        if one { "it" } else { "them" },
+        if one { "it" } else { "them" },
+    ))
+}
+
 fn multicore_requested(args: &FuzzArgs) -> bool {
     if args.sanitizers.len() > 1 {
         return true;
@@ -2243,6 +2303,15 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
     // says about the harness is said here, once.
     for note in multicore_harness_notes(&args, &harness_path) {
         bhfeprintln!("note: {note}");
+    }
+    // Every worker loads the runtime oracles it is given; one it cannot load
+    // fails here, once, as a single-worker run does, before any worker starts.
+    let mode_label = args.mode.to_string().to_ascii_lowercase();
+    if let Err(error) =
+        crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+    {
+        bhfeprintln!("{error}");
+        return 3;
     }
     let (harness_dirs, harness_executable) =
         worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
@@ -2302,6 +2371,7 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
                 campaign_duplicates_of_existing(&config.work_dir, &summary, merge.as_ref());
             let printed = MulticoreRunSummary {
                 summary: &summary,
+                runtime_oracles: runtime_oracle_mode_arg_name(args.runtime_oracles),
                 merged_findings: merge.map(|merge| merge.merged).unwrap_or_default(),
                 duplicates_of_existing,
                 duplicate_crashes_of_existing,
@@ -2395,6 +2465,9 @@ fn multicore_harness_notes(args: &FuzzArgs, harness: &Path) -> Vec<String> {
 struct MulticoreRunSummary<'a> {
     #[serde(flatten)]
     summary: &'a multicore_fuzz::MulticoreSummary,
+    /// The `--runtime-oracles` mode every worker ran with; their oracle
+    /// findings are among `merged_findings`.
+    runtime_oracles: &'static str,
     /// Parent ids the workers' new findings were merged under.
     merged_findings: Vec<String>,
     /// Findings recorded before the campaign that its crashes matched (sorted
@@ -2778,7 +2851,36 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
             out.push(format!("--qemu-arg={arg}"));
         }
     }
+    if let Some(deadline) = args.deadline {
+        out.push("--deadline".to_owned());
+        out.push(format!("{}s", deadline.as_secs()));
+    }
+    if args.fork_server {
+        out.push("--fork-server".to_owned());
+    }
+    if args.no_fork_server {
+        out.push("--no-fork-server".to_owned());
+    }
+    if let Some(grammar) = &args.grammar_file {
+        out.push("--grammar".to_owned());
+        out.push(grammar.display().to_string());
+    }
+    if let Some(dict) = &args.dict_file {
+        out.push("--dict".to_owned());
+        out.push(dict.display().to_string());
+    }
+    out.push("--runtime-oracles".to_owned());
+    out.push(runtime_oracle_mode_arg_name(args.runtime_oracles).to_owned());
     out
+}
+
+fn runtime_oracle_mode_arg_name(mode: crate::runtime_oracles::RuntimeOracleMode) -> &'static str {
+    use crate::runtime_oracles::RuntimeOracleMode;
+    match mode {
+        RuntimeOracleMode::Auto => "auto",
+        RuntimeOracleMode::On => "on",
+        RuntimeOracleMode::Off => "off",
+    }
 }
 
 fn engine_arg_name(engine: FuzzEngine) -> &'static str {
@@ -12848,6 +12950,96 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    /// Every flag a multi-worker run accepts, but the two the parent carries
+    /// out itself, reaches its workers.
+    #[test]
+    fn every_flag_a_multicore_run_accepts_reaches_its_workers() {
+        use crate::runner::SandboxModeArg;
+        use crate::runtime_oracles::RuntimeOracleMode;
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Json);
+        args.grammar_file = Some(args_dir.join("grammar.json"));
+        args.dict_file = Some(args_dir.join("tokens.dict"));
+        args.cmplog_log = Some(args_dir.join("cmplog.txt"));
+        args.len_control = DEFAULT_LEN_CONTROL + 1;
+        args.rss_limit_mb = 64;
+        args.fork_server = true;
+        args.no_fork_server = true;
+        args.qemu_user = Some(PathBuf::from("qemu-arm"));
+        args.qemu_args = vec!["-L".to_owned()];
+        args.symbolic_seed_sources = vec![args_dir.join("p.adb")];
+        args.sandbox = SandboxModeArg::None;
+        args.sandbox_tool = Some(PathBuf::from("fj"));
+        args.sandbox_strict = true;
+        args.runtime_oracles = RuntimeOracleMode::On;
+        args.seed_inputs = vec!["A".to_owned()];
+        args.seed_files = vec![args_dir.join("seed.bin")];
+        args.max_len = DEFAULT_MAX_LEN + 1;
+        args.timeout = Some(Duration::from_secs(1));
+        args.deadline = Some(Duration::from_secs(2));
+
+        let given = given_flags(&args);
+        let passthrough = worker_passthrough_args(&args);
+        for flag in MULTICORE_FLAGS
+            .iter()
+            .filter(|flag| !matches!(**flag, "--workers" | "--sanitizers"))
+        {
+            assert!(given.contains(flag), "this test does not set {flag}");
+            assert!(
+                passthrough
+                    .iter()
+                    .any(|arg| arg == flag || arg.starts_with(&format!("{flag}="))),
+                "{flag} does not reach the workers: {passthrough:?}"
+            );
+        }
+        for (flag, value) in [
+            ("--runtime-oracles", "on"),
+            ("--deadline", "2s"),
+            (
+                "--dict",
+                &*args_dir.join("tokens.dict").display().to_string(),
+            ),
+        ] {
+            assert!(
+                passthrough
+                    .windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "{flag} {value}: {passthrough:?}"
+            );
+        }
+        assert!(multicore_flag_conflict(&args).is_none());
+    }
+
+    /// A flag whose output the merge would not carry back is refused, by
+    /// name, for a multi-worker run and a sanitizer matrix.
+    #[test]
+    fn a_multicore_run_refuses_the_flags_its_workers_would_ignore() {
+        use crate::runtime_oracles::RuntimeOracleMode;
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
+        args.workers = Some(FuzzWorkerCount::Fixed(2));
+        args.runtime_oracles = RuntimeOracleMode::On;
+        assert_eq!(multicore_flag_conflict(&args), None);
+
+        args.collector = crate::collector_run::parse_collector_spec("auto").unwrap();
+        let error = multicore_flag_conflict(&args).expect("--collector is refused");
+        assert!(
+            error.starts_with("bhf fuzz: --collector does not apply to --workers"),
+            "{error}"
+        );
+
+        args.print_final_stats = true;
+        args.workers = None;
+        args.sanitizers = vec!["asan".to_owned(), "ubsan".to_owned()];
+        let error = multicore_flag_conflict(&args).expect("both are refused");
+        assert!(
+            error.starts_with(
+                "bhf fuzz: --print-final-stats, --collector do not apply to a sanitizer matrix"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

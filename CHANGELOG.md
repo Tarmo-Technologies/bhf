@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A multi-worker or sanitizer-matrix `bhf fuzz` gives every worker
+  `--runtime-oracles`, `--grammar`, `--dict`, `--deadline` and the fork-server
+  switch, which it dropped, so its workers ran crash-only and a sink the
+  runtime oracles find went unreported. The summary records the
+  `runtime_oracles` mode. `--collector`, `--collector-window-ms`,
+  `--extension` and `--print-final-stats`, whose output would stay in a
+  worker's dir, are refused with exit 2 instead of ignored.
 - The Linux `--collector auto` view reads only the runtrace log the current
   run armed; it re-read an earlier run's `runtrace.jsonl` left in the work dir.
   `bhf replay` of a collector finding with no input reports UNVERIFIED (exit

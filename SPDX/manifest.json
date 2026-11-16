@@ -2707,6 +2707,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_multicore_flags.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/introspect_cli.rs",
       "license": "Apache-2.0"
     },

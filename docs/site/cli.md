@@ -1340,6 +1340,13 @@ counting those crashes), with the same one-line note on stderr. That covers a
 worker's copy the merge finds to duplicate a recorded finding and a crash a
 worker skipped because its tree still holds such a copy from an earlier
 campaign (`per_worker[].duplicates_of_existing` names that copy).
+Every worker gets the run's `--runtime-oracles` mode (the summary's
+`runtime_oracles`), so its oracle findings merge with its crashes; `on` without
+a usable runtrace shim exits `3` before any worker starts. Every worker also
+gets `--grammar`, `--dict`, `--deadline` and the fork-server switch. A flag
+whose output stays in a worker's own dir or log is refused, with exit `2` and
+the flag named: `--collector`, `--collector-window-ms`, `--extension` and
+`--print-final-stats`. Run those with one worker and one sanitizer.
 When every worker exits non-zero (or is killed by a signal), `bhf fuzz` exits
 non-zero (the workers' shared exit code, else `1`). Workers stopped at the time
 limit fuzzed until then: when they recorded findings, the campaign keeps its
