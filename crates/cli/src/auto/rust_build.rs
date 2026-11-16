@@ -2548,6 +2548,13 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
 
     match target {
         Some(target) => {
+            // The target's module: its file's, then the inline `mod x { }`
+            // blocks it sits in.
+            let module = {
+                let mut module = module.clone();
+                module.extend(target.inline_modules.iter().cloned());
+                module
+            };
             // §27.1: a method DECLARED in a `pub trait` (byteorder's
             // `ReadBytesExt::read_u32`) has no enclosing concrete `impl` type — the
             // Rust lane synthesises a std-reader receiver (`std::io::Cursor`) and
@@ -2603,7 +2610,10 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
                     // Inherent methods are reachable through the TYPE, not through the
                     // impl block's module, so we must not gate on the impl module's
                     // visibility when the type itself is at the crate root (E0603 fix).
-                    let reachable = type_reachable_at_crate_root(&crate_root_src, &ty, impl_module);
+                    // A type defined in an inline `mod x { }` only LOOKS defined at
+                    // the root to the text search: name it through its module.
+                    let reachable = target.inline_modules.is_empty()
+                        && type_reachable_at_crate_root(&crate_root_src, &ty, impl_module);
                     if reachable {
                         call_path.push(ty.clone());
                     } else if let Some(rx) = resolve_public_reexport_path(
@@ -2703,7 +2713,11 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
                     }
                 }
                 None => {
-                    if !type_reachable_at_crate_root(&crate_root_src, &target.name, impl_module) {
+                    // As for a type: a free fn in an inline module is named through
+                    // its module, however its definition text reads at the root.
+                    if !target.inline_modules.is_empty()
+                        || !type_reachable_at_crate_root(&crate_root_src, &target.name, impl_module)
+                    {
                         if module_chain_has_private(&manifest_dir, &crate_root_src, &module) {
                             // §27.10: a free fn in a private module is unreachable
                             // externally (E0603) — build the harness IN-CRATE so a

@@ -15,6 +15,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Rust functions inside inline modules (`pub mod codec { pub fn decode() }`,
+  nested ones, and ones behind a private `mod hidden { }`) are called by their
+  full module path. They used to be called as if defined at the crate root and
+  failed to build with E0425.
 - `bhf auto` names the directories (and test- or tool-named files) its
   default non-library filter leaves out, with file counts, and `bhf list
   targets` marks the rows `auto` skips. docs/site/auto.md lists the whole

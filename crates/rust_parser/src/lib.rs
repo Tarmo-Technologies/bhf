@@ -105,6 +105,11 @@ pub struct RustFn {
     /// ranker and the Rust build lane key the std-reader receiver synthesis off a
     /// `Read`/`BufRead` supertrait (only then is a `Cursor` receiver constructable).
     pub trait_supertrait: Option<String>,
+    /// The inline modules (`mod inner { ... }`) the function sits in, outermost
+    /// first: its path in the crate is its file's module path, then these. (A
+    /// `pub fn` behind a private one keeps `Pub`: the Rust lane reaches it
+    /// in-crate, as it does one in a private file module.)
+    pub inline_modules: Vec<String>,
 }
 
 /// A generic TYPE parameter declared by a function, with its trait bound.
@@ -182,7 +187,48 @@ pub fn parse_rust_functions(source: &str) -> Result<Vec<RustFn>, RustParseError>
         file_has_fuzz_target,
         &mut functions,
     );
+    let mut modules = Vec::new();
+    collect_inline_modules(tree.root_node(), bytes, &mut modules);
+    for function in &mut functions {
+        // `modules` is in pre-order, so the enclosing ones come outermost first.
+        for module in &modules {
+            if (module.first_line..=module.last_line).contains(&function.line) {
+                function.inline_modules.push(module.name.clone());
+            }
+        }
+    }
     Ok(functions)
+}
+
+/// An inline module (`mod name { ... }`) and the lines its body spans.
+struct InlineModule {
+    name: String,
+    first_line: u32,
+    last_line: u32,
+}
+
+/// Every inline module under `node`, in pre-order. A `mod name;` declaration
+/// (its body in another file) is not one: the file's own path covers it.
+fn collect_inline_modules(node: tree_sitter::Node<'_>, bytes: &[u8], out: &mut Vec<InlineModule>) {
+    let Some(_guard) = AstDepthGuard::enter() else {
+        return;
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "mod_item" && child.child_by_field_name("body").is_some() {
+            if let Some(name) = child
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(bytes).ok())
+            {
+                out.push(InlineModule {
+                    name: name.to_owned(),
+                    first_line: child.start_position().row as u32 + 1,
+                    last_line: child.end_position().row as u32 + 1,
+                });
+            }
+        }
+        collect_inline_modules(child, bytes, out);
+    }
 }
 
 /// The enclosing `pub trait` declaration threaded into its method bodies: the
@@ -618,6 +664,7 @@ fn parse_function_item(
             .or_else(|| trait_decl.map(|t| t.name.to_owned())),
         is_trait_method: trait_decl.is_some(),
         trait_supertrait: trait_decl.and_then(|t| t.supertrait.map(str::to_owned)),
+        inline_modules: Vec::new(),
     })
 }
 
@@ -973,6 +1020,29 @@ mod tests {
 
     fn parse(src: &str) -> Vec<RustFn> {
         parse_rust_functions(src).expect("parse")
+    }
+
+    #[test]
+    fn functions_record_their_inline_module_chain() {
+        let source = "pub mod codec {\n    pub fn decode(d: &[u8]) -> usize { d.len() }\n\
+                      pub mod inner {\n        pub fn frame(d: &[u8]) -> usize { d.len() }\n    }\n}\n\
+                      mod hidden {\n    pub fn checksum(d: &[u8]) -> usize { d.len() }\n}\n\
+                      pub(crate) mod internal {\n    pub fn tally(d: &[u8]) -> usize { d.len() }\n}\n\
+                      mod declared;\n\
+                      pub fn top(d: &[u8]) -> usize { d.len() }\n";
+        let fns = parse_rust_functions(source).unwrap();
+        let by = |name| by_name(&fns, name);
+        assert_eq!(by("decode").inline_modules, ["codec"]);
+        assert_eq!(by("decode").visibility, RustVisibility::Pub);
+        assert_eq!(by("frame").inline_modules, ["codec", "inner"]);
+        assert_eq!(by("frame").visibility, RustVisibility::Pub);
+        // Behind a private module a `pub fn` keeps `Pub` (the lane reaches it
+        // in-crate) and records the module it needs.
+        assert_eq!(by("checksum").inline_modules, ["hidden"]);
+        assert_eq!(by("checksum").visibility, RustVisibility::Pub);
+        assert_eq!(by("tally").inline_modules, ["internal"]);
+        assert!(by("top").inline_modules.is_empty());
+        assert_eq!(by("top").visibility, RustVisibility::Pub);
     }
 
     fn by_name<'a>(fns: &'a [RustFn], name: &str) -> &'a RustFn {

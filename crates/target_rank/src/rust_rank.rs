@@ -491,6 +491,7 @@ mod tests {
             impl_trait: None,
             is_trait_method: false,
             trait_supertrait: None,
+            inline_modules: Vec::new(),
         }
     }
 
