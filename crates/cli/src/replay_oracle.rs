@@ -90,6 +90,69 @@ impl Recorded {
     pub(crate) fn is_crash(&self) -> bool {
         matches!(self, Self::FormatStringCrash { .. })
     }
+
+    /// What a replay that shows the finding shows, in a few words.
+    pub(crate) fn signature(&self) -> String {
+        match self {
+            Self::Oracle {
+                rule, oracle, api, ..
+            } => format!("{rule} {oracle} at {api}"),
+            Self::FormatStringCrash { api } => {
+                format!("{FORMAT_STRING_RULE} format-string-runtime at {api}")
+            }
+            Self::Capability { kind, .. } => format!("BHF-668 {kind} capability"),
+        }
+    }
+}
+
+/// The fields of finding `raw` that [`Recorded::from_finding`] reads, as a
+/// capsule records them for `bhf verify-poc`: a source file in the oracle's
+/// site evidence is written as the capsule ships it (`capsule_path` maps an
+/// original path). `None` when the finding is not one a replay shows by its
+/// oracle or capability.
+pub(crate) fn capsule_record(
+    raw: &Value,
+    capsule_path: &dyn Fn(&str) -> Option<String>,
+) -> Option<Value> {
+    let recorded = Recorded::from_finding(raw)?;
+    let mut record = serde_json::json!({
+        "classification": raw.get("classification"),
+        "rule_id": raw.get("rule_id"),
+    });
+    match &recorded {
+        Recorded::Oracle {
+            oracle, api, site, ..
+        } => {
+            let evidence: Vec<Value> = site
+                .iter()
+                .map(|(key, value)| {
+                    let value = match (*key, split_source(value)) {
+                        ("source", Some((file, _))) => match capsule_path(file) {
+                            Some(shipped) => format!("{shipped}{}", &value[file.len()..]),
+                            None => value.clone(),
+                        },
+                        _ => value.clone(),
+                    };
+                    serde_json::json!({"key": key, "value": value})
+                })
+                .collect();
+            record["oracle"] = serde_json::json!({
+                "name": oracle,
+                "api": api,
+                "evidence": evidence,
+            });
+        }
+        Recorded::FormatStringCrash { api } => {
+            record["format_string"] = serde_json::json!({ "api": api });
+        }
+        Recorded::Capability { kind, operands } => {
+            record["capability"] = serde_json::json!({
+                "kind": kind,
+                "testcase_operands": operands,
+            });
+        }
+    }
+    Some(record)
 }
 
 /// What a replay showed of a [`Recorded`] finding.
@@ -168,12 +231,11 @@ fn observe_oracle(
         checks.push(compared("api", Some(api), Some(&hit.api), api == hit.api));
         for (key, value) in site {
             let replayed = hit.evidence_value(key);
-            checks.push(compared(
-                key,
-                Some(value),
-                replayed,
-                replayed == Some(value),
-            ));
+            let same = match (*key, replayed) {
+                ("source", Some(replayed)) => same_source(value, replayed),
+                (_, replayed) => replayed == Some(value.as_str()),
+            };
+            checks.push(compared(key, Some(value), replayed, same));
         }
         checks
     };
@@ -255,6 +317,18 @@ fn observe_assertion(
             "the runtrace recorded no failed assertion; the {runtime} assertion message the \
              harness printed is compared instead"
         )),
+    }
+}
+
+/// Whether two `file:line[:function]` sources are the same line of the same
+/// file, by its last two path components (a rebuild from a capsule, or
+/// another checkout, compiles it from another directory).
+fn same_source(recorded: &str, replayed: &str) -> bool {
+    match (split_source(recorded), split_source(replayed)) {
+        (Some((file, line)), Some((replayed_file, replayed_line))) => {
+            line == replayed_line && path_tail(file) == path_tail(replayed_file)
+        }
+        _ => recorded == replayed,
     }
 }
 
@@ -519,6 +593,34 @@ mod tests {
         let other = observe(&recorded, &[exec("ls")], "", Path::new("t"));
         assert!(!other.reproduced());
         assert_eq!(other.checks[1].replayed.as_deref(), Some("ls"));
+    }
+
+    /// A capsule records the finding's oracle in the capsule's paths, and a
+    /// rebuilt PoC's assertion in another directory is the same source.
+    #[test]
+    fn a_capsule_record_reads_back_with_its_source_in_capsule_paths() {
+        let shipped = |file: &str| (file == "/src/fmt.c").then(|| "sources/fmt.c".to_owned());
+        let record = capsule_record(&assertion_finding(), &shipped).unwrap();
+        let recorded = Recorded::from_finding(&record).unwrap();
+        let Recorded::Oracle { site, .. } = &recorded else {
+            panic!("{recorded:?}");
+        };
+        assert_eq!(
+            site[0],
+            (
+                "source",
+                "sources/fmt.c:14:int check_header(const unsigned char *, size_t)".to_owned()
+            )
+        );
+        let rebuilt = runtrace::parse_str(
+            "{\"e\":\"assertion_failed\",\"a\":\"__assert_fail\",\"x\":\"data[0] != 'Z'\",\
+             \"f\":\"/tmp/capsule/sources/fmt.c\",\"n\":14,\"g\":\"check_header\"}\n",
+        );
+        assert!(observe(&recorded, &rebuilt, "", Path::new("t")).reproduced());
+        assert_eq!(
+            recorded.signature(),
+            "BHF-415 native-assertion-contract at __assert_fail"
+        );
     }
 
     #[test]

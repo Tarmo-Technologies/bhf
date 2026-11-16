@@ -61,7 +61,11 @@ minimized with a note (`bhf auto` names all such findings in one line).
 After an intentional rebuild whose inlining, line numbers or symbolizer moved
 the sink, `--allow-other-crash` minimizes against the crash the harness
 reports instead: it prints a warning naming what differs and records it as
-`minimization.other_crash` in `finding.json`.
+`minimization.other_crash` in `finding.json`. A runtime-oracle finding (a
+failed assertion, a fuzz-controlled format string) and an input-triggered
+capability finding minimize the same way, with every reduction held to what
+`bhf replay` compares for them: the oracle's rule, API and site again, or the
+capability with an operand the testcase reached.
 
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
@@ -718,7 +722,14 @@ and explain it — all offline and deterministic (no LLM):
   `finding_identity`): a minimized input that crashes another way does not
   ship, and when no input shows the finding's crash the capsule says what
   the rebuilt PoC showed instead (`reproduced: false`,
-  `reproduced_other_crash: true`, `other_crash`). Every path
+  `reproduced_other_crash: true`, `other_crash`). A C or C++ runtime-oracle
+  or capability finding is packaged too: its capsule records the oracle hit
+  or capability in the capsule's paths (`finding_oracle`), and the rebuilt PoC
+  reproduces it when a replay under bhf's runtrace shim shows it the way
+  `bhf replay` decides (`oracle_comparison`; a failed assertion is also read
+  from the message the C runtime printed). The summary counts every runtime
+  finding as written, skipped (each with its reason) or failed (each with its
+  error). Every path
   the harness's build and launch files name is relocated into the capsule:
   `build.sh` renders those files into `build/` with the capsule's own location
   and the programs it finds on the host, builds there, and writes `./poc`, so
@@ -815,7 +826,10 @@ and explain it — all offline and deterministic (no LLM):
   verify-poc prints that reason. A capsule whose own rebuild failed when it
   was packaged (manifest `rebuilt: false`, `build_error`) is reported as such
   when its rebuild fails here too, with both errors; one that rebuilds here
-  but whose input does not crash says that instead.
+  but whose input does not crash says that instead. A capsule that records a
+  `finding_oracle` is verified by replaying its input under the runtrace shim:
+  `PASS` names the compared fields, and a replay that does not show it is a
+  `FAIL` with what differed.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
   reproduces deterministically. It works on the built harness of a native lane

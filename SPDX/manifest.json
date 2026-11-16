@@ -2779,6 +2779,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/oracle_findings_minimize_capsule.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/output_sink.rs",
       "license": "Apache-2.0"
     },

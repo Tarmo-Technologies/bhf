@@ -15,6 +15,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf minimize` minimizes runtime-oracle, assertion and capability findings,
+  holding each reduction to what `bhf replay` compares for them; it held every
+  reduction to a sanitizer crash, so they never minimized. `bhf capsule`
+  packages the C and C++ ones (manifest `finding_oracle`,
+  `oracle_comparison`) and `bhf verify-poc` verifies them under the runtrace
+  shim; it skipped the oracle findings and left capability findings out of
+  its count. Its summary now accounts for every runtime finding as written,
+  skipped or failed.
 - `bhf replay` confirms runtime-oracle, assertion and capability findings
   from what the replay did: the runtrace shim records the run, and the
   finding is a `MATCH` when the oracle registry reports the same rule, API and
