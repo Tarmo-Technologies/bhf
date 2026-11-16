@@ -1575,6 +1575,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/sanitizer_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/script_load_roots.rs",
       "license": "Apache-2.0"
     },
@@ -2496,6 +2500,10 @@
     },
     {
       "path": "crates/cli/tests/auto_rust_reader_incrate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_sanitizer_replay_bounds.rs",
       "license": "Apache-2.0"
     },
     {

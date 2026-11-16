@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The post-fuzz MSan and TSan corpus replays run each input for at most
+  `min(--timeout, 30 s)`, once if it times out. An input that hung under one
+  replay is skipped by the other, and a harness's replay stops at its
+  `--per-target-time`. They ran each input up to 30 s whatever `--timeout`
+  said, and TSan retried a timed-out run four times. Every run is a line of
+  `auto/sanitizer-replay.jsonl`.
 - A compile error in the project's own source (an undeclared identifier in
   `bad.c`) is a `source_error` entry in `missing-deps.json`/`.txt` and a
   `[failed-build]` in `bug-report.md`. It left the manifest empty, which then
