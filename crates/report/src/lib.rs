@@ -3550,7 +3550,56 @@ fn sarif_locations(finding: &FindingReport, root: Option<&Path>) -> Vec<Value> {
             locations.push(location);
         }
     }
+    // GitHub code scanning drops a result with no location. An oracle,
+    // memory-limit or deadline finding has no crash frame, so point it at the
+    // fuzzed target's own source line, else at the source root (`SRCROOT`
+    // when the run declares one).
+    if locations.is_empty() {
+        locations.push(
+            sarif_target_location(&finding.target, root).unwrap_or_else(|| {
+                let artifact = match root {
+                    Some(_) => json!({ "uri": ".", "uriBaseId": "SRCROOT" }),
+                    None => json!({ "uri": "." }),
+                };
+                json!({
+                    "physicalLocation": { "artifactLocation": artifact },
+                    "message": { "text": "No source location was recorded for this finding" },
+                })
+            }),
+        );
+    }
     locations
+}
+
+/// The fuzzed target's source line as a SARIF location: `target.location`
+/// (`path`/`line`) or `target.source_path`/`target.line`.
+fn sarif_target_location(target: &Value, root: Option<&Path>) -> Option<Value> {
+    let (file, line) = match string_at(target, &["location", "path"]) {
+        Some(path) => (path, target.pointer("/location/line")),
+        None => (string_at(target, &["source_path"])?, target.get("line")),
+    };
+    if file.trim().is_empty() {
+        return None;
+    }
+    let mut physical_location = serde_json::Map::new();
+    physical_location.insert(
+        "artifactLocation".to_owned(),
+        sarif_artifact_location(&file, root),
+    );
+    let line = line.and_then(|line| {
+        line.as_u64()
+            .or_else(|| line.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    if let Some(line) = line.filter(|line| *line > 0) {
+        physical_location.insert("region".to_owned(), json!({ "startLine": line }));
+    }
+    let name = string_at(target, &["subprogram"])
+        .or_else(|| string_at(target, &["name"]))
+        .unwrap_or_else(|| "the fuzzed target".to_owned());
+    Some(json!({
+        "physicalLocation": Value::Object(physical_location),
+        "message": { "text": format!("Fuzzed target {name}") },
+    }))
 }
 
 fn push_unique_sarif_location(locations: &mut Vec<Value>, location: Value) {
@@ -6934,6 +6983,100 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Actionability fix location"));
+    }
+
+    /// GitHub code scanning drops a result without a location, so an oracle,
+    /// memory-limit or deadline finding with no crash frame points at the
+    /// fuzzed target's line, and one with nothing at all at the source root.
+    #[test]
+    fn every_sarif_result_has_a_location() {
+        let (_root_guard, root) = temp_dir("sarif-every-loc");
+        let src = root.join("src");
+        fs::create_dir_all(root.join("auto")).unwrap();
+        fs::write(
+            root.join("auto/run.json"),
+            serde_json::to_vec(&json!({ "source_root": src })).unwrap(),
+        )
+        .unwrap();
+        let findings = root.join("findings");
+        write_finding(
+            &findings.join("F-0001-fmt"),
+            json!({
+                "id": "F-0001-fmt",
+                "rule_id": "BHF-408",
+                "signature": "fmt-sig",
+                "harness_id": "H-C0001",
+                "target": {
+                    "harness_id": "H-C0001",
+                    "subprogram": "log_line",
+                    "source_path": src.join("log.c"),
+                    "line": 4
+                },
+                "exception": { "name": "format_string" }
+            }),
+        );
+        write_finding(
+            &findings.join("F-0002-rss"),
+            json!({
+                "id": "F-0002-rss",
+                "rule_id": "BHF-209",
+                "signature": "rss-sig",
+                "target": { "location": { "path": src.join("alloc.c"), "line": 17 } },
+                "exception": { "name": "rss_limit" }
+            }),
+        );
+        let deadline = json!({
+            "id": "F-0003-deadline",
+            "rule_id": "BHF-555",
+            "signature": "deadline-sig",
+            "harness_id": "H-C0003",
+            "exception": { "name": "deadline" }
+        });
+        write_finding(&findings.join("F-0003-deadline"), deadline.clone());
+        let document = build_report(&ReportOptions::new(&findings, root.join("reports"))).unwrap();
+        let sarif = render_sarif_report(&document);
+        validate_sarif_report(&sarif).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        let location_of = |sarif: &Value, rule: &str| {
+            let result = sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|result| result["ruleId"] == rule)
+                .unwrap_or_else(|| panic!("no {rule} result"))
+                .clone();
+            let locations = result["locations"].as_array().unwrap();
+            assert_eq!(locations.len(), 1, "{rule}: {locations:?}");
+            locations[0]["physicalLocation"].clone()
+        };
+        let srcroot = |uri: &str| json!({ "uri": uri, "uriBaseId": "SRCROOT" });
+        let fmt = location_of(&sarif, "BHF-408");
+        assert_eq!(fmt["artifactLocation"], srcroot("log.c"));
+        assert_eq!(fmt["region"]["startLine"], 4);
+        let rss = location_of(&sarif, "BHF-209");
+        assert_eq!(rss["artifactLocation"], srcroot("alloc.c"));
+        assert_eq!(rss["region"]["startLine"], 17);
+        assert_eq!(
+            location_of(&sarif, "BHF-555")["artifactLocation"],
+            srcroot(".")
+        );
+
+        // Without a recorded source root the fallback is a plain relative URI,
+        // since SRCROOT would be undeclared.
+        let (_bare_guard, bare) = temp_dir("sarif-every-loc-bare");
+        write_finding(&bare.join("findings/F-0003-deadline"), deadline);
+        let document = build_report(&ReportOptions::new(
+            bare.join("findings"),
+            bare.join("reports"),
+        ))
+        .unwrap();
+        let sarif = render_sarif_report(&document);
+        validate_sarif_report(&sarif).unwrap();
+        assert_eq!(
+            location_of(&sarif, "BHF-555")["artifactLocation"],
+            json!({ "uri": "." })
+        );
     }
 
     #[test]

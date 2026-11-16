@@ -3856,6 +3856,7 @@ fn run_attempt(
                             reach_label,
                             reach_basis,
                             shim_armed,
+                            Some(candidate),
                         ) {
                             bhfeprintln!("bhf auto: warning: stamp {fid} runtime_mode: {error}");
                         }
@@ -3963,6 +3964,7 @@ fn run_attempt(
                                         reach_label,
                                         reach_basis,
                                         false,
+                                        Some(candidate),
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -4067,6 +4069,7 @@ fn run_attempt(
                                         reach_label,
                                         reach_basis,
                                         false,
+                                        Some(candidate),
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -11052,6 +11055,7 @@ fn stamp_runtime_mode(
     input_reachability: Option<&str>,
     input_reachability_basis: Option<&target_rank::ReachabilityBasis>,
     shim_armed: bool,
+    target: Option<&Candidate>,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(finding_path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -11073,6 +11077,19 @@ fn stamp_runtime_mode(
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
+        // The fuzzed target's own source line: the location a report falls
+        // back to when the finding has no crash frame (an oracle, memory-limit
+        // or deadline finding). A finding that names its target keeps it.
+        if let Some(candidate) = target {
+            obj.entry("target").or_insert_with(|| {
+                serde_json::json!({
+                    "harness_id": candidate.harness_id,
+                    "subprogram": candidate.name,
+                    "source_path": candidate.source_path,
+                    "line": candidate.line,
+                })
+            });
+        }
         obj.insert(
             "runtime_mode".to_owned(),
             serde_json::json!({
@@ -12919,6 +12936,7 @@ mod stamp_tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -12962,6 +12980,7 @@ mod stamp_tests {
             Some("attacker_reachable"),
             Some(&basis),
             false,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -12982,6 +13001,7 @@ mod stamp_tests {
             Some("ipc_channel_reachable"),
             None,
             false,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -13105,10 +13125,70 @@ mod stamp_tests {
         assert!(!fuzz_pass_shim_armed(dir.path(), true));
     }
 
+    /// A fuzz finding records the fuzzed target's source line, where a report
+    /// points a finding with no crash frame; a finding that names its own
+    /// target keeps it.
+    #[test]
+    fn stamping_records_the_fuzzed_target_unless_the_finding_names_one() {
+        let candidate = crate::auto::candidate::Candidate {
+            harness_id: "H-C0004".to_owned(),
+            lang: crate::auto::candidate::Lang::C,
+            source_path: std::path::PathBuf::from("/src/log.c"),
+            line: 4,
+            name: "log_line".to_owned(),
+            score: 0,
+            is_static: false,
+            foreign_guard: None,
+            input_reachability: None,
+            input_reachability_basis: None,
+            dialect: None,
+        };
+        let (_dir, path) = tmp_finding();
+        stamp_runtime_mode(
+            &path,
+            Pass::FuzzDriven,
+            &[],
+            None,
+            None,
+            false,
+            Some(&candidate),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["target"],
+            serde_json::json!({
+                "harness_id": "H-C0004",
+                "subprogram": "log_line",
+                "source_path": "/src/log.c",
+                "line": 4,
+            })
+        );
+
+        let own = serde_json::json!({ "name": "other", "source_path": "/src/other.c", "line": 9 });
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "id": "F-0002-abc", "target": own })).unwrap(),
+        )
+        .unwrap();
+        stamp_runtime_mode(
+            &path,
+            Pass::FuzzDriven,
+            &[],
+            None,
+            None,
+            false,
+            Some(&candidate),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["target"], own);
+    }
+
     #[test]
     fn empty_env_injected_stamps_empty_object() {
         let (_dir, path) = tmp_finding();
-        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false).unwrap();
+        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
         assert_eq!(
@@ -13158,6 +13238,7 @@ mod stamp_tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

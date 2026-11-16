@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! GitHub code scanning drops a SARIF result with no location. A format-string
+//! oracle finding (BHF-408) has no crash frame of its own, and both
+//! results/findings.sarif and results/findings.json gave it none; it now points
+//! at the fuzzed target's source line.
+#![cfg(unix)]
+
+use std::process::Command;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+const TARGET: &str = "#include <stdio.h>\n#include <stddef.h>\n#include <string.h>\n\
+                      int log_line(const char *msg) {\n  char buf[64];\n  \
+                      snprintf(buf, sizeof buf, msg);\n  return (int)strlen(buf);\n}\n";
+
+#[test]
+fn every_result_of_a_run_has_a_location_and_the_oracle_one_names_the_target() {
+    if Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: no C compiler on PATH");
+        return;
+    }
+    let root = TestDir::new("sarif-locations");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("fmt.c"), TARGET).unwrap();
+    let work = root.join("work");
+    let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["auto", "--work-dir", work.to_str().unwrap()])
+        .args(["--jobs", "1", "--per-target-time", "5"])
+        .arg(&src)
+        .output()
+        .expect("run bhf auto");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(work.join("results").join(name)).unwrap())
+            .unwrap_or_else(|e| panic!("results/{name}: {e}\n{stderr}"))
+    };
+
+    let sarif = read("findings.sarif");
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    assert!(
+        results.iter().any(|r| r["ruleId"] == "BHF-408"),
+        "the planted format string is found:\n{sarif:#}\n{stderr}"
+    );
+    for result in results {
+        let locations = result["locations"].as_array().unwrap();
+        assert!(!locations.is_empty(), "no location: {result:#}");
+    }
+    let oracle = results.iter().find(|r| r["ruleId"] == "BHF-408").unwrap();
+    let physical = &oracle["locations"][0]["physicalLocation"];
+    assert_eq!(physical["artifactLocation"]["uri"], "fmt.c", "{oracle:#}");
+    assert_eq!(physical["region"]["startLine"], 4, "{oracle:#}");
+
+    let findings = read("findings.json");
+    let row = findings["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"]["id"] == "BHF-408")
+        .unwrap();
+    assert_eq!(row["location"]["file"], "fmt.c", "{row:#}");
+    assert_eq!(row["location"]["line"], 4, "{row:#}");
+}

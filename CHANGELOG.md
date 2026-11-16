@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Every SARIF result has a location, so GitHub code scanning shows the
+  format-string, memory-limit and deadline oracle findings (BHF-408, BHF-209,
+  BHF-555) it used to drop. A finding with no crash frame points at the
+  fuzzed function's source line, which `bhf auto` now records in each fuzz
+  finding (results/findings.json gets that location too), and at the source
+  root when no line is known.
 - `run.json` and `run.md` say for each fuzzed target whether the behavioral
   sink oracles ran (`behavioral_oracles`: `on`, `driver` or `off`, with the
   reason). The docs and the Python, Perl and Ruby drivers said the runtrace

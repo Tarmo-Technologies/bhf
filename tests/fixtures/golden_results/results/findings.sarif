@@ -177,7 +177,19 @@
         {
           "kind": "fail",
           "level": "error",
-          "locations": [],
+          "locations": [
+            {
+              "message": {
+                "text": "No source location was recorded for this finding"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".",
+                  "uriBaseId": "SRCROOT"
+                }
+              }
+            }
+          ],
           "message": {
             "text": "unhandled in H-C-parse: TSAN_DATA_RACE: data race"
           },
@@ -233,7 +245,19 @@
         {
           "kind": "fail",
           "level": "error",
-          "locations": [],
+          "locations": [
+            {
+              "message": {
+                "text": "No source location was recorded for this finding"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".",
+                  "uriBaseId": "SRCROOT"
+                }
+              }
+            }
+          ],
           "message": {
             "text": "unknown in unknown"
           },
@@ -360,7 +384,19 @@
         {
           "kind": "fail",
           "level": "warning",
-          "locations": [],
+          "locations": [
+            {
+              "message": {
+                "text": "No source location was recorded for this finding"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".",
+                  "uriBaseId": "SRCROOT"
+                }
+              }
+            }
+          ],
           "message": {
             "text": "divergence in unknown: OUTPUT_DIVERGENCE: stdout bytes differ"
           },

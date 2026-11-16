@@ -2439,6 +2439,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_sarif_locations.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_seed_bytes.rs",
       "license": "Apache-2.0"
     },

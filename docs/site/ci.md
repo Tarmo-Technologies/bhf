@@ -121,8 +121,11 @@ bhf ci . \
 - `--changed-since <ref>` scopes to the diff (`<merge-base>..HEAD`).
 - `--changed-paths-from <file>` uses a precomputed newline-separated file list
   instead of asking git.
-- `--sarif <path>` copies `results/findings.sarif` (SARIF 2.1.0) to `<path>`;
-  `--ci-json <path>` writes a compact machine-readable result (counts by
+- `--sarif <path>` copies `results/findings.sarif` (SARIF 2.1.0) to `<path>`.
+  Every result carries a location, since code scanning drops one without: a
+  finding with no crash frame (a format-string, memory-limit or deadline
+  oracle) points at the fuzzed function's line, or at the source root when
+  that is unknown. `--ci-json <path>` writes a compact machine-readable result (counts by
   severity/verdict, confirmed count, scoped file count) for your own
   reporting.
 - Exit code is `0` unless the gate fails.
