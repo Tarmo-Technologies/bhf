@@ -2371,6 +2371,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_lua_hook.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_lua_lane.rs",
       "license": "Apache-2.0"
     },

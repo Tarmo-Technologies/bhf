@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, build-recovery-scenarios]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, build-recovery-scenarios, ignored]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -175,8 +175,13 @@ jobs:
         run: |
           set -euo pipefail
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
+          # The #[ignore]d tests that need a quiet machine or a long budget:
+          # the Lua line-hook cost benchmark.
+          ignored='binary(=auto_lua_hook)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
             cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E "$slow"
+          elif [ "$SHARD" = ignored ]; then
+            cargo nextest run --locked -p bhf --no-fail-fast --profile ci --run-ignored only -E "$ignored"
           elif [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$HASH_SHARDS" ]; then
             cargo nextest run --locked --workspace --no-fail-fast --profile ci -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
           else

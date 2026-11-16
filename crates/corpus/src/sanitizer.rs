@@ -656,8 +656,8 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
 
 /// The frames an interpreted lane's driver prints under its finding line, one
 /// `== bhf frame: <function> @ <file>:<line>` per frame, innermost first and
-/// without the driver's and the harness's own frames (the Perl, Ruby and PHP
-/// drivers).
+/// without the driver's and the harness's own frames (the Perl, Ruby, PHP and
+/// Lua drivers).
 fn parse_bhf_frames(stderr: &str) -> Vec<StackFrame> {
     const MARKER: &str = "== bhf frame: ";
     stderr
@@ -731,7 +731,7 @@ fn parse_lua_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Lua finding".to_owned()
         } else {
@@ -2330,6 +2330,7 @@ java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 1
     #[test]
     fn interpreted_lane_findings_carry_the_driver_frames() {
         for (marker, function, file) in [
+            ("lua", "walk", "/src/walk.lua"),
             ("perl", "Calc::ratio", "/src/lib/Calc.pm"),
             ("ruby", "Reader#average", "/src/lib/reader.rb"),
             ("php", "Calc->ratio", "C:\\src\\Calc.php"),

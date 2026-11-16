@@ -26,6 +26,9 @@ ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github/workflows/integration-nightly.yml"
 SLOW = "binary(=build_recovery) & test(=build_recovery_scenarios)"
 DEDICATED = "build-recovery-scenarios"
+# The shard that runs the #[ignore]d tests the nightly owns, and their filter.
+IGNORED = "ignored"
+IGNORED_FILTER = "binary(=auto_lua_hook)"
 
 
 def integration_job() -> str:
@@ -142,12 +145,14 @@ class IntegrationNightlyShardTests(unittest.TestCase):
     def test_the_matrix_is_every_hash_shard_once_plus_the_dedicated_one(self) -> None:
         count = int(self.env["HASH_SHARDS"])
         self.assertGreaterEqual(count, 12, "the suite outgrew 6 shards of 40 minutes")
-        self.assertEqual(self.shards, [str(n) for n in range(1, count + 1)] + [DEDICATED])
+        self.assertEqual(
+            self.shards, [str(n) for n in range(1, count + 1)] + [DEDICATED, IGNORED]
+        )
         self.assertEqual(self.env["SHARD"], "${{ matrix.shard }}")
 
     def test_each_hash_shard_runs_its_partition_of_everything_but_the_slowest_test(self) -> None:
         count = int(self.env["HASH_SHARDS"])
-        for shard in self.shards[:-1]:
+        for shard in self.shards[:-2]:
             with self.subTest(shard=shard):
                 calls = run_shard(self.script, self.env, shard)
                 self.assertEqual(len(calls), 1, calls)
@@ -161,6 +166,16 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E {SLOW}"],
+        )
+
+    def test_the_ignored_shard_runs_only_the_ignored_tests_it_names(self) -> None:
+        calls = run_shard(self.script, self.env, IGNORED)
+        self.assertEqual(
+            calls,
+            [
+                "nextest run --locked -p bhf --no-fail-fast --profile ci --run-ignored only "
+                f"-E {IGNORED_FILTER}"
+            ],
         )
 
     def test_an_unknown_shard_fails_instead_of_running_nothing(self) -> None:
@@ -264,6 +279,10 @@ class IntegrationNightlySelectionTests(unittest.TestCase):
         self.assertEqual(
             selections.pop(DEDICATED), {"bhf::build_recovery::build_recovery_scenarios"}
         )
+        # The ignored shard runs tests the others skip, and nothing else.
+        ignored = selections.pop(IGNORED)
+        self.assertTrue(ignored, "the ignored shard runs tests")
+        self.assertEqual(ignored & everything, set())
         empty = [shard for shard, tests in selections.items() if not tests]
         self.assertEqual(empty, [], "every hash shard runs tests")
         counts = Counter(test for tests in selections.values() for test in tests)

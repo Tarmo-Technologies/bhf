@@ -544,6 +544,13 @@ its metatable. The Lua driver counts how many of its first 1000 inputs end in a
 nil-value error; at 95% or more (over at least 20 inputs) the target's
 `run.json` entry carries `stub_executed` and its `run.md` row says
 `stub executed:`, since such a run exercised the error path, not the target.
+The Lua driver's coverage hook gets line events only while a target chunk
+(under the target's root, not the driver or the harness) runs, and a function
+that runs 256 line events with no new edge stops getting them until a count
+hook resumes them 100000 instructions later, so a long loop or a deep recursion
+costs a few times a plain run. A Lua finding is located at the target frame the
+driver records when the error is raised (a stack overflow at the recursing
+line, not in the driver).
 
 ## Repair Synthesis
 

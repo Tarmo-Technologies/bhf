@@ -15,6 +15,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Lua lane's coverage hook costs a few times a plain run, not 100–600x:
+  line events reach it only while a target chunk runs (a call/return hook
+  switches them on and off, and a C function changes nothing), each chunk's
+  hash is computed once and its covered lines are integer ids, and a stretch
+  of 256 line events with no new edge pauses that function's line events until
+  a count hook resumes them 100000 instructions later. A recursion to a stack
+  overflow takes half a second under the harness; it took 24 s and timed out
+  unreported. The driver records the target's frames when an error is raised,
+  so a stack overflow is located in the target, not at `bhf_driver.lua:26`. The
+  nightly's new `ignored` shard runs the hook's cost benchmark.
 - A Lua colon method runs on an instance of its class (from its `new`,
   `create` or `init` constructor, else an empty table with the class as its
   metatable), so a method that reads its fields is fuzzed: `Reader:average`'s
