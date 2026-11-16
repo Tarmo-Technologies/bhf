@@ -29,6 +29,9 @@ static void emit_crumb(uint32_t id){
 volatile uint8_t  bhf_input[64] __attribute__((section(".noinit")));
 volatile uint32_t bhf_fault_flag = 0;   /* #72 fault-status word (zero-init per run: no inherited fault) */
 volatile uint32_t bhf_task_id    = 0;   /* #84 current-task identity observation */
+/* The kernel's version string, kept in the image so `firmware=` can record
+ * which kernel the target runs (#248). */
+__attribute__((used)) const char bhf_kernel_version[] = "FreeRTOS Kernel " tskKERNEL_VERSION_NUMBER;
 
 /* The host plants a gdb breakpoint at this symbol, so it must NOT be inlined
  * into its callers (otherwise the breakpoint address is never executed and the

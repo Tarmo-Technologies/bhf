@@ -177,6 +177,28 @@ pub(crate) fn replay_transport_outcome(
     let coverage_map = coverage_map.map(|map| with_recorded_input_cap(&map, input.len()));
     let plan = TransportPlan::parse(&spec, coverage_map.as_deref())
         .map_err(|error| format!("rebuild transport from profile: {error}"))?;
+    // A replay on another build of the firmware is a different experiment
+    // (re-checking a fix is one): say so rather than compare silently (#248).
+    if let (Some(path), Some(recorded)) = (
+        plan.firmware(),
+        profile
+            .pointer("/firmware_identity/sha256")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        match binary_analysis::firmware_identity(path) {
+            Ok(now) if now.sha256 != recorded => crate::bhfeprintln!(
+                "note: {} is not the firmware this finding was recorded on (sha256 {recorded} \
+                 then, {} now)",
+                path.display(),
+                now.sha256
+            ),
+            Ok(_) => {}
+            Err(error) => crate::bhfeprintln!(
+                "note: firmware=: {error}; the image this finding was recorded on cannot be \
+                 checked"
+            ),
+        }
+    }
     let transport = plan
         .into_transport(per_input_timeout)
         .map_err(|error| format!("rebuild transport from profile: {error}"))?;

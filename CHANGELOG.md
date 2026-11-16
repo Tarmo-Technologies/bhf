@@ -52,6 +52,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An on-target finding records the firmware it was found on: `firmware=PATH`
+  on a `qemu-system:` or `gdb:` transport names the ELF, and `finding.json` and
+  `transport_profile.json` record its SHA-256, size, architecture, build-id,
+  the toolchain its `.comment` names and the RTOS version string it carries
+  (FreeRTOS `tskKERNEL_VERSION_NUMBER`, Zephyr's banner). The profile's
+  `firmware_identity` was always `null`. An image bhf cannot read, or that is
+  not an ELF file, stops the run with exit 2, and `bhf replay` warns when the
+  image's SHA-256 changed. A GCC `.comment` with a build date after the
+  version (Arm GNU Toolchain's) names the version, not the date.
 - The in-crate Rust lane drives a directory opener that takes
   `impl AsRef<Path>` (or `P: AsRef<Path>`, `Into<PathBuf>`), and seeds the file
   the opener's body joins onto the directory (`data_dir.join("db.zo")` seeds

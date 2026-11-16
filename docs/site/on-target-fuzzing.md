@@ -220,6 +220,24 @@ bhf fuzz bhf_work --harness H-C0001 \
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
 `-kernel` boot) — the transport handles the rest.
 
+**Firmware identity.** `firmware=PATH` (on `qemu-system:`, and as
+`gdb:HOST:PORT,firmware=PATH`) names the ELF the target runs. Before anything
+connects, BHF reads it and records in each finding's `finding.json` and
+`transport_profile.json` a `firmware_identity` block:
+
+- its SHA-256, size, architecture and GNU build-id;
+- the toolchain its `.comment` names (`GCC 13.2.1`);
+- the RTOS version string it carries: FreeRTOS's
+  `"FreeRTOS Kernel " tskKERNEL_VERSION_NUMBER`, or Zephyr's
+  `Zephyr OS build v…` banner.
+
+An image it cannot read, or one that is not an ELF file, stops the run with
+exit 2. `bhf replay` warns when the image at that path no longer has the
+recorded SHA-256. FreeRTOS keeps no version string in an image unless the
+application references one; the reference profile's `app.c` keeps
+`bhf_kernel_version` for this. Without `firmware=`, the profile says that no
+identity was recorded.
+
 ### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
 For a device running an agent that receives inputs and streams edges and

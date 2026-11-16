@@ -45,7 +45,7 @@
 //! memory for the memory-read backends (gdb / qemu-system). The agent backend
 //! carries coverage over its protocol and rejects a coverage map.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use corpus::{CorpusError, FindingEmitter};
@@ -179,6 +179,9 @@ pub(crate) enum TransportPlan {
         map: GdbMemoryMap,
         /// The staging region's capacity and length word.
         input: InputContract,
+        /// The firmware ELF the target runs (`firmware=`), whose identity each
+        /// finding records (#248).
+        firmware: Option<PathBuf>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -200,6 +203,9 @@ pub(crate) enum TransportPlan {
         /// returns through the completion breakpoint is classified as a crash
         /// rather than a silent clean pass (#72).
         fault_status: Option<GuestFaultStatus>,
+        /// The firmware ELF the guest runs (`firmware=`), whose identity each
+        /// finding records (#248).
+        firmware: Option<PathBuf>,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -330,12 +336,28 @@ impl TransportPlan {
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
             let (map, input) = require_coverage_map("gdb", coverage_map)?;
-            let (host, port) = parse_host_port("gdb", spec, rest)?;
+            // `gdb:HOST:PORT[,firmware=PATH]`.
+            let mut parts = rest.split(',');
+            let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
+            let mut firmware = None;
+            for part in parts.map(str::trim).filter(|part| !part.is_empty()) {
+                match part.split_once('=') {
+                    Some(("firmware", value)) => firmware = Some(PathBuf::from(value.trim())),
+                    _ => {
+                        return Err(TransportSpecError::Malformed {
+                            backend: "gdb",
+                            spec: spec.to_owned(),
+                            reason: format!("unknown option {part:?}; allowed: firmware=PATH"),
+                        })
+                    }
+                }
+            }
             return Ok(Self::Gdb {
                 host,
                 port,
                 map,
                 input,
+                firmware,
             });
         }
 
@@ -373,6 +395,7 @@ impl TransportPlan {
                 port,
                 map,
                 input,
+                firmware: _,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
@@ -391,6 +414,7 @@ impl TransportPlan {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                firmware: _,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -425,6 +449,14 @@ impl TransportPlan {
     pub(crate) fn input_contract(&self) -> Option<InputContract> {
         match self {
             Self::Gdb { input, .. } | Self::QemuSystem { input, .. } => Some(*input),
+            _ => None,
+        }
+    }
+
+    /// The firmware ELF the spec names (`firmware=`), if any.
+    pub(crate) fn firmware(&self) -> Option<&Path> {
+        match self {
+            Self::Gdb { firmware, .. } | Self::QemuSystem { firmware, .. } => firmware.as_deref(),
             _ => None,
         }
     }
@@ -486,6 +518,7 @@ fn parse_qemu_system(
     let mut fault: Option<u64> = None;
     let mut fault_width: u64 = 4;
     let mut fault_clear: u64 = 0;
+    let mut firmware: Option<PathBuf> = None;
 
     let malformed = |reason: String| TransportSpecError::Malformed {
         backend: "qemu-system",
@@ -511,10 +544,11 @@ fn parse_qemu_system(
             "fault" => fault = Some(parse_int("fault", value)?),
             "fault_width" => fault_width = parse_int("fault_width", value)?,
             "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
+            "firmware" => firmware = Some(PathBuf::from(value)),
             other => {
                 return Err(malformed(format!(
                     "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
-                     fault, fault_width, fault_clear"
+                     fault, fault_width, fault_clear, firmware"
                 )))
             }
         }
@@ -567,6 +601,7 @@ fn parse_qemu_system(
         snapshot_tag,
         harness_done,
         fault_status,
+        firmware,
         notes,
     })
 }
@@ -708,6 +743,9 @@ pub(crate) struct TransportFuzzConfig {
     /// The staging region contract the memory-read backends write inputs
     /// under, recorded in each finding's transport profile.
     pub input_contract: Option<InputContract>,
+    /// The identity of the firmware the spec's `firmware=` names, recorded in
+    /// each finding and its transport profile (#248).
+    pub firmware_identity: Option<serde_json::Value>,
     /// Deterministic mutation RNG seed.
     pub rng_seed: u64,
     /// Stop as soon as this many DISTINCT findings are emitted.
@@ -1100,9 +1138,12 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
             "capacity": contract.capacity,
             "length_word": contract.length_word,
         })),
-        "firmware_identity": serde_json::Value::Null,
-        "limitations":
-            "host-observed timing; firmware/build identity not captured by this backend",
+        "firmware_identity": config.firmware_identity,
+        "limitations": if config.firmware_identity.is_some() {
+            "host-observed timing"
+        } else {
+            "host-observed timing; firmware identity not recorded (name the ELF with firmware=)"
+        },
     });
     let Ok(body) = serde_json::to_vec_pretty(&profile) else {
         return;
@@ -1110,6 +1151,19 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
     for id in finding_ids {
         let dir = config.work_dir.join("results").join("findings").join(id);
         let _ = std::fs::write(dir.join(TRANSPORT_PROFILE_FILE), &body);
+        // The finding names the firmware it was found on, too (#248).
+        if let Some(identity) = &config.firmware_identity {
+            let path = dir.join("finding.json");
+            if let Some(mut finding) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            {
+                finding["firmware_identity"] = identity.clone();
+                if let Ok(bytes) = serde_json::to_vec_pretty(&finding) {
+                    let _ = std::fs::write(&path, bytes);
+                }
+            }
+        }
     }
 }
 
@@ -1387,6 +1441,24 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
             args.max_len = contract.capacity;
         }
     }
+    // The firmware is read once, before anything runs: a finding recorded
+    // against an image bhf could not read would name no build.
+    let firmware_identity = match plan.firmware() {
+        Some(path) => Some(
+            binary_analysis::firmware_identity(path)
+                .map_err(|error| {
+                    crate::bhfeprintln!("bhf fuzz --target-transport: firmware=: {error}");
+                    2
+                })
+                .and_then(|identity| {
+                    serde_json::to_value(identity).map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --target-transport: firmware=: {error}");
+                        2
+                    })
+                })?,
+        ),
+        None => None,
+    };
     let transport_label = plan.label();
     let transport = plan.into_transport(args.timeout).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
@@ -1419,6 +1491,7 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
         input_contract,
+        firmware_identity,
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
         mode: args.mode,
@@ -1612,7 +1685,9 @@ mod tests {
                 port,
                 map,
                 input,
+                firmware,
             } => {
+                assert_eq!(firmware, None);
                 assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
@@ -1682,6 +1757,7 @@ mod tests {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                firmware: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
@@ -1991,6 +2067,7 @@ mod tests {
             coverage_map: None,
             max_len: 4096,
             input_contract: None,
+            firmware_identity: None,
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
             mode: actionability::RunMode::Reporting,

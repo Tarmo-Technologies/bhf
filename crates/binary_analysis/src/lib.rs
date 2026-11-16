@@ -670,6 +670,81 @@ pub fn build_identity(path: &Path) -> Option<BuildIdentity> {
     })
 }
 
+/// What firmware a target runs (#248): the image's bytes, its RTOS and the
+/// toolchain that built it, recorded with an on-target finding so it can be
+/// matched to the build it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FirmwareIdentity {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub architecture: &'static str,
+    pub build_id: Option<String>,
+    /// The RTOS whose version string the image carries, when it carries one.
+    pub rtos: Option<RtosIdentity>,
+    /// The compiler named in the image (`.comment` and similar stamps).
+    pub toolchain: Option<String>,
+}
+
+/// An RTOS and the version string its image carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RtosIdentity {
+    pub name: &'static str,
+    pub version: String,
+}
+
+/// Identify the firmware ELF at `path`. An image that cannot be read, or is
+/// not an ELF file, is an error naming why: an on-target finding recorded
+/// against the wrong or a missing image would not reproduce.
+pub fn firmware_identity(path: &Path) -> Result<FirmwareIdentity, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if !bytes.starts_with(b"\x7fELF") {
+        return Err(format!("{} is not an ELF file", path.display()));
+    }
+    let kind = identify_elf(&bytes)
+        .map_err(|reason| format!("{} is not a readable ELF file ({reason})", path.display()))?;
+    Ok(FirmwareIdentity {
+        path: path.display().to_string(),
+        sha256: sha256_hex(&bytes),
+        bytes: bytes.len() as u64,
+        architecture: kind.architecture,
+        build_id: binary_build_id(kind, &bytes),
+        rtos: rtos_identity(&bytes),
+        toolchain: binary_toolchain(&bytes),
+    })
+}
+
+/// The RTOS version string an image carries: FreeRTOS's
+/// `"FreeRTOS Kernel " tskKERNEL_VERSION_NUMBER` (`FreeRTOS Kernel V11.1.0+`,
+/// or `FreeRTOS V10.4.3`) or Zephyr's boot banner (`Zephyr OS build v3.5.0`).
+fn rtos_identity(bytes: &[u8]) -> Option<RtosIdentity> {
+    for value in ascii_strings(bytes, 6) {
+        for (name, prefixes) in [
+            ("FreeRTOS", &["FreeRTOS Kernel ", "FreeRTOS "][..]),
+            ("Zephyr", &["Zephyr OS build "][..]),
+        ] {
+            for prefix in prefixes {
+                let Some(at) = value.find(prefix) else {
+                    continue;
+                };
+                let token = value[at + prefix.len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                let version = token.trim_start_matches(['V', 'v']);
+                if version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    return Some(RtosIdentity {
+                        name,
+                        version: token.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn identify(path: &Path, bytes: &[u8]) -> Identification {
     if bytes.starts_with(b"\x7fELF") {
         return match identify_elf(bytes) {
@@ -2791,8 +2866,16 @@ fn binary_toolchain(bytes: &[u8]) -> Option<String> {
             }
         }
         if let Some(rest) = value.strip_prefix("GCC: ") {
-            // e.g. "(Ubuntu 13.3.0-6ubuntu2) 13.3.0" — the trailing token is the version.
-            if let Some(version) = rest.split_whitespace().last().and_then(leading_version) {
+            // "(Ubuntu 13.3.0-6ubuntu2) 13.3.0", or Arm's "(15:13.2.rel1-2) 13.2.1
+            // 20231009": the first dotted version after the vendor's parenthesis,
+            // not a trailing build date.
+            let after = rest.rsplit_once(')').map_or(rest, |(_, after)| after);
+            let version = after
+                .split_whitespace()
+                .find(|token| token.contains('.'))
+                .and_then(leading_version)
+                .or_else(|| rest.split_whitespace().last().and_then(leading_version));
+            if let Some(version) = version {
                 return Some(format!("GCC {version}"));
             }
         }
@@ -4054,7 +4137,43 @@ mod deb_scan_tests {
 
 #[cfg(test)]
 mod build_identity_tests {
-    use super::build_identity;
+    use super::{build_identity, firmware_identity, rtos_identity};
+
+    #[test]
+    fn firmware_identity_names_the_rtos_and_refuses_what_is_not_an_elf() {
+        let (_guard, dir) = temp_dir("firmware");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 1, 1, 1, 0];
+        elf.resize(18, 0);
+        elf.extend_from_slice(&40u16.to_le_bytes()); // EM_ARM
+        elf.resize(64, 0);
+        elf.extend_from_slice(
+            b"\0FreeRTOS Kernel V11.1.0+\0GCC: (15:13.2.rel1-2) 13.2.1 20231009\0",
+        );
+        let path = dir.join("rtos.elf");
+        std::fs::write(&path, &elf).unwrap();
+        let identity = firmware_identity(&path).unwrap();
+        assert_eq!(identity.bytes, elf.len() as u64);
+        assert_eq!(identity.sha256.len(), 64);
+        let rtos = identity.rtos.expect("the kernel version string");
+        assert_eq!((rtos.name, rtos.version.as_str()), ("FreeRTOS", "V11.1.0+"));
+        assert_eq!(identity.toolchain.as_deref(), Some("GCC 13.2.1"));
+
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "FreeRTOS V10.0.0").unwrap();
+        let error = firmware_identity(&text).unwrap_err();
+        assert!(error.contains("is not an ELF file"), "{error}");
+        let error = firmware_identity(&dir.join("absent.elf")).unwrap_err();
+        assert!(error.starts_with("cannot read "), "{error}");
+        assert_eq!(
+            rtos_identity(b"\0Zephyr OS build v3.5.0\0"),
+            Some(super::RtosIdentity {
+                name: "Zephyr",
+                version: "v3.5.0".to_owned(),
+            })
+        );
+        assert_eq!(rtos_identity(b"\0FreeRTOS is a kernel\0"), None);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {

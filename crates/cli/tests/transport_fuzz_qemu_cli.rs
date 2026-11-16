@@ -437,6 +437,42 @@ fn cli_qemu_system_inputs_longer_than_the_cap_never_reach_the_fault_word() {
     );
 }
 
+/// #248: a `firmware=` image bhf cannot read is reported before anything
+/// connects, so no finding is recorded against an unknown build.
+#[test]
+fn an_unreadable_firmware_image_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing.elf");
+    let text = tmp.path().join("notes.txt");
+    std::fs::write(&text, "not an image").unwrap();
+    for (firmware, says) in [(&missing, "cannot read"), (&text, "is not an ELF file")] {
+        let out = Command::new(bhf_bin())
+            .args([
+                "fuzz",
+                "--target-transport",
+                &format!(
+                    "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,firmware={}",
+                    firmware.display()
+                ),
+                "--transport-coverage-map",
+                "input=0x1000,input_cap=64,ring=0x2000,write=0x3000,wrapped=0x3004,cap=512",
+                "--harness",
+                "h",
+                "--iterations",
+                "1",
+            ])
+            .arg(tmp.path().join("work"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("firmware=") && stderr.contains(says),
+            "{says}: {stderr}"
+        );
+    }
+}
+
 /// Actual FreeRTOS CLI acceptance, separate from the bare-metal Cortex-M test.
 /// Opt in because it obtains a pinned upstream kernel unless BHF_RTOS_KERNEL is
 /// supplied. Each CLI invocation opens a fresh transport session on one guest.
@@ -535,11 +571,21 @@ fn cli_freertos_clean_fault_clean() {
     );
 
     let symbol = |name, thumb| nm_symbol(&elf, name, thumb);
+    // #248: the findings record the image they were found on.
     let spec_base = format!(
-        "done={:#x},done_kind=2,fault={:#x}",
+        "done={:#x},done_kind=2,fault={:#x},firmware={}",
         symbol("harness_done", true),
-        symbol("bhf_fault_flag", false)
+        symbol("bhf_fault_flag", false),
+        elf.display()
     );
+    let elf_sha256 = {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(std::fs::read(&elf).unwrap());
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
     let map = format!(
         "input={:#x},input_cap=64,ring={:#x},write={:#x},wrapped={:#x},cap=512",
         symbol("bhf_input", false),
@@ -615,6 +661,20 @@ fn cli_freertos_clean_fault_clean() {
             let finding_id = findings[0].as_str().unwrap();
             let finding = work.join("results/findings").join(finding_id);
             assert!(finding.join("transport_profile.json").is_file());
+            for file in ["finding.json", "transport_profile.json"] {
+                let raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(finding.join(file)).unwrap()).unwrap();
+                let identity = &raw["firmware_identity"];
+                assert_eq!(identity["sha256"], elf_sha256.as_str(), "{file}: {raw:#}");
+                assert_eq!(identity["rtos"]["name"], "FreeRTOS", "{file}: {raw:#}");
+                assert_eq!(identity["rtos"]["version"], "V11.1.0+", "{file}: {raw:#}");
+                assert!(
+                    identity["toolchain"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("GCC ")),
+                    "{file}: {raw:#}"
+                );
+            }
 
             // Replay must start from reset, at the recorded QMP/GDB endpoints.
             // A daemon parked at harness_done would snapshot a completed run.
