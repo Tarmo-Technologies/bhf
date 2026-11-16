@@ -136,6 +136,17 @@ fn call_arguments<'a>(text: &'a str, api: &str) -> Option<Vec<&'a str>> {
     None
 }
 
+/// Whether `line` holds a call of `api` (`api(`, or `api` ending the line
+/// before its arguments), not a longer identifier that ends in it.
+fn names_call(line: &str, api: &str) -> bool {
+    line.match_indices(api).any(|(at, _)| {
+        let before = line[..at].bytes().next_back();
+        let after = line[at + api.len()..].trim_start();
+        !before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && (after.starts_with('(') || after.is_empty())
+    })
+}
+
 /// Whether the `api` call at `file:line` passes a format that is not a string
 /// literal. `false` when the source or the call cannot be read.
 fn format_is_nonliteral(site: &CallSite) -> bool {
@@ -148,13 +159,12 @@ fn format_is_nonliteral(site: &CallSite) -> bool {
     else {
         return false;
     };
-    // A call may continue onto the next lines.
-    let text: String = source
-        .lines()
-        .skip(index)
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(" ");
+    // The call starts on the frame's line and may continue onto the next ones.
+    let lines: Vec<&str> = source.lines().skip(index).take(4).collect();
+    if !lines.first().is_some_and(|line| names_call(line, site.api)) {
+        return false;
+    }
+    let text = lines.join(" ");
     let position = APIS
         .iter()
         .find(|(api, _)| *api == site.api)
@@ -165,6 +175,59 @@ fn format_is_nonliteral(site: &CallSite) -> bool {
     arguments
         .get(position.unwrap_or_default())
         .is_some_and(|format| !format.is_empty() && !format.starts_with('"'))
+}
+
+/// Whether the first source frame of a finding with no printf frames (an MSan
+/// corpus replay records only the target's frame) is a printf-family call
+/// with a non-literal format, or one of `sites`.
+fn at_format_call(raw: &Value, sites: &[CallSite]) -> bool {
+    let Some((file, line)) = raw
+        .pointer("/exception/stack")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|frame| {
+            Some((
+                frame.get("file")?.as_str()?.to_owned(),
+                frame.get("line")?.as_u64()?,
+            ))
+        })
+    else {
+        return false;
+    };
+    if sites
+        .iter()
+        .any(|site| site.file == file && site.line == line)
+    {
+        return true;
+    }
+    APIS.iter().any(|(api, _)| {
+        format_is_nonliteral(&CallSite {
+            api,
+            file: file.clone(),
+            line,
+            function: None,
+        })
+    })
+}
+
+/// Put CWE-134 first in a grouped finding that keeps its own rule (an MSan
+/// read of the garbage argument a conversion took), its own CWE second.
+fn prepend_format_cwe(raw: &mut Value) {
+    let Some(record) = raw.get_mut("actionability").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut cwe = vec![Value::String("CWE-134".to_owned())];
+    cwe.extend(
+        record
+            .get("cwe")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|cwe| cwe.as_str() != Some("CWE-134"))
+            .cloned(),
+    );
+    record.insert("cwe".to_owned(), Value::Array(cwe));
 }
 
 fn is_format_oracle(raw: &Value) -> bool {
@@ -218,15 +281,23 @@ pub(crate) fn group_format_string_findings(work_dir: &Path) {
             .collect();
         // The oracle saw the format, not where it was passed; a crash says.
         let first_site = sites.iter().flatten().next().cloned();
+        let known_sites: Vec<CallSite> = sites.iter().flatten().cloned().collect();
         let cluster = shared_cluster(&harness);
         for ((path, mut raw), site) in findings.into_iter().zip(sites) {
             let oracle = is_format_oracle(&raw);
-            if site.is_none() && !oracle && !is_format_capability(&raw) {
+            let at_call = site.is_none()
+                && !oracle
+                && !is_format_capability(&raw)
+                && at_format_call(&raw, &known_sites);
+            if site.is_none() && !oracle && !is_format_capability(&raw) && !at_call {
                 continue;
             }
             let before = raw.clone();
             if let Some(site) = &site {
                 reclassify(&mut raw, site, oracle_fired, &path);
+            }
+            if at_call {
+                prepend_format_cwe(&mut raw);
             }
             if let (true, Some(site), Some(target)) = (
                 oracle,
@@ -418,6 +489,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("`log_message` passes input-controlled bytes to `snprintf`"));
+    }
+
+    /// An MSan corpus replay records only the call's own frame; one at a
+    /// non-literal printf call is the same bug, and keeps its CWE second.
+    #[test]
+    fn a_finding_whose_only_frame_is_the_format_call_joins_with_cwe_134_first() {
+        let dir = crate::test_support::TestDir::new("format-string-msan");
+        let source = dir.join("fmt.c");
+        std::fs::write(
+            &source,
+            "int log_message(const char *msg) {\n  char buf[8];\n  snprintf(buf, 8, msg);\n  \
+             return snprintf(buf, 8, \"%s\", msg);\n}\n",
+        )
+        .unwrap();
+        let msan = |line: u64| {
+            serde_json::json!({
+                "rule_id": "BHF-212",
+                "exception": { "stack": [ { "function": "", "file": source, "line": line } ] },
+                "actionability": { "cwe": ["CWE-457"] }
+            })
+        };
+        assert!(at_format_call(&msan(3), &[]));
+        assert!(
+            !at_format_call(&msan(4), &[]),
+            "a literal format is not the bug"
+        );
+        assert!(!at_format_call(&msan(1), &[]));
+        let mut raw = msan(3);
+        prepend_format_cwe(&mut raw);
+        assert_eq!(
+            raw["actionability"]["cwe"],
+            serde_json::json!(["CWE-134", "CWE-457"])
+        );
     }
 
     #[test]

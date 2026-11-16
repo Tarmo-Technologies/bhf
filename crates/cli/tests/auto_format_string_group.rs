@@ -51,11 +51,13 @@ fn a_format_string_bug_is_one_cwe_134_group_at_the_call() {
     assert_eq!(representative["cwe"][0], 134, "{representative:#}");
     assert_eq!(representative["location"]["file"], "fmt.c");
     assert_eq!(representative["location"]["line"], 7);
+    // Every finding is the format-string bug: the crashes and an MSan read
+    // of a garbage argument lead with CWE-134, and the capability finding is
+    // the format reaching the call.
     for finding in findings {
         assert!(
-            finding["cwe"].as_array().unwrap().contains(&134.into())
-                || finding["rule"]["id"] == "BHF-668",
-            "every crash is the format-string bug: {finding:#}"
+            finding["cwe"][0] == 134 || finding["rule"]["id"] == "BHF-668",
+            "every finding is the format-string bug: {finding:#}"
         );
     }
 }
