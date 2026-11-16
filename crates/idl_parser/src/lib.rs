@@ -241,7 +241,9 @@ mod tests {
         let error = parse_idl("#if VENDOR_FLAG(1)\ninterface I {};\n#endif\n")
             .expect_err("CPP expression is rejected");
         assert!(
-            error.to_string().contains("function-like macro 'VENDOR_FLAG'"),
+            error
+                .to_string()
+                .contains("function-like macro 'VENDOR_FLAG'"),
             "{error}"
         );
     }

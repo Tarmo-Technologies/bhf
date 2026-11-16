@@ -78,7 +78,10 @@ fn a_second_tree_in_the_same_work_dir_reports_only_itself() {
     let second = auto(&tree_b, &work);
     assert!(second.contains("moved it to"), "{second}");
     assert_eq!(finding_count(&work), 0, "{second}");
-    assert!(!second.contains("alpha.py") && !second.contains("IndexError"), "{second}");
+    assert!(
+        !second.contains("alpha.py") && !second.contains("IndexError"),
+        "{second}"
+    );
     let index = std::fs::read_to_string(work.join("results/INDEX.md")).unwrap_or_default();
     assert!(!index.contains("alpha.py"), "{index}");
     let canonical_a = tree_a.canonicalize().unwrap();
