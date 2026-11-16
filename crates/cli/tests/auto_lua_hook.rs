@@ -160,18 +160,25 @@ fn the_line_hook_costs_under_ten_times_plain_lua() {
          acc = acc + i\n  end\n  return acc\nend\nreturn M\n",
     )
     .unwrap();
-    let rounds = 200;
-    let plain_started = Instant::now();
-    let plain = Command::new(lua)
-        .arg("-e")
-        .arg(format!(
-            "local M = dofile('{}') for _ = 1, {rounds} do M.spin('') end",
-            target.display()
-        ))
-        .output()
-        .unwrap();
-    let plain_time = plain_started.elapsed();
-    assert!(plain.status.success());
+    // Enough rounds that the work, not the process start, is what is timed
+    // (200 rounds ran 11 ms plain), and the best of three runs on each side,
+    // so a busy CI runner's stall in one run does not decide the ratio.
+    let rounds = 2000;
+    let best_of_three =
+        |run: &mut dyn FnMut() -> std::time::Duration| (0..3).map(|_| run()).min().unwrap();
+    let plain_time = best_of_three(&mut || {
+        let started = Instant::now();
+        let plain = Command::new(lua)
+            .arg("-e")
+            .arg(format!(
+                "local M = dofile('{}') for _ = 1, {rounds} do M.spin('') end",
+                target.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(plain.status.success());
+        started.elapsed()
+    });
 
     let harness = root.join("bhfgen.lua");
     std::fs::write(
@@ -182,14 +189,17 @@ fn the_line_hook_costs_under_ten_times_plain_lua() {
         ),
     )
     .unwrap();
-    let hooked_started = Instant::now();
-    let hooked = run_driver(lua, &harness, &root, &root.join("covered.txt"));
-    let hooked_time = hooked_started.elapsed();
-    assert!(
-        hooked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&hooked.stderr)
-    );
+    let hooked_time = best_of_three(&mut || {
+        let started = Instant::now();
+        let hooked = run_driver(lua, &harness, &root, &root.join("covered.txt"));
+        let elapsed = started.elapsed();
+        assert!(
+            hooked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&hooked.stderr)
+        );
+        elapsed
+    });
     let ratio = hooked_time.as_secs_f64() / plain_time.as_secs_f64();
     eprintln!("plain {plain_time:?}, harnessed {hooked_time:?}, ratio {ratio:.1}x");
     assert!(ratio < 10.0, "harnessed/plain is {ratio:.1}x");
