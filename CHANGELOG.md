@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Java lane's javac fallback compiles a target in a package named like
+  example or test code (IntelliJ's `org.example`, Spring Initializr's
+  `com.example.demo`, a sibling `com.acme.testutil`). It used to skip those
+  package directories and report `no .java sources`; `src/test/java` and a
+  top-level `examples/` module are still left out.
 - Rust functions inside inline modules (`pub mod codec { pub fn decode() }`,
   nested ones, and ones behind a private `mod hidden { }`) are called by their
   full module path. They used to be called as if defined at the crate root and

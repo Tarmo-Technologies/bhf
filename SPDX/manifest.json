@@ -2303,6 +2303,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_java_example_package.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_java_file_param.rs",
       "license": "Apache-2.0"
     },

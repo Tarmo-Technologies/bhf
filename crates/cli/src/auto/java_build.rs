@@ -107,7 +107,8 @@ pub fn build_java_harness(
     // Resolve declaration models for the target's custom (class/enum) parameter
     // types from across the tree, so a config-object parameter (e.g. `CSVFormat`)
     // can be constructed with a default instead of skipping the target (F8).
-    let param_types = collect_param_type_models(source_root, &resolved.target);
+    let param_types =
+        collect_param_type_models(source_root, &candidate.source_path, &resolved.target);
 
     // Generate the harness BEFORE building so an un-harnessable target (instance
     // method / unsupported param) skips without a wasted compile.
@@ -317,6 +318,7 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedJavaTarget, String> {
 /// to a parameter by FQN or leaf name and synthesises a default instance.
 fn collect_param_type_models(
     source_root: &Path,
+    source_path: &Path,
     target: &java_parser::JavaMethod,
 ) -> Vec<java_parser::JavaTypeModel> {
     // Leaf names of parameter types the cursor can't decode directly (the candidates
@@ -331,7 +333,7 @@ fn collect_param_type_models(
         return Vec::new();
     }
     let mut models = Vec::new();
-    for src_path in collect_java_sources(source_root) {
+    for src_path in collect_java_sources_for(source_root, Some(source_path)) {
         let Ok(src) = std::fs::read_to_string(&src_path) else {
             continue;
         };
@@ -654,18 +656,26 @@ fn javac_feature_version(javac: &Path) -> Option<String> {
     feature.parse::<u32>().ok().map(|n| n.to_string())
 }
 
-/// A directory whose `.java` files are NOT library sources to compile: build/VCS
-/// output, and TEST/example/benchmark trees (which pull in JUnit etc. and would
-/// fail a dependency-free `javac`). Mirrors the discovery `DirFilter` defaults —
+/// Directories whose `.java` files are NOT library sources to compile: build/VCS
+/// output ([`is_build_output_dir`]), and TEST/example/benchmark trees, which pull
+/// in JUnit etc. and would fail a dependency-free `javac`
+/// ([`is_non_library_dir_name`]). Mirrors the discovery `DirFilter` defaults —
 /// `src/test/java` is the dominant real case (commons-codec, jackson, …).
-fn is_non_source_dir(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    if matches!(
-        n.as_str(),
+///
+/// Build and VCS output: never library source, wherever it sits.
+fn is_build_output_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
         "bhf_work" | ".git" | "target" | "build" | "node_modules" | "out" | ".gradle"
-    ) {
-        return true;
-    }
+    )
+}
+
+/// A test, example or benchmark tree by its name. Applied to the directories
+/// above a Java package tree (a module, `src/test`), never to a package
+/// directory: `org/example`, `com/example/demo` and `com/acme/testutil` are
+/// packages ([`collect_java_sources_for`]).
+fn is_non_library_dir_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
     // Any dir whose name contains "test" is test code (`test`, `tests`,
     // `integration-test`), guarding the words that merely contain the substring.
     if n.contains("test")
@@ -738,7 +748,7 @@ fn resolve_target_classpath(
     }
 
     // Fallback: javac the bare source tree (dep-light / dep-free projects).
-    let sources = collect_java_sources(source_root);
+    let sources = collect_java_sources_for(source_root, Some(source_path));
     if sources.is_empty() {
         return Err((
             format!("no .java sources under {}", source_root.display()),
@@ -984,7 +994,33 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// non-library dirs (build output, test/example trees). Capped to keep a
 /// pathological tree bounded.
 pub(crate) fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
+    collect_java_sources_for(root, None)
+}
+
+/// [`collect_java_sources`] for a target defined in `candidate`: the
+/// directories on its path, and its package tree (the source root its
+/// `package` declaration implies, plus the package's first segment), are kept
+/// whatever they are named, so a target in `org.example` or
+/// `com.example.demo` (IntelliJ and Spring Initializr defaults) compiles. Test,
+/// example and benchmark trees elsewhere (`src/test/java`, a top-level
+/// `examples/` module) are still left out.
+pub(crate) fn collect_java_sources_for(root: &Path, candidate: Option<&Path>) -> Vec<PathBuf> {
     const MAX: usize = 5000;
+    let chain: Vec<&Path> = candidate
+        .map(|file| {
+            file.ancestors()
+                .skip(1)
+                .take_while(|dir| dir.starts_with(root))
+                .collect()
+        })
+        .unwrap_or_default();
+    let package_tree = candidate.and_then(java_package_tree);
+    let kept = |dir: &Path| {
+        chain.contains(&dir)
+            || package_tree
+                .as_deref()
+                .is_some_and(|tree| dir.starts_with(tree))
+    };
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -997,7 +1033,7 @@ pub(crate) fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
                 continue;
             };
             if path.is_dir() {
-                if is_non_source_dir(name) {
+                if is_build_output_dir(name) || (is_non_library_dir_name(name) && !kept(&path)) {
                     continue;
                 }
                 stack.push(path);
@@ -1010,6 +1046,27 @@ pub(crate) fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The package tree `file` belongs to: the source root its `package a.b.c;`
+/// declaration implies (`src/main/java` for `src/main/java/a/b/c/X.java`)
+/// joined with the package's first segment (`.../a`). `None` for the default
+/// package or a declaration the path does not end with.
+fn java_package_tree(file: &Path) -> Option<PathBuf> {
+    let source = std::fs::read_to_string(file).ok()?;
+    let package = source.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("package ")?;
+        Some(rest.trim_end_matches(';').trim().to_owned())
+    })?;
+    let segments: Vec<&str> = package.split('.').filter(|s| !s.is_empty()).collect();
+    let mut dir = file.parent()?;
+    for segment in segments.iter().rev() {
+        if dir.file_name()?.to_str()? != *segment {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+    Some(dir.join(segments.first()?))
 }
 
 /// Ensure the bhf JVM agent jar exists AND is at least as new as its sources;
@@ -1201,6 +1258,103 @@ mod tests {
         assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }
 
+    fn write_java(root: &Path, relative: &str, package: &str) -> PathBuf {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let class = path.file_stem().unwrap().to_str().unwrap();
+        std::fs::write(
+            &path,
+            format!("package {package};\npublic class {class} {{}}\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    fn names(files: &[PathBuf], root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// IntelliJ's `org.example` and Spring Initializr's `com.example.demo`
+    /// are packages, not example trees: the target's sources compile.
+    #[test]
+    fn a_target_in_an_example_named_package_keeps_its_sources() {
+        for (relative, package) in [
+            ("src/main/java/org/example/Main.java", "org.example"),
+            (
+                "src/main/java/com/example/demo/DemoApplication.java",
+                "com.example.demo",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let target = write_java(root, relative, package);
+            write_java(
+                root,
+                "src/test/java/org/example/MainTest.java",
+                "org.example",
+            );
+            write_java(root, "examples/src/main/java/demo/Tour.java", "demo");
+            let found = names(&collect_java_sources_for(root, Some(&target)), root);
+            assert_eq!(found, [relative.to_owned()], "{relative}");
+            // Without the target's path, the old filter drops it.
+            assert!(collect_java_sources(root).is_empty(), "{relative}");
+        }
+    }
+
+    /// A package named like test code next to the target's own package is
+    /// still a package of the same source tree.
+    #[test]
+    fn a_test_named_package_beside_the_target_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = write_java(
+            root,
+            "src/main/java/com/acme/parse/Parser.java",
+            "com.acme.parse",
+        );
+        write_java(
+            root,
+            "src/main/java/com/acme/testutil/Bytes.java",
+            "com.acme.testutil",
+        );
+        write_java(
+            root,
+            "src/test/java/com/acme/parse/ParserTest.java",
+            "com.acme.parse",
+        );
+        let found = names(&collect_java_sources_for(root, Some(&target)), root);
+        assert_eq!(
+            found,
+            [
+                "src/main/java/com/acme/parse/Parser.java",
+                "src/main/java/com/acme/testutil/Bytes.java"
+            ]
+        );
+    }
+
+    /// A top-level `examples/` module (and `build/` output) is left out even
+    /// for a target whose package is named `example`.
+    #[test]
+    fn a_top_level_examples_module_is_still_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = write_java(root, "org/example/App.java", "org.example");
+        write_java(root, "examples/Tour.java", "examples");
+        write_java(root, "build/Gen.java", "build");
+        let found = names(&collect_java_sources_for(root, Some(&target)), root);
+        assert_eq!(found, ["org/example/App.java"]);
+    }
+
     #[test]
     fn collect_java_sources_finds_nested_and_skips_work_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1296,14 +1450,14 @@ mod tests {
             Some("CSVParser"),
             &["CSVParser"],
         );
-        let models = collect_param_type_models(root, &parse);
+        let models = collect_param_type_models(root, &pkg.join("CSVParser.java"), &parse);
         assert_eq!(models.len(), 1, "{models:?}");
         assert_eq!(models[0].fqn, "org.apache.commons.csv.CSVFormat");
         assert_eq!(models[0].self_constants, vec!["DEFAULT"]);
 
         // All-scalar target -> no tree scan, no models.
         let scalar = jm("f", &["String", "int"], true, false, None, &["P"]);
-        assert!(collect_param_type_models(root, &scalar).is_empty());
+        assert!(collect_param_type_models(root, &pkg.join("CSVParser.java"), &scalar).is_empty());
         // A supported JDK type (Charset) is decodable -> not modelled either.
         let charset = jm(
             "parse",
@@ -1313,7 +1467,7 @@ mod tests {
             None,
             &["P"],
         );
-        assert!(collect_param_type_models(root, &charset).is_empty());
+        assert!(collect_param_type_models(root, &pkg.join("CSVParser.java"), &charset).is_empty());
     }
 
     #[test]
