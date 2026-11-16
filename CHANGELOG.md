@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Without a compile database, a C harness gets the `-D`/`-U` defines a
+  non-executing scan of the project's CMakeLists.txt or Makefile finds,
+  labelled statically recovered in the harness Makefile. Only a few
+  header-capability macros used to apply, so code behind `#ifdef ENABLE_X`
+  that the build turns on was compiled out and its bugs missed. run.md's
+  fabricated-build-context warning names `--probe-build`.
 - `results/` groups fuzz and runtime findings by sink: their first project
   frame and bug family. One out-of-bounds read in `tlv_decode`, reached
   through two call stacks and reported by ASan and UBSan, was three findings

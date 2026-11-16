@@ -3638,7 +3638,8 @@ fn render_md(r: &RunJson<'_>) -> String {
             "These harnesses compiled only after bhf supplied headers, macro values or types \
              the build context lacked. Their findings are low confidence: code built against \
              a placeholder can take paths the real build never does. Supply the real build \
-             context (a compile database, the project's include dirs, `--define`) and re-run."
+             context (a compile database, the project's include dirs, `--define`), or let \
+             bhf run the project's own build to record it (`--probe-build`), and re-run."
         );
         for t in &r.targets {
             if let Some(fidelity) = &t.build_fidelity {

@@ -2131,6 +2131,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_c_static_defines.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_c_syntax_check_round.rs",
       "license": "Apache-2.0"
     },
