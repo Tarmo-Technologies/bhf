@@ -663,6 +663,68 @@ pub struct GdbMemoryMap {
     pub ring_capacity: usize,
 }
 
+/// How much input the firmware's staging region holds, and where it reads
+/// the input's length. The memory-read transports write each input at
+/// [`GdbMemoryMap::input_address`]; one longer than the region would overwrite
+/// the guest globals after it (a fault-status word, which then reports a false
+/// CPU exception), so [`InputContract::stage`] cuts it to `capacity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputContract {
+    /// Bytes the staging region holds. Never zero.
+    pub capacity: usize,
+    /// Address of a little-endian `u32` the firmware reads the input length
+    /// from, written before the input; `None` when it takes none.
+    pub length_word: Option<u64>,
+}
+
+impl InputContract {
+    /// A contract for a `capacity`-byte region, refused when it holds nothing.
+    pub fn new(capacity: usize, length_word: Option<u64>) -> Result<Self> {
+        if capacity == 0 {
+            return Err(TransportError::Protocol(
+                "input capacity must be at least one byte".to_owned(),
+            ));
+        }
+        Ok(Self {
+            capacity,
+            length_word,
+        })
+    }
+
+    /// The part of `input` the region holds.
+    pub fn clamp<'a>(&self, input: &'a [u8]) -> &'a [u8] {
+        &input[..input.len().min(self.capacity)]
+    }
+
+    /// Write `input`, cut to the capacity, and its length word, through `client`.
+    pub fn stage<C: Read + Write>(
+        &self,
+        client: &mut GdbClient<C>,
+        input_address: u64,
+        input: &[u8],
+    ) -> Result<()> {
+        let input = self.clamp(input);
+        if let Some(address) = self.length_word {
+            let len = u32::try_from(input.len()).unwrap_or(u32::MAX);
+            client.write_memory(address, &len.to_le_bytes())?;
+        }
+        client.write_memory(input_address, input)
+    }
+}
+
+/// Write `input` at `input_address` under `contract`, or as it is without one.
+pub fn stage_input<C: Read + Write>(
+    client: &mut GdbClient<C>,
+    input_address: u64,
+    contract: Option<&InputContract>,
+    input: &[u8],
+) -> Result<()> {
+    match contract {
+        Some(contract) => contract.stage(client, input_address, input),
+        None => client.write_memory(input_address, input),
+    }
+}
+
 /// A transport that drives a target over the GDB remote protocol.
 ///
 /// `connect` dials a fresh RSP channel per [`TargetTransport::arm`] (a TCP
@@ -671,6 +733,7 @@ pub struct GdbRemoteTransport<F> {
     connect: F,
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
+    input_contract: Option<InputContract>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -680,7 +743,15 @@ impl<F> GdbRemoteTransport<F> {
             connect,
             map,
             exec_deadline: None,
+            input_contract: None,
         }
+    }
+
+    /// Stage each input under `contract`: cut to the region's capacity, with
+    /// its length word written first when the firmware reads one.
+    pub fn with_input_contract(mut self, contract: Option<InputContract>) -> Self {
+        self.input_contract = contract;
+        self
     }
 
     /// Set the absolute per-input execution deadline (#70). A run whose `continue`
@@ -706,6 +777,7 @@ where
             client,
             map: self.map,
             exec_deadline: self.exec_deadline,
+            input_contract: self.input_contract,
         }))
     }
 }
@@ -739,6 +811,7 @@ pub struct GdbSession<C> {
     client: GdbClient<C>,
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
+    input_contract: Option<InputContract>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -748,7 +821,12 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         // hang, so it propagates (the caller halts without inventing a false
         // target-timing finding) rather than being classed as a target timeout.
         self.client.reset()?;
-        self.client.write_memory(self.map.input_address, input)?;
+        stage_input(
+            &mut self.client,
+            self.map.input_address,
+            self.input_contract.as_ref(),
+            input,
+        )?;
 
         // EXECUTION phase: bounded by the absolute per-input deadline (#70). A
         // target that never reaches its stop within the deadline is a first-class
@@ -1114,6 +1192,64 @@ mod tests {
             log.iter().any(|p| p.starts_with("M1000,")),
             "log missing input write: {log:?}"
         );
+    }
+
+    /// An input longer than the staging region is cut to its capacity, so the
+    /// write never reaches the guest globals after it, and the firmware's
+    /// length word (written first) says how much it got.
+    #[test]
+    fn an_input_contract_cuts_the_input_and_writes_its_length_first() {
+        let ring_capacity = 32_usize;
+        let (image, write, wrapped) = simulate_ring(&encode_event_stream(&[]), ring_capacity);
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity,
+        };
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log))
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(0x2000, vec![0_u8; 4])
+            .with_region(map.ring_address, image)
+            .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)]);
+        let handle = thread::spawn(move || stub.serve());
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        )
+        .with_input_contract(Some(InputContract::new(4, Some(0x2000)).unwrap()));
+
+        let mut session = transport.arm().unwrap();
+        session.run_input(b"payload").unwrap();
+        drop(session);
+        handle.join().unwrap().unwrap();
+
+        let log = log.lock().unwrap();
+        let writes: Vec<&String> = log.iter().filter(|p| p.starts_with('M')).collect();
+        assert_eq!(
+            writes,
+            ["M2000,4:04000000", "M1000,4:7061796c"],
+            "length word first, then the first four input bytes: {log:?}"
+        );
+    }
+
+    #[test]
+    fn an_input_contract_refuses_an_empty_region_and_keeps_short_inputs() {
+        assert!(InputContract::new(0, None).is_err());
+        let contract = InputContract::new(8, None).unwrap();
+        assert_eq!(contract.clamp(b"abc"), b"abc");
+        assert_eq!(contract.clamp(b"0123456789"), b"01234567");
     }
 
     #[test]

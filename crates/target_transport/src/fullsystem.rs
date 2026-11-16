@@ -391,6 +391,7 @@ pub struct FullSystemTransport<FQ, FG> {
     harness_breakpoint: Option<(u64, u32)>,
     fault_status: Option<GuestFaultStatus>,
     exec_deadline: Option<Duration>,
+    input_contract: Option<crate::gdb::InputContract>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -412,7 +413,15 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             harness_breakpoint: None,
             fault_status: None,
             exec_deadline: None,
+            input_contract: None,
         })
+    }
+
+    /// Stage each input under `contract`: cut to the guest staging region's
+    /// capacity, with its length word written first when the firmware reads one.
+    pub fn with_input_contract(mut self, contract: Option<crate::gdb::InputContract>) -> Self {
+        self.input_contract = contract;
+        self
     }
 
     /// Set the absolute per-input execution deadline (#70). A run whose `continue`
@@ -490,6 +499,7 @@ where
             snapshot_tag: self.snapshot_tag.clone(),
             fault_status: self.fault_status.clone(),
             exec_deadline: self.exec_deadline,
+            input_contract: self.input_contract,
         }))
     }
 }
@@ -503,6 +513,7 @@ pub struct FullSystemSession<CQ, CG> {
     snapshot_tag: String,
     fault_status: Option<GuestFaultStatus>,
     exec_deadline: Option<Duration>,
+    input_contract: Option<crate::gdb::InputContract>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -521,7 +532,12 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         // reaches the completion stop is a first-class Timeout outcome (a hang)
         // with a structured fault, distinct from a lost link — not an unbounded
         // wait and not a silent clean pass. Coverage is not read from a hung guest.
-        self.gdb.write_memory(self.map.input_address, input)?;
+        crate::gdb::stage_input(
+            &mut self.gdb,
+            self.map.input_address,
+            self.input_contract.as_ref(),
+            input,
+        )?;
         let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
         let (stop, stdout) = match self.gdb.cont_until(deadline)? {
             (ContStop::Stopped(stop), stdout) => (stop, stdout),

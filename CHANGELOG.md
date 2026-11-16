@@ -15,6 +15,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The `gdb` and `qemu-system` transports take the staging buffer's size,
+  `input_cap=` in `--transport-coverage-map` (required), and an optional
+  `input_len=` word the firmware reads the input's length from. They wrote
+  each input whole, so with the default `--max-len 4096` an input past the
+  buffer overwrote the guest globals after it and, when that was the `fault=`
+  word, read as a CPU exception. `--max-len` is now cut to the capacity with a
+  note, no input is written past it, and each finding's
+  `transport_profile.json` records it; a profile from before replays its
+  input whole.
 - `bhf fuzz --target-transport` and `--protocol-profile` refuse, with exit 2
   and each flag named, the host-lane flags their loops do not wire
   (`--workers`, `--grammar`, `--cmplog-log`, the sandbox and sanitizer flags

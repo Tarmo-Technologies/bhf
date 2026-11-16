@@ -56,7 +56,7 @@ use fuzz_engine_builtin::{
 use serde::Serialize;
 use target_transport::{
     AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
-    GuestFaultStatus, RunOutcome, TargetSession, TargetTransport, TransportError,
+    GuestFaultStatus, InputContract, RunOutcome, TargetSession, TargetTransport, TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -173,6 +173,8 @@ pub(crate) enum TransportPlan {
         host: String,
         port: u16,
         map: GdbMemoryMap,
+        /// The staging region's capacity and length word.
+        input: InputContract,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -182,6 +184,8 @@ pub(crate) enum TransportPlan {
         gdb_host: String,
         gdb_port: u16,
         map: GdbMemoryMap,
+        /// The staging region's capacity and length word.
+        input: InputContract,
         snapshot_tag: String,
         /// Completion breakpoint `(address, RSP kind)` planted at arm so a
         /// self-HardFaulting Cortex-M target halts back to the debugger instead
@@ -223,7 +227,8 @@ pub(crate) enum TransportSpecError {
 
     #[error(
         "the {backend} backend requires --transport-coverage-map \
-         (input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>)"
+         (input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>, \
+         and input_len=<addr> when the firmware reads the input length)"
     )]
     MissingCoverageMap { backend: &'static str },
 
@@ -239,11 +244,15 @@ pub(crate) enum TransportSpecError {
     )]
     Field { field: String, value: String },
 
-    #[error("--transport-coverage-map is missing required key {key:?} (need input,ring,write,wrapped,cap)")]
+    #[error(
+        "--transport-coverage-map is missing required key {key:?} (need input, input_cap, \
+         ring, write, wrapped and cap; input_cap is the staging region's size in bytes)"
+    )]
     MissingMapKey { key: &'static str },
 
     #[error(
-        "--transport-coverage-map has unknown key {key:?} (allowed: input,ring,write,wrapped,cap)"
+        "--transport-coverage-map has unknown key {key:?} (allowed: input, input_cap, \
+         input_len, ring, write, wrapped, cap)"
     )]
     UnknownMapKey { key: String },
 
@@ -300,14 +309,19 @@ impl TransportPlan {
         }
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
-            let map = require_coverage_map("gdb", coverage_map)?;
+            let (map, input) = require_coverage_map("gdb", coverage_map)?;
             let (host, port) = parse_host_port("gdb", spec, rest)?;
-            return Ok(Self::Gdb { host, port, map });
+            return Ok(Self::Gdb {
+                host,
+                port,
+                map,
+                input,
+            });
         }
 
         if let Some(rest) = spec.strip_prefix("qemu-system:") {
-            let map = require_coverage_map("qemu-system", coverage_map)?;
-            return parse_qemu_system(spec, rest, map);
+            let (map, input) = require_coverage_map("qemu-system", coverage_map)?;
+            return parse_qemu_system(spec, rest, map, input);
         }
 
         Err(TransportSpecError::UnknownBackend {
@@ -338,12 +352,18 @@ impl TransportPlan {
                     .open(&path)
                     .map_err(TransportError::from)
             }))),
-            Self::Gdb { host, port, map } => Ok(Box::new(
+            Self::Gdb {
+                host,
+                port,
+                map,
+                input,
+            } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
                     // deadline so a hung target is a bounded Timeout outcome, not
                     // an unbounded wait behind the per-read socket timeout (#70).
-                    .with_exec_deadline(io_timeout),
+                    .with_exec_deadline(io_timeout)
+                    .with_input_contract(Some(input)),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -351,6 +371,7 @@ impl TransportPlan {
                 gdb_host,
                 gdb_port,
                 map,
+                input,
                 snapshot_tag,
                 harness_done,
                 fault_status,
@@ -361,7 +382,8 @@ impl TransportPlan {
                     move || connect_tcp_bounded(&gdb_host, gdb_port, io_timeout),
                     map,
                     snapshot_tag,
-                )?;
+                )?
+                .with_input_contract(Some(input));
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -379,6 +401,15 @@ impl TransportPlan {
                 transport = transport.with_exec_deadline(io_timeout);
                 Ok(Box::new(transport))
             }
+        }
+    }
+
+    /// The staging region contract of a memory-read backend; `None` for the
+    /// agent, whose own protocol carries the length.
+    pub(crate) fn input_contract(&self) -> Option<InputContract> {
+        match self {
+            Self::Gdb { input, .. } | Self::QemuSystem { input, .. } => Some(*input),
+            _ => None,
         }
     }
 
@@ -417,7 +448,7 @@ fn reject_coverage_map(coverage_map: Option<&str>) -> Result<(), TransportSpecEr
 fn require_coverage_map(
     backend: &'static str,
     coverage_map: Option<&str>,
-) -> Result<GdbMemoryMap, TransportSpecError> {
+) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
     let map = coverage_map
         .filter(|m| !m.trim().is_empty())
         .ok_or(TransportSpecError::MissingCoverageMap { backend })?;
@@ -428,6 +459,7 @@ fn parse_qemu_system(
     spec: &str,
     rest: &str,
     map: GdbMemoryMap,
+    input: InputContract,
 ) -> Result<TransportPlan, TransportSpecError> {
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
@@ -515,6 +547,7 @@ fn parse_qemu_system(
         gdb_host,
         gdb_port,
         map,
+        input,
         snapshot_tag,
         harness_done,
         fault_status,
@@ -547,12 +580,14 @@ fn parse_host_port(
     Ok((host.to_owned(), port))
 }
 
-fn parse_coverage_map(spec: &str) -> Result<GdbMemoryMap, TransportSpecError> {
+fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
     let mut input = None;
     let mut ring = None;
     let mut write = None;
     let mut wrapped = None;
     let mut cap = None;
+    let mut input_cap = None;
+    let mut input_len = None;
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -572,6 +607,8 @@ fn parse_coverage_map(spec: &str) -> Result<GdbMemoryMap, TransportSpecError> {
             "write" => write = Some(parse_int(key, value)?),
             "wrapped" => wrapped = Some(parse_int(key, value)?),
             "cap" => cap = Some(parse_int(key, value)?),
+            "input_cap" => input_cap = Some(parse_int(key, value)?),
+            "input_len" => input_len = Some(parse_int(key, value)?),
             other => {
                 return Err(TransportSpecError::UnknownMapKey {
                     key: other.to_owned(),
@@ -584,14 +621,21 @@ fn parse_coverage_map(spec: &str) -> Result<GdbMemoryMap, TransportSpecError> {
     let ring_capacity =
         usize::try_from(cap).map_err(|_| TransportSpecError::CapTooLarge { cap })?;
 
-    Ok(GdbMemoryMap {
+    let map = GdbMemoryMap {
         input_address: input.ok_or(TransportSpecError::MissingMapKey { key: "input" })?,
         ring_address: ring.ok_or(TransportSpecError::MissingMapKey { key: "ring" })?,
         ring_write_address: write.ok_or(TransportSpecError::MissingMapKey { key: "write" })?,
         ring_wrapped_address: wrapped
             .ok_or(TransportSpecError::MissingMapKey { key: "wrapped" })?,
         ring_capacity,
-    })
+    };
+    // The staging region's size: bhf writes each input there, and one longer
+    // than the region overwrites the guest globals after it.
+    let input_cap = input_cap.ok_or(TransportSpecError::MissingMapKey { key: "input_cap" })?;
+    let capacity = usize::try_from(input_cap)
+        .map_err(|_| TransportSpecError::CapTooLarge { cap: input_cap })?;
+    let contract = InputContract::new(capacity, input_len)?;
+    Ok((map, contract))
 }
 
 /// Parse a decimal or `0x`-hex unsigned integer.
@@ -645,6 +689,9 @@ pub(crate) struct TransportFuzzConfig {
     pub coverage_map: Option<String>,
     /// Ceiling on a generated input's length.
     pub max_len: usize,
+    /// The staging region contract the memory-read backends write inputs
+    /// under, recorded in each finding's transport profile.
+    pub input_contract: Option<InputContract>,
     /// Deterministic mutation RNG seed.
     pub rng_seed: u64,
     /// Stop as soon as this many DISTINCT findings are emitted.
@@ -1023,6 +1070,12 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
         "backend": backend,
         "reset_mechanism": reset,
         "timing": timing,
+        // The staging region the input was written under (#84): its capacity
+        // and the length word, `null` for a backend with no such region.
+        "input_contract": config.input_contract.map(|contract| serde_json::json!({
+            "capacity": contract.capacity,
+            "length_word": contract.length_word,
+        })),
         "firmware_identity": serde_json::Value::Null,
         "limitations":
             "host-observed timing; firmware/build identity not captured by this backend",
@@ -1282,7 +1335,7 @@ pub(crate) fn run(args: FuzzArgs) -> i32 {
     }
 }
 
-fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
+fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
     let spec = args
         .target_transport
         .as_deref()
@@ -1295,6 +1348,20 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         })?;
     for note in plan.notes() {
         crate::bhfeprintln!("bhf fuzz --target-transport: note: {note}");
+    }
+    // Never generate an input the staging region cannot hold.
+    let input_contract = plan.input_contract();
+    if let Some(contract) = input_contract {
+        if args.max_len > contract.capacity {
+            crate::bhfeprintln!(
+                "bhf fuzz --target-transport: note: --max-len {} is more than input_cap={}; \
+                 inputs are at most {} bytes",
+                args.max_len,
+                contract.capacity,
+                contract.capacity
+            );
+            args.max_len = contract.capacity;
+        }
     }
     let transport_label = plan.label();
     let transport = plan.into_transport(args.timeout).map_err(|error| {
@@ -1319,6 +1386,7 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         spec: spec.to_owned(),
         coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
+        input_contract,
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
         mode: args.mode,
@@ -1430,12 +1498,57 @@ mod tests {
         }
     }
 
+    /// The staging region's size is required: without it every input past the
+    /// region's end overwrites the guest globals after it.
+    #[test]
+    fn the_coverage_map_requires_the_input_capacity_and_takes_a_length_word() {
+        let missing = TransportPlan::parse(
+            "gdb:127.0.0.1:1234",
+            Some("input=0x1000,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                missing,
+                TransportSpecError::MissingMapKey { key: "input_cap" }
+            ),
+            "{missing}"
+        );
+        assert!(missing.to_string().contains("input_cap"), "{missing}");
+
+        let zero = TransportPlan::parse(
+            "gdb:127.0.0.1:1234",
+            Some("input=0x1000,input_cap=0,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64"),
+        )
+        .unwrap_err();
+        assert!(zero.to_string().contains("at least one byte"), "{zero}");
+
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234",
+            Some("input=0x1000,input_cap=0x40,input_len=0x1040,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.input_contract(),
+            Some(InputContract::new(64, Some(0x1040)).unwrap())
+        );
+        let agent = TransportPlan::parse("agent:tcp:127.0.0.1:9", None).unwrap();
+        assert_eq!(agent.input_contract(), None);
+    }
+
     #[test]
     fn parses_gdb_spec_with_coverage_map() {
-        let map_spec = "input=0x1000,ring=0x4000,write=0x5000,wrapped=0x5100,cap=65536";
+        let map_spec =
+            "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=65536";
         let plan = TransportPlan::parse("gdb:127.0.0.1:1234", Some(map_spec)).unwrap();
         match plan {
-            TransportPlan::Gdb { host, port, map } => {
+            TransportPlan::Gdb {
+                host,
+                port,
+                map,
+                input,
+            } => {
+                assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
                 assert_eq!(map.input_address, 0x1000);
@@ -1452,7 +1565,7 @@ mod tests {
     /// breakpoint there never hits, so it is cleared with a note.
     #[test]
     fn a_thumb_done_address_has_its_interworking_bit_cleared_with_a_note() {
-        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
         let plan = TransportPlan::parse(
             "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234,done=0x189,done_kind=2",
             Some(map_spec),
@@ -1486,7 +1599,7 @@ mod tests {
 
     #[test]
     fn parses_qemu_system_spec_with_default_and_explicit_snapshot() {
-        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
         // Default snapshot tag.
         let plan = TransportPlan::parse(
             "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234",
@@ -1500,12 +1613,14 @@ mod tests {
                 gdb_host,
                 gdb_port,
                 map,
+                input,
                 snapshot_tag,
                 harness_done,
                 fault_status,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
+                assert_eq!(input.capacity, 64);
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
                 assert_eq!(gdb_host, "127.0.0.1");
@@ -1535,7 +1650,7 @@ mod tests {
 
     #[test]
     fn parses_qemu_system_completion_and_fault_status_contract() {
-        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
         // done= plants the completion breakpoint (default Thumb kind 2); fault=
         // declares the firmware fault-status word (#71/#72).
         let plan = TransportPlan::parse(
@@ -1580,7 +1695,7 @@ mod tests {
 
     #[test]
     fn qemu_system_rejects_invalid_fault_width() {
-        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
         let error = TransportPlan::parse(
             "qemu-system:qmp=h:1,gdb=h:2,fault=0x300,fault_width=9",
             Some(map_spec),
@@ -1599,7 +1714,7 @@ mod tests {
         // The whole CLI parse -> build path accepts the completion contract and
         // produces a transport (the breakpoint/fault-status behavior itself is
         // proven end-to-end by the live RV-3 Cortex-M test).
-        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
         let plan = TransportPlan::parse(
             "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,fault=0x20000100",
             Some(map_spec),
@@ -1677,7 +1792,7 @@ mod tests {
     fn agent_with_coverage_map_is_rejected() {
         let error = TransportPlan::parse(
             "agent:tcp:h:1",
-            Some("input=0,ring=0,write=0,wrapped=0,cap=1"),
+            Some("input=0,input_cap=8,ring=0,write=0,wrapped=0,cap=1"),
         )
         .unwrap_err();
         assert!(
@@ -1730,7 +1845,7 @@ mod tests {
     fn qemu_missing_qmp_key_is_descriptive() {
         let error = TransportPlan::parse(
             "qemu-system:gdb=h:2",
-            Some("input=0,ring=0,write=0,wrapped=0,cap=1"),
+            Some("input=0,input_cap=8,ring=0,write=0,wrapped=0,cap=1"),
         )
         .unwrap_err();
         assert!(error.to_string().contains("qmp"), "{error}");
@@ -1750,7 +1865,7 @@ mod tests {
     fn qemu_system_rejects_unsafe_snapshot_tag_at_build_time() {
         // A snapshot tag with a space would be spliced into an HMP command line;
         // FullSystemTransport::new must reject it, surfacing as a Transport error.
-        let map_spec = "input=0,ring=0,write=0,wrapped=0,cap=1";
+        let map_spec = "input=0,input_cap=8,ring=0,write=0,wrapped=0,cap=1";
         let plan = TransportPlan::parse(
             "qemu-system:qmp=h:1,gdb=h:2,snapshot=bad tag",
             Some(map_spec),
@@ -1810,6 +1925,7 @@ mod tests {
             spec: "agent:tcp:127.0.0.1:65535".to_owned(),
             coverage_map: None,
             max_len: 4096,
+            input_contract: None,
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
             mode: actionability::RunMode::Reporting,

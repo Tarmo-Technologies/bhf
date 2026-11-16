@@ -147,10 +147,18 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 (addresses are decimal or `0x`-hex, from your linker map / `nm`):
 
 ```
---transport-coverage-map input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
+--transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
 ```
 
 - `input`   — where BHF writes the fuzz input on the target
+- `input_cap` — the size in bytes of the staging buffer at `input`
+  (required). BHF never writes past it: `--max-len` is cut to it (with a
+  note), and an input longer than it (a seed) is written only up to it. An
+  input written past the buffer would overwrite the guest globals after it,
+  and when the next one is the `fault=` word every such input reads as a CPU
+  exception. Each finding's `transport_profile.json` records the capacity.
+- `input_len` — optional: the address of a little-endian `u32` the firmware
+  reads the input's length from. BHF writes it before the input each run.
 - `ring`    — base of the coverage ring
 - `write`   — the ring's write cursor
 - `wrapped` — the ring's wrapped flag
@@ -168,7 +176,7 @@ GDB server, or a `qemu-*` `-g` stub.
 # e.g. a qemu-user or qemu-system gdbstub on :3333, memory_buffer harness built at §2
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport gdb:127.0.0.1:3333 \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 ### 3b. Full-system emulator (`qemu-system:qmp=…,gdb=…[,snapshot=TAG]`)
@@ -205,7 +213,7 @@ qemu-system-arm -M mps2-an385 -kernel harness.elf -S \
 # done=/fault= are the harness_done and bhf_fault_flag addresses from `nm harness.elf`
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,snapshot=base,done=0x1a8,fault=0x20000100" \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
@@ -299,7 +307,7 @@ BHF repository. In brief:
 ```sh
 bhf fuzz bhf_work --harness H-C0001 \
   --target-transport gdb:127.0.0.1:3333 \
-  --transport-coverage-map input=0x2000020c,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
 ---

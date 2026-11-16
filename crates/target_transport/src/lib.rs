@@ -65,8 +65,8 @@ pub use fullsystem::{
     FullSystemSession, FullSystemTransport, GuestFaultStatus, QmpClient, QmpLimits,
 };
 pub use gdb::{
-    read_coverage_ring, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport, GdbSession,
-    StopReply,
+    read_coverage_ring, stage_input, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport,
+    GdbSession, InputContract, StopReply,
 };
 pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 pub use transport::{TargetSession, TargetTransport};

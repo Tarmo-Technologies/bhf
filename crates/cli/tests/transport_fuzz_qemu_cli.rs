@@ -163,92 +163,171 @@ fn wait_port(port: u16, within: Duration) -> bool {
     false
 }
 
-#[test]
-fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
-    for tool in [CC, QEMU, QEMU_IMG, NM] {
-        if !tool_present(tool) {
-            eprintln!(
-                "SKIP cli_qemu_system_transport_persists_a_classified_fault_finding: \
-                 {tool} not on PATH"
-            );
-            return;
+/// The Cortex-M fixture built and booted under `qemu-system-arm`, paused, with
+/// QMP and the gdbstub on loopback ports; `None` when a tool is missing.
+struct Fixture {
+    _guard: ChildGuard,
+    qmp_port: u16,
+    gdb_port: u16,
+    input_addr: u64,
+    ring_addr: u64,
+    write_addr: u64,
+    wrapped_addr: u64,
+    fault_flag: u64,
+    harness_done: u64,
+}
+
+impl Fixture {
+    fn boot(test: &str, dir: &Path) -> Option<Self> {
+        for tool in [CC, QEMU, QEMU_IMG, NM] {
+            if !tool_present(tool) {
+                eprintln!("SKIP {test}: {tool} not on PATH");
+                return None;
+            }
         }
+        let src = dir.join("harness.c");
+        let ld = dir.join("harness.ld");
+        let elf = dir.join("harness.elf");
+        std::fs::write(&src, HARNESS_C).unwrap();
+        std::fs::write(&ld, HARNESS_LD).unwrap();
+
+        let built = Command::new(CC)
+            .args([
+                "-mcpu=cortex-m3",
+                "-mthumb",
+                "-nostdlib",
+                "-nostartfiles",
+                "-ffreestanding",
+                "-O0",
+                "-g",
+                "-T",
+            ])
+            .arg(&ld)
+            .arg("-o")
+            .arg(&elf)
+            .arg(&src)
+            .status()
+            .unwrap_or_else(|e| panic!("run {CC}: {e}"));
+        assert!(built.success(), "{CC} failed to build the fixture");
+
+        // Scratch block device so qemu `savevm` has somewhere to write the snapshot.
+        let scratch = dir.join("scratch.qcow2");
+        let created = Command::new(QEMU_IMG)
+            .args(["create", "-f", "qcow2"])
+            .arg(&scratch)
+            .arg("16M")
+            .output()
+            .unwrap_or_else(|e| panic!("run {QEMU_IMG}: {e}"));
+        assert!(created.status.success(), "{QEMU_IMG} create failed");
+
+        // The CLI parses only TCP HOST:PORT endpoints, so expose qmp AND gdb over
+        // TCP (this also exercises the #79 doc correction that qmp must be a TCP
+        // socket).
+        let qmp_port = free_port();
+        let gdb_port = free_port();
+        let child = Command::new(QEMU)
+            .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
+            .arg(&elf)
+            .arg("-gdb")
+            .arg(format!("tcp::{gdb_port}"))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,file={},format=qcow2,id=sc0",
+                scratch.display()
+            ))
+            .arg("-qmp")
+            .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {QEMU}: {e}"));
+        let guard = ChildGuard(child);
+
+        // Generous boot budgets: under a loaded CI/dev host (e.g. a concurrent
+        // workspace build) qemu can take tens of seconds to open its sockets.
+        assert!(
+            wait_port(qmp_port, Duration::from_secs(45)),
+            "qemu QMP port never came up"
+        );
+        assert!(
+            wait_port(gdb_port, Duration::from_secs(45)),
+            "qemu gdbstub port never came up"
+        );
+        Some(Self {
+            _guard: guard,
+            qmp_port,
+            gdb_port,
+            input_addr: nm_symbol(&elf, "bhf_input", false),
+            ring_addr: nm_symbol(&elf, "adafuzz_probe_memory_buffer", false),
+            write_addr: nm_symbol(&elf, "adafuzz_probe_memory_buffer_write", false),
+            wrapped_addr: nm_symbol(&elf, "adafuzz_probe_memory_buffer_wrapped", false),
+            fault_flag: nm_symbol(&elf, "bhf_fault_flag", false),
+            harness_done: nm_symbol(&elf, "harness_done", true),
+        })
     }
 
+    fn spec(&self) -> String {
+        format!(
+            "qemu-system:qmp=127.0.0.1:{},gdb=127.0.0.1:{},done={:#x},done_kind=2,fault={:#x}",
+            self.qmp_port, self.gdb_port, self.harness_done, self.fault_flag
+        )
+    }
+
+    fn coverage_map(&self, input_cap: usize) -> String {
+        format!(
+            "input={:#x},input_cap={input_cap},ring={:#x},write={:#x},wrapped={:#x},cap={RING_CAP}",
+            self.input_addr, self.ring_addr, self.write_addr, self.wrapped_addr
+        )
+    }
+
+    /// `bhf fuzz` over the fixture with one seed; its exit status, summary
+    /// JSON and stderr.
+    fn fuzz(
+        &self,
+        dir: &Path,
+        name: &str,
+        seed: &[u8],
+        input_cap: usize,
+    ) -> (std::process::ExitStatus, serde_json::Value, String) {
+        let seed_path = dir.join(format!("{name}.bin"));
+        std::fs::write(&seed_path, seed).unwrap();
+        let out = Command::new(bhf_bin())
+            .args(["fuzz", "--target-transport", &self.spec()])
+            .args(["--transport-coverage-map", &self.coverage_map(input_cap)])
+            .args(["--harness", "cortex-m-fixture"])
+            .arg("--seed-file")
+            .arg(&seed_path)
+            .args(["--iterations", "1", "--time", "30s"])
+            .arg(dir.join(format!("work-{name}")))
+            .output()
+            .expect("run bhf fuzz");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let summary = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("summary JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+        (out.status, summary, stderr)
+    }
+}
+
+#[test]
+fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
-    let src = dir.join("harness.c");
-    let ld = dir.join("harness.ld");
-    let elf = dir.join("harness.elf");
-    std::fs::write(&src, HARNESS_C).unwrap();
-    std::fs::write(&ld, HARNESS_LD).unwrap();
-
-    let built = Command::new(CC)
-        .args([
-            "-mcpu=cortex-m3",
-            "-mthumb",
-            "-nostdlib",
-            "-nostartfiles",
-            "-ffreestanding",
-            "-O0",
-            "-g",
-            "-T",
-        ])
-        .arg(&ld)
-        .arg("-o")
-        .arg(&elf)
-        .arg(&src)
-        .status()
-        .unwrap_or_else(|e| panic!("run {CC}: {e}"));
-    assert!(built.success(), "{CC} failed to build the fixture");
-
-    let input_addr = nm_symbol(&elf, "bhf_input", false);
-    let ring_addr = nm_symbol(&elf, "adafuzz_probe_memory_buffer", false);
-    let write_addr = nm_symbol(&elf, "adafuzz_probe_memory_buffer_write", false);
-    let wrapped_addr = nm_symbol(&elf, "adafuzz_probe_memory_buffer_wrapped", false);
-    let fault_flag = nm_symbol(&elf, "bhf_fault_flag", false);
-    let harness_done = nm_symbol(&elf, "harness_done", true);
-
-    // Scratch block device so qemu `savevm` has somewhere to write the snapshot.
-    let scratch = dir.join("scratch.qcow2");
-    let created = Command::new(QEMU_IMG)
-        .args(["create", "-f", "qcow2"])
-        .arg(&scratch)
-        .arg("16M")
-        .output()
-        .unwrap_or_else(|e| panic!("run {QEMU_IMG}: {e}"));
-    assert!(created.status.success(), "{QEMU_IMG} create failed");
-
-    // The CLI parses only TCP HOST:PORT endpoints, so expose qmp AND gdb over TCP
-    // (this also exercises the #79 doc correction that qmp must be a TCP socket).
-    let qmp_port = free_port();
-    let gdb_port = free_port();
-    let child = Command::new(QEMU)
-        .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
-        .arg(&elf)
-        .arg("-gdb")
-        .arg(format!("tcp::{gdb_port}"))
-        .arg("-drive")
-        .arg(format!(
-            "if=none,file={},format=qcow2,id=sc0",
-            scratch.display()
-        ))
-        .arg("-qmp")
-        .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {QEMU}: {e}"));
-    let _guard = ChildGuard(child);
-
-    // Generous boot budgets: under a loaded CI/dev host (e.g. a concurrent
-    // workspace build) qemu can take tens of seconds to open its sockets.
-    assert!(
-        wait_port(qmp_port, Duration::from_secs(45)),
-        "qemu QMP port never came up"
-    );
-    assert!(
-        wait_port(gdb_port, Duration::from_secs(45)),
-        "qemu gdbstub port never came up"
-    );
+    let Some(fixture) = Fixture::boot(
+        "cli_qemu_system_transport_persists_a_classified_fault_finding",
+        dir,
+    ) else {
+        return;
+    };
+    let Fixture {
+        qmp_port,
+        gdb_port,
+        input_addr,
+        ring_addr,
+        write_addr,
+        wrapped_addr,
+        fault_flag,
+        harness_done,
+        ..
+    } = fixture;
 
     // Seed with the planted-fault byte so the single seed execution faults.
     let seed = dir.join("seed.bin");
@@ -260,7 +339,7 @@ fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
          done={harness_done:#x},done_kind=2,fault={fault_flag:#x}"
     );
     let map = format!(
-        "input={input_addr:#x},ring={ring_addr:#x},write={write_addr:#x},\
+        "input={input_addr:#x},input_cap=64,ring={ring_addr:#x},write={write_addr:#x},\
          wrapped={wrapped_addr:#x},cap={RING_CAP}"
     );
 
@@ -313,6 +392,46 @@ fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
     );
 
     eprintln!("cli_qemu_system_transport: PASSED — CLI planted the breakpoint and persisted {id}");
+}
+
+/// The fixture's `bhf_fault_flag` sits right after its 64-byte `bhf_input`.
+/// A seed of the clean-path byte whose bytes past 64 spell the fault magic
+/// overwrote the flag when the transport wrote it whole, and the run reported
+/// a CPU exception that never happened. With `input_cap=64` those bytes never
+/// reach it; a cap past the flag shows they would have.
+#[test]
+fn cli_qemu_system_inputs_longer_than_the_cap_never_reach_the_fault_word() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let Some(fixture) = Fixture::boot(
+        "cli_qemu_system_inputs_longer_than_the_cap_never_reach_the_fault_word",
+        dir,
+    ) else {
+        return;
+    };
+    let offset = usize::try_from(fixture.fault_flag - fixture.input_addr).unwrap();
+    assert!(offset >= 64, "bhf_fault_flag precedes the input buffer");
+    let mut seed = vec![0x42_u8; offset + 4];
+    seed[offset..].copy_from_slice(&0xDEAD_FA11_u32.to_le_bytes());
+
+    let (status, capped, stderr) = fixture.fuzz(dir, "capped", &seed, 64);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(
+        capped["crashes"].as_u64(),
+        Some(0),
+        "the bytes past input_cap must not reach the fault word: {capped}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--max-len 4096 is more than input_cap=64"),
+        "the run says it cut --max-len: {stderr}"
+    );
+
+    let (status, uncapped, stderr) = fixture.fuzz(dir, "uncapped", &seed, offset + 4);
+    assert!(status.success(), "{stderr}");
+    assert!(
+        uncapped["crashes"].as_u64().unwrap_or(0) >= 1,
+        "a cap past the fault word lets the overwrite through: {uncapped}\n{stderr}"
+    );
 }
 
 /// Actual FreeRTOS CLI acceptance, separate from the bare-metal Cortex-M test.
@@ -419,7 +538,7 @@ fn cli_freertos_clean_fault_clean() {
         symbol("bhf_fault_flag", false)
     );
     let map = format!(
-        "input={:#x},ring={:#x},write={:#x},wrapped={:#x},cap=512",
+        "input={:#x},input_cap=64,ring={:#x},write={:#x},wrapped={:#x},cap=512",
         symbol("bhf_input", false),
         symbol("adafuzz_probe_memory_buffer", false),
         symbol("adafuzz_probe_memory_buffer_write", false),
