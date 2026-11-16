@@ -644,7 +644,7 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Perl finding".to_owned()
         } else {
@@ -652,6 +652,28 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         },
         ..Default::default()
     })
+}
+
+/// The frames an interpreted lane's driver prints under its finding line, one
+/// `== bhf frame: <function> @ <file>:<line>` per frame, innermost first and
+/// without the driver's and the harness's own frames (the Perl, Ruby and PHP
+/// drivers).
+fn parse_bhf_frames(stderr: &str) -> Vec<StackFrame> {
+    const MARKER: &str = "== bhf frame: ";
+    stderr
+        .lines()
+        .filter_map(|line| {
+            let frame = line.split_once(MARKER)?.1.trim_end();
+            let (function, location) = frame.split_once(" @ ")?;
+            let (file, line) = location.rsplit_once(':')?;
+            Some(StackFrame {
+                function: function.to_owned(),
+                file: (!file.is_empty()).then(|| file.to_owned()),
+                line: line.parse().ok(),
+            })
+        })
+        .take(MAX_SANITIZER_FRAMES)
+        .collect()
 }
 
 /// Parse a bhf Ruby finding out of stderr. The driver prints
@@ -677,7 +699,7 @@ fn parse_ruby_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "Ruby finding".to_owned()
         } else {
@@ -741,7 +763,7 @@ fn parse_php_finding(stderr: &str) -> Option<SanitizerReport> {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: Vec::new(),
+        stack: parse_bhf_frames(stderr),
         message: if msg.is_empty() {
             "PHP finding".to_owned()
         } else {
@@ -2301,6 +2323,31 @@ java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 1
             "BHF-210"
         );
         assert!(parse_perl_finding("Use of uninitialized value\n").is_none());
+    }
+
+    /// The Perl, Ruby and PHP drivers print the target's frames under the
+    /// finding line, and each lane's report carries them.
+    #[test]
+    fn interpreted_lane_findings_carry_the_driver_frames() {
+        for (marker, function, file) in [
+            ("perl", "Calc::ratio", "/src/lib/Calc.pm"),
+            ("ruby", "Reader#average", "/src/lib/reader.rb"),
+            ("php", "Calc->ratio", "C:\\src\\Calc.php"),
+        ] {
+            let stderr = format!(
+                "== bhf {marker} finding: CWE-369: divided by 0\n\
+                 == bhf frame: {function} @ {file}:12\n\
+                 == bhf frame: main @ /src/bin/run:3\n"
+            );
+            let report = parse_sanitizer_report(&stderr).unwrap();
+            assert_eq!(report.rule_id, "BHF-205", "{marker}");
+            assert_eq!(report.stack.len(), 2, "{marker}");
+            assert_eq!(report.stack[0].function, function);
+            assert_eq!(report.stack[0].file.as_deref(), Some(file));
+            assert_eq!(report.stack[0].line, Some(12));
+        }
+        let bare = parse_sanitizer_report("== bhf ruby finding: CWE-369: x\n").unwrap();
+        assert!(bare.stack.is_empty());
     }
 
     #[test]

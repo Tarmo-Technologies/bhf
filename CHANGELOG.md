@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Perl, Ruby and PHP findings are located at the target line that raised them,
+  in results/findings.json, the SARIF and INDEX.md. Each driver prints the
+  target's frames under its finding line (`== bhf frame: <function> @
+  <file>:<line>`, without the driver's and the harness's own), and the
+  finding records them as its stack. The Perl driver stripped the die
+  message's `at FILE line N`, and the Ruby and PHP drivers printed no
+  backtrace, so these findings had no location.
 - `bhf minimize` minimizes runtime-oracle, assertion and capability findings,
   holding each reduction to what `bhf replay` compares for them; it held every
   reduction to a sanitizer crash, so they never minimized. `bhf capsule`
