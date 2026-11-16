@@ -16,6 +16,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/java_preview")
@@ -85,8 +89,7 @@ fn a_preview_language_feature_is_compiled_and_run_with_the_flag_it_asks_for() {
         }
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-java-preview-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("java-preview");
     let work = tmp.join("work");
     let seeds = tmp.join("seeds");
     std::fs::create_dir_all(&seeds).unwrap();

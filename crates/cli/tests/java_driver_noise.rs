@@ -11,6 +11,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn java_runtime_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../java_runtime/src/com/bhf")
@@ -139,8 +143,7 @@ fn driver_noise_policy_promotes_deep_npe_and_suppresses_shallow() {
         return;
     }
     let rt = java_runtime_dir();
-    let tmp = std::env::temp_dir().join(format!("bhf-jvm-noise-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("jvm-noise");
     let src = tmp.join("com/bhf");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::copy(rt.join("Driver.java"), src.join("Driver.java")).unwrap();

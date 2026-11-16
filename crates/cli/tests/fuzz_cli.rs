@@ -4,7 +4,10 @@ use cli::run_from;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn fuzz_builtin_writes_replayable_finding() {
@@ -1014,14 +1017,8 @@ fn only_finding_dir(work_dir: &Path) -> PathBuf {
     findings.into_iter().next().expect("one finding exists")
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-fuzz-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("temporary directory is created");
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("fuzz-cli-{name}"))
 }
 
 #[cfg(unix)]

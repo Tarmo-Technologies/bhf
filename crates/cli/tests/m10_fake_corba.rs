@@ -4,7 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 #[test]
 fn fake_corba_servant_fixture_is_present_and_parses() {
@@ -151,7 +154,7 @@ fn fake_corba_servant_produces_finding_when_gnat_available() {
         .position(|handler| handler.exception_name.eq_ignore_ascii_case("Foo.BadInput"))
         .expect("Foo.BadInput handler is recorded");
 
-    let mut manager = corpus::CorpusManager::new(temp.clone());
+    let mut manager = corpus::CorpusManager::new(temp.to_path_buf());
     let records = manager
         .record("H-M12", &input, &events)
         .expect("corpus records servant events");
@@ -161,7 +164,7 @@ fn fake_corba_servant_produces_finding_when_gnat_available() {
     }));
 
     let emitter = corpus::FindingEmitter::with_metadata(
-        temp.clone(),
+        temp.to_path_buf(),
         "H-M12".to_owned(),
         "Ada_2005".to_owned(),
         "examples/fake_corba_servant/bar_impl.adb".to_owned(),
@@ -897,12 +900,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("temporary directory is created");
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-{name}"))
 }

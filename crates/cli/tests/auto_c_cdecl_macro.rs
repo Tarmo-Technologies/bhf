@@ -17,6 +17,10 @@ use cli::auto::attempt::{attempt, AttemptOptions, FuzzEngine, Outcome};
 use cli::auto::candidate::{Candidate, Lang};
 use cli::auto::decl_index::DeclarationIndex;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/c_cdecl_macro")
 }
@@ -81,14 +85,7 @@ fn calling_convention_macro_funcptr_field_builds() {
     let source = std::fs::read_to_string(&source_path).unwrap();
     let line = target_line(&source, "use_hooks");
 
-    let work = std::env::temp_dir().join(format!(
-        "bhf-c-cdecl-macro-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&work).unwrap();
+    let work = TestDir::new("c-cdecl-macro");
     let work = std::fs::canonicalize(&work).unwrap();
 
     let candidate = Candidate {

@@ -12,6 +12,10 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/python_lane")
@@ -69,16 +73,14 @@ fn auto_builds_fuzzes_and_finds_recursion_cwe674() {
     }
     // Run from a temp copy OUTSIDE the repo so project-root detection doesn't
     // escape upward into the workspace.
-    let src = std::env::temp_dir().join(format!("bhf_pylane_it_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
-    std::fs::create_dir_all(&src).unwrap();
+    let src = TestDir::new("pylane_it");
     std::fs::copy(
         fixture().join("recordparser.py"),
         src.join("recordparser.py"),
     )
     .unwrap();
-    let work = std::env::temp_dir().join(format!("bhf_pylane_itwork_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("pylane_itwork");
+    let work = work_guard.join("work");
 
     let out = Command::new(bhf_bin())
         .args([

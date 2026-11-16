@@ -21,6 +21,10 @@ use cli::auto::attempt::{attempt, AttemptOptions, FuzzEngine, Outcome};
 use cli::auto::candidate::{Candidate, Lang};
 use cli::auto::decl_index::DeclarationIndex;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/win32_mfc")
 }
@@ -85,14 +89,7 @@ fn win32_integer_typedef_params_build_and_fuzz() {
     let source = std::fs::read_to_string(&source_path).unwrap();
     let line = target_line(&source, "process_flags");
 
-    let work = std::env::temp_dir().join(format!(
-        "bhf-win32-scalars-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&work).unwrap();
+    let work = TestDir::new("win32-scalars");
     let work = std::fs::canonicalize(&work).unwrap();
 
     let candidate = Candidate {

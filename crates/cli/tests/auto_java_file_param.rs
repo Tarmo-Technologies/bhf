@@ -14,6 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/java_file_param")
@@ -49,8 +53,7 @@ fn java_file_parameter_is_driven_through_a_temp_file_and_finds_the_planted_crash
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-java-fileparam-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("java-fileparam");
     let work = tmp.join("work");
     let seeds = tmp.join("seeds");
     std::fs::create_dir_all(&seeds).unwrap();

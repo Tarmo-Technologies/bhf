@@ -14,10 +14,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cli::run_from;
 use serde_json::Value;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
@@ -27,14 +30,8 @@ fn mock_extension() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf_ext_mock"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-extension-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("extension-{name}"))
 }
 
 /// Write a `bhf.extension-manifest.v1` manifest into `dir` pointing at the mock
@@ -211,7 +208,9 @@ fn extension_validate_refuses_without_explicit_manifest() {
 
 /// Drive `bhf extension evaluate` on `input_bytes` through the mock in `mode`,
 /// returning (exit code, work dir).
-fn run_evaluate(name: &str, mode: &str, input_bytes: &[u8]) -> (i32, PathBuf) {
+/// The exit code and work dir of `bhf extension evaluate`; the guard holds the
+/// work dir.
+fn run_evaluate(name: &str, mode: &str, input_bytes: &[u8]) -> (i32, PathBuf, TestDir) {
     let dir = temp_dir(name);
     let manifest = write_manifest(&dir, mode, &["oracle.evaluate"]);
     let input = dir.join("input.bin");
@@ -226,14 +225,14 @@ fn run_evaluate(name: &str, mode: &str, input_bytes: &[u8]) -> (i32, PathBuf) {
         "--work",
         work.to_str().unwrap(),
     ]);
-    (output.status.code().unwrap_or(-1), work)
+    (output.status.code().unwrap_or(-1), work, dir)
 }
 
 #[test]
 fn extension_evaluate_emits_finding_for_clean_exit_violation() {
     // "../etc/passwd" is a clean-exit semantic violation (a crash-only fuzzer
     // cannot see it) — the oracle flags it as a finding.
-    let (code, work) = run_evaluate("evaluate-finding", "well-behaved", b"../etc/passwd");
+    let (code, work, _dir) = run_evaluate("evaluate-finding", "well-behaved", b"../etc/passwd");
     assert_eq!(code, 1, "a finding must use the finding exit code");
 
     let ext = extension_findings(&work);
@@ -266,7 +265,8 @@ fn extension_evaluate_emits_finding_for_clean_exit_violation() {
 
 #[test]
 fn extension_evaluate_benign_input_is_clean() {
-    let (code, work) = run_evaluate("evaluate-clean", "well-behaved", b"a-safe-relative-path");
+    let (code, work, _dir) =
+        run_evaluate("evaluate-clean", "well-behaved", b"a-safe-relative-path");
     assert_eq!(code, 0, "a benign input exits clean");
     assert!(
         extension_findings(&work).is_empty(),
@@ -282,8 +282,8 @@ fn extension_evaluate_benign_input_is_clean() {
 fn extension_evaluate_reemits_same_stable_signature() {
     // The same violation evaluated twice yields the identical finding signature —
     // the property replay and minimize rely on.
-    let (_c1, w1) = run_evaluate("evaluate-sig-a", "well-behaved", b"../etc/passwd");
-    let (_c2, w2) = run_evaluate("evaluate-sig-b", "well-behaved", b"../etc/passwd");
+    let (_c1, w1, _dir) = run_evaluate("evaluate-sig-a", "well-behaved", b"../etc/passwd");
+    let (_c2, w2, _dir) = run_evaluate("evaluate-sig-b", "well-behaved", b"../etc/passwd");
     let s1 = extension_findings(&w1)[0]["signature"]
         .as_str()
         .unwrap()
@@ -403,7 +403,7 @@ fn extension_minimize_reduces_and_preserves_stable_signature() {
 fn extension_fault_is_not_a_target_finding() {
     // The extension crashes mid-evaluate: a bounded infrastructure result, NEVER a
     // target finding, with an exit code distinct from clean and from finding.
-    let (code, work) = run_evaluate("evaluate-crash", "crash", b"../etc/passwd");
+    let (code, work, _dir) = run_evaluate("evaluate-crash", "crash", b"../etc/passwd");
     assert_ne!(code, 0, "a fault is not clean");
     assert_ne!(code, 1, "a fault is not a finding");
     assert!(
@@ -508,7 +508,7 @@ fn extension_restart_rehandshake_failure_is_infra_with_provenance() {
 
 #[test]
 fn extension_malformed_response_is_infrastructure_not_finding() {
-    let (code, work) = run_evaluate("evaluate-malformed", "malformed", b"../etc/passwd");
+    let (code, work, _dir) = run_evaluate("evaluate-malformed", "malformed", b"../etc/passwd");
     assert_ne!(code, 0);
     assert_ne!(code, 1);
     assert!(extension_findings(&work).is_empty());
@@ -519,7 +519,7 @@ fn extension_tampered_case_identity_is_rejected() {
     // The mock echoes a DIFFERENT worker in the response; the host must reject the
     // case-identity mismatch as infrastructure, never a finding — the guard that
     // keeps two workers from ever mixing test-case identity.
-    let (code, work) = run_evaluate("evaluate-tamper", "tamper-case", b"../etc/passwd");
+    let (code, work, _dir) = run_evaluate("evaluate-tamper", "tamper-case", b"../etc/passwd");
     assert_ne!(code, 1, "a case mismatch is not a finding");
     assert!(extension_findings(&work).is_empty());
 }
@@ -527,7 +527,7 @@ fn extension_tampered_case_identity_is_rejected() {
 /// The release-build round-trip the dedicated per-PR `--release` CI step targets.
 #[test]
 fn release_profile_mock_oracle_end_to_end() {
-    let (code, work) = run_evaluate("release-e2e", "well-behaved", b"../../secret/key");
+    let (code, work, _dir) = run_evaluate("release-e2e", "well-behaved", b"../../secret/key");
     assert_eq!(code, 1);
     let ext = extension_findings(&work);
     assert_eq!(ext.len(), 1);
@@ -540,7 +540,9 @@ fn release_profile_mock_oracle_end_to_end() {
 
 /// Drive `bhf extension session` with the full capability surface, returning
 /// (exit code, work dir, the run's `extension.json`).
-fn run_session(name: &str, input_bytes: &[u8], extra: &[&str]) -> (i32, PathBuf, Value) {
+/// The exit code, work dir and JSON of a session run; the guard holds the
+/// work dir.
+fn run_session(name: &str, input_bytes: &[u8], extra: &[&str]) -> (i32, PathBuf, Value, TestDir) {
     let dir = temp_dir(name);
     // The session caps are requested as optional by the command, so the manifest
     // need only require `oracle.evaluate`.
@@ -561,7 +563,7 @@ fn run_session(name: &str, input_bytes: &[u8], extra: &[&str]) -> (i32, PathBuf,
     args.extend_from_slice(extra);
     let output = run_extension(&args);
     let run: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    (output.status.code().unwrap_or(-1), work, run)
+    (output.status.code().unwrap_or(-1), work, run, dir)
 }
 
 #[test]
@@ -569,7 +571,7 @@ fn extension_session_binds_open_handle_into_write_and_flags_escape() {
     // The scenario drives OPEN(path) then WRITE(handle, data): the target returns
     // a handle for OPEN, the extension binds it into WRITE, and the clean-exit
     // escape is a finding.
-    let (code, work, run) = run_session("session-escape", b"../etc/passwd", &[]);
+    let (code, work, run, _dir) = run_session("session-escape", b"../etc/passwd", &[]);
     assert_eq!(code, 1, "a session escape is a finding: {run}");
 
     let ext = extension_findings(&work);
@@ -605,7 +607,7 @@ fn extension_session_binds_open_handle_into_write_and_flags_escape() {
 
 #[test]
 fn extension_session_benign_path_is_clean_no_finding() {
-    let (code, work, run) = run_session("session-clean", b"logs/run-01.txt", &[]);
+    let (code, work, run, _dir) = run_session("session-clean", b"logs/run-01.txt", &[]);
     assert_eq!(code, 0, "a benign path exits clean: {run}");
     assert!(extension_findings(&work).is_empty());
     assert_eq!(run["session"]["target"]["wrote_outside_root"], false);
@@ -614,7 +616,7 @@ fn extension_session_benign_path_is_clean_no_finding() {
 #[test]
 fn extension_session_repairs_mutated_frame_before_it_reaches_target() {
     // With mutation but NO repair, the target sees malformed frames.
-    let (_c, _w, no_repair) = run_session(
+    let (_c, _w, no_repair, _dir) = run_session(
         "session-norepair",
         b"logs/run.txt",
         &["--mutate", "153", "--repair", "false"],
@@ -627,7 +629,7 @@ fn extension_session_repairs_mutated_frame_before_it_reaches_target() {
     );
 
     // With repair on, every mutated frame reaches the target well-formed.
-    let (_c2, _w2, repaired) = run_session(
+    let (_c2, _w2, repaired, _dir) = run_session(
         "session-repair",
         b"logs/run.txt",
         &["--mutate", "153", "--repair", "true"],
@@ -646,8 +648,8 @@ fn extension_session_reemits_same_stable_signature() {
     // violation evaluated again yields the identical signature (and it equals the
     // standalone `evaluate` signature for the same path — the minimization
     // predicate re-check).
-    let (_c1, w1, _r1) = run_session("session-sig-a", b"../etc/passwd", &[]);
-    let (_c2, w2, _r2) = run_session("session-sig-b", b"../etc/passwd", &[]);
+    let (_c1, w1, _r1, _dir) = run_session("session-sig-a", b"../etc/passwd", &[]);
+    let (_c2, w2, _r2, _dir) = run_session("session-sig-b", b"../etc/passwd", &[]);
     let s1 = extension_findings(&w1)[0]["signature"]
         .as_str()
         .unwrap()
@@ -658,7 +660,7 @@ fn extension_session_reemits_same_stable_signature() {
         .to_owned();
     assert_eq!(s1, s2, "session findings replay to the same signature");
 
-    let (_c3, w3) = run_evaluate("session-sig-eval", "well-behaved", b"../etc/passwd");
+    let (_c3, w3, _dir) = run_evaluate("session-sig-eval", "well-behaved", b"../etc/passwd");
     let s3 = extension_findings(&w3)[0]["signature"]
         .as_str()
         .unwrap()

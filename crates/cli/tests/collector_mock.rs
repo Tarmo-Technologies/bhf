@@ -15,7 +15,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
@@ -25,14 +28,8 @@ fn mock_collector() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mock_collector"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-collector-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("collector-{name}"))
 }
 
 /// A target that always exits cleanly — the collector must produce findings even
@@ -52,7 +49,8 @@ fn read_json(path: &Path) -> Value {
 
 /// Run `bhf binary-fuzz` with the mock collector in `scenario` and return
 /// (parsed run summary, findings dir).
-fn run_collector(work_name: &str, scenario: &str) -> (Value, PathBuf) {
+/// The run summary and its findings dir; the guard holds the dir.
+fn run_collector(work_name: &str, scenario: &str) -> (Value, PathBuf, TestDir) {
     let root = temp_dir(work_name);
     let target = clean_exit_target(&root);
     let work = root.join("work");
@@ -89,7 +87,7 @@ fn run_collector(work_name: &str, scenario: &str) -> (Value, PathBuf) {
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    (summary, work.join("results/findings"))
+    (summary, work.join("results/findings"), root)
 }
 
 fn collector_findings(findings_dir: &Path) -> Vec<Value> {
@@ -106,7 +104,7 @@ fn collector_findings(findings_dir: &Path) -> Vec<Value> {
 
 #[test]
 fn collector_three_positive_classes_emit_semantic_findings_without_a_crash() {
-    let (summary, findings_dir) = run_collector("positive", "positive_all");
+    let (summary, findings_dir, _root) = run_collector("positive", "positive_all");
     assert_eq!(
         summary.pointer("/collector/active"),
         Some(&Value::Bool(true)),
@@ -163,7 +161,7 @@ fn collector_three_positive_classes_emit_semantic_findings_without_a_crash() {
 
 #[test]
 fn collector_fixed_constants_do_not_become_taint_confirmed_findings() {
-    let (summary, findings_dir) = run_collector("constants", "fixed_constants");
+    let (summary, findings_dir, _root) = run_collector("constants", "fixed_constants");
     assert_eq!(
         summary.pointer("/collector/active"),
         Some(&Value::Bool(true))
@@ -182,7 +180,7 @@ fn collector_fixed_constants_do_not_become_taint_confirmed_findings() {
 
 #[test]
 fn collector_lossy_collection_is_never_reported_clean() {
-    let (summary, findings_dir) = run_collector("lossy", "lossy");
+    let (summary, findings_dir, _root) = run_collector("lossy", "lossy");
     // The run manifest refuses a clean assurance.
     assert_eq!(
         summary.pointer("/collector/clean_assurance"),
@@ -205,7 +203,7 @@ fn collector_lossy_collection_is_never_reported_clean() {
 
 #[test]
 fn collector_replay_reproduces_the_semantic_finding_from_stored_evidence() {
-    let (_summary, findings_dir) = run_collector("replay", "process_exec");
+    let (_summary, findings_dir, _root) = run_collector("replay", "process_exec");
     let dir = findings_dir.join("COL-0001");
     assert!(
         dir.join("collector_session.jsonl").is_file(),

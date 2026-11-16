@@ -7,6 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/java_default_package")
@@ -40,8 +44,7 @@ fn default_package_java_target_builds_and_executes() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-java-default-package-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("java-default-package");
     let work = tmp.join("work");
     let seed = tmp.join("trigger");
     std::fs::create_dir_all(&tmp).unwrap();

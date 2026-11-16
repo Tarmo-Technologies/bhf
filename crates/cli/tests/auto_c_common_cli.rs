@@ -7,6 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 /// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
@@ -43,8 +47,7 @@ fn auto_retries_legacy_tentative_definitions_with_fcommon() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-c-common-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("c-common");
     let src = tmp.join("src");
     let work = tmp.join("work");
     std::fs::create_dir_all(&src).unwrap();

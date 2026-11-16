@@ -11,9 +11,9 @@
 //!   stubbing it with an empty placeholder).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 mod support;
 
@@ -22,14 +22,12 @@ use cli::auto::candidate::{Candidate, Lang};
 use cli::auto::decl_index::DeclarationIndex;
 use cli::auto::repair::Repair;
 
-fn tmpdir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-bcr-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir() -> TestDir {
+    TestDir::new("bcr")
 }
 
 fn toolchains_ready(prefix: &str) -> bool {

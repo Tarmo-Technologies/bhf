@@ -11,20 +11,16 @@
 //! not a catchable failure).
 
 use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cli::auto::decl_index::DeclarationIndex;
 use cli::auto::discovery;
 
-fn tmpdir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-deep-src-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir() -> TestDir {
+    TestDir::new("deep-src")
 }
 
 /// Build a `.c` source whose AST nests far past the walker depth cap via the

@@ -7,8 +7,12 @@
 // read back on the auto path) and drove generation. A second case asserts a malformed
 // grammar fails the run fast, not per-target. Skips cleanly without clang.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn have_clang() -> bool {
     Command::new("clang").arg("--version").output().is_ok()
@@ -34,8 +38,7 @@ fn auto_grammar_drives_generation_and_rejects_bad_grammar() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-auto-grammar-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = TestDir::new("auto-grammar");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
 
@@ -132,5 +135,5 @@ fn auto_grammar_drives_generation_and_rejects_bad_grammar() {
         String::from_utf8_lossy(&bad_out.stderr)
     );
 
-    let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
 }

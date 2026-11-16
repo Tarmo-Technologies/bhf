@@ -8,8 +8,12 @@
 // uncut by a fixed 4096-byte cap. Skips cleanly without clang/make (and without
 // afl-fuzz/afl-clang-fast for the AFL++ case).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn have_clang() -> bool {
     Command::new("clang").arg("--version").output().is_ok()
@@ -121,11 +125,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bhf-auto-seed-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::new(&format!("auto-seed-{name}"))
 }
 
 #[test]

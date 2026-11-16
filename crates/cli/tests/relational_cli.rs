@@ -17,18 +17,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
-fn tempdir(tag: &str) -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-relational-{tag}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("relational-{tag}"))
 }
 
 /// Write the toy launcher. `viewer` may launch only `viewer-helper`;

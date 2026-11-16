@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "../src/test_support.rs"]
 mod test_support;
@@ -33,16 +32,9 @@ fn clangxx_libfuzzer_flags(prefix: &str) -> Option<Vec<String>> {
 }
 
 fn clangxx_probe(prefix: &str, extra_flags: &[String]) -> bool {
-    let dir = std::env::temp_dir().join(format!(
-        "bhf-{prefix}-clangxx-probe-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    if fs::create_dir_all(&dir).is_err() {
+    let Ok(dir) = TestDir::try_new(&format!("{prefix}-clangxx-probe")) else {
         return false;
-    }
+    };
     let src = dir.join("p.cpp");
     let bin = dir.join("p");
     let wrote = fs::write(
@@ -62,7 +54,6 @@ fn clangxx_probe(prefix: &str, extra_flags: &[String]) -> bool {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false);
-    let _ = fs::remove_dir_all(&dir);
     ok
 }
 

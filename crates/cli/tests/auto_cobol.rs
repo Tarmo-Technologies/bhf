@@ -10,6 +10,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn have(tool: &str) -> bool {
     Command::new(tool)
         .arg("--version")
@@ -18,15 +22,8 @@ fn have(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn tempdir(name: &str) -> std::path::PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cobol-e2e-{name}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir(name: &str) -> TestDir {
+    TestDir::new(&format!("cobol-e2e-{name}"))
 }
 
 fn read_findings(work: &Path) -> Vec<serde_json::Value> {

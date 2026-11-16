@@ -22,7 +22,11 @@ mod support;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// clang (with the ASan runtime) is required. A missing toolchain is a skip, not
 /// a failure.
@@ -44,14 +48,8 @@ fn c_runtime_dir() -> PathBuf {
         .join("c_runtime")
 }
 
-fn tmpdir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-asan-pool-{n}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir() -> TestDir {
+    TestDir::new("asan-pool")
 }
 
 /// A static-pool bump allocator. The one-past-allocation write at `a[8]` lands on

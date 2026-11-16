@@ -7,18 +7,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
 
-fn tmpdir(prefix: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("bhf-mined-{prefix}-{n}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmpdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("mined-{prefix}"))
 }
 
 /// `Config`'s constructor is private and its factory takes an ARGUMENT, so
@@ -42,7 +39,7 @@ int apply_config(Config cfg, const unsigned char *d, unsigned long n) {
 }
 ";
 
-fn setup(prefix: &str, with_example: bool) -> (PathBuf, PathBuf, PathBuf) {
+fn setup(prefix: &str, with_example: bool) -> (TestDir, PathBuf, PathBuf) {
     let root = tmpdir(prefix);
     let src = root.join("src");
     fs::create_dir_all(&src).unwrap();

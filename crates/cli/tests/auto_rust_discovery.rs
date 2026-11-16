@@ -10,6 +10,10 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::{discover, discover_with_dir_filter, DirFilter};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<repo>/crates/cli`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -144,8 +148,8 @@ fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-rust-m12-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("rust-m12");
+    let tmp = tmp_guard.join("tmp");
     let output = Command::new(&bin)
         .args([
             "auto",

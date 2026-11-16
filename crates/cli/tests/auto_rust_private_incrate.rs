@@ -15,6 +15,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -149,8 +153,8 @@ fn private_path_opener_builds_fuzzes_and_finds_planted_crash_in_crate() {
     let fixture_dir = fixture("rust_incrate_private");
     let before = snapshot(&fixture_dir);
 
-    let tmp = std::env::temp_dir().join(format!("bhf-incrate-private-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("incrate-private");
+    let tmp = tmp_guard.join("tmp");
     let (combined, json) = run_auto(&fixture_dir, &tmp, "20", "6", true);
 
     assert!(
@@ -254,8 +258,8 @@ fn default_path_does_not_discover_the_non_pub_method() {
     }
     // This test does NOT need a toolchain — it asserts a DISCOVERY property (the
     // non-pub method is never ranked without the opt-in flag), so it runs anywhere.
-    let tmp = std::env::temp_dir().join(format!("bhf-incrate-default-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("incrate-default");
+    let tmp = tmp_guard.join("tmp");
     let (_combined, json) = run_auto(&fixture("rust_incrate_private"), &tmp, "2", "6", false);
 
     assert!(
@@ -282,8 +286,8 @@ fn discovery_cache_tracks_the_incrate_private_flag_toggle() {
 
     // off -> on, ONE work directory: the stale flag-off cache must NOT suppress the
     // private target once the flag is enabled.
-    let w1 = std::env::temp_dir().join(format!("bhf-incrate-cache-onoff-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&w1);
+    let w1_guard = TestDir::new("incrate-cache-onoff");
+    let w1 = w1_guard.join("w1");
     let (_c1, off) = run_auto(&fx, &w1, "2", "6", false);
     assert!(
         find_attempt(&off, "open_dir").is_none(),
@@ -299,8 +303,8 @@ fn discovery_cache_tracks_the_incrate_private_flag_toggle() {
 
     // on -> off, ONE work directory: a warm flag-on cache must NOT retain the
     // private target once the flag is disabled.
-    let w2 = std::env::temp_dir().join(format!("bhf-incrate-cache-offon-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&w2);
+    let w2_guard = TestDir::new("incrate-cache-offon");
+    let w2 = w2_guard.join("w2");
     let (_c3, on2) = run_auto(&fx, &w2, "2", "6", true);
     assert!(
         find_attempt(&on2, "open_dir").is_some(),

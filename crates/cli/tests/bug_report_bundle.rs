@@ -7,6 +7,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
 }
@@ -17,14 +21,8 @@ fn have_clang() -> bool {
 
 /// A work directory whose absolute path embeds a unique, secret-looking token, so
 /// a leak of the real work path into the bundle is detectable by grep.
-fn secret_workspace(secret: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{secret}-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn secret_workspace(secret: &str) -> TestDir {
+    TestDir::new(secret)
 }
 
 fn populate_work_dir(base: &Path) -> (std::path::PathBuf, std::path::PathBuf) {

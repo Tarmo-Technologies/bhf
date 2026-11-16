@@ -5,20 +5,17 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
 }
 
-fn tempdir(prefix: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-introspect-{prefix}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir(prefix: &str) -> TestDir {
+    TestDir::new(&format!("introspect-{prefix}"))
 }
 
 fn write_two_target_project(root: &Path) {

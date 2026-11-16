@@ -9,6 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/java_cmplog")
@@ -42,8 +46,8 @@ fn jvm_cmplog_solves_a_string_magic_gate_without_a_seed() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-java-cmplog-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("java-cmplog");
+    let tmp = tmp_guard.join("tmp");
     let work = tmp.join("work");
 
     // NO seed: cmplog must splice the 13-byte "BHF_MAGIC" operand it captures

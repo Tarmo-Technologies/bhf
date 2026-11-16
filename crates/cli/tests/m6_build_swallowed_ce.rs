@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// Builds the M4-instrumented swallowed-constraint-error fixture when GNAT is
 /// available. CI currently lacks GNAT, so this test skips cleanly there.
@@ -74,12 +77,6 @@ fn build_succeeds_for_instrumented_swallowed_ce_when_gnat_available() {
     assert!(work_dir.join("build/H-TEST/obj/main").exists());
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("temporary directory is created");
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-{name}"))
 }

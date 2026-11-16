@@ -19,6 +19,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn toolchain_available() -> bool {
     which::which("clang").is_ok() && which::which("make").is_ok()
 }
@@ -57,9 +61,7 @@ fn write_fixture(root: &Path) {
 }
 
 fn manifest_for(args: &[&str], tag: &str) -> (usize, String) {
-    let tmp = std::env::temp_dir().join(format!("bhf-force-manifest-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = TestDir::new(&format!("force-manifest-{tag}"));
     write_fixture(&tmp);
     let work = tmp.join("gw");
 

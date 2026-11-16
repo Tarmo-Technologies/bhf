@@ -10,13 +10,13 @@
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("bhf-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&p);
-    fs::create_dir_all(&p).unwrap();
-    p
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(tag)
 }
 
 #[test]

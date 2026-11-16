@@ -9,10 +9,13 @@
 // rusage, so this runs on Linux only.
 #![cfg(target_os = "linux")]
 
-use std::path::Path;
 use std::process::Command;
 
 use cli::auto::memprofile::run_mem_profile;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn have_clang() -> bool {
     Command::new("clang").arg("--version").output().is_ok()
@@ -25,8 +28,8 @@ fn mem_profile_flags_amplified_allocation_input() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!("bhf-mem-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("mem-e2e");
+    let tmp = tmp_guard.join("tmp");
     let work = tmp.join("work");
     let hdir = work.join("harnesses").join("H-C0001");
     let queue = work.join("corpus").join("H-C0001").join("queue");
@@ -110,5 +113,5 @@ fn mem_profile_flags_amplified_allocation_input() {
         "reproducer should be the amplifying (large) input"
     );
 
-    let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
 }

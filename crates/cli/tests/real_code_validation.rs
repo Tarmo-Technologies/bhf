@@ -5,6 +5,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 /// The Python interpreter: Windows' installer provides `python`, not `python3`.
 const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 
@@ -322,14 +326,7 @@ fn real_code_validation_runner_dry_run_lists_matrix() {
 
 #[test]
 fn real_code_validation_runner_writes_evidence_report_and_readiness_gate() {
-    let temp = std::env::temp_dir().join(format!(
-        "bhf-real-code-evidence-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp).unwrap();
+    let temp = TestDir::new("real-code-evidence");
     let root = repo_root();
     let script = root.join("scripts/validation/real-code-matrix.py");
     let manifest = manifest_path();
@@ -408,13 +405,8 @@ fn real_code_validation_ada_local_proves_offline_target_entry() {
     let root = repo_root();
     let script = root.join("scripts/validation/real-code-matrix.py");
     let manifest = manifest_path();
-    let workspace = std::env::temp_dir().join(format!(
-        "bhf-ada-local-entry-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let workspace_guard = TestDir::new("ada-local-entry");
+    let workspace = workspace_guard.join("workspace");
     let output = Command::new(PYTHON)
         .arg(&script)
         .arg("--manifest")

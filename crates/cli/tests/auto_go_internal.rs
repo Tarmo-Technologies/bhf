@@ -14,6 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/go_internal")
@@ -40,11 +44,11 @@ fn a_target_under_internal_builds_and_fuzzes() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
-    let src = std::env::temp_dir().join(format!("bhf_gointernal_it_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
+    let src_guard = TestDir::new("gointernal_it");
+    let src = src_guard.join("src");
     copy_dir(&fixture(), &src).expect("copy go fixture module");
-    let work = std::env::temp_dir().join(format!("bhf_gointernal_w_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("gointernal_w");
+    let work = work_guard.join("work");
 
     let out = Command::new(bhf_bin())
         .args([

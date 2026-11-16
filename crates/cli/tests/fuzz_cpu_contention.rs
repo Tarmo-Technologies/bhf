@@ -10,9 +10,12 @@
 //! uncontended rate, measured in the same test so the runner's speed cancels
 //! out. Linux only (taskset); skips without taskset or a C compiler.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 /// CPU time the harness spends starting up. A busy loop on the same core
 /// doubles its wall time, past the fixed 2 s the handshake used to allow.
@@ -42,14 +45,8 @@ int bhf_run_one(const uint8_t *data, size_t size) {
 }
 "#;
 
-fn tmpdir() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cpu-contention-{nonce}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmpdir() -> TestDir {
+    TestDir::new("cpu-contention")
 }
 
 fn runs(program: &str, arg: &str) -> bool {

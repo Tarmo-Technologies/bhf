@@ -20,7 +20,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
@@ -30,14 +34,8 @@ fn mock_collector() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mock_collector"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-replay-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("replay-{name}"))
 }
 
 /// A target that records its own PID to `marker` each time it runs, then exits
@@ -62,7 +60,13 @@ fn marker_target(root: &Path, marker: &Path) -> PathBuf {
 /// Run `bhf binary-fuzz` with the mock collector in `scenario`, replaying `seed`,
 /// and return (parsed summary, findings dir, marker path, elapsed). The run itself
 /// always succeeds (a degraded collector is not a run failure).
-fn run_replay(work_name: &str, scenario: &str, seed: &str) -> (Value, PathBuf, PathBuf, f64) {
+/// The run summary, findings dir, marker and elapsed time; the guard holds the
+/// dirs.
+fn run_replay(
+    work_name: &str,
+    scenario: &str,
+    seed: &str,
+) -> (Value, PathBuf, PathBuf, f64, TestDir) {
     let root = temp_dir(work_name);
     let marker = root.join("marker.txt");
     let target = marker_target(&root, &marker);
@@ -102,7 +106,13 @@ fn run_replay(work_name: &str, scenario: &str, seed: &str) -> (Value, PathBuf, P
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    (summary, work.join("results/findings"), marker, elapsed)
+    (
+        summary,
+        work.join("results/findings"),
+        marker,
+        elapsed,
+        root,
+    )
 }
 
 fn collector_findings(findings_dir: &Path) -> Vec<(PathBuf, Value)> {
@@ -124,7 +134,8 @@ fn collector_findings(findings_dir: &Path) -> Vec<(PathBuf, Value)> {
 #[test]
 fn replay_launches_the_target_and_records_its_real_pid_and_input() {
     let seed = "REPLAY-TRIGGER-INPUT";
-    let (summary, findings_dir, marker, _elapsed) = run_replay("launched", "positive_all", seed);
+    let (summary, findings_dir, marker, _elapsed, _root) =
+        run_replay("launched", "positive_all", seed);
 
     let col = &summary["collector"];
     assert_eq!(
@@ -194,7 +205,7 @@ fn replay_launches_the_target_and_records_its_real_pid_and_input() {
 
 #[test]
 fn unrelated_concurrent_process_events_are_excluded() {
-    let (summary, findings_dir, _marker, _elapsed) =
+    let (summary, findings_dir, _marker, _elapsed, _root) =
         run_replay("unrelated", "unrelated_excluded", "SEED");
     assert_eq!(summary["collector"]["observed"], Value::Bool(true));
 
@@ -226,7 +237,7 @@ fn unrelated_concurrent_process_events_are_excluded() {
 /// assurance, surfaces the reason, and produces no findings — never a clean
 /// assurance over a run the collector did not actually watch.
 fn assert_degraded(scenario: &str, expected_reason: &str) -> f64 {
-    let (summary, findings_dir, _marker, elapsed) = run_replay(scenario, scenario, "SEED");
+    let (summary, findings_dir, _marker, elapsed, _root) = run_replay(scenario, scenario, "SEED");
     let col = &summary["collector"];
     assert_eq!(
         col["observed"],

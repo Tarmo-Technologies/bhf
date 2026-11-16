@@ -14,6 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/config_guard")
@@ -28,8 +32,8 @@ fn bhf_bin() -> PathBuf {
 
 #[test]
 fn a_config_guard_hash_error_is_repaired_by_defining_what_it_tests() {
-    let work = std::env::temp_dir().join(format!("bhf_cfgguard_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work_guard = TestDir::new("cfgguard");
+    let work = work_guard.join("work");
     let out = Command::new(bhf_bin())
         .args([
             "auto",

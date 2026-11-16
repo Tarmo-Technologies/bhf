@@ -3,14 +3,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
 
 const CANONICAL_SIGNATURE: &str =
     "20b41fb2a2ceeabc9f0403546af14199d4ccacc54e55f6fcb5855015b5eb63bd";
 
 #[test]
 fn replay_subcommand_match_returns_zero() {
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     assert_eq!(
         cli::run_from([
@@ -26,7 +29,7 @@ fn replay_subcommand_match_returns_zero() {
 
 #[test]
 fn replay_subcommand_accepts_finding_flag() {
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     assert_eq!(
         cli::run_from([
@@ -105,7 +108,7 @@ fn replay_subcommand_qemu_user_wraps_harness() {
     let qemu_path = root.join("fake-qemu-aarch64");
     let qemu_log = root.join("qemu-argv.txt");
     write_fake_qemu_user(&qemu_path);
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     let exit = cli::run_from([
         "bhf",
@@ -133,7 +136,7 @@ fn replay_subcommand_firejail_sandbox_wraps_harness() {
     let sandbox_path = root.join("fake-firejail");
     let sandbox_log = root.join("sandbox-argv.txt");
     write_fake_sandbox(&sandbox_path);
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     let exit = cli::run_from([
         "bhf",
@@ -157,7 +160,7 @@ fn replay_subcommand_firejail_sandbox_wraps_harness() {
 #[test]
 fn replay_subcommand_strict_missing_sandbox_returns_one() {
     let root = temp_dir("strict-missing-sandbox");
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     assert_eq!(
         cli::run_from([
@@ -377,7 +380,7 @@ fn replay_c_afl_strict_missing_sandbox_is_an_early_error() {
 
 #[test]
 fn replay_subcommand_mismatch_returns_three() {
-    let finding_dir = write_finding("mismatch");
+    let (_root, finding_dir) = write_finding("mismatch");
 
     assert_eq!(
         cli::run_from([
@@ -395,7 +398,7 @@ fn replay_subcommand_mismatch_returns_three() {
 fn replay_subcommand_auto_resolves_harness_from_fixture_path() {
     // No --harness: the finding records `fixture_path`, so replay resolves the
     // built harness itself and still reproduces (MATCH -> exit 0).
-    let finding_dir = write_finding_with_fixture("match", fake_harness());
+    let (_root, finding_dir) = write_finding_with_fixture("match", fake_harness());
 
     assert_eq!(
         cli::run_from(["bhf", "replay", finding_dir.to_str().unwrap(),]),
@@ -432,7 +435,8 @@ fn replay_subcommand_auto_resolves_harness_from_harness_id_layout() {
 fn replay_subcommand_explicit_harness_overrides_auto_resolution() {
     // An explicit --harness wins even when the finding records a (here bogus)
     // fixture_path that does not exist.
-    let finding_dir = write_finding_with_fixture("match", Path::new("/nonexistent/bhf/harness"));
+    let (_root, finding_dir) =
+        write_finding_with_fixture("match", Path::new("/nonexistent/bhf/harness"));
 
     assert_eq!(
         cli::run_from([
@@ -449,7 +453,7 @@ fn replay_subcommand_explicit_harness_overrides_auto_resolution() {
 #[test]
 fn replay_subcommand_unresolvable_harness_returns_one() {
     // No --harness and nothing resolvable: clear error, exit 1.
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
 
     assert_eq!(
         cli::run_from(["bhf", "replay", finding_dir.to_str().unwrap()]),
@@ -459,7 +463,8 @@ fn replay_subcommand_unresolvable_harness_returns_one() {
 
 #[test]
 fn replay_subcommand_missing_finding_returns_one() {
-    let missing = temp_dir("missing").join("findings/F-0000-missing");
+    let missing_root = temp_dir("missing");
+    let missing = missing_root.join("findings/F-0000-missing");
 
     assert_eq!(
         cli::run_from([
@@ -476,7 +481,7 @@ fn replay_subcommand_missing_finding_returns_one() {
 #[test]
 fn minimize_subcommand_writes_min_testcase_and_updates_finding_record() {
     let input = format!("{}crash{}", "A".repeat(32), "B".repeat(32));
-    let finding_dir = write_finding(&input);
+    let (_root, finding_dir) = write_finding(&input);
 
     assert_eq!(
         cli::run_from([
@@ -514,7 +519,7 @@ fn minimize_subcommand_qemu_user_wraps_harness() {
     let qemu_path = root.join("fake-qemu-aarch64");
     let qemu_log = root.join("qemu-argv.txt");
     write_fake_qemu_user(&qemu_path);
-    let finding_dir = write_finding("AAAAcrashBBBB");
+    let (_root, finding_dir) = write_finding("AAAAcrashBBBB");
 
     let exit = cli::run_from([
         "bhf",
@@ -540,7 +545,7 @@ fn minimize_subcommand_qemu_user_wraps_harness() {
 
 #[test]
 fn minimize_subcommand_typed_strategy_uses_decoded_spans() {
-    let finding_dir = write_finding("AAAAcrashBBBB");
+    let (_root, finding_dir) = write_finding("AAAAcrashBBBB");
     write_decoded_spans(
         &finding_dir,
         &[
@@ -580,7 +585,7 @@ fn minimize_subcommand_typed_strategy_uses_decoded_spans() {
 
 #[test]
 fn minimize_subcommand_typed_strategy_without_spans_records_no_reduction() {
-    let finding_dir = write_finding("AAAAcrashBBBB");
+    let (_root, finding_dir) = write_finding("AAAAcrashBBBB");
 
     assert_eq!(
         cli::run_from([
@@ -614,7 +619,7 @@ fn minimize_subcommand_typed_strategy_without_spans_records_no_reduction() {
 
 #[test]
 fn minimize_subcommand_rejects_non_reproducing_original() {
-    let finding_dir = write_finding("does-not-reproduce");
+    let (_root, finding_dir) = write_finding("does-not-reproduce");
 
     assert_eq!(
         cli::run_from([
@@ -629,10 +634,12 @@ fn minimize_subcommand_rejects_non_reproducing_original() {
     assert!(!finding_dir.join("min_testcase.bin").exists());
 }
 
-fn write_finding(input: &str) -> PathBuf {
-    let finding_dir = temp_dir(input).join("findings/F-0000-test");
+/// A finding dir holding `input`; the guard holds the dir.
+fn write_finding(input: &str) -> (TestDir, PathBuf) {
+    let root = temp_dir(input);
+    let finding_dir = root.join("findings/F-0000-test");
     write_finding_at(&finding_dir, input);
-    finding_dir
+    (root, finding_dir)
 }
 
 fn write_finding_at(finding_dir: &Path, input: &str) {
@@ -645,8 +652,10 @@ fn write_finding_at(finding_dir: &Path, input: &str) {
     .unwrap();
 }
 
-fn write_finding_with_fixture(input: &str, fixture: &Path) -> PathBuf {
-    let finding_dir = temp_dir(&format!("{input}-fixture")).join("findings/F-0000-test");
+/// A finding dir holding `input` and naming `fixture`; the guard holds the dir.
+fn write_finding_with_fixture(input: &str, fixture: &Path) -> (TestDir, PathBuf) {
+    let root = temp_dir(&format!("{input}-fixture"));
+    let finding_dir = root.join("findings/F-0000-test");
     fs::create_dir_all(&finding_dir).unwrap();
     fs::write(finding_dir.join("testcase.bin"), input.as_bytes()).unwrap();
     fs::write(
@@ -658,7 +667,7 @@ fn write_finding_with_fixture(input: &str, fixture: &Path) -> PathBuf {
         .to_string(),
     )
     .unwrap();
-    finding_dir
+    (root, finding_dir)
 }
 
 fn copy_executable(from: &Path, to: &Path) {
@@ -688,14 +697,8 @@ fn fake_harness() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_cli_fake_harness"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-cli-replay-{name}-{nonce}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(&format!("cli-replay-{name}"))
 }
 
 #[cfg(unix)]
@@ -2208,7 +2211,7 @@ fn a_non_ascii_recorded_harness_hash_does_not_break_the_summary() {
 #[cfg(unix)]
 #[test]
 fn the_event_log_replay_summary_has_an_exit_status() {
-    let finding_dir = write_finding("match");
+    let (_root, finding_dir) = write_finding("match");
     let output = replay_output(&[
         finding_dir.to_str().unwrap(),
         "--harness",
@@ -2261,7 +2264,8 @@ fn escaped_testcase() -> event_log::Testcase {
 #[cfg(unix)]
 #[test]
 fn the_event_log_replay_says_what_was_raised_and_where() {
-    let work = temp_dir("event-log-detail").join("work");
+    let work_root = temp_dir("event-log-detail");
+    let work = work_root.join("work");
     let id = corpus::FindingEmitter::new(work.clone())
         .emit(
             b"escaped",
@@ -2335,7 +2339,8 @@ fn the_event_log_replay_says_what_was_raised_and_where() {
 #[cfg(unix)]
 #[test]
 fn an_event_log_mismatch_compares_the_closest_replayed_exception() {
-    let work = temp_dir("event-log-closest").join("work");
+    let work_root = temp_dir("event-log-closest");
+    let work = work_root.join("work");
     let recorded = event_log::Testcase {
         testcase_id: 1,
         target_id: 0x42,
@@ -2428,7 +2433,8 @@ fn an_event_log_mismatch_compares_the_closest_replayed_exception() {
 #[cfg(unix)]
 #[test]
 fn an_event_log_replay_that_raised_nothing_says_so() {
-    let work = temp_dir("event-log-nothing").join("work");
+    let work_root = temp_dir("event-log-nothing");
+    let work = work_root.join("work");
     let id = corpus::FindingEmitter::new(work.clone())
         .emit(
             b"escaped",
@@ -3255,7 +3261,7 @@ fn replay_debugger_breaks_at_the_recorded_sink_without_a_target_function() {
 /// into to `<work>/preload.log`. Returns the work dir, the finding and the
 /// library, or `None` without clang.
 #[cfg(unix)]
-fn env_dependent_finding(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+fn env_dependent_finding(name: &str) -> Option<(TestDir, PathBuf, PathBuf)> {
     if !tool_runs("clang") {
         return None;
     }

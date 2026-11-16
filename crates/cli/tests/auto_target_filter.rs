@@ -2,19 +2,16 @@
 
 use cli::run_from;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-fn tempdir(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-auto-target-{name}-{nonce}"));
-    fs::create_dir_all(&dir).expect("create tempdir");
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn tempdir(name: &str) -> TestDir {
     // Resolved, as `bhf auto` resolves the tree it scans: a harness id hashes
     // the source path, and Windows' temp dir is often an 8.3 short name.
-    cli::workdir::plain_canonical(&dir)
+    TestDir::new(&format!("auto-target-{name}")).spelled_as(cli::workdir::plain_canonical)
 }
 
 fn read_run_json(work_dir: &Path) -> serde_json::Value {

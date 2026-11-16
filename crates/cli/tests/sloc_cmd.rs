@@ -3,17 +3,13 @@
 //! Integration tests for the standalone `bhf sloc` fast-counting command.
 
 use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn scratch_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bhf-sloc-{tag}-{nanos}"));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
+fn scratch_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("sloc-{tag}"))
 }
 
 /// A small tree with obvious code + comment + blank lines in two languages.

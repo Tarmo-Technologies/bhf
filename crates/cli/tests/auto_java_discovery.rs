@@ -10,6 +10,10 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/java_discovery")
@@ -99,8 +103,8 @@ fn java_static_target_builds_and_fuzzes_natively() {
         eprintln!("skip: no JDK (native Java lane needs javac/java)");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("bhf-java-disc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp_guard = TestDir::new("java-disc");
+    let tmp = tmp_guard.join("tmp");
     let output = Command::new(&bin)
         .args([
             "auto",

@@ -12,6 +12,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/go_force")
@@ -32,12 +36,13 @@ fn have_go() -> bool {
         .unwrap_or(false)
 }
 
-fn run(tag: &str, force: bool) -> (PathBuf, serde_json::Value) {
-    let src = std::env::temp_dir().join(format!("bhf_goforce_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&src);
+/// Run `bhf auto` on a copy of the fixture; the guard holds the copy and the
+/// work dir it returns.
+fn run(tag: &str, force: bool) -> (TestDir, PathBuf, serde_json::Value) {
+    let tmp = TestDir::new(&format!("goforce-{tag}"));
+    let src = tmp.join("src");
     copy_dir(&fixture(), &src).expect("copy go fixture module");
-    let work = std::env::temp_dir().join(format!("bhf_goforce_w_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work = tmp.join("work");
 
     let mut cmd = Command::new(bhf_bin());
     cmd.args([
@@ -66,8 +71,7 @@ fn run(tag: &str, force: bool) -> (PathBuf, serde_json::Value) {
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).expect("run.json"))
             .expect("parse run.json");
-    let _ = std::fs::remove_dir_all(&src);
-    (work, json)
+    (tmp, work, json)
 }
 
 #[test]
@@ -76,7 +80,7 @@ fn unforced_go_method_skips_while_data_map_fuzzes() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
-    let (work, json) = run("plain", false);
+    let (_tmp, work, json) = run("plain", false);
     assert_eq!(
         json["summary"]["unsupported_params"], 1,
         "only the receiver still needs --force: {json}"
@@ -113,7 +117,7 @@ fn forced_go_targets_build_fuzz_and_are_marked_forced() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
-    let (work, json) = run("forced", true);
+    let (_tmp, work, json) = run("forced", true);
     assert_eq!(
         json["summary"]["built_and_fuzzed"], 2,
         "both targets fuzz once forced: {json}"

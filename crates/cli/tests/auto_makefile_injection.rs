@@ -24,6 +24,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+use test_support::TestDir;
+
 /// The `bhf` binary cargo built for these tests (`bhf.exe` on Windows).
 fn bhf_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bhf"))
@@ -42,6 +46,8 @@ struct Scenario {
     root: PathBuf,
     work: PathBuf,
     marker: PathBuf,
+    /// Holds `root`, `work` and `marker`; removed when the scenario drops.
+    _base: TestDir,
 }
 
 impl Scenario {
@@ -49,8 +55,7 @@ impl Scenario {
         // Keep the path free of shell/make metacharacters: bhf correctly refuses an
         // include dir containing one, and the default `{:?}` of a ThreadId carries
         // parentheses, which would fail the benign case for the wrong reason.
-        let base = std::env::temp_dir().join(format!("bhf_mkinject_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = TestDir::new(&format!("mkinject-{tag}"));
         let root = base.join("tree");
         std::fs::create_dir_all(&root).expect("create tree");
         std::fs::write(root.join("parser.cpp"), PARSER_CPP).expect("write parser.cpp");
@@ -58,6 +63,7 @@ impl Scenario {
             work: base.join("work"),
             marker: base.join("PWNED"),
             root,
+            _base: base,
         }
     }
 
