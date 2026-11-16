@@ -1153,6 +1153,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
             env: Vec::new(),
+            rss_exceeded: None,
         }
     }
 

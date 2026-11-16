@@ -195,6 +195,9 @@ fn minimize_c_engine_until(
     // and, for an argv harness, the recorded runtime mode and injected env,
     // so a finding reproduces as the crash it was recorded as.
     let env = crate::replay::replay_env(&raw, runner, input);
+    // The memory cap the finding's input ran past: a reduction that runs past
+    // it reproduces an out-of-memory finding, and none may take the host's.
+    let rss_limit = crate::replay::recorded_rss_limit_mb(&raw);
     let run_once = |bytes: &[u8]| -> anyhow::Result<Option<corpus::SanitizerReport>> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -203,7 +206,14 @@ fn minimize_c_engine_until(
         let path = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         // Its own process group: a timeout kills whatever the harness started.
-        let run = crate::replay::run_c_harness(runner, input, &path, Duration::from_secs(10), &env);
+        let run = crate::replay::run_c_harness(
+            runner,
+            input,
+            &path,
+            Duration::from_secs(10),
+            &env,
+            rss_limit,
+        );
         let _ = fs::remove_file(&path);
         let run = run.map_err(|error| anyhow!(error))?;
         if run.timed_out || run.status.is_some_and(|status| status.success()) {

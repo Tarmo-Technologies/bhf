@@ -3631,8 +3631,43 @@ impl CmpShmReader {
     }
 }
 
+/// The report an input that ran past `--rss-limit-mb` is recorded with
+/// (BHF-209), and that a replay under the same limit reproduces.
+pub(crate) fn rss_limit_report() -> corpus::SanitizerReport {
+    corpus::SanitizerReport {
+        // A synthesized out-of-memory report: no sanitizer produced it, so the
+        // provenance is None rather than a false `asan` (#78).
+        sanitizer: None,
+        kind: "out-of-memory".to_owned(),
+        // A real catalog rule (CWE-789) so the OOM classifies as a finding
+        // like any sanitizer crash, not an unmapped "oom" tag.
+        rule_id: "BHF-209",
+        stack: Vec::new(),
+        message: "harness exceeded the configured RSS limit (--rss-limit-mb)".to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Record on finding `id` the `--rss-limit-mb` its input ran past, which
+/// `bhf replay` and `bhf minimize` apply again. Best-effort.
+fn record_rss_limit(work_dir: &Path, id: &str, rss_limit_mb: usize) {
+    let path = corpus::layout::finding_dir(work_dir, id).join("finding.json");
+    let Some(mut raw) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return;
+    };
+    if let Some(obj) = raw.as_object_mut() {
+        obj.insert("rss_limit_mb".to_owned(), serde_json::json!(rss_limit_mb));
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&raw) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn process_rss_mb(pid: u32) -> Option<usize> {
+pub(crate) fn process_rss_mb(pid: u32) -> Option<usize> {
     let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
     let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -3645,7 +3680,7 @@ fn process_rss_mb(pid: u32) -> Option<usize> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_rss_mb(_pid: u32) -> Option<usize> {
+pub(crate) fn process_rss_mb(_pid: u32) -> Option<usize> {
     None
 }
 
@@ -4063,6 +4098,9 @@ fn run_builtin_with_progress(
                         let id = emitter
                             .emit_sanitizer_crash_with_log(input, report, stderr.map(str::as_bytes))
                             .map_err(|error| format!("emit sanitizer finding: {error}"))?;
+                        if report.rule_id == "BHF-209" && prepared.rss_limit_mb > 0 {
+                            record_rss_limit(&prepared.work_dir, &id.0, prepared.rss_limit_mb);
+                        }
                         if let Some(opinion) = &opinion {
                             opinion.record(&prepared.work_dir, &id.0, &key);
                         }
@@ -6360,19 +6398,7 @@ fn run_c_libfuzzer_single_input_in(
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
-                sanitizer: Some(corpus::SanitizerReport {
-                    // A synthesized out-of-memory report: no sanitizer produced it,
-                    // so the provenance is None rather than a false `asan` (#78).
-                    sanitizer: None,
-                    kind: "out-of-memory".to_owned(),
-                    // A real catalog rule (CWE-789) so the OOM classifies as a
-                    // finding like any sanitizer crash, not an unmapped "oom" tag.
-                    rule_id: "BHF-209",
-                    stack: Vec::new(),
-                    message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
-                        .to_owned(),
-                    ..Default::default()
-                }),
+                sanitizer: Some(rss_limit_report()),
                 stderr: None,
                 rejected: false,
             });

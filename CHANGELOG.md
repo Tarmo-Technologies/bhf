@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An out-of-memory finding (BHF-209) records the `--rss-limit-mb` it ran
+  past, and `bhf replay` and `bhf minimize` run its testcase under that limit
+  and count running past it as reproducing the finding. They used to run it
+  with no cap, so the testcase really allocated (gigabytes, on the operator's
+  machine) and the replay reported MISMATCH.
 - `bhf minimize` (and the binary minimizer and replay) remove their scratch
   directory on every exit path. One whose testcase did not reproduce left an
   empty `minimize_tmp/` in the finding's evidence bundle.

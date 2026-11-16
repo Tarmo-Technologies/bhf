@@ -581,12 +581,17 @@ pub(crate) struct CRun {
     /// The variables the harness was given on top of the inherited
     /// environment.
     pub(crate) env: Vec<(String, String)>,
+    /// The RSS limit in MB the harness ran past, when it was killed for it.
+    pub(crate) rss_exceeded: Option<usize>,
 }
 
 impl CRun {
     /// The crash this run reported: a sanitizer report, or an undiagnosed
     /// fatal signal shaped the way the fuzz loop records one.
     pub(crate) fn report(&self) -> Option<corpus::SanitizerReport> {
+        if self.rss_exceeded.is_some() {
+            return Some(crate::fuzz::rss_limit_report());
+        }
         let stderr = String::from_utf8_lossy(&self.stderr);
         corpus::parse_sanitizer_report(&stderr).or_else(|| {
             let status = self.status.filter(|_| !self.timed_out)?;
@@ -742,7 +747,28 @@ pub(crate) fn run_c_testcase_with_env(
         .into_iter()
         .chain(extra_env.iter().cloned())
         .collect();
-    run_c_harness(runner, input, testcase_path, timeout, &env)
+    run_c_harness(
+        runner,
+        input,
+        testcase_path,
+        timeout,
+        &env,
+        recorded_rss_limit_mb(raw),
+    )
+}
+
+/// The `--rss-limit-mb` a replay of finding `raw` runs under: the one it
+/// recorded, else, for an out-of-memory finding recorded without it, `bhf
+/// auto`'s default, so its testcase cannot allocate the host's memory.
+pub(crate) fn recorded_rss_limit_mb(raw: &Value) -> Option<usize> {
+    raw.get("rss_limit_mb")
+        .and_then(Value::as_u64)
+        .and_then(|mb| usize::try_from(mb).ok())
+        .filter(|mb| *mb > 0)
+        .or_else(|| {
+            (raw.get("rule_id").and_then(Value::as_str) == Some("BHF-209"))
+                .then(crate::auto::cli::default_auto_rss_limit_mb)
+        })
 }
 
 /// Run `testcase_path` through a C/C++ harness via `runner` with exactly the
@@ -751,12 +777,17 @@ pub(crate) fn run_c_testcase_with_env(
 /// (a launcher's children too), and its output pipes are drained for a
 /// bounded time after it ends, so a descendant that keeps a pipe open cannot
 /// hang the replay.
+///
+/// With `rss_limit_mb`, the group is also killed as soon as the harness's
+/// resident set passes it, as the fuzz loop's `--rss-limit-mb` watchdog does,
+/// and the run reports that out-of-memory crash.
 pub(crate) fn run_c_harness(
     runner: &HarnessRunner,
     input: CInput,
     testcase_path: &Path,
     timeout: Duration,
     env: &[(String, String)],
+    rss_limit_mb: Option<usize>,
 ) -> Result<CRun, String> {
     use std::process::Stdio;
 
@@ -805,9 +836,15 @@ pub(crate) fn run_c_harness(
     let writer = bytes.and_then(|bytes| replay_min::process::feed_stdin(&mut child, bytes));
     // Whatever the harness left running would keep the pipes open: the wait
     // kills its whole group, before the harness is reaped.
-    let (status, timed_out) = group
-        .wait_then_kill(&mut child, timeout)
+    let (status, ended) = group
+        .wait_then_kill_unless(&mut child, timeout, |pid| {
+            rss_limit_mb.is_some_and(|limit| {
+                crate::fuzz::process_rss_mb(pid).is_some_and(|rss| rss > limit)
+            })
+        })
         .map_err(|error| format!("poll {}: {error}", harness.display()))?;
+    let timed_out = ended == replay_min::process::Ended::TimedOut;
+    let rss_exceeded = rss_limit_mb.filter(|_| ended == replay_min::process::Ended::Stopped);
     let duration = started.elapsed();
     // A harness that exits before reading all of its input closes the pipe;
     // its exit status, not the write, is the result.
@@ -828,6 +865,7 @@ pub(crate) fn run_c_harness(
         stdout: join(stdout),
         stderr: join(stderr),
         env: env.to_vec(),
+        rss_exceeded,
     })
 }
 
@@ -2576,6 +2614,7 @@ mod silent_abort_tests {
             &testcase,
             std::time::Duration::from_millis(300),
             &[],
+            None,
         )
         .expect("run");
         assert!(run.timed_out);
