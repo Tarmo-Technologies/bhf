@@ -15035,6 +15035,12 @@ mod tests {
         if which::which("clang").is_err() {
             return;
         }
+        // A valid -m flag on this host: `-mavx` is x86's.
+        let accepted = if cfg!(target_arch = "aarch64") {
+            "-mno-outline-atomics"
+        } else {
+            "-mavx"
+        };
         let entry = CompileCommandEntry {
             directory: PathBuf::from("."),
             file: PathBuf::from("t.c"),
@@ -15042,7 +15048,7 @@ mod tests {
                 [
                     "gcc",
                     "-mindirect-branch=thunk",
-                    "-mavx",
+                    accepted,
                     "-DKEEP=1",
                     "-c",
                     "t.c",
@@ -15059,7 +15065,7 @@ mod tests {
             "a clang-rejected gcc-only -m flag must be dropped: {flags:?}"
         );
         assert!(
-            flags.contains(&"-mavx".to_owned()),
+            flags.contains(&accepted.to_owned()),
             "a clang-accepted -m flag must be kept: {flags:?}"
         );
         assert!(flags.contains(&"-DKEEP=1".to_owned()), "{flags:?}");
