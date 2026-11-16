@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The README says Ada 83, K&R C, pre-C++98 and Python 2 are discovered and
+  statically analyzed (report-only), not supported for fuzzing; a test holds
+  the sentence to the report-only dialect set. The comparison pages list
+  GNATfuzz (commercial, generates Ada harnesses for a buildable GNAT project,
+  AFL++/libFuzzer/SymCC engines; not measured) and AFL++'s GCC plugin, and no
+  longer say no other fuzzer handles Ada.
 - `bhf sbom --fail-on` requires `--vuln-db` (exit 2), and a policy severity
   gate without a database is refused. Without advisories nothing can match,
   so the gate passed with 0 matches whatever the inventory held.
