@@ -962,6 +962,9 @@ pub fn run(args: AutoArgs) -> i32 {
         print!("{}", crate::list_fakes::render());
         return 0;
     }
+    if args.toolchain.c.no_fuzzing_build_mode {
+        harness_gen::fuzzing_build_mode::disable();
+    }
     // The auto sweep owns the terminal with a live progress line; silence the
     // per-harness "Generated ... harness at ..." banners so they don't interleave
     // with the in-place progress line and garble it (e.g.

@@ -8343,7 +8343,7 @@ fn write_per_tu_context(
                 ""
             };
             fragment.push_str(&format!(
-                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{language_cppflags}{no_fortify}{driver_define} -c {} -o {object}\n\n",
+                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{language_cppflags} $(BHF_FUZZING_BUILD_MODE_FLAGS){no_fortify}{driver_define} -c {} -o {object}\n\n",
                 sources[index]
             ));
         }

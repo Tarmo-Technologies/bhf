@@ -2263,6 +2263,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_fuzzing_build_mode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_gcc_lane.rs",
       "license": "Apache-2.0"
     },
@@ -3396,6 +3400,10 @@
     },
     {
       "path": "crates/harness_gen/src/error.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/src/fuzzing_build_mode.rs",
       "license": "Apache-2.0"
     },
     {

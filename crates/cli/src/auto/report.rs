@@ -422,6 +422,7 @@ fn target_fidelity(
     }
     facts.sanitizers = names;
     facts.tsan_ran = tsan_ran;
+    facts.fuzzing_build_mode = harness_fuzzing_build_mode(&r.harness_dir);
     // A cross-built harness ran under the emulator recorded beside it: it
     // ran its own target, with only the sanitizers its build armed.
     let harness = r.harness_dir.join("main");
@@ -443,6 +444,23 @@ fn target_fidelity(
         facts.tsan_ran = facts.tsan_ran && facts.sanitizers.iter().any(|n| n == "tsan");
     }
     Some(actionability::Fidelity::from_facts(&facts))
+}
+
+/// Whether a C/C++ harness was built with `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`:
+/// its Makefile's `BHF_FUZZING_BUILD_MODE_FLAGS` defines it and this process did
+/// not turn it off for the build. `None` for a harness without that Makefile.
+fn harness_fuzzing_build_mode(harness_dir: &Path) -> Option<actionability::FuzzingBuildMode> {
+    use harness_gen::fuzzing_build_mode as mode;
+    let makefile = std::fs::read_to_string(harness_dir.join("Makefile")).ok()?;
+    let line = makefile
+        .lines()
+        .find(|line| line.trim_start().starts_with(mode::MAKE_VAR))?;
+    let defined = line.contains(&format!("-D{}", mode::MACRO)) && mode::enabled();
+    Some(if defined {
+        actionability::FuzzingBuildMode::On
+    } else {
+        actionability::FuzzingBuildMode::Off
+    })
 }
 
 /// The target triple a harness was built for, from its toolchain stamp

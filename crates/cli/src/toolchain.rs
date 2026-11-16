@@ -105,6 +105,13 @@ pub struct CToolchainArgs {
     /// `toolchain.sysroot`.
     #[arg(long = "sysroot", value_name = "DIR")]
     pub sysroot: Option<PathBuf>,
+
+    /// Build without `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, which every
+    /// C/C++ lane otherwise defines (OSS-Fuzz's convention; AFL++'s compiler
+    /// wrappers define it too), so code a project compiles out of fuzz builds
+    /// (a signature check) runs. `BHF_FUZZING_BUILD_MODE=0` does the same.
+    #[arg(long = "no-fuzzing-build-mode")]
+    pub no_fuzzing_build_mode: bool,
 }
 
 impl CToolchainArgs {
@@ -149,6 +156,9 @@ impl CToolchainArgs {
         }
         if self.sysroot.is_some() {
             names.push("--sysroot");
+        }
+        if self.no_fuzzing_build_mode {
+            names.push("--no-fuzzing-build-mode");
         }
         names
     }

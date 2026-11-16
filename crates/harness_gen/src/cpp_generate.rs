@@ -2813,6 +2813,7 @@ mod tests {
             mk.contains("-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment"),
             "C++ default recipe must subtract FP-prone UBSan checks:\n{mk}"
         );
+        crate::fuzzing_build_mode::assert_every_target_compile_defines_it(&mk, "/tmp/source.cpp");
     }
 
     #[test]

@@ -8,7 +8,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub mod fidelity;
-pub use fidelity::{Endianness, Fidelity, FidelityDimension, FidelityFacts, FidelityStatus};
+pub use fidelity::{
+    Endianness, Fidelity, FidelityDimension, FidelityFacts, FidelityStatus, FuzzingBuildMode,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

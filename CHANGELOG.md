@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Every C/C++ lane defines `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, as
+  OSS-Fuzz builds and AFL++'s compiler wrappers do. Only the AFL++ lane had
+  it, so a crash it found past a check the project compiles out of fuzz
+  builds did not reproduce in the sanitized `main`. Each target's (and
+  finding's) fidelity records `fuzzing_build_mode`, and
+  `--no-fuzzing-build-mode` or `BHF_FUZZING_BUILD_MODE=0` turns it off.
 - Every SARIF result has a location, so GitHub code scanning shows the
   format-string, memory-limit and deadline oracle findings (BHF-408, BHF-209,
   BHF-555) it used to drop. A finding with no crash frame points at the

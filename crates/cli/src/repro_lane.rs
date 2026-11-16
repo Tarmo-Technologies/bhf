@@ -2103,6 +2103,9 @@ pub(crate) struct MakefileFacts {
     /// `BHF_DRIVER_SOURCE`: bhf's driver, which the Makefile links beside the
     /// harness (`-DBHF_EXTERNAL_DRIVER`).
     pub(crate) driver_source: Option<String>,
+    /// `BHF_FUZZING_BUILD_MODE_FLAGS` tokens: the fuzz-build define every
+    /// lane's compile of the target takes, or none.
+    pub(crate) fuzzing_build_mode_flags: Vec<String>,
 }
 
 /// The build `bhf auto` recorded for a harness (`coverage-build-recipe.json`):
@@ -2392,6 +2395,12 @@ impl CFamilyLane {
                 facts.driver_source = crate::generate_harness::split_compile_command(rest)
                     .into_iter()
                     .next();
+            } else if let Some(rest) = line
+                .strip_prefix(harness_gen::fuzzing_build_mode::MAKE_VAR)
+                .and_then(|rest| rest.trim_start().strip_prefix("?="))
+            {
+                facts.fuzzing_build_mode_flags =
+                    crate::generate_harness::split_compile_command(rest);
             }
             if crate::build::is_main_rule(line) {
                 in_main = true;
@@ -2533,6 +2542,8 @@ impl CFamilyLane {
                 extra_link_flags.extend(link_args(recipe.toolchain_words(variable), &harness_dir));
             }
         }
+        // The fuzz-build define the Makefile gives every compile of the target.
+        toolchain_cppflags.extend(parse_args(&facts.fuzzing_build_mode_flags, &harness_dir));
         Ok(BuildModel {
             driver: harness_dir.join(self.driver),
             compile_db_flags: parse_args(&facts.compile_db_flags, &harness_dir),

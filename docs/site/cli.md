@@ -1398,7 +1398,8 @@ the `AUTO_EXTRA_INCLUDES='-include <prelude>'` command.
 
 `bhf build` takes the toolchain from `--cc`/`--cxx`, `--target <triple>` (or
 `--toolchain <prefix>`: `<prefix>-gcc`/`<prefix>-g++`), `--sysroot`, `--cflags`,
-`--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`, or from the
+`--cxxflags`, `--ldflags`, `--define`, `--toolchain-include` and
+`--no-fuzzing-build-mode` (see [C/C++](c-cpp.md)), or from the
 `[toolchain]` table of `--config <file>` (the same table `bhf auto --config`
 reads; there the compilers come from `target` or `cc`/`cxx`, since
 `toolchain.ada.prefix` applies to Ada harnesses only). Flags are appended to

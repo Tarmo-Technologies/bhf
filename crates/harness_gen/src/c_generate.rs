@@ -434,6 +434,7 @@ pub(crate) fn harness_makefile_context(
     )?;
     context.insert("bhf_driver_prereq", &!driver.starts_with('"'));
     context.insert("bhf_driver_source", &driver);
+    context.insert("fuzzing_build_mode", &crate::fuzzing_build_mode::enabled());
     Ok(context)
 }
 
@@ -10248,6 +10249,7 @@ mod tests {
         // #399: the harness ships its own driver main; the default build uses
         // trace-pc-guard coverage and does NOT link libFuzzer's own main.
         assert!(mk.contains("-fsanitize-coverage=trace-pc-guard"));
+        crate::fuzzing_build_mode::assert_every_target_compile_defines_it(&mk, "/tmp/source.c");
         // The DEFAULT build's compile flags carry no libFuzzer; libFuzzer is a
         // separate opt-in target (`make libfuzzer`) for external drivers
         // (Mayhem/libFuzzer/honggfuzz), so `-fsanitize=fuzzer` appears only there.

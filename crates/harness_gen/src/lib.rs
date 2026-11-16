@@ -113,6 +113,7 @@ pub mod cpp_decoders;
 pub mod cpp_generate;
 pub mod decoders;
 pub mod error;
+pub mod fuzzing_build_mode;
 pub mod generate;
 pub mod generic_instance;
 pub mod java_generate;

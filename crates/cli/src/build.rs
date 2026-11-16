@@ -320,6 +320,9 @@ pub enum CEngine {
 }
 
 pub fn run(args: BuildArgs) -> i32 {
+    if args.toolchain_args.c.no_fuzzing_build_mode {
+        harness_gen::fuzzing_build_mode::disable();
+    }
     let toolchain = match resolve_build_toolchain(&args) {
         Ok(toolchain) => toolchain,
         Err(error) => {
@@ -3002,6 +3005,11 @@ fn apply_c_family_make_env(
     // built-in CC/CXX defaults are usually cc/g++, which do not support
     // -fsanitize=fuzzer on common Linux hosts. Respect explicit caller
     // choices, but provide clang defaults when no compiler was selected.
+    // A harness generated with the define is built without it when the
+    // process turned it off (`--no-fuzzing-build-mode`).
+    if !harness_gen::fuzzing_build_mode::enabled() {
+        cmd.env(harness_gen::fuzzing_build_mode::MAKE_VAR, "");
+    }
     let (cc, cxx) = if let Some(compiler) = compiler {
         // An explicit override (a cross build, the gcc retry, a sanitizer
         // matrix): force its CC/CXX (and replacement flags), overriding both the
