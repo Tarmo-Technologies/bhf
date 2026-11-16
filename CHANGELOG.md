@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf auto` exits 3 when harnesses built but none ran because their sanitizer
+  runtime does not start on this host, and says to re-run with
+  `--sanitizers none`. It exited 1, as for nothing built, and the hint
+  suggested `CC=clang` even for a clang build. A source path that does not
+  exist exits 2, as auto.md says; it exited 1. The exit tables in cli.md and
+  auto.md list all four codes.
 - `--sanitizers` refuses `msan` or `tsan` combined with another sanitizer (exit
   2, on `bhf auto` and `bhf fuzz`). Every target then failed to build and was
   filed as a bhf code-generation bug. `bhf auto --dry-run` checks `--engine`

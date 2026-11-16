@@ -2753,10 +2753,14 @@ fn a_sanitizer_runtime_start_failure_is_never_a_finding() {
     assert_eq!(summary["sanitizer_runtime_unavailable"], 1, "{summary}");
     assert_eq!(summary["unrecoverable_runtime"], 0, "{summary}");
     assert!(
-        out.contains("1 not fuzzed (sanitizer runtime cannot start on this host)")
-            && !out.contains("1 runtime error"),
+        out.contains(
+            "1 not fuzzed (sanitizer runtime cannot start on this host; try --sanitizers none)"
+        ) && !out.contains("1 runtime error"),
         "{out}"
     );
+    // The harness built and nothing ran: the host's runtime, its own exit code.
+    assert_eq!(output.status.code(), Some(3), "{out}");
+    assert!(out.contains("Re-run with `--sanitizers none`"), "{out}");
     assert_eq!(
         out.matches("fuzz pass `").count(),
         1,

@@ -1156,10 +1156,28 @@ fn detect_custom_build(root: &Path) -> Option<(String, String)> {
         .map(|(name, cmd)| ((*name).to_owned(), (*cmd).to_owned()))
 }
 
+/// `bhf auto` exits 0 when at least one target built and ran.
+pub const EXIT_RAN: i32 = 0;
+/// Candidates were discovered, but none built.
+pub const EXIT_NONE_BUILT: i32 = 1;
+/// Nothing to sweep: no candidates, a source path that does not exist, or a
+/// refused configuration (an unusable toolchain, an invalid flag value).
+pub const EXIT_NO_CANDIDATES: i32 = 2;
+/// Harnesses built, but none could run here because the sanitizer runtime
+/// does not start on this host: a host or toolchain problem, not the code's.
+pub const EXIT_SANITIZER_RUNTIME: i32 = 3;
+
 fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let _tstart = std::time::Instant::now();
     let started_at = Utc::now().to_rfc3339();
     let run_start = std::time::Instant::now();
+    if !args.path.exists() {
+        bhfeprintln!(
+            "error: bhf auto: {} does not exist; nothing to sweep",
+            args.path.display()
+        );
+        return Ok(EXIT_NO_CANDIDATES);
+    }
     let path = strip_verbatim_prefix(
         args.path
             .canonicalize()
@@ -3524,9 +3542,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         if summary.built + summary.built_and_fuzzed + summary.report_only > 0
             || summary.findings > 0
         {
-            0
+            EXIT_RAN
+        } else if summary.sanitizer_runtime_unavailable > 0 {
+            bhfeprintln!(
+                "bhf auto: exit {EXIT_SANITIZER_RUNTIME}: {} target(s) built, but their sanitizer \
+                 runtime does not start on this host, so none ran. Re-run with \
+                 `--sanitizers none` (coverage and crash detection, no sanitizer runtime), or \
+                 with a compiler whose sanitizer runtime starts here.",
+                summary.sanitizer_runtime_unavailable
+            );
+            EXIT_SANITIZER_RUNTIME
         } else {
-            1
+            EXIT_NONE_BUILT
         },
     )
 }
@@ -4720,7 +4747,8 @@ impl AutoSummary {
         }
         if self.sanitizer_runtime_unavailable > 0 {
             outcomes.push(format!(
-                "{} not fuzzed (sanitizer runtime cannot start on this host)",
+                "{} not fuzzed (sanitizer runtime cannot start on this host; try \
+                 --sanitizers none)",
                 self.sanitizer_runtime_unavailable
             ));
         }

@@ -468,7 +468,8 @@ Mayhemfile is emitted for them.
 |---|---|
 | 0 | At least one target built and ran |
 | 1 | Candidates discovered, none built |
-| 2 | No candidates discovered (empty tree or wrong path) |
+| 2 | No candidates discovered (empty tree, or a source path that does not exist), or a refused configuration or flag value |
+| 3 | Harnesses built, but none ran: their sanitizer runtime does not start on this host (re-run with `--sanitizers none`) |
 
 ## Discovery
 

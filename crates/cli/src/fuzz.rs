@@ -1370,9 +1370,10 @@ fn runtime_start_failure_error(runner: &replay_min::HarnessRunner, stderr: &str)
         .unwrap_or_default();
     Some(format!(
         "{RUNTIME_START_FAILURE}'{}'{built_with} printed \"{line}\" before reaching the target. \
-         That is an environment problem on this host, not a finding: build the harness with a \
-         compiler whose sanitizer runtime starts here (CC=clang CXX=clang++), or choose the \
-         sanitizers with --sanitizers, which checks that the compilers' runtimes start",
+         That is an environment problem on this host, not a finding: build the harness with \
+         `--sanitizers none` (coverage and crash detection, no sanitizer runtime), with \
+         sanitizers whose runtime starts here (`--sanitizers` checks that it does), or with a \
+         compiler whose sanitizer runtime starts here",
         harness.display()
     ))
 }
