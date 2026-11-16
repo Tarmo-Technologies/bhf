@@ -1216,6 +1216,7 @@ pub(crate) fn replay_binary_outcome(
     Ok(crate::replay::LaneReplay {
         lane: "binary",
         matched: replayed.matched,
+        unverified: false,
         status_line: if replayed.matched {
             "MATCH".to_owned()
         } else {

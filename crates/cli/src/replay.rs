@@ -1850,6 +1850,9 @@ pub(crate) struct LaneReplay {
     /// `binary`, `session`, `collector` or `transport`.
     pub(crate) lane: &'static str,
     pub(crate) matched: bool,
+    /// The evidence matched, but nothing replayed the finding's input (it has
+    /// none): exit 4, and no match is recorded.
+    pub(crate) unverified: bool,
     /// `MATCH`, or the lane's `MISMATCH ...` line.
     pub(crate) status_line: String,
     /// What was compared.
@@ -1870,7 +1873,7 @@ pub(crate) struct LaneReplay {
 
 /// Print a lane's result (a summary, or `--json`), stamp `last_seen` on a
 /// match and rebuild results/ so its hashes and attestation stay current.
-/// Exit codes: 0 = MATCH, 3 = MISMATCH, 1 = error.
+/// Exit codes: 0 = MATCH, 3 = MISMATCH, 4 = UNVERIFIED, 1 = error.
 pub(crate) fn finish_lane(
     finding_dir: &Path,
     lane: Result<LaneReplay, String>,
@@ -1888,7 +1891,11 @@ pub(crate) fn finish_lane(
         .and_then(|(_, stderr)| corpus::parse_sanitizer_report(&String::from_utf8_lossy(stderr)));
     let summary = ReplaySummary {
         schema_version: REPLAY_SCHEMA,
-        verdict: if lane.matched { "match" } else { "mismatch" },
+        verdict: match (lane.matched, lane.unverified) {
+            (true, false) => "match",
+            (_, true) => "unverified",
+            (false, false) => "mismatch",
+        },
         finding: finding_ref(finding_dir),
         lane: Some(lane.lane),
         recorded_rule: raw
@@ -1944,17 +1951,18 @@ pub(crate) fn finish_lane(
         captured.ok(),
         captured.err().unwrap_or_default(),
     );
+    let reproduced = lane.matched && !lane.unverified;
     settle_finding(
         finding_dir,
-        lane.matched.then_some(lane.history),
+        reproduced.then_some(lane.history),
         log.is_some(),
     );
     summary.replay_log = log.map(|path| path.display().to_string());
     emit(&summary, output, captured);
-    if lane.matched {
-        0
-    } else {
-        3
+    match (lane.matched, lane.unverified) {
+        (true, false) => 0,
+        (_, true) => 4,
+        (false, false) => 3,
     }
 }
 

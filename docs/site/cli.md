@@ -415,7 +415,11 @@ count as distinct violations), writes none for a rule the runtime-oracle lane
 already reported with its testcase, labels the effects with their POSIX APIs
 (`execve`, `dlopen`), records them at `medium` confidence with no clean
 assurance, and stores the session once, in `results/collector/`, which each
-finding's `paths.collector_evidence` names.
+finding's `paths.collector_evidence` names. It reads the runtrace log this run
+armed (and emptied when it armed it), never one an earlier run left in the work
+dir. Such a finding has no input, so `bhf replay` reports it `UNVERIFIED`
+(exit `4`) when its evidence still produces its signature: nothing replayed an
+input of it.
 
 `bhf binary fuzz` also accepts **user-defined postcondition oracles** with
 per-case fixture hooks: `--setup-command` runs before each testcase (prepare a

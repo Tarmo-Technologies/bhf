@@ -1479,6 +1479,13 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     };
+    // The runtrace log this run armed and truncated, if any: the collector
+    // reads that one, never a log an earlier run left in the work dir.
+    let runtrace_log = prepared
+        .extra_env
+        .iter()
+        .find(|(key, _)| key == "BHF_RUNTRACE_LOG")
+        .map(|(_, value)| PathBuf::from(value));
 
     let result = match prepared.engine {
         FuzzEngine::Builtin => run_builtin(prepared),
@@ -1502,6 +1509,7 @@ pub fn run(args: FuzzArgs) -> i32 {
                 collector_window_ms,
                 &collector_work_dir,
                 &collector_harness,
+                runtrace_log.as_deref(),
             ) {
                 Ok(provenance) => {
                     value["collector"] = provenance;
@@ -1562,6 +1570,7 @@ fn run_collector_for_fuzz(
     window_ms: u64,
     work_dir: &Path,
     harness_id: &str,
+    runtrace_log: Option<&Path>,
 ) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context;
     let Some(resolved) = crate::collector_run::resolve(spec, window_ms)? else {
@@ -1585,49 +1594,52 @@ fn run_collector_for_fuzz(
         // behaviour or re-running the harness. This log spans the WHOLE campaign, so
         // the observation is labeled AGGREGATE (not a per-testcase replay) and never
         // fabricates a per-case testcase/pid (#76).
-        let log = work_dir.join("runtrace.jsonl");
-        if !log.is_file() {
+        match runtrace_log.filter(|log| log.is_file()) {
+            None =>
             // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
             // off`), so the collector observed nothing this run. Record a degraded,
             // not-observed run rather than evaluating an empty stream and claiming a
             // clean collector assurance over coverage it never had.
-            (
-                resolved.not_observed("runtime_shim_not_armed"),
-                crate::collector_run::ObservationMode::Aggregate,
-                Vec::new(),
-            )
-        } else {
-            let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
-            crate::auto::runtrace::dedupe_in_place(&mut events);
-            // Route sink confirmation through the SAME cross-execution correlation
-            // #59 uses: the aggregated log spans every execution, so the gate's
-            // never-untainted / constant-suppression applies across the whole run
-            // and no sink is single-run taint-confirmed.
-            let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
-            let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                testcase: "campaign-aggregate".to_owned(),
-                worker: 0,
-                // Synthetic anchor for the aggregate event tree; the shim events
-                // carry the real pids. Not a per-case OS pid claim.
-                root_pid: 1,
-            };
-            let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
-                &events,
-                &adapter_ctx,
-                harness_id,
-                &gate,
-            );
-            (
-                resolved.evaluate_aggregate_jsonl(
-                    &jsonl,
-                    &work_dir.display().to_string(),
-                    &oracle_lane_rules(&findings_dir, harness_id),
-                ),
-                crate::collector_run::ObservationMode::Aggregate,
-                // Aggregate: no single triggering input, so the finding is
-                // campaign-level (its `coverage` says so), not reproducible from one.
-                Vec::new(),
-            )
+            {
+                (
+                    resolved.not_observed("runtime_shim_not_armed"),
+                    crate::collector_run::ObservationMode::Aggregate,
+                    Vec::new(),
+                )
+            }
+            Some(log) => {
+                let mut events = crate::auto::runtrace::parse_log(log).unwrap_or_default();
+                crate::auto::runtrace::dedupe_in_place(&mut events);
+                // Route sink confirmation through the SAME cross-execution correlation
+                // #59 uses: the aggregated log spans every execution, so the gate's
+                // never-untainted / constant-suppression applies across the whole run
+                // and no sink is single-run taint-confirmed.
+                let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
+                let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                    testcase: "campaign-aggregate".to_owned(),
+                    worker: 0,
+                    // Synthetic anchor for the aggregate event tree; the shim events
+                    // carry the real pids. Not a per-case OS pid claim.
+                    root_pid: 1,
+                };
+                let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                    &events,
+                    &adapter_ctx,
+                    harness_id,
+                    &gate,
+                );
+                (
+                    resolved.evaluate_aggregate_jsonl(
+                        &jsonl,
+                        &work_dir.display().to_string(),
+                        &oracle_lane_rules(&findings_dir, harness_id),
+                    ),
+                    crate::collector_run::ObservationMode::Aggregate,
+                    // Aggregate: no single triggering input, so the finding is
+                    // campaign-level (its `coverage` says so), not reproducible from one.
+                    Vec::new(),
+                )
+            }
         }
     } else {
         // Sidecar provider on the generic `fuzz` (harness) path: an honest replay
@@ -14655,12 +14667,19 @@ exit 0
     fn collector_auto_without_shim_log_is_not_reported_clean() {
         let work = crate::test_support::TestDir::new("fuzz-col-noobs");
 
-        // No runtrace.jsonl is written (the shim was never armed).
+        // This run armed no shim. An earlier run's runtrace.jsonl is still in
+        // the work dir, and the collector must not read it as this run's.
+        std::fs::write(
+            work.join("runtrace.jsonl"),
+            "{\"e\":\"exec\",\"c\":\"/bin/sh -c id\",\"t\":0}\n",
+        )
+        .unwrap();
         let prov = run_collector_for_fuzz(
             &crate::collector_run::CollectorSpec::Auto,
             crate::collector_run::DEFAULT_WINDOW_MS,
             &work,
             "harness",
+            None,
         )
         .expect("collector provenance");
 

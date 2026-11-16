@@ -1156,10 +1156,18 @@ pub(crate) fn replay_collector_outcome(
 ) -> Result<crate::replay::LaneReplay, String> {
     let (matched, want, details) =
         replay_collector_finding_inner(finding_dir).map_err(|error| format!("{error:#}"))?;
+    // A finding of the campaign-aggregate view has no input: its evidence
+    // re-evaluates, but no input of it was replayed.
+    let unverified = matched && finding_has_no_input(finding_dir);
     Ok(crate::replay::LaneReplay {
         lane: "collector",
         matched,
-        status_line: if matched {
+        unverified,
+        status_line: if unverified {
+            "UNVERIFIED collector finding has no input to replay; its stored evidence still \
+             produces the signature"
+                .to_owned()
+        } else if matched {
             "MATCH".to_owned()
         } else {
             "MISMATCH collector semantic signature not reproduced from evidence".to_owned()
@@ -1176,6 +1184,16 @@ pub(crate) fn replay_collector_outcome(
         history: "replay",
         ..Default::default()
     })
+}
+
+/// Whether collector finding `finding_dir` was recorded with no input (the
+/// campaign-aggregate view, which observed no one testcase).
+fn finding_has_no_input(finding_dir: &Path) -> bool {
+    let recorded = read_finding_json(finding_dir)
+        .ok()
+        .and_then(|raw| raw.pointer("/input/bytes").and_then(Value::as_u64));
+    let testcase = std::fs::metadata(finding_dir.join("testcase.bin")).map(|meta| meta.len());
+    recorded == Some(0) || matches!(testcase, Ok(0) | Err(_))
 }
 
 /// `bhf replay` of a collector finding with the default output.
@@ -1427,6 +1445,39 @@ mod tests {
         );
         let (matched, _, _) = replay_collector_finding_inner(&dir).unwrap();
         assert!(matched, "replay reads the shared evidence");
+    }
+
+    /// A finding with no input (the campaign-aggregate view's) replays as
+    /// UNVERIFIED, exit 4: its evidence re-evaluates, but no input of it ran.
+    /// One with an input still replays as MATCH.
+    #[test]
+    fn a_finding_without_an_input_replays_as_unverified() {
+        let collector = mock_resolved(250);
+        let set = sessions(&MockCollector::process_exec(), "tc", 0);
+        let finding = &collector.evaluate(&set, "/srv/sandbox").findings[0];
+        let tmp = tempfile::tempdir().unwrap();
+        let without = tmp.path().join("COL-0001");
+        write_finding(
+            &without,
+            "COL-0001",
+            json!({"kind": "harness"}),
+            finding,
+            &[],
+            ObservationMode::Aggregate,
+        )
+        .unwrap();
+        assert_eq!(replay_collector_finding(&without), 4);
+        let with = tmp.path().join("COL-0002");
+        write_finding(
+            &with,
+            "COL-0002",
+            json!({"kind": "binary"}),
+            finding,
+            b"payload",
+            ObservationMode::Replay,
+        )
+        .unwrap();
+        assert_eq!(replay_collector_finding(&with), 0);
     }
 
     #[test]

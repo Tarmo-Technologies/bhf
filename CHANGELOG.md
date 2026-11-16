@@ -45,6 +45,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Linux `--collector auto` view reads only the runtrace log the current
+  run armed; it re-read an earlier run's `runtrace.jsonl` left in the work dir.
+  `bhf replay` of a collector finding with no input reports UNVERIFIED (exit
+  4) instead of MATCH, and records no match.
 - `bhf fuzz --collector auto` on Linux writes at most one COL finding per rule,
   oracle and API of its aggregate campaign view, none for a rule the
   runtime-oracle lane already reported, at medium confidence and with no clean
