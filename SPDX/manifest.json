@@ -5747,6 +5747,30 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "tests/fixtures/rust_incrate_workspace/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/checksum/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/checksum/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/src/internal.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "tests/fixtures/rust_output_buffer/Cargo.toml",
       "license": "Apache-2.0"
     },

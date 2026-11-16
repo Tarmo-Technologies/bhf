@@ -52,6 +52,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The in-crate Rust lane builds a workspace member that inherits from its
+  workspace. A dependency declared `dep.workspace = true` was refused ("the
+  detached copy can't resolve it"); it is now resolved from the workspace's
+  `[workspace.dependencies]` as Cargo does (the workspace's entry, its path
+  anchored at the workspace root, with the member's features and `optional`).
+  An inherited `version` and `edition` come from `[workspace.package]` instead
+  of `0.0.0` and `2021`, so a 2024-edition member compiles. The workspace's
+  `Cargo.lock` is copied with the crate, so the offline build resolves the
+  versions the workspace locked.
 - `bhf fuzz --collector` replays the campaign's retained inputs one by one on
   the harness: its crash findings, then its persisted corpus, at most 16, each
   launched as `bhf replay` runs the harness. A sidecar now observes each one

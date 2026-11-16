@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# #218 fixture: a two-member workspace. `ws_parser` keeps its parser in a
+# private module, so only the in-crate build can reach it, and it inherits its
+# version, its edition and its `checksum` dependency from this workspace
+# (`*.workspace = true`). The detached in-crate copy resolves them from here.
+
+[workspace]
+resolver = "2"
+members = ["parser", "checksum"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+checksum = { package = "ws_checksum", path = "checksum" }

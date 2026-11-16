@@ -213,3 +213,40 @@ fn private_module_target_builds_and_fuzzes_in_crate() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// #218: a member of a workspace that inherits its edition, its version and a
+/// dependency from the workspace (`*.workspace = true`) was refused by the
+/// in-crate lane ("can't resolve"). The detached copy now takes them from the
+/// workspace's `[workspace.package]` and `[workspace.dependencies]`, with the
+/// workspace's `Cargo.lock`, and builds offline.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn a_workspace_member_inheriting_its_dependencies_builds_and_fuzzes_in_crate() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-workspace");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_workspace"), &tmp, "12", "4");
+    let parse = find_attempt(&json, "parse");
+    assert!(
+        attempt_findings(parse, "parse") > 0,
+        "the planted out-of-bounds index in the member's private parser is found:\n{combined}"
+    );
+    let harness_id = parse["harness_id"]
+        .as_str()
+        .expect("parse has a harness_id");
+    let incrate = tmp.join("harnesses").join(harness_id).join("incrate");
+    let manifest = std::fs::read_to_string(incrate.join("Cargo.toml")).unwrap();
+    assert!(!manifest.contains("workspace = true"), "{manifest}");
+    assert!(manifest.contains("ws_checksum"), "{manifest}");
+    assert!(
+        incrate.join("Cargo.lock").is_file(),
+        "the workspace's lockfile is copied"
+    );
+}

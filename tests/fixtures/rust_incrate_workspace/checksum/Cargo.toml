@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ws_checksum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
