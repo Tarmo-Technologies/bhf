@@ -7,7 +7,6 @@
 //! the campaign's; a flag whose output the merge would not carry back, such
 //! as `--collector`, is refused with exit 2.
 
-use std::path::Path;
 use std::process::{Command, Output};
 
 mod support;
@@ -131,7 +130,7 @@ fn two_workers_with_runtime_oracles_find_the_planted_sink() {
 }
 
 #[cfg(target_os = "linux")]
-fn finding(work: &Path, id: &str) -> serde_json::Value {
+fn finding(work: &std::path::Path, id: &str) -> serde_json::Value {
     let path = work.join("results/findings").join(id).join("finding.json");
     serde_json::from_slice(
         &std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display())),
