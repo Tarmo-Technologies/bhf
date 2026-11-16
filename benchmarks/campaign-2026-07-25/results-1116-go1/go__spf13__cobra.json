@@ -1,0 +1,51 @@
+{
+ "repo": "spf13/cobra",
+ "sha": "adbc8813901bba65827259daa8e22ff94ec1f30e",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "active_help.go",
+   "name": "AppendActiveHelp",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `[]Completion` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "shell_completions.go",
+   "name": "MarkFlagCustom",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*pflag.FlagSet` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "shell_completions.go",
+   "name": "MarkFlagDirname",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*pflag.FlagSet` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "shell_completions.go",
+   "name": "MarkFlagFilename",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*pflag.FlagSet` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 7,
+  "discovered_total": 7,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 7,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

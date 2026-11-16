@@ -5,9 +5,10 @@ Resumed checkpoint, 2026-09-24: a narrow data-only implementation now parses
 package-local struct declarations, rejects private fields, embedded fields,
 method-bearing and opaque types, and seeds complete JSON documents in both
 `auto` and `fuzz`. A real `auto` fixture reached a planted branch through
-nested pointer, slice, map and tagged fields. This does not resolve the
-historical 58-target bucket: its full before/after sweep and harness-origin
-finding audit have not been run. The remaining acceptance tests below still apply.
+nested pointer, slice, map and tagged fields. The full before/after sweep and
+harness-origin finding audit ran on 2026-11-16
+([Go re-sweep](validation/2026-11-16-go-resweep.md)): of the 59 targets in the
+historical bucket, 7 now build and fuzz and 52 still skip (acceptance test 5).
 
 A targeted public-source check at frp revision
 `5c6d761c1287e6153f07b824fb6d71b96ee598fe` built and entered
@@ -17,17 +18,18 @@ coverage defect: `-coverpkg` excluded the generated harness module, leaving
 target package and harness module, the same five-second target run recorded
 21 coverage edges, 69,009 executions and no finding. That is one resolved
 historical skip with measured feedback; it is not a full 58-target re-sweep or
-proof of deep parser-state coverage. Raw current-run evidence is at
-`/tmp/bhf-p2-frp-work-coverage-20260924/` in the validation environment.
+proof of deep parser-state coverage. That run's raw output was kept only on the
+validation host; the 2026-11-16 re-run of the bucket built and fuzzed the same
+target at the same revision (`results-1116-go1-go1.27/go__fatedier__frp.json`
+under `benchmarks/campaign-2026-07-25/`).
 The subsequent full-workspace test sweep found that targets taking `[]byte`
 followed by a JSON data argument need separate input fields: a length-prefixed
 raw field and a trailing JSON document. Paired starting seeds now populate
 both fields; a Go force fixture passed 2/2 while confirming only its method
 receiver still needs `--force`. The same pinned frp target repeated with this
 layout entered unforced, recorded 27 edges and 58,833 executions in five
-seconds, and reported no finding or forced repair. Its log is
-`/tmp/bhf-p2-frp-auto-mixed-20260924.log`. Parser depth beyond that measured
-feedback remains unverified.
+seconds, and reported no finding or forced repair; that log, too, stayed on the
+validation host. Parser depth beyond that measured feedback remains unverified.
 
 ## Scope recommendation
 
@@ -117,7 +119,10 @@ that establish all of the following:
 5. The unsupported 58-target Go sweep is re-run with before/after residual
    histograms, build/fuzz counts, findings, and any new harness-origin crash
    audit. Report the actual resolved count rather than assigning all 58 to this
-   feature.
+   feature. **Done 2026-11-16** ([Go re-sweep](validation/2026-11-16-go-resweep.md)):
+   7 of the 59 resolved and 52 still skip; the audit found no crash in generated
+   harness code, and two input-independent causes of false findings (#398,
+   #399).
 
 ## Non-goals
 

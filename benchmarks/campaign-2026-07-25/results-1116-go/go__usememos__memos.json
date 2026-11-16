@@ -1,0 +1,318 @@
+{
+ "lane": "go",
+ "repo": "usememos/memos",
+ "stars": 61794,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/usememos__memos --json --out /home/ubuntu/bhf-sweep-work/go__usememos__memos.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "languages": 3,
+   "sloc_total": 117698,
+   "sloc_by_lang": {
+    "go": 75849,
+    "javascript": 32405,
+    "config": 9444
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/usememos__memos --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.25,
+   "timed_out": false,
+   "panic": false,
+   "count": 2746,
+   "by_language": {
+    "typescript": 150,
+    "go": 2596
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/usememos__memos --out /home/ubuntu/bhf-sweep-work/go__usememos__memos/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 4.15,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 96,
+   "by_severity": {
+    "medium": 38,
+    "high": 40,
+    "critical": 18
+   },
+   "top_rules": {
+    "BHF-472": 28,
+    "BHF-436": 26,
+    "BHF-419": 12,
+    "BHF-500": 9,
+    "BHF-405": 7,
+    "BHF-429": 5,
+    "BHF-423": 4,
+    "BHF-477": 2,
+    "BHF-427": 1,
+    "BHF-479": 1,
+    "BHF-404": 1
+   },
+   "gaps": 1172
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/usememos__memos --out /home/ubuntu/bhf-sweep-work/go__usememos__memos/sbom",
+   "exit": 0,
+   "wall_s": 0.04,
+   "timed_out": false,
+   "panic": false,
+   "components": 753
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/usememos__memos --work-dir /home/ubuntu/bhf-sweep-work/go__usememos__memos --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 5.95,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 2746,
+    "dropped_by_cap": 2736,
+    "built": 1,
+    "built_and_fuzzed": 1,
+    "fuzzed_stub_only": 0,
+    "failed_build": 1,
+    "unsupported_params": 8,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 1,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "parseMentionsFromText",
+     "source": "remark-mention.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__usememos__memos/harnesses/H-T000E-32F272C8/target.js` is not loadable (skipped cleanly): missing module `unist-util-visit` (not in the project and not installed) \u2014 Error: Cannot find module 'unist-util-visit'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "loadWithReload",
+     "source": "lazy.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__usememos__memos/harnesses/H-T000F-D3D37D5A/target.js` is not loadable (skipped cleanly): missing module `react` (not in the project and not installed) \u2014 Error: Cannot find module 'react'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "buildMemoCreatorFilter",
+     "source": "resource-names.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__usememos__memos/harnesses/H-T000A-ECCC6E1D/target.js` is not loadable (skipped cleanly): missing module `@bufbuild/protobuf/codegenv2` (not in the project and not installed) \u2014 Error: Cannot find module '@bufbuild/protobuf/codegenv2'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "convertFileToBase64",
+     "source": "browser.ts",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 12.995322576218046,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "FormattingToolbar",
+     "source": "FormattingToolbar.tsx",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__usememos__memos/harnesses/H-T003F-777FBD38/target.js` is not loadable (skipped cleanly): missing module `lucide-react` (not in the project and not installed) \u2014 Error: Cannot find module 'lucide-react'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ExtractRefreshTokenFromCookie",
+     "source": "extract.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: google.golang.org/genproto@v0.0.0-20260427160629-7cedc36a6bc4 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ParseCronExpression",
+     "source": "parser.go",
+     "outcome": "failed_build",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ExtractAttachmentUIDFromName",
+     "source": "resource_name.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: github.com/grpc-ecosystem/grpc-gateway/v2@v2.29.0 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ParseAccessTokenV2",
+     "source": "token.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: google.golang.org/genproto@v0.0.0-20260427160629-7cedc36a6bc4 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "LoadDeploymentConfigurationDir",
+     "source": "deployment_config.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `LoadDeploymentConfigurationDir` needs a receiver value and its type `Store` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 3,
+     "detail": "go build failed: go: PATH requires go >= N.N.N (running go N.N.N; GOTOOLCHAIN=local)",
+     "language": "go"
+    },
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "go build failed: PATH undefined: slices.Backward",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"LoadDeploymentConfigurationDir\" needs a receiver value and its type \"Store\" has no no-arg constructor; pass --force to call it on a zero-valued recei\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"@bufbuild/protobuf/codegenv2\" (not in the project and not installed) \u2014 Error: Cannot find module \"@bufbuild/protobuf/codegenv2\"",
+     "language": "typescript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"lucide-react\" (not in the project and not installed) \u2014 Error: Cannot find module \"lucide-react\"",
+     "language": "typescript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"react\" (not in the project and not installed) \u2014 Error: Cannot find module \"react\"",
+     "language": "typescript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"unist-util-visit\" (not in the project and not installed) \u2014 Error: Cannot find module \"unist-util-visit\"",
+     "language": "typescript"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-ec1d1719",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-248"
+     ],
+     "cwe_name": "Uncaught Exception",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-T000F-4974128E",
+     "frames": [
+      "<anonymous>",
+      "new Promise",
+      "Object.convertFileToBase64"
+     ],
+     "message": "JS finding: ReferenceError: FileReader is not defined"
+    }
+   ]
+  }
+ },
+ "sha": "93284137970d2ac1bda29f9a8feb6da9c69e3db8",
+ "clone_s": 0.0,
+ "lane_check": "go: 355 files / 81861 lines; top=go(81861)",
+ "status": "done"
+}

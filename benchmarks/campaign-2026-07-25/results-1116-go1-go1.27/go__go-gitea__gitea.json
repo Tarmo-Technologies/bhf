@@ -1,0 +1,51 @@
+{
+ "repo": "go-gitea/gitea",
+ "sha": "4d6e172a0d23300d7ef9b2b559a2bee00d017fea",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "catfile.go",
+   "name": "BlobsLessThan1024FromCatFileBatchCheck",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `io.WriteCloser` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "commit_reader.go",
+   "name": "CommitFromReader",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `ObjectID` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "revlist.go",
+   "name": "BlobsFromRevListObjects",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `io.WriteCloser` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "upload.go",
+   "name": "AddUploadContext",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*context.Context` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 4,
+  "discovered_total": 4,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 4,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

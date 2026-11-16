@@ -1,0 +1,303 @@
+{
+ "lane": "go",
+ "repo": "multica-ai/multica",
+ "stars": 42033,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/multica-ai__multica --json --out /home/ubuntu/bhf-sweep-work/go__multica-ai__multica.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.07,
+   "timed_out": false,
+   "panic": false,
+   "languages": 3,
+   "sloc_total": 587774,
+   "sloc_by_lang": {
+    "go": 305731,
+    "javascript": 262198,
+    "config": 19845
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/multica-ai__multica --format json --top 100000",
+   "exit": 0,
+   "wall_s": 1.0,
+   "timed_out": false,
+   "panic": false,
+   "count": 2443,
+   "by_language": {
+    "typescript": 435,
+    "javascript": 14,
+    "go": 1994
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/multica-ai__multica --out /home/ubuntu/bhf-sweep-work/go__multica-ai__multica/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 33.8,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 486,
+   "by_severity": {
+    "high": 403,
+    "medium": 60,
+    "critical": 23
+   },
+   "top_rules": {
+    "BHF-405": 371,
+    "BHF-436": 28,
+    "BHF-472": 23,
+    "BHF-429": 16,
+    "BHF-548": 10,
+    "BHF-423": 8,
+    "BHF-500": 7,
+    "BHF-442": 6,
+    "BHF-404": 5,
+    "BHF-503": 3,
+    "BHF-497": 2,
+    "BHF-477": 2,
+    "BHF-422": 2,
+    "BHF-507": 1,
+    "BHF-304": 1
+   },
+   "gaps": 1753
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/multica-ai__multica --out /home/ubuntu/bhf-sweep-work/go__multica-ai__multica/sbom",
+   "exit": 0,
+   "wall_s": 0.11,
+   "timed_out": false,
+   "panic": false,
+   "components": 2191
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/multica-ai__multica --work-dir /home/ubuntu/bhf-sweep-work/go__multica-ai__multica --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 27.08,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 2443,
+    "dropped_by_cap": 2433,
+    "built": 6,
+    "built_and_fuzzed": 6,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 4,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 1,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "parsePackageArgs",
+     "source": "package.mjs",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-corpus-500/go/multica-ai__multica/apps/desktop/scripts/package.mjs` is not loadable (skipped cleanly): /bin/sh: 1: electron-vite: not found",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "parseAvatarEmoji",
+     "source": "avatar-emoji.ts",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 469.1120209817872,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "parseCommentTriggerOutcomes",
+     "source": "comment-trigger-outcomes.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__multica-ai__multica/harnesses/H-T003B-652D9D6F/target.js` is not loadable (skipped cleanly): missing module `zod` (not in the project and not installed) \u2014 Error: Cannot find module 'zod'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "parseCommandLine",
+     "source": "runtime-profile-catalog.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__multica-ai__multica/harnesses/H-T0057-33288175/target.js` is not loadable (skipped cleanly): missing module `@multica/core/types` (not in the project and not installed) \u2014 Error: Cannot find module '@multica/core/types'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "decodeBuilderInput",
+     "source": "agent-creation-studio.tsx",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__multica-ai__multica/harnesses/H-T0817-FBFFB3D3/target.js` is not loadable (skipped cleanly): missing module `react` (not in the project and not installed) \u2014 Error: Cannot find module 'react'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "MustParseUUID",
+     "source": "pgx.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 135.46027099923543,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "LoadRulesFromYAMLFile",
+     "source": "config.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1460.567722367248,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "LoadKey",
+     "source": "secretbox.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1150.4191073203433,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "default",
+     "source": "babel.config.js",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 969.9428203252285,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "applyWorktreeDevEnv",
+     "source": "worktree-dev-env.mjs",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 807.5328314210979,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "PATH N: electron-vite: not found",
+     "language": "javascript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"@multica/core/types\" (not in the project and not installed) \u2014 Error: Cannot find module \"@multica/core/types\"",
+     "language": "typescript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"react\" (not in the project and not installed) \u2014 Error: Cannot find module \"react\"",
+     "language": "typescript"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"zod\" (not in the project and not installed) \u2014 Error: Cannot find module \"zod\"",
+     "language": "typescript"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-bcc1886e",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0021-276E6D0B",
+     "frames": [
+      "github.com/multica-ai/multica/server/internal/util.MustParseUUID"
+     ],
+     "message": "Go panic: invalid UUID \"\": cannot parse UUID"
+    }
+   ]
+  }
+ },
+ "sha": "0abee49005dd8b10c08cec6694b528a4ee5bd429",
+ "clone_s": 0.0,
+ "lane_check": "go: 970 files / 362536 lines; top=go(362536)",
+ "status": "done"
+}

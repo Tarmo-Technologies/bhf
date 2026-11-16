@@ -1,0 +1,44 @@
+{
+ "repo": "wagoodman/dive",
+ "sha": "d6c691947f8fda635c952a17ee3b7555379d58f0",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "file_info.go",
+   "name": "NewFileInfo",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `os.FileInfo` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "file_info.go",
+   "name": "NewFileInfoFromTarHeader",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*tar.Reader` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "file_node.go",
+   "name": "NewNode",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*FileNode` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

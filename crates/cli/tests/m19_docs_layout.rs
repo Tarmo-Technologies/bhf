@@ -206,3 +206,45 @@ fn the_auto_output_tree_matches_a_real_run() {
         }
     }
 }
+
+/// expected-gaps.md's ranked work list sends effort only to open classes
+/// (#240): it kept items its own sections marked fixed.
+#[test]
+fn the_ranked_work_list_names_no_fixed_class() {
+    let text = std::fs::read_to_string(repo_root().join("docs/expected-gaps.md")).unwrap();
+    // `### Go-2. Method needs a receiver — 24 — **[FIXED]**` -> ("Go-2", fixed).
+    let classes: Vec<(String, bool)> = text
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("### ")?;
+            let (id, _) = rest.split_once(". ")?;
+            let fixed = line.contains("**[FIXED]");
+            Some((id.to_owned(), fixed))
+        })
+        .collect();
+    assert!(classes.iter().any(|(id, _)| id == "C-1"), "{classes:?}");
+    let ranked = text
+        .split("\n## Ranked work list\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\nClosed since").next())
+        .expect("the ranked work list");
+    for (id, fixed) in &classes {
+        let named = ranked.contains(&format!("({id};")) || ranked.contains(&format!("({id},"));
+        assert!(
+            !(*fixed && named),
+            "the ranked work list names {id}, which expected-gaps.md marks [FIXED]"
+        );
+    }
+    // Every ranked item names the classes it is about.
+    for line in ranked.lines().filter(|line| {
+        line.split_once(". ")
+            .is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty())
+    }) {
+        assert!(
+            classes
+                .iter()
+                .any(|(id, _)| line.contains(&format!("({id}"))),
+            "{line}"
+        );
+    }
+}

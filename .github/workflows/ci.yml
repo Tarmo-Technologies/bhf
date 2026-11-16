@@ -127,6 +127,9 @@ jobs:
       - name: Test offline signature verifier
         run: python3 -m unittest discover -s scripts/tests -p 'test_offline_verifier.py' -v
 
+      - name: Test the campaign sweep scripts
+        run: python3 -m unittest discover -s benchmarks/campaign-2026-07-25 -p 'test_*.py' -v
+
       - name: Build workspace
         run: cargo build --locked --workspace
 

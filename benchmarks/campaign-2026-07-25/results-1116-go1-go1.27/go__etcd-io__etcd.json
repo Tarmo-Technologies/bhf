@@ -1,0 +1,58 @@
+{
+ "repo": "etcd-io/etcd",
+ "sha": "3602ea922f973728ac75b9dfe866458bb1753002",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "cluster.go",
+   "name": "NewClusterFromURLsMap",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*zap.Logger` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "pbutil.go",
+   "name": "MaybeUnmarshal",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `Unmarshaler` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "pbutil.go",
+   "name": "MustUnmarshal",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `Unmarshaler` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "pbutil.go",
+   "name": "MustUnmarshalMessage",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `proto.Message` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "store.go",
+   "name": "MustParseMemberIDFromKey",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*zap.Logger` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

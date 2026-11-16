@@ -1,0 +1,321 @@
+{
+ "lane": "go",
+ "repo": "ollama/ollama",
+ "stars": 176895,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/ollama__ollama --json --out /home/ubuntu/bhf-sweep-work/go__ollama__ollama.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.07,
+   "timed_out": false,
+   "panic": false,
+   "languages": 5,
+   "sloc_total": 332641,
+   "sloc_by_lang": {
+    "go": 250354,
+    "c": 53400,
+    "cpp": 15105,
+    "javascript": 10092,
+    "config": 3690
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/ollama__ollama --format json --top 100000",
+   "exit": 0,
+   "wall_s": 23.55,
+   "timed_out": false,
+   "panic": false,
+   "count": 4119,
+   "by_language": {
+    "typescript": 35,
+    "go": 2281,
+    "cpp": 542,
+    "c": 1261
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/ollama__ollama --out /home/ubuntu/bhf-sweep-work/go__ollama__ollama/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 3.8,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 548,
+   "by_severity": {
+    "medium": 57,
+    "high": 480,
+    "critical": 11
+   },
+   "top_rules": {
+    "BHF-405": 452,
+    "BHF-436": 20,
+    "BHF-472": 17,
+    "BHF-500": 16,
+    "BHF-404": 10,
+    "BHF-423": 9,
+    "BHF-422": 6,
+    "BHF-544": 6,
+    "BHF-497": 4,
+    "BHF-477": 2,
+    "BHF-562": 2,
+    "BHF-406": 2,
+    "BHF-550": 1,
+    "BHF-429": 1
+   },
+   "gaps": 899
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/ollama__ollama --out /home/ubuntu/bhf-sweep-work/go__ollama__ollama/sbom",
+   "exit": 0,
+   "wall_s": 0.12,
+   "timed_out": false,
+   "panic": false,
+   "components": 999
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/ollama__ollama --work-dir /home/ubuntu/bhf-sweep-work/go__ollama__ollama --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 48.37,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 3715,
+    "dropped_by_cap": 3705,
+    "built": 4,
+    "built_and_fuzzed": 4,
+    "fuzzed_stub_only": 0,
+    "failed_build": 2,
+    "unsupported_params": 3,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "report_only": 1,
+    "findings": 1,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      },
+      "fuzzing_build_mode": "on"
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 4,
+    "synthesized_types": 3,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "parseVRAM",
+     "source": "vram.ts",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1392.6250417422193,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "readFileAsBytes",
+     "source": "fileValidation.ts",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 10.856892559615813,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "useIsWaitingForLoad",
+     "source": "useChats.ts",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-sweep-work/go__ollama__ollama/harnesses/H-T0091-560DCC16/target.js` is not loadable (skipped cleanly): missing module `@tanstack/react-query` (not in the project and not installed) \u2014 Error: Cannot find module '@tanstack/react-query'",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "DecodeFloatTensor",
+     "source": "dtype.go",
+     "outcome": "failed_build",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "DecodeImage",
+     "source": "image.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: golang.org/x/sync@v0.17.0 requires go >= 1.24.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ExtractRawFromSafetensors",
+     "source": "extractor.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 7894.249919841968,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "llama_ollama_compat::detail::read_at",
+     "source": "llama-ollama-compat-util.cpp",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "requires type(s) the generated harness cannot construct offline (ggml_type) \u2014 an external SDK/framework type (e.g. MFC/Win32, a vendor CORBA IDL) unavailable here, or a type whose definition is not visible to the harness translation unit; statically analyzed, not fuzzed",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "llama_ollama_compat::decode_base64",
+     "source": "llama-ollama-compat.cpp",
+     "outcome": "failed_build",
+     "retries": 4,
+     "repairs": 7,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "mlx_dynamic_load",
+     "source": "dynamic.c",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 9473.110222026373,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "mlx_fast_cuda_kernel_config_add_template_arg_int",
+     "source": "mlx.c",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "C parameter 'cls' of type 'mlx_fast_cuda_kernel_config' has no byte-buffer decoder after struct synthesis: opaque type 'struct mlx_fast_cuda_kernel_config_' for parameter 'cls' needs lifecycle support (Phase C)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "C parameter \"cls\" of type \"mlx_fast_cuda_kernel_config\" has no byte-buffer decoder after struct synthesis: opaque type \"struct mlx_fast_cuda_kernel_config_\" for\u2026",
+     "language": "c"
+    },
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "missing macro",
+     "language": "cpp"
+    },
+    {
+     "category": "report_only",
+     "count": 1,
+     "detail": "[cpp20] requires type(s) the generated harness cannot construct offline (ggml_type) \u2014 an external SDK/framework type (e.g. MFC/Win32, a vendor CORBA IDL) unavailable he\u2026",
+     "language": "cpp"
+    },
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "go build failed: imports iter: build constraints exclude all Go files in PATH",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "go build failed: go: PATH requires go >= N.N.N (running go N.N.N; GOTOOLCHAIN=local)",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "missing module \"@tanstack/react-query\" (not in the project and not installed) \u2014 Error: Cannot find module \"@tanstack/react-query\"",
+     "language": "typescript"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-2de8b36c",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-248"
+     ],
+     "cwe_name": "Uncaught Exception",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-T005E-85A8CEFD",
+     "frames": [
+      "<anonymous>",
+      "new Promise",
+      "Object.readFileAsBytes"
+     ],
+     "message": "JS finding: ReferenceError: FileReader is not defined"
+    }
+   ]
+  }
+ },
+ "sha": "0e2e34aa86742d17265528f107ea9ddec410c951",
+ "clone_s": 0.0,
+ "lane_check": "go: 763 files / 265052 lines; top=go(265052)",
+ "status": "done"
+}

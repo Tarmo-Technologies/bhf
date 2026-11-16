@@ -1,0 +1,44 @@
+{
+ "repo": "jesseduffield/lazygit",
+ "sha": "df0943ad334d1d3626b42057aad4b69324da3516",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "i18n.go",
+   "name": "NewTranslationSetFromConfig",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*logrus.Entry` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "search.go",
+   "name": "FindFrom",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `fuzzy.Source` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "search.go",
+   "name": "FindSubstringsFrom",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `fuzzy.Source` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

@@ -45,6 +45,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `docs/expected-gaps.md` marks the fixed classes (Go-2, C++-1, C-1 in part)
+  and its ranked work list names none of them; the Go lane's re-sweep is
+  recorded in `docs/validation/2026-11-16-go-resweep.md`. It re-ran the 40 Go
+  projects of the July sweep at the commits that sweep measured and re-ran by
+  name the 59 targets it skipped for an undrivable parameter type: 7 now build
+  and fuzz, and 52 still skip. On a current Go 1.27.4, 146 targets build and
+  fuzz against 26 on the sweep host's Go 1.22.2. The sweep script read findings
+  from a layout bhf no longer writes, so it recorded none; it now reads
+  `results/findings` and each failed build's cause, and `--pin RESULTS_DIR`
+  clones each project at the commit a results dir measured.
 - Rust, Fortran and COBOL harnesses record their `generation-metadata.json`
   (language, `harness_format_version`, target), as C, C++ and Ada ones do.
   Without it their findings carried no harness format, so a later format

@@ -1,0 +1,44 @@
+{
+ "repo": "syncthing/syncthing",
+ "sha": "bcef5c5bc68dddfb68a3d341f41fad44c11fb52e",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "config.go",
+   "name": "ReadJSON",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `protocol.DeviceID` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "config.go",
+   "name": "ReadXML",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `protocol.DeviceID` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "wrapper.go",
+   "name": "Load",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `protocol.DeviceID` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

@@ -1,0 +1,298 @@
+{
+ "lane": "go",
+ "repo": "ethereum/go-ethereum",
+ "stars": 51220,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum --json --out /home/ubuntu/bhf-sweep-work/go__ethereum__go-ethereum.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.03,
+   "timed_out": false,
+   "panic": false,
+   "languages": 5,
+   "sloc_total": 368154,
+   "sloc_by_lang": {
+    "go": 313947,
+    "c": 43968,
+    "javascript": 8206,
+    "config": 1564,
+    "python": 469
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum --format json --top 100000",
+   "exit": 0,
+   "wall_s": 24.66,
+   "timed_out": false,
+   "panic": false,
+   "count": 7048,
+   "by_language": {
+    "c": 887,
+    "go": 6133,
+    "cpp": 28
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum --out /home/ubuntu/bhf-sweep-work/go__ethereum__go-ethereum/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 7.1,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 263,
+   "by_severity": {
+    "high": 176,
+    "medium": 86,
+    "critical": 1
+   },
+   "top_rules": {
+    "BHF-405": 164,
+    "BHF-436": 27,
+    "BHF-500": 24,
+    "BHF-548": 24,
+    "BHF-403": 7,
+    "BHF-472": 4,
+    "BHF-477": 3,
+    "BHF-424": 3,
+    "BHF-406": 2,
+    "BHF-428": 2,
+    "BHF-496": 1,
+    "BHF-497": 1,
+    "BHF-304": 1
+   },
+   "gaps": 1019
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum --out /home/ubuntu/bhf-sweep-work/go__ethereum__go-ethereum/sbom",
+   "exit": 0,
+   "wall_s": 0.07,
+   "timed_out": false,
+   "panic": false,
+   "components": 195
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum --work-dir /home/ubuntu/bhf-sweep-work/go__ethereum__go-ethereum --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 97.72,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 6753,
+    "dropped_by_cap": 6743,
+    "built": 5,
+    "built_and_fuzzed": 4,
+    "fuzzed_stub_only": 0,
+    "built_not_entered": 1,
+    "failed_build": 0,
+    "unsupported_params": 0,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "report_only": 5,
+    "findings": 0,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan+tsan"
+      },
+      "fuzzing_build_mode": "on"
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 3,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "secp256k1_ellswift_xdh",
+     "source": "main_impl.h",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:5: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:93:30: error: use of undeclared identifier 'SECP256K1_B' |    93 |     secp256k1_fe_add_int(&g, SECP256K1_B);                       /* g = u^3 + 7 */ |       |                              ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:237:34: error: use of undeclared identifier 'SECP256K1_B' |   237 |         secp256k1_fe_add_int(&g, SECP256K1_B);          /* g = u^3+7 */; sequence generation also failed first: blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:5: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:93:30: error: use of undeclared identifier 'SECP256K1_B' |    93 |     secp256k1_fe_add_int(&g, SECP256K1_B);                       /* g = u^3 + 7 */ |       |                              ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:237:34: error: use of undeclared identifier 'SECP256K1_B' |   237 |         secp256k1_fe_add_int(&g, SECP256K1_B);          /* g = u^3+7 */",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "secp256k1_ec_pubkey_parse",
+     "source": "secp256k1.c",
+     "outcome": "built_not_entered",
+     "retries": 1,
+     "repairs": 3,
+     "execs_per_sec": 4.4138911967225525,
+     "reason": "harness executed 14 time(s) but every external symbol was a blind stub \u2014 only empty stub bodies ran and the real target was never entered",
+     "stub_only": true,
+     "blind_stub_fraction": 1.0
+    },
+    {
+     "name": "secp256k1_ecdsa_recoverable_signature_parse_compact",
+     "source": "main_impl.h",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:2: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h:12:86: error: unknown type name 'secp256k1_scalar' |    12 | static void secp256k1_ecdsa_recoverable_signature_load(const secp256k1_context* ctx, secp256k1_scalar* r, secp256k1_scalar* s, int* recid, const secp256k1_ecdsa_recoverable_signature* sig) { |       |                                                                                      ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h:12:107: error: unknown type name 'secp256k1_scalar' |    12 | static void secp256k1_ecdsa_recoverable_signature_load(const secp256k1_context* ctx, secp256k1_scalar* r, secp256k1_scalar* s, int* recid, const secp256k1_ecdsa_recoverable_signature* sig) {; sequence generation also failed first: blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:2: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h:12:86: error: unknown type name 'secp256k1_scalar' |    12 | static void secp256k1_ecdsa_recoverable_signature_load(const secp256k1_context* ctx, secp256k1_scalar* r, secp256k1_scalar* s, int* recid, const secp256k1_ecdsa_recoverable_signature* sig) { |       |                                                                                      ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/recovery/main_impl.h:12:107: error: unknown type name 'secp256k1_scalar' |    12 | static void secp256k1_ecdsa_recoverable_signature_load(const secp256k1_context* ctx, secp256k1_scalar* r, secp256k1_scalar* s, int* recid, const secp256k1_ecdsa_recoverable_signature* sig) {",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "BlockFromJSON",
+     "source": "beacon_block.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 3837.74999021782,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Decode",
+     "source": "hexutil.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 2574.5756975235754,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "DecodeMessage",
+     "source": "msg.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5977.737060654781,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Decode",
+     "source": "v4wire.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 667.9274772345705,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "secp256k1_ext_scalar_mul",
+     "source": "ext.h",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:1: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h:6:8: error: unknown type name 'secp256k1_context' |     6 | static secp256k1_context* secp256k1_context_create_sign_verify() { |       |        ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h:7:9: error: call to undeclared function 'secp256k1_context_create'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration] |     7 |         return secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);; sequence generation also failed first: blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:1: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h:6:8: error: unknown type name 'secp256k1_context' |     6 | static secp256k1_context* secp256k1_context_create_sign_verify() { |       |        ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/ext.h:7:9: error: call to undeclared function 'secp256k1_context_create'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration] |     7 |         return secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "secp256k1_assumption_checker()",
+     "source": "assumptions.h",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/assumptions.h' cannot be included by an independent C++ harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:3: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/util.h:256:26: error: cannot initialize a variable of type 'const unsigned char *' with an lvalue of type 'const void *' |   256 |     const unsigned char *p1 = s1, *p2 = s2; |       |                          ^    ~~ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/util.h:256:36: error: cannot initialize a variable of type 'const unsigned char *' with an lvalue of type 'const void *' |   256 |     const unsigned char *p1 = s1, *p2 = s2;",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "secp256k1_assumption_checker()",
+     "source": "assumptions.h",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/assumptions.h' cannot be included by an independent C++ harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:3: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/util.h:256:26: error: cannot initialize a variable of type 'const unsigned char *' with an lvalue of type 'const void *' |   256 |     const unsigned char *p1 = s1, *p2 = s2; |       |                          ^    ~~ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/util.h:256:36: error: cannot initialize a variable of type 'const unsigned char *' with an lvalue of type 'const void *' |   256 |     const unsigned char *p1 = s1, *p2 = s2;",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "report_only",
+     "count": 3,
+     "detail": "[c99] blocked_by_non_self_contained_header: PATH cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling pro\u2026",
+     "language": "c"
+    },
+    {
+     "category": "built_not_entered",
+     "count": 1,
+     "detail": "stub_only",
+     "language": "c"
+    },
+    {
+     "category": "report_only",
+     "count": 2,
+     "detail": "[cpp20] blocked_by_non_self_contained_header: PATH cannot be included by an independent C++ harness translation unit under its recovered build flags, and no compiling p\u2026",
+     "language": "cpp"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-9f9a6d43",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-617"
+     ],
+     "cwe_name": "Reachable Assertion",
+     "kind": null,
+     "severity": null,
+     "confidence": "high",
+     "tier": null,
+     "harness": "H-C00FA-203FFFF6",
+     "frames": [],
+     "message": "harness crashed with SIGABRT and no sanitizer report \u2014 a reachable crash"
+    }
+   ]
+  }
+ },
+ "sha": "454ca784c5aa2129ff5c9d168c4bf66fc4283d02",
+ "clone_s": 3.3,
+ "lane_check": "go: 1409 files / 385826 lines; top=go(385826)",
+ "status": "done"
+}

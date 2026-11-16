@@ -1,0 +1,277 @@
+{
+ "lane": "go",
+ "repo": "juanfont/headscale",
+ "stars": 42099,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/juanfont__headscale --json --out /home/ubuntu/bhf-sweep-work/go__juanfont__headscale.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.04,
+   "timed_out": false,
+   "panic": false,
+   "languages": 2,
+   "sloc_total": 122439,
+   "sloc_by_lang": {
+    "go": 120388,
+    "config": 2051
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/juanfont__headscale --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.19,
+   "timed_out": false,
+   "panic": false,
+   "count": 1462,
+   "by_language": {
+    "go": 1462
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/juanfont__headscale --out /home/ubuntu/bhf-sweep-work/go__juanfont__headscale/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 0.85,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 75,
+   "by_severity": {
+    "high": 44,
+    "medium": 26,
+    "critical": 5
+   },
+   "top_rules": {
+    "BHF-405": 28,
+    "BHF-500": 12,
+    "BHF-544": 8,
+    "BHF-423": 7,
+    "BHF-426": 6,
+    "BHF-436": 6,
+    "BHF-419": 3,
+    "BHF-404": 2,
+    "BHF-472": 2,
+    "BHF-470": 1
+   },
+   "gaps": 316
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/juanfont__headscale --out /home/ubuntu/bhf-sweep-work/go__juanfont__headscale/sbom",
+   "exit": 0,
+   "wall_s": 0.08,
+   "timed_out": false,
+   "panic": false,
+   "components": 302
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/juanfont__headscale --work-dir /home/ubuntu/bhf-sweep-work/go__juanfont__headscale --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 56.17,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 1462,
+    "dropped_by_cap": 1452,
+    "built": 9,
+    "built_and_fuzzed": 9,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 1,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 1,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "ParseIPSet",
+     "source": "addr.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 6753.694056972121,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "AbsolutePathFromConfigPath",
+     "source": "file.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 4304.096802973236,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "ParseLoginURLFromCLILogin",
+     "source": "util.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5540.350668697539,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "AuthIDFromString",
+     "source": "common.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 4376.951857176253,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Parse",
+     "source": "scope.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5371.852950086486,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseNodeID",
+     "source": "node.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 96.30095380683231,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "FetchPathFromContainer",
+     "source": "util.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `*dockertest.Pool` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ParseAPIKeyPrefix",
+     "source": "api_key.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 6141.179652696669,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "LoadConfig",
+     "source": "config.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 182.17087363533284,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "ReadMapResponsesFromDirectory",
+     "source": "mapper.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5201.829504385221,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"*dockertest.Pool\" (skipped)",
+     "language": "go"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-cf7110d9",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G006F-2D423776",
+     "frames": [
+      "github.com/juanfont/headscale/hscontrol/types.MustParseNodeID"
+     ],
+     "message": "Go panic: strconv.ParseUint: parsing \"\": invalid syntax"
+    }
+   ]
+  }
+ },
+ "sha": "cfd845cb53efb2f953ff30c7d2ee70329b74f1ce",
+ "clone_s": 0.0,
+ "lane_check": "go: 378 files / 140245 lines; top=go(140245)",
+ "status": "done"
+}
