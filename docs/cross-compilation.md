@@ -146,9 +146,8 @@ cargo test -p bhf --test m17_aarch64_cross_fixture swallowed_constraint_error_ -
 
 The full aarch64 path runs only when these user-installed tools are available:
 
-- `gprbuild`
-- `aarch64-linux-gnu-gprbuild`
-- `aarch64-linux-gnu-gnat`
+- `gprbuild`, or `aarch64-linux-gnu-gprbuild`
+- `aarch64-linux-gnu-gnat` (Ubuntu's `gnat-13-aarch64-linux-gnu`)
 - `qemu-aarch64` or `qemu-aarch64-static`
 
 Set `BHF_AARCH64_QEMU_USER` to override qemu discovery. Set

@@ -134,9 +134,10 @@ jobs:
 
       # The lane tests skip, and pass, when their toolchain is missing; these
       # steps install the interpreter, JVM, TypeScript, Rust-nightly, C#, Ada,
-      # AFL++, COBOL, Wine/MinGW, AArch64 and Cortex-M emulator lanes, and the
-      # skip-line check after the tests fails the shard if a test still skips
-      # (scripts/ci/allowed-skips.txt lists only tests another workflow runs).
+      # AFL++, COBOL, Wine/MinGW, AArch64 (C, C++ and Ada), armhf and Cortex-M
+      # emulator lanes, and the skip-line check after the tests fails the shard
+      # if a test still skips (scripts/ci/allowed-skips.txt lists only tests
+      # another workflow runs).
       - name: Install the interpreter and emulator toolchains
         run: |
           sudo apt-get update
@@ -152,6 +153,9 @@ jobs:
             qemu-user \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
+            gnat-13-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross \
             lua5.4 \
             php-cli \
             php-pcov \
@@ -190,7 +194,8 @@ jobs:
           set -euo pipefail
           for tool in gnatmake gprbuild afl-fuzz afl-clang-fast cobc wine \
                       x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ qemu-aarch64 \
-                      aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ lua5.4 php ruby perl java \
+                      aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
+                      arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
                       javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
                       lldb llvm-symbolizer dotnet; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
@@ -209,6 +214,14 @@ jobs:
           cargo +nightly --version
           find "$HOME/.dotnet/tools/.store/sharpfuzz.commandline" -path '*net8.0*' \
             -name SharpFuzz.Common.dll | grep -q . || { echo "no SharpFuzz.Common.dll" >&2; exit 1; }
+
+      # A Wine prefix's first start takes longer than the fork server waits
+      # for a harness, so the first Wine test would run nothing; create it now.
+      - name: Initialize the Wine prefix
+        run: |
+          set -euo pipefail
+          WINEDEBUG=-all wineboot --init
+          wineserver --wait
 
       - name: Install cargo-nextest
         run: bash scripts/ci/install-nextest.sh
