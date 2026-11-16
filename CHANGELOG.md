@@ -15,6 +15,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `--target-transport qemu-system:...,done=` clears bit 0 of a Thumb
+  (`done_kind=2`) address with a note. `nm` prints a Thumb function's address
+  odd, the FreeRTOS runbook took `done=` from it, and the unaligned breakpoint
+  never hit: the run waited out every input and ended with `os error 11` and
+  0 executions. The runbook says so too.
 - `repro.adb` is written only into Ada findings; a report removes one an
   earlier release wrote into a C, C++ or Python finding (and keeps one that
   bhf did not write). `bhf explain` no longer lists the driver's own

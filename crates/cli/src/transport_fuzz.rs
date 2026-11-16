@@ -155,6 +155,8 @@ pub(crate) enum TransportPlan {
         /// returns through the completion breakpoint is classified as a crash
         /// rather than a silent clean pass (#72).
         fault_status: Option<GuestFaultStatus>,
+        /// What the parser corrected in the spec, for the run to print.
+        notes: Vec<String>,
     },
 }
 
@@ -315,6 +317,7 @@ impl TransportPlan {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
                     move || connect_tcp_bounded(&qmp_host, qmp_port, io_timeout),
@@ -339,6 +342,14 @@ impl TransportPlan {
                 transport = transport.with_exec_deadline(io_timeout);
                 Ok(Box::new(transport))
             }
+        }
+    }
+
+    /// What the parser corrected in the spec (a Thumb `done=` address).
+    pub(crate) fn notes(&self) -> &[String] {
+        match self {
+            Self::QemuSystem { notes, .. } => notes,
+            _ => &[],
         }
     }
 
@@ -429,10 +440,23 @@ fn parse_qemu_system(
     let (gdb_host, gdb_port) =
         gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
 
+    let mut notes = Vec::new();
     let harness_done = match done {
         Some(address) => {
             let kind = u32::try_from(done_kind)
                 .map_err(|_| malformed(format!("done_kind {done_kind} is out of range")))?;
+            // `nm` prints a Thumb function's address with bit 0 set (the
+            // interworking bit). A breakpoint there is unaligned and never
+            // hits, so the run would wait out every input.
+            let address = if kind == 2 && address & 1 == 1 {
+                notes.push(format!(
+                    "done={address:#x} has the Thumb bit set; planting the breakpoint at {:#x}",
+                    address & !1
+                ));
+                address & !1
+            } else {
+                address
+            };
             Some((address, kind))
         }
         None => None,
@@ -457,6 +481,7 @@ fn parse_qemu_system(
         snapshot_tag,
         harness_done,
         fault_status,
+        notes,
     })
 }
 
@@ -1231,6 +1256,9 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
             crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
             2
         })?;
+    for note in plan.notes() {
+        crate::bhfeprintln!("bhf fuzz --target-transport: note: {note}");
+    }
     let transport_label = plan.label();
     let transport = plan.into_transport(args.timeout).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
@@ -1383,6 +1411,42 @@ mod tests {
         }
     }
 
+    /// `nm` prints a Thumb function's address with bit 0 set; a Thumb
+    /// breakpoint there never hits, so it is cleared with a note.
+    #[test]
+    fn a_thumb_done_address_has_its_interworking_bit_cleared_with_a_note() {
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234,done=0x189,done_kind=2",
+            Some(map_spec),
+        )
+        .unwrap();
+        let TransportPlan::QemuSystem { harness_done, .. } = &plan else {
+            panic!("expected QemuSystem, got {plan:?}");
+        };
+        assert_eq!(*harness_done, Some((0x188, 2)));
+        assert_eq!(
+            plan.notes(),
+            ["done=0x189 has the Thumb bit set; planting the breakpoint at 0x188"]
+        );
+        // An ARM (kind 4) or already even address is left alone.
+        for (spec, want) in [
+            ("done=0x189,done_kind=4", (0x189, 4)),
+            ("done=0x188", (0x188, 2)),
+        ] {
+            let plan = TransportPlan::parse(
+                &format!("qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234,{spec}"),
+                Some(map_spec),
+            )
+            .unwrap();
+            let TransportPlan::QemuSystem { harness_done, .. } = &plan else {
+                panic!("expected QemuSystem");
+            };
+            assert_eq!(*harness_done, Some(want), "{spec}");
+            assert!(plan.notes().is_empty(), "{spec}");
+        }
+    }
+
     #[test]
     fn parses_qemu_system_spec_with_default_and_explicit_snapshot() {
         let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
@@ -1402,7 +1466,9 @@ mod tests {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                notes,
             } => {
+                assert!(notes.is_empty(), "{notes:?}");
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
                 assert_eq!(gdb_host, "127.0.0.1");

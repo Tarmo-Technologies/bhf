@@ -91,7 +91,10 @@ arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -nostdlib -nostartfiles -ffreestanding
   "$K/portable/GCC/ARM_CM3/port.c" "$K/portable/MemMang/heap_4.c"
 
 # 3. Discover symbols (bhf_input, adafuzz_probe_memory_buffer{,_write,_wrapped},
-#    harness_done, bhf_fault_flag, bhf_task_id) with `nm rtos.elf`.
+#    harness_done, bhf_fault_flag, bhf_task_id) with `nm rtos.elf`. nm prints
+#    a Thumb function's address with bit 0 set (harness_done at 0x189 is code
+#    at 0x188). bhf clears that bit for done= when done_kind is 2 (the default)
+#    and says so; a breakpoint at the odd address would never hit.
 
 # 4. Create the scratch disk savevm/loadvm needs (any small qcow2).
 qemu-img create -f qcow2 scratch.qcow2 16M
