@@ -48,8 +48,9 @@ toolchains. Missing dependencies and unsupported targets are reported.
   offline CVE/VEX matching.
 - **Binary triage** — `bhf binary scan` / `binary fuzz` over ELF, PE, Mach-O, and raw
   firmware blobs — recursing into `ar` / Debian `.deb` packages and their compressed
-  (`gzip`/`xz`/`zstd`) tar members — with source-unavailable crash replay, including
-  AFL++ QEMU/Frida binary-only coverage.
+  (`gzip`/`xz`/`zstd`) tar members — with source-unavailable crash replay,
+  AFL++ QEMU/Frida binary-only coverage, and a blind havoc loop, labelled
+  degraded, where AFL++'s QEMU mode is missing.
 
 Behavioral / taint oracles (path control, command injection, insecure temp, sensitive env) run
 under the Linux runtime virtualization shim on native C/C++/Ada/Rust/Go/COBOL/Fortran

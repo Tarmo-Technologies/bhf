@@ -15,6 +15,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf binary fuzz`'s builtin engine, which `auto` falls back to without
+  AFL++'s QEMU mode, runs the seeds and then a blind havoc loop (stacked byte
+  mutations of the seeds, from the new `--rng-seed`) until `--iterations`,
+  `--time` or the first crash, and its run JSON records `engine`, `fidelity`
+  and `degraded` with the reason. It replayed each seed once, ignored
+  `--iterations` and `--time`, and wrote a run JSON that read as a clean pass.
 - The on-target transport lane's mutator gets a dictionary: `bhf fuzz --dict
   PATH` (new, AFL/libFuzzer format, read by the host loop too) and the
   harness's `dictionary.txt`, and `--grammar` sends only derivations of the

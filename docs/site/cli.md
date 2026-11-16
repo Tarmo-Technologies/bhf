@@ -347,7 +347,12 @@ in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
 `--target-arg` applies to both engines.
 
 `--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
-replays the seeds and detects crashes (no mutation/coverage); `afl-qemu` drives
+runs the seeds, then a blind havoc loop (each input a seed with 1, 2 or 4
+byte-level mutations stacked on it, from `--rng-seed`, with no coverage
+feedback) until `--iterations`, `--time` or the first crash; its run JSON says
+so (`engine`, `fidelity` with `seeds_run` and `mutated_inputs`, `degraded:
+true` and `degraded_reason`, which names the missing afl-qemu tool when `auto`
+fell back). `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
 mode (`afl-fuzz -Q`); `auto` (the default) uses `afl-qemu` when its toolchain is
 present and otherwise falls back to `builtin`. Under `afl-qemu`, `--timeout-ms`

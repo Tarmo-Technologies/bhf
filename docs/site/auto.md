@@ -894,10 +894,11 @@ MSan finding also saves that entry as its `testcase.bin`. The capability profile
 reached into one finding, and saves as its `testcase.bin` the queue entry
 that reached the most of the finding's operands (named in
 `capability.testcase_operands`), so its lineage is that entry's; with no
-such entry it is `unknown` and the reason says so. The seed-replay engine of `bhf binary-fuzz` and `bhf differential` run
-the operator's inputs as they are: `user_seed`, depth `0`, with the file's
-path (`generated` for the empty input `bhf binary-fuzz` runs when it is given
-no seed). Findings saved before lineage was kept, and those of lanes that
+such entry it is `unknown` and the reason says so. `bhf differential` and the builtin engine of `bhf binary-fuzz` run the
+operator's inputs as they are: `user_seed`, depth `0`, with the file's path
+(`generated` for the empty input `bhf binary-fuzz` runs when it is given no
+seed). A blind mutation of one in `bhf binary-fuzz` is a generation below it:
+depth `1`, `parent_sha256` the seed's. Findings saved before lineage was kept, and those of lanes that
 keep none (the target-transport and protocol-session lanes, `bhf
 relational`, the JVM sink oracle and the campaign-wide collector view, which
 observe a whole run rather than one input, and extensions), have no

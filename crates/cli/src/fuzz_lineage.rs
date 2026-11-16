@@ -424,6 +424,19 @@ pub(crate) fn of_operator_input(bytes: &[u8], path: Option<&Path>) -> FindingLin
     LineageIndex::new().resolve_entry(&digest(bytes), &Entry::Root(Origin::Seed(seed)))
 }
 
+/// The lineage of `child`, a mutation of `seed` whose lineage is `root`: one
+/// generation down from it (the blind havoc of `bhf binary-fuzz`).
+pub(crate) fn of_mutation(root: &FindingLineage, seed: &[u8], child: &[u8]) -> FindingLineage {
+    if child == seed {
+        return root.clone();
+    }
+    FindingLineage {
+        depth: Some(root.depth.unwrap_or(0) + 1),
+        parent_sha256: Some(corpus::lineage::hex(&digest(seed))),
+        ..root.clone()
+    }
+}
+
 /// The lineage of an input a lane made itself, from no seed (the empty input
 /// `bhf binary-fuzz` runs when it is given none).
 pub(crate) fn of_generated_input(bytes: &[u8]) -> FindingLineage {
