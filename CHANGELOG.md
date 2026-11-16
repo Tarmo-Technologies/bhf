@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A feature-gated private Rust target builds in the in-crate lane. The lane
+  built the copied crate without the features the target's `#[cfg(feature)]`
+  gate needs, so the function did not exist (E0425) and the target was a
+  `failed_build`; it now passes them with `--features`, as the dependency lane
+  enables them.
 - The builtin mutator no longer re-runs the same few inputs when the
   dictionary is small. The structured generators, which ignore the base, were
   picked uniformly beside the edits, and with one token each has a handful of
