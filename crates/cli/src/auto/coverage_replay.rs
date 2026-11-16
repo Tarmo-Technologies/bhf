@@ -1068,10 +1068,16 @@ fn build_and_replay_expert(
     if let Some(parent) = expert.parent() {
         includes.push(parent.to_path_buf());
     }
+    let probe = crate::auto::build_probe::probe_dir(project_root);
+    let coverage_probe = probe.with_file_name(".bhf-build-cov");
     for conventional in [
         project_root.join("include"),
         project_root.join("lib"),
         project_root.join("src"),
+        probe.join("include"),
+        coverage_probe.join("include"),
+        probe,
+        coverage_probe,
         project_root.join(".bhf-build"),
         project_root.join(".bhf-build-cov"),
         project_root.join(".bhf-build/include"),

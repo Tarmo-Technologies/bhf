@@ -1,8 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Response-dependent structured multi-message sessions (HDF-7, #58)
 
-> Status: **design for review** — no implementation yet. Builds on existing
-> HDF-7 library pieces; may consume #57's `scenario.*` capability later.
+> Status: **implemented** in part (c8c8fd0, `bhf fuzz --protocol-profile` over
+> TCP, a black-box lane; replay fixes in 16726ec). Builds on existing HDF-7
+> library pieces; may consume #57's `scenario.*` capability later.
+>
+> Not delivered:
+> - code coverage from the session target: [#363](https://github.com/Tarmo-Technologies/bhf/issues/363);
+> - runtime and postcondition oracles per session: [#364](https://github.com/Tarmo-Technologies/bhf/issues/364);
+> - spawning and restarting the target, with its sanitizer crashes:
+>   [#260](https://github.com/Tarmo-Technologies/bhf/issues/260);
+> - transports other than TCP: UDP [#258](https://github.com/Tarmo-Technologies/bhf/issues/258), serial [#262](https://github.com/Tarmo-Technologies/bhf/issues/262), the
+>   existing target transports [#261](https://github.com/Tarmo-Technologies/bhf/issues/261), GIOP/IIOP [#315](https://github.com/Tarmo-Technologies/bhf/issues/315);
+> - framing as a protocol-profile property: [#257](https://github.com/Tarmo-Technologies/bhf/issues/257).
 
 ## Problem
 

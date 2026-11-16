@@ -16,7 +16,8 @@ mod test_support;
 use test_support::TestDir;
 
 fn clang_available() -> bool {
-    which::which("clang").is_ok()
+    let present = { which::which("clang").is_ok() };
+    support::require_tool(present, "clang")
 }
 
 fn bhf() -> Command {

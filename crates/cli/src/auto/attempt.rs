@@ -598,6 +598,10 @@ pub struct PassRun {
     #[serde(default)]
     pub executions_per_sec: f64,
     pub findings: Vec<String>,
+    /// The builtin pass's executions killed at the per-input timeout and how
+    /// their re-runs came out (#207). Absent when none was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hangs: Option<crate::fuzz::HangRunSummary>,
 }
 
 /// Target-level throughput across a cascade: total executions ÷ total measured
@@ -3849,6 +3853,7 @@ fn run_attempt(
                         elapsed_secs: summary.elapsed_secs,
                         executions_per_sec: summary.executions_per_sec,
                         findings: summary.findings.clone(),
+                        hangs: summary.hangs.clone(),
                     });
 
                     // Stamp every finding this pass produced with its
@@ -3999,6 +4004,7 @@ fn run_attempt(
                                     elapsed_secs: summary.elapsed_secs,
                                     executions_per_sec: summary.executions_per_sec,
                                     findings: summary.findings.clone(),
+                                    hangs: summary.hangs.clone(),
                                 });
                             }
                             Err(error) => bhfeprintln!(
@@ -4104,6 +4110,7 @@ fn run_attempt(
                                     elapsed_secs: summary.elapsed_secs,
                                     executions_per_sec: summary.executions_per_sec,
                                     findings: summary.findings.clone(),
+                                    hangs: summary.hangs.clone(),
                                 });
                             }
                             Err(error) => bhfeprintln!(
@@ -12405,6 +12412,7 @@ mod throughput_tests {
             elapsed_secs: 1.0,
             executions_per_sec: 10.0,
             findings: vec![],
+            hangs: None,
         };
         let json = serde_json::to_string(&pr).unwrap();
         assert!(json.contains("\"engine\":\"afl++\""));
@@ -12425,6 +12433,7 @@ mod throughput_tests {
                 0.0
             },
             findings: vec![],
+            hangs: None,
         }
     }
 

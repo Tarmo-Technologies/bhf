@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+mod support;
+
 const CC: &str = "arm-none-eabi-gcc";
 const QEMU: &str = "qemu-system-arm";
 const QEMU_IMG: &str = "qemu-img";
@@ -102,7 +104,8 @@ void Reset_Handler(void){
 "#;
 
 fn tool_present(tool: &str) -> bool {
-    which::which(tool).is_ok()
+    let present = { which::which(tool).is_ok() };
+    support::require_tool(present, tool)
 }
 
 fn bhf_bin() -> PathBuf {

@@ -12,16 +12,21 @@ Every number here is produced by the scripts under [`benchmarks/`](https://githu
 
 ## Measured results
 
-| | **bhf** | libFuzzer | AFL++ | cargo-fuzz | Jazzer |
-|---|---|---|---|---|---|
-| Languages measured here | **C, C++, Ada, Rust, Java, Python, Perl, Go** | C/C++ | C/C++ | Rust | Java |
-| Hand-written harness per target | **0 lines** | 6 lines | 13 lines | 5 lines | 5 lines |
-| Fuzzes **Ada** | **yes** | no | no | no | no |
-| Targets fuzzed per command | **all** (185 on miniz) | 1 | 1 | 1 | 1 |
-| Needs a working build | **no** (recovers it) | yes | yes | yes | yes |
-| Needs a nightly/special toolchain | **no** | no | no | yes (nightly) | no |
-| Finds the planted bug | **yes (every language)** | yes | yes | yes | yes |
-| Drives this engine itself | — | deferred | **adapter** | — | no (own JVM agent) |
+| | **bhf** | libFuzzer | AFL++ | cargo-fuzz | Jazzer | GNATfuzz (not measured) |
+|---|---|---|---|---|---|---|
+| Languages measured here | **C, C++, Ada, Rust, Java, Python, Perl, Go** | C/C++ | C/C++ | Rust | Java | Ada |
+| Hand-written harness per target | **0 lines** | 6 lines | 13 lines | 5 lines | 5 lines | 0 (generates one per subprogram) |
+| Fuzzes **Ada** | **yes** | no | no | no | no | yes |
+| Targets fuzzed per command | **all** (185 on miniz) | 1 | 1 | 1 | 1 | 1 subprogram |
+| Needs a working build | **no** (recovers it) | yes | yes | yes | yes | yes (a buildable GNAT project) |
+| Needs a nightly/special toolchain | **no** | no | no | yes (nightly) | no | commercial (GNAT Pro) |
+| Finds the planted bug | **yes (every language)** | yes | yes | yes | yes | not measured |
+| Drives this engine itself | — | deferred | **adapter** | — | no (own JVM agent) | AFL++, libFuzzer, SymCC |
+
+GNATfuzz, AdaCore's commercial Ada fuzzer, is listed from its documentation; it
+is not part of the benchmark (it needs a licence), so it has no measured column.
+AFL++'s GCC plugin can also instrument code GNAT compiles, given a hand-written
+harness.
 
 In this fixture set, bhf required less handwritten harness code and covered more
 languages and targets per command. It also exercised the Ada fixture and worked
@@ -111,15 +116,25 @@ bhf discovers the receiver method, **synthesises the receiver object**, and
 drives a generated harness through its own JVM agent — no `fuzzerTestOneInput`,
 no classpath wiring.
 
-### Ada — vs nothing
+### Ada — vs GNATfuzz and AFL++
 
-There is **no off-the-shelf fuzzer for Ada.** AFL++, libFuzzer, Jazzer, and
-cargo-fuzz do not support it; fuzzing Ada otherwise means hand-instrumenting a
-C `main`, a custom harness, and a bespoke build.
+Of the fuzzers measured here only bhf fuzzes Ada. Two others can:
+
+- **GNATfuzz** (AdaCore, commercial, part of GNAT Pro) generates a harness for
+  each subprogram of a GNAT project that builds, and fuzzes it with AFL++,
+  libFuzzer or SymCC. It needs that buildable project and a licence; it is not
+  measured here.
+- **AFL++**'s GCC plugin instruments code GNAT compiles, given a harness and a
+  build written by hand.
+
+bhf differs on those axes: it needs no buildable project (it recovers the
+build, or stubs what is missing), harnesses every subprogram of a tree in one
+command, is open source, and fuzzes Ada beside the fifteen other languages
+with one engine.
 
 | tool | harness | finds bug | TTFC |
 |---|---|---|---|
-| (any other fuzzer) | — | **cannot fuzz Ada** | — |
+| libFuzzer, AFL++ (clang, as run here), cargo-fuzz, Jazzer | — | **do not fuzz Ada** | — |
 | **bhf** | **0** | **yes** (CONSTRAINT_ERROR) | 1.41 s (end-to-end) |
 
 bhf discovered `Parse_Frame`, decoded fuzz bytes into its `String` parameter,

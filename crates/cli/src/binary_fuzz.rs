@@ -990,26 +990,12 @@ fn afl_qemu_budget_secs(time: Option<&str>, iterations: usize) -> u64 {
     ((iterations as u64).saturating_mul(100) / 1000).clamp(1, 30)
 }
 
-/// Parse a coarse duration (`30s`, `5m`, `1h`, `500ms`, or bare seconds) to whole
-/// seconds. Returns `None` on a malformed value.
+/// A duration flag ([`crate::fuzz::parse_duration`]) in whole seconds, a
+/// fraction rounded up (afl-fuzz `-V` is second-granular). `None` on a
+/// malformed value.
 fn parse_duration_secs(value: &str) -> Option<u64> {
-    let value = value.trim();
-    let (num, mult): (&str, u64) = if let Some(rest) = value.strip_suffix("ms") {
-        // Round sub-second up to 1s (afl-fuzz -V is second-granular).
-        return rest.trim().parse::<u64>().ok().map(|ms| ms.div_ceil(1000));
-    } else if let Some(rest) = value.strip_suffix('h') {
-        (rest, 3600)
-    } else if let Some(rest) = value.strip_suffix('m') {
-        (rest, 60)
-    } else if let Some(rest) = value.strip_suffix('s') {
-        (rest, 1)
-    } else {
-        (value, 1)
-    };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .map(|n| n.saturating_mul(mult))
+    let duration = crate::fuzz::parse_duration(value).ok()?;
+    Some(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
 }
 
 /// The lineage of a crash AFL++ QEMU mode found: unknown, since AFL++
@@ -3042,6 +3028,7 @@ mod afl_qemu_tests {
         assert_eq!(parse_duration_secs("1500ms"), Some(2));
         assert_eq!(parse_duration_secs("12"), Some(12)); // bare seconds
         assert_eq!(parse_duration_secs("nope"), None);
+        assert_eq!(parse_duration_secs("0.5s"), Some(1));
     }
 
     #[test]

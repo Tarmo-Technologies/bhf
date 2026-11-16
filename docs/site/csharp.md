@@ -33,7 +33,12 @@ A `public` method taking a byte buffer (`byte[]`, `ReadOnlySpan<byte>`,
    harnesses of one project build side by side under any `--jobs`.
 3. **Instruments** the target assembly's IL with
    [SharpFuzz](https://github.com/Metalnem/sharpfuzz) (`sharpfuzz <dll>`, Apache-2.0),
-   which rewrites every basic block to record edge coverage.
+   which rewrites every basic block to record edge coverage. The rewritten
+   assembly has no debug symbols, so its stack frames name no source line:
+   bhf keeps the build as it was before instrumentation, with its pdbs, in
+   `harnesses/<id>/build/symbols/` (run by `main_symbols`), and re-runs a
+   finding's input through it, so `finding.json` and SARIF name the `.cs`
+   file and line.
 4. **Fuzzes** it over bhf's own coverage-guided fork-server engine. The driver
    `mmap`s bhf's file-backed `BHF_COV_SHM` edge bitmap (64 KB — exactly the
    AFL map size SharpFuzz targets) into `SharpFuzz.Common.Trace.SharedMem`, so the

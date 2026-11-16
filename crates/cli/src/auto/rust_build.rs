@@ -3378,6 +3378,7 @@ pub fn build_rust_harness(
             harness_id,
             &toolchain,
             c_runtime_dir,
+            &target_features,
         );
     }
 
@@ -3675,6 +3676,11 @@ fn emit_rust_portability(
 /// `crate::...` paths reach private modules), builds the copy as a `staticlib`, and
 /// clang-links it with the C fork-server driver — the same execution artifact the
 /// external lane produces, but reaching the crate's private API.
+/// `target_features`: the crate features the candidate's `#[cfg(feature)]`
+/// gate needs, enabled on the build of the copied crate as the staticlib lane
+/// enables them on its dependency (else a feature-gated private target
+/// resolves to nothing, E0425).
+#[allow(clippy::too_many_arguments)]
 fn build_in_crate(
     resolved: &ResolvedTarget,
     harness: &harness_gen::rust_generate::GeneratedRustHarness,
@@ -3682,6 +3688,7 @@ fn build_in_crate(
     harness_id: &str,
     toolchain: &RustToolchain,
     c_runtime_dir: &Path,
+    target_features: &[String],
 ) -> RustBuildResult {
     let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
     let crate_copy = auto_dir.join("incrate");
@@ -3821,18 +3828,23 @@ fn build_in_crate(
     // Build the copied crate (now a staticlib exporting `bhf_run_one`).
     let target_dir = crate_copy.join("target");
     let _target_cleanup = CargoTargetCleanup::new(target_dir.clone());
+    let mut cargo = Command::new(&toolchain.cargo);
+    cargo
+        .arg(&toolchain.channel_arg)
+        .arg("build")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .arg("--target")
+        .arg(&toolchain.host_triple)
+        .env("RUSTFLAGS", sancov_rustflags());
+    if !target_features.is_empty() {
+        cargo.arg("--features").arg(target_features.join(","));
+    }
     let build = crate::command_output::output_with_timeout(
-        Command::new(&toolchain.cargo)
-            .arg(&toolchain.channel_arg)
-            .arg("build")
-            .arg("--offline")
-            .arg("--manifest-path")
-            .arg(&manifest_path)
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .arg("--target")
-            .arg(&toolchain.host_triple)
-            .env("RUSTFLAGS", sancov_rustflags()),
+        &mut cargo,
         std::time::Duration::from_secs(30 * 60),
     );
     let build = match build {

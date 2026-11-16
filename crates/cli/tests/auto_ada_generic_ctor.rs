@@ -21,6 +21,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod support;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -29,7 +31,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn have_ada_toolchain() -> bool {
-    which::which("gnatmake").is_ok() && which::which("gprbuild").is_ok()
+    let present = { which::which("gnatmake").is_ok() && which::which("gprbuild").is_ok() };
+    support::require_tool(present, "ada toolchain")
 }
 
 fn copy_ada_sources(fixture: &Path, dest: &Path) {

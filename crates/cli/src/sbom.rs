@@ -58,7 +58,9 @@ pub struct SbomArgs {
     pub binary_inventories: Vec<PathBuf>,
 
     /// Exit non-zero when a matched vulnerability meets or exceeds this severity.
-    #[arg(long, value_enum)]
+    /// Requires an explicit advisory database: without one nothing can match,
+    /// and the gate would pass whatever the inventory holds.
+    #[arg(long, value_enum, requires = "vuln_db")]
     pub fail_on: Option<FailOnSeverity>,
 
     /// Exit non-zero for matched CVEs requiring vulnerability-specific review.

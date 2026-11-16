@@ -39,8 +39,12 @@ BUILDX_BUILDER=bhf-multiarch scripts/build-container-release.sh bhf:multiarch \
 ```
 
 The multi-platform export uses a Buildx builder with native build nodes or
-emulation for both architectures. The release workflow requires native fuzzing
-validation on x86-64 and ARM64 runners and retains a tested candidate for each.
+emulation for both architectures. The release workflow, run by hand for a
+release, requires native fuzzing validation on x86-64 and ARM64 runners before
+it retains a candidate for each, so an ARM64 image is validated only by a run
+of it. Every change is built and tested natively on ARM64 by CI (the
+`arm64-build` job): the workspace and runtrace shim, the tests outside bhf's
+heavy integration suites, and a `bhf auto` run that finds a planted overflow.
 Emulation is useful for build checks but can affect sanitizer behavior and
 fuzzing speed.
 
@@ -247,10 +251,16 @@ real translation-unit flags. bhf uses it automatically — you do **not** need
   either location is followed. bhf discovers it and builds each harness with the
   recorded flags.
 - `--probe-build` is only for *regenerating* a database by running the project's
-  own build; it writes to `<tree>/.bhf-build/compile_commands.json`. If you place
-  your own database there and regeneration then fails (e.g. offline), bhf now
-  **keeps and uses your database** instead of discarding it — but the simplest
-  path is to drop it in the project root and run without `--probe-build`.
+  own build. It builds outside the tree, in `<work>/probe/<tree>-<hash>/`
+  (CMake and Meson with their build directory there, Make and an intercepted
+  `--build-command` in a copy of the tree there), so the tree is left as it
+  was and a read-only checkout can be probed; it writes
+  `<work>/probe/<tree>-<hash>/.bhf-build/compile_commands.json`. If you place
+  your own database at `<tree>/.bhf-build/compile_commands.json` and
+  regeneration then fails (e.g. offline), bhf **keeps and uses your database**
+  instead of discarding it — but the simplest path is to drop it in the project
+  root and run without `--probe-build`. A probe that yields no database says
+  why (for Make: it ran no compiler).
 
 ## The 32-project sweep
 

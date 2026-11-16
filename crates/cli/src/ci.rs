@@ -225,6 +225,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         grammar_file: None,
         max_len: "auto".to_owned(),
         timeout: None,
+        deadline: None,
         cxx_std: None,
         unsafe_search_and_run_build_commands: false,
         dry_run: false,

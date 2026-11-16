@@ -22,12 +22,18 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn gxx_available() -> bool {
-    if which::which("g++").is_err() {
-        eprintln!("skipping auto_full_tu_link: g++ not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("g++").is_err() {
+            eprintln!("skipping auto_full_tu_link: g++ not on PATH");
+            return false;
+        }
+        true
     }
-    true
+    let present = probe();
+    support::require_tool(present, "gxx")
 }
 
 fn write_fixture(root: &Path) {

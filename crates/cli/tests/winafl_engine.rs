@@ -182,9 +182,10 @@ fn objects_with<'a>(
 
 /// `bhf auto --engine winafl` on the planted project, then the finding through
 /// `replay`, `explain` and `capsule` + `verify-poc`. Returns how WinAFL saved
-/// the input (`crash` or `hang`).
+/// the input (`crash` or `hang`). `vs_arch` is `--vs-arch` (`x86` for the
+/// 32-bit leg), else the host's.
 #[cfg(windows)]
-fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
+fn auto_winafl_finds_and_replays(page_heap: bool, vs_arch: Option<&str>) -> String {
     // One WinAFL campaign at a time, so neither starves the other's time budget.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL
@@ -221,6 +222,9 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
         .arg(&project);
     if page_heap {
         command.arg("--winafl-page-heap");
+    }
+    if let Some(arch) = vs_arch {
+        command.args(["--vs-arch", arch]);
     }
     let output = command.output().unwrap();
     let log = text(&output);
@@ -311,7 +315,16 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
         "{finding:#}"
     );
 
-    let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+    // Every later command runs in the build's environment: a capsule rebuilds
+    // the harness, for x86 with the x86 toolset.
+    let in_build_env = || {
+        let mut command = bhf();
+        if let Some(arch) = vs_arch {
+            command.args(["--vs-arch", arch]);
+        }
+        command
+    };
+    let replay = in_build_env().arg("replay").arg(&dir).output().unwrap();
     let replayed = text(&replay);
     assert!(
         replayed.contains("heap-buffer-overflow"),
@@ -319,7 +332,7 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
     );
 
     let id = dir.file_name().unwrap().to_owned();
-    let explain = bhf()
+    let explain = in_build_env()
         .arg("explain")
         .arg("--work-dir")
         .arg(&work)
@@ -334,7 +347,7 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
         text(&explain)
     );
 
-    let capsule = bhf()
+    let capsule = in_build_env()
         .arg("capsule")
         .arg("--work-dir")
         .arg(&work)
@@ -346,7 +359,11 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
     let capsule_dir = work
         .join("capsules")
         .join(format!("capsule_{}", id.to_string_lossy()));
-    let verified = bhf().arg("verify-poc").arg(&capsule_dir).output().unwrap();
+    let verified = in_build_env()
+        .arg("verify-poc")
+        .arg(&capsule_dir)
+        .output()
+        .unwrap();
     assert!(verified.status.success(), "{}", text(&verified));
     finding["discovery"]["saved_as"]
         .as_str()
@@ -361,7 +378,7 @@ fn auto_winafl_finds_and_replays(page_heap: bool) -> String {
 #[test]
 #[ignore = "needs WinAFL and DynamoRIO (BHF_WINAFL_PATH, BHF_DYNAMORIO_PATH); run with --ignored"]
 fn auto_engine_winafl_finds_the_planted_heap_overflow_and_it_replays() {
-    let saved_as = auto_winafl_finds_and_replays(false);
+    let saved_as = auto_winafl_finds_and_replays(false, None);
     assert!(
         ["crash", "hang", "crashing-seed"].contains(&saved_as.as_str()),
         "{saved_as}"
@@ -373,5 +390,64 @@ fn auto_engine_winafl_finds_the_planted_heap_overflow_and_it_replays() {
 #[test]
 #[ignore = "needs WinAFL, DynamoRIO and an elevated shell; run with --ignored"]
 fn auto_engine_winafl_with_page_heap_saves_the_overflow_as_a_crash() {
-    assert_eq!(auto_winafl_finds_and_replays(true), "crash");
+    assert_eq!(auto_winafl_finds_and_replays(true, None), "crash");
+}
+
+/// The x86 leg: `--vs-arch x86` builds a 32-bit harness, which WinAFL's
+/// 32-bit build (`build32` in a checkout) fuzzes under DynamoRIO's `bin32`.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs a 32-bit WinAFL build and DynamoRIO (BHF_WINAFL_PATH, BHF_DYNAMORIO_PATH); run with --ignored"]
+fn auto_engine_winafl_x86_finds_the_planted_heap_overflow_and_it_replays() {
+    let saved_as = auto_winafl_finds_and_replays(false, Some("x86"));
+    assert!(
+        ["crash", "hang", "crashing-seed"].contains(&saved_as.as_str()),
+        "{saved_as}"
+    );
+}
+
+/// An x86 smoke with the builtin engine: `--vs-arch x86` builds the 32-bit
+/// harness, and the planted overflow is found and replays.
+#[cfg(windows)]
+#[test]
+fn auto_x86_builds_a_32_bit_harness_and_finds_the_planted_overflow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = planted_project(tmp.path());
+    let work = tmp.path().join("work");
+    let seed = tmp.path().join("overflow.rec");
+    // 0x10 * 16 = 256 bytes into a 32-byte block.
+    std::fs::write(&seed, b"BHF\x10sixteen bytes...").unwrap();
+    let output = bhf()
+        .args([
+            "auto",
+            "--vs-arch",
+            "x86",
+            "--per-target-time",
+            "20",
+            "--max-targets",
+            "1",
+        ])
+        .arg("--seed-file")
+        .arg(&seed)
+        .arg("--work-dir")
+        .arg(&work)
+        .arg(&project)
+        .output()
+        .unwrap();
+    let log = text(&output);
+    assert!(output.status.success(), "{log}");
+    let found = std::fs::read_dir(work.join("results").join("findings"))
+        .unwrap_or_else(|error| panic!("no findings dir ({error}):\n{log}"))
+        .flatten()
+        .find(|entry| {
+            std::fs::read_to_string(entry.path().join("finding.json"))
+                .is_ok_and(|record| record.contains("heap-buffer-overflow"))
+        })
+        .unwrap_or_else(|| panic!("no heap-buffer-overflow finding:\n{log}"));
+    let replay = bhf().arg("replay").arg(found.path()).output().unwrap();
+    assert!(
+        text(&replay).contains("heap-buffer-overflow"),
+        "{}",
+        text(&replay)
+    );
 }

@@ -329,5 +329,42 @@ class IntegrationNightlySelectionTests(unittest.TestCase):
         self.assertNotIn("bhf::build_recovery::build_recovery_scenarios", counts)
 
 
+class IntegrationNightlyWinaflTests(unittest.TestCase):
+    """The WinAFL campaigns run nightly against a cached pinned build (#268)."""
+
+    def setUp(self) -> None:
+        self.job = job_block("winafl")
+
+    def test_the_job_counts_as_an_integration_shard(self) -> None:
+        # scripts/ci/nightly-gate.py counts a run as tested only when every
+        # job named like an integration shard passed.
+        self.assertIn("name: Integration tests (bhf) (WinAFL, Windows)", self.job)
+        self.assertIn("runs-on: windows-2022", self.job)
+        report = job_block("report-failure")
+        self.assertIn("needs: [gate, build, integration, winafl]", report)
+        self.assertIn("needs.winafl.result == 'failure'", report)
+
+    def test_a_cache_hit_skips_the_build(self) -> None:
+        restore = self.job.index("uses: actions/cache/restore@")
+        build = self.job.index("run: scripts/ci/build-winafl.ps1 -Root C:\\tools\\bhf-winafl")
+        save = self.job.index("uses: actions/cache/save@")
+        self.assertLess(restore, build)
+        self.assertLess(build, save)
+        skip = "if: steps.winafl-build.outputs.cache-hit != 'true'"
+        self.assertEqual(self.job.count(skip), 2, self.job)
+        # The key names the pinned versions and the script that builds them.
+        self.assertIn("key: winafl-fd85f38548-dynamorio-11.91.20763-${{ hashFiles('scripts/ci/build-winafl.ps1') }}", self.job)
+        script = (ROOT / "scripts/ci/build-winafl.ps1").read_text()
+        for pin in ("fd85f38548b14352f4b70ad414f364ea6dc1a769", "11.91.20763",
+                    "EA3DAD4AE6E39228FE87B5D4D7BC3A53FAFDB6161EE5BA6A2E98FB64F8A7E0D4"):
+            self.assertIn(pin, script)
+        self.assertIn("'build32'; Arch = 'Win32'", script)
+
+    def test_the_ignored_winafl_campaigns_run(self) -> None:
+        self.assertIn("cargo test --locked -p bhf --test winafl_engine -- --ignored --test-threads 1", self.job)
+        self.assertIn("BHF_WINAFL_PATH: C:\\tools\\bhf-winafl\\winafl", self.job)
+        self.assertIn("BHF_DYNAMORIO_PATH: C:\\tools\\bhf-winafl\\DynamoRIO-Windows-11.91.20763", self.job)
+
+
 if __name__ == "__main__":
     unittest.main()

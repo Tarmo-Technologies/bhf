@@ -9,17 +9,22 @@
 
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have(interpreter: &[&str], probe: &[&str]) -> bool {
-    interpreter.iter().any(|bin| {
-        Command::new(bin)
-            .args(probe)
-            .output()
-            .is_ok_and(|o| o.status.success())
-    })
+    let present = {
+        interpreter.iter().any(|bin| {
+            Command::new(bin)
+                .args(probe)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    };
+    support::require_tool(present, &interpreter.join(" "))
 }
 
 /// `bhf auto` over `file` = `source` fuzzing `tlv_ratio` for 20000 inputs at

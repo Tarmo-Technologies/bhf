@@ -21,6 +21,7 @@ from typing import Any
 HEAVY_JOBS = (
     "minimum-rust",
     "build-test",
+    "arm64-build",
     "container-core",
     "container-full",
     "rhel7-build",

@@ -15,12 +15,15 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
 }
 
 fn have(program: &str) -> bool {
-    which::which(program).is_ok()
+    let present = { which::which(program).is_ok() };
+    support::require_tool(present, program)
 }
 
 /// Whether `compiler` links a program with its static AddressSanitizer

@@ -2478,6 +2478,7 @@ pub(crate) fn run_on_host(
         duplicate_sanitizer_hits: dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: dedup.unreproduced_hits(),
         fresh_reruns: None,
+        hangs: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -3506,16 +3507,19 @@ mod tests {
             read_only: true,
             ..Default::default()
         };
-        let error = check_tools(&settings, &env_of(&[]), &read_only).unwrap_err();
+        // An x64 environment, whatever this host is (an ARM64 one is refused
+        // for its architecture first).
+        let x64 = || env_of(&[("VSCMD_ARG_TGT_ARCH", Path::new("x64"))]);
+        let error = check_tools(&settings, &x64(), &read_only).unwrap_err();
         assert_eq!(error, PAGE_HEAP_NEEDS_ELEVATION);
         assert!(error.contains("elevated (administrator) shell"), "{error}");
         let writable = page_heap::MemoryRegistry::default();
-        assert_eq!(check_tools(&settings, &env_of(&[]), &writable), Ok(()));
+        assert_eq!(check_tools(&settings, &x64(), &writable), Ok(()));
         let without = WinaflSettings {
             page_heap: false,
             ..settings
         };
-        assert_eq!(check_tools(&without, &env_of(&[]), &read_only), Ok(()));
+        assert_eq!(check_tools(&without, &x64(), &read_only), Ok(()));
     }
 
     fn saved_files(dir: &Path, kind: SavedKind, contents: &[&[u8]]) -> Vec<(PathBuf, SavedKind)> {

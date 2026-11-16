@@ -1204,6 +1204,15 @@ pub fn build_csharp_harness(
             target_dll.display()
         ));
     }
+    // SharpFuzz rewrites the target assembly without its debug symbols, so the
+    // instrumented build's stack frames name no source line. Keep the build as
+    // it is now, with its pdbs, for the engine to re-run a finding's input
+    // through (`main_symbols`) for the `.cs` file and line (#212).
+    let symbols_dir = hdir.join("build").join(SYMBOLS_BUILD_DIR);
+    let _ = std::fs::remove_dir_all(&symbols_dir);
+    if let Err(e) = copy_files(&out_dir, &symbols_dir) {
+        return CSharpBuildResult::Failed(format!("keep the uninstrumented build: {e}"));
+    }
     let instr = crate::command_output::output_with_timeout(
         Command::new(&sharpfuzz)
             .arg(&target_dll)
@@ -1228,30 +1237,25 @@ pub fn build_csharp_harness(
         Err(e) => return CSharpBuildResult::Failed(format!("spawn sharpfuzz: {e}")),
     }
 
-    // Emit the launcher `main`.
+    // Emit the launcher `main`, and `main_symbols` for the uninstrumented build.
     let main_path = hdir.join("main");
-    let harness_dll = out_dir.join("bhf_harness.dll");
-    let script = format!(
-        "#!/bin/sh\n\
-         # BHF_FRAMED BHF_CS_LAUNCHER bhf .NET driver launcher (native C# lane).\n\
-         # The engine sets BHF_FRAMED + BHF_COV_SHM in the environment; the CLR\n\
-         # inherits them across this exec. The Driver mmaps the file-backed\n\
-         # BHF_COV_SHM map into SharpFuzz.Common.Trace.SharedMem and speaks the\n\
-         # framed fork-server protocol. BHF_CS_NAMESPACE = the target's root\n\
-         # namespace, whose own exceptions are treated as declared input rejection.\n\
-         BHF_CS_NAMESPACE=\"{ns}\" \\\n\
-         BHF_EXPECTED_EXCEPTIONS=\"{expected}\" \\\n\
-         DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_ROLL_FORWARD=Major \\\n\
-         exec dotnet \"{dll}\" \"$@\"\n",
-        ns = method.namespace,
-        expected = "",
-        dll = harness_dll.display(),
-    );
-    if let Err(e) = std::fs::write(&main_path, script) {
-        return CSharpBuildResult::Failed(format!("write launcher {}: {e}", main_path.display()));
-    }
-    if let Err(e) = make_executable(&main_path) {
-        return CSharpBuildResult::Failed(format!("chmod +x {}: {e}", main_path.display()));
+    for (launcher, dir) in [
+        (&main_path, &out_dir),
+        (
+            &hdir.join(crate::fuzz::DOTNET_SYMBOLS_LAUNCHER),
+            &symbols_dir,
+        ),
+    ] {
+        let script = launcher_script(&method.namespace, &dir.join("bhf_harness.dll"));
+        if let Err(e) = std::fs::write(launcher, script) {
+            return CSharpBuildResult::Failed(format!(
+                "write launcher {}: {e}",
+                launcher.display()
+            ));
+        }
+        if let Err(e) = make_executable(launcher) {
+            return CSharpBuildResult::Failed(format!("chmod +x {}: {e}", launcher.display()));
+        }
     }
     CSharpBuildResult::Built {
         forced: (receiver_kind == Receiver::Uninitialized).then(|| {
@@ -1261,6 +1265,44 @@ pub fn build_csharp_harness(
             )
         }),
     }
+}
+
+/// The directory under the harness's `build/` that keeps the build as it was
+/// before SharpFuzz instrumented it, with its debug symbols (#212).
+const SYMBOLS_BUILD_DIR: &str = "symbols";
+
+/// The launcher that runs the harness assembly `harness_dll`.
+fn launcher_script(namespace: &str, harness_dll: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # BHF_FRAMED BHF_CS_LAUNCHER bhf .NET driver launcher (native C# lane).\n\
+         # The engine sets BHF_FRAMED + BHF_COV_SHM in the environment; the CLR\n\
+         # inherits them across this exec. The Driver mmaps the file-backed\n\
+         # BHF_COV_SHM map into SharpFuzz.Common.Trace.SharedMem and speaks the\n\
+         # framed fork-server protocol. BHF_CS_NAMESPACE = the target's root\n\
+         # namespace, whose own exceptions are treated as declared input rejection.\n\
+         BHF_CS_NAMESPACE=\"{namespace}\" \\\n\
+         BHF_EXPECTED_EXCEPTIONS=\"\" \\\n\
+         DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_ROLL_FORWARD=Major \\\n\
+         exec dotnet \"{dll}\" \"$@\"\n",
+        dll = harness_dll.display(),
+    )
+}
+
+/// Copy the files of `from` (not its subdirectories) into `to`.
+fn copy_files(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    for entry in std::fs::read_dir(from)
+        .map_err(|e| format!("read {}: {e}", from.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() {
+            std::fs::copy(&path, to.join(entry.file_name()))
+                .map_err(|e| format!("copy {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Last `n` bytes of a diagnostic string, at a char boundary.

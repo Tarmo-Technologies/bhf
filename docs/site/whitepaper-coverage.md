@@ -115,8 +115,9 @@ reaches one, bhf auto-harnesses all — with zero hand-written harness code:
 | Rust vs cargo-fuzz | **3 / 3** | 1 / 3 |
 | Java vs Jazzer | **3 / 3** | 1 / 3 |
 
-**Ada.** bhf found both planted `CONSTRAINT_ERROR`s; no other fuzzer supports
-Ada.
+**Ada.** bhf found both planted `CONSTRAINT_ERROR`s; none of the other fuzzers
+measured supports Ada. GNATfuzz, AdaCore's commercial Ada fuzzer, does, from a
+buildable GNAT project; it is not measured.
 
 **Timing.** bhf writes the harness on the first run and reuses it on the
 second. On these targets its build is fast enough that run 1 ≈ run 2 (1.16 s vs

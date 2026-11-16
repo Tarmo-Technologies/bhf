@@ -13,6 +13,8 @@ use std::process::Command;
 
 use cli::auto::sink_oracle::run_sink_oracle;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -25,9 +27,12 @@ fn repo_root() -> PathBuf {
 }
 
 fn has_jdk() -> bool {
-    Command::new("javac").arg("-version").output().is_ok()
-        && Command::new("java").arg("-version").output().is_ok()
-        && Command::new("jar").arg("--version").output().is_ok()
+    let present = {
+        Command::new("javac").arg("-version").output().is_ok()
+            && Command::new("java").arg("-version").output().is_ok()
+            && Command::new("jar").arg("--version").output().is_ok()
+    };
+    support::require_tool(present, "jdk")
 }
 
 fn build_agent_jar(out: &Path) -> bool {

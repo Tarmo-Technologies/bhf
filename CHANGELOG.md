@@ -45,6 +45,132 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The nightly runs the WinAFL end-to-end tests, which no workflow ran: a
+  Windows job builds the pinned WinAFL and DynamoRIO with
+  `scripts/ci/build-winafl.ps1` (the DynamoRIO zip's SHA-256 checked), caches
+  the build under the pinned versions and the script's hash so a cache hit
+  skips it, and runs `winafl_engine`'s ignored campaigns, with and without
+  PageHeap.
+- `--vs-arch x86` has tests: the nightly WinAFL job also builds WinAFL's
+  32-bit `build32` and runs an x86 campaign, and Windows CI runs an x86 smoke
+  in which the builtin engine finds a planted overflow in the 32-bit harness
+  and it replays. Only unit tests covered x86 builds, and a clang build for
+  `--vs-arch x86` failed to link: clang compiled x64 objects against the x86
+  CRT. A clang building for another architecture than the host's now gets
+  `--target=` for it (`i686-pc-windows-msvc`), and for x86 Visual Studio's x86
+  clang, which carries the i386 AddressSanitizer runtime, goes ahead of a
+  `PATH` clang without one.
+- CI builds and tests bhf natively on ARM64. A new `arm64-build` job on an
+  `ubuntu-24.04-arm` runner builds the workspace and runtrace shim, runs every
+  test outside bhf's heavy integration suites, and checks that `bhf auto`
+  finds a planted overflow; the CI acceptance gate requires it. No CI job had
+  compiled the ARM64 build the docs describe. docker.md no longer says ARM64
+  images are validated: only a run of the release workflow validates one.
+  On ARM64 a harness link now finds system libraries in the host's own
+  multiarch directories (`/usr/lib/aarch64-linux-gnu`); only the x86_64 ones
+  were searched, so a project's `-lc`-style libraries were dropped.
+- `--probe-build` builds outside the scanned tree, under
+  `<work>/probe/<tree>-<hash>/`: CMake and Meson into a build directory there,
+  Make and an intercepted `--build-command` in a copy of the tree there, whose
+  compile database names the tree's files. It wrote `.bhf-build`, objects and
+  generated files into the tree, and on a read-only checkout produced nothing
+  without a word. The tree is now left byte-identical (the sandbox mounts it
+  read-only), a read-only checkout is probed, and a Make probe that compiles
+  nothing says so.
+- A local test run with `BHF_REQUIRE_TOOLS=1` fails on a missing tool, as the
+  nightly does. Each integration test file had its own tool check that
+  printed a skip line and passed; they all return through a shared
+  `support::require_tool`, which panics under the variable, and a test fails
+  when a tool helper bypasses it.
+- A feature-gated private Rust target builds in the in-crate lane. The lane
+  built the copied crate without the features the target's `#[cfg(feature)]`
+  gate needs, so the function did not exist (E0425) and the target was a
+  `failed_build`; it now passes them with `--features`, as the dependency lane
+  enables them.
+- The builtin mutator no longer re-runs the same few inputs when the
+  dictionary is small. The structured generators, which ignore the base, were
+  picked uniformly beside the edits, and with one token each has a handful of
+  outputs (7% of one Ruby run's inputs were distinct). Their share now follows
+  the dictionary's size (at most half, at 64 tokens or more), and a suite
+  skips an output it produced among its last 16384 while another kind gives a
+  new one.
+- The README says Ada 83, K&R C, pre-C++98 and Python 2 are discovered and
+  statically analyzed (report-only), not supported for fuzzing; a test holds
+  the sentence to the report-only dialect set. The comparison pages list
+  GNATfuzz (commercial, generates Ada harnesses for a buildable GNAT project,
+  AFL++/libFuzzer/SymCC engines; not measured) and AFL++'s GCC plugin, and no
+  longer say no other fuzzer handles Ada.
+- `bhf sbom --fail-on` requires `--vuln-db` (exit 2), and a policy severity
+  gate without a database is refused. Without advisories nothing can match,
+  so the gate passed with 0 matches whatever the inventory held.
+  `vulnerabilities.json` records the advisory database as `advisory_db`
+  (path, sha256, entry count), or `null` when none was given.
+- The daemon docs say `bhf-daemon --mcp` exposes three read-only tools in a
+  default build (`bhf_scan`, `bhf_list_targets`, `bhf_load_findings`) and
+  five with `--features llm`. They said five, but the release binaries
+  advertise three. A test compares daemon.md's list with `tools/list`.
+- A C# finding names its `.cs` file and line. SharpFuzz rewrites the target
+  assembly without its debug symbols, so the frames of a finding had no line
+  (`at Acme.Tlv.Parser.Pick(Byte[] data)`). bhf keeps the uninstrumented
+  build, with its pdbs, beside the harness (`build/symbols/`, run by
+  `main_symbols`) and re-runs a finding's input through it for the lines.
+- A TypeScript finding names the `.ts` file and line. Its frames pointed at
+  the `target.js` esbuild transpiled the source to in the work dir. The lane
+  now writes a source map and runs node with `--enable-source-maps`, so the
+  stack, `finding.json` and SARIF name `src/codec.ts:7`. Plain JavaScript
+  harnesses are unchanged.
+- The AFL++ lane of a C, C++ or sequence harness runs each input from a heap
+  allocation of exactly its size, as the builtin lane does. It ran the target
+  on AFL++'s 1 MiB testcase buffer with the tail poisoned, so a read one past
+  the input was a `use-after-poison` there and a `heap-buffer-overflow` in the
+  builtin lane: one bug, two classifications.
+- The documented Ada flow works: `bhf generate-harness --target Pkg.Parse`
+  selects `Parse` in package `Pkg` (it said `subprogram 'Pkg.Parse' not
+  found`), and generates the harness `--target Parse` does. `bhf instrument`
+  copies the body's spec (`pkg.ads`) beside the instrumented body, so the
+  build that follows no longer fails on the missing spec.
+- Console output escapes control characters in text a target controls. `bhf
+  auto`'s top findings printed a finding's message raw, so an escape sequence
+  in it could retitle or clear the operator's terminal. Every line bhf prints
+  to stderr, `bhf replay` and `bhf capsule`/`verify-poc` output, and `bhf
+  explain` now write C0 and C1 controls other than tab and line breaks as
+  escapes (`\x1b`, `\u{9b}`), with one shared formatter.
+- `bhf auto --deadline` (config key `deadline`) arms the response-deadline
+  oracle for every fuzzed target; it was reachable only through an
+  undocumented environment variable. A deadline that is not shorter than the
+  per-input timeout is refused (exit 2). `run.md` counts the executions
+  killed at the per-input timeout, per target (`hangs=C/K`) and in a `Hangs:`
+  line, and `run.json` carries the counts on each pass.
+- A response-deadline finding (BHF-555) is confirmed before it is reported.
+  One run past `--deadline`, spawn time included, used to be a finding, so a
+  run slowed by a loaded host was reported. The input is now re-run in up to
+  three fresh processes, and it is a finding only when two of them overrun the
+  deadline too. The finding's `deadline_confirmation` records the deadline,
+  each re-run's time and how many overran it, and the BHF-555 notice is
+  printed only once the overrun is confirmed.
+- The builtin engine reports an input that hangs a C or C++ harness. An
+  execution killed at `--timeout` used to be dropped, so an infinite loop was
+  never a finding. Its input is now re-run in a fresh process with twice the
+  timeout; if it hangs again it is a hang finding (BHF-230, CWE-835). Before
+  that re-run is killed it gets SIGABRT, so a sanitizer runtime prints the
+  stack it was looping in, and two inputs looping in the same functions are
+  one finding. A re-run that finishes is one slow execution, not a finding.
+  `fuzz_runs/<harness>-latest.json` counts the pass's hangs under `hangs`.
+- `bhf auto` exits 3 when harnesses built but none ran because their sanitizer
+  runtime does not start on this host, and says to re-run with
+  `--sanitizers none`. It exited 1, as for nothing built, and the hint
+  suggested `CC=clang` even for a clang build. A source path that does not
+  exist exits 2, as auto.md says; it exited 1. The exit tables in cli.md and
+  auto.md list all four codes.
+- `--sanitizers` refuses `msan` or `tsan` combined with another sanitizer (exit
+  2, on `bhf auto` and `bhf fuzz`). Every target then failed to build and was
+  filed as a bhf code-generation bug. `bhf auto --dry-run` checks `--engine`
+  and `--sanitizers` before it exits: it accepted `--engine bogus`.
+- Duration flags (`--timeout`, `--time`, `--deadline` on `bhf fuzz` and
+  `bhf auto`) accept milliseconds and fractions: `500ms`, `0.5s`, `1.5m`.
+  The documented `--timeout 500ms` was refused. A multi-worker run passes a
+  sub-second `--timeout` or `--deadline` to its workers as it was given; it
+  rounded them to whole seconds.
 - The native Windows ETW collector no longer reports every DLL a target loads
   as BHF-413. ETW names files and images by NT device
   (`\Device\HarddiskVolume3\...`), which the check read as a search-path

@@ -23,18 +23,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have_clang() -> bool {
-    Command::new("clang")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("clang")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "clang")
 }
 
 fn c_runtime_dir() -> PathBuf {

@@ -282,11 +282,14 @@ inherit the fault.
 **Timing oracle (`--deadline`).** Real-time targets fail by *overrunning a
 budget*, not only by crashing. `bhf fuzz --deadline <D>` records any completed
 input whose execution exceeds `D` as a **BHF-555** finding (CWE-400
-timing/availability) instead of discarding it as a slow unit the way `--timeout`
-does. It applies on the `--target-transport` loop (measured as host-observed
-round-trip time) as well as the host lane, and `--timeout` bounds each on-target
-execution so a hung target is a distinct, non-clean outcome rather than a
-campaign that never returns:
+timing/availability), where `--timeout` only kills a slow unit. It applies on
+the `--target-transport` loop (measured as host-observed round-trip time) as
+well as the host lane, and `--timeout` bounds each on-target execution so a
+hung target is a distinct, non-clean outcome rather than a campaign that never
+returns. On the host lane an overrun is re-run in up to three fresh processes
+and is a finding only when two of them overrun `D` too, so one run slowed by a
+loaded host is not; the finding's `deadline_confirmation` records the
+deadline, each re-run's time (`rerun_ms`) and how many overran it:
 
 ```sh
 bhf fuzz bhf_work --harness H-C0001 --deadline 1s          # >1s response = finding

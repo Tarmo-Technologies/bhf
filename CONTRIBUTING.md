@@ -14,9 +14,12 @@ C/C++, a JDK for Java, `python3`/`perl`/`go` for those lanes. See the
 [README](./README.md#prerequisites) for the full list; install only the lanes you touch.
 Tests that need a missing toolchain skip themselves, so a passing run on a partial
 toolchain does **not** exercise every lane — don't mistake a skip for a pass.
-With `BHF_REQUIRE_TOOLS=1` a test fails instead of skipping when the runtrace shim
-is not built beside the `bhf` under test (`cargo build -p bhf_runtrace_shim`); the
-nightly integration suite sets it.
+With `BHF_REQUIRE_TOOLS=1` a test fails instead of skipping when a tool it needs
+is missing (a compiler, GNAT, a JDK, node, ...) or the runtrace shim is not built
+beside the `bhf` under test (`cargo build -p bhf_runtrace_shim`); the nightly
+integration suite sets it. A test's check for a tool returns through
+`support::require_tool` (`crates/cli/tests/support/mod.rs`), and a test holds every
+tool helper in `crates/cli/tests/` to it.
 
 ```sh
 cargo build --workspace     # also produces libbhf_runtrace_shim.so next to the binaries

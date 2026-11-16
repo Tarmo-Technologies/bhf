@@ -25,6 +25,7 @@
 
 use crate::auto::runtrace::{self, RuntraceEvent};
 use crate::gate_evidence::{self, Capture, Gate};
+use crate::terminal_text::terminal_safe;
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -243,41 +244,6 @@ const MAX_ORACLE_EVIDENCE: usize = 6;
 
 /// Characters of an evidence value an `Evidence:` line shows at most.
 const MAX_EVIDENCE_CHARS: usize = 200;
-
-/// `text` safe to print to a terminal: control characters (an escape
-/// sequence, a bell, a carriage return or line break) and the bidirectional
-/// overrides that reorder what is shown are written as escapes (`\x1b`,
-/// `\r`, `\u{202e}`), every other character as it is. Text from a finding's
-/// run is shown through it: fuzz input bytes reach explain's output through
-/// oracle evidence, runtrace events, the resources the shim served, decoded
-/// arguments and the target's own report (an exception message quotes its
-/// input), and the run's stack and comparison sites are printed by the target.
-fn terminal_safe(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x80 && c.is_control() => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c if c.is_control() || is_bidi_control(c) => {
-                let _ = write!(out, "\\u{{{:x}}}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// The marks and overrides that change the direction text is shown in.
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
-}
 
 /// `Oracle:` and `Evidence:` lines of an oracle finding: the oracle, the API
 /// it watched, its message and its evidence (`oracle.evidence`), each made
@@ -2229,6 +2195,7 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_text::is_bidi_control;
 
     fn frameless_finding(dir: &Path) -> Finding {
         Finding {
@@ -3223,7 +3190,9 @@ mod tests {
         );
         for line in lines.iter().chain(&env).chain(&served) {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_bidi_control(c)),
+                !line
+                    .chars()
+                    .any(|c| (c.is_control() && c != '\t') || is_bidi_control(c)),
                 "{line:?}"
             );
         }
@@ -3319,7 +3288,9 @@ mod tests {
         let out = explain_one(work.path(), &finding, &[], false);
         for line in out.lines() {
             assert!(
-                !line.chars().any(|c| c.is_control() || is_bidi_control(c)),
+                !line
+                    .chars()
+                    .any(|c| (c.is_control() && c != '\t') || is_bidi_control(c)),
                 "a control character reaches the terminal in {line:?}:\n{out}"
             );
             assert!(

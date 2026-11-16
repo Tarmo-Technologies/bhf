@@ -69,7 +69,15 @@ bhf: build environment: Visual Studio Build Tools 2022 17.14.37906.3 (x64, cache
 `--dry-run` plan. Inside a Developer shell (`INCLUDE`/`LIB` set) the shell's
 environment is used as it is. `--no-vs-env` (or `BHF_NO_VS_ENV=1`) turns
 discovery off; `--vs-arch x86|x64|arm64` picks another target architecture.
-The discovered directories reach builds only through `PATH`/`INCLUDE`/`LIB`,
+For one that is not this machine's, clang is given `--target=` for it
+(`i686-pc-windows-msvc` for x86) and must carry that architecture's
+AddressSanitizer runtime: the standalone LLVM and Visual Studio's x64 clang
+have only x64's, so for `--vs-arch x86` bhf puts Visual Studio's x86 clang
+(`VC\Tools\Llvm\bin`, from the "C++ Clang tools" component) ahead of a
+`PATH` clang without it, and the build-environment line says so. Give
+`capsule` and `verify-poc` of such a finding the same `--vs-arch`: a capsule
+rebuilds the harness, which needs that architecture's toolset. The
+discovered directories reach builds only through `PATH`/`INCLUDE`/`LIB`,
 never as recipe text, so `Program Files (x86)` needs no quoting.
 
 ### One-shot setup on a stock Windows 11 VM
@@ -239,7 +247,7 @@ DynamoRIO package. The versions bhf is validated with (Windows Server 2022, VS
 | Tool | Version | Where |
 |------|---------|-------|
 | DynamoRIO | 11.91.20763 (weekly build `cronbuild-11.91.20763`, 2026-11-07), `DynamoRIO-Windows-11.91.20763.zip`, SHA-256 `EA3DAD4AE6E39228FE87B5D4D7BC3A53FAFDB6161EE5BA6A2E98FB64F8A7E0D4` | [DynamoRIO releases](https://github.com/DynamoRIO/dynamorio/releases/tag/cronbuild-11.91.20763) |
-| WinAFL | master `fd85f38548` (WinAFL 1.17, AFL 2.43b), built x64 with `-DINTELPT=1 -DUSE_COLOR=1` | [googleprojectzero/winafl](https://github.com/googleprojectzero/winafl) |
+| WinAFL | master `fd85f38548` (WinAFL 1.17, AFL 2.43b), built x64 with `-DINTELPT=1 -DUSE_COLOR=1` and x86 (`-A Win32`) with `-DUSE_COLOR=1` | [googleprojectzero/winafl](https://github.com/googleprojectzero/winafl) |
 
 WinAFL master calls `drmgr_register_exit_event`, which DynamoRIO's last
 release, 11.3.0, does not have: linking `winafl.dll` against 11.3.0 fails with
@@ -260,6 +268,12 @@ cmake -G "Visual Studio 17 2022" -A x64 .. `
 cmake --build . --config Release
 # -> build64\bin\Release\afl-fuzz.exe, winafl.dll, winaflpt-debug.exe
 ```
+
+`scripts/ci/build-winafl.ps1 -Root C:\tools\bhf-winafl` does all of this at
+the pinned versions, x64 (`build64`) and x86 (`build32`, without Intel PT),
+checking the DynamoRIO zip's SHA-256, and leaves
+`<Root>\DynamoRIO-Windows-11.91.20763` and the `<Root>\winafl` checkout for
+`BHF_DYNAMORIO_PATH` and `BHF_WINAFL_PATH`; run again, it skips what is built.
 
 bhf finds them from `--winafl-path` (the directory holding `afl-fuzz.exe` and
 `winafl.dll`, or the checkout holding `build64\bin\Release`), then
@@ -467,14 +481,19 @@ mode.
 - Only native targets: a cross-compiled harness runs the builtin engine.
 - `--target-transport` and `--protocol-profile` run the builtin engine's own
   loops, so `bhf fuzz` refuses them with `--engine winafl` (or `afl++`).
-- WinAFL is not installed on the GitHub Windows runners, so the end-to-end
-  tests (`crates/cli/tests/winafl_engine.rs`: `bhf auto --engine winafl` on a
-  planted heap overflow, with and without PageHeap, nonzero WinAFL coverage,
-  then `replay`, `explain`, `capsule` and `verify-poc`) are `#[ignore]`d and
-  listed as ignored there; CI runs the test's refusal checks. Run them on a
-  machine with WinAFL and DynamoRIO, from an elevated shell, with
-  `BHF_WINAFL_PATH` and `BHF_DYNAMORIO_PATH` set: `cargo test -p bhf --test
-  winafl_engine -- --ignored`. Without the tools they fail instead of passing.
+- The end-to-end tests (`crates/cli/tests/winafl_engine.rs`: `bhf auto
+  --engine winafl` on a planted heap overflow, with and without PageHeap and
+  as an x86 harness (`--vs-arch x86`), nonzero WinAFL coverage, then `replay`,
+  `explain`, `capsule` and `verify-poc`) need WinAFL and DynamoRIO, which the
+  GitHub Windows runners do not have, so they are `#[ignore]`d; PR CI runs the
+  test's refusal checks and an x86 smoke (`--vs-arch x86` with the builtin
+  engine finds the overflow, and it replays). The nightly's `Integration
+  tests (bhf) (WinAFL, Windows)` job builds the pinned pair with
+  `scripts/ci/build-winafl.ps1`, caches it under the pinned versions and the
+  script's hash (a cache hit skips the build), and runs them. Locally, run
+  them from an elevated shell with `BHF_WINAFL_PATH` and `BHF_DYNAMORIO_PATH`
+  set: `cargo test -p bhf --test winafl_engine -- --ignored`. Without the
+  tools they fail instead of passing.
 
 ## Visual Studio solutions (.sln / .vcxproj)
 
@@ -562,8 +581,8 @@ MSBuild itself evaluates each project when it is installed
 static reading cannot (property functions, NuGet-imported targets); a
 project MSBuild cannot evaluate falls back to the static reading. The import
 then prints `msbuild evaluation` instead of `static evaluation`; under
-`--probe-build` it writes `<tree>\.bhf-build\compile_commands.json` like the
-other probe tiers.
+`--probe-build` it writes `compile_commands.json` to the work dir's probe home
+(`<work>\probe\<tree>-<hash>\.bhf-build\`) like the other probe tiers.
 
 Why evaluation is opt-in: evaluating a project runs code the scanned tree
 chooses. MSBuild calls the property functions the project files contain
@@ -664,7 +683,7 @@ bhf.exe auto C:\src\proj --build-command "msbuild proj.sln /p:Configuration=Rele
 No Native Tools prompt is needed: the discovered Visual Studio environment puts
 MSBuild and cl on `PATH`. The command runs through `cmd.exe`. Each compiler on
 `PATH` (`cl`, `clang-cl`, `clang`, `gcc`, ...) gets an executable shim in
-`<tree>\.bhf-build\intercept\` that records its arguments (with MSBuild's
+`<work>\probe\<tree>-<hash>\.bhf-build\intercept\` that records its arguments (with MSBuild's
 response files expanded) and runs the real compiler unchanged. MSBuild starts
 cl from the toolset directory by absolute path, so the CL task is pointed at the
 `cl.exe` shim through the `CLToolPath`/`CLToolExe` properties (with

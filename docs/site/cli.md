@@ -26,6 +26,13 @@ Run `bhf --help` for the live top-level inventory and `bhf <command>
 particular, `auto` is the sixteen-lane entry point; `scan`, `list targets`,
 `generate-harness`, and the structured LLM/MCP harness helpers are narrower.
 
+Text a target controls (its report, an exception message, its own output, the
+fuzz input quoted in them) is printed with every control character other than
+tab and line breaks written as an escape: `\x1b`, `\x07`, `\u{9b}`, and
+`\u{202e}` for a bidirectional override. An escape sequence in a finding
+cannot retitle or clear the terminal it is shown in. The JSON outputs and the
+files under the work dir keep the text as it was.
+
 ## Common Flow
 
 ```sh
@@ -1137,9 +1144,9 @@ provider choices are cached Codex/Claude CLI sessions, explicit-model OpenAI or
 Anthropic APIs, and an explicit-model local OpenAI-compatible endpoint. API
 keys are accepted only through environment variables.
 
-For interactive agent work, `bhf-daemon --mcp` exposes five read-only tools
-for bounded deterministic evidence, prompt preparation, and Ada/C/C++ harness
-preflight. It does not expose shell execution or long-running/mutating pipeline
+For interactive agent work, `bhf-daemon --mcp` exposes three read-only tools
+for bounded deterministic evidence, and a build with `--features llm` two more,
+for prompt preparation and Ada/C/C++ harness preflight. It does not expose shell execution or long-running/mutating pipeline
 steps. See [LLM Assistance](../llm/) for exact schemas, registration, provider
 privacy, root-cause workflows, memory controls, and the deterministic checks
 that must accept or reject model suggestions.
@@ -1237,7 +1244,11 @@ component was observed by a built-and-fuzzed harness, are annotated with
 `reachability.status: "reached_by_fuzz"` and counted under
 `counts.reached_matches`. Use `--fail-on
 low|medium|high|critical` for a direct gate, or `--policy` to read
-`/ci/fail_on_vulnerability_severity` from policy-as-code. `bhf ci` forwards
+`/ci/fail_on_vulnerability_severity` from policy-as-code. Either gate needs
+`--vuln-db`: without advisories nothing can match, so `--fail-on` without it
+is refused (exit 2), and so is a policy gate (exit 1). `vulnerabilities.json`
+records the database the matches came from as `advisory_db` (its path,
+sha256 and number of entries), or `null` when none was given. `bhf ci` forwards
 the `auto` budget knobs so a CI run can be bounded the same way: `--per-target-time`
 (per-target total fuzz wall), `--per-target-finding-count N` (stop a target after
 N distinct findings; `1` ≈ stop-on-first-crash), and `--campaign-time` (whole-run
@@ -1306,8 +1317,8 @@ so a run whose crashes were all known does not read as clean.
 - `--time <DURATION>` — whole-campaign wall-clock budget (e.g. `30s`, `5m`, `1h`). A builtin fork-server pass ends inside it: near the end it stops issuing inputs so its background fresh-process re-runs can finish, and stops a re-run still going at the deadline (see [Sanitizers](./sanitizers.md)).
 - `--max-len <BYTES>` — maximum generated input length (libFuzzer `-max_len`). Default `4096`. With adaptive length control on this is the ceiling.
 - `--len-control <N>` — adaptive length control (libFuzzer `-len_control`): executions without a new corpus signature before the effective length doubles toward `--max-len`. Default `100`; `0` disables it.
-- `--timeout <DURATION>` — per-input timeout (libFuzzer `-timeout`): a single C/C++ harness execution longer than this is killed and the slow unit reported. Distinct from `--time`. Default `10s`. (Ada bounds runaway inputs via CPU rlimits.)
-- `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which discards a slow unit), any input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure). For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. Whole-second spec (e.g. `1s`); use `BHF_DEADLINE_MS` for sub-second budgets. See [On-Target & Embedded](./on-target-fuzzing.md).
+- `--timeout <DURATION>` — per-input timeout (libFuzzer `-timeout`): a single C/C++ harness execution longer than this is killed, and an input that hangs again when re-run with twice the timeout is a hang finding (BHF-230; see [Sanitizers: Hangs](./sanitizers.md#hangs)). Distinct from `--time`. Default `10s`. (Ada bounds runaway inputs via CPU rlimits.) A duration (`--timeout`, `--time`, `--deadline`) is a number with `ms`, `s`, `m` or `h`, seconds when bare, and may be fractional: `500ms`, `0.5s`, `10s`, `1.5m`.
+- `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which reports only an input that hangs again at twice the timeout), an input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure) when at least two of three fresh re-runs exceed it too; the finding's `deadline_confirmation` records each re-run's time. For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. A duration (`250ms`, `0.5s`, `1s`); `BHF_DEADLINE_MS` sets it from the environment. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--rss-limit-mb <MB>` — per-execution resident-memory ceiling for a C/C++ harness (libFuzzer `-rss_limit_mb`); an execution over budget is killed and reported as an OOM finding. `0` (default) disables it. With `--engine winafl` it also becomes WinAFL's `-m`, the committed-memory cap of drrun and the target: the limit plus 1024 MiB for DynamoRIO, or `-m none` for `0`. For an x86 harness it is `-m none` when that cap is not below what the 32-bit process can address (2 GiB, or 4 GiB when large-address aware).
 - `--print-final-stats` — print a final-stats line (libFuzzer `-print_final_stats`): executions, exec/s, new vs duplicate corpus signatures, findings, elapsed time.
 - `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs while the finding they duplicate is in `results/findings`. Once that finding is removed (or `results/` is wiped), the next campaign drops them instead of merging them back.
@@ -1569,6 +1580,7 @@ Flags:
 - `--per-target-finding-count <N>` — stop a target's cascade as soon as it has produced N *distinct* findings (crash signatures), or when `--per-target-time` is spent, whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash. Unset by default (collect every finding).
 - `--total-time <SECS>` — **deprecated** alias of `--per-target-time` (overrides it when set); retained for existing benchmark/parity invocations. Hidden from `--help`.
 - `--iterations <N>` — per-pass execution cap (libFuzzer `-runs`); unset (or `0`) lets `--per-target-time` govern depth. The old hardcoded 1024 cap is retired.
+- `--timeout <DURATION>` / `--deadline <DURATION>` — the per-execution timeout and the response deadline (timing oracle) for every fuzzed target, as on `bhf fuzz`. An input that hangs again at twice the timeout is a hang finding (BHF-230), and one that takes longer than the deadline in two of three fresh re-runs a response-deadline finding (BHF-555). The deadline must be shorter than the timeout (exit 2). `run.md` and `run.json` count each target's hangs.
 - `--rss-limit-mb <MB>` — per-harness resident-set memory cap; a test case over budget is killed and reported as a BHF-209 OOM finding instead of OOM-killing the host (libFuzzer `-rss_limit_mb`). Defaults to one quarter of available host/cgroup memory, clamped to 512..8192 MiB; pass an exact value or `0` to disable. The finding records the limit (`rss_limit_mb`), and `bhf replay` and `bhf minimize` run its testcase under it, so the replay reproduces the out-of-memory kill (MATCH) instead of allocating the host's memory; a BHF-209 finding recorded without it replays under the default.
 - `--max-targets <N>` — keep only the top-N highest-scored targets after ranking, before the build/fuzz sweep; `--dry-run` prints this bounded plan, while `--list-targets` still prints the full ranked list. The kept-vs-total count is logged (never a silent truncation). Bounds *which* targets a huge tree attempts. Unset by default.
 - `--campaign-time <SECS>` — whole-*run* budget across all targets. Default: an OUTER wall-clock cap — once exceeded, `auto` stops STARTING new (ranked) targets and reports how many of the N discovered were reached. With `--min-target-time`, switches to SPLIT mode (below). Unset by default.
@@ -1615,13 +1627,15 @@ Flags:
 - `--verbose` / `-v` — print an extra indented line per target: skip/fail reason, repairs applied, and per-pass execution/finding counts.
 
 Exit codes: `0` at least one target built and ran, `1` discovery found
-candidates but none built, `2` no candidates discovered, or the toolchain
-configuration was refused (a compiler, runner or Ada tool that is not
-installed, a target with no runner to run it, a runner with nothing foreign
-to run, a probe backend a host sweep cannot read, a config file that cannot
-be read or parsed (an unknown key included) or that holds an invalid value
-(`max-corpus-mb = 0`, an unknown `languages` entry), or an unusable
-`[cross.*]` table), as for `bhf build`.
+candidates but none built, `2` no candidates discovered (a source path that
+does not exist included) or the toolchain configuration was refused (a
+compiler, runner or Ada tool that is not installed, a target with no runner to
+run it, a runner with nothing foreign to run, a probe backend a host sweep
+cannot read, a config file that cannot be read or parsed (an unknown key
+included) or that holds an invalid value (`max-corpus-mb = 0`, an unknown
+`languages` entry), or an unusable `[cross.*]` table), as for `bhf build`, and
+`3` harnesses built but none ran because their sanitizer runtime does not
+start on this host (re-run with `--sanitizers none`).
 
 The runtime audit and the shim's faking modes are Linux-only. On other hosts
 `bhf auto` still runs the build-time sweep but prints a one-line notice
@@ -2074,4 +2088,4 @@ value).
 
 `bhf-daemon` is distributed beside `bhf` in release archives. Use the
 CLI for batch workflows, default daemon mode for editor JSON-RPC integrations,
-and `bhf-daemon --mcp` for the five read-only agent tools.
+and `bhf-daemon --mcp` for the read-only agent tools.

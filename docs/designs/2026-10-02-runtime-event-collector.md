@@ -1,10 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Platform-neutral runtime-event collector + native Windows provider (#60)
 
-> Status: **design for review** — no implementation yet. Cross-platform
-> (Windows); cannot be fully validated in the current Linux dev/CI environment —
-> the Windows provider needs a Windows runner. Feeds the #55 semantic predicates
-> and #61 relational policy fuzzing.
+> Status: **implemented** in part (85e4781, the collector contract, the Linux
+> provider and the native Windows ETW provider; binary-fuzz confirmation in
+> 6ba0795 and d34266f). The Windows provider is validated on a Windows host,
+> not in Linux CI. Feeds the #55 semantic predicates and #61 relational policy
+> fuzzing.
+>
+> Not delivered:
+> - starting the collector before the target and keeping its testcase and
+>   PID: [#76](https://github.com/Tarmo-Technologies/bhf/issues/76);
+> - replaying retained testcases under the collector in the harness lanes
+>   ([#246](https://github.com/Tarmo-Technologies/bhf/issues/246)) and in `bhf binary fuzz` ([#247](https://github.com/Tarmo-Technologies/bhf/issues/247));
+> - `--collector` on `bhf auto`: [#278](https://github.com/Tarmo-Technologies/bhf/issues/278).
 
 ## Problem
 

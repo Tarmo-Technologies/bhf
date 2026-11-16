@@ -173,3 +173,45 @@ fn prerelease_version_does_not_inherit_a_final_release_fix() {
     assert_eq!(f.read("openvex.json")["statements"][0]["status"], "under_investigation");
     assert!(f.read("vex-review.json")["entries"][0]["status_notes"].as_str().unwrap().contains("not a verified fix"));
 }
+
+/// `--fail-on` gates on matched vulnerabilities, which need an advisory
+/// database: without `--vuln-db` it passed with 0 matches whatever the
+/// inventory held (#222). A policy's severity gate needs one too.
+#[test]
+fn the_severity_gate_requires_an_advisory_database() {
+    let f = Fixture::new("2.4.2", "high");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("sbom").arg(&f.root).arg("--out").arg(&f.out)
+        .args(["--fail-on", "high"]).output().unwrap();
+    assert_exit(&output, 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--vuln-db"));
+    assert!(!f.out.join("vulnerabilities.json").exists());
+
+    let policy = f.root.parent().unwrap().join("policy.json");
+    write_json(&policy, json!({"ci": {"fail_on_vulnerability_severity": "high"}}));
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("sbom").arg(&f.root).arg("--out").arg(&f.out)
+        .arg("--policy").arg(&policy).output().unwrap();
+    assert_exit(&output, 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs an advisory database") && stderr.contains("--vuln-db"), "{stderr}");
+}
+
+/// vulnerabilities.json says which advisory database its matches come from,
+/// and that none was checked when none was given.
+#[test]
+fn vulnerabilities_json_records_the_advisory_database() {
+    let f = Fixture::new("2.4.2", "high");
+    assert_exit(&f.run(&[]), 0);
+    let db = &f.read("vulnerabilities.json")["advisory_db"];
+    assert_eq!(db["path"], f.db.display().to_string());
+    assert_eq!(db["entries"], 1);
+    let digest = db["sha256"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("sbom").arg(&f.root).arg("--out").arg(&f.out).output().unwrap();
+    assert_exit(&output, 0);
+    assert!(f.read("vulnerabilities.json")["advisory_db"].is_null());
+}

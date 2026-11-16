@@ -297,7 +297,7 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Optional wall-clock budget such as 30s, 5m, or 1h.
+    /// Optional wall-clock budget such as 30s, 5m, 1h or 1.5h.
     #[arg(long, value_parser = parse_duration)]
     pub time: Option<Duration>,
 
@@ -317,22 +317,22 @@ pub struct FuzzArgs {
     pub len_control: usize,
 
     /// Per-input timeout (libFuzzer's `-timeout`): a single C/C++ harness
-    /// execution that runs longer than this is killed and skipped (the slow unit
-    /// is reported). Distinct from `--time`, the whole-campaign budget. Defaults
-    /// to 10s. (The Ada lane bounds runaway inputs via CPU rlimits instead.)
+    /// execution that runs longer than this is killed, and an input that hangs
+    /// again when re-run with twice the timeout is a hang finding (BHF-230).
+    /// Distinct from `--time`, the whole-campaign budget. Defaults to 10s;
+    /// `500ms` and `0.5s` are half a second. (The Ada lane bounds runaway
+    /// inputs via CPU rlimits instead.)
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
     /// Real-time response deadline (the timing oracle, off by default). Distinct
-    /// from `--timeout`, which is the coarse hang-kill backstop that DISCARDS a
-    /// slow unit: `--deadline` is a "must respond within D" budget, and any input
-    /// whose host-side wall-clock execution exceeds it is recorded as a *finding*
-    /// (BHF-555, a CWE-400 timing/availability failure) rather than silently
-    /// skipped. Use it for watchdog / RTOS / radar targets where overrunning a
-    /// budget is a fault, not just "it hung". When unset, hang handling is
-    /// byte-for-byte unchanged. Accepts the same duration spec as `--time`
-    /// (e.g. 250ms is not accepted — use whole seconds like `1s`, or set the
-    /// `BHF_DEADLINE_MS` env for sub-second budgets).
+    /// from `--timeout`, the coarse hang-kill backstop that reports only an
+    /// input that hangs again at twice it: `--deadline` is a "must respond
+    /// within D" budget, and any input whose host-side wall-clock execution
+    /// exceeds it is recorded as a *finding* (BHF-555, a CWE-400
+    /// timing/availability failure). Use it for watchdog / RTOS / radar
+    /// targets where overrunning a budget is a fault, not just "it hung".
+    /// Accepts the same duration spec as `--time` (`250ms`, `0.5s`, `2s`).
     #[arg(long = "deadline", value_parser = parse_duration)]
     pub deadline: Option<Duration>,
 
@@ -1031,6 +1031,10 @@ pub(crate) struct FuzzRunSummary {
     /// check for crashes only a fresh process sees). Omitted when none ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fresh_reruns: Option<FreshRerunSummary>,
+    /// The builtin pass's executions killed at the per-input timeout and
+    /// their confirmation (#207). Omitted when none was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hangs: Option<HangRunSummary>,
 }
 
 /// Fresh-process re-runs of new corpus inputs during one fork-server pass.
@@ -1295,6 +1299,9 @@ struct HarnessRun {
     /// EVERY input (incl. the empty seed — a gate/seed/harness problem, reported as
     /// built-not-fuzzed) from one that genuinely fuzzed.
     rejected: bool,
+    /// The per-input timeout the run was killed at, when it did not finish
+    /// within it (#207): a hang to confirm, not yet a finding.
+    hung: Option<Duration>,
 }
 
 /// Classify a non-success harness exit (called only when `!status.success()` and
@@ -1370,9 +1377,10 @@ fn runtime_start_failure_error(runner: &replay_min::HarnessRunner, stderr: &str)
         .unwrap_or_default();
     Some(format!(
         "{RUNTIME_START_FAILURE}'{}'{built_with} printed \"{line}\" before reaching the target. \
-         That is an environment problem on this host, not a finding: build the harness with a \
-         compiler whose sanitizer runtime starts here (CC=clang CXX=clang++), or choose the \
-         sanitizers with --sanitizers, which checks that the compilers' runtimes start",
+         That is an environment problem on this host, not a finding: build the harness with \
+         `--sanitizers none` (coverage and crash detection, no sanitizer runtime), with \
+         sanitizers whose runtime starts here (`--sanitizers` checks that it does), or with a \
+         compiler whose sanitizer runtime starts here",
         harness.display()
     ))
 }
@@ -1432,6 +1440,10 @@ pub fn run(args: FuzzArgs) -> i32 {
     // drop them (a single blind mutator instead of the asked-for workers,
     // grammar or CmpLog log) is refused instead.
     if let Some(error) = lane_flag_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
+    if let Err(error) = parse_sanitizer_args(&args.sanitizers) {
         bhfeprintln!("{error}");
         return 2;
     }
@@ -2844,7 +2856,7 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     out.push(args.len_control.to_string());
     if let Some(timeout) = args.timeout {
         out.push("--timeout".to_owned());
-        out.push(format!("{}s", timeout.as_secs().max(1)));
+        out.push(duration_arg(timeout.max(Duration::from_millis(1))));
     }
     if args.rss_limit_mb > 0 {
         out.push("--rss-limit-mb".to_owned());
@@ -2859,7 +2871,7 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     }
     if let Some(deadline) = args.deadline {
         out.push("--deadline".to_owned());
-        out.push(format!("{}s", deadline.as_secs()));
+        out.push(duration_arg(deadline));
     }
     if args.fork_server {
         out.push("--fork-server".to_owned());
@@ -4054,6 +4066,10 @@ fn run_builtin_with_progress(
     let mut corpus_new = 0_usize;
     let mut corpus_duplicates = 0_usize;
     let mut non_reproducible = 0_usize;
+    let mut hangs = HangRunSummary {
+        timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
+        ..HangRunSummary::default()
+    };
     // Sanitizer crashes dropped as libFuzzer/sanitizer driver glue (#388).
     let mut driver_glue_drops = 0_usize;
     // LSan leaks suppressed as bhf decode/harness scaffolding (#49): the
@@ -4241,18 +4257,51 @@ fn run_builtin_with_progress(
                     // faults (allocator-state corruption across inputs). The key is
                     // consumed only once the finding is emitted, so a first hit that
                     // does not reproduce does not hide a later one that does.
-                    if !c_libfuzzer_harness
-                        || sanitizer_crash_reproduces(
-                            &prepared.runner,
-                            &prepared.work_dir,
-                            input,
-                            report,
-                            &prepared.extra_env,
-                            prepared.per_input_timeout,
-                            prepared.rss_limit_mb,
-                            prepared.deadline,
-                        )
+                    // A response-deadline overrun is a finding when most of
+                    // its fresh re-runs overrun the deadline too (#209).
+                    let deadline_check = prepared
+                        .deadline
+                        .filter(|_| report.rule_id == RESPONSE_DEADLINE_RULE)
+                        .map(|deadline| {
+                            confirm_deadline(
+                                &prepared.runner,
+                                &prepared.work_dir,
+                                input,
+                                &prepared.extra_env,
+                                prepared.per_input_timeout,
+                                prepared.rss_limit_mb,
+                                deadline,
+                                pass_deadline,
+                            )
+                        });
+                    let confirmed = match &deadline_check {
+                        Some(check) => check.confirmed(),
+                        // A hang report comes from its own fresh-process
+                        // re-run (`confirm_hang`).
+                        None => {
+                            !c_libfuzzer_harness
+                                || report.rule_id == HANG_RULE
+                                || sanitizer_crash_reproduces(
+                                    &prepared.runner,
+                                    &prepared.work_dir,
+                                    input,
+                                    report,
+                                    &prepared.extra_env,
+                                    prepared.per_input_timeout,
+                                    prepared.rss_limit_mb,
+                                    prepared.deadline,
+                                )
+                        }
+                    };
+                    if let Some(check) = deadline_check.as_ref().filter(|check| !check.confirmed())
                     {
+                        bhfeprintln!(
+                            "bhf fuzz: note: an input {}, but {}: not a finding",
+                            deadline_overrun_of(report),
+                            check.describe()
+                        );
+                    }
+                    if confirmed {
                         // UBSan's object-size check reports an overflow ASan
                         // would have reported first: emit ASan's report then.
                         // Asked once per root cause: the key is consumed below.
@@ -4300,11 +4349,34 @@ fn run_builtin_with_progress(
                                 }
                             }
                         }
+                        // A .NET report names its source lines from the
+                        // uninstrumented build (#212).
+                        let symbolized = dotnet_symbolized_report(
+                            &prepared.runner,
+                            &prepared.work_dir,
+                            input,
+                            report,
+                            &prepared.extra_env,
+                            prepared.per_input_timeout,
+                            prepared.rss_limit_mb,
+                        );
+                        let (report, stderr) = match &symbolized {
+                            Some((report, stderr)) => (report, Some(stderr.as_str())),
+                            None => (report, stderr),
+                        };
                         let id = emitter
                             .emit_sanitizer_crash_with_log(input, report, stderr.map(str::as_bytes))
                             .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                         if report.rule_id == "BHF-209" && prepared.rss_limit_mb > 0 {
                             record_rss_limit(&prepared.work_dir, &id.0, prepared.rss_limit_mb);
+                        }
+                        if let Some(check) = &deadline_check {
+                            announce_deadline_finding(&format!(
+                                "{}, and {}",
+                                deadline_overrun_of(report),
+                                check.describe()
+                            ));
+                            check.record(&prepared.work_dir, &id.0);
                         }
                         if let Some(opinion) = &opinion {
                             opinion.record(&prepared.work_dir, &id.0, &key);
@@ -4422,9 +4494,6 @@ fn run_builtin_with_progress(
                         continue;
                     }
                     Some(report) => {
-                        if report.rule_id == RESPONSE_DEADLINE_RULE {
-                            announce_deadline_finding(deadline_overrun_of(report));
-                        }
                         fresh_rerun_summary.checked += 1;
                         fresh_rerun_summary.reports += 1;
                         emit_sanitizer_report!(
@@ -4556,7 +4625,7 @@ fn run_builtin_with_progress(
         // per-spawn process). Fork-server findings are replay-validated below so
         // an artifact of accumulated global state never escapes as a finding.
         let mut from_fork_server = false;
-        let run = if !input.is_empty() && fork_server.is_some() {
+        let mut run = if !input.is_empty() && fork_server.is_some() {
             match fork_server
                 .as_mut()
                 .expect("fork_server checked is_some")
@@ -4618,6 +4687,41 @@ fn run_builtin_with_progress(
             run
         };
         executions += 1;
+        // An execution killed at the per-input timeout is a hang finding once
+        // a fresh process with twice the timeout hangs on it too (#207).
+        if run.hung.is_some() && run.sanitizer.is_none() {
+            hangs.observed += 1;
+            let confirmation = if hangs.confirmed + hangs.cleared >= MAX_HANG_CONFIRMATIONS {
+                HangConfirmation::NotRerun
+            } else {
+                confirm_hang(
+                    &prepared.runner,
+                    &prepared.work_dir,
+                    &input,
+                    &prepared.extra_env,
+                    prepared.per_input_timeout,
+                    prepared.rss_limit_mb,
+                    pass_deadline,
+                )?
+            };
+            match confirmation {
+                HangConfirmation::Hung(report, stderr) => {
+                    hangs.confirmed += 1;
+                    run.sanitizer = Some(*report);
+                    run.stderr = Some(stderr);
+                }
+                HangConfirmation::Finished => {
+                    hangs.cleared += 1;
+                    bhfeprintln!(
+                        "bhf fuzz: note: an input ran past the {} per-input timeout but \
+                         finished when re-run with {}: a slow execution, not a hang",
+                        duration_arg(prepared.per_input_timeout),
+                        duration_arg(prepared.per_input_timeout.saturating_mul(2))
+                    );
+                }
+                HangConfirmation::NotRerun => hangs.not_rerun += 1,
+            }
+        }
         target_entry_observed |= run.testcases.iter().any(|testcase| testcase.target_entered);
         if run.rejected {
             rejected_count += 1;
@@ -5225,6 +5329,7 @@ fn run_builtin_with_progress(
         duplicate_sanitizer_hits: sanitizer_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
         fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
+        hangs: (hangs.observed > 0).then_some(hangs),
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -6062,6 +6167,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
         fresh_reruns: None,
+        hangs: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -6148,7 +6254,7 @@ fn is_instrumented_ada_harness(runner: &replay_min::HarnessRunner) -> bool {
 /// run indefinitely. 10s is generous - any well-behaved input
 /// completes in milliseconds, and the harness is invoked once per
 /// iteration so the overall fuzz budget caps total wall time anyway.
-const PER_INPUT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PER_INPUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A target controls its own diagnostics. Keep enough from both ends for a
 /// sanitizer header and final stack/summary, but never let a chatty execution
@@ -6274,10 +6380,11 @@ struct SpawnTweaks<'a> {
     /// the platform allows it (Windows; an unprivileged Unix process cannot
     /// undo a nice).
     restore_priority: Option<&'a std::sync::atomic::AtomicBool>,
-    /// Say nothing when the run overruns `--deadline`: the caller decides
-    /// whether the overrun becomes a finding and says so then (a fresh re-run's
-    /// overrun may be re-checked and cleared first).
-    quiet_deadline: bool,
+    /// At the timeout, first ask the process for its stack (#207): on Unix,
+    /// SIGABRT, which a sanitizer runtime armed with `handle_abort=1` answers
+    /// with the stack it was interrupted at, then up to this long for it to
+    /// finish printing before the process group is killed.
+    stack_on_timeout: Option<Duration>,
 }
 
 /// How much lower than bhf's own a background re-run's process runs on Unix.
@@ -6338,6 +6445,63 @@ fn restore_spawn_priority(child: &std::process::Child) {
 
 #[cfg(not(windows))]
 fn restore_spawn_priority(_child: &std::process::Child) {}
+
+/// The longest a timed-out process has, once asked for its stack, to print
+/// it and exit before it is killed. A sanitizer symbolizes the stack first.
+const HANG_STACK_GRACE: Duration = Duration::from_secs(5);
+
+/// Ask a timed-out process for the stack it is running (SIGABRT, which a
+/// sanitizer runtime with `handle_abort=1` reports with its stack), and wait
+/// up to `grace` for it to exit. The child is left unreaped, so
+/// its pid, which is also its process group's id, cannot be reused before the
+/// caller kills the group.
+#[cfg(target_os = "linux")]
+fn signal_for_stack(child: &mut std::process::Child, grace: Duration) {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: kill(2) on the child's pid, which is not reaped yet.
+    if unsafe { libc::kill(pid, libc::SIGABRT) } != 0 {
+        return;
+    }
+    let until = Instant::now() + grace;
+    while Instant::now() < until {
+        // SAFETY: an all-zero siginfo_t is valid; waitid(2) with WNOWAIT only
+        // reports the child's state.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: waitid filled `info` (or left it zeroed: still running).
+        if rc != 0 || unsafe { info.si_pid() } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// [`signal_for_stack`] where `waitid(WNOWAIT)` is not available: the wait
+/// reaps the child.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn signal_for_stack(child: &mut std::process::Child, grace: Duration) {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: kill(2) on the child's pid, which is not reaped yet.
+    if unsafe { libc::kill(pid, libc::SIGABRT) } == 0 {
+        let _ = replay_min::process::wait_exit_within(child, grace);
+    }
+}
+
+/// Windows has no signal a process can answer with its stack: the hang is
+/// reported without one.
+#[cfg(not(unix))]
+fn signal_for_stack(_child: &mut std::process::Child, _grace: Duration) {}
 
 /// Run `harness_path <input_path>` with a wall-clock timeout. On
 /// timeout, kill the process and return a synthetic exit status plus
@@ -6430,6 +6594,9 @@ fn run_with_timeout(
                     if lowered {
                         restore_spawn_priority(&child);
                     }
+                    if let Some(grace) = tweaks.stack_on_timeout {
+                        signal_for_stack(&mut child, grace);
+                    }
                     kill_process_group(&mut child);
                     let status = child.wait().map_err(|error| {
                         format!(
@@ -6479,6 +6646,26 @@ fn run_with_timeout(
     }
 }
 
+/// Write `input` to a file of its own under `work_dir/fuzz_inputs`, for a
+/// harness that reads its input from the file named on its command line.
+fn write_fuzz_input(work_dir: &Path, input: &[u8]) -> Result<PathBuf, String> {
+    let tmp_dir = work_dir.join("fuzz_inputs");
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|error| format!("create fuzz inputs dir '{}': {error}", tmp_dir.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // A sequence number too: fresh-process re-runs write inputs from a second
+    // thread, and two writes can share a clock reading.
+    static INPUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = INPUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let input_path = tmp_dir.join(format!("input-{}-{}-{seq}.bin", std::process::id(), nonce));
+    fs::write(&input_path, input)
+        .map_err(|error| format!("write fuzz input '{}': {error}", input_path.display()))?;
+    Ok(input_path)
+}
+
 fn run_c_libfuzzer_single_input(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
@@ -6515,20 +6702,7 @@ fn run_c_libfuzzer_single_input_in(
     deadline: Option<Duration>,
     tweaks: SpawnTweaks<'_>,
 ) -> Result<HarnessRun, String> {
-    let tmp_dir = work_dir.join("fuzz_inputs");
-    fs::create_dir_all(&tmp_dir)
-        .map_err(|error| format!("create fuzz inputs dir '{}': {error}", tmp_dir.display()))?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // A sequence number too: fresh-process re-runs write inputs from a second
-    // thread, and two writes can share a clock reading.
-    static INPUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = INPUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let input_path = tmp_dir.join(format!("input-{}-{}-{seq}.bin", std::process::id(), nonce));
-    fs::write(&input_path, input)
-        .map_err(|error| format!("write fuzz input '{}': {error}", input_path.display()))?;
+    let input_path = write_fuzz_input(work_dir, input)?;
 
     // Measure the host-side wall clock for the deadline oracle (deliverable 1).
     // `run_with_timeout` already enforces `per_input_timeout` as the hang-kill
@@ -6562,10 +6736,8 @@ fn run_c_libfuzzer_single_input_in(
     // finding is only synthesized when there is no sanitizer report to surface.
     if let Some(deadline) = deadline {
         if elapsed > deadline && corpus::parse_sanitizer_report(&stderr).is_none() {
+            // Announced only once fresh re-runs confirm it (#209).
             let overrun = deadline_overrun(deadline, elapsed);
-            if !tweaks.quiet_deadline {
-                announce_deadline_finding(&overrun);
-            }
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
@@ -6585,6 +6757,7 @@ fn run_c_libfuzzer_single_input_in(
                 }),
                 stderr: None,
                 rejected: false,
+                hung: None,
             });
         }
     }
@@ -6599,6 +6772,7 @@ fn run_c_libfuzzer_single_input_in(
                 sanitizer: Some(report),
                 stderr: Some(stderr.to_string()),
                 rejected: false,
+                hung: None,
             });
         }
         // A timed-out input is not a fuzz failure - it just means this
@@ -6614,16 +6788,18 @@ fn run_c_libfuzzer_single_input_in(
                 sanitizer: Some(rss_limit_report()),
                 stderr: None,
                 rejected: false,
+                hung: None,
             });
         }
         if stderr.contains("exceeded per-input timeout") {
-            bhfeprintln!("bhf: input hung beyond {:?}, skipping", per_input_timeout);
+            bhfeprintln!("bhf: input hung beyond {:?}", per_input_timeout);
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
                 stderr: None,
                 rejected: false,
+                hung: Some(per_input_timeout),
             });
         }
         // Hands-off robustness (#15): a diagnosed assertion/panic SIGABRT or a
@@ -6638,6 +6814,7 @@ fn run_c_libfuzzer_single_input_in(
                 sanitizer: None,
                 stderr: None,
                 rejected: true,
+                hung: None,
             });
         }
         // A genuine crash SIGNAL (silent SIGABRT/SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no sanitizer
@@ -6653,6 +6830,7 @@ fn run_c_libfuzzer_single_input_in(
             sanitizer: Some(fatal_signal_report(&output.status, &stderr)),
             stderr: Some(stderr.to_string()),
             rejected: false,
+            hung: None,
         });
     }
     Ok(HarnessRun {
@@ -6661,6 +6839,7 @@ fn run_c_libfuzzer_single_input_in(
         sanitizer: None,
         stderr: None,
         rejected: false,
+        hung: None,
     })
 }
 
@@ -6771,6 +6950,28 @@ pub(crate) fn parse_sanitizer_args(
         };
         if !out.contains(&sanitizer) {
             out.push(sanitizer);
+        }
+    }
+    // MemorySanitizer and ThreadSanitizer each need a build of their own: no
+    // other sanitizer links beside either (clang refuses
+    // `-fsanitize=address,memory`), so every target would fail to build.
+    for exclusive in [
+        multicore_fuzz::Sanitizer::Msan,
+        multicore_fuzz::Sanitizer::Tsan,
+    ] {
+        if out.contains(&exclusive) && out.len() > 1 {
+            let others: Vec<&str> = out
+                .iter()
+                .filter(|sanitizer| **sanitizer != exclusive)
+                .map(|sanitizer| sanitizer.as_str())
+                .collect();
+            return Err(format!(
+                "--sanitizers: {} cannot be combined with {}: it needs a build of its own; \
+                 run it as a separate campaign (`--sanitizers {}`)",
+                exclusive.as_str(),
+                others.join(", "),
+                exclusive.as_str()
+            ));
         }
     }
     Ok(SanitizerSelection::Set(out))
@@ -7990,9 +8191,9 @@ fn run_harness_with_protocol(
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
     let Some(status) = exit_status else {
-        // Timed out: a hung input produces no coverage/findings. Discard any
-        // partial event log and return a clean no-event run rather than
-        // hanging the engine.
+        // Timed out: a hung input produces no coverage. Discard any partial
+        // event log and return a no-event run marked hung, rather than
+        // hanging the engine; the pass confirms the hang (#207).
         let _ = fs::remove_file(&events_path);
         return Ok(HarnessRun {
             events: Vec::new(),
@@ -8000,6 +8201,7 @@ fn run_harness_with_protocol(
             sanitizer: None,
             stderr: None,
             rejected: false,
+            hung: Some(per_input_timeout),
         });
     };
     if !status.success() {
@@ -8020,6 +8222,7 @@ fn run_harness_with_protocol(
                 sanitizer: Some(report),
                 stderr: Some(stderr.to_string()),
                 rejected: false,
+                hung: None,
             });
         }
         // Hands-off robustness (#15): a diagnosed assertion/panic SIGABRT or a
@@ -8034,6 +8237,7 @@ fn run_harness_with_protocol(
                 sanitizer: None,
                 stderr: None,
                 rejected: true,
+                hung: None,
             });
         }
         // A genuine crash SIGNAL (silent SIGABRT/SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no report is a
@@ -8046,6 +8250,7 @@ fn run_harness_with_protocol(
             sanitizer: Some(fatal_signal_report(&status, &stderr)),
             stderr: Some(stderr.to_string()),
             rejected: false,
+            hung: None,
         });
     }
 
@@ -8071,6 +8276,7 @@ fn run_harness_with_protocol(
                 sanitizer: None,
                 stderr: None,
                 rejected: false,
+                hung: None,
             });
         }
         Err(error) => {
@@ -8094,6 +8300,7 @@ fn run_harness_with_protocol(
         sanitizer: None,
         stderr: None,
         rejected: false,
+        hung: None,
     })
 }
 
@@ -8151,6 +8358,212 @@ fn sanitizer_crash_reproduces(
             .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
     }
+}
+
+/// The catalog rule of an input that hangs the target (#207).
+const HANG_RULE: &str = "BHF-230";
+
+/// Whether `function` is instrumentation a stop signal can interrupt inside a
+/// loop (a coverage or comparison callback, a sanitizer hook or interceptor,
+/// bhf's driver runtime), not the code that loops.
+fn is_instrumentation_frame(function: &str) -> bool {
+    [
+        "__sanitizer_",
+        "__asan",
+        "__ubsan",
+        "__msan",
+        "__tsan",
+        "__lsan",
+        "__interceptor_",
+        "bhf_",
+    ]
+    .iter()
+    .any(|prefix| function.starts_with(prefix))
+}
+
+/// How many hangs one pass re-runs to confirm. A re-run costs twice the
+/// per-input timeout, and an input that hangs a loop is usually one of many
+/// mutants that do: past this many, later hangs are counted, not re-run.
+const MAX_HANG_CONFIRMATIONS: usize = 4;
+
+/// The executions of one builtin pass that were killed at the per-input
+/// timeout, and what their confirmation re-runs showed (#207).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct HangRunSummary {
+    /// The per-input timeout, in milliseconds.
+    pub timeout_ms: u64,
+    /// Executions killed at the per-input timeout.
+    pub observed: usize,
+    /// Hangs that hung again when re-run in a fresh process with twice the
+    /// timeout. Each is a finding, or a later hit of one.
+    pub confirmed: usize,
+    /// Hangs whose re-run finished: one slow execution, not a finding.
+    pub cleared: usize,
+    /// Hangs not re-run: the pass had already re-run
+    /// [`MAX_HANG_CONFIRMATIONS`], or too little of its time was left.
+    pub not_rerun: usize,
+}
+
+/// What re-running a hung input showed.
+enum HangConfirmation {
+    /// It hung again: the hang report and the stderr it was made from.
+    Hung(Box<corpus::SanitizerReport>, String),
+    /// It finished: one slow execution.
+    Finished,
+    /// It was not re-run: too little of the pass's time was left.
+    NotRerun,
+}
+
+/// The `<SAN>_OPTIONS` a hang confirmation runs under: `extra_env`'s, with
+/// `handle_abort=1`, so the runtime answers [`signal_for_stack`] with the
+/// stack the target is looping in.
+fn hang_stack_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = extra_env.to_vec();
+    for key in [
+        "ASAN_OPTIONS",
+        "UBSAN_OPTIONS",
+        "MSAN_OPTIONS",
+        "TSAN_OPTIONS",
+    ] {
+        match env.iter_mut().find(|(name, _)| name == key) {
+            Some((_, value)) => {
+                *value = corpus::sanitizer_options::merge(Some(value), "handle_abort=1");
+            }
+            None => env.push((
+                key.to_owned(),
+                corpus::sanitizer_options::merge(
+                    std::env::var(key).ok().as_deref(),
+                    "handle_abort=1",
+                ),
+            )),
+        }
+    }
+    env
+}
+
+/// Re-run an input that hung at `per_input_timeout` in a fresh process with
+/// twice that, asking the process for its stack if it hangs again: it has up
+/// to [`HANG_STACK_GRACE`] to print it, or what is left of the pass after the
+/// re-run if that is less. Not re-run when the pass has less time left than
+/// the re-run itself.
+fn confirm_hang(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+    pass_deadline: Option<Instant>,
+) -> Result<HangConfirmation, String> {
+    let confirm = per_input_timeout.saturating_mul(2);
+    let grace = match pass_deadline {
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left < confirm {
+                return Ok(HangConfirmation::NotRerun);
+            }
+            HANG_STACK_GRACE.min(left - confirm)
+        }
+        None => HANG_STACK_GRACE,
+    };
+    let input_path = write_fuzz_input(work_dir, input)?;
+    let output = run_with_timeout(
+        runner.harness_path(),
+        &input_path,
+        confirm,
+        &hang_stack_env(extra_env),
+        &ensure_harness_scratch(work_dir)?,
+        rss_limit_mb,
+        runner.qemu_prefix(),
+        SpawnTweaks {
+            stack_on_timeout: Some(grace),
+            ..SpawnTweaks::default()
+        },
+    );
+    let _ = fs::remove_file(&input_path);
+    let stderr = String::from_utf8_lossy(&output?.stderr).into_owned();
+    if !stderr.contains("exceeded per-input timeout") {
+        return Ok(HangConfirmation::Finished);
+    }
+    let report = hang_report(&stderr, per_input_timeout, confirm);
+    Ok(HangConfirmation::Hung(Box::new(report), stderr))
+}
+
+/// The BHF-230 report of a confirmed hang. Its stack is the one the sanitizer
+/// runtime printed when [`signal_for_stack`] stopped the re-run, if it printed
+/// one, from the first frame that is not instrumentation; the signal's own
+/// report is not the finding. Keyed on the stack's functions alone, so two
+/// inputs looping on different lines of one loop are one finding.
+fn hang_report(stderr: &str, timeout: Duration, confirm: Duration) -> corpus::SanitizerReport {
+    let mut stack = corpus::parse_sanitizer_report(stderr)
+        .map(|signalled| signalled.stack)
+        .unwrap_or_default();
+    if let Some(looping) = stack
+        .iter()
+        .position(|frame| !is_instrumentation_frame(&frame.function))
+    {
+        stack.drain(..looping);
+    }
+    corpus::SanitizerReport {
+        sanitizer: None,
+        kind: "timeout".to_owned(),
+        rule_id: HANG_RULE,
+        stack,
+        message: format!(
+            "harness did not finish within the per-input timeout ({}), and hung again when \
+             re-run with twice that ({})",
+            duration_arg(timeout),
+            duration_arg(confirm)
+        ),
+        ..Default::default()
+    }
+}
+
+/// The launcher beside a .NET harness's `main` that runs its build as it was
+/// before SharpFuzz instrumented it, with the debug symbols the instrumented
+/// assembly lost (#212).
+pub(crate) const DOTNET_SYMBOLS_LAUNCHER: &str = "main_symbols";
+
+/// `report` with the source lines of its frames, when it names none and the
+/// harness has [`DOTNET_SYMBOLS_LAUNCHER`]: the input re-run through the
+/// uninstrumented build, whose report must be the same exception. Its stderr
+/// comes with it, as the finding's log. `None` otherwise.
+fn dotnet_symbolized_report(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    report: &corpus::SanitizerReport,
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+) -> Option<(corpus::SanitizerReport, String)> {
+    if report.stack.is_empty() || report.stack.iter().any(|frame| frame.line.is_some()) {
+        return None;
+    }
+    let launcher = runner
+        .harness_path()
+        .with_file_name(DOTNET_SYMBOLS_LAUNCHER);
+    if !launcher.is_file() {
+        return None;
+    }
+    let input_path = write_fuzz_input(work_dir, input).ok()?;
+    let output = run_with_timeout(
+        &launcher,
+        &input_path,
+        per_input_timeout,
+        extra_env,
+        &ensure_harness_scratch(work_dir).ok()?,
+        rss_limit_mb,
+        None,
+        SpawnTweaks::default(),
+    );
+    let _ = fs::remove_file(&input_path);
+    let stderr = String::from_utf8_lossy(&output.ok()?.stderr).into_owned();
+    let symbolized = corpus::parse_sanitizer_report(&stderr)?;
+    (symbolized.rule_id == report.rule_id
+        && symbolized.kind == report.kind
+        && symbolized.stack.iter().any(|frame| frame.line.is_some()))
+    .then_some((symbolized, stderr))
 }
 
 /// The UBSan suppressions that turn its `object-size` check off at run time.
@@ -8736,6 +9149,136 @@ fn deadline_overrun_of(report: &corpus::SanitizerReport) -> &str {
         .message
         .strip_prefix("harness ")
         .unwrap_or(&report.message)
+}
+
+/// How many fresh runs re-check a response-deadline overrun (#209). It is a
+/// finding when most of them overrun the deadline too: one run slowed by a
+/// loaded host is not.
+const DEADLINE_CONFIRM_RUNS: usize = 3;
+
+/// The fresh re-runs of an input that overran `--deadline`, timed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeadlineConfirmation {
+    deadline: Duration,
+    /// Each re-run's wall-clock time, in order.
+    runs: Vec<Duration>,
+}
+
+impl DeadlineConfirmation {
+    fn overruns(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|took| **took > self.deadline)
+            .count()
+    }
+
+    /// Whether most of [`DEADLINE_CONFIRM_RUNS`] re-runs overran the deadline.
+    fn confirmed(&self) -> bool {
+        self.overruns() * 2 > DEADLINE_CONFIRM_RUNS
+    }
+
+    /// `2 of 2 fresh re-runs overran it too (took 1.0s, 1.0s)`.
+    fn describe(&self) -> String {
+        let took: Vec<String> = self.runs.iter().map(|took| duration_arg(*took)).collect();
+        format!(
+            "{} of {} fresh re-runs overran it too (took {})",
+            self.overruns(),
+            self.runs.len(),
+            if took.is_empty() {
+                "-".to_owned()
+            } else {
+                took.join(", ")
+            }
+        )
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let ms = |took: &Duration| u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        serde_json::json!({
+            "deadline_ms": ms(&self.deadline),
+            "rerun_ms": self.runs.iter().map(ms).collect::<Vec<_>>(),
+            "overruns": self.overruns(),
+        })
+    }
+
+    /// Record [`Self::to_json`] as the finding's `deadline_confirmation`.
+    fn record(&self, work_dir: &Path, finding_id: &str) {
+        let path = corpus::layout::finding_dir(work_dir, finding_id).join("finding.json");
+        let recorded = fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                let mut finding: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                finding["deadline_confirmation"] = self.to_json();
+                let bytes =
+                    serde_json::to_vec_pretty(&finding).map_err(|error| error.to_string())?;
+                crate::auto::report::atomic_write(&path, &bytes).map_err(|error| error.to_string())
+            });
+        if let Err(error) = recorded {
+            bhfeprintln!(
+                "warning: could not record the deadline confirmation of {finding_id}: {error}"
+            );
+        }
+    }
+}
+
+/// Re-run an input that overran `deadline` in fresh processes, timing each,
+/// until a majority of [`DEADLINE_CONFIRM_RUNS`] has decided, the pass's time
+/// runs out, or a run fails to start. Each run is bounded by the per-input
+/// timeout; one killed at it overran the deadline.
+#[allow(clippy::too_many_arguments)]
+fn confirm_deadline(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+    deadline: Duration,
+    pass_deadline: Option<Instant>,
+) -> DeadlineConfirmation {
+    let mut check = DeadlineConfirmation {
+        deadline,
+        runs: Vec::new(),
+    };
+    let needed = DEADLINE_CONFIRM_RUNS / 2 + 1;
+    while check.runs.len() < DEADLINE_CONFIRM_RUNS
+        && check.overruns() < needed
+        && check.runs.len() - check.overruns() < needed
+    {
+        let timeout = match pass_deadline {
+            Some(end) => per_input_timeout.min(end.saturating_duration_since(Instant::now())),
+            None => per_input_timeout,
+        };
+        let (Ok(input_path), Ok(scratch)) = (
+            write_fuzz_input(work_dir, input),
+            ensure_harness_scratch(work_dir),
+        ) else {
+            break;
+        };
+        if timeout <= deadline {
+            let _ = fs::remove_file(&input_path);
+            break;
+        }
+        let started = Instant::now();
+        let output = run_with_timeout(
+            runner.harness_path(),
+            &input_path,
+            timeout,
+            extra_env,
+            &scratch,
+            rss_limit_mb,
+            runner.qemu_prefix(),
+            SpawnTweaks::default(),
+        );
+        let took = started.elapsed();
+        let _ = fs::remove_file(&input_path);
+        if output.is_err() {
+            break;
+        }
+        check.runs.push(took);
+    }
+    check
 }
 
 /// Say on stderr that a run's deadline overrun is being recorded as a BHF-555
@@ -9361,8 +9904,7 @@ fn run_fresh_rerun(
             low_priority,
             cancel: background.then_some(context.cancelled),
             restore_priority: background.then_some(context.draining),
-            // Announced where the report is adopted, once it is a finding.
-            quiet_deadline: true,
+            ..SpawnTweaks::default()
         },
     );
     let _ = fs::remove_dir_all(&scratch);
@@ -9677,6 +10219,7 @@ impl ForkServer {
                 sanitizer: None,
                 stderr: None,
                 rejected: false,
+                hung: None,
             });
         }
         let event_delta_limit = max_event_delta_bytes();
@@ -9706,6 +10249,7 @@ impl ForkServer {
             sanitizer: None,
             stderr: None,
             rejected: false,
+            hung: None,
         })
     }
 }
@@ -10218,22 +10762,54 @@ pub(crate) fn resolve_env_deadline() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// Parse a duration flag: a number with an optional unit, `ms`, `s`, `m` or
+/// `h` (seconds when bare). The number may be fractional (`0.5s`, `1.5m`), and
+/// `500ms` is half a second, as the docs write it.
 pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("duration must not be empty".to_owned());
     }
-    let (number, multiplier) = match trimmed.as_bytes().last().copied() {
-        Some(b's') | Some(b'S') => (&trimmed[..trimmed.len() - 1], 1),
-        Some(b'm') | Some(b'M') => (&trimmed[..trimmed.len() - 1], 60),
-        Some(b'h') | Some(b'H') => (&trimmed[..trimmed.len() - 1], 60 * 60),
-        Some(b'0'..=b'9') => (trimmed, 1),
-        _ => return Err(format!("invalid duration '{value}'")),
+    let lower = trimmed.to_ascii_lowercase();
+    let (number, unit_millis): (&str, u64) = if let Some(number) = lower.strip_suffix("ms") {
+        (number, 1)
+    } else if let Some(number) = lower.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = lower.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = lower.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        (lower.as_str(), 1_000)
     };
-    let amount = number
-        .parse::<u64>()
-        .map_err(|error| format!("invalid duration '{value}': {error}"))?;
-    Ok(Duration::from_secs(amount.saturating_mul(multiplier)))
+    let number = number.trim();
+    let invalid = || {
+        format!(
+            "invalid duration '{value}': use a number with ms, s, m or h (500ms, 0.5s, 10s, 5m)"
+        )
+    };
+    if number.is_empty()
+        || number.matches('.').count() > 1
+        || !number.chars().all(|c| c.is_ascii_digit() || c == '.')
+        || number.starts_with('.') && number.len() == 1
+    {
+        return Err(invalid());
+    }
+    if let Ok(whole) = number.parse::<u64>() {
+        return Ok(Duration::from_millis(whole.saturating_mul(unit_millis)));
+    }
+    let amount: f64 = number.parse().map_err(|_| invalid())?;
+    Duration::try_from_secs_f64(amount * unit_millis as f64 / 1_000.0).map_err(|_| invalid())
+}
+
+/// A duration as a flag value a child `bhf` parses back exactly: whole
+/// seconds as `Ns`, anything finer as `Nms`.
+pub(crate) fn duration_arg(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn parse_worker_count(value: &str) -> Result<FuzzWorkerCount, String> {
@@ -13013,6 +13589,130 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    /// MemorySanitizer and ThreadSanitizer each need a build of their own;
+    /// ASan, UBSan and LSan combine.
+    #[test]
+    fn exclusive_sanitizers_are_refused_in_a_set() {
+        let set = |values: &[&str]| {
+            parse_sanitizer_args(&values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+        };
+        for (values, named) in [
+            (&["msan", "asan"][..], "msan cannot be combined with asan"),
+            (&["tsan", "ubsan"][..], "tsan cannot be combined with ubsan"),
+            (
+                &["asan", "tsan", "lsan"][..],
+                "tsan cannot be combined with asan, lsan",
+            ),
+            (&["msan", "tsan"][..], "msan cannot be combined with tsan"),
+        ] {
+            let error = set(values).expect_err(&format!("{values:?}"));
+            assert!(error.contains(named), "{values:?}: {error}");
+        }
+        for ok in [&["asan", "ubsan", "lsan"][..], &["msan"][..], &["tsan"][..]] {
+            assert!(set(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// A confirmed hang's report starts at the looping frame, below the
+    /// instrumentation callback the stop signal interrupted, and carries no
+    /// sanitizer of its own: the signal's report is not the finding.
+    #[test]
+    fn a_hang_report_starts_at_the_looping_frame() {
+        let stderr = "AddressSanitizer:DEADLYSIGNAL\n\
+            =================================================================\n\
+            ==7==ERROR: AddressSanitizer: ABRT on unknown address 0x03e800000007 (pc 0x55 bp 0x7f sp 0x7f T0)\n\
+            \x20   #0 0x55 in __sanitizer_cov_trace_pc_guard /src/c_runtime/bhf_driver.c:830:5\n\
+            \x20   #1 0x56 in walk_tlv /w/harnesses/H-TLV/target.c:6:14\n\
+            \x20   #2 0x57 in bhf_run_one_bytes /src/c_runtime/bhf_driver.c:1131:5\n\
+            \x20   #3 0x58 in main /src/c_runtime/bhf_driver.c:1280:9\n\
+            \n\
+            SUMMARY: AddressSanitizer: ABRT /src/c_runtime/bhf_driver.c:830:5 in __sanitizer_cov_trace_pc_guard\n\
+            bhf: harness exceeded per-input timeout of 400ms - killed\n";
+        let report = hang_report(
+            stderr,
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        );
+        assert_eq!(report.rule_id, HANG_RULE);
+        assert_eq!(report.kind, "timeout");
+        assert_eq!(report.sanitizer, None);
+        assert_eq!(report.location, None);
+        let functions: Vec<_> = report.stack.iter().map(|f| f.function.as_str()).collect();
+        assert_eq!(functions, ["walk_tlv", "bhf_run_one_bytes", "main"]);
+        assert_eq!(report.stack[0].line, Some(6));
+        assert!(
+            report.message.contains("200ms") && report.message.contains("400ms"),
+            "{}",
+            report.message
+        );
+
+        // Without a sanitizer's stack the report has none.
+        let bare = hang_report(
+            "bhf: harness exceeded per-input timeout of 400ms - killed\n",
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        );
+        assert!(bare.stack.is_empty());
+    }
+
+    /// The confirmation run asks every sanitizer runtime to answer SIGABRT
+    /// with its stack, after the options the run already had.
+    #[test]
+    fn hang_confirmations_arm_handle_abort_after_the_run_options() {
+        let env = hang_stack_env(&[
+            (
+                "ASAN_OPTIONS".to_owned(),
+                "abort_on_error=1:symbolize=1".to_owned(),
+            ),
+            ("BHF_COV_SHM".to_owned(), "/dev/shm/x".to_owned()),
+        ]);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("ASAN_OPTIONS"),
+            Some("abort_on_error=1:symbolize=1:handle_abort=1")
+        );
+        assert_eq!(value("BHF_COV_SHM"), Some("/dev/shm/x"));
+        for key in ["UBSAN_OPTIONS", "MSAN_OPTIONS", "TSAN_OPTIONS"] {
+            assert!(
+                value(key).is_some_and(|options| options.ends_with("handle_abort=1")),
+                "{key}: {env:?}"
+            );
+        }
+    }
+
+    /// `500ms` and `0.5s` are half a second, and a value with another unit
+    /// is refused.
+    #[test]
+    fn durations_take_milliseconds_and_fractions() {
+        for (text, millis) in [
+            ("500ms", 500),
+            ("0.5s", 500),
+            ("10s", 10_000),
+            ("10", 10_000),
+            ("1.5m", 90_000),
+            ("2h", 7_200_000),
+            (" 250MS ", 250),
+        ] {
+            assert_eq!(
+                parse_duration(text),
+                Ok(Duration::from_millis(millis)),
+                "{text}"
+            );
+        }
+        for bad in ["5x", "", "ms", ".s", "1.2.3s", "-1s", "1e3s"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(duration_arg(Duration::from_millis(500)), "500ms");
+        assert_eq!(duration_arg(Duration::from_secs(3)), "3s");
+        for value in [Duration::from_millis(1500), Duration::from_secs(30)] {
+            assert_eq!(parse_duration(&duration_arg(value)), Ok(value));
+        }
     }
 
     /// A native executable is named as the shim's target image, by absolute

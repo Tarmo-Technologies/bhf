@@ -232,6 +232,57 @@ jobs:
   # docs/site/*.md, which a documentation-only change can break. build-test
   # runs them with everything else; this lane runs them when the classifier
   # skipped the heavy jobs, and CI acceptance requires it to pass then.
+  # Native ARM64: the workspace (the runtrace shim included) builds, every
+  # test outside bhf's heavy integration suites passes, and `bhf auto` builds
+  # a C target and finds the stack overflow planted in it, on an ARM64 runner.
+  arm64-build:
+    name: ARM64 build, tests and auto smoke
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache the cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: arm64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: arm64-cargo-
+
+      # clang builds the harnesses; the ARM64 runtrace shim links with lld.
+      - name: Install clang, lld and make
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm make
+          clang --version | head -1
+
+      - name: Build the workspace and the runtrace shim
+        run: cargo build --locked --workspace
+
+      - name: Install cargo-nextest
+        run: bash scripts/ci/install-nextest.sh
+
+      - name: Test the workspace (all but bhf's heavy integration suites)
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: cargo nextest run --locked --workspace --no-fail-fast --profile ci -E 'not (package(bhf) & kind(test))'
+
+      - name: Find a planted bug with bhf auto
+        run: bash scripts/ci/arm64-auto-smoke.sh target/debug/bhf
+
   doc-contracts:
     name: Release and docs contract tests
     needs: changes
@@ -594,8 +645,9 @@ jobs:
       # build_recovery builds a release bhf of its own and stays off this job.
       # winafl_engine's end-to-end WinAFL campaigns need WinAFL and DynamoRIO,
       # which this runner does not install: they are #[ignore]d (and listed as
-      # ignored), so here it runs only the refusal that names them; the
-      # campaigns run with --ignored on a Windows machine that has the tools.
+      # ignored), so here it runs the refusal that names them and the x86
+      # smoke (--vs-arch x86, builtin engine); the nightly's WinAFL job runs
+      # the campaigns with --ignored against a pinned build.
       - name: Test the Windows integration suites
         shell: pwsh
         run: |
@@ -732,6 +784,7 @@ jobs:
       - doc-contracts
       - minimum-rust
       - build-test
+      - arm64-build
       - container-core
       - container-full
       - rhel7-build

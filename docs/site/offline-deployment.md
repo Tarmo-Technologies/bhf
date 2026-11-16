@@ -43,7 +43,7 @@ assistance, transfer approved model weights separately and point
 endpoint inside the enclave. BHF's distribution does not bundle weights or
 a model server.
 
-`bhf-daemon --mcp` can also serve its five read-only tools locally, but the
+`bhf-daemon --mcp` can also serve its read-only tools locally, but the
 MCP host must itself use an enclave-approved local model; MCP transport alone
 does not make a cloud-backed host offline. Review prompts, code, logs, findings,
 and MCP transcripts as controlled data. See [LLM Assistance](./llm.md) for the

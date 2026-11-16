@@ -10,16 +10,21 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, tool)
 }
 
 fn tempdir(name: &str) -> TestDir {

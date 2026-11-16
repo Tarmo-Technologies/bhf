@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -17,10 +19,13 @@ fn fixtures() -> PathBuf {
 }
 
 fn have(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|out| out.status.success())
+    let present = {
+        Command::new(program)
+            .args(args)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    support::require_tool(present, program)
 }
 
 /// Fuzz `file` from fixture `dir` with `language`, and check its divide by

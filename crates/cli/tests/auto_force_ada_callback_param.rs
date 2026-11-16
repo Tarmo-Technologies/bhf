@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod support;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -19,7 +21,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn gnat_available() -> bool {
-    which::which("gprbuild").is_ok() && which::which("gnatmake").is_ok()
+    let present = { which::which("gprbuild").is_ok() && which::which("gnatmake").is_ok() };
+    support::require_tool(present, "gnat")
 }
 
 fn outcome_for(fixture: &Path, work_dir: &Path, force: bool) -> String {

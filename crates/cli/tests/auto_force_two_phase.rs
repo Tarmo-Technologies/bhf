@@ -19,6 +19,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 /// A tree with two endpoints bhf can drive from bytes and one it cannot (a
 /// pointer to a type the tree never defines — no decoder, no constructor).
 const TREE: &str = r#"
@@ -41,7 +43,11 @@ int decode_beta(const uint8_t *d, size_t n) {
 "#;
 
 fn have_c() -> bool {
-    (which::which("clang").is_ok() || which::which("cc").is_ok()) && which::which("make").is_ok()
+    let present = {
+        (which::which("clang").is_ok() || which::which("cc").is_ok())
+            && which::which("make").is_ok()
+    };
+    support::require_tool(present, "c")
 }
 
 fn run(root: &Path, work: &Path, extra: &[&str]) -> (serde_json::Value, String) {

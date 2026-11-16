@@ -125,7 +125,11 @@ another type falls back to the name rules above. The target is then
 transpiled to CommonJS with [esbuild](https://esbuild.github.io/) (bundling local
 imports, leaving `node_modules` external) and driven by the identical warm-Node
 framed driver — same V8 block coverage, dictionary, exception oracle, and
-command-injection detector as the JavaScript lane.
+command-injection detector as the JavaScript lane. esbuild writes a source
+map beside the transpiled module and the harness runs node with
+`--enable-source-maps`, so a finding's stack, `finding.json` and SARIF name the
+`.ts` file and line (`src/codec.ts:7`), not the transpiled `target.js`. A plain
+JavaScript harness runs node without it.
 
 ```sh
 bhf auto path/to/ts-src --languages typescript   # needs node + esbuild

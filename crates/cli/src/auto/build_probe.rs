@@ -44,6 +44,106 @@ use std::process::Command;
 /// found without any extra plumbing.
 pub const PROBE_DIR: &str = ".bhf-build";
 const COVERAGE_PROBE_DIR: &str = ".bhf-build-cov";
+/// The file in a probe home that names the tree it probes.
+const SOURCE_TREE_MARKER: &str = "source-tree";
+/// The directory in a probe home that holds the copy of the tree a build that
+/// writes in place (Make, an intercepted command) runs in.
+const BUILD_COPY_DIR: &str = "src";
+
+/// The scan roots whose probes write under a work dir, with that work dir's
+/// probe root (`<work>/probe`) (#210).
+static PROBE_ROOTS: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// Send the build probes of `root`, and of every directory under it, to
+/// `<work_dir>/probe/`: a probe then writes nothing into the scanned tree,
+/// and a read-only checkout can be probed.
+pub fn register_probe_root(root: &Path, work_dir: &Path) {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let probes = work_dir.join("probe");
+    let mut roots = PROBE_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    roots.retain(|(registered, _)| *registered != root);
+    roots.push((root, probes));
+}
+
+/// The probe root of the registered scan root `tree` lies under.
+fn registered_probe_root(tree: &Path) -> Option<(PathBuf, PathBuf)> {
+    let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+    let roots = PROBE_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    roots
+        .iter()
+        .filter(|(root, _)| tree.starts_with(root))
+        .max_by_key(|(root, _)| root.components().count())
+        .map(|(_, probes)| (tree.clone(), probes.clone()))
+}
+
+/// `<work>/probe/<name>-<hash>`, where the probe of `tree` writes, when a work
+/// dir is registered for it.
+fn probe_home(tree: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let (tree, probes) = registered_probe_root(tree)?;
+    let name: String = tree
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    let digest = Sha256::digest(tree.as_os_str().to_string_lossy().as_bytes());
+    let hash: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(probes.join(format!("{name}-{hash}")))
+}
+
+/// The directory the build probe of `tree` builds in and writes its compile
+/// database to: `<probe home>/.bhf-build`, or `<tree>/.bhf-build` when no
+/// work dir is registered for the tree (a work dir probed before the probe
+/// left the tree, or a direct call).
+pub fn probe_dir(tree: &Path) -> PathBuf {
+    probe_home(tree).map_or_else(|| tree.join(PROBE_DIR), |home| home.join(PROBE_DIR))
+}
+
+/// The probe's source-coverage build directory, beside [`probe_dir`].
+fn coverage_probe_dir(tree: &Path) -> PathBuf {
+    probe_home(tree).map_or_else(
+        || tree.join(COVERAGE_PROBE_DIR),
+        |home| home.join(COVERAGE_PROBE_DIR),
+    )
+}
+
+/// Name `tree` in the probe home of `probe_dir` (when it has one, rather than
+/// being in the tree), so its archives and logs can be traced back to it.
+fn mark_probe_home(tree: &Path, probe_dir: &Path) {
+    if *probe_dir == tree.join(PROBE_DIR) {
+        return;
+    }
+    if let Some(home) = probe_dir.parent() {
+        let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+        let _ = std::fs::create_dir_all(home);
+        let _ = std::fs::write(home.join(SOURCE_TREE_MARKER), tree.display().to_string());
+    }
+}
+
+/// The probe home a path lies in (it holds a [`SOURCE_TREE_MARKER`]), and the
+/// tree that home probes.
+fn enclosing_probe_home(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    path.ancestors().find_map(|dir| {
+        let tree = std::fs::read_to_string(dir.join(SOURCE_TREE_MARKER)).ok()?;
+        Some((dir.to_path_buf(), PathBuf::from(tree.trim_end())))
+    })
+}
 const PROBE_REQUIREMENTS_FILE: &str = "missing-requirements.json";
 const PROBE_ARTIFACTS_FILE: &str = "bhf-artifacts.json";
 
@@ -306,7 +406,7 @@ fn write_probe_artifact_manifest(
     instrumentation: &ProbeInstrumentation,
     build_succeeded: bool,
 ) {
-    write_artifact_manifest_at(&tree.join(PROBE_DIR), instrumentation, build_succeeded);
+    write_artifact_manifest_at(&probe_dir(tree), instrumentation, build_succeeded);
 }
 
 fn write_artifact_manifest_at(
@@ -337,14 +437,14 @@ pub struct ProbeRequirement {
 }
 
 pub fn load_probe_requirements(tree: &Path) -> Vec<ProbeRequirement> {
-    std::fs::read_to_string(tree.join(PROBE_DIR).join(PROBE_REQUIREMENTS_FILE))
+    std::fs::read_to_string(probe_dir(tree).join(PROBE_REQUIREMENTS_FILE))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
 
 fn record_probe_requirement(tree: &Path, requirement: ProbeRequirement) {
-    let path = tree.join(PROBE_DIR).join(PROBE_REQUIREMENTS_FILE);
+    let path = probe_dir(tree).join(PROBE_REQUIREMENTS_FILE);
     let mut requirements = load_probe_requirements(tree);
     if let Some(existing) = requirements
         .iter_mut()
@@ -587,6 +687,9 @@ pub(crate) fn existing_compile_database(tree: &Path) -> Option<PathBuf> {
     ]
     .iter()
     .map(|dir| tree.join(dir).join("compile_commands.json"))
+    .chain(std::iter::once(
+        probe_dir(tree).join("compile_commands.json"),
+    ))
     .find(|path| path.is_file())
 }
 
@@ -1102,14 +1205,16 @@ pub fn probe_build(
             build_root.display()
         );
     }
-    let probe_dir = build_root.join(PROBE_DIR);
+    let probe_dir = probe_dir(build_root);
     // A user working offline (no buildable configure) may already have a valid
     // compile_commands.json and place it at exactly the path our failure message
-    // names — PROBE_DIR/compile_commands.json. Capture it before the destructive
-    // wipe below so a failed regeneration RESTORES the DB the user supplied
-    // instead of silently deleting it (the reported "put it where bhf says it's
-    // looking and it's ignored" footgun).
-    let user_supplied_db = std::fs::read(probe_dir.join("compile_commands.json")).ok();
+    // names — PROBE_DIR/compile_commands.json, in the tree or the probe home.
+    // Capture it before the destructive wipe below so a failed regeneration
+    // RESTORES the DB the user supplied instead of silently deleting it (the
+    // reported "put it where bhf says it's looking and it's ignored" footgun).
+    let user_supplied_db = std::fs::read(probe_dir.join("compile_commands.json"))
+        .or_else(|_| std::fs::read(build_root.join(PROBE_DIR).join("compile_commands.json")))
+        .ok();
     // This directory is bhf-owned build output. Reusing a CMakeCache or an
     // archive from a prior sanitizer selection can make configuration lie about
     // its compiler and can link ASan objects into a `--sanitizers none` harness.
@@ -1120,6 +1225,7 @@ pub fn probe_build(
     if std::fs::create_dir_all(&probe_dir).is_err() {
         return None;
     }
+    mark_probe_home(build_root, &probe_dir);
     let _ = std::fs::remove_file(probe_dir.join(PROBE_REQUIREMENTS_FILE));
     let db = probe_dir.join("compile_commands.json");
     let instrumentation = ProbeInstrumentation::for_selection(sanitizers);
@@ -1612,6 +1718,14 @@ pub fn discover_static_libraries(tree: &Path) -> Vec<PathBuf> {
     }
     for probe in probe_dirs_under(tree) {
         collect_static_libraries(&probe, 0, &mut out);
+        // A build that writes in place left its archives in the tree's copy.
+        if let Some((home, _)) = enclosing_probe_home(&probe) {
+            collect_static_libraries(
+                &home.join(BUILD_COPY_DIR),
+                RECOVERED_ARTIFACT_MAX_DEPTH,
+                &mut out,
+            );
+        }
     }
     out.sort();
     out.dedup();
@@ -1655,6 +1769,18 @@ pub fn compatible_probe_static_libraries(
 /// instrumentation manifest is the trust/compatibility boundary.
 fn probe_dirs_under(tree: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    // The probe homes in the work dir of the trees at or below `tree`.
+    if let Some((tree, probes)) = registered_probe_root(tree) {
+        for entry in std::fs::read_dir(&probes).into_iter().flatten().flatten() {
+            let home = entry.path();
+            let probed = std::fs::read_to_string(home.join(SOURCE_TREE_MARKER));
+            if probed.is_ok_and(|probed| Path::new(probed.trim_end()).starts_with(&tree))
+                && home.join(PROBE_DIR).is_dir()
+            {
+                found.push(home.join(PROBE_DIR));
+            }
+        }
+    }
     let mut stack = vec![(tree.to_path_buf(), 0u32)];
     while let Some((dir, depth)) = stack.pop() {
         let direct = dir.join(PROBE_DIR);
@@ -1703,7 +1829,12 @@ fn owning_probe_tree_and_relative(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     for ancestor in path.ancestors() {
         if ancestor.file_name().and_then(|name| name.to_str()) == Some(PROBE_DIR) {
-            let tree = ancestor.parent()?.to_path_buf();
+            // A probe home in the work dir names its tree; a probe dir in the
+            // tree is inside it.
+            let tree = match enclosing_probe_home(ancestor) {
+                Some((_, tree)) => tree,
+                None => ancestor.parent()?.to_path_buf(),
+            };
             let relative = path.strip_prefix(ancestor).ok()?.to_path_buf();
             return Some((tree, relative));
         }
@@ -1727,7 +1858,7 @@ pub fn coverage_variant_for_probe_archive(archive: &Path) -> Option<PathBuf> {
     if !find_on_path("cmake") {
         return None;
     }
-    let coverage_probe = tree.join(COVERAGE_PROBE_DIR);
+    let coverage_probe = coverage_probe_dir(&tree);
     let instrumentation = ProbeInstrumentation::for_source_coverage();
     let compatible_configuration = std::fs::read(coverage_probe.join(PROBE_ARTIFACTS_FILE))
         .ok()
@@ -1751,7 +1882,7 @@ pub fn coverage_variant_for_probe_archive(archive: &Path) -> Option<PathBuf> {
         return Some(same_relative_coverage_archive);
     }
 
-    let primary_probe = tree.join(PROBE_DIR);
+    let primary_probe = probe_dir(&tree);
     let primary_archive = primary_probe.join(&relative);
     let primary_archive = primary_archive.canonicalize().unwrap_or(primary_archive);
     let (target, artifact_relative) = cmake_static_library_target_artifacts(&primary_probe)
@@ -1929,7 +2060,7 @@ fn coverage_variant_for_intercept_archive(
     archive: &Path,
     relative: &Path,
 ) -> Option<PathBuf> {
-    let coverage_probe = tree.join(COVERAGE_PROBE_DIR);
+    let coverage_probe = coverage_probe_dir(tree);
     let coverage_archive = coverage_probe.join(relative);
     let instrumentation = ProbeInstrumentation::for_source_coverage();
     let compatible = std::fs::read(coverage_probe.join(PROBE_ARTIFACTS_FILE))
@@ -1959,10 +2090,9 @@ fn coverage_variant_for_intercept_archive(
     if members.is_empty() {
         return None;
     }
-    let entries: Vec<ProbeEntry> =
-        std::fs::read(tree.join(PROBE_DIR).join("compile_commands.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+    let entries: Vec<ProbeEntry> = std::fs::read(probe_dir(tree).join("compile_commands.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
     let mut selected = BTreeMap::<String, ProbeEntry>::new();
     for entry in entries {
         if !entry.arguments.iter().any(|arg| arg == "-c") {
@@ -2334,7 +2464,12 @@ fn probe_build_archives(probe: &Path) -> Vec<(PathBuf, PathBuf)> {
         .into_iter()
         .map(|archive| (archive, probe.to_path_buf()))
         .collect();
-    let Some(owner) = probe.parent() else {
+    // The tree the build ran in: the copy in the probe home for a build that
+    // writes in place, else the directory the probe dir is in.
+    let copy = enclosing_probe_home(probe)
+        .map(|(home, _)| home.join(BUILD_COPY_DIR))
+        .filter(|copy| copy.is_dir());
+    let Some(owner) = copy.as_deref().or_else(|| probe.parent()) else {
         return archives;
     };
     // The owner's own files only (no recursion into its sources), then the
@@ -2548,8 +2683,8 @@ fn cross_compile_arguments(
 /// `.so`/`.a` paths CMake already proved, in their original order.
 pub fn probe_archive_link_dependencies(tree: &Path, archive: &Path) -> Vec<PathBuf> {
     let probe = owning_probe_tree_and_relative(archive)
-        .map(|(owner, _)| owner.join(PROBE_DIR))
-        .unwrap_or_else(|| tree.join(PROBE_DIR));
+        .map(|(owner, _)| probe_dir(&owner))
+        .unwrap_or_else(|| probe_dir(tree));
     let mut link_files = Vec::new();
     collect_named_files(&probe, 0, "link.txt", &mut link_files);
     link_files.sort();
@@ -2596,10 +2731,7 @@ fn intercept_archive_link_dependencies(tree: &Path, archive: &Path) -> Vec<PathB
         return Vec::new();
     }
 
-    let log = tree
-        .join(PROBE_DIR)
-        .join("intercept")
-        .join("cc-invocations.log");
+    let log = probe_dir(tree).join("intercept").join("cc-invocations.log");
     let Ok(log) = std::fs::read_to_string(log) else {
         return Vec::new();
     };
@@ -3183,16 +3315,121 @@ fn probe_make(
         ("BHF_REAL_CC".to_owned(), real_cc.clone()),
         ("BHF_CC_LOG".to_owned(), log.display().to_string()),
     ];
-    run_build(tree, &["make".to_owned()], &env, sandbox_program);
+    // make writes its objects (and a configure step its headers) in place:
+    // with a probe home it builds a copy of the tree there, and the tree is
+    // left as it was.
+    let build_dir = match build_copy(tree, probe_dir) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            bhfeprintln!("bhf auto: --probe-build: {reason}; skipping Make probe");
+            return None;
+        }
+    };
+    run_build(&build_dir, &["make".to_owned()], &env, sandbox_program);
 
-    let log_text = std::fs::read_to_string(&log).ok()?;
-    let entries = parse_cc_log(&log_text, &real_cc);
+    let Ok(log_text) = std::fs::read_to_string(&log) else {
+        bhfeprintln!(
+            "bhf auto: --probe-build: make ran no compiler (it failed before its first \
+             compile, or the Makefile ignores $CC), so there is no compile database; run \
+             `make` in {} to see why",
+            build_dir.display()
+        );
+        return None;
+    };
+    let mut entries = parse_cc_log(&log_text, &real_cc);
     if entries.is_empty() {
         return None;
+    }
+    if build_dir != tree {
+        for entry in &mut entries {
+            entry.file = source_path_in_tree(&entry.directory, &entry.file, &build_dir, tree);
+        }
     }
     let json = serde_json::to_vec_pretty(&entries).ok()?;
     std::fs::write(db, json).ok()?;
     Some(db.to_path_buf())
+}
+
+/// The directory a build that writes in place runs in: with a probe home, a
+/// fresh copy of `tree` in it (`<home>/src`), else `tree` itself.
+fn build_copy(tree: &Path, probe_dir: &Path) -> Result<PathBuf, String> {
+    let Some((home, _)) = enclosing_probe_home(probe_dir) else {
+        return Ok(tree.to_path_buf());
+    };
+    let copy = home.join(BUILD_COPY_DIR);
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy)
+        .map_err(|error| format!("create {}: {error}", copy.display()))?;
+    // The build's compilers report their directory without Windows' `\\?\`
+    // prefix, and a compile entry is mapped back to the tree by that prefix.
+    let copy = crate::auto::cli::strip_verbatim_prefix(copy.canonicalize().unwrap_or(copy));
+    let from = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+    copy_tree(&from, &copy, &copy).map_err(|error| {
+        format!(
+            "could not copy {} to build it outside the tree: {error}",
+            tree.display()
+        )
+    })?;
+    Ok(copy)
+}
+
+/// Copy `from` to `to` for a build: every file writable, symbolic links as
+/// links, without version-control metadata, bhf's own probe output, or the
+/// directory the copy goes to (`dest`, which is in a work dir inside the tree
+/// when the work dir is).
+fn copy_tree(from: &Path, to: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some(".git" | ".hg" | ".svn" | PROBE_DIR | COVERAGE_PROBE_DIR)
+        ) {
+            continue;
+        }
+        let source = entry.path();
+        if dest.starts_with(&source) {
+            continue;
+        }
+        let target = to.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            let link = std::fs::read_link(&source)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link, &target)?;
+            #[cfg(not(unix))]
+            {
+                let _ = link;
+                std::fs::copy(&source, &target)?;
+            }
+        } else if kind.is_dir() {
+            copy_tree(&source, &target, dest)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+            let mut permissions = std::fs::metadata(&target)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&target, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+/// A compile entry's source file, built in the copy `build_dir` of `tree`,
+/// named by its path in the tree: the compile database is looked up by the
+/// tree's files. Its directory stays the copy's, so its relative include
+/// paths still find the headers the build generated there.
+fn source_path_in_tree(directory: &Path, file: &Path, build_dir: &Path, tree: &Path) -> PathBuf {
+    let absolute = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        directory.join(file)
+    };
+    match absolute.strip_prefix(build_dir) {
+        Ok(relative) => tree.join(relative),
+        Err(_) => file.to_path_buf(),
+    }
 }
 
 // --- Universal interception tier (`--build-command`) ---------------------------
@@ -3410,11 +3647,12 @@ pub fn probe_build_command(
     if cfg!(windows) {
         return probe_build_command_windows(tree, command);
     }
-    let probe_dir = tree.join(PROBE_DIR);
+    let probe_dir = probe_dir(tree);
     let intercept_dir = probe_dir.join("intercept");
     if std::fs::create_dir_all(&intercept_dir).is_err() {
         return None;
     }
+    mark_probe_home(tree, &probe_dir);
     let _ = std::fs::remove_file(probe_dir.join(PROBE_REQUIREMENTS_FILE));
     let log = intercept_dir.join("cc-invocations.log");
     let _ = std::fs::remove_file(&log);
@@ -3534,17 +3772,31 @@ pub fn probe_build_command(
             env.push(("LD_PRELOAD".to_owned(), chained));
         }
     }
+    // The command builds in place: with a probe home it builds a copy of the
+    // tree there, and the tree is left as it was.
+    let build_dir = match build_copy(tree, &probe_dir) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            bhfeprintln!("bhf auto: --build-command: {reason}");
+            return None;
+        }
+    };
     let build_succeeded = run_build(
-        tree,
+        &build_dir,
         &["sh".to_owned(), "-c".to_owned(), command.to_owned()],
         &env,
         sandbox_program,
     );
-    mirror_root_static_libraries(tree, &probe_dir);
+    mirror_root_static_libraries(&build_dir, &probe_dir);
     write_artifact_manifest_at(&probe_dir, &instrumentation, build_succeeded);
 
     let log_text = std::fs::read_to_string(&log).ok()?;
-    let entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    let mut entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    if build_dir != tree {
+        for entry in &mut entries {
+            entry.file = source_path_in_tree(&entry.directory, &entry.file, &build_dir, tree);
+        }
+    }
     if entries.is_empty() {
         bhfeprintln!(
             "bhf auto: --build-command: intercepted no compiler invocations \
@@ -3671,13 +3923,14 @@ pub(crate) fn run_intercept_shim(stem: &str, args: &[std::ffi::OsString]) -> i32
 /// real cl). The command runs through `cmd.exe`. The real build is not
 /// altered: the shims record and pass every argument through.
 fn probe_build_command_windows(tree: &Path, command: &str) -> Option<PathBuf> {
-    let probe_dir = tree.join(PROBE_DIR);
+    let probe_dir = probe_dir(tree);
     let intercept_dir = probe_dir.join("intercept");
     let log_dir = intercept_dir.join("records");
     let _ = std::fs::remove_dir_all(&log_dir);
     if std::fs::create_dir_all(&log_dir).is_err() {
         return None;
     }
+    mark_probe_home(tree, &probe_dir);
     let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (name, real) in collect_intercept_targets() {
         // A cross-prefixed name found on disk carries its own extension.
@@ -3711,7 +3964,16 @@ fn probe_build_command_windows(tree: &Path, command: &str) -> Option<PathBuf> {
     let mut env =
         windows_intercept_env(&intercept_dir, &map_file, &log_dir, map.contains_key("cl"));
     env.push(("MSBUILDDISABLENODEREUSE".to_owned(), "1".to_owned()));
-    let build_succeeded = run_windows_command(tree, command, &env);
+    // The command builds in place: with a probe home it builds a copy of the
+    // tree there.
+    let build_dir = match build_copy(tree, &probe_dir) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            bhfeprintln!("bhf auto: --build-command: {reason}");
+            return None;
+        }
+    };
+    let build_succeeded = run_windows_command(&build_dir, command, &env);
     if !build_succeeded {
         bhfeprintln!("bhf auto: --build-command: `{command}` failed; using what it compiled");
     }
@@ -3725,7 +3987,12 @@ fn probe_build_command_windows(tree: &Path, command: &str) -> Option<PathBuf> {
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .collect();
-    let entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    let mut entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    if build_dir != tree {
+        for entry in &mut entries {
+            entry.file = source_path_in_tree(&entry.directory, &entry.file, &build_dir, tree);
+        }
+    }
     if entries.is_empty() {
         bhfeprintln!(
             "bhf auto: --build-command: intercepted no compiler invocations \
@@ -3877,6 +4144,15 @@ fn intercept_entry_is_better(candidate: &ProbeEntry, current: &ProbeEntry) -> bo
     }
 }
 
+/// The probe home a build in `cwd` writes to: the one `cwd` (a build's copy
+/// of the tree) is in, or the one of the tree `cwd` is.
+fn writable_probe_home(cwd: &Path) -> Option<PathBuf> {
+    enclosing_probe_home(cwd)
+        .map(|(home, _)| home)
+        .or_else(|| probe_home(cwd))
+        .filter(|home| home.is_dir())
+}
+
 /// Build the `Command` for a probe build in `cwd` with `env`, wrapped in the
 /// sandbox when one is available. The whole tree is bind-mounted read-write (the
 /// build writes objects, generated headers, and the probe dir); the rest of the
@@ -3893,9 +4169,22 @@ fn build_command(
         Some(program) if program.file_name().and_then(|n| n.to_str()) == Some("bwrap") => {
             let mut c = Command::new(program);
             c.args(bwrap_fs_args());
-            // The tree is the one read-write area (objects, generated headers,
-            // the probe dir); everything else stays read-only.
-            c.arg("--bind").arg(cwd).arg(cwd);
+            // The probe home in the work dir is the one read-write area
+            // (objects, generated headers, the probe dir, a build's copy of
+            // the tree), and the tree is read-only. Without a probe home the
+            // tree itself is the read-write area; everything else stays
+            // read-only.
+            match writable_probe_home(cwd) {
+                Some(home) => {
+                    if !cwd.starts_with(&home) {
+                        c.arg("--ro-bind").arg(cwd).arg(cwd);
+                    }
+                    c.arg("--bind").arg(&home).arg(&home);
+                }
+                None => {
+                    c.arg("--bind").arg(cwd).arg(cwd);
+                }
+            }
             c.arg("--chdir").arg(cwd);
             for (key, value) in env {
                 c.arg("--setenv").arg(key).arg(value);
@@ -3908,6 +4197,9 @@ fn build_command(
             let mut c = Command::new(program);
             c.args(["--quiet", "--net=none", "--private-tmp"]);
             c.arg(format!("--whitelist={}", cwd.display()));
+            if let Some(home) = writable_probe_home(cwd) {
+                c.arg(format!("--whitelist={}", home.display()));
+            }
             c.arg("--");
             c.args(args);
             c.current_dir(cwd);
@@ -3966,6 +4258,33 @@ mod tests {
 
     fn tmpdir() -> crate::test_support::TestDir {
         crate::test_support::TestDir::new("probe")
+    }
+
+    /// The copy a `--build-command` builds is named as its compilers name
+    /// their directory: on Windows, without the `\\?\` prefix `canonicalize`
+    /// adds, so a compile entry built there maps back to the tree's file.
+    #[test]
+    fn a_compile_entry_built_in_the_copy_names_the_tree_file() {
+        let root = tmpdir();
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("core")).unwrap();
+        fs::write(tree.join("core/widget.c"), "int widget;\n").unwrap();
+        let home = root.join("probe/tree-0");
+        let probe = home.join(PROBE_DIR);
+        fs::create_dir_all(&probe).unwrap();
+        fs::write(home.join(SOURCE_TREE_MARKER), tree.display().to_string()).unwrap();
+
+        let copy = build_copy(&tree, &probe).unwrap();
+        assert!(
+            !copy.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            copy.display()
+        );
+        assert!(copy.join("core/widget.c").is_file());
+        assert_eq!(
+            source_path_in_tree(&copy.join("core"), Path::new("widget.c"), &copy, &tree),
+            tree.join("core").join("widget.c")
+        );
     }
 
     #[test]
@@ -4383,8 +4702,12 @@ mod tests {
     #[test]
     fn probe_archives_are_rebuilt_for_a_cross_target() {
         let cross = "aarch64-linux-gnu-gcc";
-        if which::which(cross).is_err() || which::which("gcc").is_err() {
-            eprintln!("skip: {cross}/gcc unavailable");
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || which::which(cross).is_err()
+            || which::which("gcc").is_err()
+        {
+            eprintln!("skip: {cross}/gcc unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();
@@ -4477,11 +4800,13 @@ mod tests {
     #[test]
     fn a_make_tier_projects_archives_are_rebuilt_for_a_cross_target() {
         let cross = "aarch64-linux-gnu-gcc";
-        if ["make", "cc", "ar", cross]
-            .iter()
-            .any(|tool| which::which(tool).is_err())
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || ["make", "cc", "ar", cross]
+                .iter()
+                .any(|tool| which::which(tool).is_err())
         {
-            eprintln!("skip: make/cc/ar/{cross} unavailable");
+            eprintln!("skip: make/cc/ar/{cross} unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();
@@ -4534,8 +4859,12 @@ mod tests {
     #[test]
     fn same_named_members_are_rebuilt_from_their_own_translation_units() {
         let cross = "aarch64-linux-gnu-gcc";
-        if which::which(cross).is_err() || which::which("gcc").is_err() {
-            eprintln!("skip: {cross}/gcc unavailable");
+        // On an aarch64 host the host's archives are the cross target's already.
+        if cfg!(target_arch = "aarch64")
+            || which::which(cross).is_err()
+            || which::which("gcc").is_err()
+        {
+            eprintln!("skip: {cross}/gcc unavailable, or the host is aarch64");
             return;
         }
         let root = tmpdir();

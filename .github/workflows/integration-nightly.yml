@@ -313,13 +313,71 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # The WinAFL campaigns of winafl_engine (x64, x64 under PageHeap, x86), which
+  # need WinAFL and DynamoRIO: the pinned pair (docs/site/windows.md) built by
+  # scripts/ci/build-winafl.ps1, x64 and x86, and cached under its versions
+  # and the script's hash, so a cache hit skips the build.
+  winafl:
+    name: Integration tests (bhf) (WinAFL, Windows)
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Restore the WinAFL and DynamoRIO build
+        id: winafl-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\tools\bhf-winafl
+          key: winafl-fd85f38548-dynamorio-11.91.20763-${{ hashFiles('scripts/ci/build-winafl.ps1') }}
+
+      - name: Build WinAFL (x64 and x86) against DynamoRIO
+        if: steps.winafl-build.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: scripts/ci/build-winafl.ps1 -Root C:\tools\bhf-winafl
+
+      - name: Save the WinAFL and DynamoRIO build
+        if: steps.winafl-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\tools\bhf-winafl
+          key: ${{ steps.winafl-build.outputs.cache-primary-key }}
+
+      # The harnesses build with clang and GNU make, which the image lacks.
+      - name: Install GNU make
+        shell: pwsh
+        run: |
+          choco install make --version=4.4.1 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The PageHeap campaign needs an elevated shell, which the hosted
+      # runner's is. One campaign at a time, so none starves another's budget.
+      - name: Run the WinAFL end-to-end tests
+        shell: pwsh
+        env:
+          BHF_WINAFL_PATH: C:\tools\bhf-winafl\winafl
+          BHF_DYNAMORIO_PATH: C:\tools\bhf-winafl\DynamoRIO-Windows-11.91.20763
+        run: |
+          cargo test --locked -p bhf --test winafl_engine -- --ignored --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   # A failed or timed-out shard opens one tracking issue for this branch, or
   # updates the open one, and comments on it when a new commit fails. A run
   # cancelled by a newer one reports nothing.
   report-failure:
     name: Report a failed nightly
-    needs: [gate, build, integration]
-    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.build.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled') }}
+    needs: [gate, build, integration, winafl]
+    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.build.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled' || needs.winafl.result == 'failure' || needs.winafl.result == 'cancelled') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

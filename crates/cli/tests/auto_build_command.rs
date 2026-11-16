@@ -16,17 +16,23 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 fn toolchain_available() -> bool {
-    if which::which("clang").is_err() {
-        eprintln!("skipping auto_build_command: clang not on PATH");
-        return false;
+    fn probe() -> bool {
+        if which::which("clang").is_err() {
+            eprintln!("skipping auto_build_command: clang not on PATH");
+            return false;
+        }
+        // The shim execs `cc`; require a host C compiler the build script can call.
+        if which::which("cc").is_err() && which::which("gcc").is_err() {
+            eprintln!("skipping auto_build_command: no cc/gcc on PATH");
+            return false;
+        }
+        true
     }
-    // The shim execs `cc`; require a host C compiler the build script can call.
-    if which::which("cc").is_err() && which::which("gcc").is_err() {
-        eprintln!("skipping auto_build_command: no cc/gcc on PATH");
-        return false;
-    }
-    true
+    let present = probe();
+    support::require_tool(present, "toolchain")
 }
 
 fn write_fixture(root: &Path) {
@@ -81,7 +87,9 @@ fn build_command_interception_recovers_flags_and_fuzzes() {
 
     // The interception must have produced a compile database with the recovered
     // include dir + define.
-    let db_path = root.join(".bhf-build/compile_commands.json");
+    // Recovered under the work dir: the tree stays as it was.
+    assert!(!root.join(".bhf-build").exists());
+    let db_path = support::probe_dir_in(&work).join("compile_commands.json");
     let db = std::fs::read_to_string(&db_path).unwrap_or_else(|e| {
         panic!(
             "read {}: {e}; bhf auto exit={:?}\nstderr:\n{}",
@@ -170,7 +178,9 @@ fn build_command_intercepts_an_absolute_path_compiler() {
         .output()
         .expect("spawn bhf auto");
 
-    let db_path = root.join(".bhf-build/compile_commands.json");
+    // Recovered under the work dir: the tree stays as it was.
+    assert!(!root.join(".bhf-build").exists());
+    let db_path = support::probe_dir_in(&work).join("compile_commands.json");
     let db: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&db_path).unwrap_or_else(|e| {
             panic!(

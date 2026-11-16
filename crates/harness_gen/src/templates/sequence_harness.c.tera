@@ -865,23 +865,6 @@ static int bhf_afl_loop_remaining = 1;
 #define __AFL_INIT()
 #endif
 
-/* Under AddressSanitizer the bytes of the testcase buffer past the input are
- * poisoned while the target runs, so a read one past a buffer that views the
- * input is reported (as use-after-poison), as it is in the lanes that pass
- * each input in a heap allocation of exactly its size. */
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define BHF_AFL_POISON_TAIL 1
-#endif
-#endif
-#if !defined(BHF_AFL_POISON_TAIL) && defined(__SANITIZE_ADDRESS__)
-#define BHF_AFL_POISON_TAIL 1
-#endif
-#if defined(BHF_AFL_POISON_TAIL)
-void __asan_poison_memory_region(void const volatile *addr, size_t size);
-void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
-#endif
-
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -889,20 +872,17 @@ int main(int argc, char **argv) {
     __AFL_INIT();
 #endif
     uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
-#if defined(BHF_AFL_POISON_TAIL)
-    size_t poisoned_from = BHF_AFL_BUF_CAP;
-#endif
     while (__AFL_LOOP(10000)) {
-#if defined(BHF_AFL_POISON_TAIL)
-        /* The next input is written into the whole buffer. */
-        __asan_unpoison_memory_region(buf + poisoned_from, BHF_AFL_BUF_CAP - poisoned_from);
-#endif
         size_t len = (size_t)__AFL_FUZZ_TESTCASE_LEN;
-#if defined(BHF_AFL_POISON_TAIL)
-        poisoned_from = len < BHF_AFL_BUF_CAP ? len : BHF_AFL_BUF_CAP;
-        __asan_poison_memory_region(buf + poisoned_from, BHF_AFL_BUF_CAP - poisoned_from);
-#endif
-        bhf_run_one(buf, len);
+        /* Each input runs from a heap allocation of exactly its size, as the
+         * lanes bhf drives itself pass it: a read one past it is the
+         * heap-buffer-overflow they report, not a read inside the testcase
+         * buffer. An empty input gets one byte (ASan's malloc(0) is one as well). */
+        uint8_t *input = (uint8_t *)malloc(len ? len : 1);
+        if (!input) abort();
+        memcpy(input, buf, len);
+        bhf_run_one(input, len);
+        free(input);
     }
     return 0;
 }

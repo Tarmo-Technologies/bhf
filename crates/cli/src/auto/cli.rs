@@ -118,7 +118,7 @@ pub struct AutoArgs {
     /// `winafl-path`, `dynamorio-path` and the `[toolchain]` table, require this
     /// explicit flag). Only these flags have a
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
-    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, grammar,
+    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
     /// engine, languages, project, ada-deps, passes, force, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
@@ -182,10 +182,18 @@ pub struct AutoArgs {
     #[arg(long = "max-len", default_value = "auto")]
     pub max_len: String,
 
-    /// Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a
-    /// hang/timeout. Default: the engine's 10s.
+    /// Per-execution timeout (e.g. `10s`, `500ms`). An execution past it is
+    /// killed, and an input that hangs again when re-run with twice the
+    /// timeout is a hang finding (BHF-230). Default: the engine's 10s.
     #[arg(long = "timeout", value_parser = crate::fuzz::parse_duration)]
     pub timeout: Option<std::time::Duration>,
+
+    /// Response deadline for every fuzzed target (e.g. `50ms`, `1s`), the
+    /// timing oracle: an input whose execution takes longer, in two of three
+    /// fresh re-runs too, is a response-deadline finding (BHF-555). Shorter
+    /// than `--timeout`. Off by default.
+    #[arg(long = "deadline", value_parser = crate::fuzz::parse_duration)]
+    pub deadline: Option<std::time::Duration>,
 
     /// Force the C++ standard for every harness build (e.g. `gnu++14`, `c++03`),
     /// pinning the dialect for legacy C++. Without it, `auto` builds C++ at the modern
@@ -484,9 +492,12 @@ pub struct AutoArgs {
     /// Recover the project's real compile wiring by running its own build
     /// (CMake configure + instrumented static-library targets, or `make` under a
     /// compiler-interposing wrapper) once,
-    /// offline, before harnessing. Produces `<tree>/.bhf-build/
-    /// compile_commands.json`, generated headers, and compatible static archives
-    /// so each harness builds with the real translation-unit and link context.
+    /// offline, before harnessing. It builds under the work dir
+    /// (`<work>/probe/`), never in the tree: CMake and Meson into a build
+    /// directory there, Make in a copy of the tree there. Produces
+    /// `compile_commands.json`, generated headers, and compatible static
+    /// archives so each harness builds with the real translation-unit and link
+    /// context.
     ///
     /// This EXECUTES the project's untrusted build scripts; it runs under
     /// bhf's sandbox (bwrap/firejail) when one is available and degrades to a
@@ -1156,10 +1167,28 @@ fn detect_custom_build(root: &Path) -> Option<(String, String)> {
         .map(|(name, cmd)| ((*name).to_owned(), (*cmd).to_owned()))
 }
 
+/// `bhf auto` exits 0 when at least one target built and ran.
+pub const EXIT_RAN: i32 = 0;
+/// Candidates were discovered, but none built.
+pub const EXIT_NONE_BUILT: i32 = 1;
+/// Nothing to sweep: no candidates, a source path that does not exist, or a
+/// refused configuration (an unusable toolchain, an invalid flag value).
+pub const EXIT_NO_CANDIDATES: i32 = 2;
+/// Harnesses built, but none could run here because the sanitizer runtime
+/// does not start on this host: a host or toolchain problem, not the code's.
+pub const EXIT_SANITIZER_RUNTIME: i32 = 3;
+
 fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let _tstart = std::time::Instant::now();
     let started_at = Utc::now().to_rfc3339();
     let run_start = std::time::Instant::now();
+    if !args.path.exists() {
+        bhfeprintln!(
+            "error: bhf auto: {} does not exist; nothing to sweep",
+            args.path.display()
+        );
+        return Ok(EXIT_NO_CANDIDATES);
+    }
     let path = strip_verbatim_prefix(
         args.path
             .canonicalize()
@@ -1180,6 +1209,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A build probe of this tree builds under the work dir, never in the tree
+    // (#210).
+    crate::auto::build_probe::register_probe_root(&path, &work);
     // A work dir reused for another source tree: set that run aside before this
     // one writes anything, so it neither reports nor resumes the other tree's
     // findings.
@@ -1246,9 +1278,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         coverage_modules: args.winafl_coverage_modules.clone(),
         page_heap: args.winafl_page_heap,
     };
-    if crate::fuzz::parse_engine_list(&args.engine)
-        .is_ok_and(|engines| engines.contains(&crate::fuzz::FuzzEngine::Winafl))
-    {
+    // Every value is checked before anything runs, `--dry-run` included: a
+    // plan for an engine or sanitizer set that cannot run is no plan.
+    let engines = match crate::fuzz::parse_engine_list(&args.engine) {
+        Ok(engines) => engines,
+        Err(error) => {
+            bhfeprintln!("error: --engine: {error}");
+            return Ok(2);
+        }
+    };
+    if let Err(error) = crate::fuzz::parse_sanitizer_args(&args.sanitizers) {
+        bhfeprintln!("error: {error}");
+        return Ok(2);
+    }
+    if engines.contains(&crate::fuzz::FuzzEngine::Winafl) {
         if let Err(error) = crate::fuzz::check_winafl_available(&winafl) {
             bhfeprintln!("error: {error}");
             return Ok(2);
@@ -1333,6 +1376,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
     if let Some(timeout) = args.timeout {
         std::env::set_var("BHF_EXEC_TIMEOUT", timeout.as_millis().to_string());
+    }
+    // --deadline arms the timing oracle for every target the same way.
+    if let Some(deadline) = args.deadline {
+        let timeout = args.timeout.unwrap_or(crate::fuzz::PER_INPUT_TIMEOUT);
+        if deadline.as_millis() == 0 || deadline >= timeout {
+            bhfeprintln!(
+                "error: --deadline must be at least 1ms and shorter than the per-input \
+                 timeout ({}), got {}",
+                crate::fuzz::duration_arg(timeout),
+                crate::fuzz::duration_arg(deadline)
+            );
+            return Ok(EXIT_NO_CANDIDATES);
+        }
+        std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
     }
     // --cxx-std pins the C++ dialect for every harness build (disabling the ladder).
     // Validate the shape so a typo fails fast rather than every C++ build silently.
@@ -3513,9 +3570,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         if summary.built + summary.built_and_fuzzed + summary.report_only > 0
             || summary.findings > 0
         {
-            0
+            EXIT_RAN
+        } else if summary.sanitizer_runtime_unavailable > 0 {
+            bhfeprintln!(
+                "bhf auto: exit {EXIT_SANITIZER_RUNTIME}: {} target(s) built, but their sanitizer \
+                 runtime does not start on this host, so none ran. Re-run with \
+                 `--sanitizers none` (coverage and crash detection, no sanitizer runtime), or \
+                 with a compiler whose sanitizer runtime starts here.",
+                summary.sanitizer_runtime_unavailable
+            );
+            EXIT_SANITIZER_RUNTIME
         } else {
-            1
+            EXIT_NONE_BUILT
         },
     )
 }
@@ -4709,7 +4775,8 @@ impl AutoSummary {
         }
         if self.sanitizer_runtime_unavailable > 0 {
             outcomes.push(format!(
-                "{} not fuzzed (sanitizer runtime cannot start on this host)",
+                "{} not fuzzed (sanitizer runtime cannot start on this host; try \
+                 --sanitizers none)",
                 self.sanitizer_runtime_unavailable
             ));
         }
@@ -5926,7 +5993,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let tree = tmp.path().join("src");
-        let probe = tree.join(crate::auto::build_probe::PROBE_DIR);
+        let probe = crate::auto::build_probe::probe_dir(&tree);
         std::fs::create_dir_all(&probe).unwrap();
         std::fs::write(
             tree.join("util.c"),
@@ -7256,6 +7323,7 @@ mod tests {
                     elapsed_secs: 1.0,
                     executions_per_sec: 127.0,
                     findings: vec![],
+                    hangs: None,
                 },
                 PassRun {
                     pass: Pass::Rng,
@@ -7267,6 +7335,7 @@ mod tests {
                     elapsed_secs: 1.0,
                     executions_per_sec: 112.0,
                     findings: vec!["F-0001".to_owned()],
+                    hangs: None,
                 },
             ],
             runtrace_events: vec![],
@@ -7380,6 +7449,7 @@ mod tests {
                         elapsed_secs: 0.5,
                         executions_per_sec: 2.0,
                         findings: vec!["F-0001".to_owned(), "F-0002".to_owned()],
+                        hangs: None,
                     }],
                     runtrace_events: vec![],
                 },
@@ -7580,6 +7650,7 @@ mod tests {
                     // A crash produced WITHOUT target entry — a decode/stub
                     // artifact, not a target finding.
                     findings: vec!["F-9".to_owned()],
+                    hangs: None,
                 }],
                 per_pass_budget_secs: 60,
                 total_wall_budget_secs: 60,

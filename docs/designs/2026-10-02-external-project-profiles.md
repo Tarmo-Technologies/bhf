@@ -1,8 +1,13 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: First-class external project profiles (#56)
 
-> Status: **design for review** — no implementation yet. One of five specs for the
-> private-target-integration program (#56/#57/#58/#60/#61). Author: bhf maintainers.
+> Status: **implemented** (0b76dd0, `bhf project`; secret redaction in 4ba3763
+> and 6898f17; the runner, semantic-oracle and runtime-oracle fields in
+> 8c9bda9). One of five specs for the private-target-integration program
+> (#56/#57/#58/#60/#61). Author: bhf maintainers.
+>
+> Not delivered: all four phases shipped. A related follow-up, importing an
+> OSS-Fuzz `build.sh` into a profile, is [#334](https://github.com/Tarmo-Technologies/bhf/issues/334).
 
 ## Problem
 

@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -42,10 +44,13 @@ pub fn digest(data: &[u8]) -> u32 {
 "#;
 
 fn cargo_available() -> bool {
-    Command::new("cargo")
-        .args(["+nightly", "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let present = {
+        Command::new("cargo")
+            .args(["+nightly", "--version"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    support::require_tool(present, "cargo")
 }
 
 fn crate_in(dir: &Path) -> std::path::PathBuf {
@@ -133,5 +138,48 @@ fn a_private_inline_module_function_builds_in_the_in_crate_lane() {
     let root = crate_in(&dir);
     let (text, run) = run_auto(&root, &dir.join("work"), true);
     assert_built(&run, "checksum", &text);
+    assert!(!text.contains("E0425"), "{text}");
+}
+
+/// A private function behind a crate feature: the in-crate lane builds the
+/// copied crate with the feature its `#[cfg]` needs, as the dependency lane
+/// enables it (#215). Without it the function did not exist in the build
+/// (E0425) and the target was a `failed_build`.
+#[test]
+fn a_feature_gated_private_function_builds_with_its_feature() {
+    if !cargo_available() {
+        eprintln!("skipping: cargo +nightly not installed");
+        return;
+    }
+    let dir = TestDir::new("rust-gated-private");
+    let root = dir.join("framed");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"framed\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [features]\nframes = []\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"mod hidden {
+    #[cfg(feature = "frames")]
+    pub fn frame_len(data: &[u8]) -> usize {
+        if data.len() > 2 && data[0] == b'F' {
+            return data[2] as usize;
+        }
+        data.len()
+    }
+}
+
+#[cfg(feature = "frames")]
+pub fn total(data: &[u8]) -> usize {
+    hidden::frame_len(data)
+}
+"#,
+    )
+    .unwrap();
+    let (text, run) = run_auto(&root, &dir.join("work"), false);
+    assert_built(&run, "frame_len", &text);
     assert!(!text.contains("E0425"), "{text}");
 }

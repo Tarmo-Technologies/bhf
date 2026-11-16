@@ -11,6 +11,8 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -28,11 +30,14 @@ fn bhf_bin() -> PathBuf {
 }
 
 fn have_go() -> bool {
-    Command::new("go")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "go")
 }
 
 #[test]

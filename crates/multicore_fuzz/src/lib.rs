@@ -1092,6 +1092,17 @@ impl Sanitizer {
             _ => None,
         }
     }
+
+    /// The name `--sanitizers` takes: `asan`, `msan`, `ubsan`, `tsan`, `lsan`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sanitizer::Asan => "asan",
+            Sanitizer::Msan => "msan",
+            Sanitizer::Ubsan => "ubsan",
+            Sanitizer::Tsan => "tsan",
+            Sanitizer::Lsan => "lsan",
+        }
+    }
 }
 
 /// What `--sanitizers` selected for a build+run (#434). Distinguishes the three

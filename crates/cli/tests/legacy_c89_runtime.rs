@@ -11,6 +11,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -25,11 +27,14 @@ fn c_runtime_dir() -> PathBuf {
 }
 
 fn have_clang() -> bool {
-    Command::new("clang")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let present = {
+        Command::new("clang")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    support::require_tool(present, "clang")
 }
 
 #[test]

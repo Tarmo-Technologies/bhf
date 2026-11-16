@@ -8,12 +8,15 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn clang_available() -> bool {
-    which::which("clang").is_ok()
+    let present = { which::which("clang").is_ok() };
+    support::require_tool(present, "clang")
 }
 
 fn bhf() -> Command {
@@ -276,7 +279,8 @@ fn capsule_of_a_source_file_named_with_a_space_reproduces_offline() {
 }
 
 fn clangxx_available() -> bool {
-    which::which("clang++").is_ok()
+    let present = { which::which("clang++").is_ok() };
+    support::require_tool(present, "clangxx")
 }
 
 /// The finding dirs under `work`, as `(id, dir, finding.json)`.

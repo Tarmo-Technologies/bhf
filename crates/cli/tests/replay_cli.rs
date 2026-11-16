@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -3062,10 +3064,13 @@ fn replay_and_minimize_flag_a_finding_recorded_against_another_harness_format() 
 /// Whether `tool --version` runs.
 #[cfg(unix)]
 fn tool_runs(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
+    let present = {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    support::require_tool(present, tool)
 }
 
 /// `--debugger gdb` re-runs the testcase under gdb: it stops at the

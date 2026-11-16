@@ -7866,10 +7866,10 @@ mod tests {
         fs::remove_dir_all(&out).ok();
     }
 
-    /// The AFL++ lane hands the target AFL++'s testcase buffer, which is
-    /// larger than any input. The bytes past the input are poisoned, so a read
-    /// one past a buffer that views the input is reported in that lane too,
-    /// and made addressable again before the next input arrives.
+    /// AFL++ hands the lane its testcase buffer, which is larger than any
+    /// input. The lane runs each input from a heap allocation of exactly its
+    /// size, so a read one past a buffer that views the input is the
+    /// heap-buffer-overflow the builtin lane reports.
     #[test]
     fn built_c_afl_lane_reports_a_read_one_past_the_input() {
         let source = format!(
@@ -7898,14 +7898,14 @@ mod tests {
             &[out.join("target.c")],
             crate::standalone_driver::AFL_LOOP_INPUTS,
         ) {
-            crate::standalone_driver::assert_afl_loop_poisons_only_past_each_input(&program);
+            crate::standalone_driver::assert_afl_loop_reports_only_past_each_input(&program);
         }
         fs::remove_dir_all(&out).ok();
     }
 
-    /// The AFL++ lane of a sequence harness poisons the bytes past the input
-    /// too: an input too short for a control tail runs the target once over
-    /// the whole input.
+    /// The AFL++ lane of a sequence harness runs each input from an
+    /// exact-length heap allocation too: an input too short for a control
+    /// tail runs the target once over the whole input.
     #[test]
     fn built_sequence_afl_lane_reports_a_read_one_past_the_input() {
         let header = "#include <stddef.h>\n\
@@ -7945,7 +7945,7 @@ mod tests {
             &[out.join("widget.c")],
             crate::standalone_driver::AFL_LOOP_INPUTS,
         ) {
-            crate::standalone_driver::assert_afl_loop_poisons_only_past_each_input(&program);
+            crate::standalone_driver::assert_afl_loop_reports_only_past_each_input(&program);
         }
         fs::remove_dir_all(&out).ok();
     }

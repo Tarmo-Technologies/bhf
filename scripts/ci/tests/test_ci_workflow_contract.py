@@ -57,6 +57,20 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(set(ids), GATE.EXPECTED_JOBS)
 
+    def test_arm64_job_builds_tests_and_finds_a_bug_natively(self):
+        # An ARM64 runner builds the workspace, runs every test outside bhf's
+        # heavy integration suites and the auto smoke, on every heavy change.
+        job = self.jobs["arm64-build"]
+        self.assertIn("runs-on: ubuntu-24.04-arm", job)
+        self.assertIn("if: needs.changes.outputs.heavy == 'true'", job)
+        self.assertIn("cargo build --locked --workspace", job)
+        self.assertIn("bash scripts/ci/install-nextest.sh", job)
+        self.assertIn("-E 'not (package(bhf) & kind(test))'", job)
+        self.assertIn("bash scripts/ci/arm64-auto-smoke.sh target/debug/bhf", job)
+        self.assertTrue((ROOT / "scripts/ci/arm64-auto-smoke.sh").is_file())
+        installer = (ROOT / "scripts/ci/install-nextest.sh").read_text()
+        self.assertIn('"Linux aarch64")', installer)
+
     def test_gate_runs_after_failure_and_uses_same_run_observations(self):
         gate = self.jobs["ci-acceptance"]
         self.assertIn("    if: ${{ always() }}", gate)

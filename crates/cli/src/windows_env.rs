@@ -14,9 +14,13 @@
 //! The same step makes the default clang lane work without a separate LLVM
 //! install: a clang already on PATH is kept; otherwise the standalone LLVM
 //! (`%ProgramFiles%\LLVM\bin`), then Visual Studio's bundled clang
-//! (`VC\Tools\Llvm\x64\bin`, the "C++ Clang tools" component) is used. GNU
-//! make is looked up in its usual Windows install locations. `--no-vs-env`
-//! (or `BHF_NO_VS_ENV=1`) turns all of it off.
+//! (`VC\Tools\Llvm\x64\bin`, the "C++ Clang tools" component) is used. For
+//! another architecture than this machine's (`--vs-arch x86`) the clang must
+//! carry that architecture's AddressSanitizer runtime, which the standalone
+//! LLVM and Visual Studio's x64 clang do not for x86: then the first of those
+//! that does (for x86, Visual Studio's `VC\Tools\Llvm\bin`) goes ahead of
+//! PATH's. GNU make is looked up in its usual Windows install locations.
+//! `--no-vs-env` (or `BHF_NO_VS_ENV=1`) turns all of it off.
 //!
 //! Discovered directories reach builds only through `PATH`/`INCLUDE`/`LIB`;
 //! none is ever written into a recipe, so their spaces (`Program Files
@@ -56,6 +60,9 @@ pub(crate) struct BuildEnvironment {
     /// The clang the default lane resolves to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clang: Option<PathBuf>,
+    /// Why that clang was put ahead of the one PATH had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clang_reason: Option<String>,
     /// cl.exe, when the environment provides it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl: Option<PathBuf>,
@@ -94,6 +101,9 @@ impl BuildEnvironment {
         ] {
             if let Some(tool) = tool {
                 parts.push(format!("{label} {}", tool.display()));
+                if let (true, Some(reason)) = (label == "clang", &self.clang_reason) {
+                    parts.push(reason.clone());
+                }
             }
         }
         parts.join("; ")
@@ -278,7 +288,8 @@ pub(crate) fn merged_path(original: &[PathBuf], captured: &[PathBuf]) -> Vec<Pat
 }
 
 /// Where the default lane's clang comes from when none is on PATH: the
-/// standalone LLVM, then Visual Studio's bundled one.
+/// standalone LLVM, then Visual Studio's bundled one, its build for `arch`
+/// first (`bin` is the x86 one).
 pub(crate) fn clang_fallback_dirs(
     program_files: Option<&Path>,
     vs: Option<&Path>,
@@ -293,10 +304,93 @@ pub(crate) fn clang_fallback_dirs(
         if arch.eq_ignore_ascii_case("arm64") {
             dirs.push(llvm.join("ARM64").join("bin"));
         }
-        dirs.push(llvm.join("x64").join("bin"));
-        dirs.push(llvm.join("bin"));
+        if arch.eq_ignore_ascii_case("x86") {
+            dirs.push(llvm.join("bin"));
+            dirs.push(llvm.join("x64").join("bin"));
+        } else {
+            dirs.push(llvm.join("x64").join("bin"));
+            dirs.push(llvm.join("bin"));
+        }
     }
     dirs
+}
+
+/// The architecture this bhf runs on, as `--vs-arch` spells it.
+pub(crate) fn host_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86") {
+        "x86"
+    } else {
+        "x64"
+    }
+}
+
+/// Whether the clang in `bin` carries the AddressSanitizer runtime for
+/// `arch` (`x86`, `x64`, `arm64`): `<bin>\..\lib\clang\<version>\lib\windows\
+/// clang_rt.asan_dynamic-<i386|x86_64|aarch64>.dll`.
+pub(crate) fn clang_has_asan_runtime(bin: &Path, arch: &str) -> bool {
+    let runtime_arch = match arch.to_ascii_lowercase().as_str() {
+        "x86" => "i386",
+        "x64" | "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        _ => return false,
+    };
+    let Some(root) = bin.parent() else {
+        return false;
+    };
+    let Ok(versions) = std::fs::read_dir(root.join("lib").join("clang")) else {
+        return false;
+    };
+    let runtime = format!("clang_rt.asan_dynamic-{runtime_arch}.dll");
+    versions.flatten().any(|version| {
+        version
+            .path()
+            .join("lib")
+            .join("windows")
+            .join(&runtime)
+            .is_file()
+    })
+}
+
+/// Where the default lane's clang comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClangChoice {
+    /// PATH's clang (or none to be had).
+    Keep,
+    /// No clang on PATH: this directory goes at its end.
+    Append(PathBuf),
+    /// PATH's clang cannot build for the architecture: this directory goes
+    /// ahead of it.
+    Prepend(PathBuf),
+}
+
+/// Choose the default lane's clang for `arch` on a `host` machine, given the
+/// directory of PATH's clang and the [`clang_fallback_dirs`]. A clang on
+/// PATH is kept, unless the build is for another architecture than the
+/// host's and that clang has no AddressSanitizer runtime for it while a
+/// fallback does.
+pub(crate) fn choose_clang(
+    arch: &str,
+    host: &str,
+    on_path: Option<&Path>,
+    fallbacks: &[PathBuf],
+    has_clang: &dyn Fn(&Path) -> bool,
+    has_runtime: &dyn Fn(&Path, &str) -> bool,
+) -> ClangChoice {
+    let Some(on_path) = on_path else {
+        return fallbacks
+            .iter()
+            .find(|dir| has_clang(dir))
+            .map_or(ClangChoice::Keep, |dir| ClangChoice::Append(dir.clone()));
+    };
+    if arch.eq_ignore_ascii_case(host) || has_runtime(on_path, arch) {
+        return ClangChoice::Keep;
+    }
+    fallbacks
+        .iter()
+        .find(|dir| !same_dir(dir, on_path) && has_clang(dir) && has_runtime(dir, arch))
+        .map_or(ClangChoice::Keep, |dir| ClangChoice::Prepend(dir.clone()))
 }
 
 /// GNU make's usual Windows install locations.
@@ -409,19 +503,34 @@ fn activate_once(options: &ActivationOptions) -> BuildEnvironment {
     }
     if !disabled {
         // The default clang lane: keep a clang on PATH, else the standalone
-        // LLVM, else Visual Studio's bundled clang.
-        if which::which("clang").is_err() {
-            let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
-            let vs = environment
-                .visual_studio
-                .as_ref()
-                .map(|vs| vs.installation_path.clone())
-                .or_else(|| std::env::var_os("VSINSTALLDIR").map(PathBuf::from));
-            if let Some(dir) = clang_fallback_dirs(program_files.as_deref(), vs.as_deref(), &arch)
-                .into_iter()
-                .find(|dir| dir.join("clang.exe").is_file())
-            {
-                append_path(&dir);
+        // LLVM, else Visual Studio's bundled clang; for another architecture,
+        // one with that architecture's AddressSanitizer runtime.
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+        let vs = environment
+            .visual_studio
+            .as_ref()
+            .map(|vs| vs.installation_path.clone())
+            .or_else(|| std::env::var_os("VSINSTALLDIR").map(PathBuf::from));
+        let on_path = which::which("clang").ok();
+        let on_path_dir = on_path.as_deref().and_then(Path::parent);
+        match choose_clang(
+            &arch,
+            host_arch(),
+            on_path_dir,
+            &clang_fallback_dirs(program_files.as_deref(), vs.as_deref(), &arch),
+            &|dir| dir.join("clang.exe").is_file(),
+            &clang_has_asan_runtime,
+        ) {
+            ClangChoice::Keep => {}
+            ClangChoice::Append(dir) => append_path(&dir),
+            ClangChoice::Prepend(dir) => {
+                prepend_path(&dir);
+                if let Some(previous) = &on_path {
+                    environment.clang_reason = Some(format!(
+                        "{} has no {arch} AddressSanitizer runtime",
+                        previous.display()
+                    ));
+                }
             }
         }
         if which::which("make").is_err() {
@@ -447,6 +556,19 @@ fn append_path(dir: &Path) {
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
     paths.push(dir.to_path_buf());
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+#[cfg(windows)]
+fn prepend_path(dir: &Path) {
+    let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];
+    paths.extend(
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
     if let Ok(joined) = std::env::join_paths(paths) {
         std::env::set_var("PATH", joined);
     }
@@ -819,5 +941,73 @@ mod tests {
             load_cache(&path, &instance, "x64").is_none(),
             "a removed toolset recaptures"
         );
+    }
+
+    #[test]
+    fn windows_an_x86_build_prefers_visual_studios_x86_clang() {
+        let dirs = clang_fallback_dirs(
+            Some(Path::new("C:\\Program Files")),
+            Some(Path::new("C:\\VS")),
+            "x86",
+        );
+        let llvm = Path::new("C:\\VS").join("VC").join("Tools").join("Llvm");
+        assert_eq!(dirs[1], llvm.join("bin"));
+        assert_eq!(dirs[2], llvm.join("x64").join("bin"));
+    }
+
+    #[test]
+    fn windows_a_clang_is_kept_unless_it_cannot_build_for_the_architecture() {
+        let standalone = PathBuf::from("C:\\Program Files\\LLVM\\bin");
+        let vs_x86 = PathBuf::from("C:\\VS\\VC\\Tools\\Llvm\\bin");
+        let fallbacks = vec![standalone.clone(), vs_x86.clone()];
+        let has_clang = |_: &Path| true;
+        // The standalone LLVM carries x86_64's runtime only, VS's x86 clang i386's.
+        let has_runtime = |dir: &Path, arch: &str| {
+            if dir == vs_x86.as_path() {
+                arch == "x86"
+            } else {
+                arch == "x64"
+            }
+        };
+        let choose = |arch: &str, on_path: Option<&Path>| {
+            choose_clang(arch, "x64", on_path, &fallbacks, &has_clang, &has_runtime)
+        };
+        assert_eq!(choose("x64", Some(&standalone)), ClangChoice::Keep);
+        assert_eq!(
+            choose("x86", Some(&standalone)),
+            ClangChoice::Prepend(vs_x86.clone())
+        );
+        assert_eq!(choose("x86", Some(&vs_x86)), ClangChoice::Keep);
+        assert_eq!(choose("x64", None), ClangChoice::Append(standalone.clone()));
+        // No clang has the runtime: PATH's stays, and the build says why.
+        let none = |_: &Path, _: &str| false;
+        assert_eq!(
+            choose_clang(
+                "x86",
+                "x64",
+                Some(&standalone),
+                &fallbacks,
+                &has_clang,
+                &none
+            ),
+            ClangChoice::Keep
+        );
+    }
+
+    #[test]
+    fn windows_a_clangs_asan_runtimes_are_found_by_architecture() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let windows = root.path().join("lib/clang/19/lib/windows");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&windows).unwrap();
+        std::fs::write(windows.join("clang_rt.asan_dynamic-i386.dll"), b"").unwrap();
+        assert!(clang_has_asan_runtime(&bin, "x86"));
+        assert!(!clang_has_asan_runtime(&bin, "x64"));
+        assert!(!clang_has_asan_runtime(&bin, "arm64"));
+        assert!(!clang_has_asan_runtime(
+            &root.path().join("none/bin"),
+            "x86"
+        ));
     }
 }

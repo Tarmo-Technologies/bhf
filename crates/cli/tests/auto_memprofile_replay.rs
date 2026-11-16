@@ -13,12 +13,15 @@ use std::process::Command;
 
 use cli::auto::memprofile::run_mem_profile;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have_clang() -> bool {
-    Command::new("clang").arg("--version").output().is_ok()
+    let present = { Command::new("clang").arg("--version").output().is_ok() };
+    support::require_tool(present, "clang")
 }
 
 #[test]

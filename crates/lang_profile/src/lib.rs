@@ -757,43 +757,114 @@ fn strip_python_strings(line: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every dialect. [`every_dialect_is_listed`] fails to compile when a
+    /// variant is added and not listed.
+    const ALL: [Dialect; 28] = [
+        Dialect::Ada83,
+        Dialect::Ada95,
+        Dialect::Ada2005,
+        Dialect::Ada2012,
+        Dialect::Ada2022,
+        Dialect::CKAndR,
+        Dialect::C89,
+        Dialect::C99,
+        Dialect::C11,
+        Dialect::C17,
+        Dialect::C23,
+        Dialect::CppPre98,
+        Dialect::Cpp98,
+        Dialect::Cpp11,
+        Dialect::Cpp14,
+        Dialect::Cpp17,
+        Dialect::Cpp20,
+        Dialect::Cpp23,
+        Dialect::Rust2015,
+        Dialect::Rust2018,
+        Dialect::Rust2021,
+        Dialect::Rust2024,
+        Dialect::Python2,
+        Dialect::Python3,
+        Dialect::Perl4,
+        Dialect::Perl5,
+        Dialect::Go,
+        Dialect::Unknown,
+    ];
+
+    #[test]
+    fn every_dialect_is_listed() {
+        for dialect in ALL {
+            match dialect {
+                Dialect::Ada83
+                | Dialect::Ada95
+                | Dialect::Ada2005
+                | Dialect::Ada2012
+                | Dialect::Ada2022
+                | Dialect::CKAndR
+                | Dialect::C89
+                | Dialect::C99
+                | Dialect::C11
+                | Dialect::C17
+                | Dialect::C23
+                | Dialect::CppPre98
+                | Dialect::Cpp98
+                | Dialect::Cpp11
+                | Dialect::Cpp14
+                | Dialect::Cpp17
+                | Dialect::Cpp20
+                | Dialect::Cpp23
+                | Dialect::Rust2015
+                | Dialect::Rust2018
+                | Dialect::Rust2021
+                | Dialect::Rust2024
+                | Dialect::Python2
+                | Dialect::Python3
+                | Dialect::Perl4
+                | Dialect::Perl5
+                | Dialect::Go
+                | Dialect::Unknown => {}
+            }
+        }
+    }
+
     #[test]
     fn dialect_str_roundtrips_every_variant() {
-        let all = [
-            Dialect::Ada83,
-            Dialect::Ada95,
-            Dialect::Ada2005,
-            Dialect::Ada2012,
-            Dialect::Ada2022,
-            Dialect::CKAndR,
-            Dialect::C89,
-            Dialect::C99,
-            Dialect::C11,
-            Dialect::C17,
-            Dialect::C23,
-            Dialect::CppPre98,
-            Dialect::Cpp98,
-            Dialect::Cpp11,
-            Dialect::Cpp14,
-            Dialect::Cpp17,
-            Dialect::Cpp20,
-            Dialect::Cpp23,
-            Dialect::Rust2015,
-            Dialect::Rust2018,
-            Dialect::Rust2021,
-            Dialect::Rust2024,
-            Dialect::Python2,
-            Dialect::Python3,
-            Dialect::Perl4,
-            Dialect::Perl5,
-            Dialect::Go,
-            Dialect::Unknown,
-        ];
+        let all = ALL;
         for d in all {
             assert_eq!(Dialect::from_str(d.as_str()), Some(d), "roundtrip {d:?}");
             assert!(!d.label().is_empty());
         }
         assert_eq!(Dialect::from_str("not-a-dialect"), None);
+    }
+
+    /// The README's "Legacy code" bullet names exactly the report-only
+    /// dialects, and says they are not fuzzed.
+    #[test]
+    fn the_readme_names_the_report_only_dialects() {
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+        )
+        .unwrap();
+        let start = readme
+            .find("- **Legacy code.**")
+            .expect("README has a Legacy code bullet");
+        let rest = &readme[start + 2..];
+        let bullet = &rest[..rest.find("\n- ").unwrap_or(rest.len())];
+        assert!(bullet.contains("report-only"), "{bullet}");
+        for dialect in ALL {
+            // `pre-C++98 (cfront/ARM)` is `pre-C++98` in prose.
+            let name = dialect.label().split(" (").next().unwrap();
+            // As a word: `C++98` is not named by `pre-C++98`.
+            let named = bullet.match_indices(name).any(|(at, _)| {
+                !bullet[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|before| before.is_alphanumeric() || before == '-')
+            });
+            match dialect.fuzz_support() {
+                FuzzSupport::ReportOnly => assert!(named, "{name} missing: {bullet}"),
+                FuzzSupport::Fuzzable => assert!(!named, "{name} is fuzzable: {bullet}"),
+            }
+        }
     }
 
     #[test]

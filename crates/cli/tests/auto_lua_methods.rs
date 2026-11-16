@@ -9,17 +9,22 @@
 use std::path::Path;
 use std::process::Command;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
 
 fn have_lua() -> bool {
-    ["lua", "lua5.4"].iter().any(|lua| {
-        Command::new(lua)
-            .args(["-e", "return 1"])
-            .output()
-            .is_ok_and(|out| out.status.success())
-    })
+    let present = {
+        ["lua", "lua5.4"].iter().any(|lua| {
+            Command::new(lua)
+                .args(["-e", "return 1"])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    };
+    support::require_tool(present, "lua")
 }
 
 /// `average` divides the bytes' total by its instance's count, which `new`

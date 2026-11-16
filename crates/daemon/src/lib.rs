@@ -2115,6 +2115,66 @@ fn display_argv(argv: &[OsString]) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod mcp_docs_tests {
+    use super::mcp_tools;
+
+    fn doc(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/site")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The `bhf_*` names in backticks in `text`, in order.
+    fn tool_names(text: &str) -> Vec<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| word.starts_with("bhf_"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// daemon.md names the tools `tools/list` advertises: the three of a
+    /// default build, and the two `--features llm` adds. index.md says the
+    /// same counts.
+    #[test]
+    fn the_daemon_docs_list_the_tools_tools_list_advertises() {
+        let daemon = doc("daemon.md");
+        let start = daemon
+            .find("The MCP mode of a default build")
+            .expect("daemon.md describes the MCP tools");
+        let end = daemon[start..]
+            .find("\n\n")
+            .map_or(daemon.len(), |end| start + end);
+        let paragraph = &daemon[start..end];
+        let (default_part, llm_part) = paragraph
+            .split_once("A build with `--features llm` adds")
+            .expect("daemon.md names the llm tools");
+        let default_tools = tool_names(default_part);
+        let llm_tools = tool_names(llm_part);
+        assert_eq!(default_tools.len(), 3, "{paragraph}");
+        assert_eq!(llm_tools.len(), 2, "{paragraph}");
+
+        let advertised: Vec<String> = mcp_tools()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        let mut expected = default_tools.clone();
+        if cfg!(feature = "llm") {
+            expected.extend(llm_tools);
+        }
+        assert_eq!(advertised, expected);
+
+        let index = doc("index.md");
+        assert!(
+            index.contains("three read-only MCP tools (five\n  with the `llm` feature)"),
+            "index.md states the daemon's tool counts"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BhfRpc, BuildRequest, CliRpcService, CliRunner, FakeCorbaRequest, GenerateHarnessRequest,

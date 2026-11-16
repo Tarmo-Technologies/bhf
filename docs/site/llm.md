@@ -19,7 +19,7 @@ The LLM surface is optional and is not part of `bhf auto`. BHF does not
 silently call a model, apply a completion to the repository, execute a
 model-generated command, or promote model prose into a finding. `llm prompt`
 renders a prompt, `llm assist` makes one bounded provider request, and the MCP
-LLM-enabled MCP server exposes five read-only tools. The operator or host agent decides what to
+LLM-enabled MCP server (a build with `--features llm`) exposes five read-only tools. The operator or host agent decides what to
 do next, under the same command-review and sandbox policy used for any other
 change.
 

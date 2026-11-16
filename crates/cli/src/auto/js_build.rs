@@ -95,7 +95,7 @@ pub fn build_js_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str
         return JsBuildResult::Skip(reason);
     }
 
-    emit_js_harness(work_dir, harness_id, &runtime, &module_abs, &func)
+    emit_js_harness(work_dir, harness_id, &runtime, &module_abs, &func, false)
 }
 
 /// `None` if the module parses and `require`s cleanly, else a skip reason. Catches
@@ -145,12 +145,17 @@ fn js_module_load_error(module_abs: &Path, load_cwd: &Path) -> Option<String> {
 
 /// Copy the driver and emit the `node` launcher pointing at `module_abs` (the target
 /// module for JS, or the transpiled `.js` for TS). Shared by both lanes.
+/// `source_maps`: run node with `--enable-source-maps`, so the stacks of a
+/// module transpiled with a source map (the TypeScript lane's `target.js`)
+/// name the original source's file and line. Off for plain JavaScript, whose
+/// frames already name its own files.
 fn emit_js_harness(
     work_dir: &Path,
     harness_id: &str,
     runtime: &Path,
     module_abs: &Path,
     func: &JsFunction,
+    source_maps: bool,
 ) -> JsBuildResult {
     let hdir = crate::auto::layout::harness_dir(work_dir, harness_id);
     if let Err(e) = std::fs::create_dir_all(&hdir) {
@@ -175,10 +180,15 @@ fn emit_js_harness(
          BHF_JS_MODULE=\"{module}\" \\\n\
          BHF_JS_EXPORT=\"{export_path}\" \\\n\
          BHF_JS_ARG=\"{arg}\" \\\n\
-         exec node \"{driver}\" \"$@\"\n",
+         exec node {node_flags}\"{driver}\" \"$@\"\n",
         module = module_abs.display(),
         export_path = func.export_path,
         arg = func.arg_kind.as_env(),
+        node_flags = if source_maps {
+            "--enable-source-maps "
+        } else {
+            ""
+        },
         driver = driver.display(),
     );
     if let Err(e) = std::fs::write(&main_path, script) {
@@ -393,12 +403,15 @@ pub fn build_ts_harness(
     let out_js = hdir.join("target.js");
 
     // Transpile: bundle local TS imports + strip types, keep node_modules external.
+    // The source map (`target.js.map`) lets node's stacks, and so the finding,
+    // name the `.ts` file and line rather than the transpiled module's.
     let mut cmd = Command::new(&esbuild);
     cmd.arg(&src_abs)
         .arg("--bundle")
         .arg("--packages=external")
         .arg("--format=cjs")
         .arg("--platform=node")
+        .arg("--sourcemap")
         .arg(format!("--outfile={}", out_js.display()));
     for loader in NON_CODE_IMPORT_LOADERS {
         cmd.arg(loader);
@@ -423,7 +436,7 @@ pub fn build_ts_harness(
     if let Some(reason) = js_module_load_error(&out_js, &hdir) {
         return JsBuildResult::Skip(reason);
     }
-    emit_js_harness(work_dir, harness_id, &runtime, &out_js, &func)
+    emit_js_harness(work_dir, harness_id, &runtime, &out_js, &func, true)
 }
 
 #[cfg(unix)]

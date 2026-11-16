@@ -6,6 +6,7 @@
 //! opening run.json / the SARIF.
 
 use crate::auto::preflight::PreflightReport;
+use crate::terminal_text::terminal_safe;
 use std::path::Path;
 
 pub struct TriageInputs<'a> {
@@ -247,11 +248,13 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
         rows.len()
     );
     for row in rows.iter().take(max) {
-        let msg = truncate(&row.message, 90);
+        // The finding's fields quote what the target printed: no escape
+        // sequence of theirs reaches the operator's terminal.
+        let msg = terminal_safe(&truncate(&row.message, 90));
         out.push_str(&format!(
             "  [{}] {} — {}\n      reproduce: bhf replay --finding {}\n",
-            row.severity.to_uppercase(),
-            row.rule_id,
+            terminal_safe(&row.severity.to_uppercase()),
+            terminal_safe(&row.rule_id),
             msg,
             // One shell word, so a work dir with a space pastes as one argument.
             crate::repro_lane::host_word(&row.dir.to_string_lossy()),

@@ -15,7 +15,7 @@ coming from `clang -fsanitize=fuzzer` know what to reach for.
 |---|---|---|
 | `-max_len=N` | `--max-len N` | Maximum generated input length. Default 4096. |
 | `-len_control=N` | `--len-control N` | Adaptive length growth: the effective mutation length starts at 64 and doubles toward `--max-len` after `N` executions without a new corpus signature. `0` disables it. Default 100. |
-| `-timeout=N` | `--timeout 10s` | Per-input timeout for C/C++ harnesses; the slow unit is killed and skipped. Distinct from `--time` (the whole-campaign budget). The Ada lane bounds runaway inputs via CPU rlimits. |
+| `-timeout=N` | `--timeout 10s` | Per-input timeout for C/C++ harnesses; the slow unit is killed, and one that hangs again at twice the timeout is a hang finding (BHF-230), as libFuzzer saves a `timeout-` unit. Distinct from `--time` (the whole-campaign budget). The Ada lane bounds runaway inputs via CPU rlimits. |
 | `-rss_limit_mb=N` | `--rss-limit-mb N` | Per-input RSS ceiling. RSS is polled from `/proc/<pid>/statm`; a breach is reported as an `out-of-memory` finding. `0` (default) disables it. RSS polling is used instead of an `RLIMIT_AS` cap, which would break ASan's large virtual-address reservation. |
 | `-print_final_stats=1` | `--print-final-stats` | End-of-run summary: executions, exec/s, new vs duplicate corpus signatures, findings, elapsed. |
 | `-runs=N` | `--iterations N` | Execution cap (defaults to 256 with no `--time`). |

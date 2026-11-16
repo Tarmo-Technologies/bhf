@@ -3586,6 +3586,21 @@ fn render_md(r: &RunJson<'_>) -> String {
         r.summary.unrecoverable_runtime
     );
     let _ = writeln!(s, "Findings:   {}", r.summary.findings);
+    // #208: executions killed at the per-input timeout, across every target.
+    let hangs = hang_totals(r.targets.iter().flat_map(|t| match t.outcome {
+        Outcome::BuiltAndFuzzed { passes, .. } | Outcome::BuiltNotEntered { passes, .. } => {
+            passes.as_slice()
+        }
+        _ => &[],
+    }));
+    if hangs.observed > 0 {
+        let _ = writeln!(
+            s,
+            "Hangs:      {} killed at the per-input timeout: {} hung again when re-run, \
+             {} finished, {} not re-run",
+            hangs.observed, hangs.confirmed, hangs.cleared, hangs.not_rerun
+        );
+    }
     // #102: durable, grouped discovery-drop diagnostics (read/decode/parse
     // failures). Each row is one (language, stage, class) with the file count and
     // one bounded, scrubbed sample — no paths, filenames, source, or identifiers.
@@ -3943,6 +3958,15 @@ fn passes_summary(passes: &[PassRun]) -> String {
         })
         .collect();
     let mut line = parts.join(" ");
+    // Executions killed at the per-input timeout, and how many of them hung
+    // again when re-run (#207): `hangs=1/3` is one confirmed of three.
+    let hangs = hang_totals(passes);
+    if hangs.observed > 0 {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&format!("hangs={}/{}", hangs.confirmed, hangs.observed));
+    }
     // Edge coverage accumulates across passes, so the last/largest value is the
     // total the target reached (#385). Only shown when a coverage runtime ran,
     // with the instrumentation that fed it (`/sancov-trace-pc` for a GCC build).
@@ -3962,6 +3986,18 @@ fn passes_summary(passes: &[PassRun]) -> String {
         }
     }
     line
+}
+
+/// The hang counts of `passes`, summed (`timeout_ms` is left 0).
+fn hang_totals<'a>(passes: impl IntoIterator<Item = &'a PassRun>) -> crate::fuzz::HangRunSummary {
+    let mut total = crate::fuzz::HangRunSummary::default();
+    for hangs in passes.into_iter().filter_map(|pass| pass.hangs.as_ref()) {
+        total.observed += hangs.observed;
+        total.confirmed += hangs.confirmed;
+        total.cleared += hangs.cleared;
+        total.not_rerun += hangs.not_rerun;
+    }
+    total
 }
 
 fn md_section(s: &mut String, title: &str, bag: &[Aggregated]) {
@@ -4751,6 +4787,7 @@ mod tests {
                         elapsed_secs: 1.0,
                         executions_per_sec: 9.0,
                         findings: vec![finding.to_owned()],
+                        hangs: None,
                     }],
                     runtrace_events: vec![],
                 },
@@ -5023,6 +5060,7 @@ mod tests {
                         elapsed_secs: 1.0,
                         executions_per_sec: 9.0,
                         findings: vec![finding.to_owned()],
+                        hangs: None,
                     }],
                     runtrace_events: vec![],
                 },
@@ -5162,6 +5200,7 @@ mod tests {
                 executions_per_sec: 9.0,
                 // Order matters: the phantom precedes the survivor.
                 findings: vec![phantom.to_owned(), survivor.to_owned()],
+                hangs: None,
             }],
             runtrace_events: vec![],
         };
@@ -6075,6 +6114,7 @@ mod tests {
                 elapsed_secs: 4.123,
                 executions_per_sec: 1000.0,
                 findings: vec![],
+                hangs: None,
             },
             PassRun {
                 pass: Pass::Rng,
@@ -6086,6 +6126,7 @@ mod tests {
                 elapsed_secs: 1.9055,
                 executions_per_sec: 2000.0,
                 findings: vec!["F-0001".to_owned()],
+                hangs: None,
             },
             PassRun {
                 pass: Pass::FuzzDriven,
@@ -6097,6 +6138,7 @@ mod tests {
                 elapsed_secs: 5.802,
                 executions_per_sec: 500.0,
                 findings: vec!["F-0002".to_owned(), "F-0003".to_owned()],
+                hangs: None,
             },
         ];
         let executions_per_sec = crate::auto::attempt::aggregate_executions_per_sec(&passes);
@@ -6373,6 +6415,7 @@ mod tests {
                 elapsed_secs: 10.0,
                 executions_per_sec: 800_000.0,
                 findings: vec![],
+                hangs: None,
             }],
             runtrace_events: vec![],
         };
@@ -6402,6 +6445,7 @@ mod tests {
                 elapsed_secs: 1.0,
                 executions_per_sec: 1000.0,
                 findings: vec![],
+                hangs: None,
             }],
             runtrace_events: vec![],
         };
@@ -6526,6 +6570,7 @@ mod tests {
                 elapsed_secs: 1.0,
                 executions_per_sec: 1000.0,
                 findings: vec![fid.to_owned()],
+                hangs: None,
             }],
             runtrace_events: vec![],
         };
@@ -6604,6 +6649,7 @@ mod tests {
             elapsed_secs: 1.0,
             executions_per_sec: 5.0,
             findings: vec![],
+            hangs: None,
         };
         assert_eq!(
             passes_summary(&[run(137, Some("sancov-trace-pc"))]),

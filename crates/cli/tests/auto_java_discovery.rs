@@ -10,6 +10,8 @@ use std::process::Command;
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 
+mod support;
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TestDir;
@@ -84,8 +86,11 @@ fn discovers_and_ranks_java_targets() {
 /// Whether a usable JDK is installed (the native Java lane needs javac/java);
 /// without one the lane skips cleanly, so this test self-skips too.
 fn has_jdk() -> bool {
-    Command::new("javac").arg("-version").output().is_ok()
-        && Command::new("java").arg("-version").output().is_ok()
+    let present = {
+        Command::new("javac").arg("-version").output().is_ok()
+            && Command::new("java").arg("-version").output().is_ok()
+    };
+    support::require_tool(present, "jdk")
 }
 
 #[test]

@@ -1979,6 +1979,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/terminal_text.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/test_support.rs",
       "license": "Apache-2.0"
     },
@@ -2012,6 +2016,10 @@
     },
     {
       "path": "crates/cli/tests/ada_depth_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/ada_qualified_target_flow.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2223,7 +2231,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_csharp_source_lines.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_cxx_std_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_deadline_hangs.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2240,6 +2256,10 @@
     },
     {
       "path": "crates/cli/tests/auto_exec_taint_confirm.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_exit_codes_docs.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2463,6 +2483,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_probe_out_of_tree.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_python_lane.rs",
       "license": "Apache-2.0"
     },
@@ -2552,6 +2576,14 @@
     },
     {
       "path": "crates/cli/tests/auto_target_filter.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_terminal_escapes.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_ts_source_maps.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2675,6 +2707,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/deadline_confirmation_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/differential_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2688,6 +2724,10 @@
     },
     {
       "path": "crates/cli/tests/driver_inline_counters.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/duration_flags_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2768,6 +2808,10 @@
     },
     {
       "path": "crates/cli/tests/generate_harness_languages.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/hang_findings_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2935,6 +2979,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/sanitizer_set_validation.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/sbom_assurance_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2968,6 +3016,10 @@
     },
     {
       "path": "crates/cli/tests/support/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/support_require_tool.rs",
       "license": "Apache-2.0"
     },
     {
