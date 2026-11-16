@@ -2903,6 +2903,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/support_test_bin.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/target_selection_cli.rs",
       "license": "Apache-2.0"
     },

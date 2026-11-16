@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Changed
+- The nightly builds every test binary once, into one nextest archive with
+  the runtrace shim, the compiler intercept and the release bhf, and each shard
+  runs from it instead of compiling the workspace. The heavy tests run the
+  prebuilt bhf `BHF_TEST_BIN` names instead of `cargo run --release` inside the
+  test, which counted the build against their deadlines. CI caches the cargo
+  registry.
 - Every download in the Dockerfile and the workflows retries transient
   failures and checks a pinned digest: the CA bootstrap is fetched with
   `curl --retry` in a digest-pinned `buildpack-deps:noble-curl` stage instead

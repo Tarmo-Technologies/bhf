@@ -28,6 +28,16 @@ retries = 1
 slow-timeout = { period = "120s", terminate-after = 8 }
 fail-fast = false
 failure-output = "immediate-final"
+# The nightly builds one archive (`cargo nextest archive --profile ci`) that
+# every shard runs from. bhf loads the runtrace shim and the compiler intercept
+# from beside itself, cdylibs no test binary links, and the heavy tests run the
+# release bhf (BHF_TEST_BIN), so the archive carries them too.
+archive.include = [
+    { path = "debug/libbhf_runtrace_shim.so", relative-to = "target", on-missing = "error" },
+    { path = "debug/libbhf_cc_intercept.so", relative-to = "target", on-missing = "error" },
+    { path = "release/bhf", relative-to = "target", on-missing = "error" },
+    { path = "release/libbhf_runtrace_shim.so", relative-to = "target", on-missing = "error" },
+]
 
 [profile.ci.junit]
 path = "junit.xml"

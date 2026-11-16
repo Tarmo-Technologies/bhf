@@ -60,8 +60,25 @@ fn clang_sanitizer_runtime_dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+/// The release bhf a heavy test runs: the prebuilt binary `$BHF_TEST_BIN`
+/// names (the nightly builds it once, beside its runtrace shim), else
+/// `cargo run --release` of this crate.
 #[allow(dead_code)]
 pub fn bhf_cargo_command() -> Command {
+    bhf_command_with(std::env::var_os("BHF_TEST_BIN").map(PathBuf::from))
+}
+
+/// [`bhf_cargo_command`] for an explicit `test_bin`: with one, that binary
+/// runs and cargo never does.
+#[allow(dead_code)]
+pub fn bhf_command_with(test_bin: Option<PathBuf>) -> Command {
+    if let Some(bin) = test_bin {
+        let mut cmd = Command::new(&bin);
+        if let Some(shim) = prebuilt_shim(&bin) {
+            cmd.env("BHF_RUNTRACE_SHIM", shim);
+        }
+        return cmd;
+    }
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "--manifest-path"])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
@@ -93,6 +110,10 @@ pub fn configure_runtrace_shim(cmd: &mut Command) {
 fn runtrace_shim_path() -> Option<PathBuf> {
     static SHIM: OnceLock<Option<PathBuf>> = OnceLock::new();
     SHIM.get_or_init(|| {
+        // A prebuilt bhf comes with its shim: build nothing.
+        if let Some(bin) = std::env::var_os("BHF_TEST_BIN") {
+            return prebuilt_shim(Path::new(&bin));
+        }
         let status = Command::new(env!("CARGO"))
             .args(["build", "--release", "-p", "bhf_runtrace_shim"])
             .status()
@@ -104,6 +125,19 @@ fn runtrace_shim_path() -> Option<PathBuf> {
         shim.is_file().then_some(shim)
     })
     .clone()
+}
+
+/// The runtrace shim for the prebuilt bhf `bin`: `$BHF_RUNTRACE_SHIM` when it
+/// names a file, else the one beside `bin`.
+#[allow(dead_code)]
+fn prebuilt_shim(bin: &Path) -> Option<PathBuf> {
+    std::env::var_os("BHF_RUNTRACE_SHIM")
+        .map(PathBuf::from)
+        .filter(|shim| shim.is_file())
+        .or_else(|| {
+            let shim = bin.with_file_name("libbhf_runtrace_shim.so");
+            shim.is_file().then_some(shim)
+        })
 }
 
 /// Workspace target directory, honouring $CARGO_TARGET_DIR when set and

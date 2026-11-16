@@ -28,13 +28,19 @@ SLOW = "binary(=build_recovery) & test(=build_recovery_scenarios)"
 DEDICATED = "build-recovery-scenarios"
 # The shard that runs the #[ignore]d tests the nightly owns, and their filter.
 IGNORED = "ignored"
+# Every shard runs from the test archive the build job uploads.
+ARCHIVE = "--archive-file nightly-tests.tar.zst --workspace-remap . --extract-to ."
 IGNORED_FILTER = "binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)"
 
 
-def integration_job() -> str:
+def job_block(name: str) -> str:
     source = WORKFLOW.read_text()
-    block = source.split("\n  integration:\n", 1)[1]
+    block = source.split(f"\n  {name}:\n", 1)[1]
     return re.split(r"\n  [a-z][a-z0-9-]*:\n", block, maxsplit=1)[0]
+
+
+def integration_job() -> str:
+    return job_block("integration")
 
 
 def shard_step(job: str) -> str:
@@ -116,7 +122,18 @@ def nextest_selection(argv: list[str]) -> set[str]:
     """The tests the `cargo nextest run` call `argv` runs, as `cargo nextest
     list` with the same arguments reports them (`<binary id>::<test>`)."""
     assert argv[:2] == ["nextest", "run"], argv
-    args = ["nextest", "list"] + [arg for arg in argv[2:] if arg != "--no-fail-fast"]
+    # A shard runs from the archive; list what its build would hold instead.
+    rest: list[str] = []
+    skip = False
+    for arg in argv[2:]:
+        if skip:
+            skip = False
+        elif arg in ("--archive-file", "--workspace-remap", "--extract-to"):
+            skip = True
+        elif arg != "--no-fail-fast":
+            rest.append(arg)
+    build = [flag for flag in ("--locked", "--workspace") if flag not in rest]
+    args = ["nextest", "list", *build, *rest]
     listed = subprocess.run(
         ["cargo", *args, "--message-format", "json"],
         cwd=ROOT,
@@ -157,7 +174,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
                 calls = run_shard(self.script, self.env, shard)
                 self.assertEqual(len(calls), 1, calls)
                 call = calls[0]
-                self.assertTrue(call.startswith("nextest run --locked --workspace --no-fail-fast --profile ci "), call)
+                self.assertTrue(call.startswith(f"nextest run {ARCHIVE} --no-fail-fast --profile ci "), call)
                 self.assertIn(f"-E package(bhf) & kind(test) & !({SLOW})", call)
                 self.assertTrue(call.endswith(f" --partition hash:{shard}/{count}"), call)
 
@@ -165,7 +182,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         calls = run_shard(self.script, self.env, DEDICATED)
         self.assertEqual(
             calls,
-            [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E {SLOW}"],
+            [f"nextest run {ARCHIVE} --no-fail-fast --profile ci -E {SLOW}"],
         )
 
     def test_the_ignored_shard_runs_only_the_ignored_tests_it_names(self) -> None:
@@ -173,7 +190,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "nextest run --locked -p bhf --no-fail-fast --profile ci --run-ignored only "
+                f"nextest run {ARCHIVE} --no-fail-fast --profile ci --run-ignored only "
                 f"-E {IGNORED_FILTER}"
             ],
         )
@@ -193,67 +210,80 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         self.assertIn('RAYON_NUM_THREADS: "1"', self.step)
 
 
-class IntegrationNightlyShimTests(unittest.TestCase):
-    """Every shard builds the runtrace shim and the compiler intercept, which
-    nextest's build of the test binaries does not produce (both are cdylibs),
-    before it runs a test: bhf preloads them from beside itself, and without
-    them each fuzz runs with the runtime audit off and the env-capsule tests
-    skip."""
+class IntegrationNightlyArchiveTests(unittest.TestCase):
+    """One build job compiles every test binary, the runtrace shim and the
+    compiler intercept (cdylibs no test binary links, which bhf preloads from
+    beside itself) and the release bhf the heavy tests run, into one nextest
+    archive; every shard runs from it instead of building its own."""
 
-    STEP = "Build the runtrace shim and compiler intercept"
+    STEP = "Build the cdylibs, the release bhf and the test archive"
 
     def setUp(self) -> None:
+        self.build_job = job_block("build")
         self.job = integration_job()
-        steps = re.findall(r"(?m)^      - name: (.+)$", self.job)
-        self.assertIn(self.STEP, steps)
-        self.assertLess(steps.index(self.STEP), steps.index("Integration tests (shard ${{ matrix.shard }})"))
-        self.step = self.job.split(f"      - name: {self.STEP}\n", 1)[1].split("\n      - name:", 1)[0]
+        self.step = self.build_job.split(f"      - name: {self.STEP}\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
 
-    def build(self, *, produce: tuple[str, ...]) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
-        """Run the build step with a stand-in cargo that writes `produce`."""
+    def test_the_build_job_builds_the_cdylibs_and_the_release_bhf_into_the_archive(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            work = Path(scratch)
-            bin_dir = work / "bin"
+            bin_dir = Path(scratch, "bin")
             bin_dir.mkdir()
-            log = work / "cargo.log"
+            log = Path(scratch, "cargo.log")
             stub = bin_dir / "cargo"
             stub.write_text(
                 f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
+                "import json, os, sys\n"
                 "with open(os.environ['CARGO_LOG'], 'a') as log:\n"
                 "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "for name in os.environ['PRODUCE'].split():\n"
-                "    path = pathlib.Path('target/debug', name)\n"
-                "    path.parent.mkdir(parents=True, exist_ok=True)\n"
-                "    path.write_bytes(b'')\n"
             )
             stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-            result = subprocess.run(
-                ["bash", "-e", "-o", "pipefail", "-c", step_script(self.step)],
-                cwd=work, capture_output=True, text=True, timeout=30,
+            subprocess.run(
+                ["bash", "-c", step_script(self.step)], check=True, cwd=scratch,
                 env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                     "CARGO_LOG": str(log), "PRODUCE": " ".join(produce)},
+                     "CARGO_LOG": str(log)},
             )
-            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-            return result, calls
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(
+            calls,
+            [
+                ["build", "--locked", "-p", "bhf_runtrace_shim", "-p", "bhf_cc_intercept"],
+                ["build", "--locked", "--release", "-p", "bhf", "-p", "bhf_runtrace_shim"],
+                ["nextest", "archive", "--locked", "--workspace", "--profile", "ci",
+                 "--archive-file", "nightly-tests.tar.zst"],
+            ],
+        )
 
-    def test_each_shard_builds_both_libraries_before_its_tests(self) -> None:
-        self.assertNotRegex(self.step, r"(?m)^        if:")
-        result, calls = self.build(produce=("libbhf_runtrace_shim.so", "libbhf_cc_intercept.so"))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, [["build", "--locked", "-p", "bhf_runtrace_shim", "-p", "bhf_cc_intercept"]])
+    def test_the_archive_must_carry_the_cdylibs_and_the_release_bhf(self) -> None:
+        import tomllib
 
-    def test_a_build_that_leaves_a_library_out_fails_the_shard(self) -> None:
-        for produced in (("libbhf_runtrace_shim.so",), ("libbhf_cc_intercept.so",)):
-            with self.subTest(produced=produced):
-                result, _ = self.build(produce=produced)
-                self.assertNotEqual(result.returncode, 0)
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        include = config["profile"]["ci"]["archive"]["include"]
+        self.assertEqual(
+            {entry["path"] for entry in include},
+            {
+                "debug/libbhf_runtrace_shim.so",
+                "debug/libbhf_cc_intercept.so",
+                "release/bhf",
+                "release/libbhf_runtrace_shim.so",
+            },
+        )
+        for entry in include:
+            self.assertEqual((entry["relative-to"], entry["on-missing"]), ("target", "error"))
+
+    def test_every_shard_runs_from_the_archive_the_build_job_uploads(self) -> None:
+        self.assertIn("    needs: [gate, build]\n", self.job)
+        name = "nightly-tests-${{ github.run_id }}-${{ github.run_attempt }}"
+        self.assertIn(f"          name: {name}\n          path: nightly-tests.tar.zst\n", self.build_job)
+        self.assertIn(f"          name: {name}\n", self.job.split("Download the test archive", 1)[1])
+        env = step_env(shard_step(self.job))
+        self.assertEqual(env["BHF_TEST_BIN"], "${{ github.workspace }}/target/release/bhf")
+        self.assertNotIn("cargo build", self.job, "a shard builds nothing")
 
     def test_the_tests_require_the_shim(self) -> None:
         # BHF_REQUIRE_TOOLS=1 turns a test's "runtrace shim not built" skip
         # into a failure.
         self.assertEqual(step_env(shard_step(self.job)).get("BHF_REQUIRE_TOOLS"), "1")
-
 
 
 @unittest.skipUnless(nextest_installed(), "cargo-nextest is not installed")

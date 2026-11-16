@@ -90,7 +90,17 @@ manual dispatch always runs. A failed or timed-out shard opens one issue
 labelled `integration-nightly` for the branch, or updates the open one, and
 comments on it when a new commit fails; close it once a nightly passes.
 
-Each shard builds the runtrace shim and installs the interpreter, JVM,
+A `build` job compiles every test binary once, with line tables only, into
+one nextest archive (`cargo nextest archive --profile ci`) that also carries
+the runtrace shim and the compiler intercept, which bhf preloads from beside
+itself, and the release bhf (`.config/nextest.toml` `archive.include`); every
+shard downloads it and runs `cargo nextest run --archive-file ... --extract-to
+.`, so the binaries sit where they were built and no shard compiles. The heavy
+tests that ran `cargo run --release` inside the test run the prebuilt bhf that
+`BHF_TEST_BIN` names instead (set it locally to a release bhf to skip that
+build too); the support helpers then never invoke cargo.
+
+Each shard installs the interpreter, JVM,
 TypeScript, Rust-nightly, C# and Cortex-M emulator toolchains (Lua 5.4, PHP
 with pcov, Ruby, Perl, JDK 21, Node 24 with esbuild, a nightly Rust, the
 SharpFuzz tool, `qemu-system-arm` with `gcc-arm-none-eabi`, gdb, lldb and LLVM)
