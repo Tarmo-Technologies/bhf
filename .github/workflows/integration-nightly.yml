@@ -20,13 +20,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Skip the nightly when the code hasn't changed: if the tip commit is older
-  # than a day there were no new commits since the last nightly. A manual
-  # dispatch always runs.
+  # Skip the nightly only when an earlier run at this commit ran every shard
+  # and all of them passed (scripts/ci/nightly-gate.py). A failed nightly
+  # runs again while the commit is unchanged, and a skip, which GitHub records
+  # as a success, never hides a failure. A manual dispatch always runs.
   gate:
-    name: Gate on new commits
+    name: Gate on an untested commit
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       changed: ${{ steps.check.outputs.changed }}
     steps:
@@ -34,26 +38,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Detect commits in the last day
+      - name: Look for a full successful run at this commit
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "manual dispatch: running"
-            exit 0
-          fi
-          head_ts="$(git log -1 --format=%ct)"
-          now="$(date +%s)"
-          age=$(( now - head_ts ))
-          # 25h window covers the daily cron plus scheduler jitter.
-          if [ "$age" -lt 90000 ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "tip commit is ${age}s old (< 25h): running"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "tip commit is ${age}s old (>= 25h): no new code, skipping"
-          fi
+          python3 scripts/ci/nightly-gate.py --repo "$GITHUB_REPOSITORY" \
+            --workflow integration-nightly.yml --sha "$GITHUB_SHA" \
+            --event "$EVENT_NAME" --run-id "$GITHUB_RUN_ID"
 
   integration:
     name: Integration tests (bhf)
@@ -123,3 +116,43 @@ jobs:
             echo "unknown shard: $SHARD" >&2
             exit 1
           fi
+
+  # A failed or timed-out shard opens one tracking issue for this branch, or
+  # updates the open one, and comments on it when a new commit fails. A run
+  # cancelled by a newer one reports nothing.
+  report-failure:
+    name: Report a failed nightly
+    needs: [gate, integration]
+    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/nightly-failure.md"
+          comment="$RUNNER_TEMP/nightly-failure-comment.md"
+          {
+            echo "The nightly integration suite failed on \`$GITHUB_REF_NAME\` at $GITHUB_SHA."
+            echo
+            echo "Last failing run: $RUN_URL ($EVENT_NAME)"
+            echo
+            echo "The nightly runs again every day until a run at the branch's tip passes"
+            echo "every shard. Close this issue once it does."
+          } > "$body"
+          echo "The nightly now fails at $GITHUB_SHA: $RUN_URL" > "$comment"
+          python3 scripts/ci/tracking-issue.py --repo "$GITHUB_REPOSITORY" \
+            --key "integration-nightly:$GITHUB_REF_NAME" --label integration-nightly \
+            --title "Integration nightly failing on $GITHUB_REF_NAME" \
+            --body-file "$body" --fingerprint "$GITHUB_SHA" --comment-file "$comment"

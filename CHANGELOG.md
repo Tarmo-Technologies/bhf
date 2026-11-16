@@ -1657,6 +1657,11 @@
   been given.
 
 ### Changed
+- The nightly integration suite skips a commit only after a run at that
+  commit passed every shard, instead of whenever the tip commit was over 25
+  hours old: a failed nightly runs again the next day, and a skipped run no
+  longer reports success over a failure. A failed nightly opens or updates
+  one `integration-nightly` tracking issue.
 - The nightly integration suite builds the runtrace shim and the compiler
   intercept before its tests, which used to fuzz with the runtime audit off
   and skip the env-capsule tests. With the new `BHF_REQUIRE_TOOLS=1`, which

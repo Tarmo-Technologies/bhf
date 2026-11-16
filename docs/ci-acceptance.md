@@ -66,6 +66,17 @@ open one, and comments on it when the blocker list changes. A manual run with
 check that a first run opens the issue and a second run updates it; close the
 issue afterwards.
 
+## Nightly integration suite
+
+`.github/workflows/integration-nightly.yml` runs every bhf integration test in
+13 shards. Its gate (`scripts/ci/nightly-gate.py`) skips a scheduled run only
+when an earlier run at the same commit ran every shard and all of them passed;
+a skipped run, which GitHub records as a success, does not count. A nightly
+that failed therefore runs again each day while the commit is unchanged, and a
+manual dispatch always runs. A failed or timed-out shard opens one issue
+labelled `integration-nightly` for the branch, or updates the open one, and
+comments on it when a new commit fails; close it once a nightly passes.
+
 ## Running and consuming the checks
 
 Run the complete policy and shell-behavior regression suite on Linux without
