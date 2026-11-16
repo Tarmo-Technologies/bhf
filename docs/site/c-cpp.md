@@ -996,7 +996,11 @@ transformed execution and emits BHF-307 `metamorphic-relation-runtime` findings
 when the relation is violated.
 
 Ada-only findings such as swallowed exception breadcrumbs, Ada handler paths,
-and generated `repro.adb` files do not apply to C/C++ targets.
+and generated `repro.adb` files do not apply to C/C++ targets: a report writes
+`repro.adb` only into an Ada finding, and removes one an earlier release wrote
+into another finding. `bhf explain` leaves the files bhf's driver opens to feed
+each input (`<work>/fuzz_inputs`, `<work>/fuzz_scratch`) out of a finding's
+FAKED ENVIRONMENT.
 
 ### Reproducing a finding offline
 

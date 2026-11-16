@@ -15,6 +15,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `repro.adb` is written only into Ada findings; a report removes one an
+  earlier release wrote into a C, C++ or Python finding (and keeps one that
+  bhf did not write). `bhf explain` no longer lists the driver's own
+  `fuzz_inputs`/`fuzz_scratch` files as files the target opened.
 - `bhf cartography` rates a copy whose size the input's length sets (a
   `memcpy` of `min(data[0], len - 1)` bytes into a small buffer) as an
   `input_sized_linear_write` with high exploitability. Minimization pinned the

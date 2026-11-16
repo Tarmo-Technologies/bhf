@@ -1973,7 +1973,15 @@ fn normalize_finding(
     let minimal_reproducer = string_at(&raw, &["minimal_reproducer"])
         .or_else(|| string_at(&raw, &["paths", "minimized"]));
     let raw_generated_repro_ada = string_at(&raw, &["generated_repro_ada"]);
-    let (generated_repro_ada, repro_ada_omitted_reason) = if generate_reproducers {
+    let ada = finding_is_ada(&raw);
+    let (generated_repro_ada, repro_ada_omitted_reason) = if !ada {
+        // An Ada program that writes the testcase back out means nothing to
+        // a C, C++ or Python developer; drop one an earlier release wrote.
+        if generate_reproducers {
+            remove_generated_repro_ada(finding_dir);
+        }
+        (None, None)
+    } else if generate_reproducers {
         repro_ada_status(finding_dir, &id, raw_generated_repro_ada.as_deref())
     } else if finding_dir.join("repro.adb").is_file() {
         (Some(finding_artifact_path(&id, "repro.adb")), None)
@@ -2187,6 +2195,44 @@ fn renders_ada_repro(finding: &FindingReport) -> bool {
     let has_sanitizer = string_at(&finding.raw, &["exception", "sanitizer"])
         .is_some_and(|sanitizer| !sanitizer.trim().is_empty());
     !has_sanitizer && finding.generated_repro_ada.is_some()
+}
+
+/// Whether a finding is an Ada target's: its dialect says Ada, or, with no
+/// dialect recorded (an older or hand-written record), it carries Ada
+/// exception evidence (a handler, a package) and no sanitizer report.
+fn finding_is_ada(raw: &Value) -> bool {
+    let dialect = string_at(raw, &["dialect"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if dialect.starts_with("ada") {
+        return true;
+    }
+    if !dialect.is_empty() {
+        return false;
+    }
+    let has_sanitizer = string_at(raw, &["exception", "sanitizer"])
+        .is_some_and(|sanitizer| !sanitizer.trim().is_empty());
+    !has_sanitizer
+        && (raw.pointer("/exception/handler").is_some()
+            || raw.get("handler").is_some()
+            || string_at(raw, &["target", "package"]).is_some()
+            || string_at(raw, &["generated_repro_ada"]).is_some())
+}
+
+/// Remove a `repro.adb` bhf generated for `finding_dir`'s testcase (its
+/// content is exactly what [`render_repro_ada`] writes), never one someone
+/// else put there.
+fn remove_generated_repro_ada(finding_dir: &Path) {
+    let repro = finding_dir.join("repro.adb");
+    let (Ok(existing), Ok(testcase)) = (
+        read_regular_no_follow(&repro),
+        read_regular_no_follow(&finding_dir.join("testcase.bin")),
+    ) else {
+        return;
+    };
+    if existing == render_repro_ada(&testcase).as_bytes() {
+        let _ = fs::remove_file(&repro);
+    }
 }
 
 fn repro_ada_status(
@@ -5463,6 +5509,73 @@ mod tests {
             max_raw_bytes: 4096,
             max_normalized_bytes: 8192,
         }
+    }
+
+    /// The Ada reproducer is an Ada program that writes the testcase back out:
+    /// only an Ada finding gets one, and one an earlier release wrote into a C
+    /// finding is removed, while a file someone else put there stays.
+    #[test]
+    fn repro_adb_is_written_only_for_ada_findings() {
+        let (_root_guard, root) = temp_dir("repro-adb-ada-only");
+        let cases = [
+            (
+                "F-0001-ada",
+                json!({"id": "F-0001-ada", "dialect": "ada2012",
+                "exception": {"name": "CONSTRAINT_ERROR"}}),
+            ),
+            (
+                "F-0002-c",
+                json!({"id": "F-0002-c", "dialect": "unknown",
+                "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan"}}),
+            ),
+            (
+                "F-0003-py",
+                json!({"id": "F-0003-py", "dialect": "python",
+                "exception": {"name": "IndexError"}}),
+            ),
+            (
+                "F-0004-legacy",
+                json!({"id": "F-0004-legacy",
+                "exception": {"name": "CONSTRAINT_ERROR", "handler": {"file": "p.adb", "line": 3}}}),
+            ),
+            (
+                "F-0005-stale",
+                json!({"id": "F-0005-stale", "dialect": "c",
+                "exception": {"name": "ASAN_SEGV", "sanitizer": "asan"}}),
+            ),
+            (
+                "F-0006-own",
+                json!({"id": "F-0006-own", "dialect": "c",
+                "exception": {"name": "ASAN_SEGV", "sanitizer": "asan"}}),
+            ),
+        ];
+        for (id, raw) in &cases {
+            let dir = root.join(id);
+            write_finding(&dir, raw.clone());
+            fs::write(dir.join("testcase.bin"), b"AB").unwrap();
+        }
+        fs::write(
+            root.join("F-0005-stale/repro.adb"),
+            super::render_repro_ada(b"AB"),
+        )
+        .unwrap();
+        fs::write(root.join("F-0006-own/repro.adb"), "-- mine\n").unwrap();
+
+        let findings = load_findings(&root).unwrap();
+        let by_id = |id: &str| findings.iter().find(|f| f.id == id).unwrap();
+        for id in ["F-0001-ada", "F-0004-legacy"] {
+            assert!(root.join(id).join("repro.adb").is_file(), "{id}");
+            assert!(by_id(id).generated_repro_ada.is_some(), "{id}");
+        }
+        for id in ["F-0002-c", "F-0003-py", "F-0005-stale"] {
+            assert!(!root.join(id).join("repro.adb").exists(), "{id}");
+            assert_eq!(by_id(id).generated_repro_ada, None, "{id}");
+            assert_eq!(by_id(id).repro_ada_omitted_reason, None, "{id}");
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("F-0006-own/repro.adb")).unwrap(),
+            "-- mine\n"
+        );
     }
 
     #[test]
