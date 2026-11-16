@@ -5,6 +5,10 @@
 ## Unreleased
 
 ### Changed
+- The nightly installs AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross
+  compilers, and qemu-user with the AArch64 cross compilers, and runs those
+  lanes' tests, which skipped as passes; the skip allowlist no longer names a
+  lane.
 - The nightly installs GNAT 13 and GPRbuild and runs the Ada lane tests,
   which skipped as passes, and no longer allows an Ada skip line; the PR
   smoke's Ada representative runs on a runner with GNAT.

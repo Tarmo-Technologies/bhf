@@ -133,16 +133,25 @@ jobs:
           toolchain: stable
 
       # The lane tests skip, and pass, when their toolchain is missing; these
-      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C#, Ada
-      # and Cortex-M emulator lanes, and the skip-line check after the tests
-      # fails the shard if a test still skips (scripts/ci/allowed-skips.txt
-      # lists the lanes not installed yet: AFL++, COBOL, Wine and AArch64).
+      # steps install the interpreter, JVM, TypeScript, Rust-nightly, C#, Ada,
+      # AFL++, COBOL, Wine/MinGW, AArch64 and Cortex-M emulator lanes, and the
+      # skip-line check after the tests fails the shard if a test still skips
+      # (scripts/ci/allowed-skips.txt lists only tests another workflow runs).
       - name: Install the interpreter and emulator toolchains
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gnat \
             gprbuild \
+            afl++ \
+            gnucobol3 \
+            wine \
+            wine64 \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            qemu-user \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
             lua5.4 \
             php-cli \
             php-pcov \
@@ -179,9 +188,11 @@ jobs:
       - name: Check the installed toolchains
         run: |
           set -euo pipefail
-          for tool in gnatmake gprbuild lua5.4 php ruby perl java javac node esbuild \
-                      qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb lldb llvm-symbolizer \
-                      dotnet; do
+          for tool in gnatmake gprbuild afl-fuzz afl-clang-fast cobc wine \
+                      x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ qemu-aarch64 \
+                      aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ lua5.4 php ruby perl java \
+                      javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
+                      lldb llvm-symbolizer dotnet; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for

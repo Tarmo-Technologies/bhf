@@ -15,18 +15,6 @@
 # The GNAT Matrix workflow sets BHF_M19_FULL_CI for this one.
 bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  skipping: BHF_M19_FULL_CI is not set
 
-# AFL++: afl-fuzz and afl-clang-fast are not installed yet.
-*  *afl-fuzz*
-
-# COBOL: GnuCOBOL (cobc) is not installed yet.
-*  *cobc*
-
-# Wine and MinGW-w64: the Windows cross lane is not installed yet.
-*  *x86_64-w64-mingw32-*
-
-# AArch64: the cross compilers and qemu-aarch64 are not installed yet.
-*  *aarch64*
-
 # The FreeRTOS CLI acceptance fetches a pinned kernel; hil-emu.yml runs it with
 # BHF_RTOS_CLI=1.
 bhf::transport_fuzz_qemu_cli::cli_freertos_clean_fault_clean  skip cli_freertos_clean_fault_clean: set BHF_RTOS_CLI=1

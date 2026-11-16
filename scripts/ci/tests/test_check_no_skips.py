@@ -147,18 +147,12 @@ class AllowlistTests(unittest.TestCase):
     def allowed(self, test: str, line: str) -> bool:
         return self.module.allowed(self.entries, test, line)
 
-    def test_it_allows_the_lanes_the_next_slices_install(self):
+    def test_it_does_not_allow_the_lanes_the_nightly_installs(self):
         for test, line in (
             ("bhf::auto_afl_engine::auto_engine_afl_only", "skipping auto_engine_afl_only: afl-fuzz/afl-clang-fast not on PATH"),
             ("bhf::auto_cobol::cobol_lane", "skip: needs cobc (GnuCOBOL) + clang + make"),
             ("bhf::windows_cross_fixture::wine_case", "skipping: requires x86_64-w64-mingw32-gcc and wine"),
             ("bhf::toolchain_config_cli::cross_case", "skip: aarch64-linux-gnu-gcc/qemu-aarch64/make unavailable"),
-        ):
-            with self.subTest(line=line):
-                self.assertTrue(self.allowed(test, line))
-
-    def test_it_does_not_allow_the_lanes_the_nightly_installs(self):
-        for test, line in (
             ("bhf::auto_ada_coverage::ada_lane", "SKIP: gnatmake/gprbuild not installed — Ada lane unavailable"),
             ("bhf::fork_server::ada_case", "skipping: no Ada compiler on PATH"),
             ("bhf::auto_lua_lane::lua_case", "skipping: no lua on PATH (GNAT-less rule)"),
