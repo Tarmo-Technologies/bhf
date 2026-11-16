@@ -4257,21 +4257,51 @@ fn run_builtin_with_progress(
                     // faults (allocator-state corruption across inputs). The key is
                     // consumed only once the finding is emitted, so a first hit that
                     // does not reproduce does not hide a later one that does.
-                    // A hang report comes from its own fresh-process re-run
-                    // (`confirm_hang`).
-                    if !c_libfuzzer_harness
-                        || report.rule_id == HANG_RULE
-                        || sanitizer_crash_reproduces(
-                            &prepared.runner,
-                            &prepared.work_dir,
-                            input,
-                            report,
-                            &prepared.extra_env,
-                            prepared.per_input_timeout,
-                            prepared.rss_limit_mb,
-                            prepared.deadline,
-                        )
+                    // A response-deadline overrun is a finding when most of
+                    // its fresh re-runs overrun the deadline too (#209).
+                    let deadline_check = prepared
+                        .deadline
+                        .filter(|_| report.rule_id == RESPONSE_DEADLINE_RULE)
+                        .map(|deadline| {
+                            confirm_deadline(
+                                &prepared.runner,
+                                &prepared.work_dir,
+                                input,
+                                &prepared.extra_env,
+                                prepared.per_input_timeout,
+                                prepared.rss_limit_mb,
+                                deadline,
+                                pass_deadline,
+                            )
+                        });
+                    let confirmed = match &deadline_check {
+                        Some(check) => check.confirmed(),
+                        // A hang report comes from its own fresh-process
+                        // re-run (`confirm_hang`).
+                        None => {
+                            !c_libfuzzer_harness
+                                || report.rule_id == HANG_RULE
+                                || sanitizer_crash_reproduces(
+                                    &prepared.runner,
+                                    &prepared.work_dir,
+                                    input,
+                                    report,
+                                    &prepared.extra_env,
+                                    prepared.per_input_timeout,
+                                    prepared.rss_limit_mb,
+                                    prepared.deadline,
+                                )
+                        }
+                    };
+                    if let Some(check) = deadline_check.as_ref().filter(|check| !check.confirmed())
                     {
+                        bhfeprintln!(
+                            "bhf fuzz: note: an input {}, but {}: not a finding",
+                            deadline_overrun_of(report),
+                            check.describe()
+                        );
+                    }
+                    if confirmed {
                         // UBSan's object-size check reports an overflow ASan
                         // would have reported first: emit ASan's report then.
                         // Asked once per root cause: the key is consumed below.
@@ -4324,6 +4354,14 @@ fn run_builtin_with_progress(
                             .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                         if report.rule_id == "BHF-209" && prepared.rss_limit_mb > 0 {
                             record_rss_limit(&prepared.work_dir, &id.0, prepared.rss_limit_mb);
+                        }
+                        if let Some(check) = &deadline_check {
+                            announce_deadline_finding(&format!(
+                                "{}, and {}",
+                                deadline_overrun_of(report),
+                                check.describe()
+                            ));
+                            check.record(&prepared.work_dir, &id.0);
                         }
                         if let Some(opinion) = &opinion {
                             opinion.record(&prepared.work_dir, &id.0, &key);
@@ -4441,9 +4479,6 @@ fn run_builtin_with_progress(
                         continue;
                     }
                     Some(report) => {
-                        if report.rule_id == RESPONSE_DEADLINE_RULE {
-                            announce_deadline_finding(deadline_overrun_of(report));
-                        }
                         fresh_rerun_summary.checked += 1;
                         fresh_rerun_summary.reports += 1;
                         emit_sanitizer_report!(
@@ -6330,10 +6365,6 @@ struct SpawnTweaks<'a> {
     /// the platform allows it (Windows; an unprivileged Unix process cannot
     /// undo a nice).
     restore_priority: Option<&'a std::sync::atomic::AtomicBool>,
-    /// Say nothing when the run overruns `--deadline`: the caller decides
-    /// whether the overrun becomes a finding and says so then (a fresh re-run's
-    /// overrun may be re-checked and cleared first).
-    quiet_deadline: bool,
     /// At the timeout, first ask the process for its stack (#207): on Unix,
     /// SIGABRT, which a sanitizer runtime armed with `handle_abort=1` answers
     /// with the stack it was interrupted at, then up to this long for it to
@@ -6690,10 +6721,8 @@ fn run_c_libfuzzer_single_input_in(
     // finding is only synthesized when there is no sanitizer report to surface.
     if let Some(deadline) = deadline {
         if elapsed > deadline && corpus::parse_sanitizer_report(&stderr).is_none() {
+            // Announced only once fresh re-runs confirm it (#209).
             let overrun = deadline_overrun(deadline, elapsed);
-            if !tweaks.quiet_deadline {
-                announce_deadline_finding(&overrun);
-            }
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
@@ -9060,6 +9089,136 @@ fn deadline_overrun_of(report: &corpus::SanitizerReport) -> &str {
         .unwrap_or(&report.message)
 }
 
+/// How many fresh runs re-check a response-deadline overrun (#209). It is a
+/// finding when most of them overrun the deadline too: one run slowed by a
+/// loaded host is not.
+const DEADLINE_CONFIRM_RUNS: usize = 3;
+
+/// The fresh re-runs of an input that overran `--deadline`, timed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeadlineConfirmation {
+    deadline: Duration,
+    /// Each re-run's wall-clock time, in order.
+    runs: Vec<Duration>,
+}
+
+impl DeadlineConfirmation {
+    fn overruns(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|took| **took > self.deadline)
+            .count()
+    }
+
+    /// Whether most of [`DEADLINE_CONFIRM_RUNS`] re-runs overran the deadline.
+    fn confirmed(&self) -> bool {
+        self.overruns() * 2 > DEADLINE_CONFIRM_RUNS
+    }
+
+    /// `2 of 2 fresh re-runs overran it too (took 1.0s, 1.0s)`.
+    fn describe(&self) -> String {
+        let took: Vec<String> = self.runs.iter().map(|took| duration_arg(*took)).collect();
+        format!(
+            "{} of {} fresh re-runs overran it too (took {})",
+            self.overruns(),
+            self.runs.len(),
+            if took.is_empty() {
+                "-".to_owned()
+            } else {
+                took.join(", ")
+            }
+        )
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let ms = |took: &Duration| u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        serde_json::json!({
+            "deadline_ms": ms(&self.deadline),
+            "rerun_ms": self.runs.iter().map(ms).collect::<Vec<_>>(),
+            "overruns": self.overruns(),
+        })
+    }
+
+    /// Record [`Self::to_json`] as the finding's `deadline_confirmation`.
+    fn record(&self, work_dir: &Path, finding_id: &str) {
+        let path = corpus::layout::finding_dir(work_dir, finding_id).join("finding.json");
+        let recorded = fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                let mut finding: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                finding["deadline_confirmation"] = self.to_json();
+                let bytes =
+                    serde_json::to_vec_pretty(&finding).map_err(|error| error.to_string())?;
+                crate::auto::report::atomic_write(&path, &bytes).map_err(|error| error.to_string())
+            });
+        if let Err(error) = recorded {
+            bhfeprintln!(
+                "warning: could not record the deadline confirmation of {finding_id}: {error}"
+            );
+        }
+    }
+}
+
+/// Re-run an input that overran `deadline` in fresh processes, timing each,
+/// until a majority of [`DEADLINE_CONFIRM_RUNS`] has decided, the pass's time
+/// runs out, or a run fails to start. Each run is bounded by the per-input
+/// timeout; one killed at it overran the deadline.
+#[allow(clippy::too_many_arguments)]
+fn confirm_deadline(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+    deadline: Duration,
+    pass_deadline: Option<Instant>,
+) -> DeadlineConfirmation {
+    let mut check = DeadlineConfirmation {
+        deadline,
+        runs: Vec::new(),
+    };
+    let needed = DEADLINE_CONFIRM_RUNS / 2 + 1;
+    while check.runs.len() < DEADLINE_CONFIRM_RUNS
+        && check.overruns() < needed
+        && check.runs.len() - check.overruns() < needed
+    {
+        let timeout = match pass_deadline {
+            Some(end) => per_input_timeout.min(end.saturating_duration_since(Instant::now())),
+            None => per_input_timeout,
+        };
+        let (Ok(input_path), Ok(scratch)) = (
+            write_fuzz_input(work_dir, input),
+            ensure_harness_scratch(work_dir),
+        ) else {
+            break;
+        };
+        if timeout <= deadline {
+            let _ = fs::remove_file(&input_path);
+            break;
+        }
+        let started = Instant::now();
+        let output = run_with_timeout(
+            runner.harness_path(),
+            &input_path,
+            timeout,
+            extra_env,
+            &scratch,
+            rss_limit_mb,
+            runner.qemu_prefix(),
+            SpawnTweaks::default(),
+        );
+        let took = started.elapsed();
+        let _ = fs::remove_file(&input_path);
+        if output.is_err() {
+            break;
+        }
+        check.runs.push(took);
+    }
+    check
+}
+
 /// Say on stderr that a run's deadline overrun is being recorded as a BHF-555
 /// finding.
 fn announce_deadline_finding(overrun: &str) {
@@ -9683,8 +9842,6 @@ fn run_fresh_rerun(
             low_priority,
             cancel: background.then_some(context.cancelled),
             restore_priority: background.then_some(context.draining),
-            // Announced where the report is adopted, once it is a finding.
-            quiet_deadline: true,
             ..SpawnTweaks::default()
         },
     );

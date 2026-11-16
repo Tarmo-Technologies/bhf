@@ -2679,6 +2679,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/deadline_confirmation_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/differential_cli.rs",
       "license": "Apache-2.0"
     },

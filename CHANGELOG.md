@@ -45,6 +45,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A response-deadline finding (BHF-555) is confirmed before it is reported.
+  One run past `--deadline`, spawn time included, used to be a finding, so a
+  run slowed by a loaded host was reported. The input is now re-run in up to
+  three fresh processes, and it is a finding only when two of them overrun the
+  deadline too. The finding's `deadline_confirmation` records the deadline,
+  each re-run's time and how many overran it, and the BHF-555 notice is
+  printed only once the overrun is confirmed.
 - The builtin engine reports an input that hangs a C or C++ harness. An
   execution killed at `--timeout` used to be dropped, so an infinite loop was
   never a finding. Its input is now re-run in a fresh process with twice the

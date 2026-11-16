@@ -323,8 +323,9 @@ loop's priority, and with `--deadline` it runs inline, so a response time is
 never judged while it competes with the loop.
 
 - **Deadline re-check.** A response-deadline (BHF-555) report from a
-  background re-run is re-checked inline, at the loop's priority, before it
-  becomes a finding, whatever the CPU count.
+  background re-run is re-checked inline, at the loop's priority, whatever the
+  CPU count. Like every BHF-555 report, it then becomes a finding only when
+  two of three fresh re-runs overrun the deadline too.
 - **Isolation.** Each re-run starts in an empty working directory of its own,
   with `TMPDIR` (`TMP` and `TEMP` on Windows) pointing there, so a target that
   keeps files in its working directory never shares them with the fork-server.
