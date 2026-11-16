@@ -2093,6 +2093,16 @@ fn record_failed_build_blockers(
                 continue;
             }
             match err {
+                E::MissingPackage { name, version } => manifest.push_merge_with_hint(
+                    DepKind::LanguagePackage,
+                    match version {
+                        Some(version) => format!("{name} {version}"),
+                        None => name.clone(),
+                    },
+                    vec![id.clone()],
+                    false,
+                    Some(missing_package_hint(name, version.as_deref())),
+                ),
                 E::MissingHeader { path } => {
                     // A configure/cmake-generated header has no distro package; if a
                     // `.in`/`.dist`/`.cmake` template sits in the tree, name it and
@@ -2418,6 +2428,18 @@ fn manifest_reference_count(
         .iter()
         .filter(|e| e.referenced_by.iter().any(|r| r == id))
         .count()
+}
+
+/// How to stage a NuGet package the harness build restores offline.
+fn missing_package_hint(name: &str, version: Option<&str>) -> String {
+    let version = version.unwrap_or("<version>");
+    format!(
+        "the harness build restores only from the local NuGet package cache: on a connected \
+         host, `dotnet add package {name} --version {version}` to any project and \
+         `dotnet restore` it, then copy `~/.nuget/packages/{}/{version}` into this host's \
+         NUGET_PACKAGES (or ~/.nuget/packages); see docs/site/csharp.md",
+        name.to_ascii_lowercase()
+    )
 }
 
 /// What to do about a compile error in the project's own source.
@@ -4263,6 +4285,35 @@ mod tests {
             entry("harmless_t").stubbed,
             "a stubbed type absent from the errors stays stubbed (build continued)"
         );
+    }
+
+    /// A NuGet package the C# harness could not restore is a missing language
+    /// package, named with its version, with how to stage it.
+    #[test]
+    fn an_nu1101_failure_is_a_missing_sharpfuzz_package() {
+        use build_classifier::BuildErrorKind;
+        let root = tempfile::tempdir().unwrap();
+        let mut m = build_dependency_manifest(&NeededForBuild::default(), root.path(), "");
+        let failed = vec![(
+            "H-S0001".to_owned(),
+            vec![BuildErrorKind::MissingPackage {
+                name: "SharpFuzz".to_owned(),
+                version: Some("2.3.0".to_owned()),
+            }],
+        )];
+        record_failed_build_blockers(&mut m, &failed, &StdPreludes::new(), root.path());
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.name == "SharpFuzz 2.3.0")
+            .unwrap_or_else(|| panic!("{:?}", m.entries));
+        assert_eq!(entry.kind, DepKind::LanguagePackage);
+        assert!(!entry.stubbed);
+        let hint = entry.acquisition_hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("NUGET_PACKAGES"), "{hint}");
+        assert!(hint.contains("sharpfuzz/2.3.0"), "{hint}");
+        // Not a C/C++ dependency.
+        assert!(!hint.contains("apt"), "{hint}");
     }
 
     /// A compile error located in the project's own file is a source error in

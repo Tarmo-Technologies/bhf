@@ -5821,6 +5821,7 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
             format!("undeclared function '{name}' at {file}:{line}")
         }
         MissingSharedLib { name } => format!("missing shared library '{name}'"),
+        MissingPackage { name, .. } => format!("missing package '{name}'"),
         MissingAdaWith { unit } => format!("missing Ada unit '{unit}'"),
         MissingAdaSymbol { unit, symbol } => format!("missing Ada symbol '{unit}.{symbol}'"),
         MissingAdaPackageBody { unit } => format!("missing Ada package body '{unit}'"),

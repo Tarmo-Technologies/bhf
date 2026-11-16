@@ -16,6 +16,13 @@ pub enum BuildErrorKind {
     MissingHeader {
         path: String,
     },
+    /// A package the build restores is not in any package source it may use:
+    /// NuGet's NU1101 ("Unable to find package") or NU1102 (none with the
+    /// version asked for). `version` is the one NU1102 names.
+    MissingPackage {
+        name: String,
+        version: Option<String>,
+    },
     MissingType {
         name: String,
     },
@@ -228,6 +235,7 @@ pub fn unqualified_std_names(stderr: &str) -> Vec<UnqualifiedStdName> {
 /// report.
 pub fn classify(stderr: &str) -> Vec<BuildErrorKind> {
     let mut hits = Vec::new();
+    nuget_into(stderr, &mut hits);
     gcc_clang::classify_into(stderr, &mut hits);
     gnat::classify_into(stderr, &mut hits);
     // gprbuild frequently repeats the same underlying GNAT diagnostic while
@@ -298,6 +306,43 @@ pub fn is_codegen_error(kind: &BuildErrorKind) -> bool {
         BuildErrorKind::MissingType { name } => is_recovery_artifact(name),
         BuildErrorKind::Other { tail } => tail_is_codegen(tail),
         _ => false,
+    }
+}
+
+/// NuGet restore errors: `error NU1101: Unable to find package SharpFuzz.`
+/// and `error NU1102: Unable to find package SharpFuzz with version (>= 2.3.0)`.
+fn nuget_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
+    for line in stderr.lines() {
+        let Some(at) = line
+            .find("NU1101: Unable to find package ")
+            .or_else(|| line.find("NU1102: Unable to find package "))
+        else {
+            continue;
+        };
+        let rest = &line[at + "NU1101: Unable to find package ".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect::<String>()
+            .trim_end_matches('.')
+            .to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let version = rest
+            .split_once("with version (")
+            .and_then(|(_, tail)| tail.split_once(')'))
+            .map(|(range, _)| {
+                range
+                    .trim_start_matches(['>', '=', '<', ' '])
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|version| !version.is_empty());
+        let hit = BuildErrorKind::MissingPackage { name, version };
+        if !hits.contains(&hit) {
+            hits.push(hit);
+        }
     }
 }
 
@@ -416,6 +461,27 @@ mod tests {
 
     /// An undeclared identifier in the project's own file is the project's
     /// error; in the generated driver, or with no location, it is bhf's.
+    #[test]
+    fn nuget_restore_errors_name_the_missing_package() {
+        let log = "/w/H-S1/bhf_harness.csproj : error NU1101: Unable to find package \
+                   SharpFuzz. No packages exist with this id in source(s): offline-feed\n\
+                   /w/H-S1/bhf_harness.csproj : error NU1102: Unable to find package \
+                   Newtonsoft.Json with version (>= 13.0.3)\n";
+        assert_eq!(
+            classify(log),
+            vec![
+                BuildErrorKind::MissingPackage {
+                    name: "SharpFuzz".to_owned(),
+                    version: None,
+                },
+                BuildErrorKind::MissingPackage {
+                    name: "Newtonsoft.Json".to_owned(),
+                    version: Some("13.0.3".to_owned()),
+                },
+            ]
+        );
+    }
+
     #[test]
     fn a_lookup_error_is_codegen_only_in_the_generated_harness() {
         let in_tree = "/p/src/bad.c:3:25: error: use of undeclared identifier 'counter'";

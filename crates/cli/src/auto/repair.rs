@@ -3519,7 +3519,8 @@ pub(crate) fn plan_repair_forced_with_source_policy(
                 })
             }
         }
-        BuildErrorKind::MissingSharedLib { .. } => None,
+        // A package to restore is staged by the operator, not repaired.
+        BuildErrorKind::MissingSharedLib { .. } | BuildErrorKind::MissingPackage { .. } => None,
         BuildErrorKind::MissingGprImport { path } => {
             // A missing external `with`ed GPR fails at project LOAD, before any
             // unit compiles. Without `--force` this is an honest missing dependency

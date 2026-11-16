@@ -94,6 +94,32 @@ pub(crate) fn locate_sharpfuzz() -> Option<PathBuf> {
     None
 }
 
+/// The SharpFuzz NuGet package every generated harness project references.
+pub(crate) const SHARPFUZZ_PACKAGE: (&str, &str) = ("SharpFuzz", "2.3.0");
+
+/// NuGet's global packages folder: `$NUGET_PACKAGES`, else `.nuget/packages`
+/// in the home directory. The harness build restores only from there.
+pub(crate) fn nuget_packages_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("NUGET_PACKAGES").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".nuget").join("packages"))
+}
+
+/// Whether NuGet's global packages folder holds the SharpFuzz package the
+/// harness references, restored (its `.nupkg.metadata` written).
+pub(crate) fn sharpfuzz_package_cached() -> bool {
+    let (name, version) = SHARPFUZZ_PACKAGE;
+    nuget_packages_dir().is_some_and(|dir| {
+        dir.join(name.to_ascii_lowercase())
+            .join(version)
+            .join(".nupkg.metadata")
+            .is_file()
+    })
+}
+
 /// Locate the bundled `csharp_runtime/Driver.cs`, relative to the source tree
 /// (dev) or the installed binary (release) — mirrors `locate_python_runtime`.
 fn locate_csharp_runtime() -> Option<PathBuf> {
@@ -820,6 +846,38 @@ fn generate_source_target_csproj(target_csproj: &Path, excluded: &[PathBuf]) -> 
 }
 
 /// The single public entry point of the lane.
+/// Give each missing NuGet package of `errors` without a version (NU1101
+/// names none) the version the harness project in `hdir` references.
+pub(crate) fn fill_package_versions(errors: &mut [build_classifier::BuildErrorKind], hdir: &Path) {
+    let Ok(csproj) = std::fs::read_to_string(hdir.join("proj").join("bhf_harness.csproj")) else {
+        return;
+    };
+    for error in errors {
+        let build_classifier::BuildErrorKind::MissingPackage { name, version } = error else {
+            continue;
+        };
+        if version.is_none() {
+            *version = package_reference_version(&csproj, name);
+        }
+    }
+}
+
+/// The `Version` of the `<PackageReference Include="name" …>` in `csproj`.
+fn package_reference_version(csproj: &str, name: &str) -> Option<String> {
+    csproj.lines().find_map(|line| {
+        let include = format!("Include=\"{name}\"");
+        if !line.contains("<PackageReference")
+            || !line
+                .to_ascii_lowercase()
+                .contains(&include.to_ascii_lowercase())
+        {
+            return None;
+        }
+        let (_, rest) = line.split_once("Version=\"")?;
+        rest.split('"').next().map(str::to_owned)
+    })
+}
+
 pub fn build_csharp_harness(
     candidate: &Candidate,
     work_dir: &Path,
@@ -1179,6 +1237,33 @@ mod tests {
             kind,
             raw_type: raw.to_owned(),
         }
+    }
+
+    /// NU1101 names no version; the harness project's PackageReference does.
+    #[test]
+    fn a_missing_package_takes_the_version_the_harness_references() {
+        let dir = crate::test_support::TestDir::new("csharp-package-version");
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        std::fs::write(
+            dir.join("proj").join("bhf_harness.csproj"),
+            generate_csproj(
+                Path::new("x.csproj"),
+                &TargetLinkage::ProjectReference { pinned_tfm: None },
+            ),
+        )
+        .unwrap();
+        let mut errors = build_classifier::classify(
+            "bhf_harness.csproj : error NU1101: Unable to find package SharpFuzz. No packages \
+             exist with this id in source(s): offline-feed",
+        );
+        fill_package_versions(&mut errors, dir.path());
+        assert_eq!(
+            errors,
+            vec![build_classifier::BuildErrorKind::MissingPackage {
+                name: SHARPFUZZ_PACKAGE.0.to_owned(),
+                version: Some(SHARPFUZZ_PACKAGE.1.to_owned()),
+            }]
+        );
     }
 
     #[test]

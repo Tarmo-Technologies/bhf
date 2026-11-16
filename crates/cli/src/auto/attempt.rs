@@ -2778,12 +2778,14 @@ fn run_attempt(
                 });
             }
             crate::auto::csharp_build::CSharpBuildResult::Failed(reason) => {
+                let mut last_errors = build_classifier::classify(&reason);
+                crate::auto::csharp_build::fill_package_versions(&mut last_errors, &harness_dir);
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
                     outcome: Outcome::FailedBuild {
                         repairs: Vec::new(),
                         retries: 0,
-                        last_errors: build_classifier::classify(&reason),
+                        last_errors,
                     },
                     harness_dir,
                 });

@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- C# preflight checks NuGet's global packages folder for the SharpFuzz 2.3.0
+  package the harness restores (offline only), and reports the lane MISSING it
+  when it is absent. Every target used to fail instead, with NU1101 filed as an
+  unrecognised error and C/C++ advice. A NuGet NU1101 or NU1102 is now a
+  `language_package` entry named with its version (`SharpFuzz 2.3.0`), with
+  staging steps; csharp.md documents them.
 - An installed bhf stages its embedded harness runtimes once, atomically, in
   `<user cache>/bhf/runtime-<sha256>/` and reuses them. It wrote them to a
   temporary directory it never removed, which generated Makefiles and

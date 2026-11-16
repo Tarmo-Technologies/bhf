@@ -368,6 +368,8 @@ fn build_error_detail(error: &build_classifier::BuildErrorKind) -> String {
         E::UndefinedSymbol { .. } => "undefined symbol".to_owned(),
         E::UndeclaredFunction { .. } => "undeclared function".to_owned(),
         E::MissingSharedLib { .. } => "missing shared library".to_owned(),
+        // The package is the lever: which one to stage.
+        E::MissingPackage { name, .. } => format!("missing package \"{name}\""),
         E::MissingAdaWith { .. } => "missing Ada unit".to_owned(),
         E::MissingAdaSymbol { .. } => "missing Ada symbol".to_owned(),
         E::MissingAdaPackageBody { .. } => "missing Ada package body".to_owned(),
