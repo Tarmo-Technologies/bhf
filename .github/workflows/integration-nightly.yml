@@ -279,8 +279,9 @@ jobs:
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
           # The #[ignore]d tests that need a quiet machine or a long budget:
           # the Lua line-hook cost benchmark, the RedQueen/cmplog cold-solve
-          # discriminators and the engine-parity cold-solve sweep.
-          ignored='binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)'
+          # discriminators, the engine-parity cold-solve sweep and the
+          # crash-dense throughput benchmark.
+          ignored='binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity) | binary(=fuzz_crash_throughput)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
             cargo nextest run $archive --no-fail-fast --profile ci -E "$slow"
           elif [ "$SHARD" = ignored ]; then

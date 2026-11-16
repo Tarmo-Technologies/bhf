@@ -1261,6 +1261,10 @@ struct PreparedFuzzRun {
     winafl_timeout: Option<Duration>,
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
+    /// `extra_env` for the builtin loop's own executions (the fork server and
+    /// the per-spawn runs): the sanitizers neither symbolize nor abort
+    /// ([`in_loop_env`]). Re-runs and confirmations use `extra_env`.
+    loop_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
     _local_coverage_map: Option<shared_map::SharedMapFile>,
     /// Keeps the RedQueen (#400) per-input cmplog operand map alive for the run.
@@ -3259,6 +3263,7 @@ fn prepare_with_runner(
         },
         winafl_timeout: args.timeout,
         mode: args.mode,
+        loop_env: in_loop_env(&extra_env, in_loop_symbolize()),
         extra_env,
         _local_coverage_map: local_coverage_map,
         _local_cmp_map: local_cmp_map,
@@ -4147,6 +4152,7 @@ fn run_builtin_with_progress(
         HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
     // Sanitizer-crash dedup (#389): one finding per root cause, not one per
     // crashing input.
+    let mut in_loop_symbolization = InLoopSymbolization::default();
     let mut sanitizer_dedup = SanitizerClusterDedup::new(
         existing_findings.clusters.keys().cloned(),
     )
@@ -4298,6 +4304,41 @@ fn run_builtin_with_progress(
             let report: &corpus::SanitizerReport = $report;
             let stderr: Option<&str> = $stderr;
             'emit: {
+                // The loop's executions do not symbolize (#230): a crash whose
+                // signature was reported is counted, and a new one is re-run in
+                // a fresh process, symbolized, and that report goes on.
+                let symbolized_rerun;
+                let (report, stderr) =
+                    match in_loop_symbolization.classify(report, stderr, &mut sanitizer_dedup) {
+                        InLoopCrash::AsIs => (report, stderr),
+                        InLoopCrash::Duplicate => break 'emit,
+                        InLoopCrash::Symbolize(signature) => {
+                            symbolized_rerun = run_harness_with_protocol(
+                                &prepared.runner,
+                                &prepared.work_dir,
+                                input,
+                                &prepared.extra_env,
+                                prepared.per_input_timeout,
+                                prepared.rss_limit_mb,
+                                protocol,
+                                prepared.deadline,
+                            )
+                            .ok()
+                            .and_then(|rerun| Some((rerun.sanitizer?, rerun.stderr)));
+                            match &symbolized_rerun {
+                                Some((fresh, fresh_stderr)) => {
+                                    in_loop_symbolization
+                                        .symbolized(signature, sanitizer_dedup.key(fresh));
+                                    (fresh, fresh_stderr.as_deref())
+                                }
+                                None => {
+                                    sanitizer_dedup.unconfirmed(signature);
+                                    non_reproducible += 1;
+                                    break 'emit;
+                                }
+                            }
+                        }
+                    };
                 // (#49) An LSan leak whose entire allocation stack is bhf's own
                 // decode/harness scaffolding (no target frame) is the decoder buffer the
                 // harness would have freed — left dangling only because an exit()/abort()-
@@ -4705,7 +4746,7 @@ fn run_builtin_with_progress(
                         &prepared.runner,
                         &prepared.work_dir,
                         &input,
-                        &prepared.extra_env,
+                        &prepared.loop_env,
                         prepared.per_input_timeout,
                         prepared.rss_limit_mb,
                         protocol,
@@ -4737,7 +4778,7 @@ fn run_builtin_with_progress(
                 &prepared.runner,
                 &prepared.work_dir,
                 &input,
-                &prepared.extra_env,
+                &prepared.loop_env,
                 prepared.per_input_timeout,
                 prepared.rss_limit_mb,
                 protocol,
@@ -5559,6 +5600,21 @@ impl SanitizerClusterDedup {
     /// The key `report` is deduplicated on.
     fn key(&self, report: &corpus::SanitizerReport) -> String {
         corpus::finding::sanitizer_dedupe_key_scoped(report, &self.scope)
+    }
+
+    /// Count a hit of `key` when its root cause is settled: reported (or
+    /// pre-seeded) or given up. `false` when it is neither, so the hit still
+    /// needs its confirmation.
+    fn note_settled_hit(&mut self, key: &str) -> bool {
+        if let Some(count) = self.seen.get_mut(key) {
+            *count = count.saturating_add(1);
+            return true;
+        }
+        if let Some(later) = self.abandoned.get_mut(key) {
+            *later = later.saturating_add(1);
+            return true;
+        }
+        false
     }
 
     /// A finding was emitted for `key`: later hits are duplicates.
@@ -7149,6 +7205,101 @@ fn sanitizer_child_env_with(
             merge(ubsan, &ubsan_required(emulated)),
         ),
     ]
+}
+
+/// Whether the builtin loop's own executions symbolize sanitizer reports:
+/// only with `BHF_IN_LOOP_SYMBOLIZE=1`. Symbolizing a report (llvm-symbolizer)
+/// and aborting through the kernel's core pattern take most of a second, which
+/// on a target where most inputs crash left a few executions a second for a
+/// crash already reported.
+fn in_loop_symbolize() -> bool {
+    std::env::var("BHF_IN_LOOP_SYMBOLIZE").is_ok_and(|value| value == "1")
+}
+
+/// `env` for the builtin loop's own executions. Unless `symbolize`, each
+/// sanitizer's options get `symbolize=0` (a report names `module+offset`
+/// frames, which [`InLoopSymbolization`] tells crashes apart by) and
+/// `abort_on_error=0` (the sanitizer exits non-zero after its report, which
+/// classifies it, instead of aborting through the core pattern). bhf's keys
+/// go last, so these win.
+fn in_loop_env(env: &[(String, String)], symbolize: bool) -> Vec<(String, String)> {
+    let mut env = env.to_vec();
+    if symbolize {
+        return env;
+    }
+    for (key, value) in env.iter_mut() {
+        if matches!(
+            key.as_str(),
+            "ASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
+        ) {
+            *value = corpus::sanitizer_options::merge(Some(value), "symbolize=0:abort_on_error=0");
+        }
+    }
+    env
+}
+
+/// What to do with an unsymbolized sanitizer report from the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InLoopCrash {
+    /// The report is symbolized already, or names no frames: report it.
+    AsIs,
+    /// A crash an earlier one with the same signature was reported (or given
+    /// up) for: counted, not re-run.
+    Duplicate,
+    /// A new signature: re-run the input symbolized and report that.
+    Symbolize(String),
+}
+
+/// The builtin loop's view of its unsymbolized crashes: the signature of each
+/// (rule, kind and the top frames' `module+offset`) and the root-cause key its
+/// symbolized re-run was reported under, so a crash with a signature seen
+/// before costs no re-run.
+#[derive(Default)]
+struct InLoopSymbolization {
+    keys: HashMap<String, String>,
+}
+
+impl InLoopSymbolization {
+    /// Frames of the signature: enough to tell two call paths apart.
+    const FRAMES: usize = 5;
+
+    fn signature(report: &corpus::SanitizerReport, stderr: Option<&str>) -> Option<String> {
+        let frames = corpus::sanitizer::unsymbolized_frames(stderr?);
+        if frames.is_empty() || !report.stack.is_empty() {
+            return None;
+        }
+        let top = &frames[..frames.len().min(Self::FRAMES)];
+        Some(format!(
+            "unsymbolized:{}:{}:{}",
+            report.rule_id,
+            report.kind,
+            top.join(",")
+        ))
+    }
+
+    fn classify(
+        &self,
+        report: &corpus::SanitizerReport,
+        stderr: Option<&str>,
+        dedup: &mut SanitizerClusterDedup,
+    ) -> InLoopCrash {
+        let Some(signature) = Self::signature(report, stderr) else {
+            return InLoopCrash::AsIs;
+        };
+        let settled = |key: &str, dedup: &mut SanitizerClusterDedup| dedup.note_settled_hit(key);
+        if settled(&signature, dedup) {
+            return InLoopCrash::Duplicate;
+        }
+        match self.keys.get(&signature) {
+            Some(key) if settled(key, dedup) => InLoopCrash::Duplicate,
+            _ => InLoopCrash::Symbolize(signature),
+        }
+    }
+
+    /// The re-run of `signature`'s input was reported under `key`.
+    fn symbolized(&mut self, signature: String, key: String) {
+        self.keys.insert(signature, key);
+    }
 }
 
 /// Turn `abort_on_error` off in the `ASAN_OPTIONS` and `UBSAN_OPTIONS` of
@@ -10114,7 +10265,7 @@ fn start_fork_server(
     match ForkServer::spawn(
         &prepared.runner,
         &prepared.work_dir,
-        &prepared.extra_env,
+        &prepared.loop_env,
         prepared.rss_limit_mb,
         prepared.per_input_timeout,
         handshake_timeout,
@@ -12204,6 +12355,96 @@ mod auto_path_tests {
             duplicates.get(&corpus::finding::sanitizer_dedupe_key(&a1)),
             Some(&1)
         );
+    }
+
+    /// An unsymbolized ASan report whose crash stack is `frames`.
+    fn unsymbolized(frames: &[&str]) -> (corpus::SanitizerReport, String) {
+        let mut stderr = "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+                          WRITE of size 9 at 0x1 thread T0\n"
+            .to_owned();
+        for (index, frame) in frames.iter().enumerate() {
+            stderr.push_str(&format!("    #{index} 0x55d0c3a1b2c4  (/w/main+{frame})\n"));
+        }
+        stderr.push_str("\nSUMMARY: AddressSanitizer: heap-buffer-overflow (/w/main+0x1)\n");
+        (corpus::parse_sanitizer_report(&stderr).unwrap(), stderr)
+    }
+
+    #[test]
+    fn a_crash_with_a_reported_signature_is_not_symbolized_again() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let mut symbolization = InLoopSymbolization::default();
+        let (first, first_stderr) = unsymbolized(&["0x12b1b2", "0x13f001"]);
+        let InLoopCrash::Symbolize(signature) =
+            symbolization.classify(&first, Some(&first_stderr), &mut dedup)
+        else {
+            panic!("a new signature is symbolized");
+        };
+        // Its symbolized re-run is reported under the root cause's key.
+        let symbolized = sanitizer_report("BHF-201", vec!["copy_record", "bhf_run_one"]);
+        let key = dedup.first_sighting(&symbolized).unwrap();
+        dedup.consumed(key.clone());
+        symbolization.symbolized(signature, key.clone());
+
+        let (again, again_stderr) = unsymbolized(&["0x12b1b2", "0x13f001"]);
+        assert_eq!(
+            symbolization.classify(&again, Some(&again_stderr), &mut dedup),
+            InLoopCrash::Duplicate
+        );
+        assert_eq!(dedup.duplicate_hits().get(&key), Some(&1));
+        // Another call path is a new signature.
+        let (other, other_stderr) = unsymbolized(&["0x12b1b2", "0x140aa0"]);
+        assert!(matches!(
+            symbolization.classify(&other, Some(&other_stderr), &mut dedup),
+            InLoopCrash::Symbolize(_)
+        ));
+        // A symbolized report goes on as it is.
+        assert_eq!(
+            symbolization.classify(&symbolized, None, &mut dedup),
+            InLoopCrash::AsIs
+        );
+    }
+
+    #[test]
+    fn a_signature_whose_rerun_never_crashes_is_given_up() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let symbolization = InLoopSymbolization::default();
+        let (report, stderr) = unsymbolized(&["0x4242"]);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let InLoopCrash::Symbolize(signature) =
+                symbolization.classify(&report, Some(&stderr), &mut dedup)
+            else {
+                panic!("re-run until given up");
+            };
+            dedup.unconfirmed(signature);
+        }
+        assert_eq!(
+            symbolization.classify(&report, Some(&stderr), &mut dedup),
+            InLoopCrash::Duplicate
+        );
+    }
+
+    #[test]
+    fn the_loops_children_neither_symbolize_nor_abort() {
+        let env = vec![
+            (
+                "ASAN_OPTIONS".to_owned(),
+                "detect_leaks=1:symbolize=1".to_owned(),
+            ),
+            ("UBSAN_OPTIONS".to_owned(), "halt_on_error=1".to_owned()),
+            ("BHF_COV_SHM".to_owned(), "/w/cov".to_owned()),
+        ];
+        let loop_env = in_loop_env(&env, false);
+        assert_eq!(
+            loop_env[0].1,
+            "detect_leaks=1:symbolize=1:symbolize=0:abort_on_error=0"
+        );
+        assert_eq!(
+            loop_env[1].1,
+            "halt_on_error=1:symbolize=0:abort_on_error=0"
+        );
+        assert_eq!(loop_env[2], env[2]);
+        // BHF_IN_LOOP_SYMBOLIZE=1 keeps the loop as it was.
+        assert_eq!(in_loop_env(&env, true), env);
     }
 
     fn missing_return_at(line: u32) -> corpus::SanitizerReport {

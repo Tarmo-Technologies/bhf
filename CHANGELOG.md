@@ -45,6 +45,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A target whose inputs mostly crash keeps its throughput: the builtin loop
+  runs its executions with `symbolize=0:abort_on_error=0`, counts a crash
+  whose signature (rule, kind, top five `module+offset` frames) was reported
+  against that finding without re-running it, and symbolizes only a new one,
+  in a fresh-process re-run whose report becomes the finding, so every finding
+  keeps its symbolized stack. Each crashing execution was symbolized and
+  aborted through the kernel's core pattern, most of a second each, which held
+  such targets to a few executions a second. `BHF_IN_LOOP_SYMBOLIZE=1`
+  restores in-loop symbolization; a nightly benchmark checks the loop runs at
+  least three times faster without it.
 - An interrupted `bhf fuzz` leaves no shared-memory files behind. Its maps
   were `.tmp*` files at the top of the work dir, which a killed run left there
   and `bhf clean --all` kept; they now live in `<work>/fuzz_shm/` as
