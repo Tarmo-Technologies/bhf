@@ -1689,18 +1689,21 @@ fn build_overflowing_harness(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The runtrace shim this checkout built, when it is newer than the code that
-/// copies the published input (an older build would test the old code).
+/// copies the published input (an older build would test the old code). A
+/// prebuilt bhf (`$BHF_TEST_BIN`) comes with the shim built from this
+/// checkout, which an extracted test archive dates before the checkout.
 #[cfg(target_os = "linux")]
 fn fresh_runtrace_shim() -> Option<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = root.join("crates/bhf_runtrace_shim/src/fakes/fuzz_input.rs");
     let source_mtime = fs::metadata(source).and_then(|m| m.modified()).ok()?;
+    let prebuilt = std::env::var_os("BHF_TEST_BIN").is_some();
     let target =
         std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
     ["debug", "release"].into_iter().find_map(|profile| {
         let shim = target.join(profile).join("libbhf_runtrace_shim.so");
         let built = fs::metadata(&shim).and_then(|m| m.modified()).ok()?;
-        (built >= source_mtime).then_some(shim)
+        (prebuilt || built >= source_mtime).then_some(shim)
     })
 }
 

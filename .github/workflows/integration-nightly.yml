@@ -223,6 +223,18 @@ jobs:
           WINEDEBUG=-all wineboot --init
           wineserver --wait
 
+      # The build job's registry cache: the Rust capsule tests vendor a crate
+      # from it.
+      - name: Restore the cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: nightly-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: nightly-cargo-
+
       - name: Install cargo-nextest
         run: bash scripts/ci/install-nextest.sh
 
