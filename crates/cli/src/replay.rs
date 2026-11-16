@@ -694,8 +694,14 @@ pub(crate) fn replay_env(
 
     // The host LD_PRELOAD runtrace shim is a HOST .so, so it is injected only
     // for a NATIVE replay — never forced into a foreign process running under
-    // qemu-user (#81).
-    if runner.qemu_prefix().is_none() {
+    // qemu-user (#81) — and, as when fuzzing, never into an interpreter or VM
+    // launcher: the runtime's own startup trips it, and the CLR hangs under
+    // it until the replay times out.
+    let launcher = runner
+        .harness_path()
+        .parent()
+        .is_some_and(crate::auto::attempt::harness_owns_runtime_instrumentation);
+    if runner.qemu_prefix().is_none() && !launcher {
         if let Some(shim) = crate::auto::shim_path::locate() {
             env.push((
                 "LD_PRELOAD".to_owned(),
@@ -2631,6 +2637,30 @@ mod tests {
                 Some("abort_on_error=1"),
                 "{key}"
             );
+        }
+    }
+
+    /// An interpreter or VM launcher harness replays without the runtrace
+    /// shim, as it fuzzed: the CLR hangs under it until the replay times out.
+    #[test]
+    fn a_launcher_harness_replays_without_the_runtrace_shim() {
+        let dir = crate::test_support::TestDir::new("replay-launcher-env");
+        let raw = serde_json::json!({"rule_id": "BHF-201", "runtime_mode": {"pass": "empty"}});
+        for marker in [
+            "BHF_CS_LAUNCHER",
+            "BHF_JVM_LAUNCHER",
+            "BHF_JS_LAUNCHER",
+            "BHF_PY_LAUNCHER",
+        ] {
+            let main = dir.join("main");
+            std::fs::write(&main, format!("#!/bin/sh\n# {marker}\nexec dotnet run\n")).unwrap();
+            let runner = replay_min::HarnessRunner::direct(&main);
+            let env = super::replay_env(&raw, &runner, super::CInput::ArgvFile);
+            assert!(
+                !env.iter().any(|(key, _)| key == "LD_PRELOAD"),
+                "{marker}: {env:?}"
+            );
+            assert!(env.contains(&("BHF_RUNTRACE_MODE".to_owned(), "empty".to_owned())));
         }
     }
 

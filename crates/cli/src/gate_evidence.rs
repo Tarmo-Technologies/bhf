@@ -1724,10 +1724,14 @@ impl<'a> Runner<'a> {
         command.env_remove("BHF_ENVCAP_RECORD");
         command.env_remove("BHF_ENVCAP_REPLAY");
         // The runtrace shim is a host library: it cannot load into a
-        // harness that runs under an emulator.
+        // harness that runs under an emulator, and, as when fuzzing, it is
+        // kept out of an interpreter or VM launcher.
         let mut armed_log = None;
         let served_world = scratch.join("served-world.jsonl");
-        if baseline && self.emulator.is_none() {
+        let launcher = Path::new(self.replay.harness)
+            .parent()
+            .is_some_and(crate::auto::attempt::harness_owns_runtime_instrumentation);
+        if baseline && self.emulator.is_none() && !launcher {
             if let Some(log) = &self.replay.runtrace_log {
                 // A log from an earlier capture would not describe this run.
                 let _ = std::fs::remove_file(log);

@@ -15,6 +15,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf replay` and the capture replay keep the runtrace shim out of JVM, CLR,
+  Node and interpreter launchers, as fuzzing does. Preloaded, it hung the CLR
+  (which ignored SIGTERM), so every C# finding replayed as a timeout
+  MISMATCH. A replay that times out kills the harness's whole process group.
 - `--target-transport agent:serial:PATH` opens the port raw (8N1, no flow
   control, echo, line editing or newline translation) and bounds every read by
   `--timeout`, on Linux and Windows, and takes `,baud=N`. The tty stayed in its

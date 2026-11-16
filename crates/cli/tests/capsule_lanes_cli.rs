@@ -1114,6 +1114,84 @@ fn csharp_harness_round_trips() {
     );
 }
 
+/// `bhf replay` runs a C# launcher without the runtrace shim, as fuzzing does.
+/// Preloaded, the shim hung the CLR, which ignored SIGTERM, so every C#
+/// finding replayed as a timeout MISMATCH after ten seconds.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn csharp_finding_replays_as_a_match_without_the_shim() {
+    skip_unless!(
+        runs("dotnet", &["--version"]),
+        "the .NET SDK is not installed"
+    );
+    let run = Run::new(&[
+        ("Widget.csproj", WIDGET_CSPROJ),
+        ("Parser.cs", WIDGET_PARSER_CS),
+    ]);
+    let id = if sharpfuzz_package_cached() {
+        run.auto("csharp", 10, &["--run-untrusted"])
+            .expect("bhf auto must find the crash")
+    } else {
+        let Some(sharpfuzz_common) = sharpfuzz_common_dll() else {
+            eprintln!(
+                "skipping: no SharpFuzz.Common.dll (install the sharpfuzz tool: dotnet tool \
+                 install --global SharpFuzz.CommandLine)"
+            );
+            return;
+        };
+        let id = lay_out_csharp_harness(&run, &sharpfuzz_common, None);
+        let harness = run.work.join("harnesses/H-S0001-0000C0DE");
+        let built = run
+            .command("dotnet")
+            .args(["build", "--nologo", "-o"])
+            .arg(harness.join("out"))
+            .arg(harness.join("proj/bhf_harness.csproj"))
+            .output()
+            .expect("run dotnet build");
+        assert!(
+            built.status.success(),
+            "the laid-out harness must build:\n{}",
+            String::from_utf8_lossy(&built.stdout)
+        );
+        // Record the crash frame a fuzzed C# finding records, so the replay
+        // has a location to compare.
+        let finding = run
+            .work
+            .join("results/findings")
+            .join(&id)
+            .join("finding.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&finding).unwrap()).unwrap();
+        raw["exception"] = serde_json::json!({
+            "name": "ASAN_CSHARP_INDEX_OUT_OF_BOUNDS",
+            "sanitizer": "asan",
+            "stack": [{ "function": "Widget.Parser.ParseRecord" }]
+        });
+        std::fs::write(&finding, raw.to_string()).unwrap();
+        id
+    };
+    let started = std::time::Instant::now();
+    let replay = run
+        .bhf()
+        .args(["replay", "--finding"])
+        .arg(run.work.join("results/findings").join(&id))
+        .output()
+        .expect("run bhf replay");
+    let stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay.status.success() && stdout.starts_with("MATCH"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(9),
+        "the replay ran into its timeout: {stdout}"
+    );
+}
+
 /// A C# target that references a NuGet package: the capsule vendors the
 /// package from the local NuGet package cache into `vendor/nuget` and restores
 /// from that feed alone, with no other feed or cache reachable. The package is
