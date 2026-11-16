@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- A real cargo-nextest 0.9.146 JUnit report (profile with retries = 1, a 3s
+     terminate-after and store-success-output) of four tests: one that passes,
+     one that fails once and passes on retry (FLAKY), one that hangs and is
+     killed on both tries (TIMEOUT), and one that prints a skip line. -->
+<testsuites name="nextest-run" tests="4" skipped="0" failures="1" errors="0" uuid="326e6fb1-dc99-433a-b9ca-77a6c5ddfbb8" timestamp="2026-11-15T19:13:58.308-06:00" time="6.012">
+    <testsuite name="widget::cases" tests="4" skipped="0" errors="0" failures="1">
+        <testcase name="parse_record_passes" classname="widget::cases" timestamp="2026-11-15T19:13:58.309-06:00" time="0.003">
+            <system-out>
+running 1 test
+out line
+test parse_record_passes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>err line
+</system-err>
+        </testcase>
+        <testcase name="copy_at_is_flaky" classname="widget::cases" timestamp="2026-11-15T19:13:58.317-06:00" time="0.003">
+            <flakyFailure timestamp="2026-11-15T19:13:58.309-06:00" time="0.005" message="thread &apos;copy_at_is_flaky&apos; (666399) panicked at tests/cases.rs:7:66" type="test failure with exit code 101">thread &apos;copy_at_is_flaky&apos; (666399) panicked at tests/cases.rs:7:66:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test copy_at_is_flaky ... FAILED
+
+failures:
+
+failures:
+    copy_at_is_flaky
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;copy_at_is_flaky&apos; (666399) panicked at tests/cases.rs:7:66:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </flakyFailure>
+            <system-out>
+running 1 test
+test copy_at_is_flaky ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err></system-err>
+        </testcase>
+        <testcase name="widget_hangs" classname="widget::cases" timestamp="2026-11-15T19:13:58.309-06:00" time="3.003">
+            <failure type="test timeout"/>
+            <rerunFailure timestamp="2026-11-15T19:14:01.313-06:00" time="3.004" type="test timeout">
+                <system-out>
+running 1 test
+</system-out>
+                <system-err></system-err>
+            </rerunFailure>
+            <system-out>
+running 1 test
+</system-out>
+            <system-err></system-err>
+        </testcase>
+        <testcase name="widget_skips" classname="widget::cases" timestamp="2026-11-15T19:14:04.317-06:00" time="0.003">
+            <system-out>
+running 1 test
+test widget_skips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>skipping: widget tool not installed
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>

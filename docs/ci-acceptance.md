@@ -84,6 +84,19 @@ manual dispatch always runs. A failed or timed-out shard opens one issue
 labelled `integration-nightly` for the branch, or updates the open one, and
 comments on it when a new commit fails; close it once a nightly passes.
 
+## Test reports, retries and hangs
+
+CI's nextest runs (`build-test`, `doc-contracts` and every nightly shard) use
+the `ci` profile in `.config/nextest.toml`. A failing test is retried once; a
+test that then passes is reported FLAKY, listed in the job summary by
+`scripts/ci/junit-summary.py` and annotated as a warning, rather than hidden. A
+test still running after 16 minutes (8 slow-timeout periods of 120 s; 50
+minutes for `build_recovery_scenarios`) is killed and reported as a TIMEOUT
+failure. Each job uploads its JUnit report (`junit-*` artifacts, from
+`target/nextest/<profile>/junit.xml`), which keeps every test's captured
+stdout and stderr, passing tests included, even when the job fails. Run
+`cargo nextest run --profile ci ...` to reproduce a CI run's behavior locally.
+
 ## Running and consuming the checks
 
 Run the complete policy and shell-behavior regression suite on Linux without

@@ -99,6 +99,9 @@ jobs:
       # the slowest across the numbered shards; the named shard builds and runs
       # that one alone. --no-fail-fast matches `cargo test`. BHF_REQUIRE_TOOLS=1
       # fails a test that finds the runtrace shim missing instead of skipping.
+      # The `ci` profile (.config/nextest.toml) retries a failure once (a pass
+      # then is FLAKY), kills a test that hangs, and writes the JUnit report,
+      # with every test's output, that the next steps summarize and upload.
       - name: Integration tests (shard ${{ matrix.shard }})
         env:
           RAYON_NUM_THREADS: "1"
@@ -109,13 +112,28 @@ jobs:
           set -euo pipefail
           slow='binary(=build_recovery) & test(=build_recovery_scenarios)'
           if [ "$SHARD" = build-recovery-scenarios ]; then
-            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast -E "$slow"
+            cargo nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E "$slow"
           elif [ "$SHARD" -ge 1 ] && [ "$SHARD" -le "$HASH_SHARDS" ]; then
-            cargo nextest run --locked --workspace --no-fail-fast -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
+            cargo nextest run --locked --workspace --no-fail-fast --profile ci -E "package(bhf) & kind(test) & !($slow)" --partition "hash:$SHARD/$HASH_SHARDS"
           else
             echo "unknown shard: $SHARD" >&2
             exit 1
           fi
+
+      - name: Summarize the nextest report
+        if: ${{ always() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: python3 scripts/ci/junit-summary.py --title "Shard $SHARD" target/nextest/ci/junit.xml
+
+      - name: Retain the nextest report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-nightly-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: warn
+          retention-days: 30
 
   # A failed or timed-out shard opens one tracking issue for this branch, or
   # updates the open one, and comments on it when a new commit fails. A run

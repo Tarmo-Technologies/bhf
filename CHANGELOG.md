@@ -1657,6 +1657,10 @@
   been given.
 
 ### Changed
+- CI's nextest runs use a new `ci` profile: a failing test is retried once
+  and reported FLAKY in the job summary if it then passes, a test running
+  past 16 minutes is killed and reported, and each job uploads a JUnit report
+  that keeps every test's output.
 - Pull request CI runs the release and docs contract tests (`m19_*`,
   `offline_dist_scripts`, `release_bundle_manifest` and the guide checks),
   which used to run only nightly; a documentation-only change runs them in

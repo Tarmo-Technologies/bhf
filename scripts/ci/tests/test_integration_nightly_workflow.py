@@ -152,7 +152,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
                 calls = run_shard(self.script, self.env, shard)
                 self.assertEqual(len(calls), 1, calls)
                 call = calls[0]
-                self.assertTrue(call.startswith("nextest run --locked --workspace --no-fail-fast "), call)
+                self.assertTrue(call.startswith("nextest run --locked --workspace --no-fail-fast --profile ci "), call)
                 self.assertIn(f"-E package(bhf) & kind(test) & !({SLOW})", call)
                 self.assertTrue(call.endswith(f" --partition hash:{shard}/{count}"), call)
 
@@ -160,7 +160,7 @@ class IntegrationNightlyShardTests(unittest.TestCase):
         calls = run_shard(self.script, self.env, DEDICATED)
         self.assertEqual(
             calls,
-            [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast -E {SLOW}"],
+            [f"nextest run --locked -p bhf --test build_recovery --no-fail-fast --profile ci -E {SLOW}"],
         )
 
     def test_an_unknown_shard_fails_instead_of_running_nothing(self) -> None:
