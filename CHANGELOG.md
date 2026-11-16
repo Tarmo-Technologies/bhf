@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- On Windows a background re-run starts one priority class below bhf's own
+  and is returned to bhf's own class, not to a fixed BelowNormal and Normal:
+  under a BelowNormal parent (the GitHub runner's worker, or any BelowNormal
+  launcher) the re-run ran at the fuzz loop's class and was then raised above
+  bhf. Windows CI raises its test step to Normal and runs the priority test,
+  which it skipped.
 - A target whose inputs mostly crash keeps its throughput: the builtin loop
   runs its executions with `symbolize=0:abort_on_error=0`, counts a crash
   whose signature (rule, kind, top five `module+offset` frames) was reported

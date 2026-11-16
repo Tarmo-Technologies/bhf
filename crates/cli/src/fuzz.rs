@@ -6524,20 +6524,86 @@ fn lower_spawn_priority(command: &mut std::process::Command) {
     }
 }
 
+/// Windows priority classes, lowest first, and what bhf does with them: a
+/// background re-run starts one class below bhf's own and is returned to
+/// bhf's own, so it gives way to the fuzz loop whatever class bhf runs at. A
+/// BelowNormal bhf (the GitHub runner's worker starts its steps there) made a
+/// fixed BelowNormal re-run no lower than the loop, and a fixed Normal restore
+/// raised it above bhf.
+#[cfg(any(windows, test))]
+mod priority_class {
+    pub(super) const IDLE: u32 = 0x0000_0040;
+    pub(super) const BELOW_NORMAL: u32 = 0x0000_4000;
+    pub(super) const NORMAL: u32 = 0x0000_0020;
+    pub(super) const ABOVE_NORMAL: u32 = 0x0000_8000;
+    pub(super) const HIGH: u32 = 0x0000_0080;
+    pub(super) const REALTIME: u32 = 0x0000_0100;
+    const ORDER: [u32; 6] = [IDLE, BELOW_NORMAL, NORMAL, ABOVE_NORMAL, HIGH, REALTIME];
+
+    /// The class one below `class` (Idle stays Idle); an unknown class is
+    /// taken for Normal.
+    pub(super) fn lowered(class: u32) -> u32 {
+        match ORDER.iter().position(|known| *known == class) {
+            Some(at) => ORDER[at.saturating_sub(1)],
+            None => BELOW_NORMAL,
+        }
+    }
+
+    /// The class Windows gives a process created without a class flag by a
+    /// parent of `class`: the parent's when it is Idle or BelowNormal, else
+    /// Normal.
+    #[cfg(test)]
+    pub(super) fn inherited(class: u32) -> u32 {
+        if class == IDLE || class == BELOW_NORMAL {
+            class
+        } else {
+            NORMAL
+        }
+    }
+
+    /// `class` as `Get-Process` names it.
+    #[cfg(test)]
+    pub(super) fn name(class: u32) -> &'static str {
+        match class {
+            IDLE => "Idle",
+            BELOW_NORMAL => "BelowNormal",
+            ABOVE_NORMAL => "AboveNormal",
+            HIGH => "High",
+            REALTIME => "RealTime",
+            _ => "Normal",
+        }
+    }
+}
+
+/// This process's priority class.
+#[cfg(windows)]
+fn own_priority_class() -> u32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetPriorityClass(process: *mut std::ffi::c_void) -> u32;
+    }
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    match unsafe { GetPriorityClass(GetCurrentProcess()) } {
+        0 => priority_class::NORMAL,
+        class => class,
+    }
+}
+
 #[cfg(windows)]
 fn lower_spawn_priority(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+    command.creation_flags(priority_class::lowered(own_priority_class()));
 }
 
 #[cfg(not(any(unix, windows)))]
 fn lower_spawn_priority(_command: &mut std::process::Command) {}
 
-/// Return a process [`lower_spawn_priority`] started to normal priority: on
-/// Windows, before it is killed (a starved process is slow to finish dying)
-/// and once the loop it gave way to has stopped. A Unix process cannot raise
-/// a nice value back without privilege, so there it stays lowered.
+/// Return a process [`lower_spawn_priority`] started to bhf's own priority
+/// class: on Windows, before it is killed (a starved process is slow to
+/// finish dying) and once the loop it gave way to has stopped. A Unix process
+/// cannot raise a nice value back without privilege, so there it stays
+/// lowered.
 #[cfg(windows)]
 fn restore_spawn_priority(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
@@ -6545,17 +6611,17 @@ fn restore_spawn_priority(child: &std::process::Child) {
     extern "system" {
         fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
     }
-    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    let class = own_priority_class();
     // SAFETY: the handle is the live child's, owned by `child`.
-    let restored = unsafe { SetPriorityClass(child.as_raw_handle().cast(), NORMAL_PRIORITY_CLASS) };
+    let restored = unsafe { SetPriorityClass(child.as_raw_handle().cast(), class) };
     if restored == 0 {
-        // A re-run left below normal only finishes later; say why, once per
+        // A re-run left lowered only finishes later; say why, once per
         // process, rather than fail the run.
         static WARNED: std::sync::Once = std::sync::Once::new();
         let error = std::io::Error::last_os_error();
         WARNED.call_once(|| {
             bhfeprintln!(
-                "bhf fuzz: warning: could not return a background re-run (pid {}) to normal priority: {error}",
+                "bhf fuzz: warning: could not return a background re-run (pid {}) to bhf's priority: {error}",
                 child.id()
             );
         });
@@ -10733,26 +10799,43 @@ mod exec_wait_tests {
     }
 }
 
-/// A background re-run's process starts in the below-normal priority class,
-/// and is returned to normal once the loop it gave way to has stopped.
+#[cfg(test)]
+mod priority_class_tests {
+    use super::priority_class::*;
+
+    #[test]
+    fn a_background_rerun_runs_one_class_below_bhf() {
+        assert_eq!(lowered(NORMAL), BELOW_NORMAL);
+        assert_eq!(lowered(BELOW_NORMAL), IDLE);
+        assert_eq!(lowered(IDLE), IDLE);
+        assert_eq!(lowered(ABOVE_NORMAL), NORMAL);
+        assert_eq!(lowered(HIGH), ABOVE_NORMAL);
+        assert_eq!(lowered(REALTIME), HIGH);
+        assert_eq!(lowered(0x1234), BELOW_NORMAL);
+    }
+
+    #[test]
+    fn a_child_without_a_class_flag_gets_an_idle_or_below_normal_parents_class() {
+        assert_eq!(inherited(BELOW_NORMAL), BELOW_NORMAL);
+        assert_eq!(inherited(IDLE), IDLE);
+        assert_eq!(inherited(NORMAL), NORMAL);
+        assert_eq!(inherited(HIGH), NORMAL);
+        assert_eq!(name(lowered(BELOW_NORMAL)), "Idle");
+    }
+}
+
+/// A background re-run's process starts one priority class below bhf's, and
+/// is returned to bhf's once the loop it gave way to has stopped.
 #[cfg(all(test, windows))]
 mod spawn_priority_windows_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn a_low_priority_spawn_runs_below_normal_until_restored() {
-        // GitHub's hosted Windows runner changes process priority classes
-        // from outside the test: across runs it reported a child started at
-        // normal priority as BelowNormal, and a child returned to normal as
-        // BelowNormal, which no Windows Server 2022 host reproduces (from
-        // Windows PowerShell or pwsh, alone or in the full lib run). The
-        // classes are this test's only observable, so it runs everywhere
-        // but there.
-        if std::env::var_os("GITHUB_ACTIONS").is_some() {
-            eprintln!("skipping: the hosted runner changes priority classes itself");
-            return;
-        }
+    fn a_low_priority_spawn_runs_below_bhf_until_restored() {
+        // Relative to this process's class: the GitHub runner's worker starts
+        // its steps BelowNormal (CI raises the test step to Normal).
+        let own = own_priority_class();
         let work = crate::test_support::TestDir::new("spawn-priority");
         let scratch = ensure_harness_scratch(&work).unwrap();
         // The script prints its own priority class `samples` times, 250 ms
@@ -10792,17 +10875,22 @@ mod spawn_priority_windows_tests {
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(classes(false, None, 1), ["Normal"]);
-        assert_eq!(classes(true, None, 1), ["BelowNormal"]);
-        // Raised as soon as the loop that it gave way to has stopped (here,
-        // from the start): within the 5 s the script samples, whatever the
-        // load on the host, and it stays raised.
+        let name = |class| priority_class::name(class).to_owned();
+        assert_eq!(
+            classes(false, None, 1),
+            [name(priority_class::inherited(own))]
+        );
+        assert_eq!(classes(true, None, 1), [name(priority_class::lowered(own))]);
+        // Raised to bhf's class as soon as the loop that it gave way to has
+        // stopped (here, from the start): within the 5 s the script samples,
+        // whatever the load on the host, and it stays raised.
         let restore = AtomicBool::new(true);
         let seen = classes(true, Some(&restore), 20);
-        let raised = seen.iter().position(|class| class == "Normal");
+        let raised = seen.iter().position(|class| *class == name(own));
         assert!(
-            raised.is_some_and(|at| seen[at..].iter().all(|class| class == "Normal")),
-            "the re-run was not returned to normal priority: {seen:?}"
+            raised.is_some_and(|at| seen[at..].iter().all(|class| *class == name(own))),
+            "the re-run was not returned to bhf's {} priority: {seen:?}",
+            name(own)
         );
     }
 }
