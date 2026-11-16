@@ -4512,7 +4512,6 @@ mod tests {
         assert!(generated.contains(&format!("extends \"{}\"", source_project.display())));
     }
 
-    #[test]
     /// A cross build after the host build of the same harness compiles the
     /// runtime again; a second build for the same target keeps its objects.
     #[test]
