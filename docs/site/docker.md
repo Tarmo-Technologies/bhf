@@ -39,8 +39,12 @@ BUILDX_BUILDER=bhf-multiarch scripts/build-container-release.sh bhf:multiarch \
 ```
 
 The multi-platform export uses a Buildx builder with native build nodes or
-emulation for both architectures. The release workflow requires native fuzzing
-validation on x86-64 and ARM64 runners and retains a tested candidate for each.
+emulation for both architectures. The release workflow, run by hand for a
+release, requires native fuzzing validation on x86-64 and ARM64 runners before
+it retains a candidate for each, so an ARM64 image is validated only by a run
+of it. Every change is built and tested natively on ARM64 by CI (the
+`arm64-build` job): the workspace and runtrace shim, the tests outside bhf's
+heavy integration suites, and a `bhf auto` run that finds a planted overflow.
 Emulation is useful for build checks but can affect sanitizer behavior and
 fuzzing speed.
 

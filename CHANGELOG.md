@@ -45,6 +45,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- CI builds and tests bhf natively on ARM64. A new `arm64-build` job on an
+  `ubuntu-24.04-arm` runner builds the workspace and runtrace shim, runs every
+  test outside bhf's heavy integration suites, and checks that `bhf auto`
+  finds a planted overflow; the CI acceptance gate requires it. No CI job had
+  compiled the ARM64 build the docs describe. docker.md no longer says ARM64
+  images are validated: only a run of the release workflow validates one.
 - `--probe-build` builds outside the scanned tree, under
   `<work>/probe/<tree>-<hash>/`: CMake and Meson into a build directory there,
   Make and an intercepted `--build-command` in a copy of the tree there, whose
