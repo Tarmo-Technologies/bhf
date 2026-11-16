@@ -492,11 +492,18 @@ pub(crate) fn publish(config: &ToolchainConfig) -> Result<Published, String> {
         .clone()
         .or_else(|| std::env::var("CC").ok())
         .unwrap_or_else(|| "clang".to_owned());
-    // Without any C/C++ setting the environment is left exactly as it was.
+    let family = compiler_family(&effective_cc, false);
+    // Without any C/C++ setting the environment is left as it was, but for the
+    // target a Visual Studio environment for another architecture implies.
     if !config.has_c_family_settings() {
+        if let Some(target) = clang_target(config, family) {
+            let value = format!("--target={target}");
+            published.notes.push(format!("{ENV_TARGET_FLAGS}={value}"));
+            std::env::set_var(ENV_TARGET_FLAGS, value);
+        }
         return Ok(published);
     }
-    let values = make_values(config, compiler_family(&effective_cc, false));
+    let values = make_values(config, family);
     for (variable, value) in values {
         if value.is_empty() {
             std::env::remove_var(variable);
@@ -573,6 +580,41 @@ pub(crate) fn route_msvc_through_front_end() -> Result<Option<String>, String> {
     )))
 }
 
+/// The `--target=` a clang builds for: the toolchain's `target`, else, on
+/// Windows, the Visual Studio environment's target architecture when it is
+/// not this machine's ([`vs_arch_clang_target`]).
+fn clang_target(config: &ToolchainConfig, family: Option<CompilerFamily>) -> Option<String> {
+    if family != Some(CompilerFamily::Clang) {
+        return None;
+    }
+    if let Some(target) = &config.target {
+        return Some(target.clone());
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    vs_arch_clang_target(
+        std::env::var("VSCMD_ARG_TGT_ARCH").ok().as_deref(),
+        crate::windows_env::host_arch(),
+    )
+    .map(str::to_owned)
+}
+
+/// The clang target triple for a Visual Studio environment's target
+/// architecture (`VSCMD_ARG_TGT_ARCH`, which `--vs-arch` picks) when it is
+/// not `host`'s. A clang builds for its own architecture by default, so in an
+/// x86 environment it compiles x64 objects that meet the x86 CRT at the link.
+pub(crate) fn vs_arch_clang_target(arch: Option<&str>, host: &str) -> Option<&'static str> {
+    let arch = arch?.to_ascii_lowercase();
+    let (name, triple) = match arch.as_str() {
+        "x86" => ("x86", "i686-pc-windows-msvc"),
+        "x64" | "amd64" => ("x64", "x86_64-pc-windows-msvc"),
+        "arm64" => ("arm64", "aarch64-pc-windows-msvc"),
+        _ => return None,
+    };
+    (name != host).then_some(triple)
+}
+
 /// The `BHF_TOOLCHAIN_*` make values for `config`, rendered for a recipe.
 /// `family` is the C compiler's: a clang building for another target needs
 /// `--target=` where a cross gcc needs nothing.
@@ -592,7 +634,7 @@ pub(crate) fn make_values(
     if let Some(sysroot) = &config.sysroot {
         target_flags.push(format!("--sysroot={}", recipe_path(&make_path(sysroot))));
     }
-    if let (Some(target), Some(CompilerFamily::Clang)) = (&config.target, family) {
+    if let Some(target) = clang_target(config, family) {
         target_flags.push(format!("--target={target}"));
     }
     let mut cppflags: Vec<String> = config
@@ -803,7 +845,7 @@ pub(crate) fn compile_args(
     if let Some(sysroot) = &config.sysroot {
         args.push(format!("--sysroot={}", sysroot.display()));
     }
-    if let (Some(target), Some(CompilerFamily::Clang)) = (&config.target, family) {
+    if let Some(target) = clang_target(config, family) {
         args.push(format!("--target={target}"));
     }
     args.extend(config.defines.iter().map(|define| format!("-D{define}")));
@@ -2079,5 +2121,27 @@ mod tests {
             Some(CompilerFamily::Gcc)
         );
         assert_eq!(compiler_family("/nonexistent/bin/cc", false), None);
+    }
+
+    #[test]
+    fn a_visual_studio_environment_for_another_architecture_gives_clang_its_target() {
+        assert_eq!(
+            vs_arch_clang_target(Some("x86"), "x64"),
+            Some("i686-pc-windows-msvc")
+        );
+        assert_eq!(
+            vs_arch_clang_target(Some("ARM64"), "x64"),
+            Some("aarch64-pc-windows-msvc")
+        );
+        assert_eq!(
+            vs_arch_clang_target(Some("x64"), "arm64"),
+            Some("x86_64-pc-windows-msvc")
+        );
+        // The host's own architecture, no environment, or one bhf does not
+        // know: clang's default target stands.
+        assert_eq!(vs_arch_clang_target(Some("x64"), "x64"), None);
+        assert_eq!(vs_arch_clang_target(Some("amd64"), "x64"), None);
+        assert_eq!(vs_arch_clang_target(None, "x64"), None);
+        assert_eq!(vs_arch_clang_target(Some("mips"), "x64"), None);
     }
 }

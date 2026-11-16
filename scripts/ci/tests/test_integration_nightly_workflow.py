@@ -358,6 +358,7 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
         for pin in ("fd85f38548b14352f4b70ad414f364ea6dc1a769", "11.91.20763",
                     "EA3DAD4AE6E39228FE87B5D4D7BC3A53FAFDB6161EE5BA6A2E98FB64F8A7E0D4"):
             self.assertIn(pin, script)
+        self.assertIn("'build32'; Arch = 'Win32'", script)
 
     def test_the_ignored_winafl_campaigns_run(self) -> None:
         self.assertIn("cargo test --locked -p bhf --test winafl_engine -- --ignored --test-threads 1", self.job)

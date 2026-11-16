@@ -645,8 +645,9 @@ jobs:
       # build_recovery builds a release bhf of its own and stays off this job.
       # winafl_engine's end-to-end WinAFL campaigns need WinAFL and DynamoRIO,
       # which this runner does not install: they are #[ignore]d (and listed as
-      # ignored), so here it runs only the refusal that names them; the
-      # campaigns run with --ignored on a Windows machine that has the tools.
+      # ignored), so here it runs the refusal that names them and the x86
+      # smoke (--vs-arch x86, builtin engine); the nightly's WinAFL job runs
+      # the campaigns with --ignored against a pinned build.
       - name: Test the Windows integration suites
         shell: pwsh
         run: |

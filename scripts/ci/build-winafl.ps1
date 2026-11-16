@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Build the WinAFL and DynamoRIO pair bhf's WinAFL end-to-end tests run
 # against, at the versions docs/site/windows.md pins: DynamoRIO 11.91.20763
-# (its SHA-256 checked) and WinAFL at fd85f38548, x64 (build64), with the
-# Visual Studio 2022 generator.
+# (its SHA-256 checked) and WinAFL at fd85f38548, x64 (build64) and x86
+# (build32), with the Visual Studio 2022 generator.
 #
 #   scripts/ci/build-winafl.ps1 -Root C:\tools\bhf-winafl
 #
 # leaves <Root>\DynamoRIO-Windows-11.91.20763 and <Root>\winafl (the checkout
-# holding build64\bin\Release), which is what
+# holding build64\bin\Release and build32\bin\Release), which is what
 # BHF_DYNAMORIO_PATH and BHF_WINAFL_PATH name.
 param(
     [Parameter(Mandatory = $true)][string]$Root
@@ -59,8 +59,10 @@ if ($LASTEXITCODE -ne 0) { throw "WinAFL has no commit $winaflCommit" }
 git -C $winafl submodule update --init --recursive --quiet
 if ($LASTEXITCODE -ne 0) { throw 'WinAFL submodule update failed' }
 
+# Intel PT is a 64-bit feature of WinAFL; the x86 build leaves it out.
 foreach ($build in @(
-        @{ Dir = 'build64'; Arch = 'x64'; Extra = @('-DINTELPT=1') })) {
+        @{ Dir = 'build64'; Arch = 'x64'; Extra = @('-DINTELPT=1') },
+        @{ Dir = 'build32'; Arch = 'Win32'; Extra = @() })) {
     $dir = Join-Path $winafl $build.Dir
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     cmake -S $winafl -B $dir -G 'Visual Studio 17 2022' -A $build.Arch `
@@ -73,4 +75,4 @@ foreach ($build in @(
         if (-not (Test-Path $built)) { throw "the $($build.Arch) build made no $built" }
     }
 }
-Write-Host "WinAFL $winaflCommit (x64) against DynamoRIO $dynamorioVersion in $Root"
+Write-Host "WinAFL $winaflCommit (x64, x86) against DynamoRIO $dynamorioVersion in $Root"

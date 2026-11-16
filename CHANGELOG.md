@@ -51,6 +51,15 @@
   the build under the pinned versions and the script's hash so a cache hit
   skips it, and runs `winafl_engine`'s ignored campaigns, with and without
   PageHeap.
+- `--vs-arch x86` has tests: the nightly WinAFL job also builds WinAFL's
+  32-bit `build32` and runs an x86 campaign, and Windows CI runs an x86 smoke
+  in which the builtin engine finds a planted overflow in the 32-bit harness
+  and it replays. Only unit tests covered x86 builds, and a clang build for
+  `--vs-arch x86` failed to link: clang compiled x64 objects against the x86
+  CRT. A clang building for another architecture than the host's now gets
+  `--target=` for it (`i686-pc-windows-msvc`), and for x86 Visual Studio's x86
+  clang, which carries the i386 AddressSanitizer runtime, goes ahead of a
+  `PATH` clang without one.
 - CI builds and tests bhf natively on ARM64. A new `arm64-build` job on an
   `ubuntu-24.04-arm` runner builds the workspace and runtrace shim, runs every
   test outside bhf's heavy integration suites, and checks that `bhf auto`

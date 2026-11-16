@@ -313,10 +313,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # The WinAFL campaigns of winafl_engine (x64, and x64 under PageHeap), which
+  # The WinAFL campaigns of winafl_engine (x64, x64 under PageHeap, x86), which
   # need WinAFL and DynamoRIO: the pinned pair (docs/site/windows.md) built by
-  # scripts/ci/build-winafl.ps1 and cached under its versions and the script's
-  # hash, so a cache hit skips the build.
+  # scripts/ci/build-winafl.ps1, x64 and x86, and cached under its versions
+  # and the script's hash, so a cache hit skips the build.
   winafl:
     name: Integration tests (bhf) (WinAFL, Windows)
     needs: gate
@@ -341,7 +341,7 @@ jobs:
           path: C:\tools\bhf-winafl
           key: winafl-fd85f38548-dynamorio-11.91.20763-${{ hashFiles('scripts/ci/build-winafl.ps1') }}
 
-      - name: Build WinAFL against DynamoRIO
+      - name: Build WinAFL (x64 and x86) against DynamoRIO
         if: steps.winafl-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: scripts/ci/build-winafl.ps1 -Root C:\tools\bhf-winafl
