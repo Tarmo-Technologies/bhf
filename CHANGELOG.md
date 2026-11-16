@@ -15,6 +15,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The session lane (`--protocol-profile`) treats a session the target ends
+  mid-way (a closed or reset connection, or one that stops answering) as a
+  crash candidate: it keeps the session, drives it again on a new connection,
+  writes a BHF-210 `session-disconnect` finding when the target drops it at the
+  same message again, and goes on fuzzing. It used to abort the campaign with
+  exit 1, saving nothing, and reported `crashes: 0` always. Three failed
+  connections in a row stop the campaign.
 - Perl, Ruby and PHP findings are located at the target line that raised them,
   in results/findings.json, the SARIF and INDEX.md. Each driver prints the
   target's frames under its finding line (`== bhf frame: <function> @

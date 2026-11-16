@@ -275,6 +275,14 @@ impl TcpSessionTransport {
     }
 }
 
+/// The target ended the session (a closed or reset connection, or one that
+/// stopped answering within [`SESSION_IO_TIMEOUT`]): drop the stream, so the
+/// next reset connects again whatever the reset mode.
+fn lost(stream: &mut Option<TcpStream>, message: String) -> TransportError {
+    *stream = None;
+    TransportError::session_lost(message)
+}
+
 impl SessionTransport for TcpSessionTransport {
     fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
         if request.len() > u16::MAX as usize {
@@ -293,12 +301,20 @@ impl SessionTransport for TcpSessionTransport {
             .write_all(&len)
             .and_then(|()| stream.write_all(request))
             .and_then(|()| stream.flush())
-            .map_err(|e| TransportError::new(format!("session write: {e}")))?;
+            .map_err(|e| lost(&mut self.stream, format!("session write: {e}")))?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
 
         let mut len_buf = [0u8; 2];
         stream
             .read_exact(&mut len_buf)
-            .map_err(|e| TransportError::new(format!("session read reply length: {e}")))?;
+            .map_err(|e| lost(&mut self.stream, format!("session read reply length: {e}")))?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
         let reply_len = usize::from(u16::from_be_bytes(len_buf));
         if reply_len > MAX_REPLY_BYTES {
             return Err(TransportError::new(format!(
@@ -308,7 +324,7 @@ impl SessionTransport for TcpSessionTransport {
         let mut reply = vec![0u8; reply_len];
         stream
             .read_exact(&mut reply)
-            .map_err(|e| TransportError::new(format!("session read reply body: {e}")))?;
+            .map_err(|e| lost(&mut self.stream, format!("session read reply body: {e}")))?;
         Ok(reply)
     }
 
@@ -460,8 +476,12 @@ pub(crate) struct SessionFuzzSummary {
     pub states_covered: usize,
     /// Protocol-state channel: distinct transitions walked.
     pub transitions_covered: usize,
-    /// Crash outcomes (always 0 on this lane — findings are clean-exit).
+    /// Sessions the target dropped, the second drive dropping them again at
+    /// the same message (each is a BHF-210 finding, deduped by message).
     pub crashes: usize,
+    /// Sessions the target dropped once but not when driven again; each is
+    /// kept under `<work_dir>/session_disconnects/` for triage.
+    pub unconfirmed_disconnects: usize,
     /// Distinct finding ids written to `<work_dir>/results/findings/`.
     pub findings: Vec<String>,
     pub elapsed_secs: f64,
@@ -558,13 +578,91 @@ fn mutate_one(
     }
 }
 
+/// The oracle name of a session the target dropped.
+pub(crate) const DISCONNECT_ORACLE: &str = "session-disconnect";
+/// The rule of a session the target dropped: a reachable crash of the
+/// service (at least a denial of service).
+const DISCONNECT_RULE: &str = "BHF-210";
+/// Failures to connect in a row after which a campaign stops: the target is
+/// gone, not crashing on an input.
+const MAX_CONNECT_FAILURES: usize = 3;
+/// How long to wait before the next connection after a failed one, times the
+/// failures so far: a service that restarts after a crash gets the time to.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Dropped sessions and connection failures across one campaign.
+#[derive(Debug, Default)]
+struct CrashTally {
+    crashes: usize,
+    unconfirmed: usize,
+    /// Failures to connect in a row; any drive that connects resets it.
+    connect_failures: usize,
+}
+
+/// Drive `messages`, counting a failure to connect: `None` when the drive
+/// could not connect or the candidate could not be driven, an error once
+/// [`MAX_CONNECT_FAILURES`] connections in a row have failed.
+fn drive_counting(
+    runner: &SessionRunner,
+    messages: &[protocol_session::MessageInstance],
+    transport: &mut dyn SessionTransport,
+    tally: &mut CrashTally,
+) -> Result<Option<SessionRun>, SessionFuzzError> {
+    match runner.drive(messages, transport) {
+        Ok(run) => {
+            tally.connect_failures = 0;
+            Ok(Some(run))
+        }
+        Err(protocol_session::RunnerError::Connect(error)) => {
+            tally.connect_failures += 1;
+            if tally.connect_failures >= MAX_CONNECT_FAILURES {
+                return Err(SessionFuzzError::Transport(TransportError::new(format!(
+                    "{} ({} connection attempts in a row failed)",
+                    error.message, tally.connect_failures
+                ))));
+            }
+            let failures = u32::try_from(tally.connect_failures).unwrap_or(u32::MAX);
+            std::thread::sleep(CONNECT_RETRY_DELAY.saturating_mul(failures));
+            Ok(None)
+        }
+        // Candidate-specific error (an illegal transition, an encode or
+        // response failure, a frame the wire cannot carry): skip it rather
+        // than aborting the campaign.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Keep a session the target dropped under `<work_dir>/session_disconnects/`
+/// before it is driven again, so it survives a target that does not come back.
+fn persist_disconnect(
+    config: &SessionFuzzConfig,
+    run: &SessionRun,
+) -> Result<PathBuf, SessionFuzzError> {
+    use sha2::Digest;
+    let serialized = run
+        .testcase
+        .to_json()
+        .map_err(SessionFuzzError::Serialize)?;
+    let dir = config.work_dir.join("session_disconnects");
+    std::fs::create_dir_all(&dir).map_err(|source| SessionFuzzError::Io {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    let digest = corpus::hex_lower(&sha2::Sha256::digest(serialized.as_bytes()));
+    let path = dir.join(format!("{}.json", &digest[..16]));
+    write_artifact(&path, serialized.as_bytes())?;
+    Ok(path)
+}
+
 /// Drive one candidate against the transport, folding both novelty channels and
 /// emitting a finding (deduped by rule|oracle) on a clean-exit violation.
 /// Returns the state-novelty delta and whether a NEW finding was emitted.
 ///
-/// A transport error aborts the campaign (the connection is broken); a
-/// candidate-specific drive error (illegal transition, encode/response failure)
-/// is skipped so the loop keeps exploring.
+/// A session the target drops is a crash candidate: it is kept, driven again
+/// on a new connection, and written as a finding when the target drops it at
+/// the same message again. A failure to connect skips the candidate, and
+/// [`MAX_CONNECT_FAILURES`] of them in a row abort the campaign; a
+/// candidate-specific drive error is skipped so the loop keeps exploring.
 #[allow(clippy::too_many_arguments)]
 fn drive_candidate(
     candidate: &SessionTestcase,
@@ -576,15 +674,10 @@ fn drive_candidate(
     config: &SessionFuzzConfig,
     seen: &mut HashSet<String>,
     finding_ids: &mut Vec<String>,
+    tally: &mut CrashTally,
 ) -> Result<(StateNoveltyDelta, bool), SessionFuzzError> {
-    let run = match runner.drive(&candidate.messages, transport) {
-        Ok(run) => run,
-        Err(protocol_session::RunnerError::Transport(error)) => {
-            return Err(SessionFuzzError::Transport(error))
-        }
-        // Candidate-specific error (should not occur for a graph-legal mutant):
-        // skip it rather than aborting the campaign.
-        Err(_) => return Ok((StateNoveltyDelta::default(), false)),
+    let Some(run) = drive_counting(runner, &candidate.messages, transport, tally)? else {
+        return Ok((StateNoveltyDelta::default(), false));
     };
 
     let delta = state_novelty.observe(&run.state_ids, &run.transitions);
@@ -593,6 +686,42 @@ fn drive_candidate(
     code_novelty.observe(&[]);
 
     let mut new_finding = false;
+    if let SessionVerdict::Disconnected {
+        step,
+        message,
+        error,
+    } = &run.verdict
+    {
+        let kept = persist_disconnect(config, &run)?;
+        let again = drive_counting(runner, &candidate.messages, transport, tally)?;
+        let confirmed = again.is_some_and(|again| {
+            matches!(again.verdict, SessionVerdict::Disconnected { step: again_step, .. } if again_step == *step)
+        });
+        if !confirmed {
+            tally.unconfirmed += 1;
+            return Ok((delta, false));
+        }
+        let _ = std::fs::remove_file(kept);
+        tally.crashes += 1;
+        if seen.insert(format!("{DISCONNECT_RULE}|{DISCONNECT_ORACLE}|{message}")) {
+            let detail = format!(
+                "the target dropped the session at message {} ({message}), and again when it \
+                 was driven on a new connection: {error}",
+                step + 1
+            );
+            let id = emit_session_finding(
+                emitter,
+                &run,
+                DISCONNECT_ORACLE,
+                Some(DISCONNECT_RULE),
+                message,
+                &detail,
+                config,
+            )?;
+            finding_ids.push(id);
+            new_finding = true;
+        }
+    }
     if let SessionVerdict::Finding {
         oracle,
         rule_id,
@@ -651,6 +780,7 @@ pub(crate) fn run_session_campaign(
     let mut corpus_new = 0usize;
     let mut finding_ids: Vec<String> = Vec::new();
     let mut seen_findings: HashSet<String> = HashSet::new();
+    let mut tally = CrashTally::default();
 
     // --- seed phase: drive every seed once; seeds are always corpus members. ---
     let seed_count = config.seeds.len();
@@ -676,6 +806,7 @@ pub(crate) fn run_session_campaign(
             config,
             &mut seen_findings,
             &mut finding_ids,
+            &mut tally,
         )?;
         executions += 1;
         scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
@@ -727,6 +858,7 @@ pub(crate) fn run_session_campaign(
                 config,
                 &mut seen_findings,
                 &mut finding_ids,
+                &mut tally,
             )?;
             executions += 1;
             if delta.is_novel() {
@@ -750,7 +882,8 @@ pub(crate) fn run_session_campaign(
         coverage_blocks: 0,
         states_covered: state_novelty.states_covered(),
         transitions_covered: state_novelty.transitions_covered(),
-        crashes: 0,
+        crashes: tally.crashes,
+        unconfirmed_disconnects: tally.unconfirmed,
         findings: finding_ids,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
@@ -784,12 +917,17 @@ fn emit_session_finding(
         evidence.push(OracleEvidence::new(source.clone(), format_bound(value)));
     }
 
+    let disconnect = oracle == DISCONNECT_ORACLE;
     let hit = OracleHit {
         oracle_name: oracle.to_owned(),
         rule_id: rule_id.unwrap_or("HDF7-SESSION").to_owned(),
-        category: "logic-bug".to_owned(),
+        category: if disconnect { "crash" } else { "logic-bug" }.to_owned(),
         api: message.to_owned(),
-        message: format!("protocol session reached a clean-exit violation: {detail}"),
+        message: if disconnect {
+            format!("the target dropped the protocol session: {detail}")
+        } else {
+            format!("protocol session reached a clean-exit violation: {detail}")
+        },
         evidence,
     };
 
@@ -890,6 +1028,10 @@ pub(crate) fn replay_session_outcome(
             "oracle {oracle} fired with rule {}",
             rule_id.as_deref().unwrap_or("<none>")
         ),
+        SessionVerdict::Disconnected { step, message, .. } => format!(
+            "the target dropped the session at message {} ({message})",
+            step + 1
+        ),
         SessionVerdict::Clean => "no oracle fired".to_owned(),
     };
     Ok(crate::replay::LaneReplay {
@@ -933,6 +1075,7 @@ fn verdict_reproduces(verdict: &SessionVerdict, meta: &SessionArtifactMeta) -> b
         SessionVerdict::Finding {
             oracle, rule_id, ..
         } => *oracle == meta.oracle && *rule_id == meta.rule_id,
+        SessionVerdict::Disconnected { .. } => meta.oracle == DISCONNECT_ORACLE,
         SessionVerdict::Clean => false,
     }
 }

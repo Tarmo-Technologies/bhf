@@ -37,12 +37,26 @@ pub trait SessionTransport {
 #[error("session transport error: {message}")]
 pub struct TransportError {
     pub message: String,
+    /// The target ended a session it had accepted: the connection closed,
+    /// was reset or stopped answering mid-session. A drive records that as
+    /// [`SessionVerdict::Disconnected`], not as a failure of the transport.
+    pub session_lost: bool,
 }
 
 impl TransportError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_lost: false,
+        }
+    }
+
+    /// The target ended the session mid-way (see
+    /// [`TransportError::session_lost`]).
+    pub fn session_lost(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            session_lost: true,
         }
     }
 }
@@ -121,11 +135,24 @@ pub enum SessionVerdict {
         message: String,
         detail: String,
     },
+    /// The target ended the session at message `step` (`message`, counted
+    /// from 0) after accepting it: it closed or reset the connection, or
+    /// stopped answering. A crash candidate.
+    Disconnected {
+        step: usize,
+        message: String,
+        error: String,
+    },
 }
 
 impl SessionVerdict {
     pub fn is_finding(&self) -> bool {
         matches!(self, SessionVerdict::Finding { .. })
+    }
+
+    /// Whether the target dropped the session: a crash candidate.
+    pub fn is_disconnect(&self) -> bool {
+        matches!(self, SessionVerdict::Disconnected { .. })
     }
 }
 
@@ -213,7 +240,7 @@ impl<'a> SessionRunner<'a> {
         messages: &[MessageInstance],
         transport: &mut dyn SessionTransport,
     ) -> Result<SessionRun, RunnerError> {
-        transport.reset().map_err(RunnerError::Transport)?;
+        transport.reset().map_err(RunnerError::Connect)?;
 
         let graph = self.model.graph();
         let oracle = SessionOracle::new(self.model.oracles());
@@ -226,7 +253,7 @@ impl<'a> SessionRunner<'a> {
         let mut sent_frames = Vec::new();
         let mut verdict = SessionVerdict::Clean;
 
-        for instance in messages {
+        for (step, instance) in messages.iter().enumerate() {
             let compiled = self.model.message(&instance.message).ok_or_else(|| {
                 RunnerError::UnknownMessage {
                     name: instance.message.clone(),
@@ -244,9 +271,18 @@ impl<'a> SessionRunner<'a> {
                 .into_bytes();
             sent_frames.push(frame.clone());
 
-            let reply = transport
-                .send_request(&frame)
-                .map_err(RunnerError::Transport)?;
+            let reply = match transport.send_request(&frame) {
+                Ok(reply) => reply,
+                Err(error) if error.session_lost => {
+                    verdict = SessionVerdict::Disconnected {
+                        step,
+                        message: instance.message.clone(),
+                        error: error.message,
+                    };
+                    break;
+                }
+                Err(error) => return Err(RunnerError::Transport(error)),
+            };
             captured_responses.push(reply.clone());
 
             let captures = extract(&instance.message, &compiled.response, &reply)
@@ -414,6 +450,9 @@ fn ddmin<F: FnMut(&[usize]) -> bool>(n: usize, mut test: F) -> Vec<usize> {
 /// Errors from driving a session. Every variant is descriptive and bounded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RunnerError {
+    /// The session could not be (re)established.
+    #[error("connect: {0}")]
+    Connect(TransportError),
     #[error(transparent)]
     Transport(TransportError),
     #[error("encoding failed: {0}")]
@@ -474,6 +513,40 @@ mod tests {
         let write_frame = &run.sent_frames[1];
         assert_eq!(&write_frame[1..5], &0x1122_3344u32.to_be_bytes());
         assert!(!run.verdict.is_finding());
+    }
+
+    /// Answers OPEN, then ends the session the way a crashed service does.
+    struct DropsAfterOpen;
+
+    impl SessionTransport for DropsAfterOpen {
+        fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+            match request.first() {
+                Some(1) => Ok(handle_reply(7)),
+                _ => Err(TransportError::session_lost("connection reset by peer")),
+            }
+        }
+
+        fn reset(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_session_the_target_drops_is_a_disconnect_at_that_message() {
+        let model = toy_model();
+        let run = SessionRunner::new(&model)
+            .drive(&open_write(&model), &mut DropsAfterOpen)
+            .expect("a dropped session is a verdict, not an error");
+        assert_eq!(
+            run.verdict,
+            SessionVerdict::Disconnected {
+                step: 1,
+                message: "WRITE".to_owned(),
+                error: "connection reset by peer".to_owned(),
+            }
+        );
+        assert!(run.verdict.is_disconnect() && !run.verdict.is_finding());
+        assert_eq!(run.testcase.captured_responses.len(), 1);
     }
 
     #[test]

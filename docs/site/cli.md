@@ -1400,6 +1400,19 @@ re-resolving the reference, so it still reproduces), and minimize shrinks the
 sequence and bytes fields while re-repairing the computed fields and keeping the
 dynamic bindings live.
 
+A session the target ends after accepting it (it closes or resets the
+connection, or stops answering within the I/O timeout) is a crash candidate:
+the session is kept under `<work_dir>/session_disconnects/`, driven again on a
+new connection, and written as a BHF-210 finding (oracle `session-disconnect`,
+deduplicated by the message it dropped at) when the target drops it at the same
+message again; the summary counts these in `crashes` and the ones a second drive
+did not repeat in `unconfirmed_disconnects`. The campaign goes on. A failure to
+connect skips the session, and three in a row stop the campaign (exit `1`),
+naming them; the wait before each retry grows by 200 ms, so a service that
+restarts after a crash has time to come back. `bhf replay` of a
+`session-disconnect` finding is a `MATCH` when the target drops the session
+again.
+
 Every bound is explicit and surfaced as a bounded diagnostic rather than a panic
 or an unbounded loop: a malformed profile or an unresolved reference, a truncated
 response, an excessive message count (`--max-session-messages`), and an oversized
