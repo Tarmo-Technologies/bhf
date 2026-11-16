@@ -45,6 +45,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The AFL++ lane of a C, C++ or sequence harness runs each input from a heap
+  allocation of exactly its size, as the builtin lane does. It ran the target
+  on AFL++'s 1 MiB testcase buffer with the tail poisoned, so a read one past
+  the input was a `use-after-poison` there and a `heap-buffer-overflow` in the
+  builtin lane: one bug, two classifications.
 - The documented Ada flow works: `bhf generate-harness --target Pkg.Parse`
   selects `Parse` in package `Pkg` (it said `subprogram 'Pkg.Parse' not
   found`), and generates the harness `--target Parse` does. `bhf instrument`

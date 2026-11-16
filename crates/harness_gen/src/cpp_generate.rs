@@ -7456,9 +7456,10 @@ mod tests {
         }
     }
 
-    /// The C++ AFL++ lane poisons the bytes of AFL++'s testcase buffer past
-    /// the input, so a read one past a buffer that views the input is
-    /// reported there too, and makes them addressable before the next input.
+    /// The C++ AFL++ lane runs each input from a heap allocation of exactly
+    /// its size, so a read one past a buffer that views the input is the
+    /// heap-buffer-overflow the builtin lane reports, whatever the length of
+    /// the input before it.
     #[test]
     fn built_cpp_afl_lane_reports_a_read_one_past_the_input() {
         let (_out_guard, out) = temp_dir("cpp-afl-probe");
@@ -7498,7 +7499,7 @@ mod tests {
             &[out.join("target.cpp")],
             crate::standalone_driver::AFL_LOOP_INPUTS,
         ) {
-            crate::standalone_driver::assert_afl_loop_poisons_only_past_each_input(&program);
+            crate::standalone_driver::assert_afl_loop_reports_only_past_each_input(&program);
         }
         fs::remove_dir_all(&out).ok();
     }

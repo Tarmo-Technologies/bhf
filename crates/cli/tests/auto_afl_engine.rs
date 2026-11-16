@@ -347,3 +347,77 @@ fn an_afl_finding_records_the_comparison_evidence_of_its_input() {
         "{result:#}"
     );
 }
+
+/// A read one past the input is the same AddressSanitizer heap-buffer-overflow
+/// whichever engine finds it. The AFL++ lane ran the target on AFL++'s 1 MiB
+/// testcase buffer with the bytes past the input poisoned, so there it was a
+/// `use-after-poison` (#213); it now copies each input into a heap block of
+/// exactly its size, as the builtin lane passes it. AFL++ is required under
+/// `BHF_REQUIRE_TOOLS=1`, as the nightly runs this.
+#[test]
+fn an_over_read_of_the_input_is_a_heap_buffer_overflow_in_both_engines() {
+    if !afl_present() || !which("make") {
+        assert!(
+            std::env::var_os("BHF_REQUIRE_TOOLS").is_none_or(|value| value != "1"),
+            "BHF_REQUIRE_TOOLS=1 and afl-fuzz/afl-clang-fast or make is not on PATH"
+        );
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("tag.c"),
+        "#include <stddef.h>\n\
+         int read_tag(const unsigned char *d, size_t n) {\n\
+         \x20   if (n >= 4 && d[0] == 'T' && d[1] == 'G') return d[n];\n\
+         \x20   return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let seed = tmp.path().join("seed.bin");
+    std::fs::write(&seed, b"TGab").unwrap();
+    for engine in ["afl++", "builtin"] {
+        let work = tmp.path().join(format!("work-{engine}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+            .arg("auto")
+            .arg(&src)
+            .arg("--work-dir")
+            .arg(&work)
+            .args(["--engine", engine, "--per-target-time", "6"])
+            .args(["--max-targets", "1", "--jobs", "1", "--no-discovery-cache"])
+            .arg("--seed-file")
+            .arg(&seed)
+            .env_remove("CC")
+            .env_remove("CXX")
+            .output()
+            .unwrap();
+        let log = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let findings: Vec<serde_json::Value> = std::fs::read_dir(work.join("results/findings"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let text = std::fs::read_to_string(entry.path().join("finding.json")).ok()?;
+                serde_json::from_str(&text).ok()
+            })
+            .collect();
+        let names: Vec<&str> = findings
+            .iter()
+            .filter_map(|finding| finding["exception"]["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"ASAN_HEAP_BUFFER_OVERFLOW"),
+            "{engine}: {names:?}\n{log}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("POISON")),
+            "{engine}: {names:?}"
+        );
+    }
+}

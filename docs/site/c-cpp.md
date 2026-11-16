@@ -547,9 +547,9 @@ with no cursor parameter, that is the whole testcase:
 bhf's driver passes each input in a heap allocation of exactly its size (one
 byte for an empty input), in the fuzz loop and on replay, as libFuzzer does.
 A read one past a view of the input is a heap overflow the sanitizer reports.
-The AFL++ lane passes AFL++'s own testcase buffer, which is larger than the
-input; under AddressSanitizer the bytes past the input are poisoned, so the
-same read is reported there as `use-after-poison`.
+The AFL++ lane copies each input out of AFL++'s testcase buffer, which is
+larger than the input, into such an allocation too, so the same read is the
+same `heap-buffer-overflow` there.
 
 So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
 bytes 4-7 and `data` the bytes from 8 on, and for

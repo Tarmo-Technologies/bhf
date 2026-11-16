@@ -478,9 +478,9 @@ pub(crate) mod standalone_driver {
     }
 
     /// `program` is an AFL++ lane of a target with [`AFL_PROBE_BODY`]: a
-    /// read one past the input is reported, though AFL++'s testcase buffer
-    /// is larger than any input, and a correct read of an input of any size
-    /// is not.
+    /// read one past the input is the heap-buffer-overflow the builtin lane
+    /// reports, though AFL++'s testcase buffer is larger than any input, and
+    /// a correct read of an input of any size is not reported.
     pub(crate) fn assert_afl_reports_a_read_one_past_the_input(program: &Path) {
         for input in [&b"ABCD"[..], b""] {
             let run = run_afl(program, input);
@@ -494,7 +494,8 @@ pub(crate) mod standalone_driver {
         let run = run_afl(program, b"XBCD");
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(
-            !run.status.success() && stderr.contains("AddressSanitizer"),
+            !run.status.success()
+                && stderr.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
             "{}: the read one past the input: {}: {stderr}",
             program.display(),
             run.status
@@ -504,8 +505,8 @@ pub(crate) mod standalone_driver {
     /// `program` was built with [`build_afl_loop`] over
     /// [`AFL_LOOP_INPUTS`] for a target with [`AFL_PROBE_BODY`]: every input
     /// runs clean however its length compares to the last one's, until the
-    /// last input's read one past it is reported.
-    pub(crate) fn assert_afl_loop_poisons_only_past_each_input(program: &Path) {
+    /// last input's read one past it is reported as a heap-buffer-overflow.
+    pub(crate) fn assert_afl_loop_reports_only_past_each_input(program: &Path) {
         let run = Command::new(program)
             .env_remove("BHF_TRACE_ARGS")
             .output()
@@ -517,13 +518,14 @@ pub(crate) mod standalone_driver {
             .collect();
         assert_eq!(runs, ["4", "8", "0", "8", "4"], "{stderr}");
         assert!(
-            !run.status.success() && stderr.contains("AddressSanitizer"),
+            !run.status.success()
+                && stderr.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
             "{}: {stderr}",
             run.status
         );
     }
 
-    /// The inputs [`assert_afl_loop_poisons_only_past_each_input`] expects:
+    /// The inputs [`assert_afl_loop_reports_only_past_each_input`] expects:
     /// a shorter, a longer, an empty and a longer input, then one that reads
     /// one past itself.
     pub(crate) const AFL_LOOP_INPUTS: &[&[u8]] = &[b"ABCD", b"ABCDEFGH", b"", b"ABCDEFGH", b"XBCD"];
