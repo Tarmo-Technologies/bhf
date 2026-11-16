@@ -2483,6 +2483,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_probe_out_of_tree.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_python_lane.rs",
       "license": "Apache-2.0"
     },

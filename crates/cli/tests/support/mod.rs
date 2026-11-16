@@ -33,6 +33,20 @@ pub fn require_tool_with(available: bool, what: &str, required: bool) -> bool {
     available
 }
 
+/// The `.bhf-build` a build probe of `bhf auto --work-dir work` wrote, in its
+/// probe home under `work/probe/`: the probe builds outside the scanned tree.
+/// Panics unless there is exactly one.
+pub fn probe_dir_in(work: &Path) -> PathBuf {
+    let homes: Vec<PathBuf> = fs::read_dir(work.join("probe"))
+        .unwrap_or_else(|e| panic!("{}: {e}", work.join("probe").display()))
+        .flatten()
+        .map(|entry| entry.path().join(".bhf-build"))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    assert_eq!(homes.len(), 1, "{homes:?}");
+    homes.into_iter().next().unwrap()
+}
+
 /// Serializes fuzz-bearing tests inside one test binary.
 ///
 /// A test that asserts a planted bug is FOUND is budgeted in wall-clock seconds,

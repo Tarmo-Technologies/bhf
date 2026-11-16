@@ -247,10 +247,16 @@ real translation-unit flags. bhf uses it automatically — you do **not** need
   either location is followed. bhf discovers it and builds each harness with the
   recorded flags.
 - `--probe-build` is only for *regenerating* a database by running the project's
-  own build; it writes to `<tree>/.bhf-build/compile_commands.json`. If you place
-  your own database there and regeneration then fails (e.g. offline), bhf now
-  **keeps and uses your database** instead of discarding it — but the simplest
-  path is to drop it in the project root and run without `--probe-build`.
+  own build. It builds outside the tree, in `<work>/probe/<tree>-<hash>/`
+  (CMake and Meson with their build directory there, Make and an intercepted
+  `--build-command` in a copy of the tree there), so the tree is left as it
+  was and a read-only checkout can be probed; it writes
+  `<work>/probe/<tree>-<hash>/.bhf-build/compile_commands.json`. If you place
+  your own database at `<tree>/.bhf-build/compile_commands.json` and
+  regeneration then fails (e.g. offline), bhf **keeps and uses your database**
+  instead of discarding it — but the simplest path is to drop it in the project
+  root and run without `--probe-build`. A probe that yields no database says
+  why (for Make: it ran no compiler).
 
 ## The 32-project sweep
 

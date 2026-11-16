@@ -906,11 +906,11 @@ fn a_cross_sweep_links_the_probe_archives_rebuilt_for_its_target() {
     assert_eq!(elf_machine(&harness_main(&work, &target)), EM_AARCH64);
 }
 
-/// A plain Makefile project's probe (the Make tier) builds its archive in the
-/// tree, beside its sources; a cross sweep rebuilds that archive for its
-/// target and links it too.
+/// A plain Makefile project's probe (the Make tier) builds its archive in
+/// place, in its copy of the tree under the work dir; a cross sweep rebuilds
+/// that archive for its target and links it too.
 #[test]
-fn a_cross_sweep_rebuilds_the_archive_a_plain_makefile_builds_in_the_tree() {
+fn a_cross_sweep_rebuilds_the_archive_a_plain_makefile_builds_in_place() {
     if !have("aarch64-linux-gnu-gcc") || !have("qemu-aarch64") || !have("make") || !have("cc") {
         eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/make/cc unavailable");
         return;
@@ -943,9 +943,12 @@ fn a_cross_sweep_rebuilds_the_archive_a_plain_makefile_builds_in_the_tree() {
         .output()
         .unwrap();
     let out = text(&output);
+    // In place in its copy of the tree; the tree is left as it was.
+    assert!(!src.join("libwidget.a").exists(), "{out}");
+    let copy = support::probe_dir_in(&work).parent().unwrap().join("src");
     assert!(
-        src.join("libwidget.a").is_file(),
-        "the Make tier builds in place:\n{out}"
+        copy.join("libwidget.a").is_file(),
+        "the Make tier builds in place in its copy:\n{out}"
     );
     let rebuilt = work.join("auto/probe-archives/aarch64-linux-gnu/libwidget.a");
     assert!(
@@ -1022,7 +1025,7 @@ fn gcc_probe_builds_and_links_its_archive(src: &Path, work: &Path) {
         .unwrap();
     let out = text(&output);
     let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(src.join(".bhf-build/bhf-artifacts.json"))
+        &std::fs::read(support::probe_dir_in(&work).join("bhf-artifacts.json"))
             .unwrap_or_else(|_| panic!("no probe manifest:\n{out}")),
     )
     .unwrap();
@@ -1032,7 +1035,7 @@ fn gcc_probe_builds_and_links_its_archive(src: &Path, work: &Path) {
         flags.contains("trace-pc,trace-cmp") && !flags.contains("trace-pc-guard"),
         "{flags}"
     );
-    let archive = src.join(".bhf-build/libwidget.a");
+    let archive = support::probe_dir_in(&work).join("libwidget.a");
     assert!(
         compiler_comment(&archive).contains("GCC:")
             && !compiler_comment(&archive).contains("clang"),

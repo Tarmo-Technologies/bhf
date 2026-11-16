@@ -8533,7 +8533,12 @@ fn compile_database_candidates_in_tree(source_path: &Path) -> Vec<PathBuf> {
         for sub in COMPILE_DB_BUILD_SUBDIRS {
             push_unique_path(&mut candidates, dir.join(sub).join("compile_commands.json"));
         }
-        // The `--probe-build` step writes the recovered database here.
+        // The `--probe-build` step writes the recovered database here: in
+        // the work dir's probe home, or in the tree for an earlier probe.
+        push_unique_path(
+            &mut candidates,
+            crate::auto::build_probe::probe_dir(&dir).join("compile_commands.json"),
+        );
         push_unique_path(
             &mut candidates,
             dir.join(crate::auto::build_probe::PROBE_DIR)

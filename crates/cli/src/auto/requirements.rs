@@ -412,8 +412,7 @@ fn add_declared_generated_outputs(
     // after configuration completed. At that point configure_file outputs have
     // either been materialized in the binary tree or were transient CMake test
     // artifacts; continuing to call them source-drop blockers is a false alarm.
-    let cmake_configured = source_root
-        .join(crate::auto::build_probe::PROBE_DIR)
+    let cmake_configured = crate::auto::build_probe::probe_dir(source_root)
         .join("compile_commands.json")
         .is_file();
     let mut stack = vec![(source_root.to_path_buf(), 0usize)];
@@ -693,8 +692,7 @@ fn declared_source_present(source_root: &Path, cmake_file: &Path, source: &str) 
     let base = cmake_file.parent().unwrap_or(source_root);
     base.join(source).is_file()
         || source_root.join(source).is_file()
-        || source_root
-            .join(crate::auto::build_probe::PROBE_DIR)
+        || crate::auto::build_probe::probe_dir(source_root)
             .join(source)
             .is_file()
 }
@@ -766,8 +764,7 @@ fn generated_output_present(source_root: &Path, cmake_file: &Path, output: &str)
     let base = cmake_file.parent().unwrap_or(source_root);
     base.join(output).is_file()
         || source_root.join(output).is_file()
-        || source_root
-            .join(crate::auto::build_probe::PROBE_DIR)
+        || crate::auto::build_probe::probe_dir(source_root)
             .join(output)
             .is_file()
 }

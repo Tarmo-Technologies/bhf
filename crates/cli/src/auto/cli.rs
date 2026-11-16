@@ -492,9 +492,12 @@ pub struct AutoArgs {
     /// Recover the project's real compile wiring by running its own build
     /// (CMake configure + instrumented static-library targets, or `make` under a
     /// compiler-interposing wrapper) once,
-    /// offline, before harnessing. Produces `<tree>/.bhf-build/
-    /// compile_commands.json`, generated headers, and compatible static archives
-    /// so each harness builds with the real translation-unit and link context.
+    /// offline, before harnessing. It builds under the work dir
+    /// (`<work>/probe/`), never in the tree: CMake and Meson into a build
+    /// directory there, Make in a copy of the tree there. Produces
+    /// `compile_commands.json`, generated headers, and compatible static
+    /// archives so each harness builds with the real translation-unit and link
+    /// context.
     ///
     /// This EXECUTES the project's untrusted build scripts; it runs under
     /// bhf's sandbox (bwrap/firejail) when one is available and degrades to a
@@ -1206,6 +1209,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A build probe of this tree builds under the work dir, never in the tree
+    // (#210).
+    crate::auto::build_probe::register_probe_root(&path, &work);
     // A work dir reused for another source tree: set that run aside before this
     // one writes anything, so it neither reports nor resumes the other tree's
     // findings.
@@ -5987,7 +5993,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let tree = tmp.path().join("src");
-        let probe = tree.join(crate::auto::build_probe::PROBE_DIR);
+        let probe = crate::auto::build_probe::probe_dir(&tree);
         std::fs::create_dir_all(&probe).unwrap();
         std::fs::write(
             tree.join("util.c"),

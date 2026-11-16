@@ -45,6 +45,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `--probe-build` builds outside the scanned tree, under
+  `<work>/probe/<tree>-<hash>/`: CMake and Meson into a build directory there,
+  Make and an intercepted `--build-command` in a copy of the tree there, whose
+  compile database names the tree's files. It wrote `.bhf-build`, objects and
+  generated files into the tree, and on a read-only checkout produced nothing
+  without a word. The tree is now left byte-identical (the sandbox mounts it
+  read-only), a read-only checkout is probed, and a Make probe that compiles
+  nothing says so.
 - A local test run with `BHF_REQUIRE_TOOLS=1` fails on a missing tool, as the
   nightly does. Each integration test file had its own tool check that
   printed a skip line and passed; they all return through a shared

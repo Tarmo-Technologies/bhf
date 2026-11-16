@@ -87,7 +87,9 @@ fn build_command_interception_recovers_flags_and_fuzzes() {
 
     // The interception must have produced a compile database with the recovered
     // include dir + define.
-    let db_path = root.join(".bhf-build/compile_commands.json");
+    // Recovered under the work dir: the tree stays as it was.
+    assert!(!root.join(".bhf-build").exists());
+    let db_path = support::probe_dir_in(&work).join("compile_commands.json");
     let db = std::fs::read_to_string(&db_path).unwrap_or_else(|e| {
         panic!(
             "read {}: {e}; bhf auto exit={:?}\nstderr:\n{}",
@@ -176,7 +178,9 @@ fn build_command_intercepts_an_absolute_path_compiler() {
         .output()
         .expect("spawn bhf auto");
 
-    let db_path = root.join(".bhf-build/compile_commands.json");
+    // Recovered under the work dir: the tree stays as it was.
+    assert!(!root.join(".bhf-build").exists());
+    let db_path = support::probe_dir_in(&work).join("compile_commands.json");
     let db: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&db_path).unwrap_or_else(|e| {
             panic!(

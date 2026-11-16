@@ -562,8 +562,8 @@ MSBuild itself evaluates each project when it is installed
 static reading cannot (property functions, NuGet-imported targets); a
 project MSBuild cannot evaluate falls back to the static reading. The import
 then prints `msbuild evaluation` instead of `static evaluation`; under
-`--probe-build` it writes `<tree>\.bhf-build\compile_commands.json` like the
-other probe tiers.
+`--probe-build` it writes `compile_commands.json` to the work dir's probe home
+(`<work>\probe\<tree>-<hash>\.bhf-build\`) like the other probe tiers.
 
 Why evaluation is opt-in: evaluating a project runs code the scanned tree
 chooses. MSBuild calls the property functions the project files contain
@@ -664,7 +664,7 @@ bhf.exe auto C:\src\proj --build-command "msbuild proj.sln /p:Configuration=Rele
 No Native Tools prompt is needed: the discovered Visual Studio environment puts
 MSBuild and cl on `PATH`. The command runs through `cmd.exe`. Each compiler on
 `PATH` (`cl`, `clang-cl`, `clang`, `gcc`, ...) gets an executable shim in
-`<tree>\.bhf-build\intercept\` that records its arguments (with MSBuild's
+`<work>\probe\<tree>-<hash>\.bhf-build\intercept\` that records its arguments (with MSBuild's
 response files expanded) and runs the real compiler unchanged. MSBuild starts
 cl from the toolset directory by absolute path, so the CL task is pointed at the
 `cl.exe` shim through the `CLToolPath`/`CLToolExe` properties (with
