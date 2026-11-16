@@ -1657,6 +1657,11 @@
   been given.
 
 ### Changed
+- The nightly integration suite builds the runtrace shim and the compiler
+  intercept before its tests, which used to fuzz with the runtime audit off
+  and skip the env-capsule tests. With the new `BHF_REQUIRE_TOOLS=1`, which
+  the nightly sets, a test that finds the shim missing fails instead of
+  skipping.
 - Container image CVE blockers no longer fail pull request or branch push
   CI: the scan still runs and reports them (`release-review.json` gains
   `enforcement`), and tag, release and container-release runs still fail on
