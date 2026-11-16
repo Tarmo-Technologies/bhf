@@ -147,6 +147,15 @@ jobs:
       - name: Install cargo-nextest
         run: bash scripts/ci/install-nextest.sh
 
+      # The smoke subset's Ada representative (auto_ada_access_lifecycle)
+      # builds and fuzzes an Ada target; without GNAT it skips as a pass.
+      - name: Install GNAT for the Ada smoke test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnat gprbuild
+          gnatmake --version | head -1
+          gprbuild --version | head -1
+
       # nextest runs all tests across every binary in one global parallel pool.
       # `cargo test` runs the ~290 test binaries one at a time, which took the
       # slow integration suites past the job timeout (58min+). nextest brings the

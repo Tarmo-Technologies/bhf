@@ -12,13 +12,6 @@
 # keep it as narrow as the lane, and delete it once the nightly installs what
 # the lane needs.
 
-# Ada: the nightly installs no GNAT or GPRbuild yet. The real-code validation
-# workflow and the GNAT Matrix run the Ada build and fuzz pipelines.
-*  *gnatmake*
-*  *gprbuild*
-*  *no gnat toolchain*
-*  *no ada compiler*
-*  *the ada toolchain is not installed*
 # The GNAT Matrix workflow sets BHF_M19_FULL_CI for this one.
 bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  skipping: BHF_M19_FULL_CI is not set
 

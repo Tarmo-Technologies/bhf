@@ -5,6 +5,9 @@
 ## Unreleased
 
 ### Changed
+- The nightly installs GNAT 13 and GPRbuild and runs the Ada lane tests,
+  which skipped as passes, and no longer allows an Ada skip line; the PR
+  smoke's Ada representative runs on a runner with GNAT.
 - The nightly builds every test binary once, into one nextest archive with
   the runtrace shim, the compiler intercept and the release bhf, and each shard
   runs from it instead of compiling the workspace. The heavy tests run the
