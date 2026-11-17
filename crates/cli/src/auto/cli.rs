@@ -12,7 +12,6 @@ use crate::auto::discovery::DirFilter;
 use crate::auto::report::{write_reports, write_reports_with_output_limit};
 use crate::target_filter::{path_matches_exclusion, ExcludeCategory};
 use anyhow::{Context, Result};
-use chrono::Utc;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1204,7 +1203,7 @@ pub const EXIT_SANITIZER_RUNTIME: i32 = 3;
 
 fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let _tstart = std::time::Instant::now();
-    let started_at = Utc::now().to_rfc3339();
+    let started_at = super::bug_report::now_rfc3339();
     let run_start = std::time::Instant::now();
     if !args.path.exists() {
         bhfeprintln!(
@@ -2104,7 +2103,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 "bhf auto: --static — static scan wrote {n} finding(s) (no fuzzable targets discovered)"
             );
         }
-        let finished_at = Utc::now().to_rfc3339();
+        let finished_at = super::bug_report::now_rfc3339();
         write_reports(
             &path,
             &[],
@@ -3422,7 +3421,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
     }
 
-    let finished_at = Utc::now().to_rfc3339();
+    let finished_at = super::bug_report::now_rfc3339();
     crate::auto::discovery::bhfprof("auto:post_sweep", _tpost);
     let _twr = std::time::Instant::now();
     write_reports_with_output_limit(

@@ -51,7 +51,7 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | regex | Diagnostic parsing | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | num_cpus (Rust) | Detect host CPU count for `bhf auto` worker pool | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | rayon (Rust) | Data-parallel static-scan file pipeline (10M-SLOC scale) | MIT/Apache-2.0 | **Core** | Low | Allow. Work-stealing pool bounded to cores-1; deterministic order-preserving collect. |
-| chrono (Rust) | RFC3339 timestamps in `bhf auto` reports | MIT/Apache-2.0 | **Core** | Low | `default-features = false` + `clock` only; no serde / windows-bindings pull-in. |
+| jiff (Rust) | RFC 3339 timestamps in findings and `bhf auto` reports | Unlicense OR MIT | **Core** | Low | `default-features = false` + `std` only: UTC timestamps, no time-zone database. Replaces chrono, which RUSTSEC-2026-0543 marks unmaintained. |
 | which (Rust) | Compiler binary discovery on PATH | MIT | **Core** | Low | Allow. |
 | libc (Rust) | Unix `prctl` / `setrlimit` safety rails on spawned fuzz harnesses | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | tar (Rust) | `data.tar` member extraction for `binary scan` DEB/tarball recursion | MIT/Apache-2.0 | **Core** | Low | Allow. Pure-Rust (no `-sys`); keeps RHEL 7 / Windows MSVC / cross builds C-toolchain-free. |

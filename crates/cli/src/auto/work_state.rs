@@ -125,7 +125,7 @@ pub(crate) fn archive_other_tree(
             }
         })
         .collect();
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ");
     let base = work_dir.join(ARCHIVE_DIR);
     let mut archive = base.join(format!("{stamp}-{tree_name}"));
     let mut suffix = 1;

@@ -47,7 +47,6 @@ c_parser = { path = "../c_parser" }
 c_stub_gen = { path = "../c_stub_gen" }
 java_parser = { path = "../java_parser" }
 cmplog = { path = "../cmplog" }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap.workspace = true
 compiler_adapter = { path = "../compiler_adapter" }
 config = { path = "../config" }
@@ -63,6 +62,7 @@ governance = { path = "../governance" }
 harness_gen = { path = "../harness_gen" }
 idl_parser = { path = "../idl_parser" }
 instrumenter = { path = "../instrumenter" }
+jiff = { version = "1", default-features = false, features = ["std"] }
 lang_profile = { path = "../lang_profile" }
 license_policy = { path = "../license_policy" }
 llm_harness_gen = { path = "../llm_harness_gen", optional = true }

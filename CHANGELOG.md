@@ -5,6 +5,9 @@
 ## Unreleased
 
 ### Changed
+- bhf's UTC timestamps come from `jiff` instead of `chrono`, which
+  RUSTSEC-2026-0543 marks unmaintained and `cargo deny` refused. The
+  timestamps are written in the same formats (#408).
 - The unused workspace crates `discovery`, `semantic`, `fork_server`,
   `fuzz_engine_nyx_adapter`, `fuzz_engine_libfuzzer_adapter` and
   `fuzz_engine_afl_adapter` are removed: nothing depended on them (the AFL++
