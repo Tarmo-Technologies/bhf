@@ -1791,6 +1791,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/peer_sync.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/shared_map.rs",
       "license": "Apache-2.0"
     },
@@ -2967,6 +2971,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_worker_sync.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/generate_harness_languages.rs",
       "license": "Apache-2.0"
     },
@@ -3076,6 +3084,10 @@
     },
     {
       "path": "crates/cli/tests/manual_c_protocol_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/minimize_typed_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3191,6 +3203,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/session_target_transport_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/single_file_tool_main.rs",
       "license": "Apache-2.0"
     },
@@ -3256,6 +3272,10 @@
     },
     {
       "path": "crates/cli/tests/transport_fuzz_timeout_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_minimize_cli.rs",
       "license": "Apache-2.0"
     },
     {
