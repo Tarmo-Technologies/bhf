@@ -76,6 +76,13 @@
   workspace_admin, since those decide which findings count or are hidden and
   which rules run. Only a viewer was restricted, so an operator was an
   administrator. daemon.md has the permission table.
+- On Linux the daemon pins each path a tenant was authorized to use (#362):
+  it opens the path beneath a handle on the workspace root without
+  following a symlink (`openat2`, `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`)
+  and works through that handle. It used to check the resolved path and
+  then open the request's path again, so a component swapped for a symlink
+  in between could redirect the call outside the root. Responses and a
+  static scan's reports name the resolved paths.
 - The insecure-permissions oracle judges a directory by the mode it was
   created with (#407). The runtrace shim checked the mode `mkdir` and
   `mkdirat` were asked for, and `0777` is the mode they are normally called

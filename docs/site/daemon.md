@@ -105,6 +105,15 @@ also be inside the tenant's workspace root.
 
 A call the role may not make is `-32002`, naming the role.
 
+On Linux a tenant's paths are pinned for the call: the daemon opens each one
+beneath a handle on the workspace root without following a symlink
+(`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) and works through
+that handle. A component swapped for a symlink after the check cannot
+redirect the call, and one swapped before the pin is refused with `-32003`.
+Responses and the static scan's reports name the resolved paths. Elsewhere,
+and on kernels before 5.6, the daemon checks the resolved path and then uses
+the one the request named.
+
 ## Continuous Daemon
 
 `continuous_daemon` is a separate background scheduler for on-prem continuous

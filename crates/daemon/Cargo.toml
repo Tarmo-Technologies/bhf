@@ -33,6 +33,9 @@ serde_json.workspace = true
 static_analysis = { path = "../static_analysis" }
 target_rank = { path = "../target_rank" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 llm = ["dep:llm_harness_gen", "cli/llm"]

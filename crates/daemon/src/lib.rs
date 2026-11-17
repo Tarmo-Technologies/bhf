@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod memory_budget;
+mod pinned_path;
 mod security_config;
 
 pub use security_config::{load_security_config, MIN_TOKEN_CHARS};
@@ -733,35 +734,49 @@ fn dispatch_json_rpc_method(
     identity: &AuthorizedIdentity,
     limit: usize,
 ) -> Result<Value, RpcFailure> {
+    // The paths the request was authorized to use stay pinned until the
+    // response is built, which names them resolved (#362).
+    let mut pins = pinned_path::Pins::default();
+    let result = dispatch_authorized(method, params, identity, limit, &mut pins)?;
+    Ok(pins.unpin(result))
+}
+
+fn dispatch_authorized(
+    method: &str,
+    params: Option<Value>,
+    identity: &AuthorizedIdentity,
+    limit: usize,
+    pins: &mut pinned_path::Pins,
+) -> Result<Value, RpcFailure> {
     match method {
         "scan" => {
-            let params = parse_params::<PathParams>(params)?;
+            let mut params = parse_params::<PathParams>(params)?;
             authorize_method(identity, MethodAccess::Read)?;
-            authorize_path(identity, &params.path)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(scan(params.path))
         }
         "listTargets" => {
-            let params = parse_params::<ListTargetsRpcParams>(params)?;
+            let mut params = parse_params::<ListTargetsRpcParams>(params)?;
             authorize_method(identity, MethodAccess::Read)?;
-            authorize_path(identity, &params.path)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(list_targets(params.path, params.top))
         }
         "findings" => {
-            let params = parse_params::<FindingsParams>(params)?;
+            let mut params = parse_params::<FindingsParams>(params)?;
             authorize_method(identity, MethodAccess::Read)?;
-            authorize_path(identity, &params.findings)?;
+            params.findings = authorize_path(identity, &params.findings, pins)?;
             to_result(load_findings(params.findings, limit))
         }
         "rankAt" => {
-            let params = parse_params::<RankAtParams>(params)?;
+            let mut params = parse_params::<RankAtParams>(params)?;
             authorize_method(identity, MethodAccess::Read)?;
-            authorize_path(identity, &params.path)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(rank_at(params))
         }
         "instrumentPreview" => {
-            let params = parse_params::<PathParams>(params)?;
+            let mut params = parse_params::<PathParams>(params)?;
             authorize_method(identity, MethodAccess::Operate)?;
-            authorize_path(identity, &params.path)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(instrument_preview(params.path))
         }
         "staticScan" => {
@@ -778,19 +793,29 @@ fn dispatch_json_rpc_method(
             {
                 authorize_method(identity, MethodAccess::Administer)?;
             }
-            authorize_path(identity, &params.path)?;
-            authorize_optional_path(identity, params.suppressions.as_deref())?;
-            authorize_optional_path(identity, params.baseline.as_deref())?;
-            authorize_optional_path(identity, params.policy.as_deref())?;
+            params.path = authorize_path(identity, &params.path, pins)?;
+            params.suppressions = authorize_optional_path(identity, params.suppressions, pins)?;
+            params.baseline = authorize_optional_path(identity, params.baseline, pins)?;
+            params.policy = authorize_optional_path(identity, params.policy, pins)?;
             if params.out.is_none() {
                 if let AuthorizedIdentity::Tenant(tenant) = identity {
                     params.out = Some(tenant.workspace_root.join("bhf_work/static"));
                 }
             }
-            if let Some(out) = params.out.as_deref() {
-                authorize_output_path(identity, out)?;
+            if let Some(out) = params.out.take() {
+                params.out = Some(authorize_output_path(identity, &out, pins)?);
             }
-            to_result(static_scan(params, limit))
+            let result = to_result(static_scan(params, limit))?;
+            // The reports it wrote name the paths it was given.
+            let written: Vec<PathBuf> = ["json_path", "markdown_path", "sarif_path"]
+                .iter()
+                .filter_map(|key| result["summary"][key].as_str().map(PathBuf::from))
+                .collect();
+            let written: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
+            pins.unpin_files(&written).map_err(|error| {
+                RpcFailure::server_error(format!("rewrite the reports: {error}"))
+            })?;
+            Ok(result)
         }
         _ => Err(RpcFailure::method_not_found()),
     }
@@ -855,48 +880,73 @@ fn authorize_method(identity: &AuthorizedIdentity, access: MethodAccess) -> Resu
     }
 }
 
-fn authorize_path(identity: &AuthorizedIdentity, path: &Path) -> Result<(), RpcFailure> {
+/// Authorize `path` for `identity` and return the path the operation opens:
+/// for a tenant, the path pinned beneath its workspace root (#362); for the
+/// local user, `path` as it is.
+fn authorize_path(
+    identity: &AuthorizedIdentity,
+    path: &Path,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
+    authorize_beneath(identity, path, path, None, pins)
+}
+
+/// Authorize `existing` (`requested` itself, or the nearest ancestor of it
+/// that exists) and pin it, with `rest` the components still to be made.
+fn authorize_beneath(
+    identity: &AuthorizedIdentity,
+    requested: &Path,
+    existing: &Path,
+    rest: Option<&Path>,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
     let AuthorizedIdentity::Tenant(tenant) = identity else {
-        return Ok(());
+        return Ok(requested.to_path_buf());
     };
     let root = canonicalize_for_auth(&tenant.workspace_root)?;
-    let target = canonicalize_for_auth(path)?;
-    if target.starts_with(&root) {
-        Ok(())
-    } else {
-        Err(RpcFailure::workspace_denied(format!(
+    let target = canonicalize_for_auth(existing)?;
+    if !target.starts_with(&root) {
+        return Err(RpcFailure::workspace_denied(format!(
             "path {} is outside authorized workspace {}",
-            path.display(),
+            requested.display(),
             tenant.workspace_root.display()
-        )))
+        )));
     }
+    Ok(pins
+        .pin(&root, &target, rest)
+        .map_err(|error| RpcFailure::workspace_denied(error.0))?
+        .unwrap_or_else(|| requested.to_path_buf()))
 }
 
 fn authorize_optional_path(
     identity: &AuthorizedIdentity,
-    path: Option<&Path>,
-) -> Result<(), RpcFailure> {
-    if let Some(path) = path {
-        authorize_path(identity, path)?;
-    }
-    Ok(())
+    path: Option<PathBuf>,
+    pins: &mut pinned_path::Pins,
+) -> Result<Option<PathBuf>, RpcFailure> {
+    path.map(|path| authorize_path(identity, &path, pins))
+        .transpose()
 }
 
-fn authorize_output_path(identity: &AuthorizedIdentity, path: &Path) -> Result<(), RpcFailure> {
+fn authorize_output_path(
+    identity: &AuthorizedIdentity,
+    path: &Path,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
     let AuthorizedIdentity::Tenant(_) = identity else {
-        return Ok(());
+        return Ok(path.to_path_buf());
     };
-    if path.exists() {
-        return authorize_path(identity, path);
-    }
-    let mut current = path.parent();
-    while let Some(parent) = current {
-        if parent.exists() {
-            return authorize_path(identity, parent);
+    let mut existing = path;
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => return authorize_path(identity, path, pins),
         }
-        current = parent.parent();
     }
-    authorize_path(identity, path)
+    let rest = path
+        .strip_prefix(existing)
+        .ok()
+        .filter(|rest| !rest.as_os_str().is_empty());
+    authorize_beneath(identity, path, existing, rest, pins)
 }
 
 fn canonicalize_for_auth(path: &Path) -> Result<PathBuf, RpcFailure> {
@@ -2945,6 +2995,49 @@ mod tests {
             serde_json::json!({ "policy": "" }),
         );
         assert_eq!(viewer["error"]["code"], -32002, "{viewer}");
+    }
+
+    /// A tenant's paths are pinned for the operation (#362), and what the
+    /// response and the written reports name is the resolved path, never the
+    /// handle's.
+    #[test]
+    fn a_tenant_static_scan_names_its_paths_resolved() {
+        let (_workspace_guard, workspace) = temp_dir("tenant-pinned-static");
+        let source = workspace.join("legacy.c");
+        fs::write(&source, "void f(char *s) { char b[4]; strcpy(b, s); }\n").unwrap();
+        let security = super::DaemonSecurityConfig::workspace_shared(super::TenantConfig {
+            tenant: "alpha".to_owned(),
+            token: "token-alpha".to_owned(),
+            workspace_root: workspace.clone(),
+            role: super::DaemonRole::Operator,
+        });
+        let request = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "staticScan",
+            "auth": { "tenant": "alpha", "token": "token-alpha" },
+            "params": { "path": source }
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        let response = parse_frames(&output).remove(0);
+        let text = response.to_string();
+        assert!(response.get("result").is_some(), "{text}");
+        assert!(!text.contains("/proc/"), "{text}");
+        let json_path = response["result"]["summary"]["json_path"].as_str().unwrap();
+        // Resolved on Linux; elsewhere the request's own spelling.
+        assert!(
+            std::path::Path::new(json_path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(workspace.canonicalize().unwrap()),
+            "{json_path}"
+        );
+        let report = fs::read_to_string(json_path).unwrap();
+        assert!(!report.contains("/proc/"), "{report}");
     }
 
     #[test]
