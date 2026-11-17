@@ -2786,6 +2786,14 @@
   when bhf panics.
 
 ### Added
+- The workers of a `bhf fuzz --workers` campaign share their corpus while
+  they run (#277). Every `BHF_SYNC_INTERVAL_MS` (10 s by default, spread
+  over the workers), each writes the entries its pool kept to
+  `fuzz_campaigns/<harness>/sync/worker-<id>/`. It also runs the entries
+  the others wrote that it has not seen, by content hash, and keeps those
+  that add coverage. An entry is written once, and each worker logs its
+  imports to `sync-import.log`. The workers merged their queues only after
+  all of them had exited.
 - `bhf fuzz --engine afl++ --workers N` runs AFL++'s own parallel mode
   (#276): a `-M main` instance, which runs CmpLog, and N-1 `-S` instances in
   one output directory. They sync each other's queues at start and every

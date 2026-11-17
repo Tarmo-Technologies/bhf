@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
+mod peer_sync;
 pub(crate) mod shared_map;
 pub(crate) mod typed_spans;
 mod winafl;
@@ -4653,6 +4654,16 @@ fn run_builtin_with_progress(
     if let Some(dir) = live_corpus_dir.as_deref() {
         let _ = fs::create_dir_all(dir);
     }
+    // #277: a worker of a `--workers` campaign shares the entries its pool
+    // keeps with the other workers as it runs, and runs theirs.
+    let mut peer_sync = peer_sync::PeerSync::from_env(
+        &prepared.work_dir,
+        pool.iter().map(|entry| entry.bytes.as_slice()),
+        prepared.max_len,
+    );
+    if let Some(sync) = peer_sync.as_mut() {
+        sync.skip_seeds(pool.len());
+    }
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -5171,7 +5182,21 @@ fn run_builtin_with_progress(
         }
 
         let mut parents = crate::fuzz_lineage::InputParents::Queued(iteration);
-        let input = if iteration < initial_seed_count {
+        // A peer's entry runs as it is, once the seeds have run.
+        let imported = match peer_sync.as_mut() {
+            Some(sync) if iteration >= initial_seed_count => {
+                sync.tick(
+                    pool.iter()
+                        .map(|entry| (entry.bytes.as_slice(), entry.retired)),
+                );
+                sync.next_import()
+            }
+            _ => None,
+        };
+        let input = if let Some(imported) = imported {
+            parents = crate::fuzz_lineage::InputParents::Generated;
+            imported
+        } else if iteration < initial_seed_count {
             pool[iteration].bytes.clone()
         } else {
             // #382: pick a base weighted by coverage energy / under-exploration.

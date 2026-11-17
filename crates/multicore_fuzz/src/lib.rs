@@ -26,6 +26,32 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The campaign directory's live sync directory (#277).
+pub const SYNC_DIR: &str = "sync";
+
+/// The variable that gives each worker the sync directory.
+pub const SYNC_DIR_ENV: &str = "BHF_SYNC_DIR";
+
+/// Milliseconds between a worker's syncs; the campaign's own value, when
+/// set, is each worker's.
+pub const SYNC_INTERVAL_ENV: &str = "BHF_SYNC_INTERVAL_MS";
+
+/// Milliseconds a worker's first sync waits past the interval: worker `i` of
+/// `n` waits `interval * i / n`, which spreads the syncs over the interval.
+pub const SYNC_OFFSET_ENV: &str = "BHF_SYNC_OFFSET_MS";
+
+/// The sync interval when [`SYNC_INTERVAL_ENV`] is not set.
+pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The campaign's sync interval: [`SYNC_INTERVAL_ENV`], or the default.
+fn sync_interval() -> Duration {
+    std::env::var(SYNC_INTERVAL_ENV)
+        .ok()
+        .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SYNC_INTERVAL)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MulticoreConfig {
     /// Bhf work directory containing build/<harness_id>/.
@@ -314,6 +340,14 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         .join("queue");
     std::fs::create_dir_all(&campaign_dir)?;
     std::fs::create_dir_all(&shared_queue)?;
+    // The workers' live corpus exchange (#277): each writes the entries it
+    // keeps under `sync/worker-<id>/` and runs the others'. Each campaign
+    // starts it empty; the shared queue carries what earlier ones found.
+    let sync_dir = campaign_dir.join(SYNC_DIR);
+    if sync_dir.exists() {
+        std::fs::remove_dir_all(&sync_dir)?;
+    }
+    std::fs::create_dir_all(&sync_dir)?;
     let shared_seed_files = queue_seed_files(&shared_queue)?;
     let mut children: Vec<RunningWorker> = Vec::new();
     let worker_namespace = sanitize_worker_namespace(&config.harness_id);
@@ -356,6 +390,13 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
             .env("BHF_WORKER_ID", worker_id.to_string())
             .env("BHF_SHARED_CORPUS_DIR", &shared_queue)
             .env("BHF_CAMPAIGN_DIR", &campaign_dir)
+            .env(SYNC_DIR_ENV, &sync_dir)
+            .env(SYNC_INTERVAL_ENV, sync_interval().as_millis().to_string())
+            .env(
+                SYNC_OFFSET_ENV,
+                (sync_interval().as_millis() * u128::from(worker_id) / u128::from(workers.max(1)))
+                    .to_string(),
+            )
             // The orchestrating `bhf fuzz` records the campaign and rebuilds
             // results/ once; workers must not each do it.
             .env(corpus::layout::RESULTS_DEFER_ENV, "1")
