@@ -70,6 +70,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The daemon's operator role has fewer permissions than workspace_admin
+  (#361): it runs scans and jobs, but a `staticScan` with its own `policy`,
+  `suppressions`, `baseline`, `enabled_rules` or `disabled_rules` needs a
+  workspace_admin, since those decide which findings count or are hidden and
+  which rules run. Only a viewer was restricted, so an operator was an
+  administrator. daemon.md has the permission table.
 - The insecure-permissions oracle judges a directory by the mode it was
   created with (#407). The runtrace shim checked the mode `mkdir` and
   `mkdirat` were asked for, and `0777` is the mode they are normally called

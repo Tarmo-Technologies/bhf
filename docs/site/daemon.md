@@ -41,7 +41,6 @@ truncation.
   core static languages plus JavaScript/TypeScript and supported QML/config/IaC
   inputs), writes JSON, Markdown, and optional SARIF artifacts, and returns the
   full static report plus a CI-style `exit_code`.
-
 `rankAt` and `instrumentPreview` are Ada-only today. The flagship CLI `auto`
 command fuzzes all
 sixteen current lanes; narrower manual commands state their exact language
@@ -65,6 +64,17 @@ or hosted deployments must opt into workspace-scoped security:
 Secure JSON-RPC requests use a top-level `auth` object with `tenant` and
 `token`. Authorized secure responses include `bhfAudit`; denied requests use
 BHF server error codes `-32001`, `-32002`, or `-32003`.
+
+A tenant's role decides what it may call. Every path a request names must
+also be inside the tenant's workspace root.
+
+| Role | May call |
+|---|---|
+| `viewer` | `scan`, `listTargets`, `findings`, `rankAt` |
+| `operator` | the viewer's methods, `instrumentPreview`, and `staticScan` without the overrides below |
+| `workspace_admin` | the operator's methods, and `staticScan` with its own `policy`, `suppressions`, `baseline`, `enabled_rules` or `disabled_rules`: these decide which findings count or are hidden, and which rules run |
+
+A call the role may not make is `-32002`, naming the role.
 
 ## Continuous Daemon
 

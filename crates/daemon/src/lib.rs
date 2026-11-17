@@ -733,37 +733,48 @@ fn dispatch_json_rpc_method(
     match method {
         "scan" => {
             let params = parse_params::<PathParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
+            authorize_method(identity, MethodAccess::Read)?;
             authorize_path(identity, &params.path)?;
             to_result(scan(params.path))
         }
         "listTargets" => {
             let params = parse_params::<ListTargetsRpcParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
+            authorize_method(identity, MethodAccess::Read)?;
             authorize_path(identity, &params.path)?;
             to_result(list_targets(params.path, params.top))
         }
         "findings" => {
             let params = parse_params::<FindingsParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
+            authorize_method(identity, MethodAccess::Read)?;
             authorize_path(identity, &params.findings)?;
             to_result(load_findings(params.findings, limit))
         }
         "rankAt" => {
             let params = parse_params::<RankAtParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
+            authorize_method(identity, MethodAccess::Read)?;
             authorize_path(identity, &params.path)?;
             to_result(rank_at(params))
         }
         "instrumentPreview" => {
             let params = parse_params::<PathParams>(params)?;
-            authorize_method(identity, MethodAccess::OperateWorkspace)?;
+            authorize_method(identity, MethodAccess::Operate)?;
             authorize_path(identity, &params.path)?;
             to_result(instrument_preview(params.path))
         }
         "staticScan" => {
             let mut params = parse_params::<StaticScanParams>(params)?;
-            authorize_method(identity, MethodAccess::OperateWorkspace)?;
+            authorize_method(identity, MethodAccess::Operate)?;
+            // The policy, suppressions and baseline decide which findings
+            // count or are hidden, and the enabled or disabled rules which of
+            // the rule pack run: an administrator's choice (#361).
+            if params.policy.is_some()
+                || params.suppressions.is_some()
+                || params.baseline.is_some()
+                || !params.enabled_rules.is_empty()
+                || !params.disabled_rules.is_empty()
+            {
+                authorize_method(identity, MethodAccess::Administer)?;
+            }
             authorize_path(identity, &params.path)?;
             authorize_optional_path(identity, params.suppressions.as_deref())?;
             authorize_optional_path(identity, params.baseline.as_deref())?;
@@ -782,10 +793,14 @@ fn dispatch_json_rpc_method(
     }
 }
 
+/// What a method does to a workspace, which decides the roles that may call
+/// it: a viewer reads, an operator also runs scans and jobs, and a workspace
+/// administrator also sets the scan policy and the rule pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MethodAccess {
-    ReadWorkspace,
-    OperateWorkspace,
+    Read,
+    Operate,
+    Administer,
 }
 
 fn authorize_request(
@@ -826,8 +841,12 @@ fn authorize_method(identity: &AuthorizedIdentity, access: MethodAccess) -> Resu
         return Ok(());
     };
     match (tenant.role, access) {
-        (DaemonRole::Viewer, MethodAccess::OperateWorkspace) => Err(RpcFailure::permission_denied(
-            "role viewer cannot perform workspace operations",
+        (DaemonRole::Viewer, MethodAccess::Operate | MethodAccess::Administer) => Err(
+            RpcFailure::permission_denied("role viewer cannot perform workspace operations"),
+        ),
+        (DaemonRole::Operator, MethodAccess::Administer) => Err(RpcFailure::permission_denied(
+            "role operator cannot set the scan policy or the rule pack (policy, \
+                 suppressions, baseline, enabled or disabled rules); a workspace_admin can",
         )),
         _ => Ok(()),
     }
@@ -2849,6 +2868,80 @@ mod tests {
         assert_eq!(responses[0]["bhfAudit"]["role"], "viewer");
         assert_eq!(responses[0]["bhfAudit"]["method"], "rankAt");
         assert_eq!(responses[1]["error"]["code"], -32002);
+    }
+
+    /// One `staticScan` as `role`, with or without a policy override, and the
+    /// response.
+    fn static_scan_as(role: super::DaemonRole, params: serde_json::Value) -> serde_json::Value {
+        let (_workspace_guard, workspace) = temp_dir("json-rpc-policy-role");
+        let source = workspace.join("legacy.c");
+        fs::write(&source, "void f(void) {}\n").unwrap();
+        let policy = workspace.join("policy.json");
+        fs::write(&policy, "{}\n").unwrap();
+        let mut params = params;
+        params["path"] = serde_json::json!(source);
+        if params.get("policy").is_some() {
+            params["policy"] = serde_json::json!(policy);
+        }
+        let security = super::DaemonSecurityConfig::multi_tenant(vec![super::TenantConfig {
+            tenant: "t".to_owned(),
+            token: "token-t".to_owned(),
+            workspace_root: workspace.clone(),
+            role,
+        }]);
+        let request = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "staticScan",
+            "auth": { "tenant": "t", "token": "token-t" },
+            "params": params
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        parse_frames(&output).remove(0)
+    }
+
+    /// An operator runs scans, but the scan policy and the rule pack are an
+    /// administrator's (#361): it could hide findings with them.
+    #[test]
+    fn operator_cannot_call_policy_or_pack_methods() {
+        let plain = static_scan_as(super::DaemonRole::Operator, serde_json::json!({}));
+        assert!(plain.get("result").is_some(), "{plain}");
+        for params in [
+            serde_json::json!({ "policy": "" }),
+            serde_json::json!({ "disabled_rules": ["BHF-101"] }),
+            serde_json::json!({ "enabledRules": ["BHF-101"] }),
+        ] {
+            let denied = static_scan_as(super::DaemonRole::Operator, params.clone());
+            assert_eq!(denied["error"]["code"], -32002, "{params}: {denied}");
+            assert!(
+                denied["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("role operator")),
+                "{denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_can_call_policy_and_pack_methods() {
+        for params in [
+            serde_json::json!({ "policy": "" }),
+            serde_json::json!({ "disabled_rules": ["BHF-101"] }),
+        ] {
+            let allowed = static_scan_as(super::DaemonRole::WorkspaceAdmin, params.clone());
+            assert!(allowed.get("result").is_some(), "{params}: {allowed}");
+            assert_eq!(allowed["bhfAudit"]["role"], "workspace_admin");
+        }
+        // A viewer can do neither.
+        let viewer = static_scan_as(
+            super::DaemonRole::Viewer,
+            serde_json::json!({ "policy": "" }),
+        );
+        assert_eq!(viewer["error"]["code"], -32002, "{viewer}");
     }
 
     #[test]
