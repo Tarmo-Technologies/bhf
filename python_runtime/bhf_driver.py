@@ -115,8 +115,50 @@ def _load_run_one():
     return getattr(mod, "bhf_run_one")
 
 
+# The file the runtrace shim reads the current input from, when bhf preloads
+# it (#300): the shim cannot see this process's bytes otherwise, so a sink the
+# target reached could not be traced back to the input. One per process, since
+# bhf runs fresh processes beside this one; removed at exit.
+_SHIM_INPUT_FILE = (
+    "{0}.{1}".format(os.environ["BHF_SHIM_INPUT_FILE"], os.getpid())
+    if os.environ.get("BHF_SHIM_INPUT_FILE")
+    else None
+)
+
+
+def _remove_published_input():
+    try:
+        os.unlink(_SHIM_INPUT_FILE)
+    except OSError:
+        pass
+
+
+if _SHIM_INPUT_FILE is not None:
+    import atexit
+
+    atexit.register(_remove_published_input)
+
+
+def _publish_input(data: bytes):
+    if _SHIM_INPUT_FILE is None:
+        return
+    try:
+        fd = os.open(_SHIM_INPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        return
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _run_input(run_one, data: bytes):
     bhf_cov.reset_prev()
+    _publish_input(data)
     try:
         run_one(data)
     except BaseException as exc:  # noqa: BLE001 - we classify, then re-decide

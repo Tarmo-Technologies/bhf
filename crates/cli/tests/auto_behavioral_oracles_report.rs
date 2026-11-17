@@ -2,8 +2,9 @@
 
 //! A run says, for each fuzzed target, whether the behavioral sink oracles
 //! ran. The runtrace shim that runs them is preloaded into native harnesses
-//! only, so a C target is `on` and the Python, Perl, Ruby, Lua and PHP
-//! targets, whose interpreters run without it, are `off`.
+//! and the Python and Perl launchers (#300), so those targets are `on`, and
+//! the Ruby, Lua and PHP targets, whose interpreters run without it, are
+//! `off`.
 #![cfg(target_os = "linux")]
 
 use std::path::Path;
@@ -67,7 +68,7 @@ fn shim_built() -> bool {
 }
 
 #[test]
-fn run_md_and_run_json_mark_the_interpreted_lanes_off_and_c_on() {
+fn run_md_and_run_json_mark_each_lane_on_or_off() {
     let interpreted = interpreted_fixtures();
     if interpreted.is_empty() || !runs("cc", &["--version"]) || !shim_built() {
         eprintln!("skipping: needs cc, the runtrace shim and one interpreter");
@@ -106,7 +107,11 @@ fn run_md_and_run_json_mark_the_interpreted_lanes_off_and_c_on() {
             .iter()
             .find(|t| t["source"].as_str().is_some_and(|s| s.ends_with(file)))
             .unwrap_or_else(|| panic!("no {file} target in run.json:\n{run:#}\n{stderr}"));
-        let want = if file == "loader.c" { "on" } else { "off" };
+        let want = if ["loader.c", "loader.py", "Loader.pm"].contains(&file) {
+            "on"
+        } else {
+            "off"
+        };
         assert_eq!(
             target["behavioral_oracles"]["status"], want,
             "{file}: {target:#}\n{stderr}"

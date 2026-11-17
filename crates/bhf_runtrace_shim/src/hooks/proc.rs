@@ -17,6 +17,18 @@ use crate::jsonl::Builder;
 use crate::reentrancy::HookGuard;
 use std::ffi::CStr;
 
+unsafe extern "C" {
+    // exec_hooks.c: execl, execlp and execle, which collect their variadic
+    // arguments and call the execv, execvp and execve hooks below (#300).
+    fn bhf_exec_hook_anchor();
+    fn execl();
+    fn execlp();
+    fn execle();
+}
+
+#[used]
+static KEEP_EXEC_HOOKS: [unsafe extern "C" fn(); 4] = [bhf_exec_hook_anchor, execl, execlp, execle];
+
 static REAL_SYSTEM: ResolvedFn = ResolvedFn::new(b"system\0");
 static REAL_POPEN: ResolvedFn = ResolvedFn::new(b"popen\0");
 static REAL_EXECV: ResolvedFn = ResolvedFn::new(b"execv\0");

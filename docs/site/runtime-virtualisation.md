@@ -11,11 +11,18 @@ The shim lives in `crates/bhf_runtrace_shim` and is Linux-only. On other
 hosts the cdylib is built empty; `bhf auto` falls through to build-time
 sweeping with no runtime audit.
 
-The shim is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses. It is
-**not** armed for the interpreted Python/Perl/Ruby/Lua/PHP lanes or for
-Java/JVM, C#/.NET, or JavaScript/TypeScript/Node—each uses its own runtime's
-coverage and crash signals—and not under cross-compiled or emulated runs
-(qemu-user, wine). In
+The shim is armed for native C/C++/Ada/Rust/Go/COBOL/Fortran harnesses and
+for the Python and Perl interpreters. There, `BHF_RUNTRACE_AFTER_TARGET_ENTRY=1`
+holds every record until the process opens the file `BHF_TARGET_ENTRY_SHM`
+names, which the harness does right before it first calls the target, and the
+driver writes each input to `<BHF_SHIM_INPUT_FILE>.<pid>`, from which the shim
+reads the input it matches a sink's argument against (`bhf auto` sets both).
+The shim hooks the 64-bit and fortified `open64`, `openat64`, `__open64_2`
+and `__openat64_2` such interpreters call, and the variadic `execl`, `execlp`
+and `execle` a shell command goes through. It is **not** armed for the
+interpreted Ruby/Lua/PHP lanes or for Java/JVM, C#/.NET, or
+JavaScript/TypeScript/Node—each uses its own runtime's coverage and crash
+signals—and not under cross-compiled or emulated runs (qemu-user, wine). In
 those cases the runtime audit, resource virtualisations, and shim-fed executable
 oracles described below are unavailable.
 

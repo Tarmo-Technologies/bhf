@@ -154,9 +154,10 @@ runs under a persistent CPython held open by the framed fork-server protocol, an
 coverage is collected by `sys.monitoring` (3.12+) or a `sys.settrace` fallback,
 whose edge counters are written into the same file-backed `BHF_COV_SHM` map
 the engine reads for every other lane. This is **real coverage feedback**, not
-black-box. The LD_PRELOAD runtrace shim is not loaded into the interpreter,
-so this lane has no behavioral/taint sink oracles yet and reports exceptions
-only. Python uses this single edge map only; the hit-count-bucket and
+black-box. The LD_PRELOAD runtrace shim is loaded into the interpreter and
+records from target entry on, so the lane reports the shim's sink findings (a
+path the input controls reaching `open`, a command reaching a shell) beside
+exceptions. Python uses this single edge map only; the hit-count-bucket and
 comparison-progress channels are not part of the lane.
 
 ## Perl instrumentation (interpreter tracer)
@@ -166,8 +167,8 @@ by source rewriting. The harness runs under `perl -d:BhfCov`, whose `DB::DB`
 hook records per-statement edge coverage into the shared `BHF_COV_SHM` map;
 the `perl -d` debugger path is what makes this the slowest of the tracer lanes,
 but the coverage feedback is real, not black-box. As with Python, the runtrace
-shim is not loaded into `perl`, so the lane has no sink oracles yet. Perl uses
-this single edge map only.
+shim is loaded into `perl` from target entry on, so the lane has the shim's sink
+oracles. Perl uses this single edge map only.
 
 ## Go instrumentation
 

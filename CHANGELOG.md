@@ -52,6 +52,16 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Python and Perl lanes run the runtrace shim's sink oracles (#300): a
+  path the input controls reaching `open` is a BHF-405 path finding, and a
+  command reaching a shell a BHF-431. The shim was never preloaded into an
+  interpreter launcher. It now is, recording only once the harness reaches
+  the target (`BHF_RUNTRACE_AFTER_TARGET_ENTRY`), so the interpreter's
+  start-up is not audited, and the drivers write each input where the shim
+  matches it against a sink's argument. The shim also hooks `open64`,
+  `openat64` and their fortified forms, which distribution interpreters call
+  and it missed, and `execl`, `execlp` and `execle`, through which Perl runs
+  a shell command.
 - The engine trade study sees the crashes its bhf lane finds (#403). It read
   bhf's crash input and findings from `<work>/findings/`, and bhf writes
   them to `<work>/results/findings/` since that layout, so a study run since

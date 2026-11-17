@@ -26,6 +26,8 @@ pub mod dlsym;
 #[cfg(target_os = "linux")]
 pub mod fakes;
 #[cfg(target_os = "linux")]
+pub mod gate;
+#[cfg(target_os = "linux")]
 pub mod hooks;
 #[cfg(target_os = "linux")]
 pub mod jsonl;
