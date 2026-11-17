@@ -2759,6 +2759,17 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --session-server-cmd COMMAND` runs the service the session lane
+  fuzzes (#260). bhf starts it with its stderr kept, waits until it serves
+  the transport's port, and after each session checks whether it exited. A
+  session after which it exits, again on a restart, is a finding: from the
+  sanitizer report in its stderr (oracle `session-server-crash`, with
+  `sanitizer.log`), else a BHF-210 exit (`session-server-exit`). The service
+  is started again and the campaign goes on; `server_starts` counts the
+  starts. A service that does not start is exit 2 with its stderr, and
+  `bhf replay` and `bhf minimize` start it for each drive. The lane could not
+  start a service, so it had no sanitizer oracle and stopped once the service
+  crashed.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

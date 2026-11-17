@@ -48,6 +48,7 @@ use protocol_session::{
 use serde::{Deserialize, Serialize};
 
 use crate::fuzz::FuzzArgs;
+use crate::session_server::{ServerExit, SessionServer, SERVER_EXIT_GRACE};
 
 /// The versioned name of the per-finding session artifact sidecar.
 const SESSION_ARTIFACT_SCHEMA: &str = "bhf.session-artifact.v1";
@@ -202,6 +203,14 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
             Self::Udp { host, port } => format!("udp:{host}:{port}"),
+        }
+    }
+
+    /// The host, port and whether it is UDP, for a service bhf starts.
+    fn endpoint(&self) -> (String, u16, bool) {
+        match self {
+            Self::Tcp { host, port } => (host.clone(), *port, false),
+            Self::Udp { host, port } => (host.clone(), *port, true),
         }
     }
 
@@ -653,6 +662,8 @@ pub(crate) struct SessionFuzzConfig {
     pub reset: SessionResetMode,
     /// `--session-reply-timeout`, recorded so a replay waits as long.
     pub reply_timeout: Option<Duration>,
+    /// `--session-server-cmd`, recorded so a replay can start the service.
+    pub server_cmd: Option<String>,
     /// Bounded cap on messages per session.
     pub max_messages: usize,
     /// The valid seed session(s) the campaign mutates.
@@ -706,6 +717,10 @@ pub(crate) struct SessionFuzzSummary {
     /// Sessions the target dropped once but not when driven again; each is
     /// kept under `<work_dir>/session_disconnects/` for triage.
     pub unconfirmed_disconnects: usize,
+    /// How many times bhf started the service (`--session-server-cmd`): once,
+    /// and again after each crash. Zero when bhf did not run it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub server_starts: usize,
     /// Distinct finding ids written to `<work_dir>/results/findings/`.
     pub findings: Vec<String>,
     pub elapsed_secs: f64,
@@ -725,6 +740,8 @@ pub(crate) enum SessionFuzzError {
         path: String,
         source: std::io::Error,
     },
+    #[error("the service did not start again: {0}")]
+    Server(String),
 }
 
 /// The self-contained replay/minimize sidecar written next to a session finding.
@@ -745,6 +762,9 @@ struct SessionArtifactMeta {
     /// `--session-reply-timeout`, when the run gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reply_timeout_ms: Option<u64>,
+    /// `--session-server-cmd`, when bhf ran the service: a replay starts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_cmd: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +827,12 @@ fn mutate_one(
 
 /// The oracle name of a session the target dropped.
 pub(crate) const DISCONNECT_ORACLE: &str = "session-disconnect";
+/// The oracle of a finding whose session crashed the service bhf runs
+/// (`--session-server-cmd`), with the sanitizer report from its stderr.
+pub(crate) const SERVER_CRASH_ORACLE: &str = "session-server-crash";
+/// The oracle of a finding whose session made the service exit with no
+/// sanitizer report.
+pub(crate) const SERVER_EXIT_ORACLE: &str = "session-server-exit";
 /// The rule of a session the target dropped: a reachable crash of the
 /// service (at least a denial of service).
 const DISCONNECT_RULE: &str = "BHF-210";
@@ -824,6 +850,9 @@ struct CrashTally {
     unconfirmed: usize,
     /// Failures to connect in a row; any drive that connects resets it.
     connect_failures: usize,
+    /// The session driven before the current one: when the service is found
+    /// gone before a session connects, that one is what crashed it.
+    previous: Option<SessionTestcase>,
 }
 
 /// Drive `messages`, counting a failure to connect: `None` when the drive
@@ -902,8 +931,62 @@ fn drive_candidate(
     seen: &mut HashSet<String>,
     finding_ids: &mut Vec<String>,
     tally: &mut CrashTally,
+    server: Option<&mut SessionServer>,
 ) -> Result<(StateNoveltyDelta, bool), SessionFuzzError> {
-    let Some(run) = drive_counting(runner, &candidate.messages, transport, tally)? else {
+    // With a service bhf runs, a refused connection is the service gone: look
+    // at it before counting a failure to connect.
+    let (driven, refused) = match server {
+        Some(_) => match runner.drive(&candidate.messages, transport) {
+            Ok(run) => (Some(run), false),
+            Err(protocol_session::RunnerError::Connect(_)) => (None, true),
+            // A candidate the profile cannot drive (an encode or a response
+            // error) says nothing about the service.
+            Err(_) => (None, false),
+        },
+        None => (
+            drive_counting(runner, &candidate.messages, transport, tally)?,
+            false,
+        ),
+    };
+    if let Some(server) = server {
+        let lost = refused
+            || driven
+                .as_ref()
+                .is_some_and(|run| matches!(run.verdict, SessionVerdict::Disconnected { .. }));
+        let grace = if lost {
+            SERVER_EXIT_GRACE
+        } else {
+            Duration::ZERO
+        };
+        if server.exited_within(grace).is_some() {
+            let blamed = match (refused, &tally.previous) {
+                (true, Some(previous)) => previous.clone(),
+                _ => candidate.clone(),
+            };
+            tally.previous = Some(candidate.clone());
+            let delta = driven
+                .as_ref()
+                .map(|run| state_novelty.observe(&run.state_ids, &run.transitions))
+                .unwrap_or_default();
+            let new_finding = confirm_server_crash(
+                &blamed,
+                runner,
+                transport,
+                server,
+                emitter,
+                config,
+                seen,
+                finding_ids,
+                tally,
+            )?;
+            return Ok((delta, new_finding));
+        }
+        if refused {
+            drive_counting(runner, &candidate.messages, transport, tally)?;
+        }
+    }
+    tally.previous = Some(candidate.clone());
+    let Some(run) = driven else {
         return Ok((StateNoveltyDelta::default(), false));
     };
 
@@ -978,6 +1061,98 @@ fn drive_candidate(
     Ok((delta, new_finding))
 }
 
+/// The service exited after `blamed` ran: start it again, drive `blamed`
+/// once more, and if the service exits again write the finding, from the
+/// sanitizer report in its stderr when there is one. Either way the service
+/// is running again for the campaign. `Ok(true)` when a new finding was
+/// written.
+#[allow(clippy::too_many_arguments)]
+fn confirm_server_crash(
+    blamed: &SessionTestcase,
+    runner: &SessionRunner,
+    transport: &mut dyn SessionTransport,
+    server: &mut SessionServer,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+    tally: &mut CrashTally,
+) -> Result<bool, SessionFuzzError> {
+    server.start().map_err(SessionFuzzError::Server)?;
+    tally.connect_failures = 0;
+    let again = runner.drive(&blamed.messages, transport).ok();
+    let exit = server.exited_within(SERVER_EXIT_GRACE);
+    if exit.is_some() {
+        server.start().map_err(SessionFuzzError::Server)?;
+    }
+    let (Some(exit), Some(run)) = (exit, again) else {
+        tally.unconfirmed += 1;
+        let kept = SessionRun {
+            testcase: blamed.clone(),
+            verdict: SessionVerdict::Clean,
+            state_ids: Vec::new(),
+            transitions: Vec::new(),
+            sent_frames: Vec::new(),
+        };
+        persist_disconnect(config, &kept)?;
+        return Ok(false);
+    };
+    tally.crashes += 1;
+    let serialized = run
+        .testcase
+        .to_json()
+        .map_err(SessionFuzzError::Serialize)?;
+    let message = run
+        .testcase
+        .messages
+        .last()
+        .map_or("?", |message| message.message.as_str())
+        .to_owned();
+    if let Some(report) = corpus::sanitizer::parse_sanitizer_report(&exit.stderr) {
+        let top = report
+            .stack
+            .first()
+            .map_or("", |frame| frame.function.as_str());
+        if !seen.insert(format!("{SERVER_CRASH_ORACLE}|{}|{top}", report.rule_id)) {
+            return Ok(false);
+        }
+        let id = emitter.emit_sanitizer_crash_with_log(
+            serialized.as_bytes(),
+            &report,
+            Some(exit.stderr.as_bytes()),
+        )?;
+        write_session_artifacts(
+            &id.0,
+            &serialized,
+            SERVER_CRASH_ORACLE,
+            Some(report.rule_id),
+            config,
+        )?;
+        finding_ids.push(id.0);
+        return Ok(true);
+    }
+    if !seen.insert(format!("{SERVER_EXIT_ORACLE}|{message}")) {
+        return Ok(false);
+    }
+    let detail = format!(
+        "the service ({}) exited with {} after the session, and again when the session was \
+         driven on the service started again; its stderr has no sanitizer report",
+        server.command(),
+        exit.status
+    );
+    let id = emit_session_finding(
+        emitter,
+        &run,
+        SERVER_EXIT_ORACLE,
+        Some(DISCONNECT_RULE),
+        &message,
+        &detail,
+        config,
+    )?;
+    finding_ids.push(id);
+    Ok(true)
+}
+
 /// Drive a bounded, coverage- and state-guided session campaign against
 /// `transport`, reusing the builtin [`PowerScheduler`] for seed selection and
 /// `protocol_session`'s graph-gated structured mutation. Returns the run summary;
@@ -986,6 +1161,7 @@ pub(crate) fn run_session_campaign(
     model: &ProtocolModel,
     transport: &mut dyn SessionTransport,
     config: &SessionFuzzConfig,
+    mut server: Option<&mut SessionServer>,
 ) -> Result<SessionFuzzSummary, SessionFuzzError> {
     let start = Instant::now();
     let runner = SessionRunner::new(model);
@@ -1034,6 +1210,7 @@ pub(crate) fn run_session_campaign(
             &mut seen_findings,
             &mut finding_ids,
             &mut tally,
+            server.as_deref_mut(),
         )?;
         executions += 1;
         scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
@@ -1086,6 +1263,7 @@ pub(crate) fn run_session_campaign(
                 &mut seen_findings,
                 &mut finding_ids,
                 &mut tally,
+                server.as_deref_mut(),
             )?;
             executions += 1;
             if delta.is_novel() {
@@ -1112,6 +1290,7 @@ pub(crate) fn run_session_campaign(
         transitions_covered: state_novelty.transitions_covered(),
         crashes: tally.crashes,
         unconfirmed_disconnects: tally.unconfirmed,
+        server_starts: server.as_ref().map_or(0, |server| server.starts()),
         findings: finding_ids,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
@@ -1145,13 +1324,15 @@ fn emit_session_finding(
         evidence.push(OracleEvidence::new(source.clone(), format_bound(value)));
     }
 
-    let disconnect = oracle == DISCONNECT_ORACLE;
+    let disconnect = oracle == DISCONNECT_ORACLE || oracle == SERVER_EXIT_ORACLE;
     let hit = OracleHit {
         oracle_name: oracle.to_owned(),
         rule_id: rule_id.unwrap_or("HDF7-SESSION").to_owned(),
         category: if disconnect { "crash" } else { "logic-bug" }.to_owned(),
         api: message.to_owned(),
-        message: if disconnect {
+        message: if oracle == SERVER_EXIT_ORACLE {
+            format!("the service exited during the protocol session: {detail}")
+        } else if disconnect {
             format!("the target dropped the protocol session: {detail}")
         } else {
             format!("protocol session reached a clean-exit violation: {detail}")
@@ -1160,10 +1341,21 @@ fn emit_session_finding(
     };
 
     let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
-    let finding_dir = corpus::layout::finding_dir(&config.work_dir, &id.0);
+    write_session_artifacts(&id.0, &serialized, oracle, rule_id, config)?;
+    Ok(id.0)
+}
 
+/// Write a session finding's `session.json` and `session_meta.json` into its
+/// finding dir.
+fn write_session_artifacts(
+    id: &str,
+    serialized: &str,
+    oracle: &str,
+    rule_id: Option<&str>,
+    config: &SessionFuzzConfig,
+) -> Result<(), SessionFuzzError> {
+    let finding_dir = corpus::layout::finding_dir(&config.work_dir, id);
     write_artifact(&finding_dir.join(SESSION_ARTIFACT), serialized.as_bytes())?;
-
     let meta = SessionArtifactMeta {
         schema: SESSION_ARTIFACT_SCHEMA.to_owned(),
         profile_sha256: config.profile_sha256.clone(),
@@ -1177,11 +1369,14 @@ fn emit_session_finding(
         reply_timeout_ms: config
             .reply_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        server_cmd: config.server_cmd.clone(),
     };
     let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(SessionFuzzError::Serialize)?;
-    write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)?;
+    write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)
+}
 
-    Ok(id.0)
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 fn write_artifact(path: &Path, bytes: &[u8]) -> Result<(), SessionFuzzError> {
@@ -1256,9 +1451,53 @@ pub(crate) fn replay_session_outcome(
 ) -> Result<crate::replay::LaneReplay, String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
     let mut transport = build_live_transport(&meta, &model)?;
+    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    if let Some(mut server) = finding_server(&meta)? {
+        let runner = SessionRunner::new(&model);
+        let (_, exit) = drive_against_server(&runner, &testcase, &mut transport, &mut server.0)?;
+        let matched = exit
+            .as_ref()
+            .is_some_and(|exit| server_exit_reproduces(exit, &meta));
+        let replayed = match &exit {
+            Some(exit) => format!(
+                "the service exited with {}{}",
+                exit.status,
+                corpus::sanitizer::parse_sanitizer_report(&exit.stderr)
+                    .map(|report| format!(", rule {}", report.rule_id))
+                    .unwrap_or_default()
+            ),
+            None => "the service did not exit".to_owned(),
+        };
+        return Ok(crate::replay::LaneReplay {
+            lane: "session",
+            matched,
+            status_line: if matched {
+                "MATCH".to_owned()
+            } else {
+                "MISMATCH: the recorded session no longer makes the service exit".to_owned()
+            },
+            compared: format!("session oracle {} with rule {rule}", meta.oracle),
+            differences: if matched {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "verdict: recorded oracle {} with rule {rule}, replayed {replayed}",
+                    meta.oracle
+                )]
+            },
+            details: vec![
+                crate::replay::Detail::new(
+                    "transport",
+                    format!("{} (reset {})", meta.transport, meta.reset),
+                ),
+                crate::replay::Detail::new("service", server.0.command().to_owned()),
+            ],
+            history: "replay",
+            ..Default::default()
+        });
+    }
     let verdict = replay_verdict(&model, &testcase, &mut transport)?;
     let matched = verdict_reproduces(&verdict, &meta);
-    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
     let replayed = match &verdict {
         SessionVerdict::Finding {
             oracle, rule_id, ..
@@ -1318,6 +1557,55 @@ fn verdict_reproduces(verdict: &SessionVerdict, meta: &SessionArtifactMeta) -> b
     }
 }
 
+/// The service a finding's run started, ready to start again for a replay or
+/// a minimization, with a scratch dir for its logs; `None` when bhf did not
+/// run the service or the finding is not of its exit.
+fn finding_server(
+    meta: &SessionArtifactMeta,
+) -> Result<Option<(SessionServer, tempfile::TempDir)>, String> {
+    let Some(command) = &meta.server_cmd else {
+        return Ok(None);
+    };
+    if meta.oracle != SERVER_CRASH_ORACLE && meta.oracle != SERVER_EXIT_ORACLE {
+        return Ok(None);
+    }
+    let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
+        .map_err(|e| e.to_string())?
+        .endpoint();
+    let logs = tempfile::Builder::new()
+        .prefix("bhf-session-server-")
+        .tempdir()
+        .map_err(|e| format!("create a dir for the service's logs: {e}"))?;
+    let server = SessionServer::new(command.clone(), host, port, udp, logs.path());
+    Ok(Some((server, logs)))
+}
+
+/// Start the service, drive `testcase` against it, and return the run and
+/// how the service exited, if it did.
+fn drive_against_server(
+    runner: &SessionRunner,
+    testcase: &SessionTestcase,
+    transport: &mut dyn SessionTransport,
+    server: &mut SessionServer,
+) -> Result<(Option<SessionRun>, Option<ServerExit>), String> {
+    server.start()?;
+    let run = runner.replay(testcase, transport).ok();
+    let exit = server.exited_within(SERVER_EXIT_GRACE);
+    server.stop();
+    Ok((run, exit))
+}
+
+/// Whether the service's exit is the one a finding recorded: for a
+/// sanitizer report, one with the same rule.
+fn server_exit_reproduces(exit: &ServerExit, meta: &SessionArtifactMeta) -> bool {
+    match meta.oracle.as_str() {
+        SERVER_CRASH_ORACLE => corpus::sanitizer::parse_sanitizer_report(&exit.stderr)
+            .is_some_and(|report| Some(report.rule_id) == meta.rule_id.as_deref()),
+        SERVER_EXIT_ORACLE => true,
+        _ => false,
+    }
+}
+
 /// Re-drive `testcase` against `transport` and return the verdict it reaches.
 fn replay_verdict(
     model: &ProtocolModel,
@@ -1368,9 +1656,14 @@ pub(crate) fn minimize_session_finding(finding_dir: &Path) -> i32 {
 
 fn minimize_session_inner(finding_dir: &Path) -> Result<(usize, usize, bool), String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let (original_len, run, reproduces) = minimize_session_core(&model, &testcase, &meta, || {
-        build_live_transport(&meta, &model)
-    })?;
+    let mut server = finding_server(&meta)?;
+    let (original_len, run, reproduces) = minimize_session_core(
+        &model,
+        &testcase,
+        &meta,
+        || build_live_transport(&meta, &model),
+        server.as_mut().map(|(server, _)| server),
+    )?;
     let minimized_len = run.testcase.messages.len();
 
     let serialized = run
@@ -1404,6 +1697,7 @@ fn minimize_session_core<T, F>(
     testcase: &SessionTestcase,
     meta: &SessionArtifactMeta,
     mut make_transport: F,
+    mut server: Option<&mut SessionServer>,
 ) -> Result<(usize, SessionRun, bool), String>
 where
     T: SessionTransport,
@@ -1412,40 +1706,44 @@ where
     let runner = SessionRunner::new(model);
     let original_len = testcase.messages.len();
 
+    // Drive one candidate on a fresh transport (fresh handle) and, for a
+    // finding of the service's exit, a service started again; only the
+    // RECORDED oracle counts as still reproducing — a smaller sequence that
+    // trips a different oracle must not be accepted.
+    let mut drive = |candidate: &SessionTestcase| -> Result<(Option<SessionRun>, bool), String> {
+        let mut transport = make_transport()?;
+        match server.as_deref_mut() {
+            Some(server) => {
+                let (run, exit) = drive_against_server(&runner, candidate, &mut transport, server)?;
+                let reproduces = exit
+                    .as_ref()
+                    .is_some_and(|exit| server_exit_reproduces(exit, meta));
+                Ok((run, reproduces))
+            }
+            None => {
+                let run = runner
+                    .replay(candidate, &mut transport)
+                    .map_err(|e| format!("replay session: {e}"))?;
+                let reproduces = verdict_reproduces(&run.verdict, meta);
+                Ok((Some(run), reproduces))
+            }
+        }
+    };
+
     // Baseline: the recorded session must still reproduce the SAME recorded
     // oracle before we minimize it.
-    {
-        let mut transport = make_transport()?;
-        let run = runner
-            .replay(testcase, &mut transport)
-            .map_err(|e| format!("baseline replay: {e}"))?;
-        if !verdict_reproduces(&run.verdict, meta) {
-            return Err(
-                "the recorded session no longer reproduces; refusing to minimize".to_owned(),
-            );
-        }
+    let (_, reproduces) = drive(testcase).map_err(|e| format!("baseline {e}"))?;
+    if !reproduces {
+        return Err("the recorded session no longer reproduces; refusing to minimize".to_owned());
     }
 
-    // Each predicate candidate re-drives on a fresh transport (fresh handle),
-    // and only a finding for the RECORDED oracle counts as still reproducing —
-    // a smaller sequence that trips a different oracle must not be accepted.
-    let predicate = |candidate: &SessionTestcase| -> bool {
-        let Ok(mut transport) = make_transport() else {
-            return false;
-        };
-        runner
-            .replay(candidate, &mut transport)
-            .map(|run| verdict_reproduces(&run.verdict, meta))
-            .unwrap_or(false)
-    };
-    let minimized = runner.minimize(testcase, predicate);
+    let minimized = runner.minimize(testcase, |candidate| {
+        drive(candidate).is_ok_and(|(_, reproduces)| reproduces)
+    });
 
     // Re-drive the minimized testcase once to capture its fresh evidence.
-    let mut transport = make_transport()?;
-    let run = runner
-        .replay(&minimized, &mut transport)
-        .map_err(|e| format!("drive minimized session: {e}"))?;
-    let reproduces = verdict_reproduces(&run.verdict, meta);
+    let (run, reproduces) = drive(&minimized).map_err(|e| format!("drive minimized {e}"))?;
+    let run = run.ok_or_else(|| "drive minimized session: it did not connect".to_owned())?;
     Ok((original_len, run, reproduces))
 }
 
@@ -1506,6 +1804,24 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     })?;
     let transport_label = plan.label();
     let transport_kind = plan.kind().to_owned();
+    let mut server = match args.session_server_cmd.as_deref() {
+        Some(command) => {
+            let (host, port, udp) = plan.endpoint();
+            let mut server = SessionServer::new(
+                command.to_owned(),
+                host,
+                port,
+                udp,
+                &args.work_dir.join("session_server"),
+            );
+            server.start().map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                2
+            })?;
+            Some(server)
+        }
+        None => None,
+    };
     let mut transport = plan.into_transport(
         args.session_reset,
         model.framing().clone(),
@@ -1530,6 +1846,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         transport_kind,
         reset: args.session_reset,
         reply_timeout: args.session_reply_timeout,
+        server_cmd: args.session_server_cmd.clone(),
         max_messages: args.max_session_messages,
         seeds,
         iterations: args.effective_iterations(),
@@ -1539,7 +1856,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         mode: args.mode,
     };
 
-    run_session_campaign(&model, &mut transport, &config).map_err(|error| {
+    run_session_campaign(&model, &mut transport, &config, server.as_mut()).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --protocol-profile: {error}");
         1
     })
@@ -1671,6 +1988,7 @@ mod tests {
             transport_kind: "scripted".to_owned(),
             reset: SessionResetMode::Reconnect,
             reply_timeout: None,
+            server_cmd: None,
             max_messages: 64,
             seeds: seed_sessions(model),
             iterations,
@@ -1779,7 +2097,7 @@ mod tests {
         )];
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
 
         assert!(
             summary.transitions_covered >= 2,
@@ -1801,7 +2119,7 @@ mod tests {
         let cfg = config(&model, work_dir.to_path_buf(), 200);
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
 
         assert_eq!(summary.profile_sha256, model.profile_sha256());
         assert_eq!(summary.reset_fidelity, "scripted;reset=reconnect");
@@ -1820,7 +2138,7 @@ mod tests {
         let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.time_budget = Some(Duration::from_secs(0));
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(summary.executions, 0, "zero-budget run does nothing");
         assert!(summary.findings.is_empty());
         std::fs::remove_dir_all(&work_dir).ok();
@@ -1830,7 +2148,7 @@ mod tests {
         let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.stop_after_findings = Some(1);
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(
             summary.findings.len(),
             1,
@@ -1853,7 +2171,7 @@ mod tests {
         cfg.stop_after_findings = Some(1);
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(
             summary.findings.len(),
             1,
@@ -2022,6 +2340,7 @@ equals = 226
             rule_id: Some(rule_id.to_owned()),
             oracle: oracle.to_owned(),
             reply_timeout_ms: None,
+            server_cmd: None,
         }
     }
 
@@ -2078,11 +2397,14 @@ equals = 226
         // happily shrink the BUMP away. Gating on the recorded oracle keeps it.
         let recorded = session_of(&model, &["OPEN", "BUMP", "WRITE"]);
 
-        let (original_len, run, reproduces) =
-            minimize_session_core(&model, &recorded, &meta, || {
-                Ok::<_, String>(MultiOracleService::new())
-            })
-            .unwrap();
+        let (original_len, run, reproduces) = minimize_session_core(
+            &model,
+            &recorded,
+            &meta,
+            || Ok::<_, String>(MultiOracleService::new()),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(original_len, 3);
         assert!(reproduces, "the minimized sequence still reproduces O1");
@@ -2104,9 +2426,13 @@ equals = 226
         // Recorded as O1, but the only sequence we hand minimize reproduces O2.
         let meta = multi_oracle_meta(&model, "O1", "R1");
         let drifted = session_of(&model, &["OPEN", "WRITE"]);
-        let err = minimize_session_core(&model, &drifted, &meta, || {
-            Ok::<_, String>(MultiOracleService::new())
-        })
+        let err = minimize_session_core(
+            &model,
+            &drifted,
+            &meta,
+            || Ok::<_, String>(MultiOracleService::new()),
+            None,
+        )
         .unwrap_err();
         assert!(
             err.contains("no longer reproduces"),

@@ -1508,6 +1508,28 @@ at = 1
 tag = 2
 ```
 
+`--session-server-cmd COMMAND` has bhf run the service itself, through the
+shell, with its stderr kept under `<work_dir>/session_server/`. bhf waits until
+it serves the `--session-transport` port, and after each session checks
+whether it exited. A session after which it exits is driven again on the
+service started again; if it exits again, that is a finding, written from the
+sanitizer report in the service's stderr (with its rule, stack and
+`sanitizer.log`, oracle `session-server-crash`) or, with no report, a BHF-210
+finding (oracle `session-server-exit`). The service is started again and the
+campaign goes on; the summary's `server_starts` counts the starts. Unless the
+environment sets `ASAN_OPTIONS`, the service runs with
+`halt_on_error=1:abort_on_error=0:detect_leaks=0:symbolize=1`. A service that
+exits before it serves its port, or does not serve it within 10s, stops the
+run with exit `2` and its stderr. `bhf replay` and `bhf minimize` of such a
+finding start the service for each drive.
+
+```sh
+bhf fuzz bhf_work --harness H-PROTO \
+  --protocol-profile profiles/echo.toml \
+  --session-transport tcp:127.0.0.1:9000 \
+  --session-server-cmd './build/echo_server 9000' --iterations 2000
+```
+
 ```sh
 bhf fuzz bhf_work --harness H-PROTO \
   --protocol-profile profiles/toy-open-write.toml \

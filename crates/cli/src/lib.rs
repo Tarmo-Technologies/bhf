@@ -103,6 +103,7 @@ mod sbom;
 mod scan;
 mod serial_port;
 mod session_fuzz;
+mod session_server;
 mod sloc;
 mod snippet;
 mod source_text;

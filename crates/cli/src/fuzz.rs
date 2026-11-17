@@ -563,6 +563,17 @@ pub struct FuzzArgs {
     #[arg(long = "session-transport", value_name = "SPEC")]
     pub session_transport: Option<String>,
 
+    /// A command that runs the service the session lane fuzzes, through the
+    /// shell. bhf starts it (with `ASAN_OPTIONS` set to report and exit on the
+    /// first error, unless the environment sets it), waits until it serves the
+    /// `--session-transport` port, and after each session checks whether it
+    /// exited: a session that crashes it, again on a restart, is a finding,
+    /// from the sanitizer report in its stderr when there is one. The service
+    /// is started again and the campaign goes on. A service that does not
+    /// start is exit 2, with its stderr.
+    #[arg(long = "session-server-cmd", value_name = "COMMAND")]
+    pub session_server_cmd: Option<String>,
+
     /// How long the session lane waits for a reply before the target is taken
     /// to have ended the session (default 5s over TCP, 1s over UDP).
     #[arg(long = "session-reply-timeout", value_parser = parse_duration, value_name = "DURATION")]
@@ -2102,6 +2113,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
         session_reply_timeout: None,
+        session_server_cmd: None,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
@@ -2349,6 +2361,7 @@ fn afl_programmatic_args(
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
         session_reply_timeout: None,
+        session_server_cmd: None,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
@@ -2418,6 +2431,7 @@ pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
             "--session-reply-timeout",
             args.session_reply_timeout.is_some(),
         ),
+        ("--session-server-cmd", args.session_server_cmd.is_some()),
     ];
     given
         .into_iter()
@@ -16992,6 +17006,7 @@ exit 0
             session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
             max_session_messages: 64,
             session_reply_timeout: None,
+            session_server_cmd: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             extension: None,

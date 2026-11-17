@@ -720,6 +720,7 @@ fn plan_to_fuzz_args(
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
         session_reply_timeout: None,
+        session_server_cmd: None,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         // A project-level `[[extension]]`, when declared, is materialized and
