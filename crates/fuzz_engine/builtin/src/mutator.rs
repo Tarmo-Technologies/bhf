@@ -2,11 +2,9 @@
 
 use std::{fmt, ops::Range};
 
-use type_model::TargetAbi;
-
 use crate::dictionary::Dictionary;
 use crate::rng::MutationRng;
-use crate::typed::{typed_candidates_for_abi, TypedSpan};
+use crate::typed::{decoded_arg_candidates, TypedSpan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationKind {
@@ -455,11 +453,6 @@ impl<'a> MutationInput<'a> {
 #[derive(Debug)]
 pub struct MutatorSuite {
     config: MutatorConfig,
-    /// Byte order + pointer width the typed-input generator serializes multi-byte
-    /// scalar anchors in. Defaults to the host ABI, so an unconfigured suite is
-    /// byte-for-byte the historical behavior; set a foreign target's ABI with
-    /// [`MutatorSuite::with_abi`] to fuzz a big-endian target faithfully.
-    abi: TargetAbi,
     /// The inputs this suite produced last, so it does not hand the loop one
     /// it just ran (#219).
     recent: std::sync::Mutex<RecentOutputs>,
@@ -470,7 +463,6 @@ impl Clone for MutatorSuite {
     fn clone(&self) -> Self {
         Self {
             config: self.config,
-            abi: self.abi,
             recent: std::sync::Mutex::new(RecentOutputs::default()),
         }
     }
@@ -534,16 +526,8 @@ impl MutatorSuite {
     pub fn new(config: MutatorConfig) -> Self {
         Self {
             config,
-            abi: TargetAbi::host(),
             recent: std::sync::Mutex::new(RecentOutputs::default()),
         }
-    }
-
-    /// Select the target ABI whose byte order typed inputs are generated in.
-    /// The host ABI (the default) leaves generation identical to before.
-    pub fn with_abi(mut self, abi: TargetAbi) -> Self {
-        self.abi = abi;
-        self
     }
 
     pub fn mutate(
@@ -1756,7 +1740,7 @@ impl MutatorSuite {
 
                 let current = &bytes[span.range.clone()];
                 let candidates: Vec<Vec<u8>> =
-                    typed_candidates_for_abi(span.kind, dictionary, self.abi)
+                    decoded_arg_candidates(span.kind, current.len(), dictionary)
                         .into_iter()
                         .filter(|candidate| candidate.as_slice() != current)
                         .filter(|candidate| {
@@ -3903,35 +3887,31 @@ mod tests {
         assert!(matches!(result.bytes[1], 0 | 1));
     }
 
+    /// #299: bhf's decoder reads every scalar little-endian on every target,
+    /// so a span of a big-endian target's decoded argument still gets
+    /// little-endian candidates, at the span's width. The suite has no byte
+    /// order to set: none of its callers could disagree with the decoder.
     #[test]
-    fn suite_generates_typed_candidates_in_the_configured_target_byte_order() {
-        // The suite threads its ABI into typed candidate generation: a big-endian
-        // target's 32-bit anchors arrive in big-endian byte order, while the
-        // default (host) suite keeps little-endian order. Exercised through the
-        // real span-candidate path, not the free function.
+    fn cross_target_typed_candidates_match_decoder_byte_order() {
+        let be = type_model::TargetAbi::from_triple("powerpc64-linux-gnu").expect("ppc64 abi");
+        assert!(be.is_big_endian());
         let dictionary = Dictionary::default();
-        let bytes = [0u8; 4];
-        let spans = [TypedSpan::new(0..4, TypedValueKind::SignedInteger)];
-
-        let flatten = |suite: &MutatorSuite| -> Vec<Vec<u8>> {
-            suite
-                .typed_span_candidates(&bytes, &dictionary, &spans)
-                .into_iter()
-                .flat_map(|(_, candidates)| candidates)
-                .collect()
-        };
-
-        let be = TargetAbi::from_triple("powerpc64-linux-gnu").expect("ppc64 abi");
-        let be_candidates = flatten(&suite().with_abi(be));
-        // 1 is 00 00 00 01 big-endian, MIN is 80 00 00 00.
-        assert!(be_candidates.contains(&1_i32.to_be_bytes().to_vec()));
-        assert!(be_candidates.contains(&i32::MIN.to_be_bytes().to_vec()));
-        // The little-endian spelling of 1 (01 00 00 00) must NOT appear under BE.
-        assert!(!be_candidates.contains(&1_i32.to_le_bytes().to_vec()));
-
-        // The default (host) suite keeps little-endian order.
-        let host_candidates = flatten(&suite());
-        assert!(host_candidates.contains(&1_i32.to_le_bytes().to_vec()));
+        let bytes = [9u8; 12];
+        let spans = [
+            TypedSpan::new(0..4, TypedValueKind::SignedInteger),
+            TypedSpan::new(4..12, TypedValueKind::SignedInteger),
+        ];
+        let candidates = suite().typed_span_candidates(&bytes, &dictionary, &spans);
+        let of = |index: usize| candidates[index].1.clone();
+        assert_eq!(
+            of(0),
+            [0_i32, 1, -1, i32::MIN, i32::MAX].map(|v| v.to_le_bytes().to_vec())
+        );
+        assert!(!of(0).contains(&1_i32.to_be_bytes().to_vec()));
+        assert_eq!(
+            of(1),
+            [0_i64, 1, -1, i64::MIN, i64::MAX].map(|v| v.to_le_bytes().to_vec())
+        );
     }
 
     #[test]

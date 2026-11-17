@@ -24,6 +24,7 @@ use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
 mod shared_map;
+pub(crate) mod typed_spans;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
 
@@ -3974,6 +3975,9 @@ struct PoolEntry {
     /// at the offset they were compared instead of every occurrence of a common
     /// byte. `None` until captured; mutation draws from it when present.
     colored: Option<Vec<u8>>,
+    /// The spans of the mutation base's decoded scalar arguments (#299),
+    /// from the harness's `arg-layout.json`; `None` until first selected.
+    typed_spans: Option<Vec<fuzz_engine_builtin::TypedSpan>>,
     /// A fresh-process re-run showed this input crashes (#416): it is a
     /// finding, so it is neither mutated from nor saved in the queue. Kept in
     /// place so every other entry keeps its pool index.
@@ -4147,6 +4151,7 @@ impl PoolEntry {
             selections: 0,
             cmplog: None,
             colored: None,
+            typed_spans: None,
             retired: false,
         }
     }
@@ -4495,6 +4500,13 @@ fn run_builtin_with_progress(
         .harness_path
         .parent()
         .and_then(SequenceGeometry::load);
+    // #299: the harness's argument layout, for typed mutation of the
+    // arguments it decodes.
+    let arg_layout = typed_spans::find_arg_layout(
+        &prepared.work_dir,
+        &prepared.harness_id,
+        Some(&prepared.harness_path),
+    );
     let mut portfolio_feedback = sequence_geometry
         .filter(|geometry| geometry.portfolio_lanes > 1)
         .map(|geometry| {
@@ -5063,6 +5075,14 @@ fn run_builtin_with_progress(
                     }
                 }
             }
+            if let (Some(layout), Some(entry)) = (arg_layout.as_ref(), pool.get_mut(base_index)) {
+                if entry.typed_spans.is_none() {
+                    entry.typed_spans = Some(typed_spans::arg_layout_typed_spans(
+                        layout,
+                        entry.mutation_base(),
+                    ));
+                }
+            }
             let (bytes, made_from) = mutate_from_pool(
                 &pool,
                 base_index,
@@ -5560,6 +5580,7 @@ fn run_builtin_with_progress(
                 selections: 0,
                 cmplog: None,
                 colored: None,
+                typed_spans: None,
                 retired: false,
             });
         }
@@ -8208,6 +8229,12 @@ fn mutate_from_pool(
         .unwrap_or(&[]);
     let peer = &full_peer[..full_peer.len().min(config.max_len)];
     let mut mutation_input = MutationInput::new(base, dictionary).with_peer(peer);
+    if let Some(spans) = pool
+        .get(base_index)
+        .and_then(|entry| entry.typed_spans.as_deref())
+    {
+        mutation_input = mutation_input.with_typed_spans(spans);
+    }
     let cmplog = pool
         .get(base_index)
         .and_then(|entry| entry.cmplog.as_ref())
@@ -12192,6 +12219,69 @@ mod entropic_tests {
         assert!(broad_lane.scheduling_energy() > narrow_lane.scheduling_energy() * 100);
         assert!(broad_lane.made_progress());
         assert!(!CoverageNovelty::default().made_progress());
+    }
+}
+
+#[cfg(test)]
+mod typed_span_tests {
+    use super::{mutate_from_pool, typed_spans, PoolEntry};
+    use fuzz_engine_builtin::{Dictionary, MutationRng, MutatorConfig};
+
+    /// The 32-bit boundary values the first argument of `outputs` took,
+    /// little-endian at offset 0, with the rest of the base kept.
+    fn int32_boundaries_at_the_span(outputs: &[Vec<u8>], base: &[u8]) -> Vec<i32> {
+        let mut seen: Vec<i32> = [0, 1, -1, i32::MIN, i32::MAX]
+            .into_iter()
+            .filter(|value| {
+                outputs.iter().any(|out| {
+                    out.len() == base.len()
+                        && out[..4] == value.to_le_bytes()
+                        && out[4..] == base[4..]
+                })
+            })
+            .collect();
+        seen.sort_unstable();
+        seen
+    }
+
+    fn mutate(entry: &PoolEntry) -> Vec<Vec<u8>> {
+        let pool = [PoolEntry {
+            typed_spans: entry.typed_spans.clone(),
+            ..PoolEntry::seed(entry.bytes.clone())
+        }];
+        let dictionary = Dictionary::default();
+        let config = MutatorConfig {
+            max_len: 64,
+            ..MutatorConfig::default()
+        };
+        let mut rng = MutationRng::new(299);
+        (0..4000)
+            .map(|_| mutate_from_pool(&pool, 0, &dictionary, None, None, config, None, &mut rng).0)
+            .collect()
+    }
+
+    /// #299: the loop hands the mutator the spans the harness's
+    /// `arg-layout.json` gives the base's decoded arguments, so the typed
+    /// mutation writes an `int32_t` argument's boundary values into its
+    /// bytes, little-endian, keeping the rest. Without the spans the same
+    /// seeded run does not.
+    #[test]
+    fn fuzz_loop_passes_typed_spans_from_arg_layout() {
+        let base = vec![9u8; 13];
+        let layout = typed_spans::tests::packet_layout();
+        let mut entry = PoolEntry::seed(base.clone());
+        entry.typed_spans = Some(typed_spans::arg_layout_typed_spans(&layout, &base));
+        assert_eq!(entry.typed_spans.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            int32_boundaries_at_the_span(&mutate(&entry), &base),
+            [i32::MIN, -1, 0, 1, i32::MAX]
+        );
+
+        entry.typed_spans = None;
+        assert_ne!(
+            int32_boundaries_at_the_span(&mutate(&entry), &base),
+            [i32::MIN, -1, 0, 1, i32::MAX]
+        );
     }
 }
 

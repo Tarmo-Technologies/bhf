@@ -39,7 +39,54 @@ pub fn typed_candidates(kind: TypedValueKind, dictionary: &Dictionary) -> Vec<Ve
     typed_candidates_for_abi(kind, dictionary, TargetAbi::host())
 }
 
-/// Typed byte-range replacement candidates emitted in a TARGET's byte order.
+/// Typed candidates for a span bhf's argument decoder reads (#299). The
+/// decoder (`bhf_decode.h`) reads every scalar little-endian on every target,
+/// big-endian ones included, so an integer's boundary values are written
+/// little-endian, at the span's own width: a replacement never moves the
+/// fields decoded after it. A 64-bit float span takes the float anchors, and
+/// bytes and string spans the dictionary, as in [`typed_candidates`].
+pub fn decoded_arg_candidates(
+    kind: TypedValueKind,
+    width: usize,
+    dictionary: &Dictionary,
+) -> Vec<Vec<u8>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let sized = |value: u64| -> Vec<u8> {
+        let mut bytes = value.to_le_bytes().to_vec();
+        bytes.resize(width, if (value as i64) < 0 { 0xff } else { 0 });
+        bytes
+    };
+    let bits = (width * 8).min(64) as u32;
+    let high_bit = 1u64.checked_shl(bits - 1).unwrap_or(0);
+    match kind {
+        TypedValueKind::Boolean => vec![sized(0), sized(1)],
+        TypedValueKind::SignedInteger => {
+            // 0, 1, -1, the most negative and the most positive value.
+            vec![sized(0), sized(1), sized(u64::MAX), sized(high_bit), {
+                let mut max = sized(u64::MAX);
+                if let Some(top) = max.get_mut(width.min(8) - 1) {
+                    *top = 0x7f;
+                }
+                max
+            }]
+        }
+        TypedValueKind::UnsignedInteger => {
+            vec![sized(0), sized(1), sized(u64::MAX), sized(high_bit)]
+        }
+        TypedValueKind::Float64 if width == 8 => {
+            typed_candidates_for_abi(kind, dictionary, TargetAbi::host())
+        }
+        TypedValueKind::Float64 => Vec::new(),
+        TypedValueKind::Bytes | TypedValueKind::String => typed_candidates(kind, dictionary),
+    }
+}
+
+/// Typed byte-range replacement candidates emitted in a TARGET's byte order,
+/// for a raw struct image the target reads in its own byte order. An argument
+/// bhf's decoder reads is little-endian on every target: those spans take
+/// [`decoded_arg_candidates`].
 ///
 /// Multi-byte scalar anchors (signed/unsigned 32-bit integers and 64-bit floats)
 /// are serialized in `abi`'s endianness, so a big-endian target's `0x00000001`
@@ -124,6 +171,49 @@ mod tests {
         assert!(span.valid_for(4));
         assert!(!span.valid_for(3));
         assert!(!TypedSpan::new(2..2, TypedValueKind::Bytes).valid_for(4));
+    }
+
+    /// A decoded argument's candidates are its width's boundary values,
+    /// little-endian whatever the target, and never change its length.
+    #[test]
+    fn decoded_arg_candidates_are_little_endian_at_the_span_width() {
+        let dict = Dictionary::default();
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::SignedInteger, 4, &dict),
+            [0_i32, 1, -1, i32::MIN, i32::MAX].map(|v| v.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::SignedInteger, 8, &dict),
+            [0_i64, 1, -1, i64::MIN, i64::MAX].map(|v| v.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::SignedInteger, 2, &dict),
+            [0_i16, 1, -1, i16::MIN, i16::MAX].map(|v| v.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::UnsignedInteger, 1, &dict),
+            [vec![0], vec![1], vec![0xff], vec![0x80]]
+        );
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::UnsignedInteger, 4, &dict),
+            [0_u32, 1, u32::MAX, 1 << 31].map(|v| v.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            decoded_arg_candidates(TypedValueKind::Boolean, 1, &dict),
+            [vec![0], vec![1]]
+        );
+        for width in 1..=8 {
+            for kind in [
+                TypedValueKind::SignedInteger,
+                TypedValueKind::UnsignedInteger,
+            ] {
+                assert!(decoded_arg_candidates(kind, width, &dict)
+                    .iter()
+                    .all(|candidate| candidate.len() == width));
+            }
+        }
+        assert!(decoded_arg_candidates(TypedValueKind::Float64, 4, &dict).is_empty());
+        assert!(decoded_arg_candidates(TypedValueKind::SignedInteger, 0, &dict).is_empty());
     }
 
     #[test]

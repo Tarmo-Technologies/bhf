@@ -52,6 +52,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The built-in mutator's typed mutation reaches a harness's decoded
+  arguments (#299). The fuzz loop and the transport loop take each decoded
+  scalar argument's span from the harness's `arg-layout.json` and pass it to
+  the mutator, which writes the type's boundary values (0, 1, -1, the
+  extremes) into it, little-endian as `bhf_decode.h` reads it on every
+  target, at the argument's width. No production caller passed spans, so
+  typed candidates never applied; they were 4 bytes whatever the span. The
+  mutator's unused target byte-order setting, which would have disagreed
+  with the decoder on a big-endian target, is gone.
 - One unbounded recursion is one finding. A stack overflow's cluster key is
   the functions of the recursion, not the frame that ran out of stack: that
   was whichever of a comparison hook, a coverage callback, the recursive
