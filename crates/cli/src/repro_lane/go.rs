@@ -83,10 +83,13 @@ impl Lane for GoLane {
         let dir = &harness.harness_dir;
         let go_mod = std::fs::read_to_string(dir.join("go.mod"))?;
         // A package outside every module was copied into the harness dir
-        // (`bhf_target/`), which ships with the harness.
+        // (`bhf_target/`), which ships with the harness. Compared resolved: on
+        // Windows the go.mod and the harness dir can spell one dir apart (a
+        // `\\?\` prefix, the drive letter's case).
+        let harness_root = crate::workdir::plain_canonical(dir);
         let (copied, replaced): (Vec<PathBuf>, Vec<PathBuf>) = replaced_dirs(&go_mod)
             .into_iter()
-            .partition(|module| module.starts_with(dir));
+            .partition(|module| crate::workdir::plain_canonical(module).starts_with(&harness_root));
         let tree = super::recorded_source_root(&harness.work_dir)
             .filter(|root| replaced.iter().all(|module| module.starts_with(root)))
             .or_else(|| replaced.first().cloned())
@@ -115,12 +118,17 @@ impl Lane for GoLane {
             })
             .collect();
         for module in &copied {
+            let Ok(relative) = crate::workdir::plain_canonical(module)
+                .strip_prefix(&harness_root)
+                .map(Path::to_path_buf)
+            else {
+                continue;
+            };
             harness_files.extend(
                 std::fs::read_dir(module)?
                     .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_file())
-                    .filter_map(|path| path.strip_prefix(dir).ok().map(Path::to_path_buf)),
+                    .filter(|entry| entry.path().is_file())
+                    .map(|entry| relative.join(entry.file_name())),
             );
         }
         harness_files.sort();
