@@ -2759,6 +2759,13 @@
   when bhf panics.
 
 ### Added
+- The session lane has a UDP backend (#258): `--session-transport
+  udp:HOST:PORT` sends each message as one datagram, framed as the profile
+  says, from a socket of its own per session, and waits for one reply
+  datagram. `--session-reply-timeout` sets how long a reply may take, over
+  TCP (5s by default) or UDP (1s); a UDP reply that does not come, or a
+  datagram the host refuses, ends the session as a dropped TCP connection
+  does. The lane accepted only `tcp:HOST:PORT`.
 - The Java lane fuzzes a target that takes a JDK collection (#236):
   `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
   nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The

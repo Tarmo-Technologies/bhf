@@ -169,6 +169,37 @@ fn start_toy_service() -> u16 {
     port
 }
 
+/// The toy service over UDP: each datagram is one request, unframed, and the
+/// reply is one datagram. A client address (its source port) is a session,
+/// so a new socket starts with no handle.
+fn start_udp_toy_service() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp toy service");
+    let port = socket.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut sessions: std::collections::HashMap<std::net::SocketAddr, (Option<u32>, bool)> =
+            std::collections::HashMap::new();
+        let mut buf = [0u8; 65_536];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf) {
+            let (handle, tainted) = sessions.entry(peer).or_default();
+            let reply = handle_frame(&buf[..n], handle, tainted);
+            let _ = socket.send_to(&reply, peer);
+        }
+    });
+    port
+}
+
+/// The toy profile with no `[framing]`: raw, so each message is its datagram.
+fn raw_toy_profile(dir: &Path) -> PathBuf {
+    let framing = "[framing]\nkind = \"length_prefix\"\nwidth = 2\nendian = \"big\"\n";
+    assert!(
+        TOY_PROFILE.contains(framing),
+        "the toy profile's framing table"
+    );
+    let path = dir.join("toy-open-write-raw.toml");
+    std::fs::write(&path, TOY_PROFILE.replace(framing, "")).unwrap();
+    path
+}
+
 /// The toy service, except that the WRITE through an escaped path, which the
 /// toy service answers with the boundary status, kills the session instead:
 /// the connection closes with no reply, as a service that crashes on the
@@ -296,6 +327,51 @@ fn session_campaign_over_tcp_reaches_boundary_and_records_evidence() {
 
     // The finding carries a stamped finding.json so it indexes into results/.
     assert!(finding_dir.join("finding.json").is_file());
+
+    std::fs::remove_dir_all(&work_dir).ok();
+}
+
+/// #258: the same campaign over UDP. A WRITE is answered only in the
+/// `opened` state, through the handle its session's OPEN captured, so the
+/// finding proves the campaign reached the second state over datagrams.
+#[test]
+fn session_campaign_over_udp_reaches_the_second_state_and_the_oracle_fires() {
+    let port = start_udp_toy_service();
+    let work_dir = temp_dir("udp-campaign");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let profile = raw_toy_profile(&work_dir);
+
+    let exit = cli::run_from(vec![
+        "bhf".to_owned(),
+        "fuzz".to_owned(),
+        work_dir.to_str().unwrap().to_owned(),
+        "--harness".to_owned(),
+        "H-session-udp".to_owned(),
+        "--protocol-profile".to_owned(),
+        profile.to_str().unwrap().to_owned(),
+        "--session-transport".to_owned(),
+        format!("udp:127.0.0.1:{port}"),
+        "--session-reply-timeout".to_owned(),
+        "2s".to_owned(),
+        "--iterations".to_owned(),
+        "1500".to_owned(),
+    ]);
+    assert_eq!(exit, 0, "session fuzz run over udp should succeed");
+
+    let finding_dir =
+        find_session_finding(&work_dir).expect("the campaign emitted a session finding");
+    let testcase = read_session(&finding_dir);
+    assert!(
+        testcase.state_path.iter().any(|state| state == "opened"),
+        "the session reached the second state: {:?}",
+        testcase.state_path
+    );
+    assert!(testcase.bindings.contains("OPEN.response.handle"));
+    let finding = std::fs::read_to_string(finding_dir.join("finding.json")).unwrap();
+    assert!(finding.contains("HDF7-PATHTRAV"), "{finding}");
+    let meta = std::fs::read_to_string(finding_dir.join("session_meta.json")).unwrap();
+    assert!(meta.contains("\"udp:127.0.0.1:"), "{meta}");
+    assert!(meta.contains("\"reply_timeout_ms\": 2000"), "{meta}");
 
     std::fs::remove_dir_all(&work_dir).ok();
 }

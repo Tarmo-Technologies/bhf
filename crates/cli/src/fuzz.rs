@@ -557,9 +557,16 @@ pub struct FuzzArgs {
     pub protocol_profile: Option<PathBuf>,
 
     /// Request/response backend for the session lane. `tcp:HOST:PORT` connects a
-    /// socket per session. Required when `--protocol-profile` is set.
+    /// socket per session; `udp:HOST:PORT` sends each message as a datagram from
+    /// a socket of its own per session and waits for one reply datagram.
+    /// Required when `--protocol-profile` is set.
     #[arg(long = "session-transport", value_name = "SPEC")]
     pub session_transport: Option<String>,
+
+    /// How long the session lane waits for a reply before the target is taken
+    /// to have ended the session (default 5s over TCP, 1s over UDP).
+    #[arg(long = "session-reply-timeout", value_parser = parse_duration, value_name = "DURATION")]
+    pub session_reply_timeout: Option<Duration>,
 
     /// How a session is reset between testcases: `reconnect` (default; a fresh
     /// connection gives fresh per-session target state, so a new handle / id /
@@ -2094,6 +2101,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
+        session_reply_timeout: None,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
@@ -2340,6 +2348,7 @@ fn afl_programmatic_args(
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
+        session_reply_timeout: None,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
@@ -2405,6 +2414,10 @@ pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
             args.session_reset != crate::session_fuzz::SessionResetMode::default(),
         ),
         ("--max-session-messages", args.max_session_messages != 64),
+        (
+            "--session-reply-timeout",
+            args.session_reply_timeout.is_some(),
+        ),
     ];
     given
         .into_iter()
@@ -16978,6 +16991,7 @@ exit 0
             session_transport: None,
             session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
             max_session_messages: 64,
+            session_reply_timeout: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             extension: None,

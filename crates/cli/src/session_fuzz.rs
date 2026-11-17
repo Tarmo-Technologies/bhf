@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,9 @@ const SESSION_META: &str = "session_meta.json";
 const MAX_REPLY_BYTES: usize = 1 << 20;
 /// Per-request socket read/write timeout, so a silent peer cannot hang a run.
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a UDP request waits for its reply datagram. A datagram the target
+/// drops is not answered at all, so the deadline is shorter than TCP's.
+const UDP_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Cap on the state-novelty contribution folded into the shared scheduler's
 /// breadcrumb channel, so protocol novelty can never dominate code coverage.
 const STATE_NOVELTY_CAP: usize = 8;
@@ -153,15 +156,18 @@ pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
 pub(crate) enum SessionTransportPlan {
     /// A TCP request/response backend: one socket connected per session.
     Tcp { host: String, port: u16 },
+    /// A UDP backend: one datagram per message, one reply datagram awaited
+    /// within the reply deadline, and a socket of its own per session.
+    Udp { host: String, port: u16 },
 }
 
 /// A descriptive failure parsing a `--session-transport` spec. Never a silent
 /// `None`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionSpecError {
-    #[error("empty --session-transport spec; expected tcp:HOST:PORT")]
+    #[error("empty --session-transport spec; expected tcp:HOST:PORT or udp:HOST:PORT")]
     Empty,
-    #[error("unknown --session-transport backend {backend:?}; supported: tcp")]
+    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp")]
     UnknownBackend { backend: String },
     #[error("malformed {backend} spec {spec:?}: {reason}")]
     Malformed {
@@ -182,6 +188,10 @@ impl SessionTransportPlan {
             let (host, port) = parse_host_port("tcp", spec, rest)?;
             return Ok(Self::Tcp { host, port });
         }
+        if let Some(rest) = spec.strip_prefix("udp:") {
+            let (host, port) = parse_host_port("udp", spec, rest)?;
+            return Ok(Self::Udp { host, port });
+        }
         Err(SessionSpecError::UnknownBackend {
             backend: spec.split(':').next().unwrap_or(spec).to_owned(),
         })
@@ -191,6 +201,7 @@ impl SessionTransportPlan {
     fn label(&self) -> String {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
+            Self::Udp { host, port } => format!("udp:{host}:{port}"),
         }
     }
 
@@ -198,14 +209,35 @@ impl SessionTransportPlan {
     fn kind(&self) -> &'static str {
         match self {
             Self::Tcp { .. } => "tcp",
+            Self::Udp { .. } => "udp",
         }
     }
 
     /// Build the live transport this plan describes. The socket is dialed lazily
     /// on the first [`SessionTransport::reset`], so this itself touches nothing.
-    fn into_transport(self, reset: SessionResetMode, framing: Framing) -> TcpSessionTransport {
+    /// `reply_timeout` overrides the backend's deadline for a reply
+    /// ([`SESSION_IO_TIMEOUT`] over TCP, [`UDP_REPLY_TIMEOUT`] over UDP).
+    fn into_transport(
+        self,
+        reset: SessionResetMode,
+        framing: Framing,
+        reply_timeout: Option<Duration>,
+    ) -> LiveTransport {
         match self {
-            Self::Tcp { host, port } => TcpSessionTransport::new(host, port, reset, framing),
+            Self::Tcp { host, port } => LiveTransport::Tcp(TcpSessionTransport::new(
+                host,
+                port,
+                reset,
+                framing,
+                reply_timeout.unwrap_or(SESSION_IO_TIMEOUT),
+            )),
+            Self::Udp { host, port } => LiveTransport::Udp(UdpSessionTransport::new(
+                host,
+                port,
+                reset,
+                framing,
+                reply_timeout.unwrap_or(UDP_REPLY_TIMEOUT),
+            )),
         }
     }
 }
@@ -250,18 +282,27 @@ pub(crate) struct TcpSessionTransport {
     port: u16,
     reset: SessionResetMode,
     framing: Framing,
+    /// How long a reply may take to start, and a write to finish.
+    io_timeout: Duration,
     stream: Option<TcpStream>,
     /// Bytes read past the end of the last reply.
     pending: Vec<u8>,
 }
 
 impl TcpSessionTransport {
-    fn new(host: String, port: u16, reset: SessionResetMode, framing: Framing) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        reset: SessionResetMode,
+        framing: Framing,
+        io_timeout: Duration,
+    ) -> Self {
         Self {
             host,
             port,
             reset,
             framing,
+            io_timeout,
             stream: None,
             pending: Vec::new(),
         }
@@ -273,8 +314,8 @@ impl TcpSessionTransport {
         let stream = TcpStream::connect((self.host.as_str(), self.port)).map_err(|e| {
             TransportError::new(format!("connect {}:{}: {e}", self.host, self.port))
         })?;
-        stream.set_read_timeout(Some(SESSION_IO_TIMEOUT)).ok();
-        stream.set_write_timeout(Some(SESSION_IO_TIMEOUT)).ok();
+        stream.set_read_timeout(Some(self.io_timeout)).ok();
+        stream.set_write_timeout(Some(self.io_timeout)).ok();
         // Disable Nagle: a request/response session sends one small frame then
         // blocks on the reply, so Nagle + delayed-ACK would add a ~40ms stall per
         // round-trip. We frame explicitly, so coalescing buys nothing.
@@ -308,7 +349,7 @@ impl TcpSessionTransport {
             let wait = if quiet_completes {
                 idle
             } else {
-                Some(SESSION_IO_TIMEOUT)
+                Some(self.io_timeout)
             };
             stream.set_read_timeout(wait).ok();
             match stream.read(&mut chunk) {
@@ -337,7 +378,7 @@ impl TcpSessionTransport {
 }
 
 /// The target ended the session (a closed or reset connection, or one that
-/// stopped answering within [`SESSION_IO_TIMEOUT`]): drop the stream, so the
+/// stopped answering within the reply deadline): drop the stream, so the
 /// next reset connects again whatever the reset mode.
 fn lost(stream: &mut Option<TcpStream>, message: String) -> TransportError {
     *stream = None;
@@ -368,6 +409,152 @@ impl SessionTransport for TcpSessionTransport {
             self.connect()?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live UDP backend
+// ---------------------------------------------------------------------------
+
+/// A UDP [`SessionTransport`]: each request is one datagram, framed as the
+/// profile says, and its reply is the next datagram that comes back within
+/// the reply deadline. A reset opens a new socket, so the target sees a new
+/// source port and keeps no state for it. A reply that does not arrive, or a
+/// datagram the target's host refuses (port unreachable), ends the session.
+pub(crate) struct UdpSessionTransport {
+    host: String,
+    port: u16,
+    reset: SessionResetMode,
+    framing: Framing,
+    reply_timeout: Duration,
+    socket: Option<UdpSocket>,
+}
+
+impl UdpSessionTransport {
+    fn new(
+        host: String,
+        port: u16,
+        reset: SessionResetMode,
+        framing: Framing,
+        reply_timeout: Duration,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            reset,
+            framing,
+            reply_timeout,
+            socket: None,
+        }
+    }
+
+    fn open(&mut self) -> Result<(), TransportError> {
+        self.socket = None;
+        let target = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|e| TransportError::new(format!("resolve {}:{}: {e}", self.host, self.port)))?
+            .next()
+            .ok_or_else(|| {
+                TransportError::new(format!(
+                    "{}:{} resolves to no address",
+                    self.host, self.port
+                ))
+            })?;
+        let local: SocketAddr = if target.is_ipv4() {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = UdpSocket::bind(local)
+            .and_then(|socket| socket.connect(target).map(|()| socket))
+            .map_err(|e| TransportError::new(format!("open udp socket to {target}: {e}")))?;
+        socket.set_read_timeout(Some(self.reply_timeout)).ok();
+        socket.set_write_timeout(Some(self.reply_timeout)).ok();
+        self.socket = Some(socket);
+        Ok(())
+    }
+
+    fn lost(&mut self, message: String) -> TransportError {
+        self.socket = None;
+        TransportError::session_lost(message)
+    }
+}
+
+impl SessionTransport for UdpSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let datagram = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| TransportError::new("udp session is not open; reset first"))?;
+        if let Err(e) = socket.send(&datagram) {
+            return Err(self.lost(format!("session send: {e}")));
+        }
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let socket = self
+                .socket
+                .as_ref()
+                .ok_or_else(|| TransportError::new("udp session is not open; reset first"))?;
+            match socket.recv(&mut buf) {
+                Ok(n) => {
+                    return match self.framing.datagram_reply(&buf[..n], MAX_REPLY_BYTES) {
+                        ReplyProgress::Complete { reply, .. } => Ok(reply),
+                        ReplyProgress::Invalid(reason) => {
+                            Err(TransportError::new(format!("session reply: {reason}")))
+                        }
+                        ReplyProgress::NeedMore => Err(TransportError::new(
+                            "session reply: the datagram holds part of a reply",
+                        )),
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(self.lost(format!(
+                        "no reply datagram within {} ms",
+                        self.reply_timeout.as_millis()
+                    )))
+                }
+                Err(e) => return Err(self.lost(format!("session receive: {e}"))),
+            }
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.socket.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.open()?;
+        }
+        Ok(())
+    }
+}
+
+/// A live backend, as `--session-transport` names it.
+pub(crate) enum LiveTransport {
+    Tcp(TcpSessionTransport),
+    Udp(UdpSessionTransport),
+}
+
+impl SessionTransport for LiveTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        match self {
+            LiveTransport::Tcp(transport) => transport.send_request(request),
+            LiveTransport::Udp(transport) => transport.send_request(request),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        match self {
+            LiveTransport::Tcp(transport) => transport.reset(),
+            LiveTransport::Udp(transport) => transport.reset(),
+        }
     }
 }
 
@@ -464,6 +651,8 @@ pub(crate) struct SessionFuzzConfig {
     pub transport_kind: String,
     /// How a session is reset between testcases.
     pub reset: SessionResetMode,
+    /// `--session-reply-timeout`, recorded so a replay waits as long.
+    pub reply_timeout: Option<Duration>,
     /// Bounded cap on messages per session.
     pub max_messages: usize,
     /// The valid seed session(s) the campaign mutates.
@@ -553,6 +742,9 @@ struct SessionArtifactMeta {
     reset_fidelity: String,
     rule_id: Option<String>,
     oracle: String,
+    /// `--session-reply-timeout`, when the run gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_timeout_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +1174,9 @@ fn emit_session_finding(
         reset_fidelity: config.reset_fidelity(),
         rule_id: rule_id.map(str::to_owned),
         oracle: oracle.to_owned(),
+        reply_timeout_ms: config
+            .reply_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
     };
     let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(SessionFuzzError::Serialize)?;
     write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)?;
@@ -1043,10 +1238,14 @@ fn load_session_finding(
 fn build_live_transport(
     meta: &SessionArtifactMeta,
     model: &ProtocolModel,
-) -> Result<TcpSessionTransport, String> {
+) -> Result<LiveTransport, String> {
     let plan = SessionTransportPlan::parse(&meta.transport).map_err(|e| e.to_string())?;
     let reset = SessionResetMode::parse(&meta.reset)?;
-    Ok(plan.into_transport(reset, model.framing().clone()))
+    Ok(plan.into_transport(
+        reset,
+        model.framing().clone(),
+        meta.reply_timeout_ms.map(Duration::from_millis),
+    ))
 }
 
 /// `bhf replay` of a session finding: re-drive the recorded session against a
@@ -1307,7 +1506,11 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     })?;
     let transport_label = plan.label();
     let transport_kind = plan.kind().to_owned();
-    let mut transport = plan.into_transport(args.session_reset, model.framing().clone());
+    let mut transport = plan.into_transport(
+        args.session_reset,
+        model.framing().clone(),
+        args.session_reply_timeout,
+    );
 
     let seeds = seed_sessions(&model);
     if seeds.is_empty() {
@@ -1326,6 +1529,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         transport_label,
         transport_kind,
         reset: args.session_reset,
+        reply_timeout: args.session_reply_timeout,
         max_messages: args.max_session_messages,
         seeds,
         iterations: args.effective_iterations(),
@@ -1466,6 +1670,7 @@ mod tests {
             transport_label: "scripted".to_owned(),
             transport_kind: "scripted".to_owned(),
             reset: SessionResetMode::Reconnect,
+            reply_timeout: None,
             max_messages: 64,
             seeds: seed_sessions(model),
             iterations,
@@ -1816,6 +2021,7 @@ equals = 226
             reset_fidelity: "scripted;reset=reconnect".to_owned(),
             rule_id: Some(rule_id.to_owned()),
             oracle: oracle.to_owned(),
+            reply_timeout_ms: None,
         }
     }
 
@@ -1995,6 +2201,7 @@ equals = 226
                 port,
                 SessionResetMode::None,
                 framing,
+                SESSION_IO_TIMEOUT,
             );
             transport.reset().unwrap();
             for _ in 0..2 {
@@ -2026,6 +2233,7 @@ equals = 226
             Framing::Raw {
                 reply_idle_ms: 5_000,
             },
+            SESSION_IO_TIMEOUT,
         );
         transport.reset().unwrap();
         let started = Instant::now();
@@ -2034,5 +2242,62 @@ equals = 226
             started.elapsed() < Duration::from_secs(4),
             "waited for the idle window"
         );
+    }
+
+    /// #258: a `udp:` spec, and a datagram per message: an echo peer answers,
+    /// a silent one misses the reply deadline and a closed port refuses, and
+    /// either ends the session.
+    #[test]
+    fn udp_sends_a_datagram_per_message_and_a_missing_reply_ends_the_session() {
+        assert_eq!(
+            SessionTransportPlan::parse("udp:127.0.0.1:9").unwrap(),
+            SessionTransportPlan::Udp {
+                host: "127.0.0.1".to_owned(),
+                port: 9
+            }
+        );
+        let udp = |port: u16, timeout_ms: u64| {
+            let mut transport = UdpSessionTransport::new(
+                "127.0.0.1".to_owned(),
+                port,
+                SessionResetMode::Reconnect,
+                Framing::default(),
+                Duration::from_millis(timeout_ms),
+            );
+            transport.reset().unwrap();
+            transport
+        };
+
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let mut reply = b"reply:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = echo.send_to(&reply, peer);
+            }
+        });
+        let mut transport = udp(echo_port, 2_000);
+        assert_eq!(transport.send_request(b"ping").unwrap(), b"reply:ping");
+        assert_eq!(transport.send_request(b"pong").unwrap(), b"reply:pong");
+
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let error = udp(silent.local_addr().unwrap().port(), 100)
+            .send_request(b"ping")
+            .unwrap_err();
+        assert!(error.session_lost, "{error}");
+        assert!(
+            error.message.contains("no reply datagram within 100 ms"),
+            "{error}"
+        );
+
+        let closed_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = udp(closed_port, 1_000).send_request(b"ping").unwrap_err();
+        assert!(error.session_lost, "{error}");
     }
 }
