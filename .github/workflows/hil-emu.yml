@@ -24,6 +24,8 @@ on:
       - "crates/cli/src/transport_*.rs"
       - "crates/cli/src/fuzz.rs"
       - "crates/cli/tests/transport_fuzz_qemu_cli.rs"
+      - "crates/cli/tests/transport_freertos_agent_cli.rs"
+      - "c_runtime/bhf_agent.*"
       - "scripts/hil-emu.sh"
       - ".github/workflows/hil-emu.yml"
   schedule:

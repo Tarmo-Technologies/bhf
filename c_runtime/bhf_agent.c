@@ -10,8 +10,10 @@
 #include <setjmp.h>
 #endif
 
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__clang__)
 #define BHF_AGENT_NOCOV __attribute__((no_sanitize("coverage")))
+#elif defined(__GNUC__) && __GNUC__ >= 12
+#define BHF_AGENT_NOCOV __attribute__((no_sanitize_coverage))
 #else
 #define BHF_AGENT_NOCOV
 #endif
@@ -185,5 +187,11 @@ BHF_AGENT_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32
 
 BHF_AGENT_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     if (*guard && bhf_running) bhf_agent_edge(*guard);
+}
+
+/* GCC's -fsanitize-coverage=trace-pc, which has no guards: the edge is the
+ * address the callback returns to, a block of the code under test. */
+BHF_AGENT_NOCOV void __sanitizer_cov_trace_pc(void) {
+    if (bhf_running) bhf_agent_edge((uint32_t)(uintptr_t)__builtin_return_address(0));
 }
 #endif

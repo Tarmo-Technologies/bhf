@@ -18,9 +18,10 @@
  * status: 0 ok, 1 crash, 2 timeout, 3 refused (the input is longer than the
  * agent's input buffer: it is read and dropped, not run). Fault kinds are
  * BHF_AGENT_FAULT_*. Edges are the SanitizerCoverage guards the input reached:
- * build the code under test with -fsanitize-coverage=trace-pc-guard and this
- * file provides the callbacks (define BHF_AGENT_NO_SANCOV to provide your own
- * and call bhf_agent_edge()).
+ * build the code under test with -fsanitize-coverage=trace-pc-guard (clang)
+ * or trace-pc (GCC, whose edges are block addresses) and this file provides
+ * the callbacks (define BHF_AGENT_NO_SANCOV to provide your own and call
+ * bhf_agent_edge()).
  *
  * A fault handler (a HardFault vector, a POSIX signal handler) calls
  * bhf_agent_fault(): the agent reports the fault for the input that was

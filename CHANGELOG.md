@@ -2812,6 +2812,14 @@
   when bhf panics.
 
 ### Added
+- The reference agent runs as a FreeRTOS task under `qemu-system-arm`
+  (#290). `crates/target_transport/tests/freertos/agent_task.c` serves the
+  agent protocol over UART0 of `mps2-an385`, which `-serial tcp:` makes a
+  socket. Its HardFault handler returns from the exception into a recovery
+  function that reports the fault from the task. `transport_freertos_agent_cli`
+  (opt in with `BHF_RTOS_CLI=1`) runs clean, fault and clean inputs in one
+  boot and replays the fault (`docs/validation/2026-11-18-freertos-agent.md`).
+  The agent lane had not been run against anything but mocks.
 - A reference target-side agent ships for `agent:tcp` and `agent:serial`
   (#289): `c_runtime/bhf_agent.{h,c}`, freestanding C99 with no heap. It
   serves the agent protocol over the board's read and write callbacks and

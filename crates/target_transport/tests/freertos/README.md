@@ -138,3 +138,12 @@ The two commands in [Validation status](#validation-status) run the transport
 and CLI tests. They require `arm-none-eabi-gcc`, `qemu-system-arm`, `qemu-img`,
 and `nm`. The kernel commit is pinned above; bring a local checkout with
 `BHF_RTOS_KERNEL` for disconnected validation.
+
+## The reference agent as a task (#290)
+
+`agent_task.c` runs the reference target-side agent (`c_runtime/bhf_agent.c`)
+as a FreeRTOS task serving the agent protocol over UART0. `agent_target.c` is
+its code under test. `make agent.elf KERNEL=<kernel>` builds the image, and
+`BHF_RTOS_CLI=1 cargo test -p bhf --test transport_freertos_agent_cli` drives
+it through `bhf fuzz --target-transport agent:tcp` under `qemu-system-arm`. See
+[the validation record](../../../../docs/validation/2026-11-18-freertos-agent.md).

@@ -288,8 +288,13 @@ cc -o agent agent_posix.o bhf_agent.o target.o
 bhf fuzz bhf_work --harness H-agent --target-transport agent:tcp:127.0.0.1:9000 --max-len 4096
 ```
 
-Set `--max-len` to the agent's input buffer. An agent that implements the
-protocol itself uses this frame format. Every integer is little-endian, one
+Set `--max-len` to the agent's input buffer. On a board the agent runs as a
+task over the UART. `crates/target_transport/tests/freertos/agent_task.c` is
+one, for FreeRTOS on `mps2-an385` under QEMU, and its `Makefile` builds it.
+Its HardFault handler returns from the exception into a function that reports
+the fault from the task. The run is recorded in
+[validation](../validation/2026-11-18-freertos-agent.md). An agent that
+implements the protocol itself uses this frame format. Every integer is little-endian, one
 round trip per input:
 
 | Direction | Field | Size | Meaning |

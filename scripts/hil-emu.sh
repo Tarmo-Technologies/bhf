@@ -116,6 +116,8 @@ BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_LIVE=1 cargo test --locked \
   -p target_transport --test live_rtos -- --nocapture
 BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_CLI=1 cargo test --locked \
   -p bhf --test transport_fuzz_qemu_cli cli_freertos_ -- --nocapture
+BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_CLI=1 cargo test --locked \
+  -p bhf --test transport_freertos_agent_cli -- --nocapture
 echo
 
 echo "== hil-emu: RV-1 through RV-4 executed the REAL live paths and passed =="
