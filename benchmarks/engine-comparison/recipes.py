@@ -112,7 +112,94 @@ def sqlite(checkout: Path, build: Path) -> Prepared:
     )
 
 
-RECIPES = {"cjson": cjson, "sqlite": sqlite}
+ZLIB_SOURCES = (
+    "adler32.c",
+    "compress.c",
+    "crc32.c",
+    "deflate.c",
+    "infback.c",
+    "inffast.c",
+    "inflate.c",
+    "inftrees.c",
+    "trees.c",
+    "uncompr.c",
+    "zutil.c",
+)
+ZLIB_PINS = {
+    "adler32.c": "9cd1443a24ff2a3053961695bd432035c58347386a420d3388232376ebabe211",
+    "compress.c": "41f1c7ad886012571cd481a2b1b6a83812e5125e90d995e298fde34d6c015614",
+    "crc32.c": "da37f3483e77c20f64c28cf55d62d7bed9d62af33eb401be906835d84539b9c9",
+    "deflate.c": "8244ed0d9b791d6da527eeca10cc920418ae6d440e0cdb4f9e1974188539496e",
+    "infback.c": "9f05ca3bfe4e27e9b08418fd02eeb48d63daefd7d2d90c80f7dca5e3b5c305d6",
+    "inffast.c": "f96787a11bb7131ffd2221fb40db27f6a5a1dfb12f59c0bc388807010749c34a",
+    "inflate.c": "90221ea7d762e7044057f6ad5013e969086c6ba3d3051716b7aa786d7a6362ec",
+    "inftrees.c": "64fc6aeea744510253a22f8b0611fcefa970458224a41a1649f5e0db340af8fe",
+    "trees.c": "a16217d5ea6d8342ff08afe5207b1dab620f05610e121dda55b4f9aae9de4f68",
+    "uncompr.c": "953f5381650838d507b01499790bd64524433ea6ea29ea9325bf542af10cfe7d",
+    "zutil.c": "04303a4d607958905f0c036aeca43d14218d01752e6c444fdbeb94983912ec38",
+    "zlib.h": "6f5162028729e94b221eb6586debe9548a007fd951cfea7a77f67e0323555545",
+    "zconf.h": "cb7c2c84211473b4699223edd363d3207b43b9578e739b5bf638f42204ea6e0f",
+}
+
+
+def zlib(checkout: Path, build: Path) -> Prepared:
+    """zlib's core translation units (no gz* file I/O); the checked-in
+    zconf.h is the one configure would leave for this host."""
+    verify(checkout, ZLIB_PINS, "zlib")
+    return Prepared(
+        sources=(ADAPTERS / "zlib.c", *(checkout / name for name in ZLIB_SOURCES)),
+        include_dirs=(checkout,),
+    )
+
+
+LIBYAML_SOURCES = (
+    "src/api.c",
+    "src/dumper.c",
+    "src/emitter.c",
+    "src/loader.c",
+    "src/parser.c",
+    "src/reader.c",
+    "src/scanner.c",
+    "src/writer.c",
+)
+LIBYAML_PINS = {
+    "src/api.c": "71f9263a2c77237762c8fa5e7c3d2bdd35723ecf1e2898222c7a603a5bf3f2db",
+    "src/dumper.c": "56fe41a1db73e1b9342b9381856e1fade8ea339a0b723bef90e7e1e8638bc441",
+    "src/emitter.c": "fbec4f702153929ad1421636ab0f5ecded140f0f37014d5ab3c65dfecd7e0743",
+    "src/loader.c": "68424f0b29e16434e7f2c0838b26dd4b68e04b567ad40f4f4c1bc61cd8e93479",
+    "src/parser.c": "3df3106f1b045da438a3bfba316efcee246573565122ea68095a4e8ef7d2ea23",
+    "src/reader.c": "c428a44b177391557bdf49177c1dc0216edf2a2bbe0e24ca2ef2725ef7f01e9d",
+    "src/scanner.c": "a853092204abb33d7f79b3da7a19f8df14c156c5cca738f1bb54c19d1f52f2e2",
+    "src/writer.c": "44a75c870a0b7039e37b457850b31748a69ce3bf1bf39950e7b855acef472de2",
+    "src/yaml_private.h": "8dffe95c784665eba4ee88169456ebd41137a6d80ad13d536df6ad10d7a4d459",
+    "include/yaml.h": "5dfca217235c26810a0ab2f52c328fd3b95fd2ee244fab12f1b0f72d63da2780",
+}
+
+
+LIBYAML_CONFIG_H = """/* The config.h libyaml 0.2.5's configure writes, as far as its sources read it. */
+#define YAML_VERSION_MAJOR 0
+#define YAML_VERSION_MINOR 2
+#define YAML_VERSION_PATCH 5
+#define YAML_VERSION_STRING "0.2.5"
+"""
+
+
+def libyaml(checkout: Path, build: Path) -> Prepared:
+    """libyaml's src/*.c, with the config.h its configure would write for the
+    version configure.ac defines (0.2.5), so no autogen step runs. A header,
+    not -D flags: a quoted string define does not survive a make recipe."""
+    verify(checkout, LIBYAML_PINS, "libyaml")
+    config = build / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "config.h").write_text(LIBYAML_CONFIG_H)
+    return Prepared(
+        sources=(ADAPTERS / "libyaml.c", *(checkout / name for name in LIBYAML_SOURCES)),
+        include_dirs=(checkout / "include", checkout / "src", config),
+        extra_cflags=("-DHAVE_CONFIG_H=1", "-DYAML_DECLARE_STATIC"),
+    )
+
+
+RECIPES = {"cjson": cjson, "sqlite": sqlite, "zlib": zlib, "libyaml": libyaml}
 
 
 def prepare(name: str, checkout: Path, build: Path) -> Prepared:

@@ -2711,6 +2711,11 @@
   when bhf panics.
 
 ### Added
+- Pinned build recipes for the trade study's zlib and libyaml targets
+  (#370): zlib's core translation units with its checked-in `zconf.h`, and
+  libyaml's `src/*.c` with the `config.h` its configure writes for 0.2.5,
+  each with an adapter. The dry run lists four of the six real-code targets
+  as runnable.
 - Pinned, checksum-verified build recipes for the trade study's cjson and
   sqlite real-code targets (#255). `recipes.py` turns a checkout fetched at
   its pin into the sources, include dirs and flags to compile: cjson is

@@ -761,7 +761,7 @@ class RecipeTests(unittest.TestCase):
             text=True,
             check=True,
         ).stdout
-        for name in ("cjson", "sqlite"):
+        for name in sorted(recipes.RECIPES):
             self.assertIn(f"- {name} [self_contained/runnable]", out)
             self.assertIn(f"recipe: {name}", out)
 

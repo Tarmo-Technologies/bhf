@@ -118,6 +118,8 @@ Generated files live under `<workdir>/recipes/<name>/`.
 |---|---|
 | `cjson` | `cJSON.c` (pinned) with `adapters/cjson.c`, which parses the input with `cJSON_ParseWithLengthOpts` and prints what parsed |
 | `sqlite` | the amalgamation SQLite 3.54.0's `configure --disable-tcl && make sqlite3.c` generates out of tree (deterministic under its bundled jimsh; `sqlite3.c`/`sqlite3.h` pinned), with `adapters/sqlite.c`, which runs the input as SQL on an in-memory database (`sqlite3_prepare_v2`, a progress budget and a row cap); `SQLITE_THREADSAFE=0`, no extension loading |
+| `zlib` | the core translation units (no `gz*` file I/O) with the checked-in `zconf.h`, all pinned, with `adapters/zlib.c`, which decompresses the input with `uncompress2` into a 64 KiB buffer |
+| `libyaml` | `src/*.c` (pinned) with the `config.h` its configure writes for 0.2.5, generated into the recipe dir (a header, since a quoted string define does not survive bhf's make recipe), with `adapters/libyaml.c`, which parses the input event by event |
 
 A smoke build, `BHF_TRADE_STUDY_SOURCES=<fetch root> python3 -m unittest
 test_runner`, prepares every recipe and builds and runs its libFuzzer harness.
