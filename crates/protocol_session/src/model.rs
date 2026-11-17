@@ -264,6 +264,7 @@ pub struct ProtocolModel {
     graph: ProtocolStateGraph,
     oracles: Vec<OracleDef>,
     session: SessionDef,
+    framing: crate::framing::Framing,
 }
 
 impl ProtocolModel {
@@ -285,6 +286,7 @@ impl ProtocolModel {
             graph,
             oracles: profile.oracles().to_vec(),
             session: profile.session().clone(),
+            framing: profile.framing().clone(),
         })
     }
 
@@ -318,6 +320,11 @@ impl ProtocolModel {
 
     pub fn session(&self) -> &SessionDef {
         &self.session
+    }
+
+    /// How messages are delimited on the wire.
+    pub fn framing(&self) -> &crate::framing::Framing {
+        &self.framing
     }
 }
 

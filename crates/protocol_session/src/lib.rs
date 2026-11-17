@@ -22,6 +22,7 @@
 //! vulnerability-management tools to read.
 
 pub mod binding;
+pub mod framing;
 pub mod model;
 pub mod mutate;
 pub mod novelty;
@@ -31,6 +32,7 @@ pub mod runner;
 pub mod testcase;
 
 pub use binding::{Bindings, BoundValue};
+pub use framing::{Framing, FramingError, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
 pub use model::{
     CaptureSpec, CompiledCapture, CompiledField, CompiledMessage, ComputedSpec, DataSpec,
     EncodeError, FieldRole, FieldValue, ModelError, ProtocolModel,

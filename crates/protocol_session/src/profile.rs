@@ -201,6 +201,8 @@ struct RawProfile {
     session: Option<SessionDef>,
     #[serde(default, rename = "oracle")]
     oracle: Vec<OracleDef>,
+    #[serde(default)]
+    framing: Option<crate::framing::FramingDef>,
 }
 
 /// A parsed, validated protocol profile.
@@ -214,6 +216,7 @@ pub struct Profile {
     transitions: Vec<TransitionDef>,
     session: SessionDef,
     oracles: Vec<OracleDef>,
+    framing: crate::framing::Framing,
     source_sha256: String,
 }
 
@@ -267,6 +270,11 @@ impl Profile {
             .unwrap_or_else(|| "start".to_owned());
 
         let max_messages = raw.max_messages.unwrap_or(DEFAULT_MAX_MESSAGES);
+        let framing = raw
+            .framing
+            .unwrap_or_default()
+            .resolve()
+            .map_err(|reason| ProfileError::BadFraming { reason })?;
         let source_sha256 = hex_sha256(source.as_bytes());
 
         Ok(Self {
@@ -278,6 +286,7 @@ impl Profile {
             transitions: raw.transition,
             session: raw.session.unwrap_or_default(),
             oracles: raw.oracle,
+            framing,
             source_sha256,
         })
     }
@@ -316,6 +325,11 @@ impl Profile {
 
     pub fn oracles(&self) -> &[OracleDef] {
         &self.oracles
+    }
+
+    /// How messages are delimited on the wire (`[framing]`; raw when absent).
+    pub fn framing(&self) -> &crate::framing::Framing {
+        &self.framing
     }
 
     /// The SHA-256 of the profile source, as lowercase hex. Recorded on every
@@ -373,6 +387,8 @@ pub enum ProfileError {
     DuplicateMessage { name: String },
     #[error("field {field:?} references undefined response value {reference:?}")]
     BadReference { field: String, reference: String },
+    #[error("bad [framing] in protocol profile: {reason}")]
+    BadFraming { reason: String },
 }
 
 #[cfg(test)]
@@ -387,6 +403,7 @@ mod tests {
         assert_eq!(profile.schema(), SCHEMA_V1);
         assert_eq!(profile.transport(), Some("tcp"));
         assert_eq!(profile.start_state(), "start");
+        assert_eq!(profile.framing().label(), "length_prefix(u16 big)");
 
         // Exactly two messages, OPEN and WRITE.
         let names: Vec<&str> = profile.messages().iter().map(|m| m.name.as_str()).collect();

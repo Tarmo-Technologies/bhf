@@ -41,9 +41,9 @@ use corpus::{CorpusError, FindingEmitter};
 use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 use fuzz_engine_builtin::{MutationRng, PowerScheduler, ScheduleFeedback};
 use protocol_session::{
-    mutate_fields, mutate_sequence, BoundValue, CodeCoverageNovelty, FieldRole, Profile,
-    ProtocolModel, SessionRun, SessionRunner, SessionTestcase, SessionTransport, SessionVerdict,
-    StateNovelty, StateNoveltyDelta, TransportError,
+    mutate_fields, mutate_sequence, BoundValue, CodeCoverageNovelty, FieldRole, Framing, Profile,
+    ProtocolModel, ReplyProgress, SessionRun, SessionRunner, SessionTestcase, SessionTransport,
+    SessionVerdict, StateNovelty, StateNoveltyDelta, TransportError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -203,9 +203,9 @@ impl SessionTransportPlan {
 
     /// Build the live transport this plan describes. The socket is dialed lazily
     /// on the first [`SessionTransport::reset`], so this itself touches nothing.
-    fn into_transport(self, reset: SessionResetMode) -> TcpSessionTransport {
+    fn into_transport(self, reset: SessionResetMode, framing: Framing) -> TcpSessionTransport {
         match self {
-            Self::Tcp { host, port } => TcpSessionTransport::new(host, port, reset),
+            Self::Tcp { host, port } => TcpSessionTransport::new(host, port, reset, framing),
         }
     }
 }
@@ -239,29 +239,37 @@ fn parse_host_port(
 // The live TCP request/response backend
 // ---------------------------------------------------------------------------
 
-/// A real TCP [`SessionTransport`]. Each request is length-prefixed
-/// (`[u16 BE len][frame]`) and the reply is read the same way, with a bounded
-/// read (`MAX_REPLY_BYTES`) and a read/write timeout so neither a huge reply nor
-/// a silent peer can wedge a campaign.
+/// A real TCP [`SessionTransport`]. Each request is framed as the profile's
+/// `[framing]` says and the reply is read the same way: a length-prefixed,
+/// delimited or fixed-size reply ends by its content, and a raw one when the
+/// peer goes quiet. The read is bounded (`MAX_REPLY_BYTES`) and the socket has
+/// a read/write timeout, so neither a huge reply nor a silent peer can wedge a
+/// campaign.
 pub(crate) struct TcpSessionTransport {
     host: String,
     port: u16,
     reset: SessionResetMode,
+    framing: Framing,
     stream: Option<TcpStream>,
+    /// Bytes read past the end of the last reply.
+    pending: Vec<u8>,
 }
 
 impl TcpSessionTransport {
-    fn new(host: String, port: u16, reset: SessionResetMode) -> Self {
+    fn new(host: String, port: u16, reset: SessionResetMode, framing: Framing) -> Self {
         Self {
             host,
             port,
             reset,
+            framing,
             stream: None,
+            pending: Vec::new(),
         }
     }
 
     fn connect(&mut self) -> Result<(), TransportError> {
         self.stream = None;
+        self.pending.clear();
         let stream = TcpStream::connect((self.host.as_str(), self.port)).map_err(|e| {
             TransportError::new(format!("connect {}:{}: {e}", self.host, self.port))
         })?;
@@ -273,6 +281,58 @@ impl TcpSessionTransport {
         stream.set_nodelay(true).ok();
         self.stream = Some(stream);
         Ok(())
+    }
+
+    /// Read until the framing has a whole reply. A raw reply is complete when
+    /// no byte arrives for its idle window after the first, or the peer closes.
+    fn read_reply(&mut self) -> Result<Vec<u8>, TransportError> {
+        let idle = self.framing.reply_idle_ms().map(Duration::from_millis);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.framing.take_reply(&self.pending, MAX_REPLY_BYTES) {
+                ReplyProgress::Complete { reply, consumed } => {
+                    self.pending.drain(..consumed);
+                    return Ok(reply);
+                }
+                ReplyProgress::Invalid(reason) => {
+                    self.pending.clear();
+                    return Err(TransportError::new(format!("session reply: {reason}")));
+                }
+                ReplyProgress::NeedMore => {}
+            }
+            let quiet_completes = idle.is_some() && !self.pending.is_empty();
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
+            let wait = if quiet_completes {
+                idle
+            } else {
+                Some(SESSION_IO_TIMEOUT)
+            };
+            stream.set_read_timeout(wait).ok();
+            match stream.read(&mut chunk) {
+                Ok(0) if quiet_completes => return Ok(std::mem::take(&mut self.pending)),
+                Ok(0) => {
+                    return Err(lost(
+                        &mut self.stream,
+                        "session read reply: the connection closed".to_owned(),
+                    ))
+                }
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if quiet_completes
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    return Ok(std::mem::take(&mut self.pending));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(lost(&mut self.stream, format!("session read reply: {e}"))),
+            }
+        }
     }
 }
 
@@ -286,47 +346,19 @@ fn lost(stream: &mut Option<TcpStream>, message: String) -> TransportError {
 
 impl SessionTransport for TcpSessionTransport {
     fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if request.len() > u16::MAX as usize {
-            return Err(TransportError::new(format!(
-                "request frame is {} bytes, exceeding the {} wire-length cap",
-                request.len(),
-                u16::MAX
-            )));
-        }
+        let frame = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-        let len = (request.len() as u16).to_be_bytes();
         stream
-            .write_all(&len)
-            .and_then(|()| stream.write_all(request))
+            .write_all(&frame)
             .and_then(|()| stream.flush())
             .map_err(|e| lost(&mut self.stream, format!("session write: {e}")))?;
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-
-        let mut len_buf = [0u8; 2];
-        stream
-            .read_exact(&mut len_buf)
-            .map_err(|e| lost(&mut self.stream, format!("session read reply length: {e}")))?;
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-        let reply_len = usize::from(u16::from_be_bytes(len_buf));
-        if reply_len > MAX_REPLY_BYTES {
-            return Err(TransportError::new(format!(
-                "reply length {reply_len} exceeds the {MAX_REPLY_BYTES}-byte cap"
-            )));
-        }
-        let mut reply = vec![0u8; reply_len];
-        stream
-            .read_exact(&mut reply)
-            .map_err(|e| lost(&mut self.stream, format!("session read reply body: {e}")))?;
-        Ok(reply)
+        self.read_reply()
     }
 
     fn reset(&mut self) -> Result<(), TransportError> {
@@ -465,6 +497,8 @@ pub(crate) struct SessionFuzzSummary {
     pub profile_sha256: String,
     pub transport: String,
     pub reset_fidelity: String,
+    /// How the profile frames messages on the wire (`raw`, `length_prefix(u16 big)`).
+    pub framing: String,
     pub seeds: usize,
     pub executions: usize,
     pub corpus_new: usize,
@@ -876,6 +910,7 @@ pub(crate) fn run_session_campaign(
         profile_sha256: config.profile_sha256.clone(),
         transport: config.transport_label.clone(),
         reset_fidelity: config.reset_fidelity(),
+        framing: model.framing().label(),
         seeds: seed_count,
         executions,
         corpus_new,
@@ -1005,10 +1040,13 @@ fn load_session_finding(
     Ok((testcase, model, meta))
 }
 
-fn build_live_transport(meta: &SessionArtifactMeta) -> Result<TcpSessionTransport, String> {
+fn build_live_transport(
+    meta: &SessionArtifactMeta,
+    model: &ProtocolModel,
+) -> Result<TcpSessionTransport, String> {
     let plan = SessionTransportPlan::parse(&meta.transport).map_err(|e| e.to_string())?;
     let reset = SessionResetMode::parse(&meta.reset)?;
-    Ok(plan.into_transport(reset))
+    Ok(plan.into_transport(reset, model.framing().clone()))
 }
 
 /// `bhf replay` of a session finding: re-drive the recorded session against a
@@ -1018,7 +1056,7 @@ pub(crate) fn replay_session_outcome(
     finding_dir: &Path,
 ) -> Result<crate::replay::LaneReplay, String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let mut transport = build_live_transport(&meta)?;
+    let mut transport = build_live_transport(&meta, &model)?;
     let verdict = replay_verdict(&model, &testcase, &mut transport)?;
     let matched = verdict_reproduces(&verdict, &meta);
     let rule = meta.rule_id.as_deref().unwrap_or("<none>");
@@ -1131,8 +1169,9 @@ pub(crate) fn minimize_session_finding(finding_dir: &Path) -> i32 {
 
 fn minimize_session_inner(finding_dir: &Path) -> Result<(usize, usize, bool), String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let (original_len, run, reproduces) =
-        minimize_session_core(&model, &testcase, &meta, || build_live_transport(&meta))?;
+    let (original_len, run, reproduces) = minimize_session_core(&model, &testcase, &meta, || {
+        build_live_transport(&meta, &model)
+    })?;
     let minimized_len = run.testcase.messages.len();
 
     let serialized = run
@@ -1268,7 +1307,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     })?;
     let transport_label = plan.label();
     let transport_kind = plan.kind().to_owned();
-    let mut transport = plan.into_transport(args.session_reset);
+    let mut transport = plan.into_transport(args.session_reset, model.framing().clone());
 
     let seeds = seed_sessions(&model);
     if seeds.is_empty() {
@@ -1866,6 +1905,134 @@ equals = 226
         assert!(
             err.contains("no longer reproduces"),
             "baseline must refuse to minimize a non-reproducing O1 finding, got {err:?}"
+        );
+    }
+
+    /// A peer that answers each request it reads with `reply:` and the
+    /// request, framed as `framing` frames it. A raw reply goes out in two
+    /// writes 10 ms apart, inside the reply's idle window.
+    fn framed_echo_server(framing: Framing) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let framing = framing.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buffered = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let request = match framing.take_reply(&buffered, MAX_REPLY_BYTES) {
+                            ReplyProgress::Complete { reply, consumed } => {
+                                buffered.drain(..consumed);
+                                reply
+                            }
+                            _ if framing.reply_idle_ms().is_some() && !buffered.is_empty() => {
+                                std::mem::take(&mut buffered)
+                            }
+                            _ => match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buffered.extend_from_slice(&chunk[..n]);
+                                    continue;
+                                }
+                            },
+                        };
+                        let mut reply = b"reply:".to_vec();
+                        reply.extend_from_slice(&request);
+                        let wire = framing.encode(&reply).unwrap();
+                        if framing.reply_idle_ms().is_some() {
+                            let (head, tail) = wire.split_at(wire.len() / 2);
+                            stream.write_all(head).unwrap();
+                            std::thread::sleep(Duration::from_millis(10));
+                            stream.write_all(tail).unwrap();
+                        } else {
+                            stream.write_all(&wire).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// #257: every framing mode frames the request and reads the reply over
+    /// a real socket, twice on one connection.
+    #[test]
+    fn each_framing_mode_carries_requests_and_replies_over_tcp() {
+        let cases = [
+            (Framing::default(), b"reply:ping".to_vec()),
+            (
+                Framing::LengthPrefix {
+                    width: 2,
+                    endian: protocol_session::ByteOrder::Big,
+                    includes_prefix: false,
+                },
+                b"reply:ping".to_vec(),
+            ),
+            (
+                Framing::LengthPrefix {
+                    width: 4,
+                    endian: protocol_session::ByteOrder::Little,
+                    includes_prefix: true,
+                },
+                b"reply:ping".to_vec(),
+            ),
+            (
+                Framing::Delimiter {
+                    delimiter: b"\r\n".to_vec(),
+                },
+                b"reply:ping".to_vec(),
+            ),
+            // The request is padded to 8 bytes, and the reply cut to 8.
+            (Framing::Fixed { size: 8 }, b"reply:pi".to_vec()),
+        ];
+        for (framing, expected) in cases {
+            let label = framing.label();
+            let port = framed_echo_server(framing.clone());
+            let mut transport = TcpSessionTransport::new(
+                "127.0.0.1".to_owned(),
+                port,
+                SessionResetMode::None,
+                framing,
+            );
+            transport.reset().unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    transport.send_request(b"ping").unwrap(),
+                    expected,
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// A raw peer that closes after its reply has answered: the reply is the
+    /// bytes before the close.
+    #[test]
+    fn a_raw_reply_ends_when_the_peer_closes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 64];
+            let _ = stream.read(&mut chunk);
+            stream.write_all(b"bye").unwrap();
+        });
+        let mut transport = TcpSessionTransport::new(
+            "127.0.0.1".to_owned(),
+            port,
+            SessionResetMode::Reconnect,
+            Framing::Raw {
+                reply_idle_ms: 5_000,
+            },
+        );
+        transport.reset().unwrap();
+        let started = Instant::now();
+        assert_eq!(transport.send_request(b"hi").unwrap(), b"bye");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "waited for the idle window"
         );
     }
 }

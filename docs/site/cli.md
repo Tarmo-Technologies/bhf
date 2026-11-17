@@ -1472,6 +1472,25 @@ response captures a reply exposes, the session `reset`, and the `[[oracle]]`
 that marks the clean-exit finding. The seed session is synthesized from the
 profile (a legal, reference-satisfying walk).
 
+How messages are delimited on the wire is the profile's `[framing]`, and the
+transport adds nothing of its own:
+
+| `kind` | A request is | A reply ends |
+|---|---|---|
+| `raw` (the default) | written as it is | when no byte arrives for `reply_idle_ms` (50) after the first, or the peer closes |
+| `length_prefix` | preceded by its length in `width` bytes (1, 2 or 4; 2 by default), `endian` `big` (the default) or `little`; `includes_prefix = true` when the length counts the prefix | after the length its prefix declares |
+| `delimiter` | followed by `delimiter` (`"\r\n"`) | at the delimiter, which is not part of the reply |
+| `fixed` | `size` bytes: a shorter request is padded with zeros, a longer one cut | after `size` bytes |
+
+```toml
+[framing]
+kind = "length_prefix"
+width = 2
+endian = "big"
+```
+
+The run summary's `framing` names it (`length_prefix(u16 big)`).
+
 ```sh
 bhf fuzz bhf_work --harness H-PROTO \
   --protocol-profile profiles/toy-open-write.toml \

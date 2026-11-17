@@ -18,6 +18,12 @@ transport = "tcp"
 max_messages = 64
 start = "start"
 
+# Every request and every reply is preceded by its length as a big-endian u16.
+[framing]
+kind = "length_prefix"
+width = 2
+endian = "big"
+
 # ---------------------------------------------------------------------------
 # OPEN: establish a handle for a path.
 # ---------------------------------------------------------------------------

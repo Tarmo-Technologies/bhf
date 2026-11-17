@@ -11,6 +11,15 @@
   still works. A target the lane admits but cannot set up has its own
   outcome, `unsupported_setup` (`summary.unsupported_setup`), instead of
   `unsupported_params`.
+- A protocol profile declares how its messages are framed on the wire
+  (#257), in a `[framing]` table: `raw` (the default: a request is written as
+  it is, and a reply ends when the peer goes quiet or closes),
+  `length_prefix` (width 1, 2 or 4, either byte order, with or without the
+  prefix counted), `delimiter` or `fixed`. The session transport put a
+  big-endian u16 length before every request and read every reply the same
+  way, which no real protocol uses. A profile that relied on it declares
+  `kind = "length_prefix"`, as the toy OPEN/WRITE profile now does. The run
+  summary's `framing` names the framing.
 - bhf's UTC timestamps come from `jiff` instead of `chrono`, which
   RUSTSEC-2026-0543 marks unmaintained and `cargo deny` refused. The
   timestamps are written in the same formats (#408).
