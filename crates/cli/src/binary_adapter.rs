@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `bhf binary adapter`: the functions, call edges, strings and xrefs of a
-//! binary, from an external analyzer run as a subprocess (Rizin; the Ghidra and angr adapters find their tool but run no
-//! analysis yet) or
+//! binary, from an external analyzer run as a subprocess (Rizin, Ghidra headless; the angr adapter finds its tool but
+//! runs no analysis yet) or
 //! from a mock fixture, written as
 //! `binary-adapter-report.json`.
 //!
@@ -12,6 +12,7 @@
 //! addresses (a PIE's are offsets from 0), whatever base the tool loaded it
 //! at.
 
+mod ghidra;
 mod rizin;
 
 use config::Profile;
@@ -166,8 +167,9 @@ enum ProbeFailure {
 
 /// Find the adapter's tool and its version, without analyzing anything.
 /// `rizin -v` prints its version (`rizin --version` opens a file named
-/// `--version` and waits in the shell); `analyzeHeadless` has no version
-/// option; for angr the tool is a Python that must import angr.
+/// `--version` and waits in the shell); Ghidra's is in the
+/// `application.properties` of the install `analyzeHeadless` is in; for angr
+/// the tool is a Python that must import angr.
 fn probe_tool(kind: AdapterKind, tool: &Path) -> Result<FoundTool, ProbeFailure> {
     let Ok(path) = which::which(tool) else {
         return Err(ProbeFailure::NotFound(format!(
@@ -177,7 +179,7 @@ fn probe_tool(kind: AdapterKind, tool: &Path) -> Result<FoundTool, ProbeFailure>
     };
     if kind == AdapterKind::Ghidra {
         return Ok(FoundTool {
-            version: String::new(),
+            version: ghidra::version(&path).unwrap_or_default(),
             path,
         });
     }
@@ -244,7 +246,7 @@ fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
         "path": found.path.to_string_lossy(),
         "version": found.version
     });
-    if matches!(kind, AdapterKind::Ghidra | AdapterKind::Angr) {
+    if matches!(kind, AdapterKind::Angr) {
         return not_implemented(args, tool_info);
     }
     let target = std::path::absolute(&args.target)
@@ -253,9 +255,8 @@ fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
         let timeout = Duration::from_secs(args.timeout_secs.max(1));
         match kind {
             AdapterKind::Rizin => rizin::analyze(&found.path, &target, timeout),
-            AdapterKind::Ghidra | AdapterKind::Angr | AdapterKind::Mock => {
-                unreachable!("no analysis runs")
-            }
+            AdapterKind::Ghidra => ghidra::analyze(&found.path, &target, timeout),
+            AdapterKind::Angr | AdapterKind::Mock => unreachable!("no analysis runs"),
         }
     } else {
         Err(AdapterError::new(
@@ -487,6 +488,35 @@ fn run_analyzer(command: &mut Command, timeout: Duration) -> Result<String, Adap
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read the JSON export a bundled script wrote to `path`, at most
+/// [`MAX_OUTPUT_BYTES`] of it.
+fn read_export(path: &Path, stdout: &str) -> Result<Value, AdapterError> {
+    let size = fs::metadata(path)
+        .map_err(|_| {
+            let tail: Vec<&str> = stdout.lines().rev().take(20).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            AdapterError::new(
+                "bad_output",
+                format!(
+                    "the export script wrote no {}; the analyzer printed:\n{}",
+                    path.display(),
+                    tail.join("\n")
+                ),
+            )
+        })?
+        .len();
+    if size > MAX_OUTPUT_BYTES as u64 {
+        return Err(AdapterError::new(
+            "output_too_large",
+            format!("the export is {size} bytes"),
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| AdapterError::new("bad_output", format!("read the export: {error}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AdapterError::new("bad_output", format!("parse the export: {error}")))
 }
 
 struct ReportBuilder {

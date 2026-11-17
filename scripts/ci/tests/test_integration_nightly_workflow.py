@@ -370,8 +370,8 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
 
 
 class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
-    """The binary adapters run nightly against the real Rizin
-    (#264), pinned by digest."""
+    """The binary adapters run nightly against the real Rizin and Ghidra
+    (#264, #265), pinned by digest."""
 
     def setUp(self) -> None:
         self.job = job_block("binary-analyzers")
@@ -388,6 +388,7 @@ class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
         self.assertIn("-E 'binary(=binary_adapter_tools)'", self.job)
         self.assertIn('BHF_BINARY_ANALYZERS: "1"', self.job)
         self.assertIn('BHF_REQUIRE_TOOLS: "1"', self.job)
+        self.assertIn("java-version: 25", self.job)
         self.assertIn(
             'run: bash scripts/ci/install-binary-analyzers.sh "$RUNNER_TEMP/analyzers" >> "$GITHUB_ENV"',
             self.job,
@@ -395,9 +396,10 @@ class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
 
     def test_every_download_is_pinned_by_digest(self) -> None:
         script = (ROOT / "scripts/ci/install-binary-analyzers.sh").read_text()
-        self.assertEqual(script.count('"$here/fetch.sh" \\\n'), 1, script)
+        self.assertEqual(script.count('"$here/fetch.sh" \\\n'), 2, script)
         for pin in (
             "rizin_sha256=9102249a9f0b6319c5334a2e5cf8d9cc3f2035e1d3def027c41f6a90f647e8cf",
+            "ghidra_sha256=2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67",
         ):
             self.assertIn(pin, script)
         self.assertNotIn("curl", script)

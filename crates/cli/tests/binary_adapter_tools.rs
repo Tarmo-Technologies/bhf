@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `bhf binary adapter` against the real Rizin (#264), on
+//! `bhf binary adapter` against the real Rizin and Ghidra (#264, #265), on
 //! `tests/fixtures/binary_adapter/legacy.c` built with `cc -O0`.
 //!
 //! These run where `BHF_BINARY_ANALYZERS=1`: the nightly's binary-analyzers
-//! job installs the pinned tool and sets it, with `BHF_REQUIRE_TOOLS=1`, so
-//! a missing tool fails the test there. The tool is `BHF_RIZIN`, else `rizin`
-//! on `PATH`.
+//! job installs the pinned tools and sets it, with `BHF_REQUIRE_TOOLS=1`, so
+//! a missing tool fails the test there. The tools are `BHF_RIZIN` and
+//! `BHF_GHIDRA_HEADLESS` (Ghidra's `support/analyzeHeadless`, with a JDK 25
+//! on `PATH` or in `JAVA_HOME`), else `rizin` and `analyzeHeadless` on
+//! `PATH`.
 
 #![cfg(target_os = "linux")]
 
@@ -147,5 +149,12 @@ fn analyze_legacy(kind: &str, tool: &Path) {
 fn rizin_finds_the_fixtures_functions_and_call_edges() {
     if let Some(rizin) = analyzer("rizin", "BHF_RIZIN", "rizin") {
         analyze_legacy("rizin", &rizin);
+    }
+}
+
+#[test]
+fn ghidra_headless_finds_the_fixtures_functions_and_call_edges() {
+    if let Some(headless) = analyzer("ghidra", "BHF_GHIDRA_HEADLESS", "analyzeHeadless") {
+        analyze_legacy("ghidra", &headless);
     }
 }

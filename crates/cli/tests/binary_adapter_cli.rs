@@ -172,7 +172,7 @@ fn fake_tool(root: &Path, name: &str, code: i32) -> PathBuf {
 
 /// The adapters that run an external analyzer.
 #[cfg(unix)]
-const ANALYZERS: &[&str] = &["rizin"];
+const ANALYZERS: &[&str] = &["rizin", "ghidra"];
 
 /// A tool that answers its probe and writes, or prints, the analysis its real
 /// counterpart recorded for `tests/fixtures/binary_adapter/legacy.c`: rizin
@@ -187,6 +187,14 @@ fn recording_tool(root: &Path, kind: &str) -> PathBuf {
             "#!/bin/sh\n[ \"$1\" = -v ] && {{ echo 'rizin 0.9.1 @ linux-x86-64'; exit 0; }}\n\
              cat '{}'\n",
             recorded.join("rizin-legacy.out").display()
+        ),
+        // analyzeHeadless <project> <name> -import <binary> -scriptPath <dir>
+        //   -postScript BhfExport.java <export> <limit> -deleteProject
+        "ghidra" => format!(
+            "#!/bin/sh\nscripts=$6\n[ \"$7 $8\" = '-postScript BhfExport.java' ] || exit 9\n\
+             grep -q 'class BhfExport' \"$scripts/BhfExport.java\" || exit 9\n\
+             cp '{}' \"$9\"\n",
+            recorded.join("ghidra-legacy.json").display()
         ),
         other => panic!("{other}"),
     };
@@ -272,7 +280,7 @@ fn a_real_adapter_without_an_analysis_is_an_error_or_skipped() {
 
 /// The adapters that find their tool but run no analysis yet.
 #[cfg(unix)]
-const NOT_YET: &[&str] = &["ghidra", "angr"];
+const NOT_YET: &[&str] = &["angr"];
 
 /// An adapter whose analysis bhf does not run yet says so with its tool
 /// (exit 3).
@@ -298,7 +306,9 @@ fn the_adapter_help_names_the_analyzers_it_runs() {
         .unwrap();
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
-        help.contains("with Rizin, run as a subprocess (Ghidra and angr: no analysis yet, exit 3)"),
+        help.contains(
+            "with Rizin or Ghidra headless, run as subprocesses (angr: no analysis yet, exit 3)"
+        ),
         "{help}"
     );
     assert!(

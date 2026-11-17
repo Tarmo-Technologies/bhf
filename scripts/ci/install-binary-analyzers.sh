@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# install-binary-analyzers.sh DIR: install the pinned Rizin that
+# install-binary-analyzers.sh DIR: install the pinned Rizin and Ghidra that
 # crates/cli/tests/binary_adapter_tools.rs runs `bhf binary adapter` against
-# into DIR, and print the variable that names it (BHF_RIZIN) on stdout, for
-# $GITHUB_ENV.
+# into DIR, and print the variables that name them (BHF_RIZIN,
+# BHF_GHIDRA_HEADLESS) on stdout, for $GITHUB_ENV. Ghidra 12.2 needs a JDK 25
+# on PATH or in JAVA_HOME, which the workflow installs.
 set -euo pipefail
 [ "$#" -eq 1 ] || { echo "usage: install-binary-analyzers.sh DIR" >&2; exit 2; }
 dir=$1
@@ -12,6 +13,9 @@ mkdir -p "$dir"
 
 rizin_version=0.9.1
 rizin_sha256=9102249a9f0b6319c5334a2e5cf8d9cc3f2035e1d3def027c41f6a90f647e8cf
+ghidra_version=12.2
+ghidra_build=20261016
+ghidra_sha256=2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67
 
 # The static build: one tree with its libraries, no system packages.
 "$here/fetch.sh" \
@@ -21,10 +25,20 @@ mkdir -p "$dir/rizin"
 tar -xJf "$dir/rizin.tar.xz" -C "$dir/rizin"
 rm "$dir/rizin.tar.xz"
 
-# It answers before the tests run; its output is the job log's, not
+"$here/fetch.sh" \
+  "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${ghidra_version}_build/ghidra_${ghidra_version}_PUBLIC_$ghidra_build.zip" \
+  "$ghidra_sha256" "$dir/ghidra.zip"
+unzip -q "$dir/ghidra.zip" -d "$dir"
+rm "$dir/ghidra.zip"
+headless=$dir/ghidra_${ghidra_version}_PUBLIC/support/analyzeHeadless
+
+# Each answers before the tests run; their output is the job log's, not
 # $GITHUB_ENV's.
 {
   "$dir/rizin/bin/rizin" -v </dev/null
+  test -x "$headless"
+  grep "^application.version=$ghidra_version\$" "$dir/ghidra_${ghidra_version}_PUBLIC/Ghidra/application.properties"
 } >&2
 
 echo "BHF_RIZIN=$dir/rizin/bin/rizin"
+echo "BHF_GHIDRA_HEADLESS=$headless"
