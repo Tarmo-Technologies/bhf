@@ -70,6 +70,55 @@ fn dir_mode_is_insecure(mode: libc::mode_t) -> bool {
         || mode & (libc::S_ISUID | libc::S_ISGID) != 0
 }
 
+/// The permission bits of the directory `mkdir`/`mkdirat` just created at
+/// `path` (relative to `dirfd`): the mode it asked for less the umask. The
+/// usual `mkdir(path, 0777)` creates a `0755` directory under umask 022, so
+/// the requested mode says nothing about what was assigned. A raw
+/// `newfstatat`, as the shim hooks `stat`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn created_dir_mode(dirfd: libc::c_int, path: *const libc::c_char) -> Option<libc::mode_t> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `path` is the NUL-terminated path the hook was called with and
+    // `stat` is a writable `struct stat`, the layout the kernel's newfstatat
+    // fills on these architectures.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            dirfd,
+            path,
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: the syscall succeeded and filled `stat`.
+    Some(unsafe { stat.assume_init() }.st_mode & 0o7777)
+}
+
+/// Elsewhere the shim cannot read back what was created; the requested mode
+/// is all it has.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn created_dir_mode(_dirfd: libc::c_int, _path: *const libc::c_char) -> Option<libc::mode_t> {
+    None
+}
+
+/// Whether a `mkdir` that returned `result` assigned insecure permissions:
+/// only a directory it created counts, by the mode it was created with.
+fn created_dir_is_insecure(
+    result: libc::c_int,
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    requested: libc::mode_t,
+) -> Option<libc::mode_t> {
+    if result != 0 {
+        return None;
+    }
+    let mode = created_dir_mode(dirfd, path).unwrap_or(requested);
+    dir_mode_is_insecure(mode).then_some(mode)
+}
+
 /// World-writable directories where a predictably-named file is exposed to a
 /// symlink / temp-file race by any other local user.
 fn in_world_writable_tmp(path: &[u8]) -> bool {
@@ -1201,8 +1250,8 @@ pub unsafe extern "C" fn mkdir(path: *const libc::c_char, mode: libc::mode_t) ->
     let saved_errno = save_errno();
     if let Some(_g) = HookGuard::acquire() {
         emit_fs_destroy(b"mkdir", path_bytes_from_ptr(path));
-        if dir_mode_is_insecure(mode) {
-            log_insecure_mkdir(b"mkdir", path_bytes_from_ptr(path), mode);
+        if let Some(created) = created_dir_is_insecure(result, libc::AT_FDCWD, path, mode) {
+            log_insecure_mkdir(b"mkdir", path_bytes_from_ptr(path), created);
         }
     }
     restore_errno(saved_errno);
@@ -1229,8 +1278,8 @@ pub unsafe extern "C" fn mkdirat(
     let saved_errno = save_errno();
     if let Some(_g) = HookGuard::acquire() {
         emit_fs_destroy(b"mkdirat", path_bytes_from_ptr(path));
-        if dir_mode_is_insecure(mode) {
-            log_insecure_mkdir(b"mkdirat", path_bytes_from_ptr(path), mode);
+        if let Some(created) = created_dir_is_insecure(result, dirfd, path, mode) {
+            log_insecure_mkdir(b"mkdirat", path_bytes_from_ptr(path), created);
         }
     }
     restore_errno(saved_errno);
@@ -1239,7 +1288,7 @@ pub unsafe extern "C" fn mkdirat(
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_mode_is_insecure, tempfile_is_insecure};
+    use super::{created_dir_is_insecure, dir_mode_is_insecure, tempfile_is_insecure};
 
     #[test]
     fn dir_mode_flags_world_writable_without_sticky() {
@@ -1251,6 +1300,16 @@ mod tests {
         // ...but the sticky /tmp idiom and private modes are fine.
         assert!(!dir_mode_is_insecure(0o1777));
         assert!(!dir_mode_is_insecure(0o0755));
+    }
+
+    /// A `mkdir` that failed created nothing, whatever mode it asked for.
+    #[test]
+    fn a_failed_mkdir_assigns_no_permissions() {
+        let path = c"/nonexistent-bhf-parent/child";
+        assert_eq!(
+            created_dir_is_insecure(-1, libc::AT_FDCWD, path.as_ptr(), 0o777),
+            None
+        );
     }
 
     #[test]

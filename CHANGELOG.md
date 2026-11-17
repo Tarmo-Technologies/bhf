@@ -70,6 +70,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The insecure-permissions oracle judges a directory by the mode it was
+  created with (#407). The runtrace shim checked the mode `mkdir` and
+  `mkdirat` were asked for, and `0777` is the mode they are normally called
+  with, which the umask makes `0755`: each such call was a BHF-416 finding
+  with no world-writable directory. The shim now stats a directory it saw
+  created and tests that mode; a `mkdir` that fails assigns nothing.
+- The JVM agent's first build fetches ASM with retries and checks each jar
+  against its pinned SHA-256, a pre-staged or cached copy too (#410). It
+  writes the jars and the agent beside their place and renames them in, so
 - The JVM agent's first build fetches ASM with retries, and a fetched or
   cached jar must have its pinned SHA-256: a cached one that does not is
   fetched again (#410). `ASM_JAR_DIR` jars are the operator's, used as they
