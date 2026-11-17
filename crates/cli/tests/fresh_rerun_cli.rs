@@ -93,6 +93,16 @@ fn five_branch_target(fresh_start_ms: u32) -> String {
 
 const FIVE_SEEDS: [&str; 5] = ["A1", "B2", "C3", "D4", "READ"];
 
+/// Whether a finding's input is READ's root cause: READ, or a mutant that
+/// keeps its first two bytes and length and so also reads the trailer in a
+/// fresh process. Whichever of them a pass checks first is the finding, and
+/// the others are later hits of it.
+fn reads_trailer(input: &serde_json::Value) -> bool {
+    input
+        .as_str()
+        .is_some_and(|input| input.starts_with("RE") && input.chars().count() >= 4)
+}
+
 /// Build `target` with bhf's driver into `<work>/harnesses/<id>/main`.
 fn build_harness(work: &Path, id: &str, target: &str, sanitize: bool) {
     let dir = work.join("harnesses").join(id);
@@ -309,8 +319,8 @@ fn an_input_reaches_the_queue_only_once_a_fresh_run_clears_it() {
     assert!(
         found
             .iter()
-            .any(|finding| finding["rule_id"] == "BHF-201" && finding["input"] == "READ"),
-        "READ is reported once a fresh run checks it: {found:?}"
+            .any(|finding| finding["rule_id"] == "BHF-201" && reads_trailer(&finding["input"])),
+        "READ's root cause is reported once a fresh run checks it: {found:?}"
     );
     let queued = inputs_in(&queue_dir);
     assert!(!queued.contains(&b"READ".to_vec()), "{queued:?}");
@@ -719,8 +729,8 @@ mod one_core {
         assert!(
             found
                 .iter()
-                .any(|finding| finding["rule_id"] == "BHF-201" && finding["input"] == "READ"),
-            "READ is reported by the next pass: {found:?}"
+                .any(|finding| finding["rule_id"] == "BHF-201" && reads_trailer(&finding["input"])),
+            "READ's root cause is reported by the next pass: {found:?}"
         );
         let queued = inputs_in(&queue_dir);
         assert!(!queued.contains(&b"READ".to_vec()), "{queued:?}");
