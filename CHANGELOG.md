@@ -2781,6 +2781,15 @@
   when bhf panics.
 
 ### Added
+- `--session-transport transport:<spec>` drives a protocol session through a
+  `--target-transport` backend (#261): an on-target agent, a debug probe or
+  an emulator, with `--transport-coverage-map` for the gdb and qemu-system
+  backends. Each message is one execution, in order. A fault, crash or hang
+  at a message is a disconnect finding once a second drive confirms it, and
+  `bhf replay` reproduces it. The executions' edges feed the lane's code
+  channel (`coverage_source = "target"`). A reply is the backend's stdout,
+  which the agent backends do not have. The session lane could not reach a
+  protocol on the target.
 - `--session-transport serial:PATH[,baud=N]` drives a protocol session over
   a UART or a pty (#262), opened raw as the agent's serial transport is, with
   the profile's framing and every read bounded by the reply deadline.

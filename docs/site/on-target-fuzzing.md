@@ -285,6 +285,31 @@ The `kind`, `addr`, `detail_len` and `detail` fields are sent only when
 edges or a detail over 64 KiB before it allocates. The agent has no stdout
 channel.
 
+### 3d. Protocol sessions on the target
+
+A stateful command set on the board is fuzzed as sessions by naming the
+transport in `--session-transport transport:<spec>` with a protocol profile
+(see the [CLI reference](cli.md)):
+
+```sh
+bhf fuzz bhf_work --harness H-CMD --protocol-profile profiles/cmd.toml \
+  --session-transport transport:agent:tcp:192.168.1.50:7000 --iterations 5000
+```
+
+Each message of a session is one execution through the backend, in order:
+the agent or the harness reads it as its input. A fault, a crash or a hang at
+a message ends the session there; bhf drives the session again on a fresh
+target session, and a fault at the same message is a finding with the
+session and the fault in its detail, which `bhf replay` reproduces. The
+executions' edges feed the session lane's code channel (`coverage_source`
+`target`), so a session that reaches new firmware code is kept. A reply is
+the backend's stdout, which the agent does not have: a profile over the
+agent captures nothing from replies and its oracles are the faults. The
+`gdb` and `qemu-system` backends take `--transport-coverage-map` here as
+they do for `--target-transport`. `--session-reset reconnect` (the default)
+arms a fresh target session for each protocol session; `none` keeps one
+armed for the campaign.
+
 ---
 
 ## 4. Faults and the real-time deadline oracle

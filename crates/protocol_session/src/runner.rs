@@ -30,6 +30,12 @@ pub trait SessionTransport {
     /// Reset the session (e.g. reconnect), giving the target fresh per-session
     /// state so a later request captures a *new* handle / id / nonce.
     fn reset(&mut self) -> Result<(), TransportError>;
+    /// The code-coverage edges the target reported since the last call: a
+    /// backend that runs the target per message reports them (#261); a socket
+    /// reports none.
+    fn take_coverage_edges(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A transport-layer failure. Carries a bounded, descriptive message.

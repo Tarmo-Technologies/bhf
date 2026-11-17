@@ -144,11 +144,17 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
 /// The flags this run gives that the session lane would ignore.
 /// `--runtime-oracles` applies to a service bhf runs (#364): without
 /// `--session-server-cmd` there is no process to put under the shim.
+/// `--transport-coverage-map` applies to a `transport:` backend (#261).
 pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
+    let over_target = args
+        .session_transport
+        .as_deref()
+        .is_some_and(|spec| spec.trim().starts_with("transport:"));
     crate::fuzz::given_flags(args)
         .into_iter()
         .filter(|flag| {
-            UNSUPPORTED_FLAGS.contains(flag)
+            (UNSUPPORTED_FLAGS.contains(flag)
+                && !(*flag == "--transport-coverage-map" && over_target))
                 || (*flag == "--runtime-oracles" && args.session_server_cmd.is_none())
         })
         .collect()
@@ -169,6 +175,13 @@ pub(crate) enum SessionTransportPlan {
     Udp { host: String, port: u16 },
     /// A serial device (a UART, a pty), opened raw at `baud` when given (#262).
     Serial { path: PathBuf, baud: Option<u32> },
+    /// A `--target-transport` backend (#261): each message is one execution
+    /// on the target. `spec` is the target-transport spec, and `coverage_map`
+    /// the `--transport-coverage-map` a gdb or qemu-system backend needs.
+    Target {
+        spec: String,
+        coverage_map: Option<String>,
+    },
 }
 
 /// A descriptive failure parsing a `--session-transport` spec. Never a silent
@@ -176,11 +189,14 @@ pub(crate) enum SessionTransportPlan {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionSpecError {
     #[error(
-        "empty --session-transport spec; expected tcp:HOST:PORT, udp:HOST:PORT or \
-         serial:PATH[,baud=N]"
+        "empty --session-transport spec; expected tcp:HOST:PORT, udp:HOST:PORT, \
+         serial:PATH[,baud=N] or transport:TARGET-TRANSPORT-SPEC"
     )]
     Empty,
-    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp, serial")]
+    #[error(
+        "unknown --session-transport backend {backend:?}; supported: tcp, udp, serial, \
+         transport"
+    )]
     UnknownBackend { backend: String },
     #[error("malformed {backend} spec {spec:?}: {reason}")]
     Malformed {
@@ -193,6 +209,15 @@ pub(crate) enum SessionSpecError {
 impl SessionTransportPlan {
     /// Parse a `--session-transport` spec into an inspectable plan.
     pub(crate) fn parse(spec: &str) -> Result<Self, SessionSpecError> {
+        Self::parse_with_map(spec, None)
+    }
+
+    /// Parse a `--session-transport` spec with the `--transport-coverage-map`
+    /// a `transport:` backend takes.
+    pub(crate) fn parse_with_map(
+        spec: &str,
+        coverage_map: Option<&str>,
+    ) -> Result<Self, SessionSpecError> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Err(SessionSpecError::Empty);
@@ -204,6 +229,19 @@ impl SessionTransportPlan {
         if let Some(rest) = spec.strip_prefix("udp:") {
             let (host, port) = parse_host_port("udp", spec, rest)?;
             return Ok(Self::Udp { host, port });
+        }
+        if let Some(rest) = spec.strip_prefix("transport:") {
+            crate::transport_fuzz::TransportPlan::parse(rest, coverage_map).map_err(|error| {
+                SessionSpecError::Malformed {
+                    backend: "transport",
+                    spec: spec.to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            return Ok(Self::Target {
+                spec: rest.to_owned(),
+                coverage_map: coverage_map.map(str::to_owned),
+            });
         }
         if let Some(rest) = spec.strip_prefix("serial:") {
             let malformed = |reason: String| SessionSpecError::Malformed {
@@ -247,6 +285,7 @@ impl SessionTransportPlan {
                 path.display(),
                 baud.map(|baud| format!(",baud={baud}")).unwrap_or_default()
             ),
+            Self::Target { spec, .. } => format!("transport:{spec}"),
         }
     }
 
@@ -256,7 +295,7 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { host, port } => Ok((host.clone(), *port, false)),
             Self::Udp { host, port } => Ok((host.clone(), *port, true)),
-            Self::Serial { .. } => Err(format!(
+            Self::Serial { .. } | Self::Target { .. } => Err(format!(
                 "--session-server-cmd needs a tcp: or udp: --session-transport, whose port \
                  bhf waits for; {} has none",
                 self.label()
@@ -270,6 +309,7 @@ impl SessionTransportPlan {
             Self::Tcp { .. } => "tcp",
             Self::Udp { .. } => "udp",
             Self::Serial { .. } => "serial",
+            Self::Target { .. } => "transport",
         }
     }
 
@@ -282,8 +322,8 @@ impl SessionTransportPlan {
         reset: SessionResetMode,
         framing: Framing,
         reply_timeout: Option<Duration>,
-    ) -> LiveTransport {
-        match self {
+    ) -> Result<LiveTransport, String> {
+        Ok(match self {
             Self::Tcp { host, port } => LiveTransport::Tcp(TcpSessionTransport::new(
                 host,
                 port,
@@ -307,7 +347,18 @@ impl SessionTransportPlan {
                 port: None,
                 pending: Vec::new(),
             }),
-        }
+            Self::Target { spec, coverage_map } => {
+                let transport =
+                    crate::transport_fuzz::TransportPlan::parse(&spec, coverage_map.as_deref())
+                        .and_then(|plan| {
+                            plan.into_transport(Some(reply_timeout.unwrap_or(SESSION_IO_TIMEOUT)))
+                        })
+                        .map_err(|error| {
+                            format!("--session-transport transport:{spec}: {error}")
+                        })?;
+                LiveTransport::Target(TargetSessionTransport::new(transport, reset))
+            }
+        })
     }
 }
 
@@ -709,11 +760,111 @@ impl SessionTransport for SerialSessionTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The target-transport backend
+// ---------------------------------------------------------------------------
+
+/// A session over a `--target-transport` backend (#261): an on-target agent,
+/// a debug probe, an emulator. Each message is one execution: the message's
+/// bytes are the input, and the reply is the backend's stdout channel, which
+/// agent backends do not have (a profile over them captures nothing). A
+/// fault, a crash or a hang ends the session at that message, which the lane
+/// confirms and records as a finding, and the executions' coverage edges feed
+/// its code channel. `--session-reset reconnect` arms a fresh target session
+/// for each protocol session; `none` keeps one armed.
+pub(crate) struct TargetSessionTransport {
+    transport: Box<dyn target_transport::TargetTransport>,
+    session: Option<Box<dyn target_transport::TargetSession>>,
+    reset: SessionResetMode,
+    edges: Vec<u64>,
+}
+
+impl TargetSessionTransport {
+    pub(crate) fn new(
+        transport: Box<dyn target_transport::TargetTransport>,
+        reset: SessionResetMode,
+    ) -> Self {
+        Self {
+            transport,
+            session: None,
+            reset,
+            edges: Vec::new(),
+        }
+    }
+}
+
+impl SessionTransport for TargetSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| TransportError::new("target session is not armed; reset first"))?;
+        let outcome = match session.run_input(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.session = None;
+                return Err(TransportError::session_lost(format!(
+                    "the target transport failed on this message: {error}"
+                )));
+            }
+        };
+        self.edges
+            .extend(outcome.coverage_edges.iter().map(|&edge| u64::from(edge)));
+        if let Some(reason) = &outcome.inconclusive {
+            return Err(TransportError::new(format!(
+                "the target's verdict on this message is inconclusive: {reason}"
+            )));
+        }
+        let fault = match (&outcome.fault, outcome.exit) {
+            (Some(fault), _) => Some(format!(
+                "{:?}{}{}",
+                fault.kind,
+                fault
+                    .address
+                    .map(|address| format!(" at {address:#x}"))
+                    .unwrap_or_default(),
+                if fault.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", fault.detail)
+                }
+            )),
+            (None, target_transport::ExitKind::Crash) => Some("a crash".to_owned()),
+            (None, target_transport::ExitKind::Timeout) => Some("a hang".to_owned()),
+            (None, _) => None,
+        };
+        if let Some(fault) = fault {
+            // The target is in no state to go on: arm it again.
+            self.session = None;
+            return Err(TransportError::session_lost(format!(
+                "the target faulted on this message: {fault}"
+            )));
+        }
+        Ok(outcome.stdout)
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.session.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.session = Some(
+                self.transport
+                    .arm()
+                    .map_err(|error| TransportError::new(format!("arm the target: {error}")))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn take_coverage_edges(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.edges)
+    }
+}
+
 /// A live backend, as `--session-transport` names it.
 pub(crate) enum LiveTransport {
     Tcp(TcpSessionTransport),
     Udp(UdpSessionTransport),
     Serial(SerialSessionTransport),
+    Target(TargetSessionTransport),
 }
 
 impl SessionTransport for LiveTransport {
@@ -722,6 +873,7 @@ impl SessionTransport for LiveTransport {
             LiveTransport::Tcp(transport) => transport.send_request(request),
             LiveTransport::Udp(transport) => transport.send_request(request),
             LiveTransport::Serial(transport) => transport.send_request(request),
+            LiveTransport::Target(transport) => transport.send_request(request),
         }
     }
 
@@ -730,6 +882,14 @@ impl SessionTransport for LiveTransport {
             LiveTransport::Tcp(transport) => transport.reset(),
             LiveTransport::Udp(transport) => transport.reset(),
             LiveTransport::Serial(transport) => transport.reset(),
+            LiveTransport::Target(transport) => transport.reset(),
+        }
+    }
+
+    fn take_coverage_edges(&mut self) -> Vec<u64> {
+        match self {
+            LiveTransport::Target(transport) => transport.take_coverage_edges(),
+            _ => Vec::new(),
         }
     }
 }
@@ -831,6 +991,9 @@ pub(crate) struct SessionFuzzConfig {
     pub reply_timeout: Option<Duration>,
     /// `--session-server-cmd`, recorded so a replay can start the service.
     pub server_cmd: Option<String>,
+    /// `--transport-coverage-map` of a `transport:` backend, recorded so a
+    /// replay rebuilds it.
+    pub coverage_map: Option<String>,
     /// Bounded cap on messages per session.
     pub max_messages: usize,
     /// The valid seed session(s) the campaign mutates.
@@ -876,7 +1039,8 @@ pub(crate) struct SessionFuzzSummary {
     pub coverage_blocks: usize,
     /// Where the code channel's edges come from: `service`, a service bhf
     /// runs with an edge map (#363); `uninstrumented_service`, one that never
-    /// wrote it; or `none`.
+    /// wrote it; `target`, a `transport:` backend that reported edges (#261);
+    /// or `none`.
     pub coverage_source: String,
     /// Protocol-state channel: distinct states visited.
     pub states_covered: usize,
@@ -936,6 +1100,9 @@ struct SessionArtifactMeta {
     /// `--session-server-cmd`, when bhf ran the service: a replay starts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server_cmd: Option<String>,
+    /// `--transport-coverage-map` of a `transport:` backend (#261).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage_map: Option<String>,
     /// For a runtime-oracle finding of the service (#364), the hit's
     /// signature: a replay runs the service under the shim again and looks
     /// for it.
@@ -1267,12 +1434,13 @@ fn drive_candidate(
             false,
         ),
     };
-    let mut new_edges = 0;
+    // A backend that runs the target per message reports its edges (#261).
+    let mut new_edges = code_novelty.observe(&transport.take_coverage_edges());
     let mut oracle_finding = false;
     if let Some(server) = server {
         // The map outlives the process, so a session that crashed the service
         // still counts the code it reached.
-        new_edges = code_novelty.observe(&server.coverage_edges());
+        new_edges += code_novelty.observe(&server.coverage_edges());
         // Its events, before a restart brings the start-up of the next.
         if let Some(oracles) = oracles {
             let events = server.take_session_events();
@@ -1649,6 +1817,7 @@ pub(crate) fn run_session_campaign(
             // A map the service never wrote: it was not built with
             // `c_runtime/bhf_service_cov.c` and SanitizerCoverage.
             true => "uninstrumented_service",
+            false if code_novelty.edges_covered() > 0 => "target",
             false => "none",
         }
         .to_owned(),
@@ -1737,6 +1906,7 @@ fn write_session_artifacts(
             .reply_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         server_cmd: config.server_cmd.clone(),
+        coverage_map: config.coverage_map.clone(),
         runtime_signature: runtime_signature.map(str::to_owned),
         runtrace_mode: runtime_signature.map(|_| config.mode.to_string().to_ascii_lowercase()),
     };
@@ -1803,13 +1973,14 @@ fn build_live_transport(
     meta: &SessionArtifactMeta,
     model: &ProtocolModel,
 ) -> Result<LiveTransport, String> {
-    let plan = SessionTransportPlan::parse(&meta.transport).map_err(|e| e.to_string())?;
+    let plan = SessionTransportPlan::parse_with_map(&meta.transport, meta.coverage_map.as_deref())
+        .map_err(|e| e.to_string())?;
     let reset = SessionResetMode::parse(&meta.reset)?;
-    Ok(plan.into_transport(
+    plan.into_transport(
         reset,
         model.framing().clone(),
         meta.reply_timeout_ms.map(Duration::from_millis),
-    ))
+    )
 }
 
 /// `bhf replay` of a session finding: re-drive the recorded session against a
@@ -2252,7 +2423,8 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         );
         2
     })?;
-    let plan = SessionTransportPlan::parse(spec).map_err(|error| {
+    let plan = SessionTransportPlan::parse_with_map(spec, args.transport_coverage_map.as_deref())
+        .map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --session-transport: {error}");
         2
     })?;
@@ -2300,11 +2472,16 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         }
         None => None,
     };
-    let mut transport = plan.into_transport(
-        args.session_reset,
-        model.framing().clone(),
-        args.session_reply_timeout,
-    );
+    let mut transport = plan
+        .into_transport(
+            args.session_reset,
+            model.framing().clone(),
+            args.session_reply_timeout,
+        )
+        .map_err(|error| {
+            crate::bhfeprintln!("bhf fuzz: {error}");
+            2
+        })?;
 
     let seeds = seed_sessions(&model);
     if seeds.is_empty() {
@@ -2325,6 +2502,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         reset: args.session_reset,
         reply_timeout: args.session_reply_timeout,
         server_cmd: args.session_server_cmd.clone(),
+        coverage_map: args.transport_coverage_map.clone(),
         max_messages: args.max_session_messages,
         seeds,
         iterations: args.effective_iterations(),
@@ -2467,6 +2645,7 @@ mod tests {
             reset: SessionResetMode::Reconnect,
             reply_timeout: None,
             server_cmd: None,
+            coverage_map: None,
             max_messages: 64,
             seeds: seed_sessions(model),
             iterations,
@@ -2819,6 +2998,7 @@ equals = 226
             oracle: oracle.to_owned(),
             reply_timeout_ms: None,
             server_cmd: None,
+            coverage_map: None,
             runtime_signature: None,
             runtrace_mode: None,
         }
@@ -3047,6 +3227,123 @@ equals = 226
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "waited for the idle window"
+        );
+    }
+
+    /// A `TargetTransport` in memory: it records each input in order, answers
+    /// with the input's length as a u32, reports an edge per input byte value, and
+    /// faults on an input that starts with `fault_on`.
+    #[derive(Clone, Default)]
+    struct MockTarget {
+        inputs: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        arms: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fault_on: Option<u8>,
+    }
+
+    impl target_transport::TargetTransport for MockTarget {
+        fn arm(&self) -> target_transport::Result<Box<dyn target_transport::TargetSession>> {
+            self.arms.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl target_transport::TargetSession for MockTarget {
+        fn run_input(
+            &mut self,
+            input: &[u8],
+        ) -> target_transport::Result<target_transport::RunOutcome> {
+            self.inputs.lock().unwrap().push(input.to_vec());
+            let faulted = self.fault_on.is_some() && input.first() == self.fault_on.as_ref();
+            Ok(target_transport::RunOutcome {
+                exit: if faulted {
+                    target_transport::ExitKind::Crash
+                } else {
+                    target_transport::ExitKind::Ok
+                },
+                coverage_edges: input.iter().map(|&byte| u32::from(byte) + 1).collect(),
+                fault: faulted.then(|| target_transport::Fault {
+                    kind: target_transport::FaultKind::MemoryProtection,
+                    address: Some(0x0800_1234),
+                    detail: "CFSR=0x8200".to_owned(),
+                }),
+                // Four bytes: the toy profile captures a u32 handle.
+                stdout: u32::try_from(input.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes()
+                    .to_vec(),
+                coverage_incomplete: None,
+                inconclusive: None,
+                target: Default::default(),
+            })
+        }
+    }
+
+    /// #261: over a target transport, a session's messages reach the target
+    /// in order, one execution each, with a fresh arm per session; the
+    /// executions' edges feed the code channel; and a fault at a message is
+    /// a confirmed disconnect finding.
+    #[test]
+    fn a_target_transport_delivers_messages_in_order_and_a_fault_is_a_finding() {
+        assert_eq!(
+            SessionTransportPlan::parse("transport:agent:tcp:127.0.0.1:7000").unwrap(),
+            SessionTransportPlan::Target {
+                spec: "agent:tcp:127.0.0.1:7000".to_owned(),
+                coverage_map: None,
+            }
+        );
+        // A backend's own requirements are checked: gdb needs its map.
+        let error = SessionTransportPlan::parse("transport:gdb:127.0.0.1:3333").unwrap_err();
+        assert!(
+            error.to_string().contains("--transport-coverage-map"),
+            "{error}"
+        );
+        let model = toy_model();
+        let seed = seed_sessions(&model).remove(0);
+        let runner = SessionRunner::new(&model);
+
+        let clean = MockTarget::default();
+        let mut transport =
+            TargetSessionTransport::new(Box::new(clean.clone()), SessionResetMode::Reconnect);
+        let run = runner.drive(&seed.messages, &mut transport).unwrap();
+        assert!(!run.verdict.is_disconnect(), "{:?}", run.verdict);
+        let sent: Vec<u8> = clean
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input[0])
+            .collect();
+        assert_eq!(sent, [1, 2], "OPEN, then WRITE, each its own execution");
+        assert!(!transport.take_coverage_edges().is_empty());
+        assert!(transport.take_coverage_edges().is_empty(), "taken once");
+        runner.drive(&seed.messages, &mut transport).unwrap();
+        assert_eq!(
+            clean.arms.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "reset=reconnect arms a target session per protocol session"
+        );
+
+        let work_dir = tmp_work_dir("target-transport");
+        let mut cfg = config(&model, work_dir.to_path_buf(), 20);
+        cfg.transport_label = "transport:mock".to_owned();
+        cfg.transport_kind = "transport".to_owned();
+        let faulty = MockTarget {
+            fault_on: Some(2),
+            ..MockTarget::default()
+        };
+        let mut transport =
+            TargetSessionTransport::new(Box::new(faulty), SessionResetMode::Reconnect);
+        let summary = run_session_campaign(&model, &mut transport, &cfg, None).unwrap();
+        assert_eq!(summary.coverage_source, "target", "{summary:?}");
+        assert!(summary.coverage_edges > 0, "{summary:?}");
+        assert!(summary.crashes > 0, "{summary:?}");
+        assert_eq!(summary.findings.len(), 1, "one per message: {summary:?}");
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let record = std::fs::read_to_string(finding_dir.join("finding.json")).unwrap();
+        assert!(record.contains(DISCONNECT_RULE), "{record}");
+        assert!(
+            record.contains("faulted on this message") && record.contains("0x8001234"),
+            "{record}"
         );
     }
 
