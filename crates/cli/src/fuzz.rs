@@ -24,6 +24,7 @@ use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
 mod shared_map;
+pub(crate) mod typed_spans;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
 
@@ -1045,6 +1046,10 @@ pub(crate) struct FuzzRunSummary {
     /// their confirmation (#207). Omitted when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) hangs: Option<HangRunSummary>,
+    /// The persistent engine's stability calibration of new corpus entries
+    /// (#232). Omitted when none was calibrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stability: Option<StabilitySummary>,
 }
 
 /// Fresh-process re-runs of new corpus inputs during one fork-server pass.
@@ -1272,6 +1277,10 @@ struct PreparedFuzzRun {
     _local_cmp_map: Option<shared_map::SharedMapFile>,
     /// Keeps the value-profile (#398) map alive for the run.
     _local_vp_map: Option<shared_map::SharedMapFile>,
+    /// Keeps the stack-depth (#220) word alive for the run.
+    _local_stack_map: Option<shared_map::SharedMapFile>,
+    /// Keeps the per-exec edge hit-count map (#420, #401) alive for the run.
+    _local_count_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
@@ -1838,6 +1847,41 @@ fn run_collector_for_fuzz(
     Ok(provenance)
 }
 
+/// `bhf auto --collector` (#278): observe `harness_id`'s retained inputs under
+/// the collector after its fuzz passes, as `bhf fuzz --collector` does, and
+/// return the run provenance. `wrapper` is the emulator a cross-built harness
+/// runs under; `runtrace_log` the last pass's shim log, read for the sinks no
+/// replay reaches.
+pub(crate) fn observe_with_collector(
+    work_dir: &Path,
+    harness_id: &str,
+    spec: &crate::collector_run::CollectorSpec,
+    window_ms: u64,
+    wrapper: Option<crate::runner::HarnessWrapper>,
+    env: &[(String, String)],
+    runtrace_log: Option<&Path>,
+) -> anyhow::Result<serde_json::Value> {
+    let harness = find_harness_executable(work_dir, harness_id, FuzzEngine::Builtin)
+        .map_err(anyhow::Error::msg)?;
+    let runner = crate::runner::harness_runner_with_wrapper(
+        harness,
+        wrapper,
+        crate::runner::SandboxModeArg::Auto,
+        None,
+        false,
+    );
+    let harness =
+        collector_replay::CollectorHarness::new(runner, work_dir, env, Duration::from_secs(10));
+    run_collector_for_fuzz(
+        spec,
+        window_ms,
+        work_dir,
+        harness_id,
+        runtrace_log,
+        Some(&harness),
+    )
+}
+
 /// The rules of the runtime-oracle findings already written for `harness_id`
 /// in `findings_dir`: the oracle lane's own findings, with their testcases, so
 /// the campaign-aggregate collector view does not repeat them.
@@ -1873,7 +1917,7 @@ pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(&FuzzTick);
 /// dashboard needs coverage growth WHILE a pass runs, not only in the pass
 /// summary, because "no new edge for four minutes" is the signal that the rest
 /// of this target's budget is being wasted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FuzzTick {
     pub(crate) executions: usize,
     pub(crate) findings: usize,
@@ -1881,6 +1925,8 @@ pub(crate) struct FuzzTick {
     /// Inputs in the in-memory corpus the mutator draws from.
     pub(crate) corpus: usize,
     pub(crate) elapsed: Duration,
+    /// The stability calibration has measured so far (#232).
+    pub(crate) stability_pct: Option<f64>,
 }
 
 /// When `bhf fuzz` prints its progress lines: 2s into the run, then after
@@ -1912,8 +1958,12 @@ impl ProgressLines {
 
 fn format_progress_line(tick: &FuzzTick) -> String {
     let secs = tick.elapsed.as_secs_f64();
+    let stability = tick
+        .stability_pct
+        .map(|pct| format!(" | stability: {pct:.1}%"))
+        .unwrap_or_default();
     format!(
-        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {} | elapsed: {:.1}s",
+        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {}{stability} | elapsed: {:.1}s",
         tick.executions,
         executions_per_sec(tick.executions, secs),
         tick.corpus,
@@ -3302,6 +3352,33 @@ fn prepare_with_runner(
             None
         };
 
+    // #401: the per-exec edge hit-count map, so a loop or recursion run more
+    // times on known edges is new coverage here as in `bhf auto` (#420).
+    let local_count_map =
+        if builtin_framed && !extra_env.iter().any(|(key, _)| key == "BHF_COV_CNT_SHM") {
+            let (path, value) = arm_shared_map(&work_dir, BHF_COV_BITS)?;
+            extra_env.push(("BHF_COV_CNT_SHM".to_owned(), value));
+            Some(path)
+        } else {
+            None
+        };
+
+    // #220 stack depth: the driver records each exec's deepest stack, and a
+    // deeper one is novelty, so recursion depth compounds toward exhaustion.
+    // `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
+    let local_stack_map = if builtin_framed
+        && !extra_env
+            .iter()
+            .any(|(key, _)| key == "BHF_STACK_DEPTH_SHM")
+        && std::env::var("BHF_DISABLE_STACK_DEPTH").as_deref() != Ok("1")
+    {
+        let (path, value) = arm_shared_map(&work_dir, BHF_STACK_DEPTH_BYTES)?;
+        extra_env.push(("BHF_STACK_DEPTH_SHM".to_owned(), value));
+        Some(path)
+    } else {
+        None
+    };
+
     // In-campaign input-to-state channels — armed BY DEFAULT for the raw
     // `bhf fuzz` path so the built-in engine solves magic-value / integer
     // comparison gates out of the box, matching what `bhf auto` already wires
@@ -3368,6 +3445,8 @@ fn prepare_with_runner(
         _local_coverage_map: local_coverage_map,
         _local_cmp_map: local_cmp_map,
         _local_vp_map: local_vp_map,
+        _local_stack_map: local_stack_map,
+        _local_count_map: local_count_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
         dict_file: args.dict_file,
@@ -3574,6 +3653,32 @@ struct CoverageTracker {
     cmpp_map: *mut u8,
     cmpp_len: usize,
     virgin_progress: Vec<u8>,
+    /// #220 stack depth: a FOURTH channel. `stack_map` is the driver's 8-byte
+    /// word of the deepest stack (bytes) this exec reached
+    /// (`BHF_STACK_DEPTH_SHM`); null when unset. `deepest` is the highest
+    /// [`stack_depth_bucket`] any input has reached, so an input that recurses
+    /// deeper than every prior one is novel on the same edges.
+    stack_map: *mut u8,
+    deepest: u32,
+}
+
+/// The bytes of the driver's stack-depth word (#220).
+const BHF_STACK_DEPTH_BYTES: usize = 8;
+
+/// A stack depth's novelty bucket: four per doubling (the two bits after the
+/// leading one), so a recursion a quarter deeper again than any before is new,
+/// while a few frames' jitter within one is not. 0 for no depth.
+fn stack_depth_bucket(depth: u64) -> u32 {
+    if depth == 0 {
+        return 0;
+    }
+    let log = 63 - depth.leading_zeros();
+    let fraction = if log >= 2 {
+        ((depth >> (log - 2)) & 3) as u32
+    } else {
+        ((depth << (2 - log)) & 3) as u32
+    };
+    1 + log * 4 + fraction
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -3622,6 +3727,13 @@ impl CoverageTracker {
         } else {
             vec![0u8; BHF_CMPP_BITS]
         };
+        // #220: optionally map the driver's stack-depth word, a fourth channel;
+        // null (inert) when BHF_STACK_DEPTH_SHM is unset.
+        let stack_map = extra_env
+            .iter()
+            .find(|(k, _)| k == "BHF_STACK_DEPTH_SHM")
+            .and_then(|(_, path)| map_shared_file(path, BHF_STACK_DEPTH_BYTES))
+            .unwrap_or(std::ptr::null_mut());
         let mut tracker = Self {
             map,
             len: BHF_COV_BITS,
@@ -3632,6 +3744,8 @@ impl CoverageTracker {
             cmpp_map,
             cmpp_len,
             virgin_progress,
+            stack_map,
+            deepest: 0,
         };
         // Start from whatever coverage already exists (so a later pass only counts
         // edges beyond the earlier passes' accumulated bitmap as "new").
@@ -3663,6 +3777,12 @@ impl CoverageTracker {
             self.last_count = now;
         }
         added
+    }
+
+    /// Take the cumulative edge count as the baseline without crediting an
+    /// input: calibration re-runs hit edges that are no new input's.
+    fn absorb_coverage(&mut self) {
+        self.last_count = self.count();
     }
 
     /// Copy the raw edge bitmap (#400 colorization). Used to save the cumulative
@@ -3727,6 +3847,36 @@ impl CoverageTracker {
         novel
     }
 
+    /// Zero the stack-depth word (#220) so the next exec records its own
+    /// deepest stack; the driver only raises it. No-op when it is absent.
+    fn zero_stack(&self) {
+        if self.stack_map.is_null() {
+            return;
+        }
+        // SAFETY: when non-null, `self.stack_map` is our writable 8-byte mapping.
+        unsafe { std::ptr::write_bytes(self.stack_map, 0, BHF_STACK_DEPTH_BYTES) }
+    }
+
+    /// 1 when the just-executed input reached a deeper stack bucket than any
+    /// input before it (#220), else 0: deeper recursion over the same edges is
+    /// progress toward stack exhaustion. Stateful; call once per main exec,
+    /// after it and before [`Self::zero_stack`] for the next. 0 without the word.
+    fn input_deepened_stack(&mut self) -> usize {
+        if self.stack_map.is_null() {
+            return 0;
+        }
+        // SAFETY: when non-null, `self.stack_map` is a valid 8-byte mapping the
+        // driver writes with one aligned store between execs.
+        let depth = unsafe { std::ptr::read_volatile(self.stack_map as *const u64) };
+        let bucket = stack_depth_bucket(depth);
+        if bucket > self.deepest {
+            self.deepest = bucket;
+            1
+        } else {
+            0
+        }
+    }
+
     /// Zero the per-exec comparison-progress map (#421) so the NEXT exec records
     /// its per-site leading-byte-match in isolation; the harness only ever raises
     /// a site via a `max`-write. Called before EVERY main exec. No-op when the
@@ -3781,6 +3931,7 @@ impl Drop for CoverageTracker {
         unmap_shared(self.map, self.len);
         unmap_shared(self.cnt_map, self.cnt_len);
         unmap_shared(self.cmpp_map, self.cmpp_len);
+        unmap_shared(self.stack_map, BHF_STACK_DEPTH_BYTES);
     }
 }
 
@@ -3798,6 +3949,7 @@ impl CoverageTracker {
     fn input_increased_coverage(&mut self) -> usize {
         0
     }
+    fn absorb_coverage(&mut self) {}
     fn snapshot(&self) -> Vec<u8> {
         Vec::new()
     }
@@ -3809,6 +3961,10 @@ impl CoverageTracker {
     }
     fn zero_progress(&self) {}
     fn input_advanced_comparisons(&mut self) -> usize {
+        0
+    }
+    fn zero_stack(&self) {}
+    fn input_deepened_stack(&mut self) -> usize {
         0
     }
 }
@@ -3833,6 +3989,9 @@ struct PoolEntry {
     /// at the offset they were compared instead of every occurrence of a common
     /// byte. `None` until captured; mutation draws from it when present.
     colored: Option<Vec<u8>>,
+    /// The spans of the mutation base's decoded scalar arguments (#299),
+    /// from the harness's `arg-layout.json`; `None` until first selected.
+    typed_spans: Option<Vec<fuzz_engine_builtin::TypedSpan>>,
     /// A fresh-process re-run showed this input crashes (#416): it is a
     /// finding, so it is neither mutated from nor saved in the queue. Kept in
     /// place so every other entry keeps its pool index.
@@ -3848,11 +4007,16 @@ struct CoverageNovelty {
     new_edges: usize,
     new_buckets: usize,
     comparison_advances: usize,
+    /// #220: the input reached a deeper stack than any before it.
+    deeper_stack: usize,
 }
 
 impl CoverageNovelty {
     fn made_progress(self) -> bool {
-        self.new_edges > 0 || self.new_buckets > 0 || self.comparison_advances > 0
+        self.new_edges > 0
+            || self.new_buckets > 0
+            || self.comparison_advances > 0
+            || self.deeper_stack > 0
     }
 
     fn scheduling_energy(self) -> u32 {
@@ -3860,7 +4024,147 @@ impl CoverageNovelty {
             .saturating_mul(8)
             .saturating_add(self.new_buckets.saturating_mul(2))
             .saturating_add(self.comparison_advances)
+            .saturating_add(self.deeper_stack.saturating_mul(4))
             .clamp(1, 4096) as u32
+    }
+}
+
+/// Write `input` into the live corpus dir (#256) as `<sha256>.bin`, the
+/// queue's naming. Best effort: the dir is an observer's, not the run's.
+fn write_live_corpus_entry(dir: &Path, input: &[u8]) {
+    use sha2::Digest;
+    let name = corpus::hex_lower(&sha2::Sha256::digest(input));
+    let path = dir.join(format!("{name}.bin"));
+    if !path.exists() {
+        let _ = fs::write(path, input);
+    }
+}
+
+/// How many times the persistent engine re-runs a new corpus entry to see
+/// whether it hits the same edges each time (#232).
+const CALIBRATION_RERUNS: usize = 4;
+
+/// Below this stability the run says the harness carries state between
+/// executions (AFL++ colours its stability figure at the same mark).
+const STABILITY_HINT_PCT: f64 = 90.0;
+
+/// Stability calibration of the persistent engine's new corpus entries
+/// (#232), as AFL++ calibrates its queue: one process runs input after input,
+/// so a target that keeps state from one execution to the next hits edges
+/// that depend on what ran before rather than on the input.
+#[derive(Debug, Default)]
+struct Calibration {
+    /// Edges any calibration run hit.
+    observed: HashSet<u32>,
+    /// Edges one run of an input hit and another run of it did not.
+    variable: HashSet<u32>,
+    /// Edges every run of some calibrated input hit.
+    stable: HashSet<u32>,
+    entries: usize,
+    dropped: usize,
+}
+
+impl Calibration {
+    /// Fold the edge sets of one input's runs. Whether it keeps its place in
+    /// the corpus: it hit the same edges every time, or it hit, every time,
+    /// an edge no calibrated input hit every time before. Otherwise its new
+    /// coverage was edges that vary from run to run.
+    fn calibrate(&mut self, runs: &[Vec<u32>]) -> bool {
+        let Some((first, rest)) = runs.split_first() else {
+            return true;
+        };
+        let mut every: HashSet<u32> = first.iter().copied().collect();
+        let mut any = every.clone();
+        for run in rest {
+            let edges: HashSet<u32> = run.iter().copied().collect();
+            every.retain(|edge| edges.contains(edge));
+            any.extend(edges);
+        }
+        self.entries += 1;
+        self.variable.extend(any.difference(&every).copied());
+        let stable_input = any.len() == every.len();
+        let adds_a_stable_edge = every
+            .iter()
+            .any(|edge| !self.stable.contains(edge) && !self.variable.contains(edge));
+        self.observed.extend(any);
+        self.stable.extend(every);
+        let keep = stable_input || adds_a_stable_edge;
+        if !keep {
+            self.dropped += 1;
+        }
+        keep
+    }
+
+    /// The share of observed edges no run varied on, in percent; `None`
+    /// before any entry was calibrated.
+    fn stability_pct(&self) -> Option<f64> {
+        if self.entries == 0 {
+            return None;
+        }
+        if self.observed.is_empty() {
+            return Some(100.0);
+        }
+        let steady = self.observed.len() - self.variable.len();
+        Some((steady as f64 * 1000.0 / self.observed.len() as f64).round() / 10.0)
+    }
+
+    fn summary(&self) -> Option<StabilitySummary> {
+        Some(StabilitySummary {
+            stability_pct: self.stability_pct()?,
+            calibrated_entries: self.entries,
+            reruns_per_entry: CALIBRATION_RERUNS,
+            observed_edges: self.observed.len(),
+            variable_edges: self.variable.len(),
+            unstable_entries_dropped: self.dropped,
+        })
+    }
+}
+
+/// The run's stability calibration (#232).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StabilitySummary {
+    /// The share of the edges calibration runs hit that every run of the
+    /// same input hit, in percent: 100 for a target whose coverage depends
+    /// on its input alone.
+    pub(crate) stability_pct: f64,
+    /// New corpus entries that were re-run.
+    pub(crate) calibrated_entries: usize,
+    /// The re-runs of each.
+    pub(crate) reruns_per_entry: usize,
+    pub(crate) observed_edges: usize,
+    /// Edges one run of an input hit and another run of it did not.
+    pub(crate) variable_edges: usize,
+    /// Entries left out of the corpus because their new coverage was only
+    /// edges that vary from run to run.
+    pub(crate) unstable_entries_dropped: usize,
+}
+
+impl StabilitySummary {
+    /// What a stability below [`STABILITY_HINT_PCT`] means, and what to do.
+    fn hint(&self) -> Option<String> {
+        (self.stability_pct < STABILITY_HINT_PCT).then(|| {
+            format!(
+                "bhf fuzz: stability {:.1}%: {} of the {} edges calibration saw differ between \
+                 runs of the same input, so the harness keeps state from one execution to the \
+                 next and coverage follows what ran before. {} new corpus entr{} whose only new \
+                 coverage was such edges {} left out. Run with --no-fork-server to give each \
+                 input a fresh process, or reset the target's state at the start of each call.",
+                self.stability_pct,
+                self.variable_edges,
+                self.observed_edges,
+                self.unstable_entries_dropped,
+                if self.unstable_entries_dropped == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                if self.unstable_entries_dropped == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
+            )
+        })
     }
 }
 
@@ -3872,6 +4176,7 @@ impl PoolEntry {
             selections: 0,
             cmplog: None,
             colored: None,
+            typed_spans: None,
             retired: false,
         }
     }
@@ -4220,6 +4525,13 @@ fn run_builtin_with_progress(
         .harness_path
         .parent()
         .and_then(SequenceGeometry::load);
+    // #299: the harness's argument layout, for typed mutation of the
+    // arguments it decodes.
+    let arg_layout = typed_spans::find_arg_layout(
+        &prepared.work_dir,
+        &prepared.harness_id,
+        Some(&prepared.harness_path),
+    );
     let mut portfolio_feedback = sequence_geometry
         .filter(|geometry| geometry.portfolio_lanes > 1)
         .map(|geometry| {
@@ -4233,6 +4545,17 @@ fn run_builtin_with_progress(
     let mut corpus_new = 0_usize;
     let mut corpus_duplicates = 0_usize;
     let mut non_reproducible = 0_usize;
+    let mut calibration = Calibration::default();
+    // #256: `BHF_LIVE_CORPUS_DIR` gets each input as the pool keeps it, so a
+    // harness that watches the corpus over a campaign (the engine trade
+    // study's coverage-over-time snapshots) sees it grow. The queue is
+    // written when the pass ends, after its re-run checks.
+    let live_corpus_dir = std::env::var_os("BHF_LIVE_CORPUS_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    if let Some(dir) = live_corpus_dir.as_deref() {
+        let _ = fs::create_dir_all(dir);
+    }
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -4777,12 +5100,22 @@ fn run_builtin_with_progress(
                     let log = if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         cmplog::CmpLog::default()
                     } else {
-                        capture_cmplog(reader, fork, &colored)
+                        let mut log = capture_cmplog(reader, fork, &colored);
+                        log.retain_spliceable(&colored);
+                        log
                     };
                     if let Some(entry) = pool.get_mut(base_index) {
                         entry.cmplog = Some(log);
                         entry.colored = Some(colored);
                     }
+                }
+            }
+            if let (Some(layout), Some(entry)) = (arg_layout.as_ref(), pool.get_mut(base_index)) {
+                if entry.typed_spans.is_none() {
+                    entry.typed_spans = Some(typed_spans::arg_layout_typed_spans(
+                        layout,
+                        entry.mutation_base(),
+                    ));
                 }
             }
             let (bytes, made_from) = mutate_from_pool(
@@ -4823,6 +5156,8 @@ fn run_builtin_with_progress(
             // per-site leading-byte-match is recorded in isolation (the harness
             // only ever `max`-raises it). No-op when the progress map is absent.
             cov.zero_progress();
+            // #220: and the stack-depth word.
+            cov.zero_stack();
         }
         // Whether this run came from the persistent fork-server (vs a fresh
         // per-spawn process). Fork-server findings are replay-validated below so
@@ -4949,10 +5284,12 @@ fn run_builtin_with_progress(
                 let new_edges = t.input_increased_coverage();
                 let new_buckets = t.input_grew_buckets();
                 let comparison_advances = t.input_advanced_comparisons();
+                let deeper_stack = t.input_deepened_stack();
                 CoverageNovelty {
                     new_edges,
                     new_buckets,
                     comparison_advances,
+                    deeper_stack,
                 }
             })
             .unwrap_or_default();
@@ -4985,6 +5322,7 @@ fn run_builtin_with_progress(
                     edges: cov_tracker.as_ref().map_or(0, |cov| cov.count()),
                     corpus: pool.len(),
                     elapsed: start.elapsed(),
+                    stability_pct: calibration.stability_pct(),
                 });
                 last_tick = Instant::now();
             }
@@ -5214,10 +5552,53 @@ fn run_builtin_with_progress(
         if run.sanitizer.is_some() && crashing_inputs.len() < finding_dedup_limit {
             crashing_inputs.insert(crash_input_key(&input));
         }
-        let keep = made_progress
+        let mut keep = made_progress
             && run.sanitizer.is_none()
             && pool.len() < corpus_limits.entries
             && pool_bytes.saturating_add(input.len()) <= corpus_limits.bytes;
+        // #232: re-run an input the persistent process would enqueue, each
+        // run from a zeroed edge bitmap, and leave it out when its new
+        // coverage was only edges that vary from run to run (state the target
+        // kept from earlier inputs). The bitmap is put back with the re-runs'
+        // edges added, without crediting any input, so a state-dependent edge
+        // they reach is not new coverage later.
+        if let (true, true, Some(cov), Some(fork)) = (
+            keep && !input.is_empty(),
+            input_new_coverage && from_fork_server,
+            cov_tracker.as_mut(),
+            fork_server.as_mut(),
+        ) {
+            let mut seen = cov.snapshot();
+            let mut runs = Vec::with_capacity(CALIBRATION_RERUNS);
+            for _ in 0..CALIBRATION_RERUNS {
+                cov.zero();
+                cov.zero_counts();
+                cov.zero_progress();
+                cov.zero_stack();
+                let _ = fork.run_one(&input);
+                let hit = cov.snapshot();
+                runs.push(
+                    hit.iter()
+                        .enumerate()
+                        .filter(|(_, byte)| **byte != 0)
+                        .map(|(edge, _)| edge as u32)
+                        .collect::<Vec<u32>>(),
+                );
+                for (into, byte) in seen.iter_mut().zip(&hit) {
+                    *into |= *byte;
+                }
+            }
+            cov.restore(&seen);
+            cov.absorb_coverage();
+            let steady = calibration.calibrate(&runs);
+            let other_progress = !new_signatures.is_empty()
+                || input_novelty.comparison_advances > 0
+                || input_novelty.deeper_stack > 0;
+            if !steady && !other_progress {
+                keep = false;
+                corpus_new = corpus_new.saturating_sub(1);
+            }
+        }
         if !input.is_empty() && keep {
             if let Some(lane) = portfolio_lane.and_then(|lane| {
                 portfolio_feedback
@@ -5227,6 +5608,9 @@ fn run_builtin_with_progress(
                 lane.retained_inputs = lane.retained_inputs.saturating_add(1);
             }
             lineage.retain(&input, parents);
+            if let Some(dir) = live_corpus_dir.as_deref() {
+                write_live_corpus_entry(dir, &input);
+            }
             pool_bytes = pool_bytes.saturating_add(input.len());
             pool.push(PoolEntry {
                 bytes: input,
@@ -5234,6 +5618,7 @@ fn run_builtin_with_progress(
                 selections: 0,
                 cmplog: None,
                 colored: None,
+                typed_spans: None,
                 retired: false,
             });
         }
@@ -5539,7 +5924,11 @@ fn run_builtin_with_progress(
         unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
         fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
         hangs: (hangs.observed > 0).then_some(hangs),
+        stability: calibration.summary(),
     };
+    if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
+        bhfeprintln!("{hint}");
+    }
     if prepared.print_final_stats {
         bhfeprintln!(
             "{}",
@@ -6392,6 +6781,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
         fresh_reruns: None,
         hangs: None,
+        stability: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -7877,6 +8267,12 @@ fn mutate_from_pool(
         .unwrap_or(&[]);
     let peer = &full_peer[..full_peer.len().min(config.max_len)];
     let mut mutation_input = MutationInput::new(base, dictionary).with_peer(peer);
+    if let Some(spans) = pool
+        .get(base_index)
+        .and_then(|entry| entry.typed_spans.as_deref())
+    {
+        mutation_input = mutation_input.with_typed_spans(spans);
+    }
     let cmplog = pool
         .get(base_index)
         .and_then(|entry| entry.cmplog.as_ref())
@@ -8057,8 +8453,10 @@ pub(crate) const LEARNED_CONSTANTS_MARKER: &str =
 /// The first lines of `learned_dictionary.txt`.
 pub(crate) const LEARNED_DICTIONARY_HEADER: &str = "\
 # Comparison operands observed at runtime while this harness was fuzzed
-# (the strcmp/memcmp-family operands recorded in cmplog.jsonl beside this
-# file), not mined from the source like dictionary.txt. A token is an operand
+# (the strcmp/memcmp-family operands and integer comparison constants
+# recorded in cmplog.jsonl beside this file), not mined from the source like
+# dictionary.txt. An integer constant is written little-endian, then
+# big-endian. Any other token is an operand
 # that met more distinct values at one comparison site than any of them met
 # there (the constant stays, the input compared with it varies), or one that
 # dictionary.txt also lists; a record that names no site only confirms a
@@ -8096,8 +8494,14 @@ pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<us
         }
     };
     let constants = log.constant_operands(&mined);
+    // An integer constant is also written big-endian, for a target that
+    // compares a field it read in network order.
+    let integers = log.integer_constants();
     for token in &constants {
         push(&mut tokens, token.clone());
+        if integers.contains(&token.as_slice()) {
+            push(&mut tokens, token.iter().rev().copied().collect());
+        }
     }
     if tokens.is_empty() {
         return Ok(0);
@@ -10360,6 +10764,7 @@ fn fresh_rerun_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
     const SHARED_WITH_THE_FORK_SERVER: &[&str] = &[
         "BHF_COV_SHM",
         "BHF_COV_CNT_SHM",
+        "BHF_STACK_DEPTH_SHM",
         "BHF_CMP_PROGRESS_SHM",
         "BHF_CMP_SHM",
         "BHF_VP_SHM",
@@ -11841,15 +12246,159 @@ mod entropic_tests {
             new_edges: 40,
             new_buckets: 3,
             comparison_advances: 1,
+            deeper_stack: 0,
         };
         let narrow_lane = CoverageNovelty {
             new_edges: 0,
             new_buckets: 1,
             comparison_advances: 0,
+            deeper_stack: 0,
         };
         assert!(broad_lane.scheduling_energy() > narrow_lane.scheduling_energy() * 100);
         assert!(broad_lane.made_progress());
         assert!(!CoverageNovelty::default().made_progress());
+    }
+}
+
+#[cfg(test)]
+mod typed_span_tests {
+    use super::{mutate_from_pool, typed_spans, PoolEntry};
+    use fuzz_engine_builtin::{Dictionary, MutationRng, MutatorConfig};
+
+    /// The 32-bit boundary values the first argument of `outputs` took,
+    /// little-endian at offset 0, with the rest of the base kept.
+    fn int32_boundaries_at_the_span(outputs: &[Vec<u8>], base: &[u8]) -> Vec<i32> {
+        let mut seen: Vec<i32> = [0, 1, -1, i32::MIN, i32::MAX]
+            .into_iter()
+            .filter(|value| {
+                outputs.iter().any(|out| {
+                    out.len() == base.len()
+                        && out[..4] == value.to_le_bytes()
+                        && out[4..] == base[4..]
+                })
+            })
+            .collect();
+        seen.sort_unstable();
+        seen
+    }
+
+    fn mutate(entry: &PoolEntry) -> Vec<Vec<u8>> {
+        let pool = [PoolEntry {
+            typed_spans: entry.typed_spans.clone(),
+            ..PoolEntry::seed(entry.bytes.clone())
+        }];
+        let dictionary = Dictionary::default();
+        let config = MutatorConfig {
+            max_len: 64,
+            ..MutatorConfig::default()
+        };
+        let mut rng = MutationRng::new(299);
+        (0..4000)
+            .map(|_| mutate_from_pool(&pool, 0, &dictionary, None, None, config, None, &mut rng).0)
+            .collect()
+    }
+
+    /// #299: the loop hands the mutator the spans the harness's
+    /// `arg-layout.json` gives the base's decoded arguments, so the typed
+    /// mutation writes an `int32_t` argument's boundary values into its
+    /// bytes, little-endian, keeping the rest. Without the spans the same
+    /// seeded run does not.
+    #[test]
+    fn fuzz_loop_passes_typed_spans_from_arg_layout() {
+        let base = vec![9u8; 13];
+        let layout = typed_spans::tests::packet_layout();
+        let mut entry = PoolEntry::seed(base.clone());
+        entry.typed_spans = Some(typed_spans::arg_layout_typed_spans(&layout, &base));
+        assert_eq!(entry.typed_spans.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            int32_boundaries_at_the_span(&mutate(&entry), &base),
+            [i32::MIN, -1, 0, 1, i32::MAX]
+        );
+
+        entry.typed_spans = None;
+        assert_ne!(
+            int32_boundaries_at_the_span(&mutate(&entry), &base),
+            [i32::MIN, -1, 0, 1, i32::MAX]
+        );
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::{Calibration, CALIBRATION_RERUNS};
+
+    /// A target whose coverage follows its input alone: every entry keeps its
+    /// place and stability is 100%, with no hint.
+    #[test]
+    fn a_deterministic_target_is_fully_stable() {
+        let mut calibration = Calibration::default();
+        assert_eq!(calibration.stability_pct(), None);
+        assert!(calibration.summary().is_none());
+        for edges in [vec![1, 2, 3], vec![1, 2, 4, 5]] {
+            assert!(calibration.calibrate(&vec![edges; CALIBRATION_RERUNS]));
+        }
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.stability_pct, 100.0);
+        assert_eq!((summary.observed_edges, summary.variable_edges), (5, 0));
+        assert_eq!(summary.calibrated_entries, 2);
+        assert_eq!(summary.unstable_entries_dropped, 0);
+        assert_eq!(summary.hint(), None);
+    }
+
+    /// A static counter picks the edge: runs of one input differ, the edges
+    /// that differ are variable, and an entry whose only news is such an
+    /// edge is left out, while the first one, whose shared edges are new,
+    /// stays.
+    #[test]
+    fn edges_that_vary_between_runs_of_an_input_lower_stability() {
+        let mut calibration = Calibration::default();
+        let shared = [1, 2, 3];
+        let runs = |cases: [u32; 4]| -> Vec<Vec<u32>> {
+            cases
+                .iter()
+                .map(|case| shared.iter().copied().chain([100 + case]).collect())
+                .collect()
+        };
+        assert!(
+            calibration.calibrate(&runs([0, 1, 2, 3])),
+            "new shared edges"
+        );
+        assert!(
+            !calibration.calibrate(&runs([4, 5, 6, 7])),
+            "only a varying edge"
+        );
+        // An unstable input that also reaches a new edge every time stays.
+        let mut deeper = runs([8, 9, 10, 11]);
+        for run in &mut deeper {
+            run.push(50);
+        }
+        assert!(calibration.calibrate(&deeper));
+
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.observed_edges, 3 + 12 + 1);
+        assert_eq!(summary.variable_edges, 12);
+        assert_eq!(summary.stability_pct, 25.0);
+        assert_eq!(summary.unstable_entries_dropped, 1);
+        let hint = summary.hint().expect("a hint below 90%");
+        assert!(hint.contains("stability 25.0%"), "{hint}");
+        assert!(hint.contains("12 of the 16 edges"), "{hint}");
+        assert!(hint.contains("1 new corpus entry whose"), "{hint}");
+        assert!(hint.contains("--no-fork-server"), "{hint}");
+    }
+
+    /// 90% is the mark: at it, no hint; just under, one.
+    #[test]
+    fn the_hint_starts_below_ninety_percent() {
+        let mut calibration = Calibration::default();
+        let mut runs = vec![(0..10).collect::<Vec<u32>>(); CALIBRATION_RERUNS];
+        runs[1].pop();
+        calibration.calibrate(&runs);
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.stability_pct, 90.0);
+        assert_eq!(summary.hint(), None);
+        let mut lower = summary;
+        lower.stability_pct = 89.9;
+        assert!(lower.hint().is_some());
     }
 }
 
@@ -11917,7 +12466,9 @@ mod resolve_iterations_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod coverage_tracker_tests {
-    use super::{count_to_bucket, CoverageTracker, BHF_COV_BITS};
+    use super::{
+        count_to_bucket, stack_depth_bucket, CoverageNovelty, CoverageTracker, BHF_COV_BITS,
+    };
     use std::io::{Seek, SeekFrom, Write};
 
     // Set one bitmap byte (an "edge") the way the driver's coverage runtime would.
@@ -12136,6 +12687,74 @@ mod coverage_tracker_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stack-depth buckets: four per doubling, so depth a quarter beyond
+    /// a bucket is the next one, and nothing below that is.
+    #[test]
+    fn stack_depth_buckets_split_each_doubling_in_four() {
+        assert_eq!(stack_depth_bucket(0), 0);
+        let buckets: Vec<u32> = [1, 2, 3, 4, 5, 6, 7, 8].map(stack_depth_bucket).to_vec();
+        assert_eq!(buckets, [1, 5, 7, 9, 10, 11, 12, 13]);
+        assert_eq!(stack_depth_bucket(4096), stack_depth_bucket(5119));
+        assert_eq!(stack_depth_bucket(5120), stack_depth_bucket(4096) + 1);
+        assert_eq!(stack_depth_bucket(8192), stack_depth_bucket(4096) + 4);
+        assert_eq!(stack_depth_bucket(u64::MAX), 1 + 63 * 4 + 3);
+    }
+
+    // #220: an input that recursed deeper than every input before it is novel
+    // with no new edge, once per bucket; a shallower or equal one is not.
+    #[test]
+    fn a_deeper_stack_on_the_same_edges_is_novelty() {
+        let dir = crate::test_support::TestDir::new("stack-depth");
+        let cov = dir.join("coverage.shm");
+        let stack = dir.join("stack.shm");
+        let env = vec![
+            ("BHF_COV_SHM".to_owned(), cov.display().to_string()),
+            (
+                "BHF_STACK_DEPTH_SHM".to_owned(),
+                stack.display().to_string(),
+            ),
+        ];
+        let mut tracker = CoverageTracker::new(&env).expect("tracker maps the stack word");
+        set_edge(&cov, 42);
+        assert_eq!(tracker.input_increased_coverage(), 1);
+
+        let exec = |tracker: &mut CoverageTracker, depth: u64| -> CoverageNovelty {
+            tracker.zero_stack();
+            assert_eq!(std::fs::read(&stack).unwrap(), [0; 8]);
+            std::fs::write(&stack, depth.to_ne_bytes()).unwrap();
+            CoverageNovelty {
+                new_edges: tracker.input_increased_coverage(),
+                deeper_stack: tracker.input_deepened_stack(),
+                ..CoverageNovelty::default()
+            }
+        };
+        let first = exec(&mut tracker, 4096);
+        assert_eq!((first.new_edges, first.deeper_stack), (0, 1));
+        assert!(first.made_progress());
+        assert!(!exec(&mut tracker, 4096).made_progress());
+        assert!(
+            !exec(&mut tracker, 5000).made_progress(),
+            "within the bucket"
+        );
+        assert!(!exec(&mut tracker, 512).made_progress(), "shallower");
+        assert!(exec(&mut tracker, 5120).made_progress());
+        let deep = exec(&mut tracker, 1 << 20);
+        assert_eq!(deep.deeper_stack, 1);
+        assert!(deep.scheduling_energy() > 1);
+    }
+
+    /// Without the stack word (a harness built before it, or a lane that
+    /// does not arm it) the channel reports nothing.
+    #[test]
+    fn coverage_tracker_without_stack_word_is_inert() {
+        let dir = crate::test_support::TestDir::new("stack-absent");
+        let cov = dir.join("coverage.shm");
+        let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
+        let mut tracker = CoverageTracker::new(&env).expect("tracker maps the bitmap");
+        tracker.zero_stack();
+        assert_eq!(tracker.input_deepened_stack(), 0);
     }
 
     // #421: the comparison-progress channel is inert (always false) when its map
@@ -13948,6 +14567,25 @@ exit 0
         );
     }
 
+    /// An integer comparison's constant (#221) is learned from one record,
+    /// little-endian as compared and big-endian beside it.
+    #[test]
+    fn a_learned_integer_constant_is_written_in_both_byte_orders() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-INT");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(
+            harness.join("cmplog.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"int\",\"s\":\"00000010.00000000\",\"a\":\"5b3e0f69\",\"b\":\"\"}\n",
+        )
+        .unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 2);
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            vec![vec![0x5b, 0x3e, 0x0f, 0x69], vec![0x69, 0x0f, 0x3e, 0x5b]]
+        );
+    }
+
     /// A runtime constant holding a protocol delimiter (`\r\n`) is written
     /// with `\xNN` escapes, which AFL++ loads, and reads back as the same
     /// bytes.
@@ -14527,6 +15165,7 @@ exit 0
                 edges: 37,
                 corpus: 5,
                 elapsed: Duration::from_secs(secs),
+                stability_pct: None,
             })
         };
         assert_eq!(at(1), None);
@@ -14545,6 +15184,24 @@ exit 0
         assert_eq!(at(61), None);
         assert!(at(62).is_some());
         assert!(at(92).is_some());
+    }
+
+    /// Once an entry was calibrated (#232), the status line gives stability.
+    #[test]
+    fn the_progress_line_gives_stability_once_measured() {
+        let line = format_progress_line(&FuzzTick {
+            executions: 800,
+            findings: 0,
+            edges: 37,
+            corpus: 5,
+            elapsed: Duration::from_secs(2),
+            stability_pct: Some(41.7),
+        });
+        assert_eq!(
+            line,
+            "bhf: fuzz: 800 execs (400/s) | corpus: 5 | findings: 0 | edges: 37 | stability: 41.7% \
+             | elapsed: 2.0s"
+        );
     }
 
     #[test]

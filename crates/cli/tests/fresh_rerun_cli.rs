@@ -93,6 +93,16 @@ fn five_branch_target(fresh_start_ms: u32) -> String {
 
 const FIVE_SEEDS: [&str; 5] = ["A1", "B2", "C3", "D4", "READ"];
 
+/// Whether a finding's input is READ's root cause: READ, or a mutant that
+/// keeps its first two bytes and length and so also reads the trailer in a
+/// fresh process. Whichever of them a pass checks first is the finding, and
+/// the others are later hits of it.
+fn reads_trailer(input: &serde_json::Value) -> bool {
+    input
+        .as_str()
+        .is_some_and(|input| input.starts_with("RE") && input.chars().count() >= 4)
+}
+
 /// Build `target` with bhf's driver into `<work>/harnesses/<id>/main`.
 fn build_harness(work: &Path, id: &str, target: &str, sanitize: bool) {
     let dir = work.join("harnesses").join(id);
@@ -309,8 +319,8 @@ fn an_input_reaches_the_queue_only_once_a_fresh_run_clears_it() {
     assert!(
         found
             .iter()
-            .any(|finding| finding["rule_id"] == "BHF-201" && finding["input"] == "READ"),
-        "READ is reported once a fresh run checks it: {found:?}"
+            .any(|finding| finding["rule_id"] == "BHF-201" && reads_trailer(&finding["input"])),
+        "READ's root cause is reported once a fresh run checks it: {found:?}"
     );
     let queued = inputs_in(&queue_dir);
     assert!(!queued.contains(&b"READ".to_vec()), "{queued:?}");
@@ -697,7 +707,10 @@ mod one_core {
             );
         }
 
-        let second = loaded_pass(&[], "15s");
+        // Each re-run sleeps 1.5 s before it runs on the loaded core: give
+        // the pass the time to finish those it submits first, however many a
+        // slower machine left.
+        let second = loaded_pass(&[], &format!("{}s", 15.max(4 * unchecked)));
         assert_eq!(second.exit, Some(0), "{}", second.stderr);
         assert!(
             second.summary["fresh_reruns"]["submitted"].as_u64() >= Some(unchecked),
@@ -716,17 +729,23 @@ mod one_core {
         assert!(
             found
                 .iter()
-                .any(|finding| finding["rule_id"] == "BHF-201" && finding["input"] == "READ"),
-            "READ is reported by the next pass: {found:?}"
+                .any(|finding| finding["rule_id"] == "BHF-201" && reads_trailer(&finding["input"])),
+            "READ's root cause is reported by the next pass: {found:?}"
         );
         let queued = inputs_in(&queue_dir);
         assert!(!queued.contains(&b"READ".to_vec()), "{queued:?}");
-        for input in pending.iter().filter(|input| input.as_slice() != b"READ") {
+        // A mutant of READ that keeps its first two bytes and length crashes
+        // in a fresh process too: a later hit of READ's finding, not queued.
+        let crashes = |input: &[u8]| input.len() >= 4 && input.starts_with(b"RE");
+        for input in pending.iter().filter(|input| !crashes(input)) {
             assert!(
                 queued.contains(input),
                 "clean {:?} joins the queue once checked: {queued:?}",
                 String::from_utf8_lossy(input)
             );
+        }
+        for input in pending.iter().filter(|input| crashes(input)) {
+            assert!(!queued.contains(input), "{queued:?}");
         }
         for input in &still {
             assert!(!queued.contains(input), "{input:?} is in the queue");

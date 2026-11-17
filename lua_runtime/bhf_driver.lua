@@ -287,8 +287,38 @@ local function hang_watchdog()
   os.exit(FINDING_HALT)
 end
 
+-- The file the runtrace shim reads the current input from, when bhf preloads
+-- it (#301): the shim cannot see this process's bytes otherwise, so a sink the
+-- target reached could not be traced back to the input. One per process, since
+-- bhf runs fresh processes beside this one; Lua has no getpid, so the pid is
+-- /proc/self/stat's first field.
+local shim_input_file = nil
+do
+  local base = os.getenv("BHF_SHIM_INPUT_FILE")
+  if base and base ~= "" then
+    local stat = io.open("/proc/self/stat", "r")
+    local pid = stat and stat:read("n")
+    if stat then stat:close() end
+    if pid then shim_input_file = base .. "." .. string.format("%d", pid) end
+  end
+end
+
+local function publish_input(data)
+  if not shim_input_file then return end
+  local f = io.open(shim_input_file, "wb")
+  if f then
+    f:write(data)
+    f:close()
+  end
+end
+
+local function remove_published_input()
+  if shim_input_file then os.remove(shim_input_file) end
+end
+
 local function run_input(data)
   reset_prev()
+  publish_input(data)
   if hang_after then
     sethook(hang_watchdog, "", HANG_WATCH_COUNT)
   else
@@ -375,5 +405,6 @@ else
   run_input(data)
   flush_cov()
 end
+remove_published_input()
 dump_covered()
 write_stats()

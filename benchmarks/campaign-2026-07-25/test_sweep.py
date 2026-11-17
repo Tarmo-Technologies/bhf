@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 import build_corpus
+import go1_rerun
 import run_sweep
 from go_resweep_compare import go_class
 
@@ -110,6 +111,73 @@ class GoClassTests(unittest.TestCase):
         for reason, prefix in cases.items():
             klass = go_class({"outcome": "unsupported_params", "reason": reason})
             self.assertTrue(klass.startswith(prefix), (reason, klass))
+
+
+class GoRerunTests(unittest.TestCase):
+    def test_a_class_is_selected_per_row_with_its_multiplicity(self):
+        go3 = "target is not inside a Go module (no go.mod found)"
+        go1 = "unsupported Go parameter type `*zap.Logger` (skipped)"
+
+        def row(targets):
+            return {"repo": "o/r", "sha": "s", "surfaces": {"auto": {"targets": targets}}}
+
+        def target(source, name, reason):
+            return {
+                "source": source,
+                "name": name,
+                "outcome": "unsupported_params",
+                "reason": reason,
+            }
+
+        with TemporaryDirectory() as tmp:
+            before = Path(tmp)
+            (before / "go__o__r.json").write_text(
+                json.dumps(
+                    row(
+                        [
+                            target("build.go", "FixHeader", go3),
+                            target("build.go", "FixHeader", go3),
+                            target("api.go", "Serve", go1),
+                        ]
+                    )
+                )
+            )
+            (before / "ruby__o__r.json").write_text(
+                json.dumps(row([target("locales.go", "Asset", go3), target("x.rb", "run", go3)]))
+            )
+            go_lane = go1_rerun.wanted_targets(before, "Go-3", all_lanes=False)
+            self.assertEqual(list(go_lane), ["go__o__r.json"])
+            self.assertEqual(go_lane["go__o__r.json"][1], {("build.go", "FixHeader"): 2})
+            every_lane = go1_rerun.wanted_targets(before, "Go-3", all_lanes=True)
+            self.assertEqual(every_lane["ruby__o__r.json"][1], {("locales.go", "Asset"): 1})
+            self.assertEqual(
+                go1_rerun.wanted_targets(before, "Go-1", all_lanes=False)["go__o__r.json"][1],
+                {("api.go", "Serve"): 1},
+            )
+
+    def test_java_targets_are_selected_by_their_own_classes(self):
+        java1 = "Java target 'join' parameter #0 has an unsupported type `List<String>`"
+        with TemporaryDirectory() as tmp:
+            before = Path(tmp)
+            row = {
+                "repo": "o/r",
+                "sha": "s",
+                "surfaces": {
+                    "auto": {
+                        "targets": [
+                            {"source": "Parts.java", "name": "join", "reason": java1},
+                            {"source": "parts.go", "name": "Join", "reason": java1},
+                        ]
+                    }
+                },
+            }
+            (before / "cobol__o__r.json").write_text(json.dumps(row))
+            wanted = go1_rerun.wanted_targets(before, "Java-1", all_lanes=True, lang="java")
+            self.assertEqual(wanted["cobol__o__r.json"][1], {("Parts.java", "join"): 1})
+            self.assertEqual(
+                go1_rerun.wanted_targets(before, "Java-1", all_lanes=False, lang="java"), {}
+            )
+        self.assertEqual(go1_rerun.java_class({"outcome": "built_and_fuzzed"}), "built and fuzzed")
 
 
 if __name__ == "__main__":

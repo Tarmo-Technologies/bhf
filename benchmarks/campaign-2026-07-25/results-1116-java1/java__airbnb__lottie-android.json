@@ -1,0 +1,104 @@
+{
+ "repo": "airbnb/lottie-android",
+ "sha": "05ea92e90381eb8a8ae06855ea2b74f322bebbec",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "LottieComposition.java",
+   "name": "fromAssetFileName",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromAssetFileName' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieComposition.java",
+   "name": "fromFileSync",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromFileSync' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieComposition.java",
+   "name": "fromInputStream",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromInputStream' parameter #1 has an unsupported type `OnCompositionLoadedListener`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieCompositionFactory.java",
+   "name": "fromAsset",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromAsset' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 3,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieCompositionFactory.java",
+   "name": "fromAssetSync",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromAssetSync' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 2,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieCompositionFactory.java",
+   "name": "fromInputStream",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromInputStream' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "LottieCompositionFactory.java",
+   "name": "fromInputStreamSync",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'fromInputStreamSync' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 12,
+  "discovered_total": 12,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 10,
+  "consent_required": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

@@ -12,7 +12,6 @@ use crate::auto::discovery::DirFilter;
 use crate::auto::report::{write_reports, write_reports_with_output_limit};
 use crate::target_filter::{path_matches_exclusion, ExcludeCategory};
 use anyhow::{Context, Result};
-use chrono::Utc;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -194,6 +193,22 @@ pub struct AutoArgs {
     /// than `--timeout`. Off by default.
     #[arg(long = "deadline", value_parser = crate::fuzz::parse_duration)]
     pub deadline: Option<std::time::Duration>,
+
+    /// Runtime-event collector that observes each fuzzed target's process,
+    /// filesystem and module-load effects: after a target's passes, its
+    /// retained inputs (its findings, then its corpus, at most 16) are replayed
+    /// one by one under it, as `bhf fuzz --collector` does. `auto` selects the
+    /// platform's built-in provider (the native Windows ETW provider, or on
+    /// Linux the runtrace shim), a PATH runs an external sidecar, and `none`
+    /// (default) runs none. A violation becomes a `binary_semantic` finding
+    /// with its input, and run.json records each target's `collector`.
+    #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
+    pub collector: crate::collector_run::CollectorSpec,
+
+    /// How long, in milliseconds, the collector keeps observing a replayed
+    /// input's descendant processes after it exits.
+    #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
+    pub collector_window_ms: u64,
 
     /// A C++ exception type an API throws to tell its callers about bad input
     /// (`std::invalid_argument`, `json::parse_error`; `*` for any), so one
@@ -1188,7 +1203,7 @@ pub const EXIT_SANITIZER_RUNTIME: i32 = 3;
 
 fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let _tstart = std::time::Instant::now();
-    let started_at = Utc::now().to_rfc3339();
+    let started_at = super::bug_report::now_rfc3339();
     let run_start = std::time::Instant::now();
     if !args.path.exists() {
         bhfeprintln!(
@@ -2088,7 +2103,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 "bhf auto: --static — static scan wrote {n} finding(s) (no fuzzable targets discovered)"
             );
         }
-        let finished_at = Utc::now().to_rfc3339();
+        let finished_at = super::bug_report::now_rfc3339();
         write_reports(
             &path,
             &[],
@@ -2329,6 +2344,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
 
     let mut options = AttemptOptions {
+        collector: (!matches!(args.collector, crate::collector_run::CollectorSpec::Off))
+            .then(|| (args.collector.clone(), args.collector_window_ms)),
         per_target_time: std::time::Duration::from_secs(args.per_target_time),
         total_time: args.total_time.map(std::time::Duration::from_secs),
         per_target_finding_count: args.per_target_finding_count,
@@ -3404,7 +3421,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
     }
 
-    let finished_at = Utc::now().to_rfc3339();
+    let finished_at = super::bug_report::now_rfc3339();
     crate::auto::discovery::bhfprof("auto:post_sweep", _tpost);
     let _twr = std::time::Instant::now();
     write_reports_with_output_limit(
@@ -3539,6 +3556,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 })
                 .count(),
             skipped_missing_toolchain: missing_toolchain_by_lane(&results),
+            skipped_lane_cannot_call: results
+                .iter()
+                .filter(|result| {
+                    result.candidate.lang == crate::auto::candidate::Lang::Fortran
+                        && matches!(
+                            &result.outcome,
+                            crate::auto::attempt::Outcome::UnsupportedParams { .. }
+                        )
+                })
+                .count(),
             skipped_consent_required: results
                 .iter()
                 .filter(|result| {

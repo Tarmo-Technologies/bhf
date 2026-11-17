@@ -851,6 +851,10 @@ pub(crate) struct TransportFuzzConfig {
     pub dictionary: Vec<Vec<u8>>,
     /// `--grammar`: every input past the seeds is a fresh derivation of it.
     pub grammar: Option<Grammar>,
+    /// The harness's `arg-layout.json`, when it decodes its arguments with
+    /// `bhf_decode.h`: the mutator writes typed values into the scalar
+    /// arguments' spans (#299).
+    pub arg_layout: Option<harness_gen::arg_layout::ArgLayout>,
 }
 
 /// The JSON summary a transport-driven run reports (mirrors the shape of the
@@ -1144,9 +1148,25 @@ pub(crate) fn run_transport_campaign(
                 // sentences: a byte mutation of one would mostly not be.
                 let generated = match &config.grammar {
                     Some(grammar) => grammar.generate(config.max_len.max(1), &mut rng),
-                    None => mutator
-                        .mutate(&MutationInput::new(&scheduled.bytes, &dictionary), &mut rng)
-                        .map(|result| result.bytes),
+                    None => {
+                        let spans = config
+                            .arg_layout
+                            .as_ref()
+                            .map(|layout| {
+                                crate::fuzz::typed_spans::arg_layout_typed_spans(
+                                    layout,
+                                    &scheduled.bytes,
+                                )
+                            })
+                            .unwrap_or_default();
+                        mutator
+                            .mutate(
+                                &MutationInput::new(&scheduled.bytes, &dictionary)
+                                    .with_typed_spans(&spans),
+                                &mut rng,
+                            )
+                            .map(|result| result.bytes)
+                    }
                 };
                 let input = generated.unwrap_or_else(|| scheduled.bytes.clone());
                 match run_one_input(session.as_mut(), &input)? {
@@ -1673,6 +1693,7 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         mode: args.mode,
         dictionary,
         grammar,
+        arg_layout: crate::fuzz::typed_spans::find_arg_layout(&args.work_dir, &args.harness, None),
     };
 
     let summary = run_transport_campaign(transport.as_ref(), &config).map_err(|error| {
@@ -2330,6 +2351,7 @@ mod tests {
             mode: actionability::RunMode::Reporting,
             dictionary: Vec::new(),
             grammar: None,
+            arg_layout: None,
         }
     }
 

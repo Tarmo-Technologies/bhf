@@ -21,6 +21,12 @@ use std::ffi::CStr;
 
 static REAL_OPEN: ResolvedFn = ResolvedFn::new(b"open\0");
 static REAL_OPENAT: ResolvedFn = ResolvedFn::new(b"openat\0");
+static REAL_OPEN64: ResolvedFn = ResolvedFn::new(b"open64\0");
+static REAL___OPEN64_2: ResolvedFn = ResolvedFn::new(b"__open64_2\0");
+static REAL___OPEN_2: ResolvedFn = ResolvedFn::new(b"__open_2\0");
+static REAL_OPENAT64: ResolvedFn = ResolvedFn::new(b"openat64\0");
+static REAL___OPENAT64_2: ResolvedFn = ResolvedFn::new(b"__openat64_2\0");
+static REAL___OPENAT_2: ResolvedFn = ResolvedFn::new(b"__openat_2\0");
 static REAL_STAT: ResolvedFn = ResolvedFn::new(b"__xstat\0");
 static REAL_ACCESS: ResolvedFn = ResolvedFn::new(b"access\0");
 static REAL_FACCESSAT: ResolvedFn = ResolvedFn::new(b"faccessat\0");
@@ -148,6 +154,7 @@ const TAINT_MIN_LEN: usize = 4;
 /// format-string hook's `u` flag so the CLI can confirm a
 /// path-controlled-open candidate (BHF-405) with a source→sink path.
 fn append_path_taint(b: &mut Builder, path: &[u8]) {
+    crate::fakes::fuzz_input::refresh_from_input_file();
     if let Some((offset, _len)) = crate::fakes::fuzz_input::taint_span(path, TAINT_MIN_LEN) {
         b.field_i64(b"u", 1);
         b.field_i64(b"o", offset as i64);
@@ -293,36 +300,101 @@ pub unsafe extern "C" fn open(
         // same call but routed via libc's own indirect ptr).
         return libc::open(path, flags, mode);
     }
-    let real: unsafe extern "C" fn(*const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int =
-        std::mem::transmute(real);
+    let real: OpenFn = std::mem::transmute(real);
     let result = real(path, flags, mode);
+    after_open(b"open", path, flags, result)
+}
+
+type OpenFn = unsafe extern "C" fn(*const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int;
+type Open2Fn = unsafe extern "C" fn(*const libc::c_char, libc::c_int) -> libc::c_int;
+type OpenatFn = unsafe extern "C" fn(
+    libc::c_int,
+    *const libc::c_char,
+    libc::c_int,
+    libc::mode_t,
+) -> libc::c_int;
+type Openat2Fn = unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int;
+
+/// `open64`, and the fortified `__open64_2` / `__open_2`: what a program
+/// built with 64-bit file offsets or `_FORTIFY_SOURCE` calls, as
+/// distribution interpreters (CPython, Perl) are. They were not hooked, so
+/// every file such a process opened went unseen (#300). Logged as `open`.
+#[no_mangle]
+pub unsafe extern "C" fn open64(
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    let real = REAL_OPEN64.ptr() as *const ();
+    if real.is_null() {
+        return libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path, flags, mode) as libc::c_int;
+    }
+    let real: OpenFn = std::mem::transmute(real);
+    let result = real(path, flags, mode);
+    after_open(b"open", path, flags, result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __open64_2(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int {
+    open_2(&REAL___OPEN64_2, path, flags)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __open_2(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int {
+    open_2(&REAL___OPEN_2, path, flags)
+}
+
+unsafe fn open_2(real: &ResolvedFn, path: *const libc::c_char, flags: libc::c_int) -> libc::c_int {
+    let real = real.ptr() as *const ();
+    if real.is_null() {
+        return libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path, flags, 0) as libc::c_int;
+    }
+    let real: Open2Fn = std::mem::transmute(real);
+    let result = real(path, flags);
+    after_open(b"open", path, flags, result)
+}
+
+/// The work every open hook does with the real call's `result`: substitute
+/// a faked MMIO device, log an insecure temporary file, the open, or the
+/// missing file (and fake it when faking), under `api`.
+unsafe fn after_open(
+    api: &'static [u8],
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    result: libc::c_int,
+) -> libc::c_int {
     let saved_errno = save_errno();
     // Everything from here on is the shim's own work: the path is classified
     // before any hook guard is held, and those comparisons are not the target's.
     let _own = crate::reentrancy::OwnWork::enter();
     let path_bytes = path_bytes_from_ptr(path);
+    crate::gate::note_open(path_bytes);
+    if crate::gate::is_bhf_file(path_bytes) {
+        restore_errno(saved_errno);
+        return result;
+    }
     if let Some(fake) = maybe_substitute_mmio(path_bytes, result) {
         restore_errno(saved_errno);
         return fake;
     }
     if tempfile_is_insecure(path_bytes, flags) {
         if let Some(_g) = HookGuard::acquire() {
-            log_insecure_tempfile(b"open", path_bytes, flags);
+            log_insecure_tempfile(api, path_bytes, flags);
         }
     }
     if result >= 0 {
         if let Some(_g) = HookGuard::acquire() {
-            log_path_open(b"open", path_bytes, result);
+            log_path_open(api, path_bytes, result);
         }
     } else if saved_errno == libc::ENOENT {
         if let Some(_g) = HookGuard::acquire() {
-            log_path_miss(b"open", path_bytes, result as i64, saved_errno);
+            log_path_miss(api, path_bytes, result as i64, saved_errno);
         }
         if crate::fakes::mode::current().is_faking() && should_audit_path(path_bytes) {
             let fake_fd = crate::fakes::memfd::create_fake_file_fd(path_bytes);
             if fake_fd >= 0 {
                 if let Some(_g) = HookGuard::acquire() {
-                    log_path_open(b"open", path_bytes, fake_fd);
+                    log_path_open(api, path_bytes, fake_fd);
                 }
                 restore_errno(saved_errno);
                 return fake_fd;
@@ -356,6 +428,12 @@ unsafe fn fopen_hooked(
     let file = real(path, mode);
     let saved_errno = save_errno();
     let path_bytes = path_bytes_from_ptr(path);
+    // A Lua driver marks target entry with io.open, which is fopen (#301).
+    crate::gate::note_open(path_bytes);
+    if crate::gate::is_bhf_file(path_bytes) {
+        restore_errno(saved_errno);
+        return file;
+    }
     if let Some(_g) = HookGuard::acquire() {
         if !file.is_null() {
             log_path_open(api, path_bytes, libc::fileno(file));
@@ -493,54 +571,71 @@ pub unsafe extern "C" fn openat(
     flags: libc::c_int,
     mode: libc::mode_t,
 ) -> libc::c_int {
-    let real = REAL_OPENAT.ptr() as *const ();
+    openat_hooked(&REAL_OPENAT, dirfd, path, flags, mode)
+}
+
+/// `openat64`, and the fortified `__openat64_2` / `__openat_2` (see
+/// [`open64`]). Logged as `openat`.
+#[no_mangle]
+pub unsafe extern "C" fn openat64(
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    openat_hooked(&REAL_OPENAT64, dirfd, path, flags, mode)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __openat64_2(
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+) -> libc::c_int {
+    openat_2(&REAL___OPENAT64_2, dirfd, path, flags)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __openat_2(
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+) -> libc::c_int {
+    openat_2(&REAL___OPENAT_2, dirfd, path, flags)
+}
+
+unsafe fn openat_hooked(
+    real: &ResolvedFn,
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> libc::c_int {
+    let real = real.ptr() as *const ();
     if real.is_null() {
         // Defense in depth: never call the exported `openat` symbol
         // here — it would re-enter this hook and recurse forever. Go
         // straight to the kernel.
         return libc::syscall(libc::SYS_openat, dirfd, path, flags, mode) as libc::c_int;
     }
-    let real: unsafe extern "C" fn(
-        libc::c_int,
-        *const libc::c_char,
-        libc::c_int,
-        libc::mode_t,
-    ) -> libc::c_int = std::mem::transmute(real);
+    let real: OpenatFn = std::mem::transmute(real);
     let result = real(dirfd, path, flags, mode);
-    let saved_errno = save_errno();
-    // The shim's own work from here on, as in `open`.
-    let _own = crate::reentrancy::OwnWork::enter();
-    let path_bytes = path_bytes_from_ptr(path);
-    if let Some(fake) = maybe_substitute_mmio(path_bytes, result) {
-        restore_errno(saved_errno);
-        return fake;
+    after_open(b"openat", path, flags, result)
+}
+
+unsafe fn openat_2(
+    real: &ResolvedFn,
+    dirfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+) -> libc::c_int {
+    let real = real.ptr() as *const ();
+    if real.is_null() {
+        return libc::syscall(libc::SYS_openat, dirfd, path, flags, 0) as libc::c_int;
     }
-    if tempfile_is_insecure(path_bytes, flags) {
-        if let Some(_g) = HookGuard::acquire() {
-            log_insecure_tempfile(b"openat", path_bytes, flags);
-        }
-    }
-    if result >= 0 {
-        if let Some(_g) = HookGuard::acquire() {
-            log_path_open(b"openat", path_bytes, result);
-        }
-    } else if saved_errno == libc::ENOENT {
-        if let Some(_g) = HookGuard::acquire() {
-            log_path_miss(b"openat", path_bytes, result as i64, saved_errno);
-        }
-        if crate::fakes::mode::current().is_faking() && should_audit_path(path_bytes) {
-            let fake_fd = crate::fakes::memfd::create_fake_file_fd(path_bytes);
-            if fake_fd >= 0 {
-                if let Some(_g) = HookGuard::acquire() {
-                    log_path_open(b"openat", path_bytes, fake_fd);
-                }
-                restore_errno(saved_errno);
-                return fake_fd;
-            }
-        }
-    }
-    restore_errno(saved_errno);
-    result
+    let real: Openat2Fn = std::mem::transmute(real);
+    let result = real(dirfd, path, flags);
+    after_open(b"openat", path, flags, result)
 }
 
 #[no_mangle]

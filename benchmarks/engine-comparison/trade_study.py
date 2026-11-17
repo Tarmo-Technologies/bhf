@@ -33,6 +33,7 @@ visible so the effective sample size is never hidden. This is Experiment 1
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ import sys
 import time
 from pathlib import Path
 
+import recipes  # build recipes for the real-code targets
 import run  # reviewed helpers: sha256, monitor, fixture_source, make_corpus, CASES, ...
 import stats  # deterministic distribution/CI summaries (unit-tested in CI)
 import targets  # pluggable real-code target set + manifest schema
@@ -109,6 +111,13 @@ def materialize_target(spec: targets.TargetSpec, dest: Path) -> tuple[list[Path]
         return [run_source], sha256(run_source)
     copied: list[Path] = []
     pairs: list[str] = []
+    names = [src.name for src in spec.sources]
+    clashing = sorted({name for name in names if names.count(name) > 1})
+    if clashing:
+        raise SystemExit(
+            f"[{spec.name}] sources share a file name, so one would overwrite "
+            f"another in the trial dir: {clashing}"
+        )
     for src in spec.sources:
         target_path = dest / src.name
         shutil.copy(src, target_path)
@@ -160,7 +169,42 @@ def source_build_args(
         args.extend(["-I", str(inc)])
     args.extend(spec.extra_cflags)
     args.extend(str(s) for s in target_sources)
+    args.extend(spec.link_flags)
     return args
+
+
+# The id the bhf lane gives a provided harness.
+BHF_PROVIDED_ID = "H-PROVIDED"
+
+
+def bhf_provided_commands(
+    bhf: Path, target_sources: list[Path], spec: targets.TargetSpec, work: Path
+) -> tuple[list[str], list[str]]:
+    """The bhf lane's commands for a provided harness (#254): wrap the
+    libfuzzer.c harness every other engine builds, with the target's sources
+    and include dirs, as docs/site/custom-harness.md describes, then build it
+    with the target's flags. Returns ``(generate, build)``."""
+    generate = [
+        str(bhf),
+        "generate-harness",
+        str(HARNESS_ROOT / "libfuzzer.c"),
+        "--target",
+        "LLVMFuzzerTestOneInput",
+        "--id",
+        BHF_PROVIDED_ID,
+        "--output",
+        str(work / "harnesses"),
+    ]
+    for source in target_sources:
+        generate.extend(["--extra-source", str(source)])
+    for include in spec.include_dirs:
+        generate.extend(["--extra-include", str(include)])
+    build_cmd = [str(bhf), "build", str(work), "--harness", BHF_PROVIDED_ID]
+    if spec.extra_cflags:
+        build_cmd.extend(["--cflags", " ".join(spec.extra_cflags)])
+    if spec.link_flags:
+        build_cmd.extend(["--ldflags", " ".join(spec.link_flags)])
+    return generate, build_cmd
 
 
 def sanitizer_flags(spec: targets.TargetSpec) -> str:
@@ -442,6 +486,84 @@ def parse_honggfuzz(log_path: Path) -> dict:
 # --- one engine on one target for one trial --------------------------------
 
 
+def engine_corpus_files(engine: str, engine_dir: Path) -> list[Path]:
+    """The corpus an engine has on disk while it runs (#256): bhf's is the
+    live corpus dir ``BHF_LIVE_CORPUS_DIR`` names, since it writes its queue
+    when the pass ends."""
+    dirs = {
+        "libfuzzer": [engine_dir / "corpus"],
+        "aflpp": [engine_dir / "afl-output" / "default" / "queue"],
+        "honggfuzz": [engine_dir / "hf-corpus"],
+        "bhf": [engine_dir / "live-corpus"],
+    }.get(engine, [])
+    return sorted(p for d in dirs if d.is_dir() for p in d.iterdir() if p.is_file())
+
+
+def engine_crash_artifacts(engine: str, engine_dir: Path) -> list[Path]:
+    """Every crash input an engine kept by the end of its campaign."""
+    if engine == "libfuzzer":
+        found = (engine_dir / "artifacts").glob("crash-*")
+    elif engine == "aflpp":
+        found = (engine_dir / "afl-output" / "default" / "crashes").glob("id:*")
+    elif engine == "honggfuzz":
+        found = (engine_dir / "hf-crashes").glob("*")
+    elif engine == "bhf":
+        work = engine_dir / "work"
+        found = [p for d in run.bhf_findings_dirs(work) for p in d.glob("*/testcase.bin")]
+    else:
+        found = []
+    return sorted(p for p in found if p.is_file())
+
+
+def snapshot_corpus(files: list[Path], dest: Path) -> Path:
+    """Copy a corpus as it stands into ``dest`` (an engine may later reduce
+    or replace an entry)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for index, path in enumerate(files):
+        try:
+            shutil.copy(path, dest / f"{index:06d}-{path.name.replace(':', '_')}")
+        except OSError:
+            pass  # the engine removed it mid-copy
+    return dest
+
+
+def curve_point(fraction: float, budget: int, coverage: dict) -> dict:
+    return {
+        "fraction": fraction,
+        "t_s": round(fraction * budget, 1),
+        "edges": coverage.get("edges"),
+        "features": coverage.get("features"),
+        "corpus_size": coverage.get("corpus_size"),
+    }
+
+
+# The most kept crash inputs one trial replays for its retained findings.
+RETAINED_REPLAY_CAP = 64
+
+
+def retained_findings(oracle: Path, artifacts: list[Path], target: str) -> dict:
+    """The crash inputs an engine kept, replayed through the independent
+    oracle (#256): how many it kept, how many reproduce, and how many
+    distinct normalized diagnostics they give (a grouping aid like
+    ``normalized_diagnostic_variants``, not a defect count)."""
+    replayed = artifacts[:RETAINED_REPLAY_CAP]
+    confirmed = 0
+    identities: set[str] = set()
+    for artifact in replayed:
+        verdict = replay_oracle(oracle, artifact)
+        if verdict.get("confirmed"):
+            confirmed += 1
+            identity = normalize_defect_signature(verdict.get("signature"), target)
+            if identity:
+                identities.add(identity)
+    return {
+        "kept": len(artifacts),
+        "replayed": len(replayed),
+        "confirmed": confirmed,
+        "distinct_diagnostics": len(identities),
+    }
+
+
 def run_engine(
     engine,
     args,
@@ -481,45 +603,23 @@ def run_engine(
         "seed_sha256s": seed_sha256s,
     }
     src_suffix = source_build_args(target_sources, spec)
+    # #256: the engine's corpus at fixed fractions of the budget, for its
+    # coverage-over-time curve.
+    snapshots: dict[float, Path] = {}
+
+    def snapshot_poll(elapsed_s: float) -> None:
+        for fraction in stats.due_checkpoints(elapsed_s, budget, set(snapshots)):
+            snapshots[fraction] = snapshot_corpus(
+                engine_corpus_files(engine, engine_dir),
+                engine_dir / "snapshots" / f"{round(fraction * 100):03d}",
+            )
+
     build_s = 0.0
     build_rc = 0
     measure = None
     native = {}
     final_corpus: list[Path] = []
     crash_artifact = None
-
-    # The engine-quality comparison is only honest when every engine drives the
-    # same fixed harness. bhf's "provided" mode (fuzz a supplied harness rather
-    # than generate one) is the correct real-code mode but its exact CLI is a
-    # documented maintainer step, so record a visible unsupported row instead of
-    # fabricating an invocation.
-    if engine == "bhf" and spec.bhf_harness_mode == targets.BHF_PROVIDED:
-        row.update(
-            {
-                "outcome": OUTCOME_UNSUPPORTED,
-                "build_rc": None,
-                "build_s": None,
-                "campaign_wall_s": None,
-                "supervisor_timeout": None,
-                "crash_found": False,
-                "crash_confirmed": False,
-                "crash_source": None,
-                "time_to_first_crash_s": None,
-                "crash_within_budget": None,
-                "crash_signature": None,
-                "common_cov_edges": None,
-                "common_cov_features": None,
-                "final_corpus_size": None,
-                "native_executions": None,
-                "native_execs_per_s": None,
-                "right_censor_s": None,
-                "unsupported_reason": (
-                    "bhf provided-harness mode is not wired to a CLI invocation; "
-                    "supply the exact `bhf fuzz` command for a pre-written harness"
-                ),
-            }
-        )
-        return row
 
     if engine == "libfuzzer":
         binary = engine_dir / "target"
@@ -564,6 +664,7 @@ def run_engine(
                 cpu=args.cpu,
                 timeout_s=budget + 20,
                 crash_probe=lambda: run.libfuzzer_crash_artifact(artifacts),
+                on_poll=snapshot_poll,
             )
             native = (
                 run.parse_libfuzzer(Path(measure["log"])) if measure.get("log") else {}
@@ -636,6 +737,7 @@ def run_engine(
                 timeout_s=budget + 25,
                 crash_probe=lambda: run.afl_crash_artifact(output),
                 env=renv,
+                on_poll=snapshot_poll,
             )
             native = run.parse_afl(output)
             final_corpus = afl_corpus(output)
@@ -696,6 +798,7 @@ def run_engine(
                 timeout_s=budget + 25,
                 crash_probe=hf_crash,
                 env=renv,
+                on_poll=snapshot_poll,
             )
             native = parse_honggfuzz(engine_dir / "run.log")
             final_corpus = hongg_corpus(outcorp)
@@ -704,23 +807,31 @@ def run_engine(
     else:  # bhf
         work = engine_dir / "work"
         work.mkdir()
-        generated = work / "generated_harnesses"
-        generated.mkdir()
-        gen = [
-            str(args.bhf),
-            "generate-harness",
-            str(primary_source),
-            "--target",
-            "target_one_input",
-            "--output",
-            str(generated),
-        ]
-        gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
-        harnesses = sorted(p for p in generated.iterdir() if p.is_dir())
-        hid = harnesses[0].name if harnesses else None
+        if spec.bhf_harness_mode == targets.BHF_PROVIDED:
+            # The engine-quality comparison is only honest when every engine
+            # drives the same fixed harness: bhf wraps the libfuzzer.c harness
+            # the other engines build, with the same sources and flags.
+            gen, bcmd = bhf_provided_commands(args.bhf, target_sources, spec, work)
+            gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
+            hid = BHF_PROVIDED_ID if gen_rc == 0 else None
+        else:
+            generated = work / "generated_harnesses"
+            generated.mkdir()
+            gen = [
+                str(args.bhf),
+                "generate-harness",
+                str(primary_source),
+                "--target",
+                "target_one_input",
+                "--output",
+                str(generated),
+            ]
+            gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
+            harnesses = sorted(p for p in generated.iterdir() if p.is_dir())
+            hid = harnesses[0].name if harnesses else None
+            bcmd = [str(args.bhf), "build", str(work), "--harness", hid] if hid else []
         build_s, build_rc = gen_s, gen_rc
         if build_rc == 0 and hid:
-            bcmd = [str(args.bhf), "build", str(work), "--harness", hid]
             bs, brc, _ = build(bcmd, args.cpu, engine_dir / "build-native.log")
             build_s += bs
             build_rc = brc
@@ -764,6 +875,8 @@ def run_engine(
                     cpu=args.cpu,
                     timeout_s=budget + 25,
                     crash_probe=bhf_crash,
+                    env={**os.environ, "BHF_LIVE_CORPUS_DIR": str(engine_dir / "live-corpus")},
+                    on_poll=snapshot_poll,
                 )
                 native = (
                     run.parse_bhf_fuzz(Path(measure["log"]), work)
@@ -791,6 +904,21 @@ def run_engine(
 
     # Engine-neutral coverage of the FINAL corpus.
     cov = common_coverage(cov_binary, final_corpus, args.cpu, engine_dir / "cov")
+    seeds = sorted(p for p in corpus.iterdir() if p.is_file())
+    curve = []
+    for fraction, snapshot in sorted(snapshots.items()):
+        point = common_coverage(
+            cov_binary,
+            seeds + sorted(snapshot.iterdir()),
+            args.cpu,
+            engine_dir / f"cov-{round(fraction * 100):03d}",
+        )
+        curve.append(curve_point(fraction, budget, point))
+    if measure is not None:
+        curve.append(curve_point(1.0, budget, cov))
+    retained = retained_findings(
+        oracle, engine_crash_artifacts(engine, engine_dir), case
+    )
 
     # Precise TTFC only from the engine's native crash artifact (honggfuzz's
     # persistent+ASan loop does not record one, so its TTFC is null even when the
@@ -823,6 +951,10 @@ def run_engine(
             "common_cov_edges": cov.get("edges"),
             "common_cov_features": cov.get("features"),
             "final_corpus_size": cov.get("corpus_size"),
+            # #256: engine-neutral coverage at each checkpoint, and every crash
+            # input the engine kept, replayed through the oracle.
+            "coverage_over_time": curve,
+            "retained_findings": retained,
             "native_executions": native.get("executions_native"),
         }
     )
@@ -996,6 +1128,20 @@ def aggregate(rows: list[dict], engines, cases) -> dict:
             "ttfc_s": "distribution over oracle-confirmed trials with a native TTFC",
             "common_cov_edges": "engine-neutral shared-sancov edges; median + IQR + range + bootstrap CI",
             "native_execs_per_s": "per-engine only; NOT comparable across engines (counter semantics differ)",
+            "coverage_over_time": (
+                "engine-neutral shared-sancov edges of the corpus snapshotted at each "
+                "fraction of the budget (seeds included), the final corpus at 1.0; a "
+                "trial that ended earlier (libFuzzer stops at its first crash) is "
+                "missing from the later points, so n stays visible"
+            ),
+            "retained_confirmed_findings": (
+                "crash inputs the engine kept by the end of a trial that the oracle "
+                "reproduces (at most 64 replayed per trial)"
+            ),
+            "retained_distinct_diagnostics": (
+                "distinct normalized diagnostics among them: a grouping aid, NOT a "
+                "defect count"
+            ),
         },
     }
 
@@ -1074,6 +1220,17 @@ def engine_summary(sub: list[dict]) -> dict:
         "right_censored_s": sorted(
             r["right_censor_s"] for r in censored if r.get("right_censor_s") is not None
         ),
+        # #256: engine-neutral coverage at each checkpoint over the trials, and
+        # the crash inputs each trial kept and the oracle confirmed.
+        "coverage_over_time": stats.coverage_curve(
+            [r["coverage_over_time"] for r in sub if r.get("coverage_over_time")]
+        ),
+        "retained_confirmed_findings": stats.summarize(
+            [(r.get("retained_findings") or {}).get("confirmed") for r in sub]
+        ).as_dict(),
+        "retained_distinct_diagnostics": stats.summarize(
+            [(r.get("retained_findings") or {}).get("distinct_diagnostics") for r in sub]
+        ).as_dict(),
     }
 
 
@@ -1091,7 +1248,35 @@ def load_targets(args) -> list[targets.TargetSpec]:
             raise SystemExit(f"--cases named unknown targets: {sorted(missing)}")
     if not specs:
         raise SystemExit("no targets selected")
+    if args.bhf_harness_mode:
+        specs = [
+            dataclasses.replace(s, bhf_harness_mode=args.bhf_harness_mode) for s in specs
+        ]
+    if not (args.fetch or args.dry_run or args.list_targets):
+        specs = [apply_recipe(s, args) for s in specs]
     return specs
+
+
+def apply_recipe(spec: targets.TargetSpec, args) -> targets.TargetSpec:
+    """A runnable target's sources from its build recipe (#255): the recipe
+    checks and builds the checkout ``--fetch`` made under ``--sources``."""
+    if spec.recipe is None or spec.status != targets.RUNNABLE:
+        return spec
+    sources_root = (args.sources or args.workdir / "sources").resolve()
+    try:
+        prepared = recipes.prepare(
+            spec.recipe, sources_root / spec.name, args.workdir / "recipes" / spec.name
+        )
+    except recipes.RecipeError as error:
+        raise SystemExit(f"[{spec.name}] {error}") from error
+    return dataclasses.replace(
+        spec,
+        sources=prepared.sources,
+        include_dirs=prepared.include_dirs + spec.include_dirs,
+        extra_cflags=prepared.extra_cflags + spec.extra_cflags,
+        link_flags=prepared.link_flags + spec.link_flags,
+        source_sha256={src.name: sha256(src) for src in prepared.sources},
+    )
 
 
 def describe_plan(specs: list[targets.TargetSpec], args) -> None:
@@ -1104,11 +1289,21 @@ def describe_plan(specs: list[targets.TargetSpec], args) -> None:
             f"    budget={budget}s max_len={max_len} sanitizer={spec.sanitizer_policy} "
             f"bhf_harness={spec.bhf_harness_mode}"
         )
+        if spec.status == targets.RUNNABLE:
+            lanes = [
+                "bhf (provided harness)"
+                if engine == "bhf" and spec.bhf_harness_mode == targets.BHF_PROVIDED
+                else engine
+                for engine in args.engines
+            ]
+            print(f"    runnable lanes: {', '.join(lanes)}")
         if spec.sources:
             print(f"    sources: {', '.join(p.name for p in spec.sources)}")
         if spec.source_sha256:
             for name, digest in spec.source_sha256.items():
                 print(f"      {name}: {digest[:16]}")
+        if spec.recipe:
+            print(f"    recipe: {spec.recipe}")
         if spec.notes:
             print(f"    notes: {spec.notes}")
 
@@ -1179,6 +1374,12 @@ def main() -> int:
         "--list-targets",
         action="store_true",
         help="print the resolved target set and exit",
+    )
+    p.add_argument(
+        "--bhf-harness-mode",
+        choices=[targets.BHF_GENERATED, targets.BHF_PROVIDED],
+        default=None,
+        help="harness every target's bhf lane this way (default: each target's own mode)",
     )
     p.add_argument("--trials", type=int, default=10)
     p.add_argument("--budget", type=int, default=60, help="fuzz wall seconds per trial")

@@ -2479,6 +2479,7 @@ pub(crate) fn run_on_host(
         unreproduced_sanitizer_hits: dedup.unreproduced_hits(),
         fresh_reruns: None,
         hangs: None,
+        stability: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)

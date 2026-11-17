@@ -18,8 +18,9 @@
 //! declared type. A Go panic (nil deref, index OOB, divide-by-zero, ...) is
 //! `recover`ed and reported as a finding; an unrecoverable `fatal error` crashes
 //! the process and the engine catches the death. A missing `go` toolchain, a
-//! target outside a module, a method (needs a receiver), or an unsupported
-//! parameter type skips cleanly (the GNAT-less rule).
+//! method (needs a receiver), or an unsupported parameter type skips cleanly
+//! (the GNAT-less rule). A target outside every module is copied into a module
+//! of its own ([`loose_package_module`]).
 
 use crate::auto::candidate::Candidate;
 use go_parser::{parse_go_data_types, parse_go_functions, parse_go_package, GoDataType, GoFunc};
@@ -78,21 +79,10 @@ pub fn build_go_harness(
         Err(reason) => return GoBuildResult::Failed { reason, skip: true },
     };
 
-    // Locate the enclosing Go module (go.mod) so the harness can import the target
-    // package by its module import path.
     let target_abs = candidate
         .source_path
         .canonicalize()
         .unwrap_or_else(|_| candidate.source_path.clone());
-    let Some((mod_root, module_path)) = find_go_module(&target_abs) else {
-        return GoBuildResult::Failed {
-            reason: "target is not inside a Go module (no go.mod found); only \
-                     module-based Go targets are supported (skipped cleanly)"
-                .to_owned(),
-            skip: true,
-        };
-    };
-    let import_path = compute_import_path(&module_path, &mod_root, &target_abs);
 
     // Build the decode/call body; an unsupported required param type skips cleanly
     // (unforced) or is synthesized as its zero value (forced).
@@ -117,6 +107,26 @@ pub fn build_go_harness(
             skip: false,
         };
     }
+
+    // The enclosing Go module (go.mod), so the harness can import the target
+    // package by its module import path. A package outside every module (a
+    // GOPATH-era tree, a loose directory of `.go` files) is copied into a module
+    // of its own.
+    let (mod_root, module_path, import_path) = match find_go_module(&target_abs) {
+        Some((mod_root, module_path)) => {
+            let import_path = compute_import_path(&module_path, &mod_root, &target_abs);
+            (mod_root, module_path, import_path)
+        }
+        None => match loose_package_module(&target_abs, &auto_dir, &func.package) {
+            Ok((mod_root, module_path)) => (mod_root, module_path.clone(), module_path),
+            Err(reason) => {
+                return GoBuildResult::Failed {
+                    reason,
+                    skip: false,
+                }
+            }
+        },
+    };
 
     let main_go = generate_main_go(&import_path, &body);
     let harness_files = std::iter::once(("bhf_harness.go", main_go.as_str())).chain(GO_OS_FILES);
@@ -147,8 +157,14 @@ pub fn build_go_harness(
         version = placeholder_module_version(&module_path),
         // go.mod uses Go string-literal quoting, not shell quoting. A bare
         // local replacement path breaks when the source directory has spaces.
-        root = serde_json::to_string(&mod_root.to_string_lossy())
-            .expect("serializing a path string cannot fail"),
+        // The copy of a package outside every module is named relative to the
+        // go.mod: it moves with the harness dir (a capsule ships both), and
+        // no spelling of the dir (a Windows 8.3 short name) has to match.
+        root = serde_json::to_string(&match mod_root.strip_prefix(&auto_dir) {
+            Ok(relative) => format!("./{}", relative.to_string_lossy().replace('\\', "/")),
+            Err(_) => mod_root.to_string_lossy().into_owned(),
+        })
+        .expect("serializing a path string cannot fail"),
     );
     if let Err(e) = std::fs::write(auto_dir.join("go.mod"), &go_mod) {
         return GoBuildResult::Failed {
@@ -429,6 +445,151 @@ fn find_go_module(target_abs: &Path) -> Option<(PathBuf, String)> {
             return Some((dir.to_path_buf(), module));
         }
         dir = dir.parent()?;
+    }
+}
+
+/// Where in the harness dir a package outside every Go module is copied.
+pub(crate) const LOOSE_PACKAGE_DIR: &str = "bhf_target";
+
+/// What a copied `package main` is renamed to, so the harness can import it.
+const LOOSE_MAIN_PACKAGE: &str = "bhftarget";
+
+/// The module a target outside every Go module is built from: a copy of its
+/// package dir in the harness dir, with a synthesized `go.mod`. The `replace`
+/// that points the harness at a target module needs a dir holding a `go.mod`,
+/// and the scanned tree is never edited. Returns (module root, module path).
+///
+/// A copy rather than a `-overlay`: `-cover` instruments the files on disk and
+/// ignores an overlay's replacement `.go` files, and a `package main` has to be
+/// renamed to be imported at all. Each copied `.go` file opens with a `//line`
+/// directive naming the original, so a panic's frames and the coverage map
+/// name the project's file and line, not the copy's.
+fn loose_package_module(
+    target_abs: &Path,
+    auto_dir: &Path,
+    package: &str,
+) -> Result<(PathBuf, String), String> {
+    // Plain (no Windows `\\?\` prefix), as the `//line` directives name it.
+    let package_dir = crate::workdir::plain_canonical(
+        target_abs
+            .parent()
+            .ok_or_else(|| "Go target source has no package directory".to_owned())?,
+    );
+    let package_dir = package_dir.as_path();
+    let copy = auto_dir.join(LOOSE_PACKAGE_DIR);
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy)
+        .map_err(|error| format!("create {}: {error}", copy.display()))?;
+    let entries = std::fs::read_dir(package_dir)
+        .map_err(|error| format!("read Go package '{}': {error}", package_dir.display()))?;
+    let mut files: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !path.is_file() || name.ends_with("_test.go") {
+            continue;
+        }
+        let text = name
+            .ends_with(".go")
+            .then(|| std::fs::read_to_string(&path).ok())
+            .flatten();
+        files.push((path, text));
+    }
+    // A dir of `go run file.go` scripts: each file is a program with its own
+    // `main`, and together they are no package at all. Only the target's
+    // file is the target's program.
+    let mains = files
+        .iter()
+        .filter(|(_, text)| text.as_deref().is_some_and(declares_main))
+        .count();
+    let target_file = target_abs.file_name();
+    for (path, text) in &files {
+        let dest = copy.join(path.file_name().unwrap_or_default());
+        let copied = match text {
+            Some(_) if package == "main" && mains > 1 && path.file_name() != target_file => {
+                continue;
+            }
+            Some(text) => std::fs::write(&dest, loose_go_source(path, text, package == "main")),
+            None => std::fs::copy(path, &dest).map(|_| ()),
+        };
+        copied
+            .map_err(|error| format!("copy {} to {}: {error}", path.display(), dest.display()))?;
+    }
+    let module_path = format!("bhf.local/{}", module_path_element(package_dir));
+    std::fs::write(
+        copy.join("go.mod"),
+        format!("module {module_path}\n\ngo 1.21\n"),
+    )
+    .map_err(|error| format!("write the target's go.mod: {error}"))?;
+    Ok((copy, module_path))
+}
+
+/// A copied Go source: a `//line` directive naming `original`, then the
+/// source, with `package main` and its `func main` renamed when `rename_main`
+/// so the package can be imported. Every line keeps its number.
+fn loose_go_source(original: &Path, text: &str, rename_main: bool) -> String {
+    let mut out = format!("//line {}:1\n", original.display());
+    let mut in_block_comment = false;
+    let mut renamed_package = !rename_main;
+    for line in text.split_inclusive('\n') {
+        let rewritten = if in_block_comment || !rename_main {
+            None
+        } else if !renamed_package {
+            renamed_package_clause(line).inspect(|_| renamed_package = true)
+        } else {
+            line.strip_prefix("func main(")
+                .map(|rest| format!("func bhfProgramMain({rest}"))
+        };
+        if let Some((_, after)) = line.rsplit_once("/*") {
+            in_block_comment = !after.contains("*/");
+        } else if in_block_comment && line.contains("*/") {
+            in_block_comment = false;
+        }
+        out.push_str(rewritten.as_deref().unwrap_or(line));
+    }
+    out
+}
+
+/// Whether a Go source declares a top-level `func main`.
+fn declares_main(text: &str) -> bool {
+    text.lines().any(|line| line.starts_with("func main("))
+}
+
+/// `line` with a `package main` clause renamed to [`LOOSE_MAIN_PACKAGE`],
+/// or `None` when it is not the package clause.
+fn renamed_package_clause(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("package")?;
+    let name = rest.trim_start_matches([' ', '\t']);
+    let after = name.strip_prefix("main")?;
+    if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let indent = &rest[..rest.len() - name.len()];
+    Some(format!("package{indent}{LOOSE_MAIN_PACKAGE}{after}"))
+}
+
+/// A module path element from a package dir's name: its ASCII letters,
+/// digits, `-`, `_` and `~`, every other character a `-`.
+fn module_path_element(package_dir: &Path) -> String {
+    let name = package_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let element: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '~') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let element = element.trim_matches('-');
+    if element.is_empty() {
+        "pkg".to_owned()
+    } else {
+        element.to_owned()
     }
 }
 
@@ -2161,5 +2322,123 @@ func ParseRequest(req *Request) {}
                 "{path}"
             );
         }
+    }
+
+    /// A copied `package main` is renamed, with its `main`, and keeps every
+    /// line where it was: the `//line` directive maps line 1 of the copy's
+    /// second line to line 1 of the original.
+    #[test]
+    fn a_copied_main_package_is_renamed_and_keeps_its_line_numbers() {
+        let source = "// Command tool.\n\
+                      /*\n\
+                      package main is what this is\n\
+                      */\n\
+                      package main // the tool\n\
+                      \n\
+                      func Parse(s string) int { return len(s) }\n\
+                      \n\
+                      func main() {\n\
+                      \tfunc main() {}\n\
+                      }\n\
+                      \n\
+                      func mainly() {}\n";
+        let copied = loose_go_source(Path::new("/src/tool/tool.go"), source, true);
+        let (directive, body) = copied.split_once('\n').unwrap();
+        assert_eq!(directive, "//line /src/tool/tool.go:1");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), source.lines().count());
+        assert_eq!(lines[2], "package main is what this is");
+        assert_eq!(lines[4], "package bhftarget // the tool");
+        assert_eq!(lines[8], "func bhfProgramMain() {");
+        assert_eq!(lines[9], "\tfunc main() {}");
+        assert_eq!(lines[12], "func mainly() {}");
+
+        // Any other package is copied as it is, under the directive.
+        let library = "package parser\n\nfunc main() {}\n";
+        assert_eq!(
+            loose_go_source(Path::new("/src/p.go"), library, false),
+            format!("//line /src/p.go:1\n{library}")
+        );
+        // `package mainframe` is not `package main`.
+        assert_eq!(renamed_package_clause("package mainframe\n"), None);
+    }
+
+    #[test]
+    fn a_package_dir_name_becomes_a_module_path_element() {
+        for (dir, element) in [
+            ("/r/zh-tw", "zh-tw"),
+            ("/r/my tool", "my-tool"),
+            ("/r/v1.2", "v1-2"),
+            ("/r/日本", "pkg"),
+        ] {
+            assert_eq!(module_path_element(Path::new(dir)), element, "{dir}");
+        }
+    }
+
+    /// A package outside every module is copied with a `go.mod` of its own;
+    /// its tests are left behind and the scanned tree is not written to.
+    #[test]
+    fn a_loose_package_is_copied_into_a_module_of_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let package_dir = root.path().join("legacy tool");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("tool.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("tool_test.go"), "package main\n").unwrap();
+        std::fs::write(package_dir.join("words.txt"), "embedded\n").unwrap();
+        let auto_dir = root.path().join("harness");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+
+        let (mod_root, module_path) =
+            loose_package_module(&package_dir.join("tool.go"), &auto_dir, "main").unwrap();
+        assert_eq!(mod_root, auto_dir.join(LOOSE_PACKAGE_DIR));
+        assert_eq!(module_path, "bhf.local/legacy-tool");
+        assert_eq!(
+            std::fs::read_to_string(mod_root.join("go.mod")).unwrap(),
+            "module bhf.local/legacy-tool\n\ngo 1.21\n"
+        );
+        let copied = std::fs::read_to_string(mod_root.join("tool.go")).unwrap();
+        assert!(copied.contains("package bhftarget\n"), "{copied}");
+        assert!(copied.contains("func bhfProgramMain() {}"), "{copied}");
+        assert!(mod_root.join("words.txt").is_file());
+        assert!(!mod_root.join("tool_test.go").exists());
+        let mut left: Vec<_> = std::fs::read_dir(&package_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["tool.go", "tool_test.go", "words.txt"]);
+    }
+
+    /// Two files that each declare `main` are two `go run` programs: the
+    /// copy holds only the target's.
+    #[test]
+    fn a_dir_of_standalone_programs_copies_only_the_targets_file() {
+        let root = tempfile::tempdir().unwrap();
+        let scripts = root.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        for name in ["build.go", "build_new.go"] {
+            std::fs::write(
+                scripts.join(name),
+                "package main\n\nfunc FixHeader(s string) string { return s }\n\nfunc main() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(scripts.join("notes.md"), "notes\n").unwrap();
+        let auto_dir = root.path().join("harness");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        let (mod_root, _) =
+            loose_package_module(&scripts.join("build_new.go"), &auto_dir, "main").unwrap();
+        let mut copied: Vec<_> = std::fs::read_dir(&mod_root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        copied.sort();
+        assert_eq!(copied, ["build_new.go", "go.mod", "notes.md"]);
     }
 }

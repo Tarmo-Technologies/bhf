@@ -39,6 +39,11 @@ pub struct FortranProc {
     /// distinct character-result ABIs (both verified empirically):
     /// see [`FortranResult`]. Ubiquitous in Fortran string libraries.
     pub result: FortranResult,
+    /// The C name of a `BIND(C)` procedure: its `NAME=`, else its name in
+    /// lower case (#235). C calls it directly: an array dummy is a bare
+    /// pointer, a `VALUE` dummy is passed by value, and no character dummy
+    /// has a hidden length.
+    pub bind_c: Option<String>,
 }
 
 /// How a Fortran procedure returns — selects the gfortran C-ABI calling convention
@@ -72,6 +77,11 @@ pub enum FortranResult {
 pub struct FortranArg {
     pub name: String,
     pub kind: FortranArgKind,
+    /// Declared `VALUE`: passed by value rather than by reference.
+    pub by_value: bool,
+    /// An assumed-shape array (`DIMENSION(:)`, `name(:)`), which even a
+    /// `BIND(C)` procedure takes as a descriptor.
+    pub assumed_shape: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +374,8 @@ pub fn parse_fortran(source: &str) -> Vec<FortranProc> {
                 .map(|a| FortranArg {
                     name: a.clone(),
                     kind: FortranArgKind::Other,
+                    by_value: false,
+                    assumed_shape: false,
                 })
                 .collect();
             // External (non-module) procedures are always accessible; inside a module,
@@ -383,7 +395,11 @@ pub fn parse_fortran(source: &str) -> Vec<FortranProc> {
             } else {
                 None
             };
+            let bind_c = (l.contains("BIND(C") || l.contains("BIND (C")).then(|| {
+                bind_c_name(source, *line_no).unwrap_or_else(|| hdr.name.to_ascii_lowercase())
+            });
             procs.push(FortranProc {
+                bind_c,
                 name: hdr.name,
                 line: *line_no as u32,
                 args,
@@ -412,11 +428,15 @@ pub fn parse_fortran(source: &str) -> Vec<FortranProc> {
             if let Some(spec_end) = type_spec_end(l) {
                 let kind = decl_kind(l);
                 let names = declared_names(l, spec_end);
-                if !matches!(kind, FortranArgKind::Other) {
-                    for n in &names {
-                        if let Some(arg) = procs[idx].args.iter_mut().find(|a| &a.name == n) {
+                let attrs = l.split("::").next().unwrap_or(l);
+                let by_value = attrs.split(',').any(|attr| attr.trim() == "VALUE");
+                for n in &names {
+                    if let Some(arg) = procs[idx].args.iter_mut().find(|a| &a.name == n) {
+                        if !matches!(kind, FortranArgKind::Other) {
                             arg.kind = kind;
                         }
+                        arg.by_value |= by_value;
+                        arg.assumed_shape |= is_assumed_shape(l, n);
                     }
                 }
                 // The RESULT variable's declaration selects the return ABI. This must
@@ -571,6 +591,49 @@ fn proc_header(l: &str) -> Option<ProcHeader> {
         is_function,
         char_result_prefix,
         result_name,
+    })
+}
+
+/// The `NAME=` of the `BIND(C, NAME="...")` clause on the header that starts
+/// at physical line `line_no` (1-based), as written: the normalized lines are
+/// upper-cased, and a C name is case-sensitive.
+fn bind_c_name(source: &str, line_no: usize) -> Option<String> {
+    let mut header = String::new();
+    for raw in source.lines().skip(line_no.saturating_sub(1)).take(8) {
+        let code = raw.split('!').next().unwrap_or(raw).trim_end();
+        let continued = code.ends_with('&');
+        header.push_str(code.trim_end_matches('&'));
+        if !continued {
+            break;
+        }
+    }
+    let lower = header.to_ascii_lowercase();
+    let bind = lower.find("bind")?;
+    let name = bind + lower[bind..].find("name")?;
+    let after = header[name + 4..]
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
+    let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let value: String = after[1..].chars().take_while(|c| *c != quote).collect();
+    (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+/// Whether the declaration `l` makes `name` an assumed-shape array:
+/// `DIMENSION(:...)`, or `name(:...)` after the `::`.
+fn is_assumed_shape(l: &str, name: &str) -> bool {
+    let attrs = l.split("::").next().unwrap_or(l);
+    if attrs.contains("DIMENSION(:") || attrs.contains("DIMENSION (:") {
+        return true;
+    }
+    let Some((_, entities)) = l.split_once("::") else {
+        return false;
+    };
+    entities.split(',').any(|entity| {
+        let entity = entity.trim();
+        entity
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.trim_start().starts_with("(:"))
     })
 }
 
@@ -946,5 +1009,32 @@ end module m
         let p = &parse_fortran(src)[0];
         assert!(p.public);
         assert!(p.is_fuzzable());
+    }
+
+    /// #235: a BIND(C) procedure keeps its binding name as written, a
+    /// `VALUE` integer is by value, and an assumed-size `c_char` array is not
+    /// assumed-shape (it needs no descriptor).
+    #[test]
+    fn a_bind_c_procedure_records_its_c_name_and_value_dummies() {
+        let src = "module recs\n  use iso_c_binding\ncontains\n  \
+                   subroutine parse_rec(buf, n) &\n      bind(C, name=\"Parse_Rec\")\n    \
+                   integer(c_int), value :: n\n    \
+                   character(kind=c_char), dimension(*), intent(in) :: buf\n  \
+                   end subroutine parse_rec\n  subroutine plain(s) bind(c)\n    \
+                   character(kind=c_char) :: s(:)\n  end subroutine plain\nend module recs\n";
+        let procs = parse_fortran(src);
+        let rec = &procs[0];
+        assert_eq!(rec.bind_c.as_deref(), Some("Parse_Rec"));
+        assert_eq!(rec.args[0].kind, FortranArgKind::CharArray { len: 1 });
+        assert!(!rec.args[0].assumed_shape && !rec.args[0].by_value);
+        assert_eq!(rec.args[1].kind, FortranArgKind::Integer);
+        assert!(rec.args[1].by_value);
+        let plain = &procs[1];
+        assert_eq!(plain.bind_c.as_deref(), Some("plain"));
+        assert!(plain.args[0].assumed_shape);
+        assert_eq!(
+            parse_fortran("subroutine f(s)\n character(len=*) :: s\nend\n")[0].bind_c,
+            None
+        );
     }
 }

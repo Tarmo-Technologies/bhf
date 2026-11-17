@@ -32,7 +32,7 @@ pub const FINDING_SCHEMA_VERSION: &str = "bhf.finding.v1";
 /// suffix. Every finding timestamp uses this one format, so they also order
 /// correctly as plain strings; compare against other formats only after parsing.
 pub fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    format!("{:.3}", jiff::Timestamp::now())
 }
 
 /// Stamp a new per-finding record with the `bhf.finding.v1` envelope. Keeps an
@@ -2380,10 +2380,7 @@ mod tests {
         assert_eq!(raw["schema_version"], "bhf.finding.v1");
         assert_eq!(raw["finding_kind"], "fuzz");
         let created = raw["created_at"].as_str().unwrap();
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(created).is_ok(),
-            "{created}"
-        );
+        assert!(created.parse::<jiff::Timestamp>().is_ok(), "{created}");
     }
 
     #[test]
@@ -2403,7 +2400,11 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0]["command"], "minimize");
         assert_eq!(history[1]["fields"][0], "primitive");
-        assert!(chrono::DateTime::parse_from_rfc3339(history[0]["at"].as_str().unwrap()).is_ok());
+        assert!(history[0]["at"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .is_ok());
     }
 
     #[test]

@@ -41,6 +41,26 @@ What issue #85 added on top:
   campaigns keep their censor time.
 - **Native counters are not a shared unit.** `native_execs_per_s` is reported
   per-engine with `comparable_across_engines: false`; it is never pooled.
+- **Coverage over time** (#256). While a campaign runs, the study copies the
+  engine's on-disk corpus at 10, 25, 50 and 75% of the budget
+  (`stats.CHECKPOINT_FRACTIONS`; libFuzzer's corpus dir, AFL++'s queue,
+  honggfuzz's output corpus, and for bhf the `BHF_LIVE_CORPUS_DIR` it is
+  given, since bhf writes its queue when the pass ends). After the campaign
+  each snapshot, with the seeds, is replayed through the shared sancov binary;
+  the final corpus is the 1.0 point. A row's `coverage_over_time` lists the
+  points (`fraction`, `t_s`, `edges`, `features`, `corpus_size`), and the
+  summary's `coverage_over_time` gives each fraction's distribution over the
+  trials. A trial that ended early (libFuzzer stops at its first crash) is
+  missing from the later points, which their `n` shows.
+- **Retained findings** (#256). After a campaign every crash input the engine
+  kept (libFuzzer's `crash-*` artifacts, AFL++'s `crashes/`, honggfuzz's crash
+  dir, bhf's `results/findings/*/testcase.bin`), at most 64, is replayed
+  through the oracle. A row's `retained_findings` gives how many were kept,
+  replayed and confirmed, and how many distinct normalized diagnostics the
+  confirmed ones give (a grouping aid, not a defect count); the summary has
+  the distributions of the confirmed count and of the diagnostics. It shows
+  what an engine keeps past its first crash: libFuzzer stops there, AFL++ and
+  bhf go on.
 
 ### Running Experiment 1
 
@@ -87,7 +107,8 @@ relative to the manifest file unless absolute.
 | `kind` | no (`self_contained`) | `self_contained` real code, or `builtin_fixture` |
 | `status` | no (`runnable`) | `runnable`, `requires_build_recipe`, or `manual`; only `runnable` is built — others become visible `unsupported` rows |
 | `upstream` | yes for real code | `{url, commit}` provenance pin |
-| `sources` | yes if runnable | translation units compiled with the harness adapter; one must define `target_one_input` (or set `target_callback`) |
+| `sources` | yes if runnable without a `recipe` | translation units compiled with the harness adapter; one must define `target_one_input` (or set `target_callback`) |
+| `recipe` | no | a build recipe in `recipes.py` that supplies `sources`, `include_dirs` and `extra_cflags` from the fetched checkout at run time |
 | `include_dirs` | no | `-I` paths |
 | `extra_cflags` | no | extra compile flags (e.g. `-std=c++17`) |
 | `target_callback` | no | symbol to wrap as `target_one_input` if no source defines it |
@@ -101,6 +122,34 @@ To promote a `requires_build_recipe` target to `runnable`: fetch its sources
 defines `int target_one_input(const unsigned char*, size_t)` calling the pinned
 API, point `sources`/`include_dirs` at the adapter plus the needed project
 translation units, and set `status=runnable` with `bhf_harness_mode=provided`.
+
+### Build recipes
+
+A target with a `recipe` needs no hand-listed sources. At run time
+(`trade_study.py --manifest ... --sources <fetch root>`), `recipes.py` takes the
+checkout `--fetch` cloned at the pin, checks the SHA-256 of every file it uses,
+generates whatever the project's own build would, checks the generated files
+too, and returns the adapter (`adapters/<name>_adapter.c`) and the project's
+translation units, include dirs and flags. A checksum mismatch stops the run:
+a moved pin or a changed generator is not the variant the manifest names.
+Generated files live under `<workdir>/recipes/<name>/`.
+
+| Recipe | Builds |
+|---|---|
+| `cjson` | `cJSON.c` (pinned) with `adapters/cjson_adapter.c`, which parses the input with `cJSON_ParseWithLengthOpts` and prints what parsed |
+| `sqlite` | the amalgamation SQLite 3.54.0's `configure --disable-tcl && make sqlite3.c` generates out of tree (deterministic under its bundled jimsh; `sqlite3.c`/`sqlite3.h` pinned), with `adapters/sqlite_adapter.c`, which runs the input as SQL on an in-memory database (`sqlite3_prepare_v2`, a progress budget and a row cap); `SQLITE_THREADSAFE=0`, no extension loading |
+| `zlib` | the core translation units (no `gz*` file I/O) with the checked-in `zconf.h`, all pinned, with `adapters/zlib_adapter.c`, which decompresses the input with `uncompress2` into a 64 KiB buffer |
+| `libyaml` | `src/*.c` (pinned) with the `config.h` its configure writes for 0.2.5, generated into the recipe dir (a header, since a quoted string define does not survive bhf's make recipe), with `adapters/libyaml_adapter.c`, which parses the input event by event |
+| `libpng` | the library translation units with the `pnglibconf.h` it ships prebuilt (pinned), linked with the `zlib` recipe's sources from the zlib checkout beside it (fetch both), with `adapters/libpng_adapter.c`, which decodes the input to RGBA with the simplified API |
+| `re2` | RE2 2023-06-01: `re2/*.cc` and `util/{rune,strutil}.cc` (pinned) against the system Abseil through pkg-config (`libabsl-dev`), with `adapters/re2_adapter.cc`, which compiles the input as a pattern under a memory budget and matches it; `-fno-sanitize=vptr`, since the C driver links no UBSan C++ runtime. The pin is the latest release that builds with the Abseil distributions ship (20220623); later ones need `absl_check` |
+
+Each adapter is named `<target>_adapter`, since the trial dir holds every
+source by its file name and RE2 has its own `re2.cc`; two sources with one
+name stop the run. A recipe's libraries (`link_flags`) follow the sources on
+every compiler line, and reach bhf as `bhf build --ldflags`.
+
+A smoke build, `BHF_TRADE_STUDY_SOURCES=<fetch root> python3 -m unittest
+test_runner`, prepares every recipe and builds and runs its libFuzzer harness.
 
 ## Experiment 2 — auto-harness productivity
 
@@ -127,8 +176,8 @@ python3 benchmarks/harness-parity-20/run.py --seconds 15 --jobs 2 \
 ```
 
 "Useful retained findings" in the issue's sense (confirmed crash/sanitizer
-findings, not just coverage parity) is a dimension this coverage-parity suite
-does not yet capture; see limitations.
+findings, not just coverage parity) is measured per engine by Experiment 1
+(`retained_findings`); this coverage-parity suite does not capture it.
 
 ## Limitations (what is not established)
 
@@ -140,27 +189,32 @@ does not yet capture; see limitations.
   State the niche and the measured number; do not extrapolate.
 - **No licensed-tool comparison.** No Mayhem (or other licensed tool) evaluation
   has been run; make no such parity claim without an actual authorized run.
-- **Coverage-over-time** is not yet recorded — Experiment 1 measures final-corpus
-  coverage, not a time series. A powered study should snapshot corpora over the
-  budget.
 - **Real-code multi-file builds.** The single clang/afl-cc/hfuzz-cc invocation
-  cannot configure an arbitrary project build; such targets ship as
-  `requires_build_recipe` (visible `unsupported` rows) until a recipe is wired.
-- **bhf provided-harness CLI.** `bhf_harness_mode=provided` is the correct
-  engine-quality mode for real code but is not wired to a concrete `bhf fuzz`
-  invocation here; the bhf lane records a visible `unsupported` row until a
-  maintainer supplies the exact command.
+  cannot configure an arbitrary project build; a target without a build recipe
+  ships as `requires_build_recipe` (visible `unsupported` rows).
+- **bhf provided harness.** With `bhf_harness_mode=provided` (the correct
+  engine-quality mode for real code) the bhf lane wraps the same
+  `harnesses/libfuzzer.c` every other engine builds:
+  `bhf generate-harness harnesses/libfuzzer.c --target LLVMFuzzerTestOneInput
+  --id H-PROVIDED --output <work>/harnesses`, with each target source as
+  `--extra-source` and each include dir as `--extra-include`, then
+  `bhf build <work> --harness H-PROVIDED --cflags "<extra_cflags>"` and the
+  same `bhf fuzz` budget, seeds and flags as the generated mode.
+  `--bhf-harness-mode provided|generated` overrides the mode for every target
+  (the builtin fixtures default to `generated`).
 - **Native execution counters** are never compared across engines.
 
 ## CI boundary
 
-The powered campaign drivers are deliberately NOT in any workflow (`ci.yml` runs
-the Rust nextest fast/smoke only). The one per-PR-eligible piece is the
-deterministic classification/stats/manifest smoke in
-`benchmarks/engine-comparison/test_runner.py`, which builds and fuzzes nothing:
+The powered campaign drivers are deliberately NOT in any workflow. `ci.yml`
+runs the deterministic classification/stats/manifest tests in
+`benchmarks/engine-comparison/test_runner.py` ("Test the engine-comparison
+scripts"), before bhf is built, so they build and fuzz nothing; the provided-
+harness smoke among them runs only where a bhf binary (`$BHF_TRADE_STUDY_BHF`,
+else `target/release/bhf`) and clang exist:
 
 ```sh
-python3 -m pytest benchmarks/engine-comparison/
+python3 -m unittest discover -s benchmarks/engine-comparison -p 'test_*.py'
 ```
 
 Powered real-code studies are run offline/scheduled and publish their immutable

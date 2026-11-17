@@ -7,9 +7,16 @@
 # `-javaagent` (Premain-Class) AND the driver main class (`java -cp <jar>
 # com.bhf.Driver`).
 #
-# ASM is fetched from Maven Central into a cache on first build (no repo binary).
-# For air-gapped builds, pre-stage the two jars into $BHF_JVM_CACHE or
-# $ASM_JAR_DIR (the bhf offline-deps workflow handles this).
+# ASM is fetched from Maven Central into a cache on first build (no repo binary),
+# retrying transient failures. A fetched or cached jar must have the SHA-256
+# pinned below; a cached one that does not is fetched again. ASM_JAR_DIR names
+# jars the operator vouches for, used as they are: a distribution's own build of
+# ASM 9.7 (Debian's libasm-java, as the container image uses) is not
+# byte-identical to Maven Central's. For air-gapped builds, pre-stage Maven
+# Central's two jars into $BHF_JVM_CACHE, or any build of them into
+# $ASM_JAR_DIR (the bhf offline-deps workflow handles this). Downloads and the
+# jar are written beside their place and renamed into it, so concurrent first
+# builds never read a partial file.
 #
 # Usage: build-agent.sh [OUT_JAR]
 #   OUT_JAR defaults to $BHF_JVM_CACHE/bhf-jvm-agent.jar.
@@ -17,6 +24,8 @@
 set -eu
 
 ASM_VERSION="9.7"
+ASM_CORE_SHA256="adf46d5e34940bdf148ecdd26a9ee8eea94496a72034ff7141066b3eea5c4e9d"
+ASM_TREE_SHA256="62f4b3bc436045c1acb5c3ba2d8ec556ec3369093d7f5d06c747eb04b56d52b1"
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/src"
 CACHE="${BHF_JVM_CACHE:-$HOME/.cache/bhf/jvm}"
@@ -26,27 +35,60 @@ mkdir -p "$CACHE"
 JAVAC="${JAVAC:-javac}"
 JAR="${JAR:-jar}"
 
-# Locate (or fetch) the two ASM jars we need: core + tree API.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# Locate (or fetch) the two ASM jars we need: core + tree API. A fetched or
+# cached one must have its pinned SHA-256.
 fetch_asm() {
   name="$1"
-  # Prefer a pre-staged copy (offline), then the cache, then Maven Central.
-  for dir in "${ASM_JAR_DIR:-}" "$CACHE"; do
-    [ -n "$dir" ] && [ -f "$dir/$name" ] && { echo "$dir/$name"; return 0; }
-  done
-  url="https://repo1.maven.org/maven2/org/ow2/asm/${name%-$ASM_VERSION.jar}/$ASM_VERSION/$name"
+  want="$2"
+  # Prefer the operator's pre-staged copy, then the cache, then Maven Central.
+  if [ -n "${ASM_JAR_DIR:-}" ] && [ -f "$ASM_JAR_DIR/$name" ]; then
+    echo "$ASM_JAR_DIR/$name"
+    return 0
+  fi
+  if [ -f "$CACHE/$name" ]; then
+    if [ "$(sha256_of "$CACHE/$name")" = "$want" ]; then
+      echo "$CACHE/$name"
+      return 0
+    fi
+    # Not the jar this script fetched: a partial or altered file.
+    rm -f "$CACHE/$name"
+  fi
+  url="https://repo1.maven.org/maven2/org/ow2/asm/${name%-"$ASM_VERSION".jar}/$ASM_VERSION/$name"
+  part="$CACHE/$name.part.$$"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$CACHE/$name"
+    # --retry-all-errors (curl 7.71) also retries an HTTP 429 or 503.
+    retry="--retry 6 --retry-delay 5"
+    if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then
+      retry="$retry --retry-all-errors"
+    fi
+    # shellcheck disable=SC2086
+    curl --proto '=https' -fsSL $retry "$url" -o "$part" || { rm -f "$part"; return 1; }
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$CACHE/$name"
+    wget -q --tries=6 --waitretry=5 "$url" -O "$part" || { rm -f "$part"; return 1; }
   else
     echo "build-agent.sh: need curl or wget to fetch $name (or pre-stage it in \$ASM_JAR_DIR)" >&2
     return 1
   fi
+  got=$(sha256_of "$part")
+  if [ "$got" != "$want" ]; then
+    rm -f "$part"
+    echo "build-agent.sh: $url has SHA-256 $got, not ASM $ASM_VERSION's $want" >&2
+    return 1
+  fi
+  mv -f "$part" "$CACHE/$name"
   echo "$CACHE/$name"
 }
 
-ASM_CORE=$(fetch_asm "asm-$ASM_VERSION.jar")
-ASM_TREE=$(fetch_asm "asm-tree-$ASM_VERSION.jar")
+ASM_CORE=$(fetch_asm "asm-$ASM_VERSION.jar" "$ASM_CORE_SHA256")
+ASM_TREE=$(fetch_asm "asm-tree-$ASM_VERSION.jar" "$ASM_TREE_SHA256")
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -78,5 +120,6 @@ Main-Class: com.bhf.Driver
 EOF
 
 mkdir -p "$(dirname "$OUT")"
-"$JAR" cfm "$OUT" "$MANIFEST" -C "$CLASSES" .
+"$JAR" cfm "$OUT.part.$$" "$MANIFEST" -C "$CLASSES" .
+mv -f "$OUT.part.$$" "$OUT"
 echo "$OUT"

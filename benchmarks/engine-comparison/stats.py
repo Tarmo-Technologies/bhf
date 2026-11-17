@@ -162,3 +162,43 @@ def summarize(
         ci_high=r(ci_high),
         ci_method=method,
     )
+
+
+# The fractions of a trial's budget its corpus is snapshotted at (#256); the
+# final corpus is the curve's 1.0 point.
+CHECKPOINT_FRACTIONS = (0.1, 0.25, 0.5, 0.75)
+
+
+def due_checkpoints(elapsed_s: float, budget_s: float, taken: set[float]) -> list[float]:
+    """The checkpoint fractions ``elapsed_s`` has reached that are not
+    ``taken`` yet, in order."""
+    return [
+        fraction
+        for fraction in CHECKPOINT_FRACTIONS
+        if fraction not in taken and elapsed_s >= fraction * budget_s
+    ]
+
+
+def coverage_curve(series: list[list[dict]], *, key: str = "edges") -> list[dict]:
+    """Summarize per-trial coverage-over-time series into one curve.
+
+    Each trial's series is a list of points ``{"fraction", "t_s", key}``; the
+    result has one point per fraction any trial reached, with the
+    distribution of ``key`` over the trials that measured it there (a trial
+    whose snapshot is missing is left out at that point, so ``n`` shows it).
+    """
+    by_fraction: dict[float, list[dict]] = {}
+    for points in series:
+        for point in points:
+            by_fraction.setdefault(float(point["fraction"]), []).append(point)
+    curve = []
+    for fraction in sorted(by_fraction):
+        points = by_fraction[fraction]
+        curve.append(
+            {
+                "fraction": fraction,
+                "t_s": summarize([p.get("t_s") for p in points]).median,
+                key: summarize([p.get(key) for p in points], round_to=1).as_dict(),
+            }
+        )
+    return curve

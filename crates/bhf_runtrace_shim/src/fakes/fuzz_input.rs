@@ -240,6 +240,104 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
     CURSOR.store(0, Ordering::Relaxed);
 }
 
+/// The file an interpreter driver writes each input to before it runs it
+/// (#300): a driver that cannot call [`bhf_shim_set_fuzz_input`] (Python,
+/// Perl) publishes its input in `<BHF_SHIM_INPUT_FILE>.<pid>`. One file per
+/// process: bhf runs fresh processes beside the persistent one, and a shared
+/// file would be rewritten under another process's read, and give it the
+/// other's input. Resolved in the driver's process, before it forks a
+/// command it runs, whose exec the shim matches against the same input.
+pub fn input_file() -> Option<&'static std::ffi::CStr> {
+    static PATH: OnceLock<Option<std::ffi::CString>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::var_os("BHF_SHIM_INPUT_FILE").filter(|path| !path.is_empty())?;
+        let mut path = base.as_bytes().to_vec();
+        path.push(b'.');
+        path.extend_from_slice(std::process::id().to_string().as_bytes());
+        std::ffi::CString::new(path).ok()
+    })
+    .as_deref()
+}
+
+/// The largest input the shim reads back from [`input_file`].
+const MAX_INPUT_FILE_BYTES: usize = 16 << 20;
+
+/// Make the input in [`input_file`] the current one, when the driver uses
+/// that channel: a sink check calls this right before it needs the input,
+/// since the driver rewrites the file for each input. The file is read again
+/// only when its inode, size or modification time changed, so a sink check
+/// on an input already read costs one `newfstatat`. Raw system calls, so no
+/// hook of the shim's own sees them. The format-string check does not call
+/// it: an interpreter's own `snprintf` calls are not the target's formats.
+pub(crate) fn refresh_from_input_file() {
+    let Some(path) = input_file() else {
+        return;
+    };
+    static LAST: Mutex<Option<(u64, i64, i64, i64)>> = Mutex::new(None);
+    // SAFETY: plain system calls on a path and an fd this function owns; the
+    // mapping is read only while it is mapped.
+    unsafe {
+        let mut current: libc::stat = std::mem::zeroed();
+        if libc::syscall(
+            libc::SYS_newfstatat,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &mut current,
+            0,
+        ) != 0
+        {
+            return;
+        }
+        let identity = (
+            current.st_ino as u64,
+            current.st_size as i64,
+            current.st_mtime as i64,
+            current.st_mtime_nsec as i64,
+        );
+        let Ok(mut last) = LAST.try_lock() else {
+            return;
+        };
+        if *last == Some(identity) {
+            return;
+        }
+        *last = Some(identity);
+        let fd = libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        ) as libc::c_int;
+        if fd < 0 {
+            return;
+        }
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::syscall(libc::SYS_fstat, fd, &mut stat) == 0 {
+            let len = stat.st_size.max(0) as usize;
+            if let Ok(mut guard) = LIVE_INPUT.try_lock() {
+                if len == 0 {
+                    guard.store(&[]);
+                } else if len <= MAX_INPUT_FILE_BYTES {
+                    let mapped = libc::syscall(
+                        libc::SYS_mmap,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        len,
+                        libc::PROT_READ,
+                        libc::MAP_PRIVATE,
+                        fd,
+                        0,
+                    ) as *mut libc::c_void;
+                    if mapped != libc::MAP_FAILED {
+                        guard.store(std::slice::from_raw_parts(mapped as *const u8, len));
+                        libc::syscall(libc::SYS_munmap, mapped, len);
+                    }
+                }
+            }
+        }
+        libc::syscall(libc::SYS_close, fd);
+    }
+}
+
 pub fn read_into(out: &mut [u8]) -> usize {
     if out.is_empty() {
         return 0;
@@ -492,6 +590,7 @@ pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usiz
     if min_len == 0 || haystack.len() < min_len {
         return None;
     }
+    refresh_from_input_file();
     // Prefer the live buffer (`bhf_shim_set_fuzz_input`, the per-iteration channel
     // a cooperating harness publishes). try_lock, not lock: reachable from sink
     // hooks in a signal handler; skip rather than deadlock (see taint_span).

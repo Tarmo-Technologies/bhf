@@ -74,6 +74,63 @@ nonempty ID and a package identity (name/ecosystem, PURL or CPE); when supplied,
 compatibility). Malformed records reject the run rather than disappearing into a
 successful empty review. An explicit valid empty array remains supported.
 
+## Advisory database format
+
+`bhf sbom --vuln-db` reads a JSON object whose `vulnerabilities` array holds
+one record per affected package:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The advisory id (required). |
+| `aliases` | Other ids of the same advisory, such as its CVE. |
+| `package.ecosystem`, `package.name` | The package, by bhf's ecosystem names: `cargo`, `npm`, `pypi`, `golang`, `maven`, `nuget`, `gem`, `composer`, `conan`, ... |
+| `package.purl` | A package URL; one without a version matches every version the record affects. |
+| `package.cpe` | A CPE 2.3 string or 2.2 URI; `*` fields are wildcards. |
+| `affected_versions` | Exact affected versions; `"*"` is every version. |
+| `affected_ranges` | Version ranges, each an object of optional bounds `start_including`, `start_excluding`, `end_including` and `end_excluding`; `{}` is every version. |
+| `severity` | `critical`, `high`, `medium`, `low`, `none` or `unknown`; the `--fail-on` gate compares it. |
+| `summary`, `kev`, `cvss`, `cwe`, `references` | Carried into `vulnerabilities.json`. |
+
+A record needs an id and a package identity (ecosystem and name, purl, or
+CPE). A component is affected when its version is listed or lies in a range.
+Versions compare as package managers order them: dotted segments numerically
+(`0.10.38` after `0.10.9`), letters after a number's digits in order
+(`1.0.2` before `1.0.2a`), and a pre-release (`1.0.0-rc.1`) before its
+release.
+
+`bhf pack import-osv INPUT... --out cve-db.json` builds a database from OSV
+records: an OSV ecosystem export unzipped into a directory, or single record
+files (one record or an array of them each). Each affected package becomes a
+record: OSV `crates.io`, `npm`, `PyPI`, `Go`, `Maven`, `NuGet`, `RubyGems`,
+`Packagist` and `ConanCenter` packages take the bhf ecosystem names above
+(a Maven `group:artifact` also gets its purl), `versions` become
+`affected_versions`, and `SEMVER` and `ECOSYSTEM` range events become
+`affected_ranges` (`introduced` a start, `"0"` none; `fixed` or `limit` an
+excluded end; `last_affected` an included end). The severity is the GitHub
+advisory rating the record carries (`MODERATE` is `medium`), else the rating
+of its highest CVSS v3 base score, else `unknown`. The summary JSON on stdout
+counts what was read and written; a record or file that cannot be read is
+reported on stderr and in the summary's `malformed` list and skipped, and a
+package in an ecosystem bhf does not catalog, or with only a git commit
+range, is counted and left out. The command exits 1 when malformed input left
+nothing to import.
+
+`bhf pack import-nvd INPUT... --out cve-db.json` builds one from NVD CVE JSON
+2.0 files (the yearly feeds, or API responses saved to disk), for the C and C++
+libraries an SBOM or `bhf binary scan` identifies by CPE. Each vulnerable CPE
+match in a CVE's configurations becomes a record whose `package.cpe` is the
+match's `criteria` (a CPE 2.3 string: `cpe:2.3:part:vendor:product:version:...`,
+`*` fields are wildcards). Its versions are its bounds, `versionStartIncluding`,
+`versionStartExcluding`, `versionEndIncluding` and `versionEndExcluding`, which
+become an `affected_ranges` entry; without bounds, the CPE's own version field
+(`*` or `-` is every version). A match marked not vulnerable (the platform of an
+`AND` configuration) and a negated node are left out, and so is a rejected CVE.
+The severity is the base severity of the CVE's CVSS v4.0, v3.1, v3.0 or v2
+metric, the first present, the NVD's primary score first. Malformed records are
+reported and skipped as with OSV, and a CVE with no configuration is counted
+under `without_versions`. A component matches a CPE record when its CPE agrees
+field by field and its version lies in the record's range.
+
 ## Reviewer and integration boundaries
 
 The queue is a work product for analyst review, not an approval store. This change

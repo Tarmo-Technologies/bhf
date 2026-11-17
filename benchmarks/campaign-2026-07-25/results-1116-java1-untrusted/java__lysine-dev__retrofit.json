@@ -1,0 +1,71 @@
+{
+ "repo": "lysine-dev/retrofit",
+ "sha": "d0b112dad073b7fe49c953ebc46ff1b424cb1e51",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "Invocation.java",
+   "name": "of",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'of' parameter #1 has an unsupported type `T`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "MockRetrofit.java",
+   "name": "Builder",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'Builder' parameter #0 has an unsupported type `Retrofit`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "NetworkBehavior.java",
+   "name": "create",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"javac (target) failed: /home/ubuntu/bhf-corpus-500/java/lysine-dev__retrofit/retrofit/src/main/java16/retrofit2/DefaultMethodSupport.java:23: error: duplicate class: retrofit2.DefaultMethodSupport\\n/home/ubuntu/bhf-corpus-500/java/lysine-dev__retrofit/retrofit/src/main/ja",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build",
+    "failed build"
+   ]
+  },
+  {
+   "source": "SimpleXmlConverterFactory.java",
+   "name": "create",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'create' parameter #0 has an unsupported type `Serializer`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 34,
+  "discovered_total": 34,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 22,
+  "unsupported_params": 12,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

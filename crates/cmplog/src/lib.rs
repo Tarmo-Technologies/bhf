@@ -28,6 +28,10 @@ pub enum CmpKind {
     CStringEquality,
     /// Integer comparison via `cmp` instruction.
     IntegerCompare,
+    /// An integer comparison against a constant the compiler emitted: the
+    /// driver's `"int"` record, whose `operand_a` is the constant
+    /// (little-endian, at the comparison's width) and `operand_b` empty.
+    IntegerConstant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -103,6 +107,7 @@ impl CmpLog {
             CmpKind::BufferEquality => 0u8,
             CmpKind::CStringEquality => 1,
             CmpKind::IntegerCompare => 2,
+            CmpKind::IntegerConstant => 3,
         };
         // Per site, the distinct values each operand was compared with.
         type Partners<'a> = BTreeMap<&'a [u8], BTreeSet<&'a [u8]>>;
@@ -110,8 +115,15 @@ impl CmpLog {
         let mut first_seen: BTreeMap<&[u8], usize> = BTreeMap::new();
         // Operands of entries that cannot tell the input from the constant.
         let mut ambiguous: BTreeSet<&[u8]> = BTreeSet::new();
+        // The constants the driver named as such (`"int"` records).
+        let mut named: BTreeSet<&[u8]> = BTreeSet::new();
         for (index, entry) in self.entries.iter().enumerate() {
             let (a, b) = (entry.operand_a.as_slice(), entry.operand_b.as_slice());
+            if entry.kind == CmpKind::IntegerConstant {
+                first_seen.entry(a).or_insert(index);
+                named.insert(a);
+                continue;
+            }
             for operand in [a, b] {
                 first_seen.entry(operand).or_insert(index);
             }
@@ -146,6 +158,9 @@ impl CmpLog {
                     *count = (*count).max(met.len());
                 }
             }
+        }
+        for value in named {
+            evidence.entry(value).or_insert(1);
         }
         let known: BTreeSet<&[u8]> = known.iter().map(Vec::as_slice).collect();
         for value in first_seen.keys() {
@@ -182,31 +197,76 @@ impl CmpLog {
     /// vice versa). Used by the builtin engine's mutator to
     /// learn magic-byte expectations from runtime evidence.
     pub fn splice_candidates(&self, input: &[u8]) -> Vec<SpliceCandidate> {
-        let mut out = Vec::new();
+        self.splice_candidate_iter(input).collect()
+    }
+
+    /// The constants of the driver's `"int"` records
+    /// ([`CmpKind::IntegerConstant`]), little-endian as recorded.
+    pub fn integer_constants(&self) -> Vec<&[u8]> {
+        let mut out: Vec<&[u8]> = Vec::new();
         for entry in &self.entries {
-            for (src, dst) in [
-                (&entry.operand_a, &entry.operand_b),
-                (&entry.operand_b, &entry.operand_a),
-            ] {
-                if src.is_empty() {
-                    continue;
-                }
-                let mut search_from = 0usize;
-                while let Some(pos) = find_subslice(&input[search_from..], src) {
-                    let absolute = search_from + pos;
-                    out.push(SpliceCandidate {
-                        site_id: entry.site_id,
-                        offset: absolute,
-                        replacement: dst.clone(),
-                        original_len: src.len(),
-                    });
-                    search_from = absolute + 1;
-                }
+            if entry.kind == CmpKind::IntegerConstant && !out.contains(&entry.operand_a.as_slice())
+            {
+                out.push(&entry.operand_a);
             }
         }
         out
     }
+
+    /// Drop the entries that yield no splice into `input`: neither operand
+    /// occurs in it, or the occurrence already holds the other operand. A
+    /// loop counter compared on every iteration fills the log with such
+    /// entries, and the mutator scans the input once per entry it keeps.
+    pub fn retain_spliceable(&mut self, input: &[u8]) {
+        self.entries.retain(|entry| {
+            [
+                (&entry.operand_a, &entry.operand_b),
+                (&entry.operand_b, &entry.operand_a),
+            ]
+            .into_iter()
+            .any(|(src, dst)| !src.is_empty() && src != dst && find_subslice(input, src).is_some())
+        });
+    }
+
+    /// The candidates of `splice_candidates`, found lazily. An operand is
+    /// taken at most once per `1/SPLICE_OFFSETS_PER_OPERAND` of the input,
+    /// so a one-byte operand in a long run of that byte yields a bounded,
+    /// spread set rather than one candidate per offset.
+    pub fn splice_candidate_iter<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> impl Iterator<Item = SpliceCandidate> + 'a {
+        let stride = (input.len() / SPLICE_OFFSETS_PER_OPERAND).max(1);
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind != CmpKind::IntegerConstant)
+            .flat_map(|entry| {
+                [
+                    (entry, &entry.operand_a, &entry.operand_b),
+                    (entry, &entry.operand_b, &entry.operand_a),
+                ]
+            })
+            .filter(|(_, src, _)| !src.is_empty())
+            .flat_map(move |(entry, src, dst)| {
+                let mut search_from = 0usize;
+                std::iter::from_fn(move || {
+                    let pos = find_subslice(input.get(search_from..)?, src)?;
+                    let absolute = search_from + pos;
+                    search_from = (absolute / stride + 1) * stride;
+                    Some(SpliceCandidate {
+                        site_id: entry.site_id,
+                        offset: absolute,
+                        replacement: dst.clone(),
+                        original_len: src.len(),
+                    })
+                })
+            })
+    }
 }
+
+/// The most offsets `CmpLog::splice_candidate_iter` takes for one operand,
+/// give or take one: an input shorter than twice this keeps every offset.
+pub const SPLICE_OFFSETS_PER_OPERAND: usize = 32;
 
 /// Whether `a` and `b` differ by exactly one byte substituted, inserted or
 /// removed.
@@ -264,6 +324,7 @@ pub fn ingest_from_jsonl_log(path: &std::path::Path) -> Result<CmpLog, CmpLogErr
         }
         let kind = match value.get("k").and_then(|v| v.as_str()).unwrap_or("") {
             "strcmp" | "strncmp" => CmpKind::CStringEquality,
+            "int" => CmpKind::IntegerConstant,
             _ => CmpKind::BufferEquality,
         };
         let a_hex = value.get("a").and_then(|v| v.as_str()).unwrap_or("");
@@ -357,6 +418,56 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_operand_yields_a_bounded_spread_of_offsets() {
+        let mut log = CmpLog::new();
+        log.record(CmpEntry {
+            site_id: 1,
+            operand_a: b"[".to_vec(),
+            operand_b: b"{".to_vec(),
+            kind: CmpKind::IntegerCompare,
+        });
+        let short = vec![b'['; 2 * SPLICE_OFFSETS_PER_OPERAND - 1];
+        assert_eq!(log.splice_candidates(&short).len(), short.len());
+
+        let input = vec![b'['; 1 << 20];
+        let offsets: Vec<usize> = log
+            .splice_candidates(&input)
+            .iter()
+            .map(|c| c.offset)
+            .collect();
+        assert_eq!(offsets.len(), SPLICE_OFFSETS_PER_OPERAND);
+        assert_eq!(offsets[0], 0);
+        assert!(offsets
+            .windows(2)
+            .all(|w| w[1] - w[0] == input.len() / SPLICE_OFFSETS_PER_OPERAND));
+    }
+
+    #[test]
+    fn retain_spliceable_keeps_only_entries_that_splice_into_the_input() {
+        let mut log = CmpLog::new();
+        for (a, b) in [
+            (&b"ab"[..], &b"zz"[..]),
+            (b"\x07\x00\x00\x00", b"\x09\x00\x00\x00"),
+            (b"zz", b"ab"),
+            (b"ab", b"ab"),
+        ] {
+            log.record(CmpEntry {
+                site_id: 1,
+                operand_a: a.to_vec(),
+                operand_b: b.to_vec(),
+                kind: CmpKind::IntegerCompare,
+            });
+        }
+        log.retain_spliceable(b"xxabyy");
+        let kept: Vec<(&[u8], &[u8])> = log
+            .entries
+            .iter()
+            .map(|e| (e.operand_a.as_slice(), e.operand_b.as_slice()))
+            .collect();
+        assert_eq!(kept, [(&b"ab"[..], &b"zz"[..]), (b"zz", b"ab")]);
+    }
+
+    #[test]
     fn splice_candidates_handles_bidirectional() {
         let mut log = CmpLog::new();
         log.record(CmpEntry {
@@ -403,6 +514,40 @@ not-json-just-noise\n\
         assert_eq!(log.entries[1].operand_a, b"hello");
         assert_eq!(log.entries[1].operand_b, b"world");
         assert_eq!(log.entries[1].kind, CmpKind::CStringEquality);
+    }
+
+    /// The driver's `"int"` record names an integer comparison's constant
+    /// (#221): one record is enough to make it a constant, beside string
+    /// constants that need the evidence of the values they met, and it is
+    /// never spliced, having no compared value to find in an input.
+    #[test]
+    fn an_int_record_names_its_constant() {
+        let dir = tempfile::Builder::new().prefix("bhf-").tempdir().unwrap();
+        let log_path = dir.path().join("cmplog.jsonl");
+        std::fs::write(
+            &log_path,
+            "{\"e\":\"cmplog\",\"k\":\"int\",\"s\":\"00000010.00000020\",\"a\":\"5b3e0f69\",\"b\":\"\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000030.00000020\",\"a\":\"7878\",\"b\":\"4b455931\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000030.00000020\",\"a\":\"7979\",\"b\":\"4b455931\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000040.00000020\",\"a\":\"7a7a\",\"b\":\"4e4f5045\"}\n",
+        )
+        .unwrap();
+        let log = ingest_from_jsonl_log(&log_path).unwrap();
+        assert_eq!(log.entries[0].kind, CmpKind::IntegerConstant);
+        assert_eq!(log.entries[0].operand_a, [0x5b, 0x3e, 0x0f, 0x69]);
+        assert!(log.entries[0].operand_b.is_empty());
+        assert_eq!(log.integer_constants(), [&[0x5b, 0x3e, 0x0f, 0x69][..]]);
+        assert_eq!(
+            log.constant_operands(&[]),
+            [b"KEY1".to_vec(), vec![0x5b, 0x3e, 0x0f, 0x69]],
+            "the string met two values; the integer is named; NOPE met one"
+        );
+        let offsets: Vec<usize> = log
+            .splice_candidates(&[0x5b, 0x3e, 0x0f, 0x69, b'x', b'x'])
+            .iter()
+            .map(|candidate| candidate.offset)
+            .collect();
+        assert_eq!(offsets, [4], "only the string's operand is spliced");
     }
 
     #[test]

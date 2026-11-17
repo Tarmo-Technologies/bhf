@@ -89,9 +89,18 @@ def make_corpus(path: Path) -> str:
     return sha256(seed)
 
 
+def bhf_findings_dirs(work: Path) -> list[Path]:
+    """Where bhf writes a run's findings: ``results/findings/<id>/``, or the
+    ``findings/<id>/`` of a release before that layout (#403)."""
+    return [work / "results" / "findings", work / "findings"]
+
+
 def bhf_crash_artifact(work: Path) -> Path | None:
-    findings = sorted((work / "findings").glob("*/testcase.bin"))
-    return findings[0] if findings else None
+    for findings_dir in bhf_findings_dirs(work):
+        findings = sorted(findings_dir.glob("*/testcase.bin"))
+        if findings:
+            return findings[0]
+    return None
 
 
 def libfuzzer_crash_artifact(artifacts: Path) -> Path | None:
@@ -176,6 +185,7 @@ def monitor(
     timeout_s: float,
     crash_probe: Callable[[], Path | None],
     env: dict | None = None,
+    on_poll: Callable[[float], None] | None = None,
 ) -> dict:
     started = time.monotonic()
     first_crash_s = None
@@ -191,6 +201,8 @@ def monitor(
         )
         while process.poll() is None:
             elapsed = time.monotonic() - started
+            if on_poll is not None:
+                on_poll(elapsed)
             found_artifact = crash_probe()
             if first_crash_s is None and found_artifact is not None:
                 first_crash_s = elapsed
@@ -225,7 +237,9 @@ def monitor(
 def parse_bhf_fuzz(log_path: Path, work: Path) -> dict:
     text = log_path.read_text(errors="replace")
     executions = re.search(r"final stats\s+[—-]+\s+execs:\s*(\d+)", text)
-    findings = sum(1 for _ in (work / "findings").glob("*/finding.json"))
+    findings = sum(
+        1 for findings_dir in bhf_findings_dirs(work) for _ in findings_dir.glob("*/finding.json")
+    )
     summaries = sorted((work / "fuzz_runs").glob("*-latest.json"))
     summary = None
     if len(summaries) == 1:

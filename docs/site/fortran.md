@@ -26,6 +26,12 @@ is the fuzzable unit. bhf:
    exact input size**, so a real out-of-bounds access — relative to the length the
    routine is told — lands in ASan's redzone instead of being hidden by a padded
    buffer. An integer length argument is set to the byte count.
+   A `bind(C)` procedure is called by its binding name (`name="..."`, else
+   its name in lower case) with the C ABI instead: a `character(kind=c_char),
+   dimension(*)` (or explicit-size) buffer is a bare pointer to the input, an
+   `integer(c_int), value` length is passed by value, and no hidden length is
+   added. Only an assumed-shape array (`dimension(:)`) still needs the
+   descriptor wrapper.
 4. **Fuzzes** it on bhf's C fork-server engine at native speed (thousands of
    executions/second), coverage-guided.
 
@@ -82,3 +88,7 @@ need their module context to compile standalone, and preprocessor include-fragme
   not discovered yet — a numeric-array driver is a planned enhancement.
 - One procedure is fuzzed at a time; module `use` dependencies must compile
   standalone (most numerical modules do).
+- A character-array dummy of a procedure without `bind(C)` goes through a
+  generated descriptor wrapper, which supports one `len=1` array returning an
+  allocatable string; any other such procedure is skipped, and the summary
+  says `--force` cannot help (it builds the same harness).

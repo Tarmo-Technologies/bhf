@@ -82,16 +82,19 @@ fn default_package_java_target_builds_and_executes() {
         combined.contains("built+fuzzed"),
         "default-package Java target should build and fuzz, got:\n{combined}"
     );
-    let generated = std::fs::read_to_string(
-        std::fs::read_dir(work.join("harnesses"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path()
-            .join("harness-src/BhfHarness.java"),
-    )
-    .expect("read default-package generated harness");
+    // The harness dir that holds the generated source: `harnesses/` can
+    // hold other entries, in no set order.
+    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let source = entries
+        .iter()
+        .map(|dir| dir.join("harness-src/BhfHarness.java"))
+        .find(|source| source.is_file())
+        .unwrap_or_else(|| panic!("no harness-src/BhfHarness.java in {entries:#?}\n{combined}"));
+    let generated =
+        std::fs::read_to_string(source).expect("read default-package generated harness");
     assert!(!generated.contains("package bhfgen;"), "{generated}");
     assert!(
         generated.contains("DefaultPackageParser.parse(a0);"),

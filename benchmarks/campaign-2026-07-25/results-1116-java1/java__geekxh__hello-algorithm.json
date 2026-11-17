@@ -1,0 +1,78 @@
+{
+ "repo": "geekxh/hello-algorithm",
+ "sha": "60a2b5f56d4d982c12fa2e04b6005fc27cb8d903",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "Solution.java",
+   "name": "Convert",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'Convert' parameter #0 has an unsupported type `TreeNode`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "Solution.java",
+   "name": "EntryNodeOfLoop",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'EntryNodeOfLoop' parameter #0 has an unsupported type `ListNode`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "Solution.java",
+   "name": "FindKthToTail",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'FindKthToTail' parameter #0 has an unsupported type `ListNode`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "Solution.java",
+   "name": "FindNumbersWithSum",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"javac (target) failed: /home/ubuntu/bhf-corpus-500/java/geekxh__hello-algorithm/\\u7b97\\u6cd5\\u8bfb\\u7269/\\u5251\\u6307offer/27_MirrorOfBinaryTree/Solution.java:17: error: duplicate class: Solution\\n/home/ubuntu/bhf-corpus-500/java/geekxh__hello-algorithm/\\u7b97\\u6cd5\\u8bfb",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "Solution.java",
+   "name": "FindPath",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'FindPath' parameter #0 has an unsupported type `TreeNode`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 4,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

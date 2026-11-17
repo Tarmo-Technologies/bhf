@@ -48,9 +48,14 @@ fn a_format_string_bug_is_one_cwe_134_group_at_the_call() {
         .iter()
         .find(|f| f["id"] == groups[0]["representative"])
         .unwrap();
-    assert_eq!(representative["cwe"][0], 134, "{representative:#}");
-    assert_eq!(representative["location"]["file"], "fmt.c");
-    assert_eq!(representative["location"]["line"], 7);
+    // The whole document and bhf's log go with each failure: the line a
+    // finding is placed at depends on its report being symbolized.
+    assert_eq!(representative["cwe"][0], 134, "{doc:#}\n{stderr}");
+    assert_eq!(
+        representative["location"]["file"], "fmt.c",
+        "{doc:#}\n{stderr}"
+    );
+    assert_eq!(representative["location"]["line"], 7, "{doc:#}\n{stderr}");
     // Every finding is the format-string bug: the crashes and an MSan read
     // of a garbage argument lead with CWE-134, and the capability finding is
     // the format reaching the call.

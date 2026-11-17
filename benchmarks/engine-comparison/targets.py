@@ -49,8 +49,8 @@ _STATUSES = frozenset({RUNNABLE, REQUIRES_BUILD_RECIPE, MANUAL})
 # (what the toy study measures — this conflates engine quality with harness
 # generation and is only honest on a self-contained single file). "provided"
 # holds the harness fixed across every engine, which is the correct mode for an
-# engine-quality comparison on real code; wiring the exact bhf invocation for a
-# provided harness is a documented maintainer step (see METHODOLOGY.md).
+# engine-quality comparison on real code: bhf wraps the same libfuzzer.c harness
+# with `generate-harness --target LLVMFuzzerTestOneInput` (see METHODOLOGY.md).
 BHF_GENERATED = "generated"
 BHF_PROVIDED = "provided"
 _BHF_MODES = frozenset({BHF_GENERATED, BHF_PROVIDED})
@@ -98,6 +98,8 @@ class TargetSpec:
     sources: tuple[Path, ...] = ()
     include_dirs: tuple[Path, ...] = ()
     extra_cflags: tuple[str, ...] = ()
+    # Libraries linked after the sources (a recipe's, such as C++ runtimes).
+    link_flags: tuple[str, ...] = ()
     target_callback: str | None = None
     upstream: Upstream | None = None
     seed_dir: Path | None = None
@@ -108,6 +110,9 @@ class TargetSpec:
     expected_oracle: str = "any ASan/UBSan diagnostic"
     status: str = RUNNABLE
     notes: str = ""
+    # The build recipe (recipes.py) that turns the fetched checkout into
+    # ``sources``/``include_dirs``/``extra_cflags`` at run time.
+    recipe: str | None = None
     # Resolved at load time for self-contained targets; empty for fixtures.
     source_sha256: dict[str, str] = field(default_factory=dict)
 
@@ -124,6 +129,7 @@ class TargetSpec:
             "sources": [str(p) for p in self.sources],
             "include_dirs": [str(p) for p in self.include_dirs],
             "extra_cflags": list(self.extra_cflags),
+            "link_flags": list(self.link_flags),
             "target_callback": self.target_callback,
             "upstream": self.upstream.as_dict() if self.upstream else None,
             "seed_dir": str(self.seed_dir) if self.seed_dir else None,
@@ -134,6 +140,7 @@ class TargetSpec:
             "expected_oracle": self.expected_oracle,
             "status": self.status,
             "source_sha256": self.source_sha256,
+            "recipe": self.recipe,
             "notes": self.notes,
         }
 
@@ -212,11 +219,14 @@ def _parse_target(entry: dict, base: Path, *, resolve_sources: bool) -> TargetSp
     )
     status = _validate_choice(entry.get("status", RUNNABLE), _STATUSES, "status", name)
 
-    if kind == KIND_SELF_CONTAINED and status == RUNNABLE and not sources:
+    recipe = entry.get("recipe")
+    if recipe is not None and (not isinstance(recipe, str) or not recipe):
+        raise ManifestError(f"target {name!r}: recipe must be a non-empty string")
+    if kind == KIND_SELF_CONTAINED and status == RUNNABLE and not sources and not recipe:
         raise ManifestError(
             f"target {name!r}: a runnable self_contained target needs at least one "
-            f"source; mark it status={REQUIRES_BUILD_RECIPE!r} if sources are not "
-            f"yet materialized"
+            f"source or a build recipe; mark it status={REQUIRES_BUILD_RECIPE!r} if "
+            f"sources are not yet materialized"
         )
 
     extra_cflags = entry.get("extra_cflags", [])
@@ -292,6 +302,7 @@ def _parse_target(entry: dict, base: Path, *, resolve_sources: bool) -> TargetSp
         expected_oracle=str(entry.get("expected_oracle", "any ASan/UBSan diagnostic")),
         status=status,
         notes=str(entry.get("notes", "")),
+        recipe=recipe,
         source_sha256=source_sha,
     )
 

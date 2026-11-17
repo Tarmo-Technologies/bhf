@@ -10,9 +10,9 @@ repository.workspace = true
 
 [dependencies]
 actionability = { path = "../actionability" }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 event_log = { path = "../event_log" }
 finding_rules = { path = "../finding_rules" }
+jiff = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

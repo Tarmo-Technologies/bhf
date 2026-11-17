@@ -1,0 +1,56 @@
+{
+ "repo": "binarywang/WxJava",
+ "sha": "8c5d917db934da9af8e68b2e25ee929b4fa1be18",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ApacheHttpChannelMediaDownloadRequestExecutor.java",
+   "name": "ApacheHttpChannelMediaDownloadRequestExecutor",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'ApacheHttpChannelMediaDownloadRequestExecutor' parameter #0 has an unsupported type `RequestHttp<CloseableHttpClient, HttpHost>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "ApacheMediaDownloadRequestExecutor.java",
+   "name": "ApacheMediaDownloadRequestExecutor",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'ApacheMediaDownloadRequestExecutor' parameter #0 has an unsupported type `RequestHttp<CloseableHttpClient, HttpHost>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "ApacheMinishopMediaUploadRequestCustomizeExecutor.java",
+   "name": "ApacheMinishopMediaUploadRequestCustomizeExecutor",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'ApacheMinishopMediaUploadRequestCustomizeExecutor' parameter #0 has an unsupported type `RequestHttp<CloseableHttpClient, HttpHost>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

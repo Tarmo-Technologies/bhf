@@ -29,6 +29,10 @@ pub struct TriageInputs<'a> {
     /// the run did not give `--run-untrusted`. The remedy is the consent, not
     /// `--force`.
     pub skipped_consent_required: usize,
+    /// Of `skipped`, the Fortran targets the lane cannot call (a dummy it
+    /// has no ABI for, such as an assumed-shape array). `--force` builds the
+    /// same harness, so it cannot help.
+    pub skipped_lane_cannot_call: usize,
     pub report_only: usize,
     /// Of `failed_build`, the C++ targets (the C++ dialect ladder applies).
     pub failed_build_cpp: usize,
@@ -163,13 +167,23 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         ));
     }
 
-    // 3e. Skipped (a parameter couldn't be driven) — what --force is actually for.
+    // 3e. Skipped because the Fortran lane has no ABI for a dummy.
+    if inputs.skipped_lane_cannot_call > 0 {
+        actions.push(format!(
+            "{} Fortran target(s) take a dummy the Fortran lane cannot call (each reason in \
+             run.json names it, such as an assumed-shape array); --force cannot help.",
+            inputs.skipped_lane_cannot_call
+        ));
+    }
+
+    // 3f. Skipped (a parameter couldn't be driven) — what --force is actually for.
     let undrivable = inputs
         .skipped
         .saturating_sub(inputs.skipped_missing_package)
         .saturating_sub(inputs.skipped_unsafe_path)
         .saturating_sub(skipped_missing_toolchain)
-        .saturating_sub(inputs.skipped_consent_required);
+        .saturating_sub(inputs.skipped_consent_required)
+        .saturating_sub(inputs.skipped_lane_cannot_call);
     if undrivable > 0 {
         actions.push(format!(
             "{undrivable} target(s) were skipped (a parameter couldn't be driven — opaque handle, callback, unknown type). Attempt them anyway with --force.",
@@ -310,6 +324,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 2,
@@ -330,6 +345,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
@@ -357,6 +373,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
@@ -402,6 +419,7 @@ mod tests {
             skipped_missing_package: 4,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
@@ -436,6 +454,7 @@ mod tests {
             skipped_missing_package: 5,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
@@ -464,6 +483,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 2,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 0,
             report_only: 0,
             findings: 0,
@@ -524,6 +544,7 @@ mod tests {
                 skipped_missing_package: 0,
                 skipped_unsafe_path: 0,
                 skipped_missing_toolchain: vec![("TypeScript", 2)],
+                skipped_lane_cannot_call: 0,
                 skipped_consent_required: 0,
                 report_only: 0,
                 findings: 0,
@@ -637,6 +658,7 @@ mod tests {
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
             skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 0,
             skipped_consent_required: 3,
             report_only: 0,
             findings: 0,
@@ -646,6 +668,35 @@ mod tests {
         let text = render_triage(&inputs);
         assert!(
             text.contains("3 Rust or C# target(s) need --run-untrusted"),
+            "{text}"
+        );
+        assert!(!text.contains("Attempt them anyway with --force"), "{text}");
+    }
+
+    /// A Fortran target the lane cannot call is not advised `--force`,
+    /// which builds the same harness.
+    #[test]
+    fn fortran_lane_skips_are_not_advised_force() {
+        let healthy = healthy();
+        let inputs = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
+            skipped: 2,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
+            skipped_missing_toolchain: Vec::new(),
+            skipped_lane_cannot_call: 2,
+            skipped_consent_required: 0,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy,
+            custom_build: None,
+        };
+        let text = render_triage(&inputs);
+        assert!(
+            text.contains("2 Fortran target(s) take a dummy the Fortran lane cannot call"),
             "{text}"
         );
         assert!(!text.contains("Attempt them anyway with --force"), "{text}");

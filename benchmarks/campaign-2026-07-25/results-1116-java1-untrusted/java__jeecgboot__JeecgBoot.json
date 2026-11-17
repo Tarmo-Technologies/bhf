@@ -1,0 +1,46 @@
+{
+ "repo": "jeecgboot/JeecgBoot",
+ "sha": "df83f4de76811ea73bf5b37a8fe00cbb59988a1b",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "FreemarkerParseFactory.java",
+   "name": "parseTemplate",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"[ERROR] [Help 2] http://cwiki.apache.org/confluence/display/MAVEN/UnresolvableModelException) AND javac (/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/system/api/",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "FreemarkerParseFactory.java",
+   "name": "parseTemplateContent",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"[ERROR] [Help 2] http://cwiki.apache.org/confluence/display/MAVEN/UnresolvableModelException) AND javac (/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/system/api/",
+   "class": "failed build",
+   "before": 2,
+   "classes": [
+    "failed build",
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 3,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

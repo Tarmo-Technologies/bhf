@@ -228,10 +228,22 @@ Go lane finds the package's constructor for the receiver type
 `func (p *Parser) Parse(data []byte) int`, `bhf auto` without `--force` builds
 and fuzzes `Parse`. A receiver with no such constructor still skips unforced.
 
-### Go-3. `not inside a Go module (no go.mod)` — 17 — **GAP**
+### Go-3. `not inside a Go module (no go.mod)` — 17 — **[FIXED]**
 
-A GOPATH-era or vendored tree. Synthesizing a `go.mod` for such a tree is the
-same trick the harness module already uses.
+A package outside every Go module: a GOPATH-era tree, or a dir of `.go` files
+run with `go run`. The harness imports its target through a module `replace`,
+which needs a dir with a `go.mod`. bhf now copies the package into the harness
+dir with a `go.mod` of its own; the scanned tree is not written to.
+- A `package main` is renamed in the copy, so it can be imported.
+- A dir of `go run` scripts, each with its own `main`, is no package at all,
+  so only the target's file is copied.
+- `//line` directives keep a finding on the project's file and line.
+
+The [2026-11-16 re-run](validation/2026-11-16-go3-loose-packages.md) of the 17
+targets by name: 15 build and fuzz. The other 2 are SWIG bindings and fail
+for want of `swig` (ENVIRONMENT). The copy is one dir: a GOPATH tree's other
+packages, imported by their GOPATH paths, are resolved as modules, and a build
+fails when no module provides them.
 
 ### Go-4. `requires go >= X` — 135 of 261 on Go 1.22.2 — **ENVIRONMENT**
 
@@ -276,9 +288,21 @@ is BHF's fault, not a finding. Correct to refuse.
 
 `Context` (15, Android — not resolvable offline), `RequestHttp<…>` (6, generic),
 `ListNode`/`TreeNode` (4, project types), `Map<String,Object>` (3),
-`File`/`Writer` **[FIXED]**. The remainder is generics: an empty `List<T>` cannot
-be spelled without resolving `T`, and the harness declares locals with `var`,
-which infers the wrong type. Resolving that needs the declared type, not `var`.
+`File`/`Writer` **[FIXED]**.
+
+**JDK collections are [FIXED]** (#236). The harness declared locals with `var`,
+which infers the wrong element type for a collection built from the input. A
+collection local is now declared with its parsed type and filled with decoded
+elements: `List<String>`, `Map<String, Object>`, sets, sorted maps, nested
+collections, wildcards, `int[]`. A `List` of a project type takes default
+instances of it, when the type has a no-arg constructor, factory or constant.
+
+The [2026-11-16 re-run](validation/2026-11-16-java1-collections.md) of the 57
+targets `results-0728` skipped here, by name: 7 now pass the parameter they were
+skipped on, and none builds. Five need the project's Maven or Gradle build, which
+fails, one fails javac on the tree, and one stops at its next parameter. Of the
+50 unchanged, 19 take an Android type and 29 a project or dependency type with
+nothing to construct it from. A bare type variable `T` (2) is still unresolved.
 
 ### Java-2. Instance method, no no-arg constructor — 12 — **GAP**
 
@@ -584,8 +608,9 @@ By fixable targets, highest first:
    `*pflag.FlagSet`).
 5. **Rust decoders** (Rust-1; 42) + static methods of another crate's trait
    (Rust-4; 11).
-6. **Java generic/collection parameters** (Java-1; ~40 of the 75) — needs
-   declared-type locals instead of `var`.
+6. **Java project-type parameters** (Java-1; 29 of the 57 that `results-0728`
+   left) — a project or dependency type with no no-arg constructor, factory or
+   constant to build it from. JDK collections are decoded since #236.
 7. **Python receiver-with-arguments** (Py-2; 25) and C# unforced receiver
    (C#-1; 26).
 8. **JS browser globals** (JS-2; 28) — cheap, but risks manufacturing

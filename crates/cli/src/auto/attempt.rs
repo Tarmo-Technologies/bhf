@@ -112,6 +112,10 @@ fn should_link_full_tu_set(
 /// `bhf auto` CLI flags `--per-target-time` and `--no-stubs`.
 #[derive(Debug, Clone)]
 pub struct AttemptOptions {
+    /// `--collector` and `--collector-window-ms` (#278): after a target's fuzz
+    /// passes, replay its retained inputs under this runtime-event collector.
+    /// `None` (the default) runs no collector.
+    pub collector: Option<(crate::collector_run::CollectorSpec, u64)>,
     /// TOTAL per-target fuzz wall-clock budget for the cascade against a freshly
     /// built harness, split evenly across the passes (`total / passes.len()`)
     /// under one shared deadline so the per-target wall ≈ this regardless of pass
@@ -268,6 +272,7 @@ pub struct CrossSweep {
 impl Default for AttemptOptions {
     fn default() -> Self {
         Self {
+            collector: None,
             per_target_time: Duration::from_secs(60),
             total_time: None,
             per_target_finding_count: None,
@@ -4241,6 +4246,31 @@ fn run_attempt(
                         findings,
                     );
                 }
+                // #278: replay the target's retained inputs under the collector,
+                // once, after its passes. The provenance goes beside the harness
+                // for run.json.
+                if let Some((spec, window_ms)) = &options.collector {
+                    let log = harness_dir.join("runtrace.jsonl");
+                    match crate::fuzz::observe_with_collector(
+                        work_dir,
+                        &candidate.harness_id,
+                        spec,
+                        *window_ms,
+                        cross_runner.clone(),
+                        &env_injected,
+                        Some(&log),
+                    ) {
+                        Ok(provenance) => {
+                            let _ = std::fs::write(
+                                harness_dir.join(COLLECTOR_FILE),
+                                serde_json::to_vec_pretty(&provenance).unwrap_or_default(),
+                            );
+                        }
+                        Err(error) => {
+                            bhfeprintln!("bhf auto: {}: collector: {error:#}", candidate.harness_id)
+                        }
+                    }
+                }
                 // #95: target entry is a fuzz-SUCCESS invariant. Every generated
                 // lane injects a checkpoint immediately before the selected project
                 // endpoint, so a genuine fuzz of the library hits it. If an
@@ -5116,7 +5146,7 @@ pub(crate) enum LaneSinkOracles {
 /// what the lane's driver checks itself.
 pub(crate) fn lane_sink_oracles(lang: crate::auto::candidate::Lang) -> LaneSinkOracles {
     use crate::auto::candidate::Lang;
-    if launcher_marker(lang).is_none() {
+    if launcher_marker(lang).is_none() || shim_preloaded_into_launcher(lang) {
         return LaneSinkOracles::Shim;
     }
     match lang {
@@ -5134,15 +5164,29 @@ pub(crate) fn lane_sink_oracles(lang: crate::auto::candidate::Lang) -> LaneSinkO
 /// language-aware driver owns coverage and finding classification, so the
 /// native runtrace shim is not preloaded into it.
 pub(crate) fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
+    harness_launcher_lang(harness_dir).is_some()
+}
+
+/// The lane of an interpreter/VM launcher harness, by the marker its `main`
+/// launcher script carries; `None` for a native harness.
+pub(crate) fn harness_launcher_lang(
+    harness_dir: &std::path::Path,
+) -> Option<crate::auto::candidate::Lang> {
     use clap::ValueEnum as _;
-    std::fs::read_to_string(harness_dir.join("main"))
-        .map(|s| {
-            crate::auto::candidate::LangSelector::value_variants()
-                .iter()
-                .filter_map(|selector| launcher_marker(selector.to_lang()))
-                .any(|marker| s.contains(marker))
-        })
-        .unwrap_or(false)
+    let launcher = std::fs::read_to_string(harness_dir.join("main")).ok()?;
+    crate::auto::candidate::LangSelector::value_variants()
+        .iter()
+        .map(|selector| selector.to_lang())
+        .find(|lang| launcher_marker(*lang).is_some_and(|marker| launcher.contains(marker)))
+}
+
+/// The interpreter lanes whose process the runtrace shim is preloaded into,
+/// recording from target entry (#300, #301): the interpreter's own start-up
+/// before it (imports, locale probes, its own comparisons) is not recorded.
+/// Their sinks (a file the target opens, a command it runs) are the shim's.
+pub(crate) fn shim_preloaded_into_launcher(lang: crate::auto::candidate::Lang) -> bool {
+    use crate::auto::candidate::Lang;
+    matches!(lang, Lang::Python | Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php)
 }
 
 /// The warning for a failed `make afl`: the builtin engine's results stand
@@ -5173,7 +5217,7 @@ pub(crate) const BOOTSTRAP_SEEDS: [&[u8]; 3] = [b"", b"A", b"AAAAAAAA"];
 /// "no environment use observed" from "not observed".
 fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
     !cross
-        && !harness_owns_runtime_instrumentation(harness_dir)
+        && harness_launcher_lang(harness_dir).is_none_or(shim_preloaded_into_launcher)
         && crate::auto::runtrace::log_shows_shim_loaded(&harness_dir.join("runtrace.jsonl"))
 }
 
@@ -5181,6 +5225,9 @@ fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
 /// per candidate during a large sweep. First-failed-lookup prints
 /// a single stderr line; every subsequent call is silent.
 static SHIM_MISSING_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The collector's run provenance for a target, beside its harness (#278).
+pub(crate) const COLLECTOR_FILE: &str = "collector.json";
 
 /// Run one fuzz pass with the runtrace shim loaded. Returns the
 /// FuzzRunSummary plus the parsed event list (empty when the shim
@@ -5268,6 +5315,14 @@ fn run_fuzz_with_runtrace(
             harness_dir.join("vp.shm").display().to_string(),
         ),
     ];
+    // #220: the deepest stack each exec reached, beside the other maps. The
+    // engine zeroes it before every exec, so passes can share it.
+    if std::env::var("BHF_DISABLE_STACK_DEPTH").as_deref() != Ok("1") {
+        child_env.push((
+            "BHF_STACK_DEPTH_SHM".to_owned(),
+            harness_dir.join("stack_depth.shm").display().to_string(),
+        ));
+    }
 
     // #83 runner-owned resource scratch: the opt-in in-crate path-opener harness
     // materializes each case's seeded resource under a directory the SUPERVISOR
@@ -5329,8 +5384,11 @@ fn run_fuzz_with_runtrace(
     // comparisons). Besides false behavioral events, CPython can emit megabytes of
     // startup cmplog and miss a short campaign's handshake entirely. Native lanes
     // retain the shim; managed/scripting lanes use their language-aware drivers.
-    let owns_runtime_instrumentation = harness_owns_runtime_instrumentation(harness_dir);
-    if cross_wrapper.is_some() || owns_runtime_instrumentation {
+    // #300: the Python and Perl launchers do take the shim, recording only
+    // from target entry, so the interpreter's start-up is not theirs.
+    let launcher = harness_launcher_lang(harness_dir);
+    let gated_launcher = launcher.is_some_and(shim_preloaded_into_launcher);
+    if cross_wrapper.is_some() || (launcher.is_some() && !gated_launcher) {
         // no shim for emulated targets or interpreter/VM lanes
     } else if let Some(shim) = crate::auto::shim_path::locate() {
         let ld_preload = crate::auto::shim_path::ld_preload_value_with(
@@ -5338,6 +5396,14 @@ fn run_fuzz_with_runtrace(
             std::env::var("LD_PRELOAD").ok().as_deref(),
         );
         child_env.push(("LD_PRELOAD".to_owned(), ld_preload));
+        if gated_launcher {
+            child_env.push(("BHF_RUNTRACE_AFTER_TARGET_ENTRY".to_owned(), "1".to_owned()));
+            // The driver writes each input there for the shim's taint check.
+            child_env.push((
+                "BHF_SHIM_INPUT_FILE".to_owned(),
+                harness_dir.join("shim_input.bin").display().to_string(),
+            ));
+        }
     } else if SHIM_MISSING_WARNED.set(()).is_ok() {
         bhfeprintln!(
             "bhf auto: {}; running fuzz without the runtrace shim",
@@ -5404,12 +5470,34 @@ fn run_fuzz_with_runtrace(
             )?
         }
     };
+    if gated_launcher {
+        remove_published_inputs(harness_dir);
+    }
     let events = if runtrace_log.is_file() {
         crate::auto::runtrace::parse_log(&runtrace_log).unwrap_or_default()
     } else {
         Vec::new()
     };
     Ok((summary, events))
+}
+
+/// The per-process input files (`shim_input.bin.<pid>`) a launcher's driver
+/// left for the shim (#300): each removes its own at exit, and a process that
+/// died first leaves its file behind.
+fn remove_published_inputs(harness_dir: &std::path::Path) {
+    for entry in std::fs::read_dir(harness_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("shim_input.bin."))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// HDF-6 deliverable 4: build the HDF-5 environment/peripheral model for a
@@ -13181,12 +13269,13 @@ mod stamp_tests {
                 .collect()
         };
         let preloaded = doc
-            .split_once("preloaded into native harnesses only: ")
+            .split_once("preloaded into these lanes' harnesses: ")
             .and_then(|(_, rest)| rest.split_once('.'))
             .map(|(list, _)| names(list))
             .expect("vulnerability-coverage.md names the lanes the shim is preloaded into");
         let without = doc
             .split_once(" have no sink oracles yet")
+            .or_else(|| doc.split_once(" has no sink oracles yet"))
             .and_then(|(before, _)| before.rsplit_once(". "))
             .map(|(_, list)| names(list))
             .expect("vulnerability-coverage.md names the lanes with no sink oracles");

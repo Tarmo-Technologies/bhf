@@ -69,7 +69,7 @@ impl Lane for GoLane {
         let Ok(go_mod) = std::fs::read_to_string(dir.join("go.mod")) else {
             return Some("it has no readable go.mod".to_owned());
         };
-        if replaced_dirs(&go_mod).is_empty() {
+        if replaced_dirs(&go_mod, dir).is_empty() {
             return Some(
                 "its go.mod replaces no module with a local dir, so there is no target \
                  module to ship"
@@ -82,7 +82,14 @@ impl Lane for GoLane {
     fn plan_capsule(&self, harness: &HarnessContext) -> anyhow::Result<CapsulePlan> {
         let dir = &harness.harness_dir;
         let go_mod = std::fs::read_to_string(dir.join("go.mod"))?;
-        let replaced = replaced_dirs(&go_mod);
+        // A package outside every module was copied into the harness dir
+        // (`bhf_target/`), which ships with the harness. Compared resolved: on
+        // Windows the go.mod and the harness dir can spell one dir apart (a
+        // `\\?\` prefix, the drive letter's case).
+        let harness_root = crate::workdir::plain_canonical(dir);
+        let (copied, replaced): (Vec<PathBuf>, Vec<PathBuf>) = replaced_dirs(&go_mod, dir)
+            .into_iter()
+            .partition(|module| crate::workdir::plain_canonical(module).starts_with(&harness_root));
         let tree = super::recorded_source_root(&harness.work_dir)
             .filter(|root| replaced.iter().all(|module| module.starts_with(root)))
             .or_else(|| replaced.first().cloned())
@@ -110,6 +117,20 @@ impl Lane for GoLane {
                     )
             })
             .collect();
+        for module in &copied {
+            let Ok(relative) = crate::workdir::plain_canonical(module)
+                .strip_prefix(&harness_root)
+                .map(Path::to_path_buf)
+            else {
+                continue;
+            };
+            harness_files.extend(
+                std::fs::read_dir(module)?
+                    .flatten()
+                    .filter(|entry| entry.path().is_file())
+                    .map(|entry| relative.join(entry.file_name())),
+            );
+        }
         harness_files.sort();
         let mut relocator = Relocator {
             mounts: vec![
@@ -186,6 +207,14 @@ impl Lane for GoLane {
                 "the scanned tree holding the target module".to_owned(),
             ),
         ];
+        if !copied.is_empty() {
+            layout.push((
+                format!("harness/{}/", crate::auto::go_build::LOOSE_PACKAGE_DIR),
+                "the target's package, outside every Go module in sources/, copied into a \
+                 module of its own"
+                    .to_owned(),
+            ));
+        }
         if vendor.is_some() {
             layout.push((
                 "harness/vendor/".to_owned(),
@@ -226,9 +255,10 @@ impl Lane for GoLane {
     }
 }
 
-/// The local dirs a `go.mod` replaces modules with (`replace m => /dir` or
-/// `=> "/dir with space"`).
-pub(crate) fn replaced_dirs(go_mod: &str) -> Vec<PathBuf> {
+/// The local dirs a `go.mod` in `go_mod_dir` replaces modules with (`replace
+/// m => /dir`, `=> "/dir with space"`, or `=> ./dir`, relative to the
+/// `go.mod`, as the copy of a package outside every module is named).
+pub(crate) fn replaced_dirs(go_mod: &str, go_mod_dir: &Path) -> Vec<PathBuf> {
     go_mod
         .lines()
         .filter_map(|line| {
@@ -241,6 +271,9 @@ pub(crate) fn replaced_dirs(go_mod: &str) -> Vec<PathBuf> {
             } else {
                 target.split_whitespace().next()?.to_owned()
             };
+            if path.starts_with("./") || path.starts_with("../") {
+                return Some(go_mod_dir.join(path));
+            }
             let path = PathBuf::from(path);
             path.is_absolute().then_some(path)
         })
@@ -269,7 +302,7 @@ fn vendored_dependencies(
     let output = crate::command_output::output_with_timeout(&mut list, Duration::from_secs(300))
         .map_err(|error| anyhow::anyhow!("cannot run {go} list: {error}"))?;
     let local_requirements: Vec<String> = std::fs::read_to_string(harness_dir.join("go.mod"))
-        .map(|go_mod| replaced_dirs(&go_mod))
+        .map(|go_mod| replaced_dirs(&go_mod, harness_dir))
         .unwrap_or_default()
         .iter()
         .filter_map(|dir| std::fs::read_to_string(dir.join("go.mod")).ok())
@@ -294,7 +327,7 @@ fn vendored_dependencies(
     let local: Vec<PathBuf> = std::iter::once(harness_dir.to_path_buf())
         .chain(
             std::fs::read_to_string(harness_dir.join("go.mod"))
-                .map(|go_mod| replaced_dirs(&go_mod))
+                .map(|go_mod| replaced_dirs(&go_mod, harness_dir))
                 .unwrap_or_default(),
         )
         .collect();
@@ -391,10 +424,15 @@ mod tests {
                       require bhf.example/x v0.0.0-incompatible\n\n\
                       replace bhf.example/x => \"/t/my src\"\n\
                       replace other => /t/other\n\
-                      replace remote => example.com/fork v1.2.3\n";
+                      replace remote => example.com/fork v1.2.3\n\
+                      replace bhf.local/tool => ./bhf_target\n";
         assert_eq!(
-            replaced_dirs(go_mod),
-            vec![PathBuf::from("/t/my src"), PathBuf::from("/t/other")]
+            replaced_dirs(go_mod, Path::new("/h")),
+            vec![
+                PathBuf::from("/t/my src"),
+                PathBuf::from("/t/other"),
+                PathBuf::from("/h/bhf_target")
+            ]
         );
     }
 

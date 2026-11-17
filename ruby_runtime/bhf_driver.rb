@@ -178,8 +178,33 @@ def bhf_handle_error(err)
   bhf_report_finding(cwe, "#{cls}: #{err.message}", err) if cwe
 end
 
+# The file the runtrace shim reads the current input from, when bhf preloads
+# it (#301): the shim cannot see this process's bytes otherwise, so a sink the
+# target reached could not be traced back to the input. One per process, since
+# bhf runs fresh processes beside this one; removed at exit.
+BHF_SHIM_INPUT_FILE =
+  ENV['BHF_SHIM_INPUT_FILE'].to_s.empty? ? nil : "#{ENV['BHF_SHIM_INPUT_FILE']}.#{Process.pid}"
+BHF_SHIM_INPUT_PID = Process.pid
+if BHF_SHIM_INPUT_FILE
+  at_exit do
+    begin
+      File.unlink(BHF_SHIM_INPUT_FILE) if Process.pid == BHF_SHIM_INPUT_PID
+    rescue SystemCallError
+      nil
+    end
+  end
+end
+
+def bhf_publish_input(data)
+  return unless BHF_SHIM_INPUT_FILE
+  File.binwrite(BHF_SHIM_INPUT_FILE, data)
+rescue SystemCallError
+  nil
+end
+
 def bhf_run_input(data)
   bhf_reset_prev
+  bhf_publish_input(data)
   begin
     bhf_run_one(data)
   rescue SystemExit, SignalException

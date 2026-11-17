@@ -157,8 +157,30 @@ function bhf_arm_hang_report(): void {
     pcntl_alarm(max(1, intdiv((int)$after + 999, 1000)));
 }
 
+// The file the runtrace shim reads the current input from, when bhf preloads
+// it (#301): the shim cannot see this process's bytes otherwise, so a sink the
+// target reached could not be traced back to the input. One per process, since
+// bhf runs fresh processes beside this one; removed at exit.
+$BHF_SHIM_INPUT_FILE = (string)getenv('BHF_SHIM_INPUT_FILE') !== ''
+    ? getenv('BHF_SHIM_INPUT_FILE') . '.' . getmypid()
+    : null;
+if ($BHF_SHIM_INPUT_FILE !== null) {
+    $bhf_shim_input_pid = getmypid();
+    register_shutdown_function(function () use ($bhf_shim_input_pid) {
+        global $BHF_SHIM_INPUT_FILE;
+        if (getmypid() === $bhf_shim_input_pid) @unlink($BHF_SHIM_INPUT_FILE);
+    });
+}
+
+function bhf_publish_input(string $data): void {
+    global $BHF_SHIM_INPUT_FILE;
+    if ($BHF_SHIM_INPUT_FILE === null) return;
+    @file_put_contents($BHF_SHIM_INPUT_FILE, $data);
+}
+
 function bhf_run_input(string $data): void {
     global $BHF_RUN_ONE, $have_pcov;
+    bhf_publish_input($data);
     if ($have_pcov) \pcov\clear();
     ob_start();
     try {

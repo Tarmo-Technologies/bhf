@@ -199,7 +199,12 @@ with input after input (the mutated input varies), while each input meets only
 the constants it is checked against, so at a keyword-table lookup a keyword
 counts once it has met more inputs than there are keywords, and before that
 neither side does. An operand `dictionary.txt` lists is kept too, and a record
-without a site only confirms such a token. Tokens are at most 64 bytes; a
+without a site only confirms such a token. The driver also records the constant
+of each integer comparison the compiler emitted against one (an `"int"`
+record), including a constant computed at build time that no source literal
+spells, such as a key folded from a hash of a literal; one record makes it a
+constant, written as its little-endian bytes and then big-endian. A constant
+of at most 0xff, or of all ones, is not recorded. Tokens are at most 64 bytes; a
 one-byte variant of a stronger token is left out. This run's constants come
 first, then those an earlier run learned, at most 256 tokens, under a header
 saying how they were chosen. A file an earlier release wrote held every operand, mutated
@@ -1206,6 +1211,8 @@ bhf runners plan runners.json --queue runner-queue.json --policy bhf-policy.json
 bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-root.pub
 bhf pack create --root packs/current --pack-id rules-2026-06 --item rules:rules/static.json --signing-key keys/offline-root.der --key-id offline-root --out packs/current/update-pack.json
 bhf pack verify update-pack.json --root packs/current --out bhf_work/pack-verify.json
+bhf pack import-osv osv/crates.io osv/PyPI --out packs/current/cve-db.json
+bhf pack import-nvd nvd/nvdcve-2.0-2025.json nvd/nvdcve-2.0-2026.json --out packs/current/cve-db-nvd.json
 bhf sbom path/to/src --out bhf_work/sbom --vuln-db packs/current/cve-db.json --policy bhf-policy.json
 bhf ci . --work-dir bhf_work --policy bhf-policy.json --runner-plan bhf_work/runner-plan.json --dashboard-out bhf_work/ci-dashboard.json
 bhf export --work-dir bhf_work --out bhf_work/export-manifest.json --bundle-dir bhf_work/export-bundle --policy bhf-policy.json --update-pack update-pack.json --runner-plan bhf_work/runner-plan.json
@@ -1261,9 +1268,12 @@ JSON with component purls, declared component CPEs, hashes, dependency
 relationships, declared component supplier/license metadata, BHF evidence
 properties, and BHF tool metadata including supplier, license, and package
 URL, then matches against an offline
-`--vuln-db` from an update pack. Vulnerability entries can identify packages by
-`package.ecosystem`/`package.name` plus `affected_versions`, or by
-`package.purl` or `package.cpe` plus `affected_versions`; PURL and CPE matches
+`--vuln-db` from an update pack, or one `bhf pack import-osv` or
+`bhf pack import-nvd` builds from OSV or NVD records (see [Inventory assurance](inventory-assurance.md#advisory-database-format)
+for the format). Vulnerability entries can identify packages by
+`package.ecosystem`/`package.name`, or by `package.purl` or `package.cpe`,
+plus `affected_versions` (exact versions, `*` for all) or `affected_ranges`
+(version bounds); PURL and CPE matches
 are reported as high-confidence `matching_method: "purl"` or
 `matching_method: "cpe"` findings. Identifiers are compared structurally
 rather than as exact strings: comparison is case-insensitive, both CPE 2.2
@@ -1365,10 +1375,11 @@ so a run whose crashes were all known does not read as clean.
 - `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which reports only an input that hangs again at twice the timeout), an input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure) when at least two of three fresh re-runs exceed it too; the finding's `deadline_confirmation` records each re-run's time. For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. A duration (`250ms`, `0.5s`, `1s`); `BHF_DEADLINE_MS` sets it from the environment. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--rss-limit-mb <MB>` — per-execution resident-memory ceiling for a C/C++ harness (libFuzzer `-rss_limit_mb`); an execution over budget is killed and reported as an OOM finding. `0` (default) disables it. With `--engine winafl` it also becomes WinAFL's `-m`, the committed-memory cap of drrun and the target: the limit plus 1024 MiB for DynamoRIO, or `-m none` for `0`. For an x86 harness it is `-m none` when that cap is not below what the 32-bit process can address (2 GiB, or 4 GiB when large-address aware).
 - `--print-final-stats` — print a final-stats line (libFuzzer `-print_final_stats`): executions, exec/s, new vs duplicate corpus signatures, findings, elapsed time.
-- `--quiet` (`-q`) — print no progress lines. Without it the builtin engine prints a status line on stderr 2s into the run, then at doubling intervals up to every 30s: `bhf: fuzz: 8123 execs (4061/s) | corpus: 12 | findings: 0 | edges: 214 | elapsed: 2.0s`. Workers of `--workers` run quiet.
+- `--quiet` (`-q`) — print no progress lines. Without it the builtin engine prints a status line on stderr 2s into the run, then at doubling intervals up to every 30s: `bhf: fuzz: 8123 execs (4061/s) | corpus: 12 | findings: 0 | edges: 214 | elapsed: 2.0s`, with `| stability: N%` before the elapsed time once stability calibration has measured it. Workers of `--workers` run quiet.
 - Crashes in the loop are not symbolized: the builtin engine runs its own executions with `symbolize=0:abort_on_error=0` appended to the sanitizer options, tells crashes apart by their rule, kind and top five unsymbolized frames (`module+offset`), counts a crash whose signature was reported against that finding, and re-runs a new one in a fresh process with the symbolized options replays use, whose report becomes the finding. Symbolizing every crashing execution and aborting it through the kernel's core pattern took most of a second each, which left a target whose inputs mostly crash a few executions a second. `BHF_IN_LOOP_SYMBOLIZE=1` symbolizes in the loop again.
+- `BHF_LIVE_CORPUS_DIR=<dir>` — the builtin engine also writes each input it keeps into `<dir>` as it keeps it, named `<sha256>.bin` as the queue names it, so a tool watching a campaign sees the corpus grow (the engine trade study snapshots it for coverage over time). The queue itself is written when the pass ends, after its re-run checks, and leaves out what they rejected; the dir does not.
 - `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs while the finding they duplicate is in `results/findings`. Once that finding is removed (or `results/` is wiped), the next campaign drops them instead of merging them back.
-- `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
+- `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. The persistent engine calibrates each input it would add to the corpus, as AFL++ does: it re-runs the input four times, each from a zeroed edge bitmap, and an edge one run hit and another did not is variable. An input whose runs differ is added only if every run hit an edge no calibrated input hit every time before; one whose only new coverage was variable edges is left out, and the re-runs' edges count as seen, so a state-dependent edge is not new coverage later. `stability` in `fuzz_runs/<harness>-latest.json` gives `stability_pct` (the share of the edges calibration saw that no run varied on), `variable_edges`, `calibrated_entries` and `unstable_entries_dropped`. Below 90% bhf prints a note that the harness keeps state between executions, with this flag as one remedy. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. See [On-Target & Embedded](./on-target-fuzzing.md).

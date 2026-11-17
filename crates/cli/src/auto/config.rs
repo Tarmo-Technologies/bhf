@@ -189,6 +189,10 @@ pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
     "preprocess",
     "install-deps",
     "comparison-progress",
+    // `--collector` can name a sidecar program to run; a scanned tree's
+    // config file does not choose one.
+    "collector",
+    "collector-window-ms",
     "sbom",
     "static",
     "external-tools",

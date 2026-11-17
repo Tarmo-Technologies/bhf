@@ -79,8 +79,11 @@ pub fn flush_after_panic() -> usize {
     }
 }
 
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+/// The current UTC time in RFC 3339, with a `+00:00` offset.
+pub(crate) fn now_rfc3339() -> String {
+    jiff::Timestamp::now()
+        .display_with_offset(jiff::tz::Offset::UTC)
+        .to_string()
 }
 
 /// Install the diagnostics panic hook (once) and record `--debug`. Under

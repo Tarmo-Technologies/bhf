@@ -1,0 +1,34 @@
+{
+ "repo": "zxing/zxing",
+ "sha": "19aa2d8254410e161f04dc3c928e68d5e90233c2",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ExpandedProductParsedResult.java",
+   "name": "ExpandedProductParsedResult",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/NoPluginFoundForPrefixException) AND javac (/home/ubuntu/bhf-corpus-500/java/zxing__zxing/android-integration/src/main/java/com/google/zxing/integration/android/IntentIntegrator.java:26: error: package andr",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

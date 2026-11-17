@@ -60,18 +60,23 @@
 #endif
 
 /* MSVC (`cl.exe`, the MSVC harness lane): no GNU attributes or builtins.
- * `_ReturnAddress` is the intrinsic for `__builtin_return_address(0)`, and a
- * callback MSVC's `libsancov.lib` looks up at start-up must be exported from
- * the executable for it to be found. */
+ * `_ReturnAddress` is the intrinsic for `__builtin_return_address(0)`, the
+ * slot `_AddressOfReturnAddress` names is a stack address of the current frame
+ * as `__builtin_frame_address(0)` is, and a callback MSVC's `libsancov.lib`
+ * looks up at start-up must be exported from the executable for it to be
+ * found. */
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #pragma intrinsic(_ReturnAddress)
+#pragma intrinsic(_AddressOfReturnAddress)
 #define BHF_MSVC 1
 #define BHF_RA _ReturnAddress()
+#define BHF_FA _AddressOfReturnAddress()
 #define BHF_MEMCPY memcpy
 #define BHF_EXPORT __declspec(dllexport)
 #else
 #define BHF_RA __builtin_return_address(0)
+#define BHF_FA __builtin_frame_address(0)
 #define BHF_MEMCPY __builtin_memcpy
 #define BHF_EXPORT
 #endif
@@ -508,7 +513,8 @@ BHF_NOCOV static void bhf_cmplog_open(void) {
 }
 BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t site,
                                       const unsigned char *a, unsigned la,
-                                      const unsigned char *b, unsigned lb) {
+                                      const unsigned char *b, unsigned lb,
+                                      uint32_t *written, uint32_t budget) {
     static const char hex[] = "0123456789abcdef";
     char line[96 + 4 * BHF_CMPLOG_OPMAX];
     unsigned len = 0, need, i, k;
@@ -526,7 +532,7 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t
     need = (unsigned)sizeof("{\"e\":\"cmplog\",\"k\":\"\",\"s\":\"\",\"a\":\"\",\"b\":\"\"}\n") - 1u
            + 17u + 2u * (la + lb);
     for (p = kind; *p; p++) need++;
-    if (bhf_cmplog_written + need > BHF_CMPLOG_MAX_BYTES) return;
+    if (*written + need > budget) return;
     for (p = kind; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ull; }
     for (i = 0; i < la; i++) { h ^= a[i]; h *= 1099511628211ull; }
     h ^= 0xffu; h *= 1099511628211ull;
@@ -550,8 +556,8 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t
     for (k = 0; k < lb; k++) { line[len++] = hex[b[k] >> 4]; line[len++] = hex[b[k] & 15]; }
     BHF_CL_PUT("\"}\n");
 #undef BHF_CL_PUT
-    if (bhf_cmplog_written + len > BHF_CMPLOG_MAX_BYTES) return;
-    bhf_cmplog_written += len;
+    if (*written + len > budget) return;
+    *written += len;
 #ifdef _WIN32
     {
         DWORD wrote = 0;
@@ -572,7 +578,31 @@ BHF_NOCOV static void bhf_cmplog_buf(const char *kind, const void *pc, const voi
     if (!bhf_ev_site(pc, &site) || BHF_IN_SHIM()) return;
     cap = n > BHF_CMPLOG_OPMAX ? BHF_CMPLOG_OPMAX : (unsigned)n;
     bhf_cmplog_line(kind, pc, site, a, bhf_ev_len(a, cap, stop_at_nul), b,
-                    bhf_ev_len(b, cap, stop_at_nul));
+                    bhf_ev_len(b, cap, stop_at_nul), &bhf_cmplog_written, BHF_CMPLOG_MAX_BYTES);
+}
+/* An integer comparison against a constant the compiler emitted
+ * (`__sanitizer_cov_trace_const_cmp*`, whose first argument is the constant)
+ * is an `"int"` record of the constant alone, little-endian at the
+ * comparison's width (#221). A constant solved during one run, such as a
+ * computed key folded to an immediate, then reaches the learned dictionary
+ * the next run and the AFL++ and WinAFL lanes load. A constant of at most
+ * 0xff, or of all ones, is left out: loop bounds, flags and -1 say nothing
+ * about the input. Each constant is written once per process, against its
+ * own BHF_CMPLOG_INT_MAX_BYTES, so integers cannot crowd out strings. */
+#define BHF_CMPLOG_INT_MAX_BYTES (1u << 16)
+static uint32_t bhf_cmplog_int_written = 0;
+BHF_NOCOV static void bhf_cmplog_int(const void *pc, uint64_t constant, unsigned width) {
+    unsigned char a[8];
+    uint64_t ones = width >= 8 ? ~(uint64_t)0 : (((uint64_t)1 << (8 * width)) - 1);
+    uint32_t site;
+    unsigned i;
+    if (bhf_cmplog_fd == -1) return;
+    constant &= ones;
+    if (constant <= 0xffu || constant == ones) return;
+    if (!bhf_ev_site(pc, &site) || BHF_IN_SHIM()) return;
+    for (i = 0; i < width; i++) a[i] = (unsigned char)(constant >> (8 * i));
+    bhf_cmplog_line("int", pc, site, a, width, a, 0, &bhf_cmplog_int_written,
+                    BHF_CMPLOG_INT_MAX_BYTES);
 }
 
 /* One-byte, cumulative proof that generated harness code crossed the boundary
@@ -611,6 +641,39 @@ BHF_NOCOV static void bhf_cov_cnt_open(void) {
     void *m = bhf_map_shared(p, BHF_COV_BITS);
     if (m) bhf_cov_cnt_map = (unsigned char *)m;
 }
+/* Stack depth (#220): a FOURTH MAP_SHARED word named by BHF_STACK_DEPTH_SHM,
+ * 8 bytes: the deepest this exec's stack reached, in bytes below the frame the
+ * framed loop ran the input from. The coverage callbacks note their own frame
+ * address, just below the instrumented function's, so the lowest one an exec
+ * sees bounds its recursion depth, the measure libFuzzer takes with
+ * -fsanitize-coverage=stack-depth, without that instrumentation. A frame more than 64 MiB away is another
+ * thread's and is ignored. The engine zeroes it before every exec and rewards a
+ * new deepest bucket. A no-op when unset. The layout MUST stay in sync with the
+ * other driver copies (direct_harness.c.tera, direct_harness.cpp.tera,
+ * c_runtime/bhf_driver.c) and the CoverageTracker reader in crates/cli/src/fuzz.rs. */
+static uint64_t *bhf_stack_map = 0;
+static uintptr_t bhf_stack_base = 0, bhf_stack_low = 0;
+static void bhf_stack_open(void) {
+    if (bhf_stack_map) return;
+    const char *p = getenv("BHF_STACK_DEPTH_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, 8);
+    if (m) bhf_stack_map = (uint64_t *)m;
+}
+#define BHF_STACK_NOTE() do { \
+    uintptr_t bhf_fp_ = (uintptr_t)BHF_FA; \
+    if (bhf_fp_ < bhf_stack_low && bhf_stack_base - bhf_fp_ < ((uintptr_t)64 << 20)) \
+        bhf_stack_low = bhf_fp_; \
+} while (0)
+#define BHF_STACK_BEGIN() do { \
+    if (bhf_stack_map) bhf_stack_base = bhf_stack_low = (uintptr_t)BHF_FA; \
+} while (0)
+#define BHF_STACK_END() do { \
+    if (bhf_stack_map) { \
+        uint64_t bhf_depth_ = (uint64_t)(bhf_stack_base - bhf_stack_low); \
+        if (bhf_depth_ > *bhf_stack_map) *bhf_stack_map = bhf_depth_; \
+    } \
+} while (0)
 /* laf-intel comparison-progress (#421): a THIRD map, BHF_CMP_PROGRESS_SHM,
  * one byte per hashed compare site recording the MAX leading-byte match this
  * exec, so the engine can reward an input one byte closer to a multi-byte gate.
@@ -793,6 +856,7 @@ BHF_NOCOV BHF_EXPORT void __sanitizer_cov_8bit_counters_init(unsigned char *star
     bhf_c8_modules++;
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmp_open();
     bhf_cmpp_open();
     bhf_ev_open();
@@ -823,12 +887,14 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *st
     for (uint32_t *x = start; x < stop; x++) *x = ++bhf_cov_next;
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmp_open();
     bhf_cmpp_open();
     bhf_ev_open();
 }
 BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     if (!*guard || !bhf_cov_map) return;
+    if (bhf_stack_map) BHF_STACK_NOTE();
     bhf_cov_map[*guard & (BHF_COV_BITS - 1)] = 1;
     if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
         bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
@@ -839,6 +905,7 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
  * engine's coverage reader stays platform-agnostic. */
 BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
     if (!bhf_cov_map) return;
+    if (bhf_stack_map) BHF_STACK_NOTE();
     uintptr_t pc = (uintptr_t)BHF_RA;
     uint32_t h = ((uint32_t)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);
     bhf_cov_map[h] = 1;
@@ -856,9 +923,9 @@ BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; B
 BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; BHF_MEMCPY(&ua, &a, 8); BHF_MEMCPY(&ub, &b, 8); bhf_ev_int(BHF_EV_DOUBLE, ua, ub, 8, 0, BHF_RA); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, BHF_RA); }
 /* In a const_cmp callback the FIRST argument is the compile-time constant. */
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_ev_int(BHF_EV_INT, a, b, 1, BHF_EV_CONST_A, BHF_RA); bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_ev_int(BHF_EV_INT, a, b, 4, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 4); bhf_vp_add((unsigned char *)&b, 4); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_ev_int(BHF_EV_INT, a, b, 8, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 8); bhf_vp_add((unsigned char *)&b, 8); bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, BHF_RA); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); bhf_cmplog_int(BHF_RA, a, 2); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_ev_int(BHF_EV_INT, a, b, 4, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 4); bhf_vp_add((unsigned char *)&b, 4); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, BHF_RA); bhf_cmplog_int(BHF_RA, a, 4); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_ev_int(BHF_EV_INT, a, b, 8, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 8); bhf_vp_add((unsigned char *)&b, 8); bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, BHF_RA); bhf_cmplog_int(BHF_RA, a, 8); }
 BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
     uint64_t n = cases[0], bits = cases[1];
     unsigned len = (unsigned)(bits / 8);
@@ -1220,6 +1287,7 @@ int main(int argc, char **argv) {
      * silently degrades to black-box (zero-coverage) fuzzing. */
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmpp_open();
     bhf_cmp_open();
     bhf_vp_open();
@@ -1258,7 +1326,9 @@ int main(int argc, char **argv) {
             uint8_t *input = (uint8_t *)malloc(len ? (size_t)len : 1);
             if (!input) return 1;
             if (len && !bhf_read_n(0, input, len)) { free(input); break; }
+            BHF_STACK_BEGIN();
             bhf_run_one_bytes(input, len);
+            BHF_STACK_END();
             free(input);
             unsigned char sync = 1;
             if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;

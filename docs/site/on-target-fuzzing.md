@@ -374,11 +374,14 @@ A cross build runs the target's own byte order: a big-endian-only bug (a field
 byte-swapped only on PPC) is reachable under `qemu-ppc64` or a PPC gdbstub where
 it would be invisible on the little-endian host. Cross-build with a big-endian
 triple (`powerpc64-linux-gnu`, `mips-linux-gnu`) and run it through a transport
-from §3. BHF's mutator does **not** yet emit typed, target-byte-order values
-for a decoded argument: the typed spans that would carry an argument's layout
-are not fed to the builtin mutator ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)), and BHF's C decoder reads
-scalars little-endian on every target, so the mutation is byte-level on both
-byte orders.
+from §3. BHF's C decoder (`bhf_decode.h`) reads a harness's scalar arguments
+little-endian on every target, big-endian ones included. The builtin mutator
+takes each decoded scalar argument's span from the harness's `arg-layout.json`
+and writes typed boundary values into it (0, 1, -1 and the type's extremes) in
+that order, at the argument's width, on the host and through a transport alike
+([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)). It does not
+emit raw struct images in a big-endian target's own byte order: a target that
+reads a struct straight out of the input gets byte-level mutation.
 
 ## 6. Comparison-progress for format gates
 
@@ -487,8 +490,10 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
 - **Not available yet:** a Renode full-system transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340));
   `--target-transport` takes `agent`, `gdb` and `qemu-system` only. Renode's
   gdbserver can be driven through `gdb:`, without snapshot reset. Semihosting
-  coverage ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)) and target-byte-order typed mutation
-  ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)) are not wired either.
+  coverage ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)) is not
+  wired either, nor typed mutation of a raw struct image in a big-endian
+  target's byte order (decoded arguments are typed, little-endian as the
+  decoder reads them; §5).
 - **Non-goals:** BHF does not bundle or crack vendor toolchains, ship RTOS
   images, or act as a full-system emulator (it drives `qemu-system`, it does
   not replace it).

@@ -44,6 +44,7 @@ fn toolchains_ready(prefix: &str) -> bool {
 
 fn options(source_root: &Path) -> AttemptOptions {
     AttemptOptions {
+        collector: None,
         cross_sweep: None,
         ada_toolchain: Default::default(),
         winafl: Default::default(),

@@ -1,0 +1,56 @@
+{
+ "repo": "termux/termux-app",
+ "sha": "3df69d1da197dd9bd71a3bafd902dffd720576b4",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ReflectionUtils.java",
+   "name": "invokeField",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'invokeField' parameter #2 has an unsupported type `T`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "TermuxPluginUtils.java",
+   "name": "processPluginExecutionCommandError",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'processPluginExecutionCommandError' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "TermuxPluginUtils.java",
+   "name": "processPluginExecutionCommandResult",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'processPluginExecutionCommandResult' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

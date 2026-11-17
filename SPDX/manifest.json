@@ -183,6 +183,26 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "benchmarks/engine-comparison/adapters/cjson_adapter.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "benchmarks/engine-comparison/adapters/libpng_adapter.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "benchmarks/engine-comparison/adapters/libyaml_adapter.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "benchmarks/engine-comparison/adapters/sqlite_adapter.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "benchmarks/engine-comparison/adapters/zlib_adapter.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "benchmarks/harness-parity-20/expert/brotli.c",
       "license": "Apache-2.0"
     },
@@ -1071,6 +1091,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/src/gate.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/src/hooks/assertion.rs",
       "license": "Apache-2.0"
     },
@@ -1092,6 +1116,10 @@
     },
     {
       "path": "crates/bhf_runtrace_shim/src/hooks/env.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/src/hooks/exec_hooks.c",
       "license": "Apache-2.0"
     },
     {
@@ -1743,6 +1771,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/typed_spans.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/winafl.rs",
       "license": "Apache-2.0"
     },
@@ -2179,6 +2211,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_collector.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_command_taint_confirm.rs",
       "license": "Apache-2.0"
     },
@@ -2347,6 +2383,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_fortran_bindc.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_frankenstein.rs",
       "license": "Apache-2.0"
     },
@@ -2375,6 +2415,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_go_loose.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_grammar_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2383,11 +2427,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_int_cmplog.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_interpreted_finding_locations.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/cli/tests/auto_interpreted_numeric_dictionary.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_interpreter_sinks.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2420,6 +2472,10 @@
     },
     {
       "path": "crates/cli/tests/auto_java_fuzz.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_java_generics.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2839,6 +2895,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_hit_count_buckets.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_interrupt_cleanup.rs",
       "license": "Apache-2.0"
     },
@@ -2847,11 +2907,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_live_corpus.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_multicore_flags.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/cli/tests/fuzz_progress_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_stability.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2868,6 +2936,10 @@
     },
     {
       "path": "crates/cli/tests/introspect_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/java_agent_build.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2983,6 +3055,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/pack_import_nvd.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/pack_import_osv.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/project_build_consent.rs",
       "license": "Apache-2.0"
     },
@@ -3064,6 +3144,10 @@
     },
     {
       "path": "crates/cli/tests/snippet_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/stack_depth_novelty.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3540,6 +3624,10 @@
     },
     {
       "path": "crates/governance/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/governance/src/advisories.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5179,6 +5267,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/validation/2026-11-16-go3-loose-packages.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-16-java1-collections.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/verified-distribution-handoff.md",
       "license": "Apache-2.0"
     },
@@ -5536,6 +5632,10 @@
     },
     {
       "path": "tests/fixtures/engine_parity/redqueen_int/redqueen_int.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/engine_parity/stack_depth/stack_depth.c",
       "license": "Apache-2.0"
     },
     {

@@ -1,0 +1,78 @@
+{
+ "repo": "PhilJay/MPAndroidChart",
+ "sha": "9c7275a0596a7ac0e50ca566e680f7f9d73607af",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "BarDataSet.java",
+   "name": "BarDataSet",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'BarDataSet' parameter #0 has an unsupported type `List<BarEntry>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "BubbleDataSet.java",
+   "name": "BubbleDataSet",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'BubbleDataSet' parameter #0 has an unsupported type `List<BubbleEntry>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "CandleDataSet.java",
+   "name": "CandleDataSet",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'CandleDataSet' parameter #0 has an unsupported type `List<CandleEntry>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "FileUtils.java",
+   "name": "loadBarEntriesFromAssets",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'loadBarEntriesFromAssets' parameter #0 has an unsupported type `AssetManager`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "FileUtils.java",
+   "name": "loadEntriesFromAssets",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'loadEntriesFromAssets' parameter #0 has an unsupported type `AssetManager`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

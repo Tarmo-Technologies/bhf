@@ -88,9 +88,29 @@ sub arm_hang_report {
     }
 }
 
+# The file the runtrace shim reads the current input from, when bhf preloads
+# it (#300): the shim cannot see this process's bytes otherwise, so a sink the
+# target reached could not be traced back to the input. One per process, since
+# bhf runs fresh processes beside this one; removed at exit.
+my $SHIM_INPUT_FILE =
+    (defined $ENV{BHF_SHIM_INPUT_FILE} && length $ENV{BHF_SHIM_INPUT_FILE})
+    ? "$ENV{BHF_SHIM_INPUT_FILE}.$$"
+    : undef;
+my $SHIM_INPUT_PID = $$;
+END { unlink $SHIM_INPUT_FILE if defined $SHIM_INPUT_FILE && $$ == $SHIM_INPUT_PID; }
+
+sub publish_input {
+    my ($data) = @_;
+    return if !defined $SHIM_INPUT_FILE;
+    open(my $fh, '>:raw', $SHIM_INPUT_FILE) or return;
+    print $fh $data;
+    close($fh);
+}
+
 sub run_input {
     my ($data) = @_;
     Devel::BhfCov::reset_prev();
+    publish_input($data);
     @DIE_FRAMES = ();
     my $ok = eval {
         local $SIG{__DIE__} = \&capture_die_frames;

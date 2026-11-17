@@ -1164,8 +1164,68 @@ pub fn supertype_closure(
     out
 }
 
+/// A written type split into its base and its top-level type arguments:
+/// `Map<String, List<Integer>>` is (`Map`, [`String`, `List<Integer>`]), and a
+/// type without arguments is (itself, []). Whitespace is dropped. `None` for
+/// unbalanced angle brackets or a type with something after its arguments
+/// (`List<String>[]`, an array of a generic type).
+pub fn split_generic_type(ty: &str) -> Option<(String, Vec<String>)> {
+    let t: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(open) = t.find('<') else {
+        return (!t.contains('>')).then(|| (t.clone(), Vec::new()));
+    };
+    let inner = t[open + 1..].strip_suffix('>')?;
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => {
+                args.push(inner[start..i].to_owned());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    args.push(inner[start..].to_owned());
+    if args.iter().any(String::is_empty) {
+        return None;
+    }
+    Some((t[..open].to_owned(), args))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_generic_type_splits_into_its_base_and_top_level_arguments() {
+        let split = |ty: &str| super::split_generic_type(ty);
+        assert_eq!(
+            split("java.util.Map< String, List<Integer> >"),
+            Some((
+                "java.util.Map".to_owned(),
+                vec!["String".to_owned(), "List<Integer>".to_owned()]
+            ))
+        );
+        assert_eq!(
+            split("List<?>"),
+            Some(("List".to_owned(), vec!["?".to_owned()]))
+        );
+        assert_eq!(split("String"), Some(("String".to_owned(), Vec::new())));
+        assert_eq!(split("List<String>[]"), None);
+        assert_eq!(split("List<String"), None);
+        assert_eq!(split("Map<String,>"), None);
+    }
 
     #[test]
     fn supertype_closure_is_transitive_and_terminates_on_cycles() {

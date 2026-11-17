@@ -1,0 +1,35 @@
+{
+ "repo": "zxing/zxing",
+ "sha": "19aa2d8254410e161f04dc3c928e68d5e90233c2",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ExpandedProductParsedResult.java",
+   "name": "ExpandedProductParsedResult",
+   "outcome": "consent_required",
+   "reason": "build failed via maven/gradle (Maven project build requires --run-untrusted (builds run offline)) AND javac (/home/ubuntu/bhf-corpus-500/java/zxing__zxing/android-integration/src/main/java/com/google/zxing/integration/android/IntentIntegrator.java:26: error: package android.app does not exist\nimport android.app.Activity;\n                  ^\n/home/ubuntu/bhf-corpus-500/java/zxing__zxing/android-integration/src/main/java/com/google/zxing/integration/android/IntentIntegrator.java:27: error: package android.app does not exist\nimport android.app.AlertDialog;\n                  ^\n/home/ubuntu/bhf-corpus-500/java/zxing__zxing/android-integration/src/main/java/com/google/zxing/integration/android/IntentIntegrator.java:28: error: package android.app does not exist\nimport android.app.Fragment;\n                  ^\n/home/ubuntu/bhf-corpus-500/java/zxing__zxing/android-integration/src/main/java/com/google/zxing/integration/android/IntentIntegrator.java:29: error: package android.content does not exist\nimport android.content.ActivityNotFoundException;\n                      ^)",
+   "class": "consent_required",
+   "before": 1,
+   "classes": [
+    "consent_required"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "consent_required": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

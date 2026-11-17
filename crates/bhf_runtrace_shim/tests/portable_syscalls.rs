@@ -27,6 +27,10 @@ const PORTABLE_SYSCALLS: &[&str] = &[
     // x86_64 (262) and aarch64 (79): the cmplog gate's stat of the running
     // image and of BHF_TARGET_EXE, which must not reach the shim's stat hooks.
     "SYS_newfstatat",
+    // x86_64 (5, 11) and aarch64 (80, 215, checked in libc 0.2.183): the
+    // read of an interpreter driver's published input file (#300).
+    "SYS_fstat",
+    "SYS_munmap",
     "SYS_getpid",
     "SYS_getppid",
     "SYS_getuid",

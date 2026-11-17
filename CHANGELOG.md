@@ -5,6 +5,9 @@
 ## Unreleased
 
 ### Changed
+- bhf's UTC timestamps come from `jiff` instead of `chrono`, which
+  RUSTSEC-2026-0543 marks unmaintained and `cargo deny` refused. The
+  timestamps are written in the same formats (#408).
 - The unused workspace crates `discovery`, `semantic`, `fork_server`,
   `fuzz_engine_nyx_adapter`, `fuzz_engine_libfuzzer_adapter` and
   `fuzz_engine_afl_adapter` are removed: nothing depended on them (the AFL++
@@ -52,6 +55,69 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The JVM agent's first build fetches ASM with retries, and a fetched or
+  cached jar must have its pinned SHA-256: a cached one that does not is
+  fetched again (#410). `ASM_JAR_DIR` jars are the operator's, used as they
+  are, since a distribution's build of ASM (Debian's `libasm-java`, which
+  the container image uses) is not byte-identical to Maven Central's. The
+  jars and the agent are written beside their place and renamed in, so
+  concurrent first builds never read a partial file. A Maven Central 429
+  failed the Java lane's builds, and nothing checked what was fetched.
+- The Ruby, Lua and PHP lanes run the runtrace shim's sink oracles too
+  (#301), as Python and Perl do: a command the input controls reaching
+  `system`, `os.execute` or `shell_exec` is a BHF-431. Their drivers
+  publish each input for the shim's taint match, and the shim treats an
+  `fopen` of the target-entry file (Lua's `io.open`) as entry. Only the C#
+  lane is left without sink oracles.
+- The Python and Perl lanes run the runtrace shim's sink oracles (#300): a
+  path the input controls reaching `open` is a BHF-405 path finding, and a
+  command reaching a shell a BHF-431. The shim was never preloaded into an
+  interpreter launcher. It now is, recording only once the harness reaches
+  the target (`BHF_RUNTRACE_AFTER_TARGET_ENTRY`), so the interpreter's
+  start-up is not audited, and the drivers write each input where the shim
+  matches it against a sink's argument. The shim also hooks `open64`,
+  `openat64` and their fortified forms, which distribution interpreters call
+  and it missed, and `execl`, `execlp` and `execle`, through which Perl runs
+  a shell command.
+- The engine trade study sees the crashes its bhf lane finds (#403). It read
+  bhf's crash input and findings from `<work>/findings/`, and bhf writes
+  them to `<work>/results/findings/` since that layout, so a study run since
+  then gave every bhf trial no native time-to-first-crash and confirmed a
+  crash only when the corpus backstop held it. The 2026-09-27 published study
+  predates the layout. The campaign surface script read the same place.
+- The Fortran lane fuzzes a `bind(C)` procedure that takes a
+  `character(kind=c_char), dimension(*)` buffer (#235). It calls the
+  procedure by its binding name with the C ABI: the buffer is the input's
+  exact bytes, a `value` integer length is passed by value, and no hidden
+  length follows. Every character array went to the descriptor wrapper,
+  which supports one form only, so the most C-callable Fortran parser shape
+  was skipped. A Fortran target the lane cannot call is no longer advised
+  `--force`, which built the same harness.
+- `bhf fuzz` arms the C/C++ driver's per-exec hit-count map, as `bhf auto`
+  does (#401), so its built-in engine gets hit-count bucket feedback: an
+  input that runs a loop or a recursion more times on the same edges is new
+  coverage. Without the map the bucket channel did nothing under `bhf fuzz`,
+  though the libFuzzer parity page lists it as always on.
+- The built-in mutator's typed mutation reaches a harness's decoded
+  arguments (#299). The fuzz loop and the transport loop take each decoded
+  scalar argument's span from the harness's `arg-layout.json` and pass it to
+  the mutator, which writes the type's boundary values (0, 1, -1, the
+  extremes) into it, little-endian as `bhf_decode.h` reads it on every
+  target, at the argument's width. No production caller passed spans, so
+  typed candidates never applied; they were 4 bytes whatever the span. The
+  mutator's unused target byte-order setting, which would have disagreed
+  with the decoder on a big-endian target, is gone.
+- One unbounded recursion is one finding. A stack overflow's cluster key is
+  the functions of the recursion, not the frame that ran out of stack: that
+  was whichever of a comparison hook, a coverage callback, the recursive
+  function or a helper it calls was running, so one recursion was reported
+  several times.
+- The input-to-state mutator no longer slows the engine to a few executions
+  a second on long inputs. A loop counter compared on every iteration filled
+  the comparison log, and every mutation scanned the input once per logged
+  comparison. Comparisons whose operands do not occur in the input are now
+  dropped when the log is captured. An operand that occurs throughout the
+  input yields at most 32 offsets, spread across it.
 - The FreeRTOS reference profile has a timeout and a state-contamination
   control, and a CLI test runs both. Input `0xD0` never reaches
   `harness_done`, so the run ends at `--timeout` as a timeout finding.
@@ -2678,6 +2744,123 @@
   when bhf panics.
 
 ### Added
+- The Java lane fuzzes a target that takes a JDK collection (#236):
+  `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
+  nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The
+  harness declared every local with `var`, which infers the wrong element
+  type for a collection built from the input, so these were skipped as
+  unsupported. A collection local is declared with its parsed type, spelled
+  fully qualified, and filled with a fuzzed number of elements (0 to 8),
+  each decoded by its type: a string, a boxed scalar, an `Object`, a
+  `byte[]`, an enum constant, a default instance of a tree type, or another
+  collection. A sorted collection is used only for elements that compare with
+  each other. A collection of strings ranks as a byte channel, as a string
+  does, and a `java.util.Random` parameter is seeded from the input.
+  Of the 57 targets the 2026-07-28 sweep skipped as Java-1, 7 now pass the
+  parameter they were skipped on and none builds: five need the project's
+  Maven or Gradle build, which fails, one fails javac on the tree, and one
+  stops at its next parameter
+  (`docs/validation/2026-11-16-java1-collections.md`). `go1_rerun.py` re-runs
+  Java targets (`--lang java`), several projects at once (`--jobs`), and can
+  let bhf run a project's build (`--run-untrusted`).
+- The Go lane fuzzes a package outside every Go module (#237): a GOPATH-era
+  tree, or a dir of `.go` files. Its harness imports the target through a
+  module `replace`, which needs a dir with a `go.mod`, so these were skipped.
+  bhf copies the package into the harness dir (`bhf_target/`) with a `go.mod`
+  of its own, and the scanned tree is not written to. A `package main` is
+  renamed in the copy so it can be imported. From a dir of `go run` scripts,
+  each with its own `main`, only the target's file is copied. Each copied
+  file opens with a `//line` directive, so a finding names the project's
+  file and line, and the capsule ships the copy with the harness. Of the 17
+  targets the 2026-07-28 sweep skipped this way, 15 now build and fuzz; the
+  other 2 are SWIG bindings, which need `swig`
+  (`docs/validation/2026-11-16-go3-loose-packages.md`). `go1_rerun.py`
+  re-runs any Go class by name (`--class`), across every lane's rows
+  (`--all-lanes`).
+- The engine trade study records coverage over time and retained findings
+  (#256). It snapshots each engine's corpus at 10, 25, 50 and 75% of the
+  budget and replays each through the shared coverage binary, so a row has a
+  coverage curve and the summary its distribution per checkpoint; and it
+  replays every crash input an engine kept through the oracle, so a row
+  counts the kept, confirmed and distinct findings and the summary gives
+  their distributions. `BHF_LIVE_CORPUS_DIR` makes bhf's built-in engine
+  write each input it keeps there as it keeps it, since its queue is written
+  when the pass ends.
+- Pinned build recipes for the trade study's libpng and re2 targets
+  (#371), so all six real-code targets are runnable: libpng's library
+  sources with its prebuilt `pnglibconf.h`, linked with the zlib recipe, and
+  RE2 2023-06-01 (re-pinned: the latest release that builds with a
+  distribution Abseil) against the system Abseil. A recipe can name
+  libraries to link, which bhf's lane passes as `--ldflags`; adapters are
+  named `<target>_adapter`, and two sources with one file name are refused.
+- Pinned build recipes for the trade study's zlib and libyaml targets
+  (#370): zlib's core translation units with its checked-in `zconf.h`, and
+  libyaml's `src/*.c` with the `config.h` its configure writes for 0.2.5,
+  each with an adapter. The dry run lists four of the six real-code targets
+  as runnable.
+- Pinned, checksum-verified build recipes for the trade study's cjson and
+  sqlite real-code targets (#255). `recipes.py` turns a checkout fetched at
+  its pin into the sources, include dirs and flags to compile: cjson is
+  `cJSON.c`; sqlite is the amalgamation its own `make sqlite3.c` generates out
+  of tree. Each recipe checks the SHA-256 of the files it takes or generates,
+  and each target has an adapter under `adapters/`. The dry run lists both as
+  runnable, and a smoke build (`BHF_TRADE_STUDY_SOURCES`) builds and runs both
+  harnesses.
+- The engine trade study's bhf lane fuzzes a provided harness (#254): with
+  `bhf_harness_mode=provided` it wraps the same `harnesses/libfuzzer.c` every
+  other engine builds, with the target's sources, include dirs and flags
+  (`bhf generate-harness ... --target LLVMFuzzerTestOneInput`, then
+  `bhf build --cflags`), and runs the same `bhf fuzz` budget and seeds. The
+  dry run lists the lane as runnable, and `--bhf-harness-mode` sets the mode
+  for every target. It was a hard-coded unsupported row. CI runs the study's
+  unit tests.
+- `bhf pack import-nvd INPUT... --out cve-db.json` builds an advisory
+  database from NVD CVE JSON 2.0 files (#387), with the OSV importer's
+  writer. Each vulnerable CPE match becomes a record identified by its CPE,
+  with its version bounds as a range (or the CPE's own version) and the
+  CVE's CVSS base severity, so a C or C++ library named by CPE matches by
+  CPE and version range. Malformed records are reported and skipped.
+- `bhf pack import-osv INPUT... --out cve-db.json` builds an advisory
+  database for `bhf sbom --vuln-db` from OSV records (#223): an unzipped OSV
+  ecosystem export or single record files. Each affected package becomes a
+  record with bhf's ecosystem name, explicit versions, version ranges and a
+  severity (the GitHub advisory rating, else the CVSS v3 base score's
+  rating). Malformed records are reported and skipped. The database format
+  takes `affected_ranges` (version bounds) beside `affected_versions`, and
+  `docs/site/inventory-assurance.md` documents it. No command built a
+  database from a public feed.
+- The persistent built-in engine calibrates the inputs it adds to the corpus
+  (#232), as AFL++ does. It re-runs each one four times, each from a zeroed
+  edge bitmap, and counts an edge that one run hit and another did not as
+  variable. An input whose only new coverage was variable edges is left out,
+  and the re-runs' edges count as seen. The run summary's `stability` gives
+  `stability_pct`, `variable_edges`, `calibrated_entries` and
+  `unstable_entries_dropped`; the status line shows the stability, and below
+  90% bhf says the harness keeps state between executions and suggests
+  `--no-fork-server`. A target that switches on a static call counter filled
+  the corpus with an entry per counter value, with no warning.
+- The runtime comparison log records integer comparison constants (#221):
+  the C/C++ driver writes the constant of each comparison the compiler
+  emitted against one as an `"int"` record, with its own size budget, and
+  the learned dictionary takes it as a constant from one record, in
+  little- and then big-endian bytes. A constant computed at build time that
+  no source literal spells now carries to the next run and to the AFL++ and
+  WinAFL dictionaries; it was solved again by every run. Constants of at
+  most 0xff, and all ones, are not recorded.
+- Stack depth is a coverage channel of the C/C++ driver (#220): it records
+  the deepest stack each execution reached, and the built-in engine keeps an
+  input that recursed a quarter deeper again than every input before it,
+  though it ran no new edge. A new mutator doubles the longest run of a
+  nesting opener (`[`, `{`, `(`, `<`) in an input. An unbounded recursion now
+  reaches the end of the stack and is reported as a BHF-207 stack overflow;
+  edge coverage kept none of the deeper inputs, so it was not found.
+  `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
+- `bhf auto --collector SPEC` (and `--collector-window-ms`) observes each
+  fuzzed target with the runtime-event collector: after its passes, the
+  target's retained inputs are replayed one by one under it, as
+  `bhf fuzz --collector` does, and run.json records each target's
+  `collector` observation with each replay's testcase, input SHA-256 and PID.
+  `bhf auto` had no collector: its fuzz runs left it off.
 - The FreeRTOS reference profile has an interrupt-driven entry point: its
   `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
   handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test

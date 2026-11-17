@@ -1,0 +1,34 @@
+{
+ "repo": "AdaCore/gnatstudio",
+ "sha": "4c6d0de60e970a37b6df26344a0f456ea8f6c740",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "@_Main_Name_@.java",
+   "name": "Print_On_Console",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'Print_On_Console' parameter #0 has an unsupported type `AdaString`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

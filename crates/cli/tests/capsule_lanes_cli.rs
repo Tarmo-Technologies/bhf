@@ -541,6 +541,27 @@ fn go_finding_round_trips() {
     assert_eq!(manifest["build_recipe"]["vendored"], false, "{manifest}");
 }
 
+/// A `package main` outside every Go module (#237): its harness builds a
+/// renamed copy in a module of its own, which the capsule ships with the
+/// harness, and the rebuild offline still reproduces the crash.
+#[test]
+fn a_go_finding_outside_every_module_round_trips() {
+    skip_unless!(runs("go", &["version"]), "go not installed");
+    let run = Run::new(&[(
+        "rsum/main.go",
+        "package main\n\nimport \"os\"\n\nfunc Checksum(data []byte) int {\n\t\
+         if len(data) < 2 || data[0] != 'W' {\n\t\treturn 0\n\t}\n\t\
+         return len(data) / int(data[1]-'0')\n}\n\n\
+         func main() {\n\tos.Exit(Checksum([]byte(os.Args[1])))\n}\n",
+    )]);
+    let id = run
+        .auto("go", 10, &[])
+        .expect("bhf auto must find the crash");
+    let manifest = run.round_trip(&id, "go");
+    let layout = manifest.to_string();
+    assert!(layout.contains("harness/bhf_target/"), "{manifest}");
+}
+
 /// A Go target whose module requires a module from outside the scanned tree:
 /// the capsule vendors it from the local module cache (`go mod vendor`) and
 /// rebuilds with `-mod=vendor`, with no module cache or proxy reachable. The

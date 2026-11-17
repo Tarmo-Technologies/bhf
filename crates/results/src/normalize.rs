@@ -761,7 +761,7 @@ fn non_empty(value: &str) -> Option<String> {
 
 /// An RFC 3339 timestamp at `key`, as written; anything else is dropped.
 fn timestamp_at(raw: &Value, key: &str) -> Option<String> {
-    str_at(raw, &[key]).filter(|ts| chrono::DateTime::parse_from_rfc3339(ts).is_ok())
+    str_at(raw, &[key]).filter(|ts| ts.parse::<jiff::Timestamp>().is_ok())
 }
 
 fn is_lower_hex(value: &str) -> bool {

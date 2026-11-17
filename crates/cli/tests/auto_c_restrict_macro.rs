@@ -34,6 +34,7 @@ fn cpp_fixture_dir() -> PathBuf {
 
 fn options(src_root: &std::path::Path) -> AttemptOptions {
     AttemptOptions {
+        collector: None,
         cross_sweep: None,
         ada_toolchain: Default::default(),
         winafl: Default::default(),

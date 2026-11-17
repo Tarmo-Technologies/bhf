@@ -66,13 +66,13 @@ impl LaneStatus {
     /// Whether this lane was recorded before `run_started_at` (an RFC 3339
     /// time), by an earlier run: a record with no time is one too.
     fn recorded_before(&self, run_started_at: &str) -> bool {
-        let Ok(started) = chrono::DateTime::parse_from_rfc3339(run_started_at) else {
+        let Ok(started) = run_started_at.parse::<jiff::Timestamp>() else {
             return false;
         };
         match self
             .recorded_at
             .as_deref()
-            .map(chrono::DateTime::parse_from_rfc3339)
+            .map(str::parse::<jiff::Timestamp>)
         {
             Some(Ok(recorded)) => recorded < started,
             _ => true,
@@ -105,7 +105,7 @@ pub(crate) fn first_error_line(output: &str) -> Option<String> {
 /// Record `status` for `lane` in `harness_dir`, keeping the other lanes',
 /// stamped with the time it is recorded.
 pub(crate) fn record(harness_dir: &Path, lane: &str, mut status: LaneStatus) {
-    status.recorded_at = Some(chrono::Utc::now().to_rfc3339());
+    status.recorded_at = Some(super::bug_report::now_rfc3339());
     let mut lanes = read(harness_dir);
     lanes.insert(lane.to_owned(), status);
     if let Ok(bytes) = serde_json::to_vec_pretty(&lanes) {
@@ -237,10 +237,7 @@ mod tests {
         );
         let lanes = read(dir.path());
         let recorded = lanes[COVERAGE].recorded_at.clone().unwrap();
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(&recorded).is_ok(),
-            "{recorded}"
-        );
+        assert!(recorded.parse::<jiff::Timestamp>().is_ok(), "{recorded}");
         let this_run = unavailable(&lanes, RUN_START);
         assert_eq!(
             this_run,

@@ -2,6 +2,7 @@
 
 //! Offline enterprise governance primitives for BHF.
 
+pub mod advisories;
 mod vex;
 
 use ring::{
@@ -4323,8 +4324,15 @@ fn match_vulnerabilities(
             let package_cpe = vulnerability_cpe(vuln, package);
             let package_purl = vulnerability_purl(vuln, package);
             let affected = string_array(vuln.get("affected_versions"));
+            let ranges: Vec<&serde_json::Map<String, Value>> = vuln
+                .get("affected_ranges")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_object)
+                .collect();
             for component in components {
-                if !version_is_affected(component.version.as_deref(), &affected) {
+                if !version_is_affected(component.version.as_deref(), &affected, &ranges) {
                     continue;
                 }
                 let cpe_matches = package_cpe.is_some_and(|cpe| {
@@ -4506,6 +4514,11 @@ fn validate_advisory(vuln: &Value, index: usize) -> Result<(), GovernanceError> 
     if !vuln.is_object() || !nonempty(vuln.get("id")) || !(named || identified) || !versions_valid {
         return Err(GovernanceError::InvalidInput {
             message: format!("malformed advisory record {index}: require a nonempty id, package identity and string-array affected_versions when supplied"),
+        });
+    }
+    if let Some(reason) = advisories::invalid_ranges(vuln.get("affected_ranges")) {
+        return Err(GovernanceError::InvalidInput {
+            message: format!("malformed advisory record {index}: {reason}"),
         });
     }
     Ok(())
@@ -5019,9 +5032,20 @@ fn push_normalized_cwe(values: &mut Vec<String>, value: &str) {
     }
 }
 
-fn version_is_affected(version: Option<&str>, affected: &[String]) -> bool {
+/// Whether a component at `version` is affected: `affected` lists it (or
+/// `*`), or it lies in one of `ranges` ([`advisories::range_contains`]).
+fn version_is_affected(
+    version: Option<&str>,
+    affected: &[String],
+    ranges: &[&serde_json::Map<String, Value>],
+) -> bool {
     affected.iter().any(|entry| entry == "*")
-        || version.is_some_and(|version| affected.iter().any(|entry| entry == version))
+        || version.is_some_and(|version| {
+            affected.iter().any(|entry| entry == version)
+                || ranges
+                    .iter()
+                    .any(|range| advisories::range_contains(range, version))
+        })
 }
 
 fn component_ref(component: &Component) -> String {

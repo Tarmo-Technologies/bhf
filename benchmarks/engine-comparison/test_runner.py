@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+import dataclasses
 import json
+import os
+import shutil
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import recipes
+import run
 
 import stats
 import targets
@@ -615,6 +623,304 @@ class DefectIdentityTests(unittest.TestCase):
         ]
         summary = trade_study.engine_summary(rows)
         self.assertEqual(summary["normalized_diagnostic_variants"], 2)
+
+
+
+class CoverageOverTimeTests(unittest.TestCase):
+    """#256: corpus snapshots at fixed fractions of the budget become a
+    coverage curve, and the crash inputs an engine kept are its retained
+    findings."""
+
+    def test_checkpoints_fall_due_once_each_in_order(self):
+        taken: set[float] = set()
+        self.assertEqual(stats.due_checkpoints(0.5, 10, taken), [])
+        self.assertEqual(stats.due_checkpoints(2.6, 10, taken), [0.1, 0.25])
+        taken.update([0.1, 0.25])
+        self.assertEqual(stats.due_checkpoints(2.6, 10, taken), [])
+        self.assertEqual(stats.due_checkpoints(9.9, 10, taken), [0.5, 0.75])
+
+    def test_a_curve_summarizes_each_fraction_over_the_trials(self):
+        series = [
+            [{"fraction": 0.1, "t_s": 6.0, "edges": 10}, {"fraction": 1.0, "t_s": 60.0, "edges": 40}],
+            [{"fraction": 0.1, "t_s": 6.0, "edges": 20}, {"fraction": 1.0, "t_s": 60.0, "edges": 50}],
+            # A trial that ended before its first checkpoint has its final point only.
+            [{"fraction": 1.0, "t_s": 60.0, "edges": 60}],
+        ]
+        curve = stats.coverage_curve(series)
+        self.assertEqual([point["fraction"] for point in curve], [0.1, 1.0])
+        self.assertEqual(curve[0]["t_s"], 6.0)
+        self.assertEqual(curve[0]["edges"]["n"], 2)
+        self.assertEqual(curve[0]["edges"]["median"], 15.0)
+        self.assertEqual(curve[1]["edges"]["n"], 3)
+        self.assertEqual(curve[1]["edges"]["median"], 50.0)
+        self.assertEqual(stats.coverage_curve([]), [])
+
+    def test_retained_findings_replay_every_kept_crash_input(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # A stand-in oracle: an input starting with "A" or "B" trips one
+            # of two sanitizer reports; anything else runs clean.
+            oracle = tmp / "oracle.sh"
+            oracle.write_text(
+                "#!/bin/sh\n"
+                "head=$(head -c1)\n"
+                'case "$head" in\n'
+                "  A) echo '==11==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60200000eff1' >&2; exit 1;;\n"
+                "  B) echo 'runtime error: signed integer overflow' >&2; exit 1;;\n"
+                "esac\n"
+            )
+            oracle.chmod(0o755)
+            artifacts = []
+            for index, body in enumerate([b"A1", b"A2", b"B", b"clean"]):
+                path = tmp / f"crash-{index}"
+                path.write_bytes(body)
+                artifacts.append(path)
+            self.assertEqual(
+                trade_study.retained_findings(oracle, artifacts, "tgt"),
+                {"kept": 4, "replayed": 4, "confirmed": 3, "distinct_diagnostics": 2},
+            )
+
+    def test_each_engines_crash_artifacts_and_corpus_are_found(self):
+        with TemporaryDirectory() as tmp:
+            engine_dir = Path(tmp)
+            for path in [
+                "artifacts/crash-1",
+                "afl-output/default/crashes/id:000000,sig:11",
+                "afl-output/default/queue/id:000001",
+                "hf-crashes/SIGSEGV.1",
+                "work/results/findings/F-0000-a/testcase.bin",
+                "live-corpus/ab.bin",
+                "corpus/seed-0000",
+            ]:
+                (engine_dir / path).parent.mkdir(parents=True, exist_ok=True)
+                (engine_dir / path).write_bytes(b"x")
+            for engine, crash in [
+                ("libfuzzer", "crash-1"),
+                ("aflpp", "id:000000,sig:11"),
+                ("honggfuzz", "SIGSEGV.1"),
+                ("bhf", "testcase.bin"),
+            ]:
+                found = trade_study.engine_crash_artifacts(engine, engine_dir)
+                self.assertEqual([p.name for p in found], [crash], engine)
+            self.assertEqual(
+                [p.name for p in trade_study.engine_corpus_files("bhf", engine_dir)], ["ab.bin"]
+            )
+            self.assertEqual(
+                [p.name for p in trade_study.engine_corpus_files("aflpp", engine_dir)],
+                ["id:000001"],
+            )
+
+
+class BhfFindingsLayoutTests(unittest.TestCase):
+    """#403: bhf writes findings to results/findings/<id>/; the study read
+    the legacy findings/<id>/ and never saw a bhf crash."""
+
+    def test_bhf_crashes_are_read_from_either_layout(self):
+        for layout in ("results/findings", "findings"):
+            with TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                self.assertIsNone(run.bhf_crash_artifact(work))
+                finding = work / layout / "F-0000-ab"
+                finding.mkdir(parents=True)
+                (finding / "testcase.bin").write_bytes(b"crash")
+                (finding / "finding.json").write_text("{}")
+                self.assertEqual(run.bhf_crash_artifact(work), finding / "testcase.bin")
+                log = work / "run.log"
+                log.write_text("")
+                self.assertEqual(parse_bhf_fuzz(log, work)["finding_count"], 1, layout)
+
+
+def smoke_bhf() -> Path | None:
+    """The bhf binary a smoke run uses: $BHF_TRADE_STUDY_BHF, else the
+    release build, when it exists and clang does."""
+    candidate = Path(os.environ.get("BHF_TRADE_STUDY_BHF", str(run.DEFAULT_BHF)))
+    return candidate if candidate.is_file() and shutil.which("clang") else None
+
+
+class ProvidedHarnessTests(unittest.TestCase):
+    """#254: the bhf lane fuzzes a provided harness, the one every other
+    engine builds, instead of a hard-coded unsupported row."""
+
+    def test_provided_commands_wrap_the_shared_libfuzzer_harness(self):
+        spec = dataclasses.replace(
+            targets.builtin_fixture_targets(run.CASES)[0],
+            include_dirs=(Path("/src/lib/include"),),
+            extra_cflags=("-DNDEBUG", "-DLIB_STATIC=1"),
+            bhf_harness_mode=targets.BHF_PROVIDED,
+        )
+        generate, build = trade_study.bhf_provided_commands(
+            Path("/opt/bhf"), [Path("/t/adapter.c"), Path("/t/lib.c")], spec, Path("/w")
+        )
+        self.assertEqual(
+            generate,
+            [
+                "/opt/bhf",
+                "generate-harness",
+                str(trade_study.HARNESS_ROOT / "libfuzzer.c"),
+                "--target",
+                "LLVMFuzzerTestOneInput",
+                "--id",
+                "H-PROVIDED",
+                "--output",
+                "/w/harnesses",
+                "--extra-source",
+                "/t/adapter.c",
+                "--extra-source",
+                "/t/lib.c",
+                "--extra-include",
+                "/src/lib/include",
+            ],
+        )
+        self.assertEqual(
+            build,
+            [
+                "/opt/bhf",
+                "build",
+                "/w",
+                "--harness",
+                "H-PROVIDED",
+                "--cflags",
+                "-DNDEBUG -DLIB_STATIC=1",
+            ],
+        )
+
+    def test_the_dry_run_lists_the_provided_lane_as_runnable(self):
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(Path(trade_study.__file__)),
+                "--dry-run",
+                "--cases",
+                "magic_byte",
+                "--bhf-harness-mode",
+                "provided",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertIn("runnable lanes: bhf (provided harness)", out)
+        self.assertIn("runnable: 1/1", out)
+
+    @unittest.skipUnless(smoke_bhf(), "needs a bhf binary and clang")
+    def test_a_provided_smoke_run_produces_a_bhf_row(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "study.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(trade_study.__file__)),
+                    "--cases",
+                    "magic_byte",
+                    "--engines",
+                    "bhf",
+                    "--bhf-harness-mode",
+                    "provided",
+                    "--trials",
+                    "1",
+                    "--budget",
+                    "3",
+                    "--cpu",
+                    "none",
+                    "--bhf",
+                    str(smoke_bhf()),
+                    "--workdir",
+                    str(Path(tmp) / "work"),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            [row] = json.loads(output.read_text())["rows"]
+            self.assertEqual(row["engine"], "bhf")
+            self.assertEqual(row["bhf_harness_mode"], "provided")
+            self.assertEqual(row["build_rc"], 0)
+            self.assertNotEqual(row["outcome"], trade_study.OUTCOME_UNSUPPORTED)
+            self.assertGreater(row["common_cov_edges"] or 0, 0)
+
+
+
+def fetched_sources() -> Path | None:
+    """The --fetch root a recipe smoke build uses: $BHF_TRADE_STUDY_SOURCES,
+    when it is a directory and clang exists."""
+    root = os.environ.get("BHF_TRADE_STUDY_SOURCES")
+    return Path(root) if root and Path(root).is_dir() and shutil.which("clang") else None
+
+
+class RecipeTests(unittest.TestCase):
+    """#255: pinned, checksum-verified recipes make real-code targets
+    runnable."""
+
+    def test_the_dry_run_lists_the_recipe_targets_as_runnable(self):
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(Path(trade_study.__file__)),
+                "--manifest",
+                str(Path(trade_study.__file__).parent / "experiment1-real-code.example.json"),
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for name in sorted(recipes.RECIPES):
+            self.assertIn(f"- {name} [self_contained/runnable]", out)
+            self.assertIn(f"recipe: {name}", out)
+        # #371: with the three recipe slices, every real-code target runs.
+        self.assertIn("runnable: 6/6", out)
+
+    def test_sources_that_share_a_file_name_are_refused(self):
+        with TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "a" / "re2.cc", Path(tmp) / "b" / "re2.cc"
+            for path in (first, second):
+                path.parent.mkdir()
+                path.write_text("")
+            spec = targets.TargetSpec(
+                name="clash", kind=targets.KIND_SELF_CONTAINED, sources=(first, second)
+            )
+            with self.assertRaisesRegex(SystemExit, "share a file name"):
+                trade_study.materialize_target(spec, Path(tmp) / "dest")
+
+    def test_a_checksum_mismatch_or_a_missing_checkout_is_an_error(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cJSON.c").write_text("int moved_pin;\n")
+            (root / "cJSON.h").write_text("")
+            with self.assertRaisesRegex(recipes.RecipeError, "cJSON.c has SHA-256"):
+                recipes.prepare("cjson", root, root / "build")
+            with self.assertRaisesRegex(recipes.RecipeError, "run trade_study.py --fetch"):
+                recipes.prepare("cjson", root / "absent", root / "build")
+            with self.assertRaisesRegex(recipes.RecipeError, "no build recipe named"):
+                recipes.prepare("nope", root, root / "build")
+
+    @unittest.skipUnless(fetched_sources(), "needs $BHF_TRADE_STUDY_SOURCES and clang")
+    def test_a_recipe_smoke_build_produces_each_harness(self):
+        """Build and briefly run the libFuzzer harness of every recipe target."""
+        with TemporaryDirectory() as tmp:
+            for name in sorted(recipes.RECIPES):
+                prepared = recipes.prepare(
+                    name, fetched_sources() / name, Path(tmp) / "recipes" / name
+                )
+                binary = Path(tmp) / f"{name}-fuzzer"
+                subprocess.run(
+                    [
+                        "clang",
+                        "-O1",
+                        "-fsanitize=fuzzer,address",
+                        *[f"-I{inc}" for inc in prepared.include_dirs],
+                        *prepared.extra_cflags,
+                        str(trade_study.HARNESS_ROOT / "libfuzzer.c"),
+                        *[str(src) for src in prepared.sources],
+                        *prepared.link_flags,
+                        "-o",
+                        str(binary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run([str(binary), "-runs=200"], check=True, capture_output=True)
 
 
 if __name__ == "__main__":

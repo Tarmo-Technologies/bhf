@@ -82,7 +82,11 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
     assert_eq!(record["finding_kind"], "static");
     // The v1 envelope's birth timestamp is valid RFC 3339.
     assert!(
-        chrono::DateTime::parse_from_rfc3339(record["created_at"].as_str().unwrap()).is_ok(),
+        record["created_at"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .is_ok(),
         "created_at must be RFC 3339: {}",
         record["created_at"]
     );

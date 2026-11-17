@@ -2,6 +2,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=src/hooks/format_hooks.c");
+    println!("cargo:rerun-if-changed=src/hooks/exec_hooks.c");
     println!("cargo:rerun-if-changed=src/hooks/assertion.rs");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
@@ -29,7 +30,8 @@ fn main() {
          vprintf; vfprintf; vsprintf; vsnprintf; vdprintf; vasprintf; \
          __printf_chk; __fprintf_chk; __sprintf_chk; __snprintf_chk; __dprintf_chk; \
          __asprintf_chk; __vprintf_chk; __vfprintf_chk; __vsprintf_chk; __vsnprintf_chk; \
-         __vdprintf_chk; __vasprintf_chk; dlsym; __assert_fail; __assert_perror_fail; };",
+         __vdprintf_chk; __vasprintf_chk; dlsym; __assert_fail; __assert_perror_fail; \
+         execl; execlp; execle; };",
     )
     .expect("write format hook export map");
     println!(
@@ -38,6 +40,7 @@ fn main() {
     );
     cc::Build::new()
         .file("src/hooks/format_hooks.c")
+        .file("src/hooks/exec_hooks.c")
         // The dlsym trampoline's forward must compile to a tail call (see
         // format_hooks.c); optimized in every profile, so it does.
         .opt_level(2)

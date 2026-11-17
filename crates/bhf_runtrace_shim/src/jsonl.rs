@@ -350,6 +350,10 @@ impl Builder {
     }
 
     pub fn emit(mut self) {
+        // Nothing before the target is entered, when the harness asks (#300).
+        if !crate::gate::recording() {
+            return;
+        }
         self.write_byte(b'}');
         self.write_byte(b'\n');
         emit_raw(&self.buf[..self.len]);
