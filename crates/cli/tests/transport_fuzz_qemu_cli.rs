@@ -829,8 +829,11 @@ fn cli_freertos_hang_times_out_and_the_reset_clears_state() {
 /// #251: a run's target cycles come from a counter the guest keeps, read
 /// before and after the run. QEMU models no `DWT_CYCCNT`, so this reads the
 /// MPS2 FPGAIO `COUNTER` (a 25 MHz up-counter) under `-icount`, where it
-/// advances with the instructions run. Input `0xBF` busy-loops sixteen times
-/// as long as `0xB0`.
+/// advances with the instructions run. Input `0xB0` busy-loops one unit,
+/// `0xB1` two and `0xBF` sixteen. Each run also counts the delivery and
+/// completion around the loop, a fixed cost that differs between QEMU
+/// builds, so the check is on differences: fifteen units more cost about
+/// fifteen times what one unit more does.
 #[test]
 fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
     let tmp = tempfile::tempdir().unwrap();
@@ -839,7 +842,7 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
         return;
     };
     let mut cycles = Vec::new();
-    for (tag, byte) in [("short", 0xB0_u8), ("long", 0xBF)] {
+    for (tag, byte) in [("one", 0xB0_u8), ("two", 0xB1), ("sixteen", 0xBF)] {
         let guest = RtosGuest::boot_with(&elf, dir, tag, None, &["-icount", "shift=0"]);
         let summary = guest.fuzz_with_spec(
             &elf,
@@ -853,9 +856,15 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
         cycles.push(stats["max"].as_u64().unwrap());
     }
     assert!(cycles[0] > 0, "{cycles:?}");
+    let unit = cycles[1].saturating_sub(cycles[0]);
+    let fifteen = cycles[2].saturating_sub(cycles[0]);
     assert!(
-        cycles[1] > 8 * cycles[0],
-        "sixteen times the busy work takes more cycles: {cycles:?}"
+        unit > 0,
+        "one more unit of busy work takes cycles: {cycles:?}"
+    );
+    assert!(
+        (12 * unit..=18 * unit).contains(&fifteen),
+        "fifteen more units take about fifteen times one more: {cycles:?}"
     );
 }
 
