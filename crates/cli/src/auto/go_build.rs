@@ -157,8 +157,14 @@ pub fn build_go_harness(
         version = placeholder_module_version(&module_path),
         // go.mod uses Go string-literal quoting, not shell quoting. A bare
         // local replacement path breaks when the source directory has spaces.
-        root = serde_json::to_string(&mod_root.to_string_lossy())
-            .expect("serializing a path string cannot fail"),
+        // The copy of a package outside every module is named relative to the
+        // go.mod: it moves with the harness dir (a capsule ships both), and
+        // no spelling of the dir (a Windows 8.3 short name) has to match.
+        root = serde_json::to_string(&match mod_root.strip_prefix(&auto_dir) {
+            Ok(relative) => format!("./{}", relative.to_string_lossy().replace('\\', "/")),
+            Err(_) => mod_root.to_string_lossy().into_owned(),
+        })
+        .expect("serializing a path string cannot fail"),
     );
     if let Err(e) = std::fs::write(auto_dir.join("go.mod"), &go_mod) {
         return GoBuildResult::Failed {
