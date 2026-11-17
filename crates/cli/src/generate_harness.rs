@@ -2912,7 +2912,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         .with_context(|| format!("resolve C source {}", args.source.display()))?;
     let source = crate::source_text::read_source_text(&source_path)
         .with_context(|| format!("read C source {}", source_path.display()))?;
-    let functions = c_parser::parse_c_functions(&source)
+    let functions = c_parser::parse_c_functions_with_knr(&source)
         .with_context(|| format!("parse C source {}", source_path.display()))?;
     let target_name = args
         .target

@@ -1,0 +1,34 @@
+{
+ "repo": "nwchemgit/nwchem",
+ "sha": "86b193cfeb2d4d1f39889e9f73a8f58f742872ea",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "cio.c",
+   "name": "c_read",
+   "outcome": "unsupported_params",
+   "reason": "target `c_read` has no definition in the active build: its own source /home/ubuntu/bhf-corpus-500/fortran/nwchemgit__nwchem/src/lucia/cio.c compiles but does not provide the symbol, so the definition appears to be conditionally compiled out (typically an inactive `#if` \u2014 e.g. a CPU-feature/ISA or build-capability guard not enabled by bhf's portable `-O1` build). Re-adding its own source cannot resolve the symbol, so this is skipped rather than reported as a link failure; a portable sibling target is the buildable one.",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

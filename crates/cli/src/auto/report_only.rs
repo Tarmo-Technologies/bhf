@@ -519,7 +519,7 @@ mod tests {
         let work = temp_dir("work");
         let outcome = emit_report_only(
             &candidate,
-            "K&R C has no fuzzing lane yet (M22 Phase 3)".to_owned(),
+            "K&R C: legacy dialect — discovered and statically analyzed, not fuzzed".to_owned(),
             &work,
         );
 

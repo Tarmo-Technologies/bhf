@@ -1,0 +1,78 @@
+{
+ "repo": "pgvector/pgvector",
+ "sha": "721fcf4d2c92e2ef022c42304d547b807cbfbee1",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "hnswutils.c",
+   "name": "HnswLoadElementFromTuple",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"missing_header\", \"path\": \"nodes/execnodes.h\"}, {\"kind\": \"missing_header\", \"path\": \"fmgr.h\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "hnswutils.c",
+   "name": "HnswLoadUnvisitedFromMemory",
+   "outcome": "unsupported_params",
+   "reason": "C parameter 'neighborhoodSize' of type 'Size' has no byte-buffer decoder after struct synthesis: opaque type 'Size' for parameter 'neighborhoodSize' needs lifecycle support (Phase C)",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  },
+  {
+   "source": "sparsevec.c",
+   "name": "array_to_sparsevec",
+   "outcome": "unsupported_params",
+   "reason": "C parameter 'bhf_arg__bhf_arg0' of type 'PG_FUNCTION_ARGS' has no byte-buffer decoder after struct synthesis: opaque type 'PG_FUNCTION_ARGS' for parameter 'bhf_arg__bhf_arg0' needs lifecycle support (Phase C)",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  },
+  {
+   "source": "sparsevec.c",
+   "name": "halfvec_to_sparsevec",
+   "outcome": "unsupported_params",
+   "reason": "C parameter 'bhf_arg__bhf_arg0' of type 'PG_FUNCTION_ARGS' has no byte-buffer decoder after struct synthesis: opaque type 'PG_FUNCTION_ARGS' for parameter 'bhf_arg__bhf_arg0' needs lifecycle support (Phase C)",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  },
+  {
+   "source": "sparsevec.c",
+   "name": "sparsevec",
+   "outcome": "unsupported_params",
+   "reason": "C parameter 'bhf_arg__bhf_arg0' of type 'PG_FUNCTION_ARGS' has no byte-buffer decoder after struct synthesis: opaque type 'PG_FUNCTION_ARGS' for parameter 'bhf_arg__bhf_arg0' needs lifecycle support (Phase C)",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 4,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

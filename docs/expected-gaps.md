@@ -95,12 +95,15 @@ JNI, Win32. The manifest reports them. A minority are BHF's own and worth
 re-reading the exemplars for; that method has produced a fix every time it was
 run.
 
-### C-3. K&R C — 21 — **BY DESIGN**
+### C-3. K&R C — 21 — **[FIXED]**
 
-Discovered and statically analyzed, not fuzzed (M22). Fuzzing a K&R definition
-means synthesizing a prototype from the parameter declaration list; the
-discovery side already recovers the true signature, so this is closer than the
-count suggests.
+A K&R definition is now fuzzed through the prototype its parameter
+declarations give, each parameter at its promoted type (#283). Re-running the
+sweep's 20 C-3 targets left none report-only as K&R C. Only 6 were K&R
+definitions: 2 built and fuzzed, 1 built without an input reaching the target,
+2 stop at zlib's `#define local static` (#415) and 1 is compiled out. The other
+14 were ANSI C that the July extractor misread, and now stop where other C
+targets stop. See [the re-run](validation/2026-11-18-c3-knr.md).
 
 ### C-4. `build abandoned after N repair rounds: --campaign-time exhausted` — 10 — **ENVIRONMENT**
 

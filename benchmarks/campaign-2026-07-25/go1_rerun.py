@@ -13,6 +13,7 @@ current bhf drives.
       --all-lanes --jobs 2
   BHF_BIN=... go1_rerun.py results-0728 results-1117-rust4 --lang rust --class Rust-4 \\
       --all-lanes --run-untrusted
+  BHF_BIN=... go1_rerun.py results-0728 results-1118-c3 --lang c --class C-3 --all-lanes
   BHF_BIN=... go1_rerun.py results-0728 results-1118-js2 --lang javascript --class JS-2 \\
       --all-lanes
 
@@ -93,8 +94,22 @@ def js_class(target):
     return outcome or "other"
 
 
+def c_class(target):
+    """The expected-gaps.md class of a C target's outcome."""
+    outcome = target.get("outcome") or ""
+    reason = target.get("reason") or ""
+    if outcome == "built_and_fuzzed":
+        return "built and fuzzed"
+    if "K&R C: legacy dialect" in reason:
+        return "C-3 K&R C"
+    if outcome == "failed_build":
+        return "failed build"
+    return outcome or "other"
+
+
 # Per language: its source suffixes and its classifier.
 LANGS = {
+    "c": ((".c", ".h"), c_class),
     "go": (".go", go_class),
     "java": (".java", java_class),
     "rust": (".rs", rust_class),

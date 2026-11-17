@@ -1,0 +1,175 @@
+{
+ "repo": "mapmeld/fortran-machine",
+ "sha": "5e5e6bbdab353149047971a3f872238a2a4b716e",
+ "rc": 0,
+ "targets": [
+  {
+   "source": "flemon.c",
+   "name": "ErrorMsg",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"main.c:77:13: error: conflicting types for 'ErrorMsg'\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "flemon.c",
+   "name": "OptInit",
+   "outcome": "built_not_entered",
+   "reason": "harness executed 200 time(s) but no pass reached the target-entry checkpoint \u2014 inputs were decode-rejected or the harness bailed before the endpoint",
+   "class": "built_not_entered",
+   "before": 1,
+   "classes": [
+    "built_not_entered"
+   ]
+  },
+  {
+   "source": "flemon.c",
+   "name": "Parse",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "flemon.c",
+   "name": "merge",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "flemon.c",
+   "name": "msort",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 4,
+  "built_and_fuzzed": 3,
+  "fuzzed_stub_only": 0,
+  "built_not_entered": 1,
+  "failed_build": 1,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 3,
+  "fidelity": {
+   "reduced_fidelity_targets": 0,
+   "dimensions": {
+    "arch": {
+     "status": "exercised",
+     "reason": "fuzzed natively on the host x86_64 target"
+    },
+    "endianness": {
+     "status": "exercised",
+     "reason": "native host target ran in little-endian"
+    },
+    "rtos_runtime": {
+     "status": "not_applicable",
+     "reason": "host process target has no RTOS runtime"
+    },
+    "hardware_peripherals": {
+     "status": "not_applicable",
+     "reason": "host process target has no hardware peripherals"
+    },
+    "concurrency": {
+     "status": "exercised",
+     "reason": "ThreadSanitizer pass replayed the corpus for concurrent-access faults"
+    },
+    "sanitizers": {
+     "status": "exercised",
+     "reason": "ran under asan+ubsan+tsan"
+    },
+    "fuzzing_build_mode": "on"
+   }
+  }
+ },
+ "findings_detail": [
+  {
+   "id": "F-0000-35a27d9a",
+   "rule": "BHF-223",
+   "cwe": [
+    "CWE-125"
+   ],
+   "cwe_name": "Out-of-bounds Read",
+   "kind": null,
+   "severity": null,
+   "confidence": "low",
+   "tier": null,
+   "harness": "H-C0648-07413C70",
+   "frames": [
+    "msort /home/ubuntu/bhf-corpus-500/fortran/mapmeld__fortran-machine/flibs-0.9/flibs/src/lemon/flemon.c"
+   ],
+   "message": "ERROR: AddressSanitizer: SEGV on unknown address 0x7e0deadc1e70 (pc 0x56cd69f0b265 bp 0x7ffdeadc32d0 sp 0x7ffdeadc3240 T0) (READ memory access)"
+  },
+  {
+   "id": "F-0001-a5eec718",
+   "rule": "BHF-223",
+   "cwe": [
+    "CWE-119"
+   ],
+   "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": null,
+   "harness": "H-C0614-823FA435",
+   "frames": [
+    "merge"
+   ],
+   "message": "ERROR: AddressSanitizer: SEGV on unknown address (pc 0x5b2c1259f135 bp 0x7ffde18e37e0 sp 0x7ffde18e36e0 T0) (READ memory access; high value address)"
+  },
+  {
+   "id": "F-0002-0c01e477",
+   "rule": "BHF-206",
+   "cwe": [
+    "CWE-476"
+   ],
+   "cwe_name": "NULL Pointer Dereference",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": null,
+   "harness": "H-C0717-4FB299D8",
+   "frames": [
+    "file_open"
+   ],
+   "message": "/home/ubuntu/bhf-corpus-500/fortran/mapmeld__fortran-machine/flibs-0.9/flibs/src/lemon/flemon.c:2724:13: runtime error: member access within null pointer of type 'struct lemon'"
+  },
+  {
+   "id": "F-0003-6577ba06",
+   "rule": "BHF-206",
+   "cwe": [
+    "CWE-476"
+   ],
+   "cwe_name": "NULL Pointer Dereference",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": null,
+   "harness": "H-C09A9-7AE8B190",
+   "frames": [
+    "Parse"
+   ],
+   "message": "ERROR: AddressSanitizer: SEGV on unknown address 0x0000000000b4 (pc 0x5d8c172c4b09 bp 0x000000000000 sp 0x7fff70fa0140 T0) (READ memory access)"
+  }
+ ]
+}

@@ -2812,6 +2812,12 @@
   when bhf panics.
 
 ### Added
+- `bhf auto` fuzzes K&R C definitions (#283). The harness declares the
+  prototype the definition's parameter declarations give, with the default
+  argument promotions (`char` and `short` as `int`, `float` as `double`), and
+  passes the arguments it decodes. The modern parse read an old-style
+  definition as taking no parameters, and the dialect was report-only.
+  Pre-C++98 C++ stays report-only.
 - On-target CmpLog for the `gdb` and `qemu-system` transports (#386).
   `--transport-coverage-map ...,cmplog=ADDR,cmplog_cap=N` names a record the
   firmware's `-fsanitize-coverage=trace-cmp` callbacks fill, `{u32 count,

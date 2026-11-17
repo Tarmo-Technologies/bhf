@@ -212,9 +212,9 @@ impl Dialect {
     /// syntax), so the table regresses nothing.
     pub fn fuzz_support(self) -> FuzzSupport {
         match self {
-            // Discovered + statically analyzed, not fuzzed end-to-end.
+            // Discovered + statically analyzed, not fuzzed end-to-end. K&R C
+            // fuzzes through the prototype its declaration block gives (#283).
             Dialect::Ada83 // Phase 4: parses + builds -gnat83 but report-only for now
-            | Dialect::CKAndR // Phase 3: K&R discovered via the tolerant extractor
             | Dialect::CppPre98 // Phase 5: no modern compiler accepts cfront/ARM
             | Dialect::Python2 => FuzzSupport::ReportOnly, // Phase 2: needs python2
             // Perl 4 fuzzes via the Perl 5 lane (Perl 5 is backward-compatible and
@@ -869,15 +869,11 @@ mod tests {
 
     #[test]
     fn legacy_dialects_are_report_only_modern_are_fuzzable() {
-        for d in [
-            Dialect::Ada83,
-            Dialect::CKAndR,
-            Dialect::CppPre98,
-            Dialect::Python2,
-        ] {
+        for d in [Dialect::Ada83, Dialect::CppPre98, Dialect::Python2] {
             assert_eq!(d.fuzz_support(), FuzzSupport::ReportOnly, "{d:?}");
         }
         for d in [
+            Dialect::CKAndR,
             Dialect::Ada95,
             Dialect::C89,
             Dialect::C99,

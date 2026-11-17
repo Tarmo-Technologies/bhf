@@ -906,7 +906,7 @@ fn declaration_wrapper_for_symbol(file: &str, symbol: &str) -> Option<String> {
 fn source_defines_function(file: &str, symbol: &str) -> bool {
     std::fs::read_to_string(file)
         .ok()
-        .and_then(|source| c_parser::parse_c_functions(&source).ok())
+        .and_then(|source| c_parser::parse_c_functions_with_knr(&source).ok())
         .is_some_and(|functions| functions.iter().any(|function| function.name == symbol))
 }
 

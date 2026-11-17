@@ -398,6 +398,59 @@ fn brace_delta(line: &str) -> i32 {
     })
 }
 
+/// The functions of `source` as a harness calls them (#283): what
+/// [`parse_c_functions`] finds, with each K&R definition's parameters taken
+/// from its declaration block (the modern grammar reads `int f(a, b) int a;
+/// char *b; {` as taking none), and the K&R definitions it does not find.
+/// A K&R definition is called with the default argument promotions, so each
+/// parameter is the promoted type ([`knr_promoted_type`]): a prototype that
+/// names those is compatible with the definition.
+pub fn parse_c_functions_with_knr(source: &str) -> Result<Vec<CFunction>, CParseError> {
+    let mut functions = parse_c_functions(source)?;
+    for mut knr in parse_knr_functions(source) {
+        for param in &mut knr.params {
+            param.c_type = knr_promoted_type(&param.c_type);
+        }
+        match functions
+            .iter_mut()
+            .find(|function| function.name == knr.name)
+        {
+            Some(function) => function.params = knr.params,
+            None => functions.push(knr),
+        }
+    }
+    Ok(functions)
+}
+
+/// A K&R parameter's type after the default argument promotions: `char`,
+/// `short` and `_Bool` arrive as `int`, `float` as `double`. `register` is
+/// dropped: it is storage, not type.
+pub fn knr_promoted_type(c_type: &str) -> String {
+    let words: Vec<&str> = c_type
+        .split_whitespace()
+        .filter(|word| *word != "register")
+        .collect();
+    let joined = words.join(" ");
+    if joined.contains('*') || joined.contains('[') {
+        return joined;
+    }
+    let base: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|word| !matches!(*word, "const" | "volatile"))
+        .collect();
+    if base
+        .iter()
+        .any(|word| matches!(*word, "char" | "short" | "_Bool"))
+    {
+        "int".to_owned()
+    } else if base == ["float"] {
+        "double".to_owned()
+    } else {
+        joined
+    }
+}
+
 /// Try to parse a K&R definition whose header is on `lines[start]`. Returns the
 /// synthesized [`CFunction`] or `None` if this is not a K&R definition.
 fn knr_def_at(lines: &[&str], start: usize) -> Option<CFunction> {
@@ -4834,6 +4887,49 @@ mod tests {
         assert_eq!(f.params[0].c_type, "int");
         assert_eq!(f.params[1].name, "b");
         assert_eq!(f.params[1].c_type, "char *");
+    }
+
+    /// #283: the modern parser reads a K&R definition as taking no
+    /// parameters; the merged list takes them from its declaration block,
+    /// promoted as a K&R call promotes them.
+    #[test]
+    fn knr_parameters_replace_the_modern_parse_and_are_promoted() {
+        let src = "int parse_rec(buf, len, tag, ratio)\n    unsigned char *buf;\n    \
+                   register int len;\n    char tag;\n    float ratio;\n{\n    return len;\n}\n\
+                   int modern(const char *s) { return s[0]; }\n";
+        let modern = parse_c_functions(src).unwrap();
+        let before = modern.iter().find(|f| f.name == "parse_rec");
+        assert!(before.is_none_or(|f| f.params.is_empty()), "{before:?}");
+        let fns = parse_c_functions_with_knr(src).unwrap();
+        let rec = fns.iter().find(|f| f.name == "parse_rec").unwrap();
+        let types: Vec<&str> = rec.params.iter().map(|p| p.c_type.as_str()).collect();
+        assert_eq!(types, ["unsigned char *", "int", "int", "double"]);
+        let names: Vec<&str> = rec.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["buf", "len", "tag", "ratio"]);
+        let modern = fns.iter().find(|f| f.name == "modern").unwrap();
+        assert_eq!(modern.params[0].c_type, "const char *");
+        assert_eq!(fns.iter().filter(|f| f.name == "parse_rec").count(), 1);
+    }
+
+    #[test]
+    fn knr_promoted_types_follow_the_default_argument_promotions() {
+        for (declared, promoted) in [
+            ("char", "int"),
+            ("unsigned char", "int"),
+            ("signed char", "int"),
+            ("short", "int"),
+            ("unsigned short int", "int"),
+            ("const char", "int"),
+            ("float", "double"),
+            ("register long", "long"),
+            ("unsigned long", "unsigned long"),
+            ("double", "double"),
+            ("char *", "char *"),
+            ("register char *", "char *"),
+            ("struct rec *", "struct rec *"),
+        ] {
+            assert_eq!(knr_promoted_type(declared), promoted, "{declared}");
+        }
     }
 
     #[test]
