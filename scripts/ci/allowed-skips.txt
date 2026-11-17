@@ -19,7 +19,7 @@ bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  ski
 # cli_freertos_ test with BHF_RTOS_CLI=1.
 bhf::transport_fuzz_qemu_cli::cli_freertos_*  skip cli_freertos_*: set BHF_RTOS_CLI=1
 
-# The binary analyzers' tests need the pinned Rizin and Ghidra; the
+# The binary analyzers' tests need the pinned Rizin, Ghidra and angr; the
 # nightly's binary-analyzers job installs them and runs every one with
 # BHF_BINARY_ANALYZERS=1.
 bhf::binary_adapter_tools::*  skip binary_adapter_tools: set BHF_BINARY_ANALYZERS=1

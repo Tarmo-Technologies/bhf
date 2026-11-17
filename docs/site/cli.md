@@ -382,6 +382,7 @@ subprocess, with a fixed command or a bundled script:
 |---|---|---|
 | `rizin` | `rizin` | `rizin -q -c 'aaa; aflj; axlj; izj'` |
 | `ghidra` | Ghidra's `support/analyzeHeadless` (Ghidra 12 needs a JDK 25) | an import and auto-analysis in a throwaway project, then the bundled `BhfExport.java` post-script |
+| `angr` | a Python that imports `angr` | the bundled `angr_export.py`: CFGFast over the main object, with data and cross references |
 
 Each run is bounded by `--timeout-secs` (default 900) and 128 MiB of output.
 Each array keeps at most 50,000 functions or strings, or 200,000 call edges
@@ -394,9 +395,6 @@ kept. The real adapters are blocked in `strict-permissive` (they need
   output;
 - `status: skipped` with `tool_not_found` and exit 1 when the tool is not
   there, or the Python cannot import angr.
-
-The angr adapter run no analysis yet: with their tool they
-write `status: not_implemented` and exit 3.
 
 The mock adapter reads `--mock-output` JSON instead, for contract tests of a
 consumer.

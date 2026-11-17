@@ -314,8 +314,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # The binary adapters against the real analyzers: the pinned Rizin and
-  # Ghidra (with a JDK 25) that scripts/ci/install-binary-analyzers.sh
+  # The binary adapters against the real analyzers: the pinned Rizin, Ghidra
+  # (with a JDK 25) and angr that scripts/ci/install-binary-analyzers.sh
   # installs, the downloads cached under the script's hash. The hash shards
   # run binary_adapter_tools too, where it skips without BHF_BINARY_ANALYZERS
   # (scripts/ci/allowed-skips.txt).
@@ -348,7 +348,7 @@ jobs:
           path: ~/.cache/bhf-fetch
           key: binary-analyzers-${{ hashFiles('scripts/ci/install-binary-analyzers.sh') }}
 
-      - name: Install Rizin and Ghidra
+      - name: Install Rizin, Ghidra and angr
         run: bash scripts/ci/install-binary-analyzers.sh "$RUNNER_TEMP/analyzers" >> "$GITHUB_ENV"
 
       - name: Install cargo-nextest

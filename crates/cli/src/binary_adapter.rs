@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `bhf binary adapter`: the functions, call edges, strings and xrefs of a
-//! binary, from an external analyzer run as a subprocess (Rizin, Ghidra headless; the angr adapter finds its tool but
-//! runs no analysis yet) or
-//! from a mock fixture, written as
+//! binary, from an external analyzer run as a subprocess (Rizin, Ghidra
+//! headless, angr) or from a mock fixture, written as
 //! `binary-adapter-report.json`.
 //!
 //! Each analyzer runs a fixed command or a bundled script under a wall-clock
@@ -12,6 +11,7 @@
 //! addresses (a PIE's are offsets from 0), whatever base the tool loaded it
 //! at.
 
+mod angr;
 mod ghidra;
 mod rizin;
 
@@ -208,7 +208,7 @@ fn probe_tool(kind: AdapterKind, tool: &Path) -> Result<FoundTool, ProbeFailure>
     Ok(FoundTool { path, version })
 }
 
-/// Run the analysis of the target and write its report:
+/// Run the Rizin, Ghidra or angr analysis of the target and write its report:
 /// `ok` and exit 0 with the analysis, `error` and exit 1 when the analysis
 /// failed, `skipped` and exit 1 when the tool (or angr) is not there.
 fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
@@ -246,9 +246,6 @@ fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
         "path": found.path.to_string_lossy(),
         "version": found.version
     });
-    if matches!(kind, AdapterKind::Angr) {
-        return not_implemented(args, tool_info);
-    }
     let target = std::path::absolute(&args.target)
         .map_err(|error| format!("resolve {}: {error}", args.target.display()))?;
     let analyzed = if target.is_file() {
@@ -256,7 +253,8 @@ fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
         match kind {
             AdapterKind::Rizin => rizin::analyze(&found.path, &target, timeout),
             AdapterKind::Ghidra => ghidra::analyze(&found.path, &target, timeout),
-            AdapterKind::Angr | AdapterKind::Mock => unreachable!("no analysis runs"),
+            AdapterKind::Angr => angr::analyze(&found.path, &target, timeout),
+            AdapterKind::Mock => unreachable!("the mock adapter reads its fixture"),
         }
     } else {
         Err(AdapterError::new(
@@ -295,32 +293,6 @@ fn run_real_adapter(args: &BinaryAdapterArgs) -> Result<i32, String> {
             Ok(1)
         }
     }
-}
-
-/// The exit code of an adapter whose analysis bhf does not run yet.
-const NOT_IMPLEMENTED_EXIT: i32 = 3;
-
-/// An adapter whose analysis bhf does not run yet: its tool was found, and
-/// the report says no analysis ran (`status: not_implemented`, exit 3).
-fn not_implemented(args: &BinaryAdapterArgs, tool_info: Value) -> Result<i32, String> {
-    let mut report = base_report(args, "not_implemented", "external_subprocess")
-        .with_error(
-            "not_implemented",
-            &format!(
-                "bhf runs no {} analysis yet: the tool was found, but no functions, call \
-                 graph, strings or xrefs are extracted from the binary",
-                args.adapter.as_str()
-            ),
-        )
-        .finish();
-    report["tool"] = tool_info;
-    write_report(&args.out, &report)?;
-    bhfeprintln!(
-        "binary adapter '{}': not implemented; bhf ran no analysis (report: {})",
-        args.adapter.as_str(),
-        args.out.join(REPORT_FILE).display()
-    );
-    Ok(NOT_IMPLEMENTED_EXIT)
 }
 
 /// The most entries each report array keeps; `truncated` in the report names

@@ -370,8 +370,8 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
 
 
 class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
-    """The binary adapters run nightly against the real Rizin and Ghidra
-    (#264, #265), pinned by digest."""
+    """The binary adapters run nightly against the real Rizin, Ghidra and angr
+    (#264, #265, #266), pinned by digest."""
 
     def setUp(self) -> None:
         self.job = job_block("binary-analyzers")
@@ -400,6 +400,7 @@ class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
         for pin in (
             "rizin_sha256=9102249a9f0b6319c5334a2e5cf8d9cc3f2035e1d3def027c41f6a90f647e8cf",
             "ghidra_sha256=2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67",
+            "angr_version=10.0.7",
         ):
             self.assertIn(pin, script)
         self.assertNotIn("curl", script)

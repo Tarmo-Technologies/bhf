@@ -2807,11 +2807,16 @@
   Rizin's and `nm`'s; an import's function in Ghidra's EXTERNAL block is
   left out for its PLT thunk. The version is read from the install's
   `application.properties`.
-- The nightly's binary-analyzers job installs Rizin 0.9.1 and Ghidra 12.2
-  with a JDK 25, pinned by digest (`scripts/ci/install-binary-analyzers.sh`),
-  and runs each adapter on a fixture with `BHF_REQUIRE_TOOLS=1`: the
-  fixture's functions at the addresses `nm` gives, its call edges, its magic
-  string and a call xref.
+- `bhf binary adapter --adapter angr` runs the bundled `angr_export.py`
+  (#266): CFGFast over the main object, with data and cross references,
+  moved back from angr's load base (`0x400000` for a PIE). A Python that
+  cannot import angr is `skipped`, exit 1; the adapter ran `python3
+  --version` and reported a successful analysis without angr.
+- The nightly's binary-analyzers job installs Rizin 0.9.1, Ghidra 12.2 with
+  a JDK 25, and angr 10.0.7, pinned by digest
+  (`scripts/ci/install-binary-analyzers.sh`), and runs each adapter on a
+  fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
+  addresses `nm` gives, its call edges, its magic string and a call xref.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

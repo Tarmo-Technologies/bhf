@@ -373,7 +373,7 @@ struct BinaryArgs {
 enum BinaryCommand {
     /// Inventory binaries and firmware, extract archives, match CVE components for SBOM/SCA
     Scan(binary_scan::BinaryScanArgs),
-    /// List a binary's functions, call edges, strings and xrefs with Rizin or Ghidra headless, run as subprocesses (angr: no analysis yet, exit 3), or the mock adapter's JSON contract
+    /// List a binary's functions, call edges, strings and xrefs with Rizin, Ghidra headless or angr, run as subprocesses (or the mock adapter's JSON contract)
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),

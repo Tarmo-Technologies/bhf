@@ -172,7 +172,7 @@ fn fake_tool(root: &Path, name: &str, code: i32) -> PathBuf {
 
 /// The adapters that run an external analyzer.
 #[cfg(unix)]
-const ANALYZERS: &[&str] = &["rizin", "ghidra"];
+const ANALYZERS: &[&str] = &["rizin", "ghidra", "angr"];
 
 /// A tool that answers its probe and writes, or prints, the analysis its real
 /// counterpart recorded for `tests/fixtures/binary_adapter/legacy.c`: rizin
@@ -195,6 +195,12 @@ fn recording_tool(root: &Path, kind: &str) -> PathBuf {
              grep -q 'class BhfExport' \"$scripts/BhfExport.java\" || exit 9\n\
              cp '{}' \"$9\"\n",
             recorded.join("ghidra-legacy.json").display()
+        ),
+        // python <angr_export.py> <binary> <export> <limit>
+        "angr" => format!(
+            "#!/bin/sh\n[ \"$1\" = -c ] && {{ echo 10.0.7; exit 0; }}\n\
+             grep -q CFGFast \"$1\" || exit 9\ncp '{}' \"$3\"\n",
+            recorded.join("angr-legacy.json").display()
         ),
         other => panic!("{other}"),
     };
@@ -278,26 +284,6 @@ fn a_real_adapter_without_an_analysis_is_an_error_or_skipped() {
     assert_eq!(report["errors"][0]["reason"], "tool_not_found");
 }
 
-/// The adapters that find their tool but run no analysis yet.
-#[cfg(unix)]
-const NOT_YET: &[&str] = &["angr"];
-
-/// An adapter whose analysis bhf does not run yet says so with its tool
-/// (exit 3).
-#[cfg(unix)]
-#[test]
-fn an_adapter_with_no_analysis_yet_says_so() {
-    for &kind in NOT_YET {
-        let root = temp_dir(&format!("unimplemented-{kind}"));
-        let present = fake_tool(&root, &format!("{kind}-tool"), 0);
-        let (code, report) = run_adapter(&root, kind, &present);
-        assert_eq!(code, Some(3), "{kind}: {report:#}");
-        assert_eq!(report["status"], "not_implemented", "{kind}");
-        assert_eq!(report["errors"][0]["reason"], "not_implemented", "{kind}");
-        assert_eq!(report["functions"], json!([]), "{kind}");
-    }
-}
-
 #[test]
 fn the_adapter_help_names_the_analyzers_it_runs() {
     let output = Command::new(bhf_bin())
@@ -306,15 +292,10 @@ fn the_adapter_help_names_the_analyzers_it_runs() {
         .unwrap();
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
-        help.contains(
-            "with Rizin or Ghidra headless, run as subprocesses (angr: no analysis yet, exit 3)"
-        ),
+        help.contains("Rizin, Ghidra headless or angr, run as subprocesses"),
         "{help}"
     );
-    assert!(
-        !help.contains("no analysis through them is implemented"),
-        "{help}"
-    );
+    assert!(!help.contains("no analysis through them"), "{help}");
 }
 
 fn assert_success(output: std::process::Output) {

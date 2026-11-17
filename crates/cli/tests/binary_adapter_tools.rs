@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `bhf binary adapter` against the real Rizin and Ghidra (#264, #265), on
-//! `tests/fixtures/binary_adapter/legacy.c` built with `cc -O0`.
+//! `bhf binary adapter` against the real Rizin, Ghidra and angr (#264, #265,
+//! #266), on `tests/fixtures/binary_adapter/legacy.c` built with `cc -O0`.
 //!
 //! These run where `BHF_BINARY_ANALYZERS=1`: the nightly's binary-analyzers
 //! job installs the pinned tools and sets it, with `BHF_REQUIRE_TOOLS=1`, so
-//! a missing tool fails the test there. The tools are `BHF_RIZIN` and
+//! a missing tool fails the test there. The tools are `BHF_RIZIN`,
 //! `BHF_GHIDRA_HEADLESS` (Ghidra's `support/analyzeHeadless`, with a JDK 25
-//! on `PATH` or in `JAVA_HOME`), else `rizin` and `analyzeHeadless` on
-//! `PATH`.
+//! on `PATH` or in `JAVA_HOME`) and `BHF_ANGR_PYTHON` (a Python that imports
+//! angr), else `rizin`, `analyzeHeadless` and `python3` on `PATH`.
 
 #![cfg(target_os = "linux")]
 
@@ -32,6 +32,11 @@ fn analyzer(kind: &str, variable: &str, default: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default));
     let present = match kind {
+        "angr" => Command::new(&tool)
+            .args(["-c", "import angr"])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|output| output.status.success()),
         "rizin" => Command::new(&tool)
             .arg("-v")
             .stdin(Stdio::null())
@@ -156,5 +161,12 @@ fn rizin_finds_the_fixtures_functions_and_call_edges() {
 fn ghidra_headless_finds_the_fixtures_functions_and_call_edges() {
     if let Some(headless) = analyzer("ghidra", "BHF_GHIDRA_HEADLESS", "analyzeHeadless") {
         analyze_legacy("ghidra", &headless);
+    }
+}
+
+#[test]
+fn angr_finds_the_fixtures_functions_and_call_edges() {
+    if let Some(python) = analyzer("angr", "BHF_ANGR_PYTHON", "python3") {
+        analyze_legacy("angr", &python);
     }
 }
