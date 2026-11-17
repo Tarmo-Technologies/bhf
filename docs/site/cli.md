@@ -77,6 +77,10 @@ To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
 that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
 Windows, as every harness binary there is named: `main_cov.exe`,
 `main_afl.exe`, ...).
+An on-target transport finding minimizes through the transport it was found
+on, rebuilt from its profile (`--transport-endpoint HOST:PORT` relocates it),
+on the same fault rule and site (see
+[On-target fuzzing](on-target-fuzzing.md#4-faults-and-the-real-time-deadline-oracle)).
 `bhf minimize` first runs the testcase and compares its crash with the finding
 the way `bhf replay` does, with the environment `bhf replay` gives the harness
 (the finding's recorded runtime mode and injected variables too), as does

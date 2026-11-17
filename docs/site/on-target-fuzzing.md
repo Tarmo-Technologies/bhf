@@ -376,6 +376,16 @@ finding` (exit 3), and the differences list what the other runs did. Such a
 finding depends on state the reset does not restore (a peripheral, timing,
 an uninitialized word), not only on its input.
 
+**Minimizing (`bhf minimize`).** `bhf minimize <finding>` rebuilds the
+transport from the finding's profile as `bhf replay` does (relocate it with
+`--transport-endpoint HOST:PORT`) and delta-debugs the input on the target: a
+reduction is kept only when re-driving it faults with the same rule at the
+same site, or, for a deadline finding, is again a clean run past the
+deadline. The result is `min_testcase.bin`, with `minimization.lane =
+"transport"` in `finding.json`. An input that no longer reproduces is an
+error, and `--strategy typed`, which needs a host harness's argument layout,
+is refused.
+
 ---
 
 ### Device registers on the host

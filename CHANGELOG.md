@@ -2796,6 +2796,12 @@
   when bhf panics.
 
 ### Added
+- `bhf minimize` minimizes on-target transport findings (#280). It rebuilds
+  the transport from the finding's profile as `bhf replay` does
+  (`--transport-endpoint` relocates it), then delta-debugs the input,
+  keeping a reduction only when it faults with the same rule at the same
+  site, or for a deadline finding is again a clean run past the deadline.
+  It refused transport findings.
 - The workers of a `bhf fuzz --workers` campaign share their corpus while
   they run (#277). Every `BHF_SYNC_INTERVAL_MS` (10 s by default, spread
   over the workers), each writes the entries its pool kept to

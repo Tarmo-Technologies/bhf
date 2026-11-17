@@ -71,6 +71,12 @@ pub struct MinimizeArgs {
     /// refused with exit 3.
     #[arg(long)]
     pub allow_other_crash: bool,
+
+    /// Relocate an on-target transport finding's endpoint to `HOST:PORT`, as
+    /// `bhf replay --transport-endpoint` does. Applies to agent:tcp / gdb
+    /// transport findings.
+    #[arg(long = "transport-endpoint", value_name = "HOST:PORT")]
+    pub transport_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -483,7 +489,7 @@ pub(crate) fn minimize_for_auto(
                 MinimizeStrategy::Bytes,
                 Some(deadline),
             )?;
-            return write_ada_minimization(finding_dir, &result).map(Some);
+            return write_minimization(finding_dir, &result).map(Some);
         }
     };
     minimize_c_engine_until(
@@ -570,16 +576,39 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             unverified: None,
         });
     }
-    // #80: an on-target transport finding has no host harness; minimizing it
-    // must reuse the transport replay contract (re-drive through the recorded
-    // transport). Until on-target minimization lands, fail with an actionable
-    // message rather than silently resolving/executing a host harness.
+    // #280: an on-target transport finding has no host harness: it is
+    // minimized through the transport it was found on, rebuilt from its
+    // profile as `bhf replay` does, on the same fault rule and site.
     if crate::transport_replay::is_transport_finding(&finding_dir) {
-        return Err(anyhow!(
-            "minimize does not yet support on-target transport findings; reproduce \
-             them with `bhf replay` (which re-drives the recorded input through the \
-             recorded transport). On-target minimization is a tracked follow-up."
-        ));
+        if args.strategy == MinimizeStrategy::Typed {
+            return Err(anyhow!(
+                "--strategy typed reduces a host harness's arguments by its \
+                 arg-layout.json; an on-target transport finding has none, so minimize it \
+                 with --strategy bytes"
+            ));
+        }
+        let result = crate::transport_replay::minimize_transport_finding(
+            &finding_dir,
+            args.transport_endpoint.as_deref(),
+        )
+        .map_err(|error| anyhow!(error))?;
+        let reduced = result.minimized.len() < result.original_len;
+        let output = MinimizeOutput {
+            strategy: MinimizeStrategy::Bytes,
+            original_len: result.original_len,
+            metadata: json!({
+                "strategy": "bytes",
+                "lane": "transport",
+                "original_len": result.original_len,
+                "minimized_len": result.minimized.len(),
+                "removed_bytes": result.original_len.saturating_sub(result.minimized.len()),
+                "reduced": reduced,
+                "predicate_runs": result.predicate_runs,
+            }),
+            minimized: result.minimized,
+            reduced,
+        };
+        return write_minimization(&finding_dir, &output);
     }
     let explicit = args.harness.is_some();
     let harness = finding_harness(&finding_dir, args.harness)?;
@@ -660,12 +689,13 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             detection.basis.describe()
         )
     })?;
-    write_ada_minimization(&finding_dir, &result)
+    write_minimization(&finding_dir, &result)
 }
 
-/// Write an Ada finding's minimized input to `min_testcase.bin` and record
-/// the minimization in its `finding.json`.
-fn write_ada_minimization(
+/// Write a finding's minimized input to `min_testcase.bin` and record the
+/// minimization in its `finding.json` (an Ada or a transport finding; the C
+/// engines write their own).
+fn write_minimization(
     finding_dir: &Path,
     result: &MinimizeOutput,
 ) -> anyhow::Result<MinimizeSummary> {
