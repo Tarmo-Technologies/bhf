@@ -2493,12 +2493,14 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 // A missing toolchain, or a sanitizer runtime that could not
                 // start, is a fact about the host, not the target: it may be
                 // fixed by now, so the target is tried again (unforced;
-                // forcing cannot stand in for a toolchain).
+                // forcing cannot stand in for a toolchain). So is a refusal for
+                // want of `--run-untrusted`, which this run may give.
                 Some((prior, _))
                     if matches!(
                         prior.outcome,
                         crate::auto::attempt::Outcome::MissingToolchain { .. }
                             | crate::auto::attempt::Outcome::SanitizerRuntimeUnavailable { .. }
+                            | crate::auto::attempt::Outcome::ConsentRequired { .. }
                     ) =>
                 {
                     true
@@ -2728,7 +2730,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             // serial loop is kept only for a host that could never run a second
             // worker, where the pool would add threads and buy nothing.
             let results = if jobs_ceiling <= 1 {
-                // --jobs 1 (default): the historical serial sweep, byte-identical when no
+                // One worker (`--jobs 1`, or the default on a one- or two-core
+                // host): the historical serial sweep, byte-identical when no
                 // --campaign-time is set (the deadline check is a no-op while None).
                 let mut results = Vec::new();
                 // #94: count targets that reach the fuzz phase; stop once `success_cap` do,
@@ -3521,6 +3524,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 })
                 .count(),
             skipped_missing_toolchain: missing_toolchain_by_lane(&results),
+            skipped_consent_required: results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        &result.outcome,
+                        crate::auto::attempt::Outcome::ConsentRequired { .. }
+                    )
+                })
+                .count(),
             report_only: summary.report_only,
             findings: summary.findings,
             preflight: &preflight,
@@ -4604,7 +4616,9 @@ impl AutoSummary {
                     coverage_edges = coverage_edges
                         .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
                 }
-                UnsafeBuildPath { .. } | MissingToolchain { .. } => skipped += 1,
+                UnsafeBuildPath { .. } | MissingToolchain { .. } | ConsentRequired { .. } => {
+                    skipped += 1
+                }
                 UnsupportedParams { reason } => {
                     skipped += 1;
                     // An interpreted target that could not LOAD because a package
@@ -4834,7 +4848,13 @@ impl AutoSummary {
             );
         }
         if self.coverage_edges > 0 {
-            let _ = writeln!(s, "  Coverage:     {} edges", self.coverage_edges);
+            // The most edges any one target reached: the targets' edge maps
+            // are separate, so their counts do not add up.
+            let _ = writeln!(
+                s,
+                "  Coverage:     {} edges (the most any one target reached)",
+                self.coverage_edges
+            );
         }
         // #417: loud false-clean warning. A stub-only target reports clean while
         // having fuzzed only empty stubs, so call it out explicitly here.
@@ -5468,6 +5488,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         UnsafeBuildPath { .. } => "refused: a path or flag cannot be quoted safely",
         // Not a missing feature: the lane's toolchain is not installed here.
         MissingToolchain { .. } => "skipped: toolchain not installed",
+        // Not unsupported: the build runs project code, which needs consent.
+        ConsentRequired { .. } => "needs --run-untrusted",
         UnrecoverableLink { .. } => "unrecoverable_link",
         UnrecoverableRuntime { .. } => "unrecoverable_runtime",
         // Not a harness failure: the host cannot start the sanitizer runtime.
@@ -5522,9 +5544,10 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
                 lines.push(format!("last error: {}", build_error_brief(err)));
             }
         }
-        UnsupportedParams { reason } | UnsafeBuildPath { reason } | MissingToolchain { reason } => {
-            lines.push(reason.clone())
-        }
+        UnsupportedParams { reason }
+        | UnsafeBuildPath { reason }
+        | MissingToolchain { reason }
+        | ConsentRequired { reason } => lines.push(reason.clone()),
         UnrecoverableLink { missing, .. } => {
             if !missing.is_empty() {
                 lines.push(format!("missing libraries: {}", missing.join(", ")));

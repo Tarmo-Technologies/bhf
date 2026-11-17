@@ -680,6 +680,7 @@ fn plan_to_fuzz_args(
         timeout: resolve_duration(&launch.timeout)?,
         deadline: None,
         print_final_stats: false,
+        quiet: false,
         rss_limit_mb: launch.rss_limit_mb.unwrap_or(0) as usize,
         fork_server: false,
         no_fork_server: false,

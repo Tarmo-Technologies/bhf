@@ -19,8 +19,9 @@ bhf auto /path/to/source-tree \
   --debug
 ```
 
-Read `bhf_work/FINDINGS.md` first; the top-level `findings.csv` is the
-machine-readable root-cause index and `findings/` holds full evidence bundles.
+Read `bhf_work/results/INDEX.md` first; `results/findings.json` and
+`results/findings.csv` are the machine-readable root-cause indexes and
+`results/findings/` holds full evidence bundles.
 The campaign/coverage report remains in `auto/run.md`, `auto/run.json`, and
 `auto/summary.txt`.
 
@@ -69,7 +70,7 @@ The campaign/coverage report remains in `auto/run.md`, `auto/run.json`, and
 
 ## Interpreting the result
 
-`FINDINGS.md` is the primary handoff. `summary.txt` then separates coverage
+`results/INDEX.md` is the primary handoff. `summary.txt` then separates coverage
 outcomes on purpose:
 
 - **built+fuzzed** — a harness was built and really executed the target.

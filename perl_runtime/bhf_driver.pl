@@ -52,12 +52,39 @@ my @DIE_FRAMES;
 sub capture_die_frames {
     @DIE_FRAMES = ();
     # Frame $i is where the sub named by frame $i + 1 was running.
+    # The coverage hook (DB::DB) runs inside the target's statements.
+    my $coverage = defined($INC{'Devel/BhfCov.pm'}) ? $INC{'Devel/BhfCov.pm'} : '';
     for (my $i = 0; my @here = caller($i); $i++) {
         next if $here[1] eq __FILE__ || $here[1] eq $harness || $here[1] =~ /^\(eval/;
+        next if $here[1] eq $coverage;
         my @in = caller($i + 1);
         my $function = @in ? $in[3] : 'main';
         push @DIE_FRAMES, "$function @ $here[1]:$here[2]";
         last if @DIE_FRAMES >= 5;
+    }
+}
+
+# In bhf's re-run of an input that hung, print the frames the target is
+# running once the run reaches BHF_HANG_REPORT_MS, then halt: bhf keys the hang
+# finding on them. Perl runs a signal's handler between ops, so SIGALRM's
+# interrupts a target looping in Perl where it loops.
+sub arm_hang_report {
+    my $after = $ENV{BHF_HANG_REPORT_MS};
+    return unless defined($after) && $after =~ /^\d+$/ && $after > 0;
+    my $hires = eval { require Time::HiRes; 1 };
+    my $left = $after / 1000 - (time() - $^T);
+    $left = 0.001 if $left <= 0;
+    $SIG{ALRM} = sub {
+        capture_die_frames();
+        print STDERR "== bhf hang: perl\n";
+        print STDERR "== bhf frame: $_\n" for @DIE_FRAMES;
+        require POSIX;
+        POSIX::_exit($FINDING_HALT);
+    };
+    if ($hires) {
+        Time::HiRes::alarm($left);
+    } else {
+        alarm(int($left + 0.999));
     }
 }
 
@@ -134,6 +161,7 @@ if (defined $ENV{BHF_FRAMED}) {
             if (($count & ($count - 1)) == 0 || ($count & 0x1FF) == 0);
     }
 } else {
+    arm_hang_report();
     my $data;
     if (@ARGV && -f $ARGV[0]) {
         local $/;

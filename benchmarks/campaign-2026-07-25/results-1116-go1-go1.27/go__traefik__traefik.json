@@ -1,0 +1,37 @@
+{
+ "repo": "traefik/traefik",
+ "sha": "fd5a576df2e8aeb0bfc8a96b6ef6e60a61f7ec0a",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "kv.go",
+   "name": "Decode",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `[]*store.KVPair` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "kv_node.go",
+   "name": "DecodeToNode",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `[]*store.KVPair` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

@@ -127,6 +127,9 @@ jobs:
       - name: Test offline signature verifier
         run: python3 -m unittest discover -s scripts/tests -p 'test_offline_verifier.py' -v
 
+      - name: Test the campaign sweep scripts
+        run: python3 -m unittest discover -s benchmarks/campaign-2026-07-25 -p 'test_*.py' -v
+
       - name: Build workspace
         run: cargo build --locked --workspace
 
@@ -608,9 +611,14 @@ jobs:
 
       # Every crate's unit tests, the daemon's included: a test that only
       # holds on Unix is cfg-gated in the source, so nothing is filtered here.
+      # The runner's worker starts steps at BelowNormal priority
+      # (actions/runner-images#7663); the step raises itself to Normal, the
+      # class a user's shell runs at, which the background re-run priority
+      # test then checks bhf's re-runs against.
       - name: Test the workspace libraries and the daemon
         shell: pwsh
         run: |
+          [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'Normal'
           cargo test --locked --workspace --lib --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

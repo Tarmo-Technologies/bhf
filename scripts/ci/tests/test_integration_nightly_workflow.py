@@ -30,7 +30,10 @@ DEDICATED = "build-recovery-scenarios"
 IGNORED = "ignored"
 # Every shard runs from the test archive the build job uploads.
 ARCHIVE = "--archive-file nightly-tests.tar.zst --workspace-remap . --extract-to ."
-IGNORED_FILTER = "binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity)"
+IGNORED_FILTER = (
+    "binary(=auto_lua_hook) | binary(=redqueen_cmplog) | binary(=engine_parity) | "
+    "binary(=fuzz_crash_throughput)"
+)
 
 
 def job_block(name: str) -> str:

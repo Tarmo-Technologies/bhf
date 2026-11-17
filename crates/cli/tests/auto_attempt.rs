@@ -3201,6 +3201,10 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         Outcome::MissingToolchain { reason } => {
             panic!("an Ada candidate was routed to a script lane: {reason}")
         }
+        // Only Rust, C# and Java builds need --run-untrusted.
+        Outcome::ConsentRequired { reason } => {
+            panic!("an Ada candidate was refused for consent: {reason}")
+        }
     }
 }
 

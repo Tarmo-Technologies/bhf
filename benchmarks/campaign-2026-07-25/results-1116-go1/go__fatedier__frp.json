@@ -1,0 +1,58 @@
+{
+ "repo": "fatedier/frp",
+ "sha": "5c6d761c1287e6153f07b824fb6d71b96ee598fe",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "decode.go",
+   "name": "DecodeClientConfigJSON",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: github.com/fatedier/golib@v0.8.1 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  },
+  {
+   "source": "decode.go",
+   "name": "DecodeClientPluginOptionsJSON",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: github.com/fatedier/golib@v0.8.1 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  },
+  {
+   "source": "decode.go",
+   "name": "DecodeProxyConfigurerJSON",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: github.com/fatedier/golib@v0.8.1 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  },
+  {
+   "source": "decode.go",
+   "name": "DecodeVisitorConfigurerJSON",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: github.com/fatedier/golib@v0.8.1 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  },
+  {
+   "source": "utils.go",
+   "name": "DecodeMessageInto",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `msg.Message` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

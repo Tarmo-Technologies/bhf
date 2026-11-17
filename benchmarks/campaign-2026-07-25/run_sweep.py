@@ -140,7 +140,14 @@ def distil_run(work: Path) -> dict:
                     "retries": outcome.get("retries"),
                     "repairs": len(outcome.get("repairs") or []),
                     "execs_per_sec": outcome.get("executions_per_sec"),
-                    "reason": outcome.get("reason") or outcome.get("detail"),
+                    # A failed build records its causes as `last_errors`.
+                    "reason": outcome.get("reason")
+                    or outcome.get("detail")
+                    or (
+                        json.dumps(outcome["last_errors"][:2])[:300]
+                        if outcome.get("last_errors")
+                        else None
+                    ),
                     "stub_only": stub.get("stub_only"),
                     "blind_stub_fraction": stub.get("blind_stub_fraction"),
                 }
@@ -150,7 +157,10 @@ def distil_run(work: Path) -> dict:
     if blockers is not None:
         out["blockers"] = blockers
     findings = []
-    findings_dir = work / "findings"
+    # A current bhf writes findings under results/; an older one beside auto/.
+    findings_dir = work / "results" / "findings"
+    if not findings_dir.is_dir():
+        findings_dir = work / "findings"
     if findings_dir.is_dir():
         for entry in sorted(findings_dir.iterdir())[:200]:
             meta = read_json(entry / "finding.json") or read_json(entry / "meta.json")
@@ -160,6 +170,9 @@ def distil_run(work: Path) -> dict:
                 # finding in the corpus.
                 act = meta.get("actionability") or {}
                 cwe = act.get("cwe") or meta.get("cwe")
+                exception = meta.get("exception")
+                if isinstance(exception, dict):
+                    exception = exception.get("message")
                 findings.append(
                     {
                         "id": entry.name,
@@ -171,6 +184,10 @@ def distil_run(work: Path) -> dict:
                         "confidence": act.get("confidence"),
                         "tier": meta.get("finding_tier") or meta.get("tier"),
                         "harness": meta.get("harness_id"),
+                        # What a harness-origin audit reads: the crash frames
+                        # and the message.
+                        "frames": (meta.get("cluster_normalized_frames") or [])[:4],
+                        "message": str(exception or meta.get("message") or "")[:200],
                     }
                 )
             else:
@@ -218,7 +235,7 @@ def run_project(row: dict, args: argparse.Namespace) -> dict:
 
         t0 = time.monotonic()
         try:
-            tree, sha = bc.clone_repo(lane, repo, row["url"])
+            tree, sha = bc.clone_repo(lane, repo, row["url"], sha=args.pins.get(slug))
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             result["status"] = "clone_failed"
             result["error"] = str(exc)[:300]
@@ -417,6 +434,16 @@ def pick_wave(args: argparse.Namespace) -> list[dict]:
     return wave
 
 
+def read_pins(results_dir: Path) -> dict[str, str]:
+    """The commit each row of `results_dir` measured, by row slug."""
+    pins = {}
+    for path in results_dir.glob("*.json"):
+        row = read_json(path)
+        if isinstance(row, dict) and row.get("sha"):
+            pins[path.stem] = row["sha"]
+    return pins
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--wave", default="W0")
@@ -451,7 +478,11 @@ def main() -> int:
                     help="update only the surfaces measured, keeping the rest of the row")
     ap.add_argument("--rerun", action="store_true",
                     help="re-measure projects that already have a result row")
+    ap.add_argument("--pin", type=Path,
+                    help="clone each project at the commit its row in this results "
+                         "dir records, so a re-sweep measures the same source")
     args = ap.parse_args()
+    args.pins = read_pins(args.pin) if args.pin else {}
 
     if not BHF.exists():
         print(f"missing binary: {BHF}", file=sys.stderr)

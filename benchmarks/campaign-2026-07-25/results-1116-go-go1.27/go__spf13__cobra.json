@@ -1,0 +1,293 @@
+{
+ "lane": "go",
+ "repo": "spf13/cobra",
+ "stars": 44314,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/spf13__cobra --json --out /home/ubuntu/bhf-sweep-work/go__spf13__cobra.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "languages": 2,
+   "sloc_total": 12808,
+   "sloc_by_lang": {
+    "go": 12624,
+    "config": 184
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/spf13__cobra --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "count": 165,
+   "by_language": {
+    "go": 165
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/spf13__cobra --out /home/ubuntu/bhf-sweep-work/go__spf13__cobra/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 0.07,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 14,
+   "by_severity": {
+    "high": 13,
+    "critical": 1
+   },
+   "top_rules": {
+    "BHF-405": 11,
+    "BHF-472": 2,
+    "BHF-404": 1
+   },
+   "gaps": 2
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/spf13__cobra --out /home/ubuntu/bhf-sweep-work/go__spf13__cobra/sbom",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "components": 7
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/spf13__cobra --work-dir /home/ubuntu/bhf-sweep-work/go__spf13__cobra --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 8.83,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 165,
+    "dropped_by_cap": 155,
+    "built": 2,
+    "built_and_fuzzed": 2,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 8,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 0,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "Execute",
+     "source": "command.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 6337.4247849058165,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "AppendActiveHelp",
+     "source": "active_help.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `[]Completion` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ArbitraryArgs",
+     "source": "args.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `*Command` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "CompDebug",
+     "source": "completions.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 10542.471879243574,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "GenZshCompletionFile",
+     "source": "zsh_completions.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `GenZshCompletionFile` needs a receiver value and its type `Command` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "GenFishCompletionFile",
+     "source": "fish_completions.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `GenFishCompletionFile` needs a receiver value and its type `Command` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "GenPowerShellCompletionFile",
+     "source": "powershell_completions.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `GenPowerShellCompletionFile` needs a receiver value and its type `Command` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "GenBashCompletionFileV2",
+     "source": "bash_completionsV2.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `GenBashCompletionFileV2` needs a receiver value and its type `Command` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "GenBashCompletionFile",
+     "source": "bash_completions.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Go method `GenBashCompletionFile` needs a receiver value and its type `Command` has no no-arg constructor; pass --force to call it on a zero-valued receiver (skipped cleanly)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "WriteStringAndCheck",
+     "source": "cobra.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `io.StringWriter` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"GenBashCompletionFile\" needs a receiver value and its type \"Command\" has no no-arg constructor; pass --force to call it on a zero-valued receiver (sk\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"GenBashCompletionFileV2\" needs a receiver value and its type \"Command\" has no no-arg constructor; pass --force to call it on a zero-valued receiver (\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"GenFishCompletionFile\" needs a receiver value and its type \"Command\" has no no-arg constructor; pass --force to call it on a zero-valued receiver (sk\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"GenPowerShellCompletionFile\" needs a receiver value and its type \"Command\" has no no-arg constructor; pass --force to call it on a zero-valued receiv\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Go method \"GenZshCompletionFile\" needs a receiver value and its type \"Command\" has no no-arg constructor; pass --force to call it on a zero-valued receiver (ski\u2026",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"*Command\" (skipped)",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"[]Completion\" (skipped)",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"io.StringWriter\" (skipped)",
+     "language": "go"
+    }
+   ],
+   "findings_detail": []
+  }
+ },
+ "sha": "adbc8813901bba65827259daa8e22ff94ec1f30e",
+ "clone_s": 0.0,
+ "lane_check": "go: 36 files / 14399 lines; top=go(14399)",
+ "status": "done"
+}

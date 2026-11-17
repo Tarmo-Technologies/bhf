@@ -73,8 +73,41 @@ pub fn run(args: CleanArgs) -> i32 {
             }
         }
     }
+    if args.all {
+        for name in legacy_shared_maps(&args.work_dir) {
+            let path = args.work_dir.join(&name);
+            match fs::remove_file(&path) {
+                Ok(()) => println!("removed {}", path.display()),
+                Err(error) => {
+                    bhfeprintln!("clean {}: {error}", path.display());
+                    return 1;
+                }
+            }
+        }
+    }
 
     0
+}
+
+/// The shared-map files an older `bhf fuzz` made at the top of the work dir
+/// (`.tmp` and six letters or digits, tempfile's names), which an interrupted
+/// run left there. Today's live in `fuzz_shm/`.
+fn legacy_shared_maps(work_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(work_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            name.strip_prefix(".tmp").is_some_and(|rest| {
+                rest.len() == 6 && rest.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn clean_targets(args: &CleanArgs) -> Vec<&'static str> {
@@ -96,6 +129,9 @@ fn clean_targets(args: &CleanArgs) -> Vec<&'static str> {
             "findings.csv",
             "fuzz_runs",
             "fuzz_scratch",
+            "fuzz_inputs",
+            "fuzz_shm",
+            "fuzz_campaigns",
             "afl_out",
             "afl_qemu_out",
             "capsules",
@@ -209,6 +245,8 @@ mod tests {
             "cxx_dialect.txt",
             "cxx_dialects",
             "discovery-cache.json",
+            "fuzz_inputs",
+            "fuzz_shm",
         ] {
             assert!(
                 targets.contains(&expected),
@@ -389,5 +427,28 @@ mod tests {
         let targets = clean_targets(&args);
         assert!(targets.contains(&"results/report"));
         assert!(!targets.contains(&"results"));
+    }
+
+    #[test]
+    fn all_removes_the_shared_maps_an_older_fuzz_run_left_at_the_top() {
+        let work = tempfile::tempdir().unwrap();
+        for name in [
+            ".tmpAb12Cd",
+            ".tmpzzzzzz",
+            ".tmp",
+            ".tmpTooLong1",
+            "notes.tmpabc",
+        ] {
+            fs::write(work.path().join(name), b"").unwrap();
+        }
+        fs::create_dir(work.path().join(".tmpDir123")).unwrap();
+        assert_eq!(
+            legacy_shared_maps(work.path()),
+            [".tmpAb12Cd", ".tmpzzzzzz"]
+        );
+        assert_eq!(run(all_args(work.path().to_path_buf())), 0);
+        assert!(!work.path().join(".tmpAb12Cd").exists());
+        assert!(work.path().join(".tmpTooLong1").exists());
+        assert!(work.path().join(".tmpDir123").is_dir());
     }
 }

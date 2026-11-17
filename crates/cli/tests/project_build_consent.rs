@@ -25,7 +25,8 @@ fn project_builds_are_denied_before_generating_or_executing_without_consent() {
         };
         let result = attempt(&candidate, root.path(), &index, AttemptOptions::default()).unwrap();
         match result.outcome {
-            Outcome::UnsupportedParams { reason } => assert!(reason.contains("--run-untrusted")),
+            // #241: refused for want of consent, not for its parameters.
+            Outcome::ConsentRequired { reason } => assert!(reason.contains("--run-untrusted")),
             other => panic!("expected denied project execution, got {other:?}"),
         }
         assert!(

@@ -1,0 +1,44 @@
+{
+ "repo": "AlistGo/alist",
+ "sha": "aead76e49a8629edcd3032cc43489787b4b5b319",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "fs.go",
+   "name": "ArchiveInternalExtract",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `model.ArchiveInnerArgs` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "hash.go",
+   "name": "HashReader",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*HashType` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "role_perm.go",
+   "name": "CanReadPathByRole",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*model.User` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 4,
+  "discovered_total": 4,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 4,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

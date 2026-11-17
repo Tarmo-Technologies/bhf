@@ -126,6 +126,54 @@ def _run_input(run_one, data: bytes):
         # else: expected rejection — swallow, input just rejected.
 
 
+def _arm_hang_report(run_one):
+    """In bhf's re-run of an input that hung, print the frames the target is
+    running once the run reaches BHF_HANG_REPORT_MS, then halt: bhf keys the
+    hang finding on them. SIGALRM's handler runs between bytecodes, so a
+    target looping in Python is interrupted where it loops."""
+    after = os.environ.get("BHF_HANG_REPORT_MS")
+    if not after:
+        return
+    try:
+        seconds = int(after) / 1000.0
+    except ValueError:
+        return
+    import signal
+
+    if not hasattr(signal, "setitimer"):
+        return
+    own = set()
+    harness = getattr(getattr(run_one, "__code__", None), "co_filename", __file__)
+    for path in (__file__, bhf_cov.__file__, harness):
+        own.add(os.path.realpath(path))
+    prefix = os.environ.get("BHF_TRACE_PREFIX") or None
+
+    def is_target(path):
+        real = os.path.realpath(path)
+        if real in own:
+            return False
+        return prefix is None or real.startswith(os.path.realpath(prefix))
+
+    def report(_signum, frame):
+        sys.stderr.write("== bhf hang: python\n")
+        shown = 0
+        while frame is not None and shown < 5:
+            code = frame.f_code
+            if is_target(code.co_filename):
+                sys.stderr.write(
+                    "== bhf frame: {0} @ {1}:{2}\n".format(
+                        code.co_name, code.co_filename, frame.f_lineno
+                    )
+                )
+                shown += 1
+            frame = frame.f_back
+        sys.stderr.flush()
+        os._exit(FINDING_HALT_CODE)
+
+    signal.signal(signal.SIGALRM, report)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+
+
 def _read_u32(fd) -> int:
     buf = b""
     while len(buf) < 4:
@@ -176,6 +224,7 @@ def main():
     traced_prefix = os.environ.get("BHF_TRACE_PREFIX") or None
     bhf_cov.install(traced_prefix)
     run_one = _load_run_one()
+    _arm_hang_report(run_one)
     if os.environ.get("BHF_FRAMED") is not None:
         _framed_loop(run_one)
         bhf_cov.dump_covered_lines()

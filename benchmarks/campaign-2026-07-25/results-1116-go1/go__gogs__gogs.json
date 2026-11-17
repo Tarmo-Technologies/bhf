@@ -1,0 +1,30 @@
+{
+ "repo": "gogs/gogs",
+ "sha": "eb1054e5432fc8397678372f08613429be233d7c",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "repo_editor.go",
+   "name": "NewUpload",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `multipart.File` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

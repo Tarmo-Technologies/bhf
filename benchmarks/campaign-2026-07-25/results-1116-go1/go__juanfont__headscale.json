@@ -1,0 +1,37 @@
+{
+ "repo": "juanfont/headscale",
+ "sha": "cfd845cb53efb2f953ff30c7d2ee70329b74f1ce",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "addr.go",
+   "name": "ParseIPSet",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: tailscale.com@v1.101.0-pre requires go >= 1.26.4 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  },
+  {
+   "source": "util.go",
+   "name": "FetchPathFromContainer",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*dockertest.Pool` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

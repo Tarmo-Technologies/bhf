@@ -357,6 +357,35 @@ fn write_generation_metadata(
     )
 }
 
+/// The generation metadata of a harness one of `bhf auto`'s own lane
+/// builders made (Rust, Fortran, COBOL): its language, `harness_format_version`
+/// and target, as a generated harness's. Without it the harness format of a
+/// finding could not be told when it is replayed after a format change, and
+/// `bhf explain` could only guess who built the harness.
+pub(crate) fn record_lane_generation(
+    harness_dir: &Path,
+    language: &str,
+    target_function: &str,
+    line: u32,
+    emitted_path: &str,
+) {
+    if let Err(error) = write_target_generation_metadata(
+        harness_dir,
+        language,
+        None,
+        line,
+        "auto",
+        emitted_path,
+        Some(target_function),
+        RecordedBuildInputs::default(),
+    ) {
+        bhfeprintln!(
+            "bhf: could not record the generation metadata of {}: {error:#}",
+            harness_dir.display()
+        );
+    }
+}
+
 /// [`write_generation_metadata`] for a C or C++ harness calling
 /// `target_function`; records the harness's `arg-layout.json` when the
 /// generator wrote one, and the extra build inputs it was generated with.

@@ -654,6 +654,29 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
     })
 }
 
+/// What an interpreted lane's driver prints, before its `== bhf frame:`
+/// lines, when bhf's re-run of an input that hung reaches
+/// `BHF_HANG_REPORT_MS`: the frames the target was running.
+pub const HANG_MARKER: &str = "== bhf hang:";
+
+/// The stack a hung process gave when bhf stopped it: an interpreted lane's
+/// driver frames after [`HANG_MARKER`], the Go runtime's goroutine dump on
+/// SIGABRT (without the runtime and harness frames), else the stack of the
+/// sanitizer report SIGABRT produced (`handle_abort=1`).
+pub fn hang_frames(stderr: &str) -> Vec<StackFrame> {
+    if stderr.contains(HANG_MARKER) {
+        return parse_bhf_frames(stderr);
+    }
+    if stderr.lines().any(|line| line.starts_with("SIGABRT: abort")) {
+        let mut frames = parse_go_stack_frames(stderr);
+        frames.truncate(5);
+        return frames;
+    }
+    parse_sanitizer_report(stderr)
+        .map(|report| report.stack)
+        .unwrap_or_default()
+}
+
 /// The frames an interpreted lane's driver prints under its finding line, one
 /// `== bhf frame: <function> @ <file>:<line>` per frame, innermost first and
 /// without the driver's and the harness's own frames (the Perl, Ruby, PHP and
@@ -1877,6 +1900,53 @@ fn quoted(text: &str) -> Option<String> {
     let (_, rest) = text.split_once('\'')?;
     let (name, _) = rest.split_once('\'')?;
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The crash stack of the first sanitizer report in `stderr` as the
+/// sanitizer prints it unsymbolized (`symbolize=0`): a frame line
+/// `#0 0x55d0c3a1b2c4  (/work/build/H/main+0x12b1b2)` gives `main+0x12b1b2`,
+/// the module's file name and the offset in it, which ASLR does not move.
+/// The frames from the report's `ERROR:` or `runtime error:` line up to the
+/// blank line after them; empty when the report's frames were symbolized.
+/// What tells two crashes apart before either is symbolized.
+pub fn unsymbolized_frames(stderr: &str) -> Vec<String> {
+    let mut frames = Vec::new();
+    let mut in_report = false;
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if !in_report {
+            in_report = line.contains("ERROR: ") || line.contains("runtime error:");
+            continue;
+        }
+        if trimmed.starts_with("SUMMARY:") || (trimmed.is_empty() && !frames.is_empty()) {
+            break;
+        }
+        if let Some(frame) = unsymbolized_frame(trimmed) {
+            frames.push(frame);
+        } else if trimmed.starts_with('#') {
+            // A symbolized frame: this report needs no symbolizing.
+            return Vec::new();
+        }
+    }
+    frames
+}
+
+/// `module+0xoffset` of one unsymbolized frame line.
+fn unsymbolized_frame(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('#')?;
+    let (index, rest) = rest.split_once(' ')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (address, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+    address.strip_prefix("0x")?;
+    // `(module+0xoffset)`, then possibly ` (BuildId: ...)`.
+    let inner = rest.trim().strip_prefix('(')?;
+    let inner = &inner[..inner.find(')')?];
+    let (module, offset) = inner.rsplit_once('+')?;
+    offset.strip_prefix("0x")?;
+    let name = module.rsplit(['/', '\\']).next().unwrap_or(module);
+    Some(format!("{name}+{offset}"))
 }
 
 /// The integer right after `needle` in `text`.
@@ -3448,5 +3518,54 @@ SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:
             "BHF-202",
             &ub("execution reached an unreachable program point")
         ));
+    }
+
+    #[test]
+    fn unsymbolized_frames_name_module_offsets_of_the_crash_stack() {
+        let stderr = "\
+==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000038\n\
+WRITE of size 9 at 0x502000000038 thread T0\n\
+    #0 0x55d0c3a1b2c4  (/work/build/H-1/main+0x12b1b2) (BuildId: 07df50a10f5d)\n\
+    #1 0x55d0c3a2f001  (/work/build/H-1/main+0x13f001)\n\
+    #2 0x7f15c2829d8f  (/lib/x86_64-linux-gnu/libc.so.6+0x29d8f)\n\
+\n\
+0x502000000038 is located 0 bytes after 8-byte region\n\
+allocated by thread T0 here:\n\
+    #0 0x55d0c3a00000  (/work/build/H-1/main+0x100000)\n\
+SUMMARY: AddressSanitizer: heap-buffer-overflow (/work/build/H-1/main+0x12b1b2)\n";
+        assert_eq!(
+            unsymbolized_frames(stderr),
+            ["main+0x12b1b2", "main+0x13f001", "libc.so.6+0x29d8f"]
+        );
+        // UBSan prints its stack after the runtime error line.
+        let ubsan = "t.c:4:7: runtime error: signed integer overflow\n\
+    #0 0x4f1a20  (C:\\\\work\\\\main.exe+0x4f1a20)\n";
+        assert_eq!(unsymbolized_frames(ubsan), ["main.exe+0x4f1a20"]);
+        // A symbolized report needs none.
+        let symbolized = "==7==ERROR: AddressSanitizer: heap-buffer-overflow\n\
+    #0 0x55d0c3a1b2c4 in parse /src/p.c:9:3\n";
+        assert!(unsymbolized_frames(symbolized).is_empty());
+        assert!(unsymbolized_frames("no report here\n").is_empty());
+    }
+
+    #[test]
+    fn a_hung_process_names_the_frames_its_driver_or_runtime_printed() {
+        let python = "bhf: noise\n== bhf hang: python\n\
+                      == bhf frame: spin @ /src/t.py:3\n\
+                      == bhf frame: parse @ /src/t.py:9\n";
+        let frames = hang_frames(python);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].function, "spin");
+        assert_eq!(frames[0].file.as_deref(), Some("/src/t.py"));
+        assert_eq!(frames[0].line, Some(3));
+
+        let go = "SIGABRT: abort\nPC=0x46d6e1 m=0 sigcode=0\n\n\
+                  goroutine 1 gp=0xc000002380 m=0 mp=0x5a0d40 [running]:\n\
+                  example.com/w.spin(...)\n\t/src/w/w.go:7 +0x1d\n\
+                  example.com/w.Parse({0xc0000140a8, 0x3, 0x8})\n\t/src/w/w.go:12 +0x25\n";
+        let frames = hang_frames(go);
+        assert_eq!(frames[0].function, "example.com/w.spin");
+        assert_eq!(frames[0].line, Some(7));
+        assert!(hang_frames("no stack\n").is_empty());
     }
 }

@@ -1,0 +1,300 @@
+{
+ "lane": "go",
+ "repo": "mudler/LocalAI",
+ "stars": 47853,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI --json --out /home/ubuntu/bhf-sweep-work/go__mudler__LocalAI.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.08,
+   "timed_out": false,
+   "panic": false,
+   "languages": 7,
+   "sloc_total": 624593,
+   "sloc_by_lang": {
+    "go": 474794,
+    "config": 71421,
+    "javascript": 48029,
+    "python": 19341,
+    "cpp": 9476,
+    "c": 815,
+    "rust": 717
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI --format json --top 100000",
+   "exit": 0,
+   "wall_s": 1.04,
+   "timed_out": false,
+   "panic": false,
+   "count": 4423,
+   "by_language": {
+    "javascript": 51,
+    "cpp": 305,
+    "go": 3546,
+    "python": 360,
+    "c": 110,
+    "rust": 51
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI --out /home/ubuntu/bhf-sweep-work/go__mudler__LocalAI/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 18.25,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 600,
+   "by_severity": {
+    "high": 397,
+    "medium": 135,
+    "critical": 8,
+    "low": 60
+   },
+   "top_rules": {
+    "BHF-405": 282,
+    "BHF-472": 80,
+    "BHF-500": 74,
+    "BHF-546": 53,
+    "BHF-436": 24,
+    "BHF-423": 19,
+    "BHF-425": 10,
+    "BHF-548": 9,
+    "BHF-406": 8,
+    "BHF-553": 7,
+    "BHF-473": 5,
+    "BHF-477": 4,
+    "BHF-429": 4,
+    "BHF-491": 2,
+    "BHF-471": 2
+   },
+   "gaps": 2554
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI --out /home/ubuntu/bhf-sweep-work/go__mudler__LocalAI/sbom",
+   "exit": 0,
+   "wall_s": 0.28,
+   "timed_out": false,
+   "panic": false,
+   "components": 1687
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI --work-dir /home/ubuntu/bhf-sweep-work/go__mudler__LocalAI --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 43.78,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 4401,
+    "dropped_by_cap": 4391,
+    "built": 3,
+    "built_and_fuzzed": 3,
+    "fuzzed_stub_only": 0,
+    "failed_build": 3,
+    "unsupported_params": 3,
+    "consent_required": 1,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 0,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 4,
+    "synthesized_types": 8,
+    "synthesized_macros": 25,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "formatBytes",
+     "source": "format.js",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1452.8420576656656,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "extractCodeArtifacts",
+     "source": "artifacts.js",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "target `/home/ubuntu/bhf-corpus-500/go/mudler__LocalAI/core/http/react-ui/src/utils/artifacts.js` is not loadable (skipped cleanly): Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'marked' imported from /home/ubuntu/bhf-corpus-500/go/mudler__LocalAI/core/http/react-ui/src/utils/artifacts.js",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "omni_load",
+     "source": "gomnivoicecpp.cpp",
+     "outcome": "failed_build",
+     "retries": 4,
+     "repairs": 20,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "qt3_load",
+     "source": "goqwen3ttscpp.cpp",
+     "outcome": "failed_build",
+     "retries": 4,
+     "repairs": 20,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "ContentTypeFromExtension",
+     "source": "identify.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: github.com/mudler/xlog@v0.0.6 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "CapabilityFromGPU",
+     "source": "capabilities.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: github.com/mudler/xlog@v0.0.6 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "parse_tool_calls",
+     "source": "mlx_utils.py",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5625.508848073492,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "normalize_num_frames",
+     "source": "longcat_utils.py",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 9222.352037545841,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "sherpa_shim_diarize_segment_at",
+     "source": "shim.c",
+     "outcome": "failed_build",
+     "retries": 4,
+     "repairs": 4,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "audio_decode",
+     "source": "service.rs",
+     "outcome": "consent_required",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "needs --run-untrusted: a Rust build runs project-controlled code (Cargo build scripts and proc macros, MSBuild targets); stage dependencies and use network isolation",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "expected expression",
+     "language": "c"
+    },
+    {
+     "category": "failed_build",
+     "count": 2,
+     "detail": "incomplete type",
+     "language": "cpp"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 2,
+     "detail": "go build failed: go: PATH requires go >= N.N.N (running go N.N.N; GOTOOLCHAIN=local)",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "Error [ERR_MODULE_NOT_FOUND]: Cannot find package \"marked\" imported from PATH",
+     "language": "javascript"
+    },
+    {
+     "category": "consent_required",
+     "count": 1,
+     "detail": "needs --run-untrusted: a Rust build runs project-controlled code (Cargo build scripts and proc macros, MSBuild targets); stage dependencies and use network isol\u2026",
+     "language": "rust"
+    }
+   ],
+   "findings_detail": []
+  }
+ },
+ "sha": "823fc25bb7ed2d0659ade3cfdd83342c2fb77c07",
+ "clone_s": 0.0,
+ "lane_check": "go: 1513 files / 512997 lines; top=go(512997)",
+ "status": "done"
+}

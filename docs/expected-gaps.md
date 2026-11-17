@@ -51,7 +51,7 @@ Of 3,594 attempted targets, 2,537 did not fuzz. Roughly:
 
 ## C
 
-### C-1. Opaque type needs lifecycle support — 86 — **GAP**
+### C-1. Opaque type needs lifecycle support — 86 — **[PARTLY FIXED]**
 
 The biggest single C gap. Sub-shapes:
 
@@ -80,6 +80,13 @@ plumbed down to the decoder first. That is a real feature, not a small fix.
 `git`'s `struct repository`, timescaledb's `CompressionSettings` and antirez/ds4's
 `ds4_session` are the worked examples.
 
+**Partly fixed since.** A handle whose full definition is in the target's
+**own** `.c` (antirez/ds4's `struct ds4_session`, at ds4.c:47656 beside the
+target) is now completed through the whole-TU `#include` of that source, when
+the headers do not define it and the tree has no constructor that returns
+one (`generate_harness.rs`, the private-handle path). A definition in a
+**different** non-included `.c` still needs the tree-wide plumbing above.
+
 ### C-2. `missing header` (26) / `missing type` (31) / `undeclared function` (20) — **mostly DEPENDENCY**
 
 After the repair loop exhausts itself. Spot-reading these in the previous
@@ -103,15 +110,13 @@ A cut-off, not a diagnosis. Correctly reported as such. Raise the budget.
 
 ## C++
 
-### C++-1. `blocked_by_non_self_contained_header` — 49 report-only + 10 in C — **GAP**
+### C++-1. `blocked_by_non_self_contained_header` — 49 report-only + 10 in C — **[FIXED]**
 
-A header that cannot be included by an independent translation unit. `--force`
-already bypasses this gate and it works — clay went 0 → 3 fuzzed that way. The
-gap is that the **unforced** default refuses without trying, so a plain
-`bhf auto` never sees them.
-
-Worth measuring: attempt-then-fail costs a build; the current refusal costs a
-target. Do not change it without an A/B.
+A header that cannot be included by an independent translation unit. The
+unforced default refused these without trying (`--force` already bypassed the
+gate: clay went 0 → 3 fuzzed that way). It now falls back to the header's
+owner translation unit, adopted only when it preflight-compiles; see [What the
+2026-07-28 sweep changed](#what-the-2026-07-28-sweep-changed).
 
 ### C++-2. Unconstructible class — 30 — **GAP**
 
@@ -201,28 +206,41 @@ A generic subprogram with a parameter that has no default.
 decodes to `context.Background()` (never nil, which would panic the callee). The
 rest are genuine project/library types.
 
-### Go-2. Method needs a receiver — 24 — **GAP, blocked on the parser**
+The [2026-11-16 re-sweep](validation/2026-11-16-go-resweep.md) re-ran by name
+the 59 targets the July sweep skipped here: 7 now build and fuzz (on Go 1.27.4;
+6 of them need a newer `go` than 1.22.2), and 52 remain.
+- 24 take a pointer to a struct.
+- 15 take a named type of another package.
+- 8 take a named type of their own package.
+- 5 take a map or a slice of a non-byte type.
 
-Says "pass `--force`". The forced path exists and works (a zero receiver, taken
-by address so `(&r).M()` is valid for both value and pointer receivers); the gap
-is that a REAL receiver from a sibling `func NewT() *T` is not attempted
-unforced, which is what a human would write.
+Several of the named types are a basic type underneath (`type DeviceID
+[32]byte`), which decoding through the underlying type would drive.
 
-**The blocker is `go_parser::GoFunc`, which does not capture a return type** —
-so a constructor cannot be told from any other no-arg function. Add
-`returns: Option<String>` there first; `receiver_synthesis` is then a small
-change, and it needs to emit `recv.M(…)` for a `*T` constructor versus
-`(&recv).M(…)` for a `T` one.
+### Go-2. Method needs a receiver — 24 — **[FIXED]** for a sibling constructor
+
+Said "pass `--force`", whose zero receiver (taken by address so `(&r).M()` is
+valid for both value and pointer receivers) still works. A REAL receiver from
+a sibling `func NewT() *T` is now attempted unforced, which is what a human
+would write: `go_parser::GoFunc` records its return type (`returns`), and the
+Go lane finds the package's constructor for the receiver type
+(`find_go_constructor`). For `func NewParser() *Parser` beside
+`func (p *Parser) Parse(data []byte) int`, `bhf auto` without `--force` builds
+and fuzzes `Parse`. A receiver with no such constructor still skips unforced.
 
 ### Go-3. `not inside a Go module (no go.mod)` — 17 — **GAP**
 
 A GOPATH-era or vendored tree. Synthesizing a `go.mod` for such a tree is the
 same trick the harness module already uses.
 
-### Go-4. `requires go >= X` — 13+ — **ENVIRONMENT**
+### Go-4. `requires go >= X` — 135 of 261 on Go 1.22.2 — **ENVIRONMENT**
 
 Under `GOTOOLCHAIN=local`. There is already an overlay that lowers the directive
-and retries; these are the ones where that is not enough.
+and retries; these are the ones where that is not enough: a dependency needs
+`go >= 1.23` to `go >= 1.26.4`. The
+[2026-11-16 re-sweep](validation/2026-11-16-go-resweep.md) measured 135 of the
+261 attempted targets here on the host's Go 1.22.2, and none on Go 1.27.4, where
+146 built and fuzzed against 26. A current `go` on `PATH` is the fix.
 
 ---
 
@@ -551,19 +569,28 @@ Per-file rule packs (23.6 s) are already parallel at cores-1.
 
 By fixable targets, highest first:
 
-1. **C opaque-type lifecycle** (86) — the 13 "incomplete in headers" cases need
-   the tree-wide struct definitions plumbed to the decoder first; see C-1.
-2. **Java generic/collection parameters** (~40 of the 75) — needs declared-type
-   locals instead of `var`.
-3. **C++ non-self-contained header, unforced** (49) — measure attempt-vs-refuse.
-4. **Go undrivable parameters** (58) — `context.Context` alone is worth doing.
-5. **Rust decoders** (42) + trait-impl resolution (28).
-6. **C++ unconstructible class** (30) + no-decoder (33).
-7. **Ada link/symbol residue** (52 across Ada-1/2) and **GPR structure** (18).
-8. **Python receiver-with-arguments** (25) and C# unforced receiver (26).
-9. **TS asset loaders** (12) and **JS browser globals** (28) — cheap, but the
-   second risks manufacturing findings.
-10. **C++ compile-flag quoting** (6) — smallest, purely mechanical.
+1. **C opaque-type lifecycle** (C-1; 86, less the own-TU handles now
+   completed) — a definition in another non-included `.c` needs the
+   tree-wide struct definitions plumbed to the decoder.
+2. **C++ unconstructible class** (C++-2; 30) + no-decoder (C++-3; 33).
+3. **Ada link/symbol residue** (Ada-1, Ada-2; 52) and **GPR structure**
+   (Ada-3; 18).
+4. **Go undrivable parameters** (Go-1; 58 before `context.Context` was
+   fixed) — the rest are project and library types (`*zap.Logger`,
+   `*pflag.FlagSet`).
+5. **Rust decoders** (Rust-1; 42) + trait-impl resolution (Rust-2, Rust-4;
+   28).
+6. **Java generic/collection parameters** (Java-1; ~40 of the 75) — needs
+   declared-type locals instead of `var`.
+7. **Python receiver-with-arguments** (Py-2; 25) and C# unforced receiver
+   (C#-1; 26).
+8. **JS browser globals** (JS-2; 28) — cheap, but risks manufacturing
+   findings.
+
+Closed since the list was first ranked, and dropped from it: the C++
+non-self-contained header (C++-1), the Go receiver with a sibling
+constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1) and
+the C++ compile-flag quoting (C++-6).
 
 ## Method
 

@@ -1,0 +1,357 @@
+{
+ "lane": "go",
+ "repo": "hashicorp/terraform",
+ "stars": 49293,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/hashicorp__terraform --json --out /home/ubuntu/bhf-sweep-work/go__hashicorp__terraform.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.05,
+   "timed_out": false,
+   "panic": false,
+   "languages": 2,
+   "sloc_total": 555787,
+   "sloc_by_lang": {
+    "go": 539132,
+    "config": 16655
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/hashicorp__terraform --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.38,
+   "timed_out": false,
+   "panic": false,
+   "count": 9579,
+   "by_language": {
+    "go": 9579
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/hashicorp__terraform --out /home/ubuntu/bhf-sweep-work/go__hashicorp__terraform/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 2.67,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 283,
+   "by_severity": {
+    "high": 228,
+    "medium": 47,
+    "critical": 8
+   },
+   "top_rules": {
+    "BHF-405": 218,
+    "BHF-422": 32,
+    "BHF-544": 9,
+    "BHF-423": 8,
+    "BHF-429": 8,
+    "BHF-436": 4,
+    "BHF-491": 2,
+    "BHF-477": 2
+   },
+   "gaps": 566
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/hashicorp__terraform --out /home/ubuntu/bhf-sweep-work/go__hashicorp__terraform/sbom",
+   "exit": 0,
+   "wall_s": 0.12,
+   "timed_out": false,
+   "panic": false,
+   "components": 362
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/hashicorp__terraform --work-dir /home/ubuntu/bhf-sweep-work/go__hashicorp__terraform --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 58.12,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 9579,
+    "dropped_by_cap": 9569,
+    "built": 10,
+    "built_and_fuzzed": 10,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 0,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 6,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "Parse",
+     "source": "key_parse.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 6415.324192145702,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "LoadSavedPlanBookmark",
+     "source": "saved_plan.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5545.4374013758925,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseHash",
+     "source": "hash.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 145.78641687344182,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "LoadLocksFromBytes",
+     "source": "locks_file.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 6268.345920500001,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseHash",
+     "source": "hash.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 105.8796128332028,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseVersion",
+     "source": "types.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 101.97276480805678,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseVersion",
+     "source": "version.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 54.96060357982674,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "ParseAbsComponentInstanceStr",
+     "source": "component.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5286.888172704168,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "MustParseProviderPart",
+     "source": "provider.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 116.06155238298993,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "ParseAbsActionInstanceStr",
+     "source": "action.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 5996.912306912419,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-cb9d1866",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0039-F0BADE99",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/getproviders/providerreqs.MustParseHash",
+      "github.com/hashicorp/terraform/internal/getproviders.MustParseHash"
+     ],
+     "message": "Go panic: hash string must start with a scheme keyword followed by a colon"
+    },
+    {
+     "id": "F-0001-e70f5d22",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0037-9234A422",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/getproviders/providerreqs.MustParseHash"
+     ],
+     "message": "Go panic: hash string must start with a scheme keyword followed by a colon"
+    },
+    {
+     "id": "F-0002-358129bf",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G00BE-7F1E404F",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/addrs.MustParseProviderPart"
+     ],
+     "message": "Go panic: must have at least one character"
+    },
+    {
+     "id": "F-0003-09b2f44e",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0062-868F2559",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/getproviders/providerreqs.MustParseVersion"
+     ],
+     "message": "Go panic: empty specification"
+    },
+    {
+     "id": "F-0004-c6f8a8d9",
+     "rule": "BHF-210",
+     "cwe": [
+      "CWE-119"
+     ],
+     "cwe_name": "Reachable crash (fatal signal, no memory-error report)",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0040-97448FA5",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/getproviders/providerreqs.MustParseVersion",
+      "github.com/hashicorp/terraform/internal/getproviders.MustParseVersion"
+     ],
+     "message": "Go panic: empty specification"
+    },
+    {
+     "id": "F-0005-74234fb1",
+     "rule": "BHF-201",
+     "cwe": [
+      "CWE-125",
+      "CWE-787"
+     ],
+     "cwe_name": "Out-of-bounds Read",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G007A-3D2B0AC1",
+     "frames": [
+      "github.com/hashicorp/terraform/internal/stacks/stackaddrs.ParseAbsComponentInstanceOnly",
+      "github.com/hashicorp/terraform/internal/stacks/stackaddrs.ParseAbsComponentInstance",
+      "github.com/hashicorp/terraform/internal/stacks/stackaddrs.ParseAbsComponentInstanceStr"
+     ],
+     "message": "Go panic: runtime error: index out of range [0] with length 0"
+    }
+   ]
+  }
+ },
+ "sha": "8528548ce63bd47468e3823d4c4b4fc57338abbd",
+ "clone_s": 1.9,
+ "lane_check": "go: 1991 files / 604995 lines; top=go(604995)",
+ "status": "done"
+}

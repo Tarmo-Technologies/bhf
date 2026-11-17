@@ -217,13 +217,13 @@ survived optimization or was reached; require observed target/coverage evidence.
 Make the evidence reproducible before asking for prose:
 
 ```sh
-bhf replay --finding bhf_work/findings/F-0001
-bhf minimize --finding bhf_work/findings/F-0001
+bhf replay --finding bhf_work/results/findings/F-0001
+bhf minimize --finding bhf_work/results/findings/F-0001
 bhf explain --work-dir bhf_work --finding-id F-0001
 bhf llm assist --provider local --model '<served-model>' \
   --task analyze-findings \
   --question 'Separate reproduced facts from exploitability hypotheses' \
-  --input bhf_work/findings/F-0001/finding.json \
+  --input bhf_work/results/findings/F-0001/finding.json \
   --input bhf_work/auto/run.json
 ```
 
@@ -273,7 +273,7 @@ per-target `harnesses/<id>/result.json`; BHF does not promise a synthetic
 bhf llm assist --provider claude --task analyze-findings \
   --question 'Cluster these findings and give replay checks' \
   --input bhf_work/auto/run.json \
-  --input bhf_work/findings/example/finding.json
+  --input bhf_work/results/findings/example/finding.json
 
 bhf llm assist --provider local --model '<served-model>' \
   --task generate-harness --target-symbol parse_packet --language cpp \

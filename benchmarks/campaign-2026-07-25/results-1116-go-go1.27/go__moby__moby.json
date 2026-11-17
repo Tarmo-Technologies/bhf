@@ -1,0 +1,296 @@
+{
+ "lane": "go",
+ "repo": "moby/moby",
+ "stars": 71904,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/moby__moby --json --out /home/ubuntu/bhf-sweep-work/go__moby__moby.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.16,
+   "timed_out": false,
+   "panic": false,
+   "languages": 5,
+   "sloc_total": 640160,
+   "sloc_by_lang": {
+    "config": 353692,
+    "go": 285500,
+    "lua": 535,
+    "c": 271,
+    "python": 162
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/moby__moby --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.26,
+   "timed_out": false,
+   "panic": false,
+   "count": 4456,
+   "by_language": {
+    "go": 4433,
+    "python": 4,
+    "c": 19
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/moby__moby --out /home/ubuntu/bhf-sweep-work/go__moby__moby/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 2.32,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 309,
+   "by_severity": {
+    "medium": 9,
+    "high": 280,
+    "critical": 20
+   },
+   "top_rules": {
+    "BHF-405": 247,
+    "BHF-404": 18,
+    "BHF-476": 14,
+    "BHF-426": 10,
+    "BHF-427": 6,
+    "BHF-477": 5,
+    "BHF-423": 2,
+    "BHF-436": 2,
+    "BHF-562": 1,
+    "BHF-422": 1,
+    "BHF-424": 1,
+    "BHF-304": 1,
+    "BHF-429": 1
+   },
+   "gaps": 905
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/moby__moby --out /home/ubuntu/bhf-sweep-work/go__moby__moby/sbom",
+   "exit": 0,
+   "wall_s": 1.16,
+   "timed_out": false,
+   "panic": false,
+   "components": 421
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/moby__moby --work-dir /home/ubuntu/bhf-sweep-work/go__moby__moby --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 26.4,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 4437,
+    "dropped_by_cap": 4427,
+    "built": 4,
+    "built_and_fuzzed": 4,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 2,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "report_only": 4,
+    "findings": 4,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "DecodeCreateRequest",
+     "source": "config.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `*sysinfo.SysInfo` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "DecodeOptions",
+     "source": "security_opts.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 11108.122984068747,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "AppendDevicePermissionsFromCgroupRules",
+     "source": "oci.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `[]specs.LinuxDeviceCgroup` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "DevicesFromPath",
+     "source": "devices_linux.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 531.5773994759221,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Decode",
+     "source": "authconfig.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 11744.398635793907,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "DecodePlatform",
+     "source": "form.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 11005.43258269817,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "get_namespaces",
+     "source": "ssd.py",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "which",
+     "source": "ssd.py",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "check_iptables",
+     "source": "ssd.py",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "check_network",
+     "source": "ssd.py",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"*sysinfo.SysInfo\" (skipped)",
+     "language": "go"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"[]specs.LinuxDeviceCgroup\" (skipped)",
+     "language": "go"
+    },
+    {
+     "category": "report_only",
+     "count": 4,
+     "detail": "[python2] Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "language": "python"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-RO-BHF-422-ECB0198F",
+     "rule": "BHF-422",
+     "cwe": [
+      "CWE-327"
+     ],
+     "cwe_name": "Weak or broken cryptographic primitive",
+     "kind": null,
+     "severity": "medium",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-P0011-0B7255CE",
+     "frames": [],
+     "message": "Weak cryptographic primitive (md5/sha1/DES/RC4/ECB)"
+    }
+   ]
+  }
+ },
+ "sha": "cb7c8dd909cf7760eefe5b06229beffb41fa5a55",
+ "clone_s": 0.0,
+ "lane_check": "go: 2178 files / 322080 lines; top=go(322080)",
+ "status": "done"
+}

@@ -1,0 +1,30 @@
+{
+ "repo": "moby/moby",
+ "sha": "cb7c8dd909cf7760eefe5b06229beffb41fa5a55",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "config.go",
+   "name": "DecodeCreateRequest",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*sysinfo.SysInfo` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

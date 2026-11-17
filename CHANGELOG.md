@@ -45,6 +45,106 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `docs/expected-gaps.md` marks the fixed classes (Go-2, C++-1, C-1 in part)
+  and its ranked work list names none of them; the Go lane's re-sweep is
+  recorded in `docs/validation/2026-11-16-go-resweep.md`. It re-ran the 40 Go
+  projects of the July sweep at the commits that sweep measured and re-ran by
+  name the 59 targets it skipped for an undrivable parameter type: 7 now build
+  and fuzz, and 52 still skip. On a current Go 1.27.4, 146 targets build and
+  fuzz against 26 on the sweep host's Go 1.22.2. The sweep script read findings
+  from a layout bhf no longer writes, so it recorded none; it now reads
+  `results/findings` and each failed build's cause, and `--pin RESULTS_DIR`
+  clones each project at the commit a results dir measured.
+- Rust, Fortran and COBOL harnesses record their `generation-metadata.json`
+  (language, `harness_format_version`, target), as C, C++ and Ada ones do.
+  Without it their findings carried no harness format, so a later format
+  change could not be told on replay, and `bhf explain` said such a harness
+  was built "by an earlier bhf or some other way" even when this bhf built
+  it.
+- The Rizin, Ghidra and angr binary adapters say they run no analysis: with
+  their tool present `bhf binary adapter` writes `status: not_implemented`
+  and exits 3, and without it `status: skipped` and exits 1. They reported
+  the tool's `--version` as a successful `smoke_tested` analysis with empty
+  arrays (exit 0, also for a missing tool), and the angr adapter "found"
+  angr whenever `python3` ran; it now has the Python import `angr`. The help
+  and cli.md no longer claim an analysis.
+- Line coverage counts the project's lines only. `covered-lines.txt` and
+  `coverage-summary.json` counted bhf's generated `main.c`, repairs, stubs
+  and C runtime headers too, so an 11-line target reported 44 of 457 lines.
+  The summary's edge figure now says it is the most any one target reached,
+  not a total.
+- A Rust or C# target run without `--run-untrusted` is reported as needing
+  that consent: outcome `consent_required` (`summary.consent_required`,
+  "needs --run-untrusted" in run.md), and the next steps ask for the flag. It
+  was `unsupported_params`, counted among the targets whose parameters could
+  not be driven, and the next steps told the operator to `--force` it, which
+  cannot help: the build runs the project's own code (Cargo build scripts and
+  proc macros, MSBuild targets). A Java target whose Maven or Gradle build
+  needs the consent and whose `javac` fallback fails gets the same outcome,
+  and `--resume` tries such targets again.
+- auto.md's defaults and limitations match the code: `--jobs` defaults to
+  half the host's cores (at most 8, `BHF_DEFAULT_JOBS` overrides), not 1,
+  which changes the memory sizing; `--sanitizers` defaults to
+  `address,undefined`, with `none` the opt-out; `--static-dynamic` is a
+  deprecated no-op (the `kind` and `confirmation` columns say what it
+  promised); a whole sweep does cross-build with `--target-triple` and
+  `--runner`, with the limits that has; and `finding.json` records the pass,
+  `shim_armed` and the injected environment, not a fuzz seed or fake list.
+  Docs tests compare the table's defaults with `bhf auto --help` and the
+  config-key list with the keys the code reads.
+- auto.md documents every `bhf auto` flag: `--max-attempts`, `--sbom`,
+  `--sloc`, `--extra-source`, `--project`, `--preprocess`,
+  `--no-minimize`, `--no-fuzzing-build-mode`, the WinAFL flags and the C and
+  C++ decoder bounds had no row. The `--max-targets` row and the "Scaling to
+  large trees" text describe the flag as it works, a cap on the targets that
+  fuzz with lower-ranked ones backfilled, not a top-N prefilter. A docs test
+  compares the table with `bhf auto --help`.
+- The docs name the `results/` layout a run writes: `results/INDEX.md`,
+  `results/findings.json` and `.csv`, and `results/findings/<id>/`. auto,
+  install, cli, llm, the release checklist and the recommended sweep still
+  pointed at `<work>/FINDINGS.md`, `<work>/findings.csv` and
+  `<work>/findings/`, which no run has written since the results migration,
+  and auto.md's output tree listed `build/` and `findings/` at the top. A test
+  rejects the legacy names outside text about the legacy layout, and checks
+  auto.md's tree against a real run.
+- Hangs in the interpreted lanes are findings located in the target. A
+  re-run of an input that hung had no stack there, because an interpreter
+  answers no signal while its target loops: a Python `while True` gave a
+  finding with no location, and every hang of a target was one finding. The
+  re-run now sets `BHF_HANG_REPORT_MS`, and the Python, Node, Ruby, PHP, Lua,
+  Perl and JVM drivers print the frames their target is running when it
+  passes, which key the finding; a Go target's goroutine dump on SIGABRT does
+  the same. The Lua re-run drops the coverage hook, so a recursion that
+  outlived the timeout under it overflows the stack and is reported as that
+  crash in the target file.
+- On Windows a background re-run starts one priority class below bhf's own
+  and is returned to bhf's own class, not to a fixed BelowNormal and Normal:
+  under a BelowNormal parent (the GitHub runner's worker, or any BelowNormal
+  launcher) the re-run ran at the fuzz loop's class and was then raised above
+  bhf. Windows CI raises its test step to Normal and runs the priority test,
+  which it skipped.
+- A target whose inputs mostly crash keeps its throughput: the builtin loop
+  runs its executions with `symbolize=0:abort_on_error=0`, counts a crash
+  whose signature (rule, kind, top five `module+offset` frames) was reported
+  against that finding without re-running it, and symbolizes only a new one,
+  in a fresh-process re-run whose report becomes the finding, so every finding
+  keeps its symbolized stack. Each crashing execution was symbolized and
+  aborted through the kernel's core pattern, most of a second each, which held
+  such targets to a few executions a second. `BHF_IN_LOOP_SYMBOLIZE=1`
+  restores in-loop symbolization; a nightly benchmark checks the loop runs at
+  least three times faster without it.
+- An interrupted `bhf fuzz` leaves no shared-memory files behind. Its maps
+  were `.tmp*` files at the top of the work dir, which a killed run left there
+  and `bhf clean --all` kept; they now live in `<work>/fuzz_shm/` as
+  `<pid>-<random>.shm`, are unlinked on SIGINT, SIGTERM and SIGHUP before the
+  signal ends the run, and a later run removes those of a process that is
+  gone. `clean --all` removes `fuzz_shm/`, `fuzz_inputs/`, `fuzz_campaigns/`
+  and an older run's top-level `.tmp*` maps.
+- `bhf fuzz` prints a progress line on stderr while it runs (executions,
+  exec/s, corpus entries, findings, edges, elapsed), 2s in and then at
+  doubling intervals up to every 30s; `--quiet` (`-q`) prints none. It printed
+  nothing until it finished, so a long run looked hung. Workers of
+  `--workers` run quiet.
 - The nightly runs the WinAFL end-to-end tests, which no workflow ran: a
   Windows job builds the pinned WinAFL and DynamoRIO with
   `scripts/ci/build-winafl.ps1` (the DynamoRIO zip's SHA-256 checked), caches

@@ -251,8 +251,41 @@ def clone_path(lane: str, repo: str) -> Path:
     return CORPUS_ROOT / lane / repo.replace("/", "__")
 
 
-def clone_repo(lane: str, repo: str, url: str, timeout: int = 1200) -> tuple[Path, str]:
-    """Shallow-clone one repo. Returns (path, sha) or raises RuntimeError."""
+def head_sha(dest: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+
+def clone_repo_at(lane: str, repo: str, url: str, sha: str, timeout: int = 1200) -> Path:
+    """Shallow-fetch one repo at commit `sha`, replacing a clone of another commit."""
+    dest = clone_path(lane, repo)
+    if (dest / ".git").exists() and head_sha(dest) == sha:
+        return dest
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    for cmd in (
+        ["git", "init", "--quiet"],
+        ["git", "remote", "add", "origin", url],
+        ["git", "fetch", "--quiet", "--depth", "1", "origin", sha],
+        ["git", "checkout", "--quiet", "FETCH_HEAD"],
+    ):
+        proc = subprocess.run(
+            cmd, cwd=dest, capture_output=True, text=True, timeout=timeout
+        )
+        if proc.returncode != 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RuntimeError(f"clone at {sha} failed: {proc.stderr.strip()[:200]}")
+    return dest
+
+
+def clone_repo(
+    lane: str, repo: str, url: str, timeout: int = 1200, sha: str | None = None
+) -> tuple[Path, str]:
+    """Shallow-clone one repo, at `sha` when given. Returns (path, sha) or raises
+    RuntimeError."""
+    if sha:
+        return clone_repo_at(lane, repo, url, sha, timeout), sha
     dest = clone_path(lane, repo)
     if not (dest / ".git").exists():
         if dest.exists():
@@ -267,10 +300,7 @@ def clone_repo(lane: str, repo: str, url: str, timeout: int = 1200) -> tuple[Pat
         if proc.returncode != 0:
             shutil.rmtree(dest, ignore_errors=True)
             raise RuntimeError(f"clone failed: {proc.stderr.strip()[:200]}")
-    sha = subprocess.run(
-        ["git", "-C", str(dest), "rev-parse", "HEAD"], capture_output=True, text=True
-    ).stdout.strip()
-    return dest, sha
+    return dest, head_sha(dest)
 
 
 def lane_profile(root: Path, cap_files: int = 60_000) -> tuple[Counter, Counter]:

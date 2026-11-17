@@ -74,6 +74,7 @@ pub fn outcome_bucket(outcome: &crate::auto::attempt::Outcome) -> &'static str {
         UnsupportedParams { .. }
         | UnsafeBuildPath { .. }
         | MissingToolchain { .. }
+        | ConsentRequired { .. }
         | SanitizerRuntimeUnavailable { .. } => "skipped",
         ReportOnly { .. } => "report-only",
     }

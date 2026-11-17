@@ -127,6 +127,7 @@ public final class Driver {
         // here). The input arrives EITHER as a file in argv[1] (replay tooling) OR
         // on stdin (the engine's `run_harness` per-spawn path writes stdin, no
         // argv) — support both: prefer a readable argv[1] file, else read stdin.
+        armHangReport(Thread.currentThread(), harnessClass);
         byte[] data;
         if (args.length > 1 && Files.isReadable(Path.of(args[1]))) {
             data = Files.readAllBytes(Path.of(args[1]));
@@ -134,6 +135,63 @@ public final class Driver {
             data = System.in.readAllBytes();
         }
         runInput(runOne, data);
+    }
+
+    /**
+     * In bhf's re-run of an input that hung, print the frames the target is
+     * running once the run reaches {@code BHF_HANG_REPORT_MS}, then halt: bhf
+     * keys the hang finding on them. A daemon thread keeps the time and reads
+     * the main thread's stack where it loops.
+     */
+    private static void armHangReport(Thread main, String harnessClass) {
+        String raw = System.getenv("BHF_HANG_REPORT_MS");
+        if (raw == null) {
+            return;
+        }
+        long after;
+        try {
+            after = Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            return;
+        }
+        if (after <= 0) {
+            return;
+        }
+        long uptime = 0;
+        try {
+            uptime = java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime();
+        } catch (Throwable ignored) {
+            // no java.management: count from now
+        }
+        long sleep = Math.max(0, after - uptime);
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(sleep);
+            } catch (InterruptedException e) {
+                return;
+            }
+            StringBuilder out = new StringBuilder("== bhf hang: java\n");
+            int shown = 0;
+            for (StackTraceElement frame : main.getStackTrace()) {
+                String cls = frame.getClassName();
+                if (cls.startsWith("java.") || cls.startsWith("jdk.") || cls.startsWith("sun.")
+                        || cls.startsWith("com.bhf.") || cls.equals(harnessClass)) {
+                    continue;
+                }
+                String file = frame.getFileName() == null ? "" : frame.getFileName();
+                out.append("== bhf frame: ").append(cls).append('.').append(frame.getMethodName())
+                        .append(" @ ").append(file).append(':').append(frame.getLineNumber())
+                        .append('\n');
+                if (++shown >= 5) {
+                    break;
+                }
+            }
+            System.err.print(out);
+            System.err.flush();
+            Runtime.getRuntime().halt(FINDING_HALT_CODE);
+        }, "bhf-hang-report");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     private static void runFramedLoop(Method runOne) throws IOException {

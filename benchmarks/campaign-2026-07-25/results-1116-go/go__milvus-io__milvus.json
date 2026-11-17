@@ -1,0 +1,337 @@
+{
+ "lane": "go",
+ "repo": "milvus-io/milvus",
+ "stars": 45382,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/milvus-io__milvus --json --out /home/ubuntu/bhf-sweep-work/go__milvus-io__milvus.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.14,
+   "timed_out": false,
+   "panic": false,
+   "languages": 7,
+   "sloc_total": 1661024,
+   "sloc_by_lang": {
+    "go": 1122756,
+    "cpp": 288378,
+    "python": 220338,
+    "rust": 13568,
+    "config": 12169,
+    "c": 2397,
+    "javascript": 1418
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/milvus-io__milvus --format json --top 100000",
+   "exit": 0,
+   "wall_s": 14.91,
+   "timed_out": false,
+   "panic": false,
+   "count": 44711,
+   "by_language": {
+    "cpp": 8186,
+    "go": 35862,
+    "python": 153,
+    "c": 29,
+    "rust": 481
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/milvus-io__milvus --out /home/ubuntu/bhf-sweep-work/go__milvus-io__milvus/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 17.5,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 665,
+   "by_severity": {
+    "medium": 251,
+    "high": 200,
+    "critical": 123,
+    "low": 91
+   },
+   "top_rules": {
+    "BHF-405": 96,
+    "BHF-546": 87,
+    "BHF-436": 72,
+    "BHF-424": 71,
+    "BHF-420": 62,
+    "BHF-429": 48,
+    "BHF-472": 43,
+    "BHF-544": 27,
+    "BHF-428": 25,
+    "BHF-500": 22,
+    "BHF-456": 19,
+    "BHF-406": 16,
+    "BHF-404": 12,
+    "BHF-423": 10,
+    "BHF-454": 9
+   },
+   "gaps": 3821
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/milvus-io__milvus --out /home/ubuntu/bhf-sweep-work/go__milvus-io__milvus/sbom",
+   "exit": 0,
+   "wall_s": 0.42,
+   "timed_out": false,
+   "panic": false,
+   "components": 1145
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/milvus-io__milvus --work-dir /home/ubuntu/bhf-sweep-work/go__milvus-io__milvus --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 105.57,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 40122,
+    "dropped_by_cap": 40112,
+    "built": 3,
+    "built_and_fuzzed": 3,
+    "fuzzed_stub_only": 0,
+    "failed_build": 1,
+    "unsupported_params": 4,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "report_only": 2,
+    "findings": 2,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan+tsan"
+      },
+      "fuzzing_build_mode": "on"
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 4,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "milvus::index::JsonStatsMeta::Deserialize",
+     "source": "utils.cpp",
+     "outcome": "failed_build",
+     "retries": 4,
+     "repairs": 4,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "milvus::storage::IndexEntryReader::ReadEntriesStreamToFiles",
+     "source": "IndexEntryReader.cpp",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "cannot construct C++ class 'milvus::storage::IndexEntryReader' to harness 'ReadEntriesStreamToFiles': it has no public default constructor, no supported public constructor, and no factory method or free function returning 'milvus::storage::IndexEntryReader' was found. Add a small wrapper or factory harness that constructs the object and calls 'ReadEntriesStreamToFiles', or expose a public fuzzable constructor.; sequence generation also failed first: cannot construct C++ class 'milvus::storage::IndexEntryReader' to harness 'ReadEntriesStreamToFiles': it has no public default constructor, no supported public constructor, and no factory method or free function returning 'milvus::storage::IndexEntryReader' was found. Add a small wrapper or factory harness that constructs the object and calls 'ReadEntriesStreamToFiles', or expose a public fuzzable constructor.",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "BuildJsonKeyIndex",
+     "source": "index_c.cpp",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "C++ target 'BuildJsonKeyIndex' return type 'CStatus' is undefined in the scanned tree \u2014 likely an external SDK/framework (e.g. MFC/Win32) unavailable offline; statically analyzed, not fuzzed",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "jsmn_parse",
+     "source": "jsmn.h",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 911.9296849452686,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Base64Decode",
+     "source": "crypto.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: golang.org/x/crypto@v0.52.0 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "BFTypeFromString",
+     "source": "bloom_filter.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: golang.org/x/arch@v0.20.0 requires go >= 1.23.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "CreateSparseFloatRowFromJSON",
+     "source": "schema.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "go build failed: go: golang.org/x/text@v0.37.0 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "FindCheckMacro",
+     "source": "cpplint.py",
+     "outcome": "report_only",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "MurmurHash3_x64_128",
+     "source": "Murmur3.c",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 58.803370174232775,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "chunk",
+     "source": "lintutils.py",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 7.609315393513433,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    }
+   ],
+   "blockers": [
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "missing header",
+     "language": "cpp"
+    },
+    {
+     "category": "report_only",
+     "count": 1,
+     "detail": "[cpp20] C++ target \"BuildJsonKeyIndex\" return type \"CStatus\" is undefined in the scanned tree \u2014 likely an external SDK/framework (e.g. MFC/Win32) unavailable offline; s\u2026",
+     "language": "cpp"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "cannot construct C++ class \"milvus::storage::IndexEntryReader\" to harness \"ReadEntriesStreamToFiles\": it has no public default constructor, no supported public \u2026",
+     "language": "cpp"
+    },
+    {
+     "category": "unsupported_params",
+     "count": 3,
+     "detail": "go build failed: go: PATH requires go >= N.N.N (running go N.N.N; GOTOOLCHAIN=local)",
+     "language": "go"
+    },
+    {
+     "category": "report_only",
+     "count": 1,
+     "detail": "[python2] Python 2: legacy dialect \u2014 discovered and statically analyzed, not fuzzed (M22)",
+     "language": "python"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-2e864a80",
+     "rule": "BHF-201",
+     "cwe": [
+      "CWE-122",
+      "CWE-125"
+     ],
+     "cwe_name": "Heap-based Buffer Overflow",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C0132-6145E47D",
+     "frames": [
+      "jsmn_parse"
+     ],
+     "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000024 at pc 0x5fb4bfa74b87 bp 0x7ffe09179b50 sp 0x7ffe09179b48 (READ of size 4)"
+    },
+    {
+     "id": "F-0001-29b5543d",
+     "rule": "BHF-201",
+     "cwe": [
+      "CWE-122",
+      "CWE-787"
+     ],
+     "cwe_name": "Heap-based Buffer Overflow",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C0125-13ECD1CD",
+     "frames": [
+      "MurmurHash3_x64_128"
+     ],
+     "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000050 at pc 0x63b014cea744 bp 0x7ffcd7ec6c40 sp 0x7ffcd7ec6c38 (WRITE of size 8)"
+    }
+   ]
+  }
+ },
+ "sha": "66969850be051186811eccbc0005bde340bbc273",
+ "clone_s": 0.0,
+ "lane_check": "go: 3407 files / 1227833 lines; top=go(1227833)",
+ "status": "done"
+}

@@ -615,6 +615,39 @@ mod tests {
         );
     }
 
+    /// Every key the docs' list names exists: the list said `--static-dynamic`
+    /// and others had keys the code did not read.
+    #[test]
+    fn the_docs_list_only_config_keys_that_exist() {
+        let docs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/auto.md"),
+        )
+        .unwrap();
+        let section = docs
+            .split("\n## Config file\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\nThe other flags").next())
+            .expect("auto.md lists the config keys");
+        let list = section
+            .split_once("Only these keys exist")
+            .expect("the key list")
+            .1;
+        let keys: Vec<&str> = list
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|token| token.split(" =").next().unwrap_or(token))
+            .filter(|token| !token.starts_with('-') && !token.starts_with('['))
+            .collect();
+        assert!(keys.contains(&"per-target-time"), "{keys:?}");
+        for key in keys {
+            assert!(
+                FLAG_CONFIG_KEYS.iter().any(|(_, known)| *known == key),
+                "docs/site/auto.md lists config key {key}, which the config does not read"
+            );
+        }
+    }
+
     /// The `--config` help names every config key, and lists every key that
     /// is honored only from an explicit `--config` among those.
     #[test]

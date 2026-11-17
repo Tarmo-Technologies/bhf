@@ -116,6 +116,14 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--skip", step)
         self.assertNotRegex(step, r"(?m)^\s*if:")
 
+    def test_windows_library_tests_run_at_normal_priority(self):
+        # The worker starts steps BelowNormal; the priority test compares a
+        # background re-run with the class a user's shell runs at.
+        step = self.windows_step("Test the workspace libraries and the daemon")
+        raise_priority = "[System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'Normal'"
+        self.assertIn(raise_priority, step)
+        self.assertLess(step.index(raise_priority), step.index("cargo test "))
+
     WINDOWS_INTEGRATION_SUITES = (
         "auto_msbuild_import",
         "auto_force_win32",

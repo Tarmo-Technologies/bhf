@@ -27,8 +27,9 @@ bhf build bhf_work --harness H-CPP000A
 bhf fuzz bhf_work --harness H-CPP000A --iterations 1000 --seed-input smoke
 ```
 
-Use the actual harness id printed by `generate-harness` or by
-`list-targets`. Stable ids from `list-targets` and `auto` use `H-C...` for C
+`bhf fuzz` prints a progress line on stderr 2s in, then at doubling intervals
+(`--quiet` turns them off), and its JSON summary on stdout at the end. Use the
+actual harness id printed by `generate-harness` or by `list-targets`. Stable ids from `list-targets` and `auto` use `H-C...` for C
 and `H-X...` for C++; standalone manual generation defaults to `H-C<line>` or
 `H-CPP<line>` unless `--id` is supplied. Generate into `<work>/harnesses/`,
 where `bhf auto` puts its harnesses; `bhf explain` and `bhf capsule` read

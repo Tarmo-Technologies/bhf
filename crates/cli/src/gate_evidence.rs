@@ -640,8 +640,16 @@ fn no_driver_reason(replay: &Replay<'_>) -> String {
             crate::repro_lane::language_name(&language)
         ),
         // Rust links the driver as its `main.c`; Fortran and COBOL build
-        // through the C harness and its Makefile. None records generation
-        // metadata, so the binary alone cannot say which bhf built it.
+        // through the C harness and its Makefile. Their generation metadata,
+        // when there is any, says whether this bhf made the harness.
+        Some(_)
+            if dirs
+                .iter()
+                .any(|dir| crate::generate_harness::recorded_harness_format(dir).is_some()) =>
+        {
+            let hint = own_dir.as_deref().map(make_main).unwrap_or_default();
+            c_family_reason(harness, &dirs, hint)
+        }
         Some(language) if !is_c_family(&language) => format!(
             "{name} has no bhf driver that records comparisons, though bhf's {} lane links \
              that driver into every harness it builds: this one was built by an earlier bhf \
@@ -702,7 +710,7 @@ fn c_family_reason(binary: &Path, dirs: &[PathBuf], hint: String) -> String {
         ),
         Some(_) => format!(
             "{name} has no bhf driver that records comparisons, though this bhf generated its \
-             harness: the binary was built some other way{hint}"
+             harness: the binary is not the one bhf builds from it{hint}"
         ),
         None => format!(
             "{name} has no bhf driver that records comparisons, and no generation metadata \
@@ -2548,6 +2556,19 @@ mod tests {
             assert!(native.contains("re-run `bhf auto`"), "{native}");
             assert!(!native.contains("only for"), "{native}");
             assert!(!native.contains("no generation metadata"), "{native}");
+            // The lane records its generation metadata (#234): the reason says
+            // this bhf made the harness instead of guessing.
+            metadata(
+                &dir,
+                &lane.to_ascii_lowercase(),
+                FIRST_FORMAT_WITH_COMPARISON_DRIVER,
+            );
+            let recorded = reason(work.path(), &dir.join("main"), &raw);
+            assert!(
+                recorded.contains("though this bhf generated its harness"),
+                "{recorded}"
+            );
+            assert!(!recorded.contains("some other way"), "{recorded}");
         }
 
         let work = tempfile::tempdir().unwrap();

@@ -320,17 +320,22 @@ promoted into packed-binary or binary-layout review triage. Use
 limit.
 
 `bhf binary adapter <BINARY> --adapter mock|rizin|ghidra|angr --out <DIR>`
-writes `binary-adapter-report.json` with adapter-derived functions, call-graph
-hints, strings, xrefs, signatures, and errors. The command never links external
-tools into BHF. The mock adapter consumes `--mock-output` JSON for contract
-tests. Real adapters are subprocess smoke paths, are blocked in
-`strict-permissive`, require `--profile external-tools` or `research-lab`, and
-write `status: skipped` when the requested tool is absent.
+writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`: functions,
+call-graph hints, strings, xrefs and errors). The command never links
+external tools into BHF. Only the mock adapter fills the report: it reads
+`--mock-output` JSON, for contract tests of a consumer. The Rizin, Ghidra and
+angr adapters run no analysis yet. They are blocked in `strict-permissive`
+(they need `--profile external-tools` or `research-lab`), look for their tool
+(`rizin`, Ghidra's `analyzeHeadless`, a Python that imports `angr`; `--tool`
+names another), and write `status: not_implemented` with a `not_implemented`
+error and exit 3 when it is there, or `status: skipped` with `tool_not_found`
+and exit 1 when it is not. They used to report the tool's `--version` as a
+successful `smoke_tested` analysis with empty arrays.
 
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
 repeatable `--env KEY=VALUE` launch profiles. Crashes and timeouts are written
-under `<work-dir>/findings/BF-NNNN/` as `kind: binary_crash` findings with the
+under `<work-dir>/results/findings/BF-NNNN/` as `kind: binary_crash` findings with the
 command, input mode, testcase, environment, binary SHA-256, stderr excerpt, and
 exit/timeout signature. Existing `bhf replay`, `bhf minimize`, and
 `bhf ci --fail-on ...` understand these binary findings.
@@ -1134,7 +1139,7 @@ bhf llm status --json
 bhf llm test --provider codex
 bhf llm prompt --task diagnose-error --input bhf_work/auto/run.json
 bhf llm assist --provider local --model '<served-model>' \
-  --task analyze-findings --input bhf_work/findings/F-0001/finding.json
+  --task analyze-findings --input bhf_work/results/findings/F-0001/finding.json
 ```
 
 Task names are `plan-run`, `generate-harness`, `analyze-findings`,
@@ -1290,7 +1295,7 @@ decodes fixed-width parameters before its buffer also gets each
 `arg-layout.json`), so the buffer starts with it; with `--workers`, the
 campaign makes these once and its workers add none. It writes corpus entries under
 `bhf_work/corpus/` (with the harness input format in
-`corpus/<harness-id>/metadata.json`), emits findings under `bhf_work/findings/`, and stores
+`corpus/<harness-id>/metadata.json`), emits findings under `bhf_work/results/findings/`, and stores
 the latest run metadata in `bhf_work/fuzz_runs/<harness-id>-latest.json`.
 Fuzz run summaries and finding records include `sandbox` metadata so reports
 distinguish sandboxed and unsandboxed executions.
@@ -1321,6 +1326,8 @@ so a run whose crashes were all known does not read as clean.
 - `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which reports only an input that hangs again at twice the timeout), an input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure) when at least two of three fresh re-runs exceed it too; the finding's `deadline_confirmation` records each re-run's time. For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. A duration (`250ms`, `0.5s`, `1s`); `BHF_DEADLINE_MS` sets it from the environment. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--rss-limit-mb <MB>` — per-execution resident-memory ceiling for a C/C++ harness (libFuzzer `-rss_limit_mb`); an execution over budget is killed and reported as an OOM finding. `0` (default) disables it. With `--engine winafl` it also becomes WinAFL's `-m`, the committed-memory cap of drrun and the target: the limit plus 1024 MiB for DynamoRIO, or `-m none` for `0`. For an x86 harness it is `-m none` when that cap is not below what the 32-bit process can address (2 GiB, or 4 GiB when large-address aware).
 - `--print-final-stats` — print a final-stats line (libFuzzer `-print_final_stats`): executions, exec/s, new vs duplicate corpus signatures, findings, elapsed time.
+- `--quiet` (`-q`) — print no progress lines. Without it the builtin engine prints a status line on stderr 2s into the run, then at doubling intervals up to every 30s: `bhf: fuzz: 8123 execs (4061/s) | corpus: 12 | findings: 0 | edges: 214 | elapsed: 2.0s`. Workers of `--workers` run quiet.
+- Crashes in the loop are not symbolized: the builtin engine runs its own executions with `symbolize=0:abort_on_error=0` appended to the sanitizer options, tells crashes apart by their rule, kind and top five unsymbolized frames (`module+offset`), counts a crash whose signature was reported against that finding, and re-runs a new one in a fresh process with the symbolized options replays use, whose report becomes the finding. Symbolizing every crashing execution and aborting it through the kernel's core pattern took most of a second each, which left a target whose inputs mostly crash a few executions a second. `BHF_IN_LOOP_SYMBOLIZE=1` symbolizes in the loop again.
 - `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs while the finding they duplicate is in `results/findings`. Once that finding is removed (or `results/` is wiped), the next campaign drops them instead of merging them back.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
@@ -1546,9 +1553,19 @@ remove disposable compiler caches and scratch files while preserving findings,
 reports, corpora, checkpoints, generated source, and replay binaries. Use
 `--build`, `--corpus`, `--reports`, `--findings`, or `--all` for explicit deletion
 scopes under the work directory. `--findings` removes `results/` (findings,
-indexes, `static/` and `sbom/` reports) plus any legacy `findings/`/
-`FINDINGS.md`/`findings.csv` paths; `--reports` removes only `results/report/`
+indexes, `static/` and `sbom/` reports) plus any legacy (pre-`results/`)
+paths, `findings/`, `FINDINGS.md` and `findings.csv`, at the top of a legacy
+work dir; `--reports` removes only `results/report/`
 (the `bhf report` snapshots), leaving the rest of `results/` intact.
+`--all` also removes the fuzz loop's scratch: `fuzz_inputs/`, `fuzz_shm/` and
+`fuzz_campaigns/`, and the `.tmp*` shared-map files an older `bhf fuzz` left
+at the top of the work dir.
+
+`bhf fuzz` keeps its shared-memory maps (coverage, value profile, comparison
+operands) in `<work>/fuzz_shm/`, named `<pid>-<random>.shm`. They go when the
+run ends, when SIGINT, SIGTERM or SIGHUP stops it (the signal still ends the
+run), and, for a run killed with SIGKILL, when a later `bhf fuzz` in the same
+work dir finds their process gone, or with `bhf clean --all`.
 
 ## Auto
 

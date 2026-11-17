@@ -1,0 +1,30 @@
+{
+ "repo": "cli/cli",
+ "sha": "b1a9f7b183c12ae111ea63048d49aad2a53e9101",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "state.go",
+   "name": "FillFromJSON",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*iostreams.IOStreams` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

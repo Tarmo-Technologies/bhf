@@ -381,7 +381,7 @@ bhf auto examples/swallowed_constraint_error --work-dir /tmp/bhf-ada --per-targe
 When the sweep finishes it prints a summary — duration, outcome breakdown, file/
 language counts, findings, executions, throughput, coverage edges, and where every
 output landed — and writes it to `<work-dir>/auto/summary.txt`. Detailed reports
-start at `<work-dir>/FINDINGS.md` and `<work-dir>/findings.csv`; campaign and
+start at `<work-dir>/results/INDEX.md` and `<work-dir>/results/findings.csv`; campaign and
 coverage details are at `<work-dir>/auto/run.md` and `run.json`. If the summary ends in a
 `⚠ WARNING: N target(s) fuzzed STUB-ONLY` line, those targets fuzzed blind stubs
 rather than real library code, so a clean result there is a **false clean** —

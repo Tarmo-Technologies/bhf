@@ -1,0 +1,51 @@
+{
+ "repo": "XTLS/Xray-core",
+ "sha": "5ca6f4b7d4dc20a881d4330e498892697627ec0c",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "addons.go",
+   "name": "DecodeBodyAddons",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*protocol.RequestHeader` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "addons.go",
+   "name": "DecodeHeaderAddons",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*buf.Buffer` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "encoding.go",
+   "name": "DecodeResponseHeader",
+   "outcome": "unsupported_params",
+   "reason": "unsupported Go parameter type `*protocol.RequestHeader` (skipped)",
+   "class": "Go-1 undrivable parameter type"
+  },
+  {
+   "source": "punch.go",
+   "name": "DecodePunchPacket",
+   "outcome": "unsupported_params",
+   "reason": "go build failed: go: github.com/pires/go-proxyproto@v0.15.0 requires go >= 1.25.0 (running go 1.22.2; GOTOOLCHAIN=local)",
+   "class": "Go-4 requires a newer go (environment)"
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
+mod shared_map;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
 
@@ -341,6 +342,14 @@ pub struct FuzzArgs {
     /// signatures, findings, and elapsed time.
     #[arg(long = "print-final-stats")]
     pub print_final_stats: bool,
+
+    /// Print no progress lines. Without it the builtin engine prints a status
+    /// line on stderr (executions, exec/s, corpus entries, findings, edges,
+    /// elapsed) 2s into the run, then at doubling intervals up to every 30s,
+    /// so a long run does not look hung. Workers of `--workers` always run
+    /// quiet.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
 
     /// Resident-memory ceiling in MB for a single C/C++ harness execution
     /// (libFuzzer's `-rss_limit_mb`). An execution whose RSS exceeds this is
@@ -1252,12 +1261,16 @@ struct PreparedFuzzRun {
     winafl_timeout: Option<Duration>,
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
+    /// `extra_env` for the builtin loop's own executions (the fork server and
+    /// the per-spawn runs): the sanitizers neither symbolize nor abort
+    /// ([`in_loop_env`]). Re-runs and confirmations use `extra_env`.
+    loop_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
-    _local_coverage_map: Option<tempfile::TempPath>,
+    _local_coverage_map: Option<shared_map::SharedMapFile>,
     /// Keeps the RedQueen (#400) per-input cmplog operand map alive for the run.
-    _local_cmp_map: Option<tempfile::TempPath>,
+    _local_cmp_map: Option<shared_map::SharedMapFile>,
     /// Keeps the value-profile (#398) map alive for the run.
-    _local_vp_map: Option<tempfile::TempPath>,
+    _local_vp_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
@@ -1493,6 +1506,7 @@ pub fn run(args: FuzzArgs) -> i32 {
     let collector_window_ms = args.collector_window_ms;
     let collector_work_dir = args.work_dir.clone();
     let collector_harness = args.harness.clone();
+    let quiet = args.quiet;
 
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
@@ -1509,8 +1523,14 @@ pub fn run(args: FuzzArgs) -> i32 {
         .find(|(key, _)| key == "BHF_RUNTRACE_LOG")
         .map(|(_, value)| PathBuf::from(value));
 
+    let progress_lines = (!quiet).then(ProgressLines::new);
+    let print_progress = |tick: &FuzzTick| {
+        if let Some(line) = progress_lines.as_ref().and_then(|lines| lines.line(tick)) {
+            bhfeprintln!("{line}");
+        }
+    };
     let result = match prepared.engine {
-        FuzzEngine::Builtin => run_builtin(prepared),
+        FuzzEngine::Builtin => run_builtin_with_progress(prepared, Some(&print_progress)),
         FuzzEngine::AflPlusPlus => run_afl_plus_plus(prepared),
         FuzzEngine::Winafl => winafl::run(prepared),
     };
@@ -1744,15 +1764,64 @@ fn oracle_lane_rules(findings_dir: &Path, harness_id: &str) -> std::collections:
 /// without serialising it. Errors bubble up as `String` (same shape as
 /// [`prepare`] / [`run_builtin`]) so the caller can downgrade them to a
 /// `Built` outcome without losing the original message.
-/// Periodic live-progress callback for the builtin fuzz loop:
-/// `(executions, findings_so_far, elapsed)` sampled at most every
-/// 500ms so the hot loop stays hot.
-/// `(executions, findings, edges, elapsed)`. Edges is the live distinct-edge
+/// Periodic live-progress callback for the builtin fuzz loop, sampled at most
+/// every 500ms so the hot loop stays hot.
+pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(&FuzzTick);
+
+/// A live sample of the builtin fuzz loop. `edges` is the live distinct-edge
 /// count from the coverage tracker (0 for harnesses with no edge runtime): the
 /// dashboard needs coverage growth WHILE a pass runs, not only in the pass
 /// summary, because "no new edge for four minutes" is the signal that the rest
 /// of this target's budget is being wasted.
-pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(usize, usize, usize, Duration);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuzzTick {
+    pub(crate) executions: usize,
+    pub(crate) findings: usize,
+    pub(crate) edges: usize,
+    /// Inputs in the in-memory corpus the mutator draws from.
+    pub(crate) corpus: usize,
+    pub(crate) elapsed: Duration,
+}
+
+/// When `bhf fuzz` prints its progress lines: 2s into the run, then after
+/// as long again as the run has taken, at most 30s apart.
+struct ProgressLines {
+    next: std::cell::Cell<Duration>,
+}
+
+impl ProgressLines {
+    const FIRST: Duration = Duration::from_secs(2);
+    const MAX_GAP: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            next: std::cell::Cell::new(Self::FIRST),
+        }
+    }
+
+    /// The line to print for `tick`, if one is due.
+    fn line(&self, tick: &FuzzTick) -> Option<String> {
+        if tick.elapsed < self.next.get() {
+            return None;
+        }
+        let gap = tick.elapsed.clamp(Self::FIRST, Self::MAX_GAP);
+        self.next.set(tick.elapsed + gap);
+        Some(format_progress_line(tick))
+    }
+}
+
+fn format_progress_line(tick: &FuzzTick) -> String {
+    let secs = tick.elapsed.as_secs_f64();
+    format!(
+        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {} | elapsed: {:.1}s",
+        tick.executions,
+        executions_per_sec(tick.executions, secs),
+        tick.corpus,
+        tick.findings,
+        tick.edges,
+        secs,
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_one_target_programmatic(
@@ -1838,6 +1907,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         max_len: resolve_env_max_len(largest_seed),
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
+        quiet: true,
         // Per-harness memory cap so a fuzzer-controlled huge allocation is caught
         // as an OOM finding (BHF-209) instead of OOM-killing the host (#386).
         rss_limit_mb,
@@ -2085,6 +2155,7 @@ fn afl_programmatic_args(
         max_len,
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
+        quiet: true,
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
@@ -2811,6 +2882,8 @@ fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> 
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     let mut out = vec![
+        // A worker's stderr is its log, whose tail a failed campaign prints.
+        "--quiet".to_owned(),
         "--engine".to_owned(),
         engine_arg_name(args.engine).to_owned(),
         "--mode".to_owned(),
@@ -2937,19 +3010,16 @@ fn structured_input_mode_arg_name(mode: StructuredInputMode) -> &'static str {
     }
 }
 
-/// Create a zero-filled, `bytes`-sized temp file inside `work_dir` to back a
-/// harness shared-memory channel, returning the RAII lifetime handle and its
+/// Create a zero-filled, `bytes`-sized file in `<work_dir>/fuzz_shm/` to back
+/// a harness shared-memory channel, returning the handle that keeps it and its
 /// path string (for the child's `*_SHM` env var). The file is unlinked when the
-/// returned `TempPath` drops, so it lives exactly as long as the prepared run.
-fn arm_shared_map(work_dir: &Path, bytes: usize) -> Result<(tempfile::TempPath, String), String> {
-    let file = tempfile::NamedTempFile::new_in(work_dir)
-        .map_err(|error| format!("create harness shared map: {error}"))?;
-    file.as_file()
-        .set_len(bytes as u64)
-        .map_err(|error| format!("size harness shared map: {error}"))?;
-    let path = file.into_temp_path();
-    let value = path.to_string_lossy().into_owned();
-    Ok((path, value))
+/// handle drops, so it lives exactly as long as the prepared run, or when a
+/// stopping signal ends the process ([`shared_map`]).
+fn arm_shared_map(
+    work_dir: &Path,
+    bytes: usize,
+) -> Result<(shared_map::SharedMapFile, String), String> {
+    shared_map::SharedMapFile::create(work_dir, bytes)
 }
 
 fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
@@ -3165,7 +3235,7 @@ fn prepare_with_runner(
         None
     };
     #[cfg(not(any(target_os = "linux", windows)))]
-    let local_cmp_map: Option<tempfile::TempPath> = None;
+    let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
     Ok(PreparedFuzzRun {
         work_dir,
@@ -3193,6 +3263,7 @@ fn prepare_with_runner(
         },
         winafl_timeout: args.timeout,
         mode: args.mode,
+        loop_env: in_loop_env(&extra_env, in_loop_symbolize()),
         extra_env,
         _local_coverage_map: local_coverage_map,
         _local_cmp_map: local_cmp_map,
@@ -3911,10 +3982,6 @@ fn format_final_stats(
     )
 }
 
-fn run_builtin(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
-    run_builtin_with_progress(prepared, None)
-}
-
 fn run_builtin_with_progress(
     mut prepared: PreparedFuzzRun,
     progress: Option<FuzzProgressFn<'_>>,
@@ -4085,6 +4152,7 @@ fn run_builtin_with_progress(
         HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
     // Sanitizer-crash dedup (#389): one finding per root cause, not one per
     // crashing input.
+    let mut in_loop_symbolization = InLoopSymbolization::default();
     let mut sanitizer_dedup = SanitizerClusterDedup::new(
         existing_findings.clusters.keys().cloned(),
     )
@@ -4236,6 +4304,41 @@ fn run_builtin_with_progress(
             let report: &corpus::SanitizerReport = $report;
             let stderr: Option<&str> = $stderr;
             'emit: {
+                // The loop's executions do not symbolize (#230): a crash whose
+                // signature was reported is counted, and a new one is re-run in
+                // a fresh process, symbolized, and that report goes on.
+                let symbolized_rerun;
+                let (report, stderr) =
+                    match in_loop_symbolization.classify(report, stderr, &mut sanitizer_dedup) {
+                        InLoopCrash::AsIs => (report, stderr),
+                        InLoopCrash::Duplicate => break 'emit,
+                        InLoopCrash::Symbolize(signature) => {
+                            symbolized_rerun = run_harness_with_protocol(
+                                &prepared.runner,
+                                &prepared.work_dir,
+                                input,
+                                &prepared.extra_env,
+                                prepared.per_input_timeout,
+                                prepared.rss_limit_mb,
+                                protocol,
+                                prepared.deadline,
+                            )
+                            .ok()
+                            .and_then(|rerun| Some((rerun.sanitizer?, rerun.stderr)));
+                            match &symbolized_rerun {
+                                Some((fresh, fresh_stderr)) => {
+                                    in_loop_symbolization
+                                        .symbolized(signature, sanitizer_dedup.key(fresh));
+                                    (fresh, fresh_stderr.as_deref())
+                                }
+                                None => {
+                                    sanitizer_dedup.unconfirmed(signature);
+                                    non_reproducible += 1;
+                                    break 'emit;
+                                }
+                            }
+                        }
+                    };
                 // (#49) An LSan leak whose entire allocation stack is bhf's own
                 // decode/harness scaffolding (no target frame) is the decoder buffer the
                 // harness would have freed — left dangling only because an exit()/abort()-
@@ -4643,7 +4746,7 @@ fn run_builtin_with_progress(
                         &prepared.runner,
                         &prepared.work_dir,
                         &input,
-                        &prepared.extra_env,
+                        &prepared.loop_env,
                         prepared.per_input_timeout,
                         prepared.rss_limit_mb,
                         protocol,
@@ -4675,7 +4778,7 @@ fn run_builtin_with_progress(
                 &prepared.runner,
                 &prepared.work_dir,
                 &input,
-                &prepared.extra_env,
+                &prepared.loop_env,
                 prepared.per_input_timeout,
                 prepared.rss_limit_mb,
                 protocol,
@@ -4707,6 +4810,11 @@ fn run_builtin_with_progress(
             match confirmation {
                 HangConfirmation::Hung(report, stderr) => {
                     hangs.confirmed += 1;
+                    run.sanitizer = Some(*report);
+                    run.stderr = Some(stderr);
+                }
+                HangConfirmation::Crashed(report, stderr) => {
+                    hangs.cleared += 1;
                     run.sanitizer = Some(*report);
                     run.stderr = Some(stderr);
                 }
@@ -4771,12 +4879,13 @@ fn run_builtin_with_progress(
         sink_taint.observe(&runtrace_events, &input);
         if let Some(tick) = progress {
             if last_tick.elapsed() >= Duration::from_millis(500) {
-                tick(
+                tick(&FuzzTick {
                     executions,
-                    finding_ids.len(),
-                    cov_tracker.as_ref().map_or(0, |cov| cov.count()),
-                    start.elapsed(),
-                );
+                    findings: finding_ids.len(),
+                    edges: cov_tracker.as_ref().map_or(0, |cov| cov.count()),
+                    corpus: pool.len(),
+                    elapsed: start.elapsed(),
+                });
                 last_tick = Instant::now();
             }
         }
@@ -5496,6 +5605,21 @@ impl SanitizerClusterDedup {
     /// The key `report` is deduplicated on.
     fn key(&self, report: &corpus::SanitizerReport) -> String {
         corpus::finding::sanitizer_dedupe_key_scoped(report, &self.scope)
+    }
+
+    /// Count a hit of `key` when its root cause is settled: reported (or
+    /// pre-seeded) or given up. `false` when it is neither, so the hit still
+    /// needs its confirmation.
+    fn note_settled_hit(&mut self, key: &str) -> bool {
+        if let Some(count) = self.seen.get_mut(key) {
+            *count = count.saturating_add(1);
+            return true;
+        }
+        if let Some(later) = self.abandoned.get_mut(key) {
+            *later = later.saturating_add(1);
+            return true;
+        }
+        false
     }
 
     /// A finding was emitted for `key`: later hits are duplicates.
@@ -6405,20 +6529,86 @@ fn lower_spawn_priority(command: &mut std::process::Command) {
     }
 }
 
+/// Windows priority classes, lowest first, and what bhf does with them: a
+/// background re-run starts one class below bhf's own and is returned to
+/// bhf's own, so it gives way to the fuzz loop whatever class bhf runs at. A
+/// BelowNormal bhf (the GitHub runner's worker starts its steps there) made a
+/// fixed BelowNormal re-run no lower than the loop, and a fixed Normal restore
+/// raised it above bhf.
+#[cfg(any(windows, test))]
+mod priority_class {
+    pub(super) const IDLE: u32 = 0x0000_0040;
+    pub(super) const BELOW_NORMAL: u32 = 0x0000_4000;
+    pub(super) const NORMAL: u32 = 0x0000_0020;
+    pub(super) const ABOVE_NORMAL: u32 = 0x0000_8000;
+    pub(super) const HIGH: u32 = 0x0000_0080;
+    pub(super) const REALTIME: u32 = 0x0000_0100;
+    const ORDER: [u32; 6] = [IDLE, BELOW_NORMAL, NORMAL, ABOVE_NORMAL, HIGH, REALTIME];
+
+    /// The class one below `class` (Idle stays Idle); an unknown class is
+    /// taken for Normal.
+    pub(super) fn lowered(class: u32) -> u32 {
+        match ORDER.iter().position(|known| *known == class) {
+            Some(at) => ORDER[at.saturating_sub(1)],
+            None => BELOW_NORMAL,
+        }
+    }
+
+    /// The class Windows gives a process created without a class flag by a
+    /// parent of `class`: the parent's when it is Idle or BelowNormal, else
+    /// Normal.
+    #[cfg(test)]
+    pub(super) fn inherited(class: u32) -> u32 {
+        if class == IDLE || class == BELOW_NORMAL {
+            class
+        } else {
+            NORMAL
+        }
+    }
+
+    /// `class` as `Get-Process` names it.
+    #[cfg(test)]
+    pub(super) fn name(class: u32) -> &'static str {
+        match class {
+            IDLE => "Idle",
+            BELOW_NORMAL => "BelowNormal",
+            ABOVE_NORMAL => "AboveNormal",
+            HIGH => "High",
+            REALTIME => "RealTime",
+            _ => "Normal",
+        }
+    }
+}
+
+/// This process's priority class.
+#[cfg(windows)]
+fn own_priority_class() -> u32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetPriorityClass(process: *mut std::ffi::c_void) -> u32;
+    }
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    match unsafe { GetPriorityClass(GetCurrentProcess()) } {
+        0 => priority_class::NORMAL,
+        class => class,
+    }
+}
+
 #[cfg(windows)]
 fn lower_spawn_priority(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+    command.creation_flags(priority_class::lowered(own_priority_class()));
 }
 
 #[cfg(not(any(unix, windows)))]
 fn lower_spawn_priority(_command: &mut std::process::Command) {}
 
-/// Return a process [`lower_spawn_priority`] started to normal priority: on
-/// Windows, before it is killed (a starved process is slow to finish dying)
-/// and once the loop it gave way to has stopped. A Unix process cannot raise
-/// a nice value back without privilege, so there it stays lowered.
+/// Return a process [`lower_spawn_priority`] started to bhf's own priority
+/// class: on Windows, before it is killed (a starved process is slow to
+/// finish dying) and once the loop it gave way to has stopped. A Unix process
+/// cannot raise a nice value back without privilege, so there it stays
+/// lowered.
 #[cfg(windows)]
 fn restore_spawn_priority(child: &std::process::Child) {
     use std::os::windows::io::AsRawHandle;
@@ -6426,17 +6616,17 @@ fn restore_spawn_priority(child: &std::process::Child) {
     extern "system" {
         fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
     }
-    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    let class = own_priority_class();
     // SAFETY: the handle is the live child's, owned by `child`.
-    let restored = unsafe { SetPriorityClass(child.as_raw_handle().cast(), NORMAL_PRIORITY_CLASS) };
+    let restored = unsafe { SetPriorityClass(child.as_raw_handle().cast(), class) };
     if restored == 0 {
-        // A re-run left below normal only finishes later; say why, once per
+        // A re-run left lowered only finishes later; say why, once per
         // process, rather than fail the run.
         static WARNED: std::sync::Once = std::sync::Once::new();
         let error = std::io::Error::last_os_error();
         WARNED.call_once(|| {
             bhfeprintln!(
-                "bhf fuzz: warning: could not return a background re-run (pid {}) to normal priority: {error}",
+                "bhf fuzz: warning: could not return a background re-run (pid {}) to bhf's priority: {error}",
                 child.id()
             );
         });
@@ -7086,6 +7276,101 @@ fn sanitizer_child_env_with(
             merge(ubsan, &ubsan_required(emulated)),
         ),
     ]
+}
+
+/// Whether the builtin loop's own executions symbolize sanitizer reports:
+/// only with `BHF_IN_LOOP_SYMBOLIZE=1`. Symbolizing a report (llvm-symbolizer)
+/// and aborting through the kernel's core pattern take most of a second, which
+/// on a target where most inputs crash left a few executions a second for a
+/// crash already reported.
+fn in_loop_symbolize() -> bool {
+    std::env::var("BHF_IN_LOOP_SYMBOLIZE").is_ok_and(|value| value == "1")
+}
+
+/// `env` for the builtin loop's own executions. Unless `symbolize`, each
+/// sanitizer's options get `symbolize=0` (a report names `module+offset`
+/// frames, which [`InLoopSymbolization`] tells crashes apart by) and
+/// `abort_on_error=0` (the sanitizer exits non-zero after its report, which
+/// classifies it, instead of aborting through the core pattern). bhf's keys
+/// go last, so these win.
+fn in_loop_env(env: &[(String, String)], symbolize: bool) -> Vec<(String, String)> {
+    let mut env = env.to_vec();
+    if symbolize {
+        return env;
+    }
+    for (key, value) in env.iter_mut() {
+        if matches!(
+            key.as_str(),
+            "ASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
+        ) {
+            *value = corpus::sanitizer_options::merge(Some(value), "symbolize=0:abort_on_error=0");
+        }
+    }
+    env
+}
+
+/// What to do with an unsymbolized sanitizer report from the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InLoopCrash {
+    /// The report is symbolized already, or names no frames: report it.
+    AsIs,
+    /// A crash an earlier one with the same signature was reported (or given
+    /// up) for: counted, not re-run.
+    Duplicate,
+    /// A new signature: re-run the input symbolized and report that.
+    Symbolize(String),
+}
+
+/// The builtin loop's view of its unsymbolized crashes: the signature of each
+/// (rule, kind and the top frames' `module+offset`) and the root-cause key its
+/// symbolized re-run was reported under, so a crash with a signature seen
+/// before costs no re-run.
+#[derive(Default)]
+struct InLoopSymbolization {
+    keys: HashMap<String, String>,
+}
+
+impl InLoopSymbolization {
+    /// Frames of the signature: enough to tell two call paths apart.
+    const FRAMES: usize = 5;
+
+    fn signature(report: &corpus::SanitizerReport, stderr: Option<&str>) -> Option<String> {
+        let frames = corpus::sanitizer::unsymbolized_frames(stderr?);
+        if frames.is_empty() || !report.stack.is_empty() {
+            return None;
+        }
+        let top = &frames[..frames.len().min(Self::FRAMES)];
+        Some(format!(
+            "unsymbolized:{}:{}:{}",
+            report.rule_id,
+            report.kind,
+            top.join(",")
+        ))
+    }
+
+    fn classify(
+        &self,
+        report: &corpus::SanitizerReport,
+        stderr: Option<&str>,
+        dedup: &mut SanitizerClusterDedup,
+    ) -> InLoopCrash {
+        let Some(signature) = Self::signature(report, stderr) else {
+            return InLoopCrash::AsIs;
+        };
+        let settled = |key: &str, dedup: &mut SanitizerClusterDedup| dedup.note_settled_hit(key);
+        if settled(&signature, dedup) {
+            return InLoopCrash::Duplicate;
+        }
+        match self.keys.get(&signature) {
+            Some(key) if settled(key, dedup) => InLoopCrash::Duplicate,
+            _ => InLoopCrash::Symbolize(signature),
+        }
+    }
+
+    /// The re-run of `signature`'s input was reported under `key`.
+    fn symbolized(&mut self, signature: String, key: String) {
+        self.keys.insert(signature, key);
+    }
 }
 
 /// Turn `abort_on_error` off in the `ASAN_OPTIONS` and `UBSAN_OPTIONS` of
@@ -8408,17 +8693,24 @@ pub struct HangRunSummary {
 enum HangConfirmation {
     /// It hung again: the hang report and the stderr it was made from.
     Hung(Box<corpus::SanitizerReport>, String),
+    /// Given the time, it crashed: that report and its stderr (deep recursion
+    /// under an interpreter's coverage hook can outlast the timeout).
+    Crashed(Box<corpus::SanitizerReport>, String),
     /// It finished: one slow execution.
     Finished,
     /// It was not re-run: too little of the pass's time was left.
     NotRerun,
 }
 
-/// The `<SAN>_OPTIONS` a hang confirmation runs under: `extra_env`'s, with
-/// `handle_abort=1`, so the runtime answers [`signal_for_stack`] with the
-/// stack the target is looping in.
-fn hang_stack_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+/// The environment a hang confirmation runs under: `extra_env`, its
+/// `<SAN>_OPTIONS` with `handle_abort=1`, so the runtime answers
+/// [`signal_for_stack`] with the stack the target is looping in, and
+/// `BHF_HANG_REPORT_MS`, when an interpreted lane's driver prints the frames
+/// its target is running and halts ([`HANG_REPORT_ENV`]).
+fn hang_stack_env(extra_env: &[(String, String)], confirm: Duration) -> Vec<(String, String)> {
     let mut env = extra_env.to_vec();
+    env.retain(|(name, _)| name != HANG_REPORT_ENV);
+    env.push((HANG_REPORT_ENV.to_owned(), confirm.as_millis().to_string()));
     for key in [
         "ASAN_OPTIONS",
         "UBSAN_OPTIONS",
@@ -8441,11 +8733,24 @@ fn hang_stack_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
     env
 }
 
+/// When an interpreted lane's driver reports the frames its target is
+/// running: at the re-run's `confirm` limit. An interpreter answers no signal
+/// while its target loops in bytecode, so the driver keeps the time, and bhf
+/// stops the re-run only [`hang_report_slack`] after the limit.
+const HANG_REPORT_ENV: &str = "BHF_HANG_REPORT_MS";
+
+/// How long past its limit a hang confirmation runs, so a driver that reports
+/// at the limit is not stopped first: half the limit, at most 2s.
+fn hang_report_slack(confirm: Duration) -> Duration {
+    (confirm / 2).min(Duration::from_secs(2))
+}
+
 /// Re-run an input that hung at `per_input_timeout` in a fresh process with
-/// twice that, asking the process for its stack if it hangs again: it has up
-/// to [`HANG_STACK_GRACE`] to print it, or what is left of the pass after the
-/// re-run if that is less. Not re-run when the pass has less time left than
-/// the re-run itself.
+/// twice that (and [`hang_report_slack`] more, for an interpreted lane's
+/// driver to report the frames it is running), asking the process for its
+/// stack if it hangs again: it has up to [`HANG_STACK_GRACE`] to print it, or
+/// what is left of the pass after the re-run if that is less. Not re-run when
+/// the pass has less time left than the re-run itself.
 fn confirm_hang(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
@@ -8456,13 +8761,14 @@ fn confirm_hang(
     pass_deadline: Option<Instant>,
 ) -> Result<HangConfirmation, String> {
     let confirm = per_input_timeout.saturating_mul(2);
+    let limit = confirm + hang_report_slack(confirm);
     let grace = match pass_deadline {
         Some(deadline) => {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left < confirm {
+            if left < limit {
                 return Ok(HangConfirmation::NotRerun);
             }
-            HANG_STACK_GRACE.min(left - confirm)
+            HANG_STACK_GRACE.min(left - limit)
         }
         None => HANG_STACK_GRACE,
     };
@@ -8470,8 +8776,8 @@ fn confirm_hang(
     let output = run_with_timeout(
         runner.harness_path(),
         &input_path,
-        confirm,
-        &hang_stack_env(extra_env),
+        limit,
+        &hang_stack_env(extra_env, confirm),
         &ensure_harness_scratch(work_dir)?,
         rss_limit_mb,
         runner.qemu_prefix(),
@@ -8482,22 +8788,28 @@ fn confirm_hang(
     );
     let _ = fs::remove_file(&input_path);
     let stderr = String::from_utf8_lossy(&output?.stderr).into_owned();
-    if !stderr.contains("exceeded per-input timeout") {
-        return Ok(HangConfirmation::Finished);
+    // Stopped at the limit, or a driver reported its target still running.
+    let hung = stderr.contains("exceeded per-input timeout")
+        || stderr.contains(corpus::sanitizer::HANG_MARKER);
+    if !hung {
+        return Ok(match corpus::parse_sanitizer_report(&stderr) {
+            Some(report) => HangConfirmation::Crashed(Box::new(report), stderr),
+            None => HangConfirmation::Finished,
+        });
     }
     let report = hang_report(&stderr, per_input_timeout, confirm);
     Ok(HangConfirmation::Hung(Box::new(report), stderr))
 }
 
-/// The BHF-230 report of a confirmed hang. Its stack is the one the sanitizer
-/// runtime printed when [`signal_for_stack`] stopped the re-run, if it printed
-/// one, from the first frame that is not instrumentation; the signal's own
-/// report is not the finding. Keyed on the stack's functions alone, so two
-/// inputs looping on different lines of one loop are one finding.
+/// The BHF-230 report of a confirmed hang. Its stack is the one the re-run
+/// gave ([`corpus::sanitizer::hang_frames`]: an interpreted lane's driver
+/// frames, the Go runtime's goroutine dump, or the sanitizer runtime's report
+/// when [`signal_for_stack`] stopped it), from the first frame that is not
+/// instrumentation; the signal's own report is not the finding. Keyed on the
+/// stack's functions alone, so two inputs looping on different lines of one
+/// loop are one finding.
 fn hang_report(stderr: &str, timeout: Duration, confirm: Duration) -> corpus::SanitizerReport {
-    let mut stack = corpus::parse_sanitizer_report(stderr)
-        .map(|signalled| signalled.stack)
-        .unwrap_or_default();
+    let mut stack = corpus::sanitizer::hang_frames(stderr);
     if let Some(looping) = stack
         .iter()
         .position(|frame| !is_instrumentation_frame(&frame.function))
@@ -10051,7 +10363,7 @@ fn start_fork_server(
     match ForkServer::spawn(
         &prepared.runner,
         &prepared.work_dir,
-        &prepared.extra_env,
+        &prepared.loop_env,
         prepared.rss_limit_mb,
         prepared.per_input_timeout,
         handshake_timeout,
@@ -10519,26 +10831,43 @@ mod exec_wait_tests {
     }
 }
 
-/// A background re-run's process starts in the below-normal priority class,
-/// and is returned to normal once the loop it gave way to has stopped.
+#[cfg(test)]
+mod priority_class_tests {
+    use super::priority_class::*;
+
+    #[test]
+    fn a_background_rerun_runs_one_class_below_bhf() {
+        assert_eq!(lowered(NORMAL), BELOW_NORMAL);
+        assert_eq!(lowered(BELOW_NORMAL), IDLE);
+        assert_eq!(lowered(IDLE), IDLE);
+        assert_eq!(lowered(ABOVE_NORMAL), NORMAL);
+        assert_eq!(lowered(HIGH), ABOVE_NORMAL);
+        assert_eq!(lowered(REALTIME), HIGH);
+        assert_eq!(lowered(0x1234), BELOW_NORMAL);
+    }
+
+    #[test]
+    fn a_child_without_a_class_flag_gets_an_idle_or_below_normal_parents_class() {
+        assert_eq!(inherited(BELOW_NORMAL), BELOW_NORMAL);
+        assert_eq!(inherited(IDLE), IDLE);
+        assert_eq!(inherited(NORMAL), NORMAL);
+        assert_eq!(inherited(HIGH), NORMAL);
+        assert_eq!(name(lowered(BELOW_NORMAL)), "Idle");
+    }
+}
+
+/// A background re-run's process starts one priority class below bhf's, and
+/// is returned to bhf's once the loop it gave way to has stopped.
 #[cfg(all(test, windows))]
 mod spawn_priority_windows_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn a_low_priority_spawn_runs_below_normal_until_restored() {
-        // GitHub's hosted Windows runner changes process priority classes
-        // from outside the test: across runs it reported a child started at
-        // normal priority as BelowNormal, and a child returned to normal as
-        // BelowNormal, which no Windows Server 2022 host reproduces (from
-        // Windows PowerShell or pwsh, alone or in the full lib run). The
-        // classes are this test's only observable, so it runs everywhere
-        // but there.
-        if std::env::var_os("GITHUB_ACTIONS").is_some() {
-            eprintln!("skipping: the hosted runner changes priority classes itself");
-            return;
-        }
+    fn a_low_priority_spawn_runs_below_bhf_until_restored() {
+        // Relative to this process's class: the GitHub runner's worker starts
+        // its steps BelowNormal (CI raises the test step to Normal).
+        let own = own_priority_class();
         let work = crate::test_support::TestDir::new("spawn-priority");
         let scratch = ensure_harness_scratch(&work).unwrap();
         // The script prints its own priority class `samples` times, 250 ms
@@ -10578,17 +10907,22 @@ mod spawn_priority_windows_tests {
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(classes(false, None, 1), ["Normal"]);
-        assert_eq!(classes(true, None, 1), ["BelowNormal"]);
-        // Raised as soon as the loop that it gave way to has stopped (here,
-        // from the start): within the 5 s the script samples, whatever the
-        // load on the host, and it stays raised.
+        let name = |class| priority_class::name(class).to_owned();
+        assert_eq!(
+            classes(false, None, 1),
+            [name(priority_class::inherited(own))]
+        );
+        assert_eq!(classes(true, None, 1), [name(priority_class::lowered(own))]);
+        // Raised to bhf's class as soon as the loop that it gave way to has
+        // stopped (here, from the start): within the 5 s the script samples,
+        // whatever the load on the host, and it stays raised.
         let restore = AtomicBool::new(true);
         let seen = classes(true, Some(&restore), 20);
-        let raised = seen.iter().position(|class| class == "Normal");
+        let raised = seen.iter().position(|class| *class == name(own));
         assert!(
-            raised.is_some_and(|at| seen[at..].iter().all(|class| class == "Normal")),
-            "the re-run was not returned to normal priority: {seen:?}"
+            raised.is_some_and(|at| seen[at..].iter().all(|class| *class == name(own))),
+            "the re-run was not returned to bhf's {} priority: {seen:?}",
+            name(own)
         );
     }
 }
@@ -12143,6 +12477,96 @@ mod auto_path_tests {
         );
     }
 
+    /// An unsymbolized ASan report whose crash stack is `frames`.
+    fn unsymbolized(frames: &[&str]) -> (corpus::SanitizerReport, String) {
+        let mut stderr = "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+                          WRITE of size 9 at 0x1 thread T0\n"
+            .to_owned();
+        for (index, frame) in frames.iter().enumerate() {
+            stderr.push_str(&format!("    #{index} 0x55d0c3a1b2c4  (/w/main+{frame})\n"));
+        }
+        stderr.push_str("\nSUMMARY: AddressSanitizer: heap-buffer-overflow (/w/main+0x1)\n");
+        (corpus::parse_sanitizer_report(&stderr).unwrap(), stderr)
+    }
+
+    #[test]
+    fn a_crash_with_a_reported_signature_is_not_symbolized_again() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let mut symbolization = InLoopSymbolization::default();
+        let (first, first_stderr) = unsymbolized(&["0x12b1b2", "0x13f001"]);
+        let InLoopCrash::Symbolize(signature) =
+            symbolization.classify(&first, Some(&first_stderr), &mut dedup)
+        else {
+            panic!("a new signature is symbolized");
+        };
+        // Its symbolized re-run is reported under the root cause's key.
+        let symbolized = sanitizer_report("BHF-201", vec!["copy_record", "bhf_run_one"]);
+        let key = dedup.first_sighting(&symbolized).unwrap();
+        dedup.consumed(key.clone());
+        symbolization.symbolized(signature, key.clone());
+
+        let (again, again_stderr) = unsymbolized(&["0x12b1b2", "0x13f001"]);
+        assert_eq!(
+            symbolization.classify(&again, Some(&again_stderr), &mut dedup),
+            InLoopCrash::Duplicate
+        );
+        assert_eq!(dedup.duplicate_hits().get(&key), Some(&1));
+        // Another call path is a new signature.
+        let (other, other_stderr) = unsymbolized(&["0x12b1b2", "0x140aa0"]);
+        assert!(matches!(
+            symbolization.classify(&other, Some(&other_stderr), &mut dedup),
+            InLoopCrash::Symbolize(_)
+        ));
+        // A symbolized report goes on as it is.
+        assert_eq!(
+            symbolization.classify(&symbolized, None, &mut dedup),
+            InLoopCrash::AsIs
+        );
+    }
+
+    #[test]
+    fn a_signature_whose_rerun_never_crashes_is_given_up() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let symbolization = InLoopSymbolization::default();
+        let (report, stderr) = unsymbolized(&["0x4242"]);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let InLoopCrash::Symbolize(signature) =
+                symbolization.classify(&report, Some(&stderr), &mut dedup)
+            else {
+                panic!("re-run until given up");
+            };
+            dedup.unconfirmed(signature);
+        }
+        assert_eq!(
+            symbolization.classify(&report, Some(&stderr), &mut dedup),
+            InLoopCrash::Duplicate
+        );
+    }
+
+    #[test]
+    fn the_loops_children_neither_symbolize_nor_abort() {
+        let env = vec![
+            (
+                "ASAN_OPTIONS".to_owned(),
+                "detect_leaks=1:symbolize=1".to_owned(),
+            ),
+            ("UBSAN_OPTIONS".to_owned(), "halt_on_error=1".to_owned()),
+            ("BHF_COV_SHM".to_owned(), "/w/cov".to_owned()),
+        ];
+        let loop_env = in_loop_env(&env, false);
+        assert_eq!(
+            loop_env[0].1,
+            "detect_leaks=1:symbolize=1:symbolize=0:abort_on_error=0"
+        );
+        assert_eq!(
+            loop_env[1].1,
+            "halt_on_error=1:symbolize=0:abort_on_error=0"
+        );
+        assert_eq!(loop_env[2], env[2]);
+        // BHF_IN_LOOP_SYMBOLIZE=1 keeps the loop as it was.
+        assert_eq!(in_loop_env(&env, true), env);
+    }
+
     fn missing_return_at(line: u32) -> corpus::SanitizerReport {
         corpus::parse_sanitizer_report(&format!(
             "/src/widget/classify.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
@@ -13661,13 +14085,16 @@ exit 0
     /// with its stack, after the options the run already had.
     #[test]
     fn hang_confirmations_arm_handle_abort_after_the_run_options() {
-        let env = hang_stack_env(&[
-            (
-                "ASAN_OPTIONS".to_owned(),
-                "abort_on_error=1:symbolize=1".to_owned(),
-            ),
-            ("BHF_COV_SHM".to_owned(), "/dev/shm/x".to_owned()),
-        ]);
+        let env = hang_stack_env(
+            &[
+                (
+                    "ASAN_OPTIONS".to_owned(),
+                    "abort_on_error=1:symbolize=1".to_owned(),
+                ),
+                ("BHF_COV_SHM".to_owned(), "/dev/shm/x".to_owned()),
+            ],
+            Duration::from_secs(20),
+        );
         let value = |key: &str| {
             env.iter()
                 .find(|(name, _)| name == key)
@@ -13684,6 +14111,29 @@ exit 0
                 "{key}: {env:?}"
             );
         }
+        // An interpreted lane's driver reports its frames at the 20s limit,
+        // and the re-run is stopped 2s later.
+        assert_eq!(value(HANG_REPORT_ENV), Some("20000"));
+        assert_eq!(
+            hang_report_slack(Duration::from_secs(20)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            hang_report_slack(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+    }
+
+    /// A driver's frames make the report's stack.
+    #[test]
+    fn an_interpreted_lanes_hang_is_keyed_on_the_frames_its_driver_printed() {
+        let report = hang_report(
+            "== bhf hang: python\n== bhf frame: spin @ /src/t.py:3\n",
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+        assert_eq!(report.stack[0].function, "spin");
+        assert_eq!(report.stack[0].file.as_deref(), Some("/src/t.py"));
     }
 
     /// `500ms` and `0.5s` are half a second, and a value with another unit
@@ -13965,6 +14415,43 @@ exit 0
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--len-control" && pair[1] == "7"));
+    }
+
+    #[test]
+    fn progress_lines_come_two_seconds_in_then_at_doubling_gaps_up_to_thirty_seconds() {
+        let lines = ProgressLines::new();
+        let at = |secs: u64| {
+            lines.line(&FuzzTick {
+                executions: 400 * secs as usize,
+                findings: 1,
+                edges: 37,
+                corpus: 5,
+                elapsed: Duration::from_secs(secs),
+            })
+        };
+        assert_eq!(at(1), None);
+        let first = at(2).expect("a line 2s in");
+        assert_eq!(
+            first,
+            "bhf: fuzz: 800 execs (400/s) | corpus: 5 | findings: 1 | edges: 37 | elapsed: 2.0s"
+        );
+        assert_eq!(at(3), None);
+        assert!(at(4).is_some());
+        assert_eq!(at(7), None);
+        assert!(at(8).is_some());
+        assert!(at(16).is_some());
+        assert!(at(32).is_some());
+        // From here at most 30s apart.
+        assert_eq!(at(61), None);
+        assert!(at(62).is_some());
+        assert!(at(92).is_some());
+    }
+
+    #[test]
+    fn workers_run_quiet() {
+        let args_dir = tmpdir();
+        let args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Auto);
+        assert!(worker_passthrough_args(&args).contains(&"--quiet".to_owned()));
     }
 
     #[test]
@@ -15701,6 +16188,7 @@ exit 0
             max_len: DEFAULT_MAX_LEN,
             len_control: DEFAULT_LEN_CONTROL,
             print_final_stats: false,
+            quiet: true,
             rss_limit_mb: 0,
             fork_server: false,
             no_fork_server: false,

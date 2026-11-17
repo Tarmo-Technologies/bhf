@@ -1,0 +1,276 @@
+{
+ "lane": "go",
+ "repo": "junegunn/fzf",
+ "stars": 81969,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/go/junegunn__fzf --json --out /home/ubuntu/bhf-sweep-work/go__junegunn__fzf.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "languages": 3,
+   "sloc_total": 34233,
+   "sloc_by_lang": {
+    "go": 26611,
+    "ruby": 7114,
+    "config": 508
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/go/junegunn__fzf --format json --top 100000",
+   "exit": 0,
+   "wall_s": 0.08,
+   "timed_out": false,
+   "panic": false,
+   "count": 352,
+   "by_language": {
+    "go": 352
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/go/junegunn__fzf --out /home/ubuntu/bhf-sweep-work/go__junegunn__fzf/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 0.15,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 31,
+   "by_severity": {
+    "high": 17,
+    "medium": 9,
+    "critical": 5
+   },
+   "top_rules": {
+    "BHF-405": 16,
+    "BHF-436": 7,
+    "BHF-404": 4,
+    "BHF-472": 1,
+    "BHF-500": 1,
+    "BHF-477": 1,
+    "BHF-304": 1
+   },
+   "gaps": 227
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/go/junegunn__fzf --out /home/ubuntu/bhf-sweep-work/go__junegunn__fzf/sbom",
+   "exit": 0,
+   "wall_s": 0.01,
+   "timed_out": false,
+   "panic": false,
+   "components": 27
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/go/junegunn__fzf --work-dir /home/ubuntu/bhf-sweep-work/go__junegunn__fzf --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 0,
+   "wall_s": 38.31,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 10,
+    "discovered_total": 352,
+    "dropped_by_cap": 342,
+    "built": 9,
+    "built_and_fuzzed": 9,
+    "fuzzed_stub_only": 0,
+    "failed_build": 0,
+    "unsupported_params": 1,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 1,
+    "fidelity": {
+     "reduced_fidelity_targets": 0,
+     "dimensions": {
+      "arch": {
+       "status": "exercised",
+       "reason": "fuzzed natively on the host x86_64 target"
+      },
+      "endianness": {
+       "status": "exercised",
+       "reason": "native host target ran in little-endian"
+      },
+      "rtos_runtime": {
+       "status": "not_applicable",
+       "reason": "host process target has no RTOS runtime"
+      },
+      "hardware_peripherals": {
+       "status": "not_applicable",
+       "reason": "host process target has no hardware peripherals"
+      },
+      "concurrency": {
+       "status": "not_exercised",
+       "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+      },
+      "sanitizers": {
+       "status": "exercised",
+       "reason": "ran under asan+ubsan"
+      }
+     }
+    }
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "Read",
+     "source": "util_unix.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 807.0138188392956,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Tokenize",
+     "source": "tokenizer.go",
+     "outcome": "unsupported_params",
+     "retries": null,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": "unsupported Go parameter type `Delimiter` (skipped)",
+     "stub_only": null,
+     "blind_stub_fraction": null
+    },
+    {
+     "name": "Read",
+     "source": "util_windows.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1547.090608355244,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "ParseOptions",
+     "source": "options.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 7287.9801930581825,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "IndexByteTwo",
+     "source": "indexbyte2_other.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 11380.377616807993,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "IndexByteTwo",
+     "source": "indexbyte2_arm64.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 11705.536660979562,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "IndexByteTwo",
+     "source": "indexbyte2_amd64.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 12064.787742192451,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "CompareVersions",
+     "source": "util.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 13921.53266038075,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "Init",
+     "source": "algo.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 12100.771853766913,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    },
+    {
+     "name": "HexToColor",
+     "source": "tui.go",
+     "outcome": "built_and_fuzzed",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": 1319.5610490003046,
+     "reason": null,
+     "stub_only": false,
+     "blind_stub_fraction": 0.0
+    }
+   ],
+   "blockers": [
+    {
+     "category": "unsupported_params",
+     "count": 1,
+     "detail": "unsupported Go parameter type \"Delimiter\" (skipped)",
+     "language": "go"
+    }
+   ],
+   "findings_detail": [
+    {
+     "id": "F-0000-a771d106",
+     "rule": "BHF-201",
+     "cwe": [
+      "CWE-125",
+      "CWE-787"
+     ],
+     "cwe_name": "Out-of-bounds Read",
+     "kind": null,
+     "severity": null,
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-G0187-EFACA18F",
+     "frames": [
+      "github.com/junegunn/fzf/src/tui.HexToColor"
+     ],
+     "message": "Go panic: runtime error: slice bounds out of range [:3] with length 0"
+    }
+   ]
+  }
+ },
+ "sha": "d39595ae66e2835561f6caf2b9478e887a269362",
+ "clone_s": 0.0,
+ "lane_check": "go: 82 files / 28870 lines; top=go(28870)",
+ "status": "done"
+}

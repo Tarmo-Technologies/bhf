@@ -136,6 +136,27 @@ function bhf_target_frames(Throwable $e): array {
 
 $BHF_RUN_ONE = null; // the generated harness entry
 
+// In bhf's re-run of an input that hung, print the frames the target is
+// running once the run reaches BHF_HANG_REPORT_MS (rounded up to a second,
+// pcntl_alarm's unit, within the time bhf leaves past it), then halt: bhf keys the hang finding on them. With
+// async signals PHP runs SIGALRM's handler between opcodes, so a target
+// looping in PHP is interrupted where it loops. Needs the pcntl extension.
+function bhf_arm_hang_report(): void {
+    $after = getenv('BHF_HANG_REPORT_MS');
+    if ($after === false || !ctype_digit($after) || (int)$after <= 0) return;
+    if (!function_exists('pcntl_signal') || !function_exists('pcntl_alarm')) return;
+    pcntl_async_signals(true);
+    pcntl_signal(SIGALRM, function () {
+        $frames = bhf_target_frames(new Exception());
+        fwrite(STDERR, "== bhf hang: php\n");
+        foreach ($frames as $frame) {
+            fwrite(STDERR, "== bhf frame: $frame\n");
+        }
+        exit(FINDING_HALT);
+    });
+    pcntl_alarm(max(1, intdiv((int)$after + 999, 1000)));
+}
+
 function bhf_run_input(string $data): void {
     global $BHF_RUN_ONE, $have_pcov;
     if ($have_pcov) \pcov\clear();
@@ -202,6 +223,7 @@ if (getenv('BHF_FRAMED') !== false) {
         }
     }
 } else {
+    bhf_arm_hang_report();
     $data = '';
     if (isset($argv[1]) && is_file($argv[1])) {
         $data = file_get_contents($argv[1]);

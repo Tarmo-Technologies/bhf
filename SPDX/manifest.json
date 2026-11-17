@@ -1735,6 +1735,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/shared_map.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/winafl.rs",
       "license": "Apache-2.0"
     },
@@ -2187,7 +2191,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_consent_required.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_constant_shell_command.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_coverage_scope.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2412,6 +2424,10 @@
     },
     {
       "path": "crates/cli/tests/auto_js_unconstructible_receiver.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_lane_generation_metadata.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2799,6 +2815,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_crash_throughput.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_interrupt_cleanup.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_lane_flag_conflicts.rs",
       "license": "Apache-2.0"
     },
@@ -2807,11 +2831,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_progress_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/generate_harness_languages.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/cli/tests/hang_findings_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/interpreted_hang_findings.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2871,7 +2903,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/m19_docs_auto_flags.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/m19_docs_cli_examples.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/m19_docs_layout.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5176,6 +5216,10 @@
     },
     {
       "path": "docs/validation/2026-10-05-windows-installer-results.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-16-go-resweep.md",
       "license": "Apache-2.0"
     },
     {

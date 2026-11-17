@@ -830,6 +830,14 @@ pub enum Outcome {
     MissingToolchain {
         reason: String,
     },
+    /// The target's build runs project-controlled code (Cargo build scripts
+    /// and proc macros, MSBuild targets), which `--run-untrusted` consents to,
+    /// and the run did not give it. Not unsupported: the remedy is the
+    /// consent, never `--force`. Before it had its own outcome such a target
+    /// was recorded as `unsupported_params`.
+    ConsentRequired {
+        reason: String,
+    },
     /// The harness built, but its sanitizer runtime cannot start on this
     /// host: it dies before reaching the target on every input (`FATAL:
     /// ThreadSanitizer: unexpected memory mapping`, an AddressSanitizer
@@ -1031,6 +1039,16 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::ConsentRequired { reason } => AttemptTrace {
+                terminal_stage: "consent".to_owned(),
+                fallback_chain: vec!["consent_required".to_owned()],
+                reason_category: Some("consent_required".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::SanitizerRuntimeUnavailable { repairs, reason } => AttemptTrace {
                 terminal_stage: "runtime".to_owned(),
                 fallback_chain: vec![
@@ -1128,6 +1146,7 @@ impl Outcome {
             Outcome::UnsupportedParams { .. }
             | Outcome::UnsafeBuildPath { .. }
             | Outcome::MissingToolchain { .. }
+            | Outcome::ConsentRequired { .. }
             | Outcome::ReportOnly { .. } => return None,
         };
         repairs.iter().find_map(|r| match r {
@@ -1560,8 +1579,13 @@ fn attempt_unclassified(
     {
         return Ok(AttemptResult {
             candidate: candidate.clone(),
-            outcome: Outcome::UnsupportedParams {
-                reason: "project build requires --run-untrusted: Cargo build scripts/proc macros and MSBuild targets execute project-controlled code; stage dependencies and use network isolation".into(),
+            outcome: Outcome::ConsentRequired {
+                reason: format!(
+                    "needs --run-untrusted: a {} build runs project-controlled code (Cargo \
+                     build scripts and proc macros, MSBuild targets); stage dependencies and \
+                     use network isolation",
+                    crate::auto::candidate::lang_name(candidate.lang)
+                ),
             },
             harness_dir: crate::auto::layout::harness_dir(work_dir, &candidate.harness_id),
         });
@@ -2410,9 +2434,16 @@ fn run_attempt(
             }
             crate::auto::java_build::JavaBuildResult::Failed { reason, skip } => {
                 if skip {
+                    // A Maven or Gradle build refused for want of consent, whose
+                    // bare-javac fallback failed too: the remedy is the consent.
+                    let outcome = if reason.contains("requires --run-untrusted") {
+                        Outcome::ConsentRequired { reason }
+                    } else {
+                        Outcome::UnsupportedParams { reason }
+                    };
                     return Ok(AttemptResult {
                         candidate: candidate.clone(),
-                        outcome: Outcome::UnsupportedParams { reason },
+                        outcome,
                         harness_dir,
                     });
                 }
@@ -2695,7 +2726,15 @@ fn run_attempt(
             &candidate.harness_id,
             &source_root,
         ) {
-            crate::auto::cobol_build::CobolBuildResult::Built => {}
+            crate::auto::cobol_build::CobolBuildResult::Built => {
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "cobol",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
+            }
             crate::auto::cobol_build::CobolBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2735,7 +2774,15 @@ fn run_attempt(
             &candidate.harness_id,
             &source_root,
         ) {
-            crate::auto::fortran_build::FortranBuildResult::Built => {}
+            crate::auto::fortran_build::FortranBuildResult::Built => {
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "fortran",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
+            }
             crate::auto::fortran_build::FortranBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2892,6 +2939,13 @@ fn run_attempt(
                 // The binary now exists at harnesses/<id>/main; the repair loop's
                 // try_build sees it (try_build_rust returns Success) and runs the
                 // shared fuzz cascade. Fall through.
+                crate::generate_harness::record_lane_generation(
+                    &harness_dir,
+                    "rust",
+                    &candidate.name,
+                    candidate.line,
+                    "main.c",
+                );
             }
             crate::auto::rust_build::RustBuildResult::Failed { reason, skip } => {
                 if skip {
@@ -3724,18 +3778,17 @@ fn run_attempt(
                         findings: 0,
                         is_final: false,
                     });
-                    let tick =
-                        |executions: usize, findings: usize, edges: usize, elapsed: Duration| {
-                            progress.update(&ProgressUpdate {
-                                phase: Phase::Fuzz { pass: pass_label },
-                                elapsed,
-                                budget: time_budget,
-                                executions,
-                                edges,
-                                findings,
-                                is_final: false,
-                            });
-                        };
+                    let tick = |tick: &crate::fuzz::FuzzTick| {
+                        progress.update(&ProgressUpdate {
+                            phase: Phase::Fuzz { pass: pass_label },
+                            elapsed: tick.elapsed,
+                            budget: time_budget,
+                            executions: tick.executions,
+                            edges: tick.edges,
+                            findings: tick.findings,
+                            is_final: false,
+                        });
+                    };
                     let pass_started = std::time::Instant::now();
                     // #383: carry coverage forward — reseed this pass from the
                     // prior passes' persisted, signature-deduped corpus queue so
