@@ -479,6 +479,15 @@ fn target_fidelity(
     facts.sanitizers = names;
     facts.tsan_ran = tsan_ran;
     facts.fuzzing_build_mode = harness_fuzzing_build_mode(&r.harness_dir);
+    // #288: the browser globals the JS driver stood in for.
+    facts.environment_shim = std::fs::read_to_string(
+        r.harness_dir
+            .join(crate::auto::js_build::BROWSER_GLOBALS_RECORD),
+    )
+    .ok()
+    .map(|names| names.trim().replace(',', ", "))
+    .filter(|names| !names.is_empty())
+    .map(|names| format!("browser globals ({names})"));
     // A cross-built harness ran under the emulator recorded beside it: it
     // ran its own target, with only the sanitizers its build armed.
     let harness = r.harness_dir.join("main");

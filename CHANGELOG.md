@@ -2812,6 +2812,17 @@
   when bhf panics.
 
 ### Added
+- The JS lane runs browser-oriented modules (#288). A module that needs
+  `window`, `document` or `navigator`, at load or when called, gets inert
+  stand-ins for the browser globals Node lacks, and for any
+  `HTML…Element`, `SVG…Element` or `…Observer` class it hits. The harness's
+  `browser-globals.txt` records which, and later starts install them before
+  the target loads, as an ES module needs. The target's findings carry them
+  in `fidelity.environment_shim` and `fidelity_caveat`, since a finding may
+  depend on them. A module that tests `typeof window` gets none. These
+  modules were skipped as not loadable (JS-2). Re-running the sweep's 37 JS-2
+  targets built and fuzzed 23 of them
+  (`docs/validation/2026-11-18-js2-browser-globals.md`).
 - `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
   finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
   integer or flag to the first of 0, 1, -1 and its type's limits that still

@@ -176,6 +176,9 @@ pub struct FidelityFacts {
     /// Whether the C/C++ build defined `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`,
     /// or `None` for a lane that has no such build.
     pub fuzzing_build_mode: Option<FuzzingBuildMode>,
+    /// The parts of the environment the target expects that bhf stood in for
+    /// (`"browser globals: window, navigator"`), or `None` (#288).
+    pub environment_shim: Option<String>,
 }
 
 /// Whether a C/C++ harness was built with OSS-Fuzz's
@@ -202,6 +205,7 @@ impl FidelityFacts {
             target_triple: None,
             runner: None,
             fuzzing_build_mode: None,
+            environment_shim: None,
         }
     }
 }
@@ -233,6 +237,11 @@ pub struct Fidelity {
     /// lane without a C/C++ build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzing_build_mode: Option<FuzzingBuildMode>,
+    /// The parts of the environment the target expects that bhf stood in for,
+    /// with inert stand-ins (#288): a finding may depend on them rather than
+    /// on the target's real environment. Absent when bhf stood in for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_shim: Option<String>,
 }
 
 impl Fidelity {
@@ -274,6 +283,7 @@ impl Fidelity {
                 concurrency,
                 sanitizers,
                 fuzzing_build_mode: facts.fuzzing_build_mode,
+                environment_shim: facts.environment_shim.clone(),
             },
             // A cross-built target run under user-mode emulation: its own ISA
             // and byte order ran (emulated), never the host's; a user-mode
@@ -302,6 +312,7 @@ impl Fidelity {
                     concurrency,
                     sanitizers,
                     fuzzing_build_mode: facts.fuzzing_build_mode,
+                    environment_shim: facts.environment_shim.clone(),
                 }
             }
             // Native host target: the host IS the target, so arch and byte order
@@ -324,6 +335,7 @@ impl Fidelity {
                 concurrency,
                 sanitizers,
                 fuzzing_build_mode: facts.fuzzing_build_mode,
+                environment_shim: facts.environment_shim.clone(),
             },
         }
     }
@@ -342,6 +354,7 @@ impl Fidelity {
             concurrency: dim(),
             sanitizers: dim(),
             fuzzing_build_mode: None,
+            environment_shim: None,
         }
     }
 
@@ -370,8 +383,16 @@ impl Fidelity {
     /// so it never carries a spurious caveat. When present it enumerates every
     /// un-exercised dimension, including concurrency.
     pub fn caveat(&self) -> Option<String> {
+        // #288: stand-ins for the environment the target expects are a
+        // caveat on a native run too.
+        let shim = self.environment_shim.as_ref().map(|shim| {
+            format!(
+                "the target ran with bhf's inert stand-ins for {shim}; a finding may depend on \
+                 them rather than on the target's real environment"
+            )
+        });
         if !self.is_reduced_fidelity() {
-            return None;
+            return shim;
         }
         let mut gaps: Vec<&str> = Vec::new();
         for (label, dim) in [
@@ -385,11 +406,15 @@ impl Fidelity {
                 gaps.push(label);
             }
         }
-        Some(format!(
+        let caveat = format!(
             "reduced-fidelity: portable logic fuzzed on host; NOT exercised: {}. \
              Findings are host-stub evidence, not target assurance.",
             gaps.join(", "),
-        ))
+        );
+        Some(match shim {
+            Some(shim) => format!("{caveat} Also, {shim}."),
+            None => caveat,
+        })
     }
 
     /// Merge two records into the worst case per dimension (a genuine gap wins),
@@ -417,6 +442,10 @@ impl Fidelity {
                 }
                 (left, right) => left.or(right),
             },
+            environment_shim: match (&self.environment_shim, &other.environment_shim) {
+                (Some(left), Some(right)) if left != right => Some(format!("{left}; {right}")),
+                (left, right) => left.clone().or_else(|| right.clone()),
+            },
         }
     }
 
@@ -433,6 +462,43 @@ impl Fidelity {
 mod tests {
     use super::*;
 
+    /// #288: a native target run with stand-ins for its environment carries
+    /// a caveat saying so, and a rollup keeps every stand-in.
+    #[test]
+    fn an_environment_shim_is_a_caveat_on_a_native_run() {
+        let native = Fidelity::from_facts(&FidelityFacts::host());
+        assert_eq!(native.caveat(), None);
+        let mut facts = FidelityFacts::host();
+        facts.environment_shim = Some("browser globals (window, navigator)".to_owned());
+        let shimmed = Fidelity::from_facts(&facts);
+        assert!(!shimmed.is_reduced_fidelity());
+        let caveat = shimmed.caveat().unwrap();
+        assert!(
+            caveat.contains("stand-ins for browser globals (window, navigator)"),
+            "{caveat}"
+        );
+        let json = serde_json::to_value(&shimmed).unwrap();
+        assert_eq!(
+            json["environment_shim"],
+            "browser globals (window, navigator)"
+        );
+        assert!(serde_json::to_value(&native)
+            .unwrap()
+            .get("environment_shim")
+            .is_none());
+        let rollup = Fidelity::rollup([&native, &shimmed]).unwrap();
+        assert_eq!(rollup.environment_shim, shimmed.environment_shim);
+        let stubbed = Fidelity::from_facts(&FidelityFacts {
+            environment_shim: Some("browser globals (document)".to_owned()),
+            ..vxworks_facts()
+        });
+        let both = stubbed.caveat().unwrap();
+        assert!(
+            both.starts_with("reduced-fidelity") && both.contains("(document)"),
+            "{both}"
+        );
+    }
+
     fn vxworks_facts() -> FidelityFacts {
         FidelityFacts {
             platform_stub: Some("vxworks".to_owned()),
@@ -443,6 +509,7 @@ mod tests {
             target_triple: None,
             runner: None,
             fuzzing_build_mode: None,
+            environment_shim: None,
         }
     }
 

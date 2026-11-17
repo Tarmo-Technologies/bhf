@@ -13,6 +13,8 @@ current bhf drives.
       --all-lanes --jobs 2
   BHF_BIN=... go1_rerun.py results-0728 results-1117-rust4 --lang rust --class Rust-4 \\
       --all-lanes --run-untrusted
+  BHF_BIN=... go1_rerun.py results-0728 results-1118-js2 --lang javascript --class JS-2 \\
+      --all-lanes
 
 `--all-lanes` reads every lane's rows, not only the language's own: a project
 the sweep chose for another language can hold its code too. `--jobs` re-runs
@@ -24,6 +26,7 @@ import argparse
 import collections
 import concurrent.futures
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -70,11 +73,33 @@ def rust_class(target):
     return outcome or "other"
 
 
-# Per language: its source suffix and its classifier.
+# The browser globals a JS module under Node may lack (JS-2).
+BROWSER_GLOBALS = {"window", "self", "document", "navigator", "location", "localStorage"}
+
+
+def js_class(target):
+    """The expected-gaps.md class of a JavaScript or TypeScript target's outcome."""
+    outcome = target.get("outcome") or ""
+    reason = target.get("reason") or ""
+    if outcome == "built_and_fuzzed":
+        return "built and fuzzed"
+    missing = re.search(r"ReferenceError: (\w+) is not defined", reason)
+    if missing and missing.group(1) in BROWSER_GLOBALS:
+        return "JS-2 browser globals"
+    if "not loadable" in reason:
+        return "not loadable, another reason"
+    if outcome == "failed_build":
+        return "failed build"
+    return outcome or "other"
+
+
+# Per language: its source suffixes and its classifier.
 LANGS = {
     "go": (".go", go_class),
     "java": (".java", java_class),
     "rust": (".rs", rust_class),
+    "javascript": ((".js", ".mjs", ".cjs"), js_class),
+    "typescript": ((".ts", ".tsx", ".mts", ".cts"), js_class),
 }
 
 
