@@ -225,12 +225,28 @@ pub fn java_target_has_byte_channel(m: &JavaMethod) -> bool {
 /// A parameter type that hands the method attacker-controlled bytes: a byte array
 /// (`byte[]`), a `String`/`CharSequence`, an NIO `ByteBuffer`, a stream
 /// (`InputStream`), or a character `Reader`. `ty` is the collapsed type spelling
-/// (possibly package-qualified, e.g. `java.io.InputStream`).
+/// (possibly package-qualified, e.g. `java.io.InputStream`). A JDK collection
+/// of one (`List<String>`, `Map<String, Object>`) carries the input as
+/// directly. A `String[]` is not counted: every `main(String[])` would rank as
+/// a parser.
 fn is_byte_channel_type(ty: &str) -> bool {
     let t = ty.replace(' ', "");
     // The simple binary channel.
     if t == "byte[]" {
         return true;
+    }
+    if let Some((base, args)) = java_parser::split_generic_type(&t) {
+        if !args.is_empty() {
+            let leaf = base.rsplit('.').next().unwrap_or(&base);
+            return is_jdk_collection(leaf)
+                && args.iter().any(|arg| {
+                    let arg = arg
+                        .strip_prefix("?extends")
+                        .or_else(|| arg.strip_prefix("?super"))
+                        .unwrap_or(arg);
+                    is_byte_channel_type(arg)
+                });
+        }
     }
     // Strings / char sequences (take the last `.`-segment so package-qualified
     // names like `java.lang.String` match).
@@ -253,6 +269,33 @@ fn is_byte_channel_type(ty: &str) -> bool {
             | "URI"
             | "URL"
     ) || t == "java.nio.file.Path"
+}
+
+/// A JDK collection interface or class, by its simple name.
+fn is_jdk_collection(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "List"
+            | "ArrayList"
+            | "LinkedList"
+            | "Collection"
+            | "Iterable"
+            | "Set"
+            | "HashSet"
+            | "LinkedHashSet"
+            | "SortedSet"
+            | "NavigableSet"
+            | "TreeSet"
+            | "Queue"
+            | "Deque"
+            | "ArrayDeque"
+            | "Map"
+            | "HashMap"
+            | "LinkedHashMap"
+            | "SortedMap"
+            | "NavigableMap"
+            | "TreeMap"
+    )
 }
 
 fn name_has_parser_keyword(name: &str) -> bool {
@@ -447,6 +490,22 @@ mod tests {
         assert!(is_byte_channel_type("ByteBuffer"));
         assert!(!is_byte_channel_type("int"));
         assert!(!is_byte_channel_type("Foo"));
+    }
+
+    /// #236: a collection of strings hands the target the input.
+    #[test]
+    fn a_collection_of_strings_is_a_byte_channel() {
+        for ty in [
+            "List<String>",
+            "java.util.Map<String, Object>",
+            "Collection<? extends CharSequence>",
+            "List<byte[]>",
+        ] {
+            assert!(is_byte_channel_type(ty), "{ty}");
+        }
+        for ty in ["List<Integer>", "Optional<String>", "String[]"] {
+            assert!(!is_byte_channel_type(ty), "{ty}");
+        }
     }
 
     #[test]

@@ -1,0 +1,62 @@
+{
+ "repo": "bumptech/glide",
+ "sha": "688da5a311f0185c5d4ec97b4588c520d388c19c",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "GlideExecutor.java",
+   "name": "newDiskCacheExecutor",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'newDiskCacheExecutor' parameter #2 has an unsupported type `UncaughtThrowableStrategy`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type",
+    "consent_required"
+   ]
+  },
+  {
+   "source": "GlideExecutor.java",
+   "name": "newSourceExecutor",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'newSourceExecutor' parameter #2 has an unsupported type `UncaughtThrowableStrategy`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type",
+    "consent_required"
+   ]
+  },
+  {
+   "source": "GlideJournaledLruDiskCacheWrapper.java",
+   "name": "newInstance",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'newInstance' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 2,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 9,
+  "discovered_total": 9,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 6,
+  "consent_required": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

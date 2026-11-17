@@ -2733,6 +2733,25 @@
   when bhf panics.
 
 ### Added
+- The Java lane fuzzes a target that takes a JDK collection (#236):
+  `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
+  nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The
+  harness declared every local with `var`, which infers the wrong element
+  type for a collection built from the input, so these were skipped as
+  unsupported. A collection local is declared with its parsed type, spelled
+  fully qualified, and filled with a fuzzed number of elements (0 to 8),
+  each decoded by its type: a string, a boxed scalar, an `Object`, a
+  `byte[]`, an enum constant, a default instance of a tree type, or another
+  collection. A sorted collection is used only for elements that compare with
+  each other. A collection of strings ranks as a byte channel, as a string
+  does, and a `java.util.Random` parameter is seeded from the input.
+  Of the 57 targets the 2026-07-28 sweep skipped as Java-1, 7 now pass the
+  parameter they were skipped on and none builds: five need the project's
+  Maven or Gradle build, which fails, one fails javac on the tree, and one
+  stops at its next parameter
+  (`docs/validation/2026-11-16-java1-collections.md`). `go1_rerun.py` re-runs
+  Java targets (`--lang java`), several projects at once (`--jobs`), and can
+  let bhf run a project's build (`--run-untrusted`).
 - The Go lane fuzzes a package outside every Go module (#237): a GOPATH-era
   tree, or a dir of `.go` files. Its harness imports the target through a
   module `replace`, which needs a dir with a `go.mod`, so these were skipped.

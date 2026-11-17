@@ -1,0 +1,45 @@
+{
+ "repo": "krisds/koopa",
+ "sha": "9d63708848d724a382aa6d48fca71e8f9e2a7d29",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "Jaxen.java",
+   "name": "evaluate",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'evaluate' parameter #0 has an unsupported type `Tree`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "Stage.java",
+   "name": "Stage",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'Stage' parameter #0 has an unsupported type `SuiteOfStages`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

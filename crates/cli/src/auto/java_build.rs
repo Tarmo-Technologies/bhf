@@ -322,12 +322,14 @@ fn collect_param_type_models(
     target: &java_parser::JavaMethod,
 ) -> Vec<java_parser::JavaTypeModel> {
     // Leaf names of parameter types the cursor can't decode directly (the candidates
-    // for model-based construction). Arrays and generic-only spellings are excluded.
+    // for model-based construction), and of their type arguments: a
+    // `List<Entry>` is filled with default `Entry`s. Arrays and generic-only
+    // spellings are excluded.
     let wanted: HashSet<String> = target
         .params
         .iter()
         .filter(|p| decode_param_expr(&p.ty).is_none())
-        .filter_map(|p| custom_type_leaf(&p.ty))
+        .flat_map(|p| undecodable_type_names(&p.ty))
         .collect();
     if wanted.is_empty() {
         return Vec::new();
@@ -345,6 +347,24 @@ fn collect_param_type_models(
         }
     }
     models
+}
+
+/// The leaf names of `ty` and of every type argument in it that the cursor
+/// cannot decode: `Map<String, List<Entry>>` gives `Map`, `List` and `Entry`.
+fn undecodable_type_names(ty: &str) -> Vec<String> {
+    let mut names: Vec<String> = custom_type_leaf(ty).into_iter().collect();
+    if let Some((_, args)) = java_parser::split_generic_type(ty) {
+        for arg in args {
+            let arg = arg
+                .strip_prefix("?extends")
+                .or_else(|| arg.strip_prefix("?super"))
+                .unwrap_or(&arg);
+            if decode_param_expr(arg).is_none() {
+                names.extend(undecodable_type_names(arg));
+            }
+        }
+    }
+    names
 }
 
 /// The leaf type name of a non-array, non-generic-only parameter spelling, or
@@ -1468,6 +1488,14 @@ mod tests {
             &["P"],
         );
         assert!(collect_param_type_models(root, &pkg.join("CSVParser.java"), &charset).is_empty());
+    }
+
+    #[test]
+    fn a_collections_element_types_are_modelled_too() {
+        let mut names = undecodable_type_names("Map<String, List<? extends Entry>>");
+        names.sort();
+        assert_eq!(names, ["Entry", "List", "Map"]);
+        assert_eq!(undecodable_type_names("List<String>"), ["List"]);
     }
 
     #[test]

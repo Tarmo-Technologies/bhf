@@ -1,0 +1,35 @@
+{
+ "repo": "alibaba/nacos",
+ "sha": "1ecc39c45ca103fb8e026edc33fca222283da8be",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "McpRequestUtil.java",
+   "name": "deserializeSpec",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'deserializeSpec' parameter #1 has an unsupported type `TypeReference<T>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 2,
+   "classes": [
+    "Java-1 unsupported parameter type",
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

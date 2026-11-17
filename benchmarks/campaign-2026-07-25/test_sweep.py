@@ -155,6 +155,30 @@ class GoRerunTests(unittest.TestCase):
                 {("api.go", "Serve"): 1},
             )
 
+    def test_java_targets_are_selected_by_their_own_classes(self):
+        java1 = "Java target 'join' parameter #0 has an unsupported type `List<String>`"
+        with TemporaryDirectory() as tmp:
+            before = Path(tmp)
+            row = {
+                "repo": "o/r",
+                "sha": "s",
+                "surfaces": {
+                    "auto": {
+                        "targets": [
+                            {"source": "Parts.java", "name": "join", "reason": java1},
+                            {"source": "parts.go", "name": "Join", "reason": java1},
+                        ]
+                    }
+                },
+            }
+            (before / "cobol__o__r.json").write_text(json.dumps(row))
+            wanted = go1_rerun.wanted_targets(before, "Java-1", all_lanes=True, lang="java")
+            self.assertEqual(wanted["cobol__o__r.json"][1], {("Parts.java", "join"): 1})
+            self.assertEqual(
+                go1_rerun.wanted_targets(before, "Java-1", all_lanes=False, lang="java"), {}
+            )
+        self.assertEqual(go1_rerun.java_class({"outcome": "built_and_fuzzed"}), "built and fuzzed")
+
 
 if __name__ == "__main__":
     unittest.main()

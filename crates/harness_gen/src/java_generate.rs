@@ -13,7 +13,10 @@
 //! it over the persistent `BHF_FRAMED` fork-server protocol — no Jazzer.
 //!
 //! Locals are declared with `var` so the harness needs no target-specific imports
-//! (the decode expressions are fully qualified). The exception/noise policy lives
+//! (the decode expressions are fully qualified). A collection parameter
+//! (`List<String>`, `Map<String, Object>`) is declared with its parsed type,
+//! spelled fully qualified: its elements are decoded from the input, and the
+//! declared type is what fixes their type ([`collection_value`]). The exception/noise policy lives
 //! in the Driver (runtime class inspection), so the harness has no try/catch.
 
 use java_parser::{JavaMethod, JavaTypeModel};
@@ -139,6 +142,14 @@ pub fn generate_java_direct_harness(
         // skip into a failed build. When the scanned tree owns the name, its own
         // model wins.
         let tree_owns_the_name = type_model_for(&p.ty, &args.param_types).is_some();
+        if let Some(value) = (!tree_owns_the_name)
+            .then(|| collection_value(&p.ty, &args.enum_types, &args.param_types, 0))
+            .flatten()
+        {
+            decls.push(format!("        {} a{i} = {};", value.spelled, value.expr));
+            call_args.push(format!("a{i}"));
+            continue;
+        }
         let expr = if let Some(fqn) = enum_fqn_for(&p.ty, &args.enum_types) {
             format!("{fqn}.values()[Math.floorMod(c.consumeInt(), {fqn}.values().length)]")
         } else if let Some(e) = (!tree_owns_the_name)
@@ -205,11 +216,15 @@ fn render_harness(
             decls.join("\n")
         )
     };
-    let helpers = if body.contains(TEMP_FILE_CALL) {
-        TEMP_FILE_HELPER
-    } else {
-        ""
-    };
+    let helpers: String = [
+        (TEMP_FILE_CALL, TEMP_FILE_HELPER),
+        (FILL_CALL, FILL_HELPER),
+        (FILL_MAP_CALL, FILL_MAP_HELPER),
+    ]
+    .into_iter()
+    .filter(|(call, _)| body.contains(call))
+    .map(|(_, helper)| helper)
+    .collect();
     let package_declaration = package
         .map(|name| format!("package {name};\n\n"))
         .unwrap_or_default();
@@ -467,6 +482,11 @@ fn decode_expr(ty: &str, is_rest: bool) -> Option<String> {
         // them (e.g. `CSVParser.parse(File, Charset, CSVFormat)`) become fuzzable.
         "Charset" => "java.nio.charset.StandardCharsets.UTF_8",
         "Locale" => "java.util.Locale.ROOT",
+        // A random source seeded from the input, so a replay draws the same
+        // numbers.
+        "Random" if matches!(base, "Random" | "java.util.Random") => {
+            "new java.util.Random(c.consumeLong())"
+        }
         "TimeZone" => "java.util.TimeZone.getTimeZone(\"UTC\")",
         "Reader" | "InputStreamReader" | "BufferedReader" => {
             "new java.io.InputStreamReader(new java.io.ByteArrayInputStream(\
@@ -527,8 +547,255 @@ const TEMP_FILE_HELPER: &str = concat!(
 /// uses this to fabricate constructor/factory arguments when synthesising a
 /// receiver (#459); a `None` is its cue to pass `null`.
 pub fn decode_param_expr(ty: &str) -> Option<String> {
-    decode_expr(ty, false)
+    decode_expr(ty, false).or_else(|| collection_value(ty, &[], &[], 0).map(|value| value.expr))
 }
+
+/// A decoded value of a collection or element type: the type spelled fully
+/// qualified, the expression that decodes it, and whether its values are
+/// `Comparable` with each other (a `TreeSet` element or `TreeMap` key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedValue {
+    spelled: String,
+    expr: String,
+    comparable: bool,
+}
+
+/// How deep collections nest before the decoder gives up.
+const MAX_COLLECTION_DEPTH: usize = 3;
+
+/// A string element: a length byte, then up to 32 bytes. The bounded scalar
+/// string takes a fixed 64-byte slice, which would spend 64 bytes of input on
+/// every element of a list.
+const ELEMENT_STRING: &str = "new String(c.consumeBytes(Math.floorMod(c.consumeByte(), 33)), \
+                              java.nio.charset.StandardCharsets.UTF_8)";
+
+/// A JDK collection interface or class: how the harness spells it, the class
+/// it builds, whether it is a map, and whether it is sorted.
+struct Container {
+    spelled: &'static str,
+    builds: &'static str,
+    map: bool,
+    sorted: bool,
+}
+
+fn container(base: &str) -> Option<Container> {
+    let leaf = base
+        .strip_prefix("java.util.")
+        .or_else(|| base.strip_prefix("java.lang."))
+        .unwrap_or(base);
+    if leaf.contains('.') {
+        return None;
+    }
+    let (spelled, builds, map, sorted) = match leaf {
+        "List" => ("java.util.List", "java.util.ArrayList", false, false),
+        "ArrayList" => ("java.util.ArrayList", "java.util.ArrayList", false, false),
+        "LinkedList" => ("java.util.LinkedList", "java.util.LinkedList", false, false),
+        "Collection" => ("java.util.Collection", "java.util.ArrayList", false, false),
+        "Iterable" => ("java.lang.Iterable", "java.util.ArrayList", false, false),
+        // A linked set and map iterate in insertion order, so a replay sees the
+        // elements in the order the input gave them.
+        "Set" => ("java.util.Set", "java.util.LinkedHashSet", false, false),
+        "HashSet" => ("java.util.HashSet", "java.util.HashSet", false, false),
+        "LinkedHashSet" => (
+            "java.util.LinkedHashSet",
+            "java.util.LinkedHashSet",
+            false,
+            false,
+        ),
+        "SortedSet" => ("java.util.SortedSet", "java.util.TreeSet", false, true),
+        "NavigableSet" => ("java.util.NavigableSet", "java.util.TreeSet", false, true),
+        "TreeSet" => ("java.util.TreeSet", "java.util.TreeSet", false, true),
+        "Queue" => ("java.util.Queue", "java.util.ArrayDeque", false, false),
+        "Deque" => ("java.util.Deque", "java.util.ArrayDeque", false, false),
+        "ArrayDeque" => ("java.util.ArrayDeque", "java.util.ArrayDeque", false, false),
+        "Map" => ("java.util.Map", "java.util.LinkedHashMap", true, false),
+        "HashMap" => ("java.util.HashMap", "java.util.HashMap", true, false),
+        "LinkedHashMap" => (
+            "java.util.LinkedHashMap",
+            "java.util.LinkedHashMap",
+            true,
+            false,
+        ),
+        "SortedMap" => ("java.util.SortedMap", "java.util.TreeMap", true, true),
+        "NavigableMap" => ("java.util.NavigableMap", "java.util.TreeMap", true, true),
+        "TreeMap" => ("java.util.TreeMap", "java.util.TreeMap", true, true),
+        _ => return None,
+    };
+    Some(Container {
+        spelled,
+        builds,
+        map,
+        sorted,
+    })
+}
+
+/// A collection parameter decoded from the input: a fuzzed number of
+/// elements (0 to 8), each decoded by its type. A raw collection holds
+/// strings. A sorted collection needs elements that compare with each other;
+/// an `int[]`, `long[]` or `double[]` is decoded as a list and unboxed. `None`
+/// for anything else, or an element type that cannot be decoded.
+fn collection_value(
+    ty: &str,
+    enum_types: &[String],
+    models: &[JavaTypeModel],
+    depth: usize,
+) -> Option<DecodedValue> {
+    if depth >= MAX_COLLECTION_DEPTH {
+        return None;
+    }
+    let bare: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(element) = bare.strip_suffix("[]") {
+        let (boxed, unbox, stream) = match element {
+            "int" => (
+                "java.lang.Integer",
+                "c.consumeInt()",
+                "mapToInt(java.lang.Integer::intValue)",
+            ),
+            "long" => (
+                "java.lang.Long",
+                "c.consumeLong()",
+                "mapToLong(java.lang.Long::longValue)",
+            ),
+            "double" => (
+                "java.lang.Double",
+                "c.consumeDouble()",
+                "mapToDouble(java.lang.Double::doubleValue)",
+            ),
+            _ => return None,
+        };
+        return Some(DecodedValue {
+            spelled: bare.clone(),
+            expr: format!(
+                "bhfFill(c, new java.util.ArrayList<{boxed}>(), () -> {unbox}).stream().{stream}.toArray()"
+            ),
+            comparable: false,
+        });
+    }
+    let (base, args) = java_parser::split_generic_type(&bare)?;
+    let container = container(&base)?;
+    let element = |ty: &str| element_value(ty, enum_types, models, depth + 1);
+    let string = || element("String");
+    if container.map {
+        let (key, value) = match args.as_slice() {
+            [] => (string()?, string()?),
+            [key, value] => (element(key)?, element(value)?),
+            _ => return None,
+        };
+        if container.sorted && !key.comparable {
+            return None;
+        }
+        let types = format!("{}, {}", key.spelled, value.spelled);
+        return Some(DecodedValue {
+            spelled: format!("{}<{types}>", container.spelled),
+            expr: format!(
+                "bhfFillMap(c, new {}<{types}>(), () -> {}, () -> {})",
+                container.builds, key.expr, value.expr
+            ),
+            comparable: false,
+        });
+    }
+    let item = match args.as_slice() {
+        [] => string()?,
+        [item] => element(item)?,
+        _ => return None,
+    };
+    if container.sorted && !item.comparable {
+        return None;
+    }
+    Some(DecodedValue {
+        spelled: format!("{}<{}>", container.spelled, item.spelled),
+        expr: format!(
+            "bhfFill(c, new {}<{}>(), () -> {})",
+            container.builds, item.spelled, item.expr
+        ),
+        comparable: false,
+    })
+}
+
+/// One element of a collection: a string, a boxed scalar, an `Object`, a
+/// `byte[]`, an enum constant, a default instance of a tree type, or a nested
+/// collection. A wildcard is its bound, and an unbounded one a string.
+fn element_value(
+    ty: &str,
+    enum_types: &[String],
+    models: &[JavaTypeModel],
+    depth: usize,
+) -> Option<DecodedValue> {
+    let ty = ty
+        .strip_prefix("?extends")
+        .or_else(|| ty.strip_prefix("?super"))
+        .unwrap_or(ty);
+    let ty = if ty == "?" { "String" } else { ty };
+    let lang = ty.strip_prefix("java.lang.").unwrap_or(ty);
+    let value = |spelled: &str, expr: &str, comparable: bool| {
+        Some(DecodedValue {
+            spelled: spelled.to_owned(),
+            expr: expr.to_owned(),
+            comparable,
+        })
+    };
+    match lang {
+        "String" => return value("java.lang.String", ELEMENT_STRING, true),
+        "CharSequence" => return value("java.lang.CharSequence", ELEMENT_STRING, false),
+        "Integer" => return value("java.lang.Integer", "c.consumeInt()", true),
+        "Long" => return value("java.lang.Long", "c.consumeLong()", true),
+        "Short" => return value("java.lang.Short", "c.consumeShort()", true),
+        "Byte" => return value("java.lang.Byte", "c.consumeByte()", true),
+        "Boolean" => return value("java.lang.Boolean", "c.consumeBoolean()", true),
+        "Character" => return value("java.lang.Character", "c.consumeChar()", true),
+        "Double" => return value("java.lang.Double", "c.consumeDouble()", true),
+        "Float" => return value("java.lang.Float", "c.consumeFloat()", true),
+        "Object" => {
+            return value(
+                "java.lang.Object",
+                &decode_expr("Object", false).expect("Object always decodes"),
+                false,
+            )
+        }
+        "byte[]" => {
+            return value(
+                "byte[]",
+                "c.consumeBytes(Math.floorMod(c.consumeByte(), 33))",
+                false,
+            )
+        }
+        _ => {}
+    }
+    if let Some(fqn) = enum_fqn_for(ty, enum_types) {
+        return value(
+            fqn,
+            &format!("{fqn}.values()[Math.floorMod(c.consumeInt(), {fqn}.values().length)]"),
+            true,
+        );
+    }
+    if let Some(model) = type_model_for(ty, models) {
+        return value(&model.fqn, &construct_from_model(model)?, false);
+    }
+    collection_value(ty, enum_types, models, depth)
+}
+
+/// The fill helpers a collection decode calls, emitted only when one does.
+const FILL_CALL: &str = "bhfFill(";
+const FILL_MAP_CALL: &str = "bhfFillMap(";
+const FILL_HELPER: &str = concat!(
+    "\x20   /** Add a fuzzed number of elements (0 to 8) to a collection. */\n",
+    "\x20   private static <T, C extends java.util.Collection<T>> C bhfFill(\n",
+    "\x20           com.bhf.BhfData c, C out, java.util.function.Supplier<T> next) {\n",
+    "\x20       for (int n = Math.floorMod(c.consumeByte(), 9); n > 0; n--) out.add(next.get());\n",
+    "\x20       return out;\n",
+    "\x20   }\n",
+);
+const FILL_MAP_HELPER: &str = concat!(
+    "\x20   /** Put a fuzzed number of entries (0 to 8) in a map. */\n",
+    "\x20   private static <K, V, M extends java.util.Map<K, V>> M bhfFillMap(\n",
+    "\x20           com.bhf.BhfData c, M out, java.util.function.Supplier<K> key,\n",
+    "\x20           java.util.function.Supplier<V> value) {\n",
+    "\x20       for (int n = Math.floorMod(c.consumeByte(), 9); n > 0; n--) {\n",
+    "\x20           out.put(key.get(), value.get());\n",
+    "\x20       }\n",
+    "\x20       return out;\n",
+    "\x20   }\n",
+);
 
 /// Whether a parameter type is an attacker byte channel (so it should win the rest
 /// channel). Mirrors `target_rank::java_rank::is_byte_channel_type` but also counts
@@ -1174,5 +1441,170 @@ mod tests {
             h.harness_java
         );
         assert!(h.harness_java.contains("com.acme.P.decodeHex(a0);"));
+    }
+
+    /// #236: a `List<String>` is declared with its parsed type, spelled fully
+    /// qualified, and filled with strings decoded from the input. `var` would
+    /// infer the wrong element type for an empty list.
+    #[test]
+    fn a_list_of_strings_is_declared_with_its_type_and_filled_from_the_input() {
+        let h = gen(
+            "com.acme.P",
+            method("join", &[("parts", "List<String>")], true, false),
+        )
+        .unwrap();
+        assert!(
+            h.harness_java.contains(&format!(
+                "        java.util.List<java.lang.String> a0 = bhfFill(c, \
+                 new java.util.ArrayList<java.lang.String>(), () -> {ELEMENT_STRING});"
+            )),
+            "{}",
+            h.harness_java
+        );
+        assert!(h
+            .harness_java
+            .contains("private static <T, C extends java.util.Collection<T>> C bhfFill("));
+        assert!(
+            !h.harness_java.contains("bhfFillMap("),
+            "{}",
+            h.harness_java
+        );
+        assert!(h.harness_java.contains("com.acme.P.join(a0);"));
+    }
+
+    #[test]
+    fn maps_sets_wildcards_nesting_and_primitive_arrays_decode() {
+        let decoded = |ty: &str| collection_value(ty, &[], &[], 0).map(|value| value.spelled);
+        assert_eq!(
+            decoded("Map<String, Object>").as_deref(),
+            Some("java.util.Map<java.lang.String, java.lang.Object>")
+        );
+        assert_eq!(
+            decoded("java.util.List<Set<Integer>>").as_deref(),
+            Some("java.util.List<java.util.Set<java.lang.Integer>>")
+        );
+        assert_eq!(
+            decoded("Collection<? extends CharSequence>").as_deref(),
+            Some("java.util.Collection<java.lang.CharSequence>")
+        );
+        assert_eq!(
+            decoded("List<?>").as_deref(),
+            Some("java.util.List<java.lang.String>")
+        );
+        // A raw collection holds strings.
+        assert_eq!(
+            decoded("Map").as_deref(),
+            Some("java.util.Map<java.lang.String, java.lang.String>")
+        );
+        assert_eq!(
+            decoded("SortedMap<String, byte[]>").as_deref(),
+            Some("java.util.SortedMap<java.lang.String, byte[]>")
+        );
+        assert_eq!(decoded("int[]").as_deref(), Some("int[]"));
+        let ints = collection_value("int[]", &[], &[], 0).unwrap().expr;
+        assert!(
+            ints.ends_with(".stream().mapToInt(java.lang.Integer::intValue).toArray()"),
+            "{ints}"
+        );
+
+        let map = gen(
+            "com.acme.P",
+            method("render", &[("vars", "Map<String,Object>")], true, false),
+        )
+        .unwrap()
+        .harness_java;
+        assert!(
+            map.contains(
+                "bhfFillMap(c, new java.util.LinkedHashMap<java.lang.String, java.lang.Object>(), "
+            ),
+            "{map}"
+        );
+        assert!(
+            map.contains("private static <K, V, M extends java.util.Map<K, V>> M bhfFillMap("),
+            "{map}"
+        );
+    }
+
+    /// A sorted collection of values that do not compare with each other
+    /// would throw ClassCastException on its second element: the harness's
+    /// fault, not the target's. So is a type it cannot decode, or nesting past
+    /// the limit.
+    #[test]
+    fn collections_the_harness_cannot_fill_correctly_are_refused() {
+        for ty in [
+            "TreeSet<Object>",
+            "SortedMap<Object, String>",
+            "List<Widget>",
+            "List<T>",
+            "List<List<List<List<String>>>>",
+            "Map<String>",
+            "short[]",
+            "com.acme.List<String>",
+        ] {
+            assert_eq!(collection_value(ty, &[], &[], 0), None, "{ty}");
+        }
+        let err = gen(
+            "com.acme.P",
+            method("f", &[("w", "List<Widget>")], true, false),
+        )
+        .unwrap_err();
+        assert!(
+            err.reason.contains("unsupported type `List<Widget>`"),
+            "{err}"
+        );
+    }
+
+    /// An element type the tree declares is a default instance of it, and an
+    /// enum element a fuzzed constant.
+    #[test]
+    fn tree_types_and_enums_are_collection_elements() {
+        let mut entry = tm("com.acme.Entry");
+        entry.has_public_no_arg_ctor = true;
+        let h = generate_java_direct_harness(&GenerateJavaDirectArgs {
+            target_class: "com.acme.Chart".to_owned(),
+            target: method(
+                "plot",
+                &[("entries", "List<Entry>"), ("modes", "Set<Mode>")],
+                true,
+                false,
+            ),
+            receiver: None,
+            enum_types: vec!["com.acme.Mode".to_owned()],
+            param_types: vec![entry],
+            target_class_is_abstract: false,
+        })
+        .unwrap()
+        .harness_java;
+        assert!(
+            h.contains("java.util.List<com.acme.Entry> a0 = bhfFill(c, new java.util.ArrayList<com.acme.Entry>(), () -> new com.acme.Entry());"),
+            "{h}"
+        );
+        assert!(h.contains("java.util.Set<com.acme.Mode> a1 = bhfFill(c, new java.util.LinkedHashSet<com.acme.Mode>(), () -> com.acme.Mode.values()["), "{h}");
+    }
+
+    #[test]
+    fn a_random_parameter_is_seeded_from_the_input() {
+        assert_eq!(
+            decode_param_expr("java.util.Random").as_deref(),
+            Some("new java.util.Random(c.consumeLong())")
+        );
+        assert_eq!(decode_param_expr("com.acme.Random"), None);
+    }
+
+    /// A tree that declares its own `List` keeps it: the JDK collection is not
+    /// substituted for a type of the same name.
+    #[test]
+    fn a_tree_declared_list_type_is_not_a_jdk_collection() {
+        let mut own = tm("com.acme.List");
+        own.has_public_no_arg_ctor = true;
+        let h = gen_with_models(
+            "com.acme.P",
+            method("f", &[("l", "List<String>")], true, false),
+            vec![own],
+        )
+        .unwrap()
+        .harness_java;
+        assert!(h.contains("var a0 = new com.acme.List();"), "{h}");
+        assert!(!h.contains("bhfFill("), "{h}");
     }
 }

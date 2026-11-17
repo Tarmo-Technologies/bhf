@@ -1,0 +1,45 @@
+{
+ "repo": "alibaba/spring-cloud-alibaba",
+ "sha": "171ea765c8179ca871903baad701245a7330a3ab",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "NacosLoadBalancer.java",
+   "name": "NacosLoadBalancer",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'NacosLoadBalancer' parameter #0 has an unsupported type `ObjectProvider<ServiceInstanceListSupplier>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "RandomLoadBalancer.java",
+   "name": "RandomLoadBalancer",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'RandomLoadBalancer' parameter #0 has an unsupported type `ObjectProvider<ServiceInstanceListSupplier>`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

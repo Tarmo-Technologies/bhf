@@ -1,0 +1,56 @@
+{
+ "repo": "uwol/proleap-cobol-parser",
+ "sha": "d1bfe75bdd6d480f70c74c6345bcc02610ac30d3",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "CobolCompilationUnitVisitorImpl.java",
+   "name": "CobolCompilationUnitVisitorImpl",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'CobolCompilationUnitVisitorImpl' parameter #2 has an unsupported type `CommonTokenStream`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "CobolLineReaderImpl.java",
+   "name": "parseLine",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'parseLine' parameter #2 has an unsupported type `CobolParserParams`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "CommunicationDescriptionEntryCallImpl.java",
+   "name": "CommunicationDescriptionEntryCallImpl",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'CommunicationDescriptionEntryCallImpl' parameter #1 has an unsupported type `CommunicationDescriptionEntry`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

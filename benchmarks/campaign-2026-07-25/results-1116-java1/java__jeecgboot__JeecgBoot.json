@@ -1,0 +1,47 @@
+{
+ "repo": "jeecgboot/JeecgBoot",
+ "sha": "df83f4de76811ea73bf5b37a8fe00cbb59988a1b",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "FreemarkerParseFactory.java",
+   "name": "parseTemplate",
+   "outcome": "consent_required",
+   "reason": "build failed via maven/gradle (Maven project build requires --run-untrusted (builds run offline)) AND javac (/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/system/api/ISysBaseAPI.java:27: error: duplicate class: org.jeecg.common.system.api.ISysBaseAPI\npublic interface ISysBaseAPI extends CommonAPI {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/airag/api/IAiragBaseApi.java:9: error: duplicate class: org.jeecg.common.airag.api.IAiragBaseApi\npublic interface IAiragBaseApi {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/online/api/IOnlineBaseExtApi.java:14: error: duplicate class: org.jeecg.common.online.api.IOnlineBaseExtApi\npublic interface IOnlineBaseExtApi {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-server-cloud/jeecg-cloud-nacos/src/main/java/com/alibaba/nacos/JeecgNacosApplication.java:3: error: package com.alibaba.nacos.console does not exist\nimport com.alibaba.nacos.console.NacosConsole;\n                                ^)",
+   "class": "consent_required",
+   "before": 1,
+   "classes": [
+    "consent_required"
+   ]
+  },
+  {
+   "source": "FreemarkerParseFactory.java",
+   "name": "parseTemplateContent",
+   "outcome": "consent_required",
+   "reason": "build failed via maven/gradle (Maven project build requires --run-untrusted (builds run offline)) AND javac (/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/system/api/ISysBaseAPI.java:27: error: duplicate class: org.jeecg.common.system.api.ISysBaseAPI\npublic interface ISysBaseAPI extends CommonAPI {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/airag/api/IAiragBaseApi.java:9: error: duplicate class: org.jeecg.common.airag.api.IAiragBaseApi\npublic interface IAiragBaseApi {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-module-system/jeecg-system-api/jeecg-system-local-api/src/main/java/org/jeecg/common/online/api/IOnlineBaseExtApi.java:14: error: duplicate class: org.jeecg.common.online.api.IOnlineBaseExtApi\npublic interface IOnlineBaseExtApi {\n       ^\n/home/ubuntu/bhf-corpus-500/java/jeecgboot__JeecgBoot/jeecg-boot/jeecg-server-cloud/jeecg-cloud-nacos/src/main/java/com/alibaba/nacos/JeecgNacosApplication.java:3: error: package com.alibaba.nacos.console does not exist\nimport com.alibaba.nacos.console.NacosConsole;\n                                ^)",
+   "class": "consent_required",
+   "before": 2,
+   "classes": [
+    "consent_required",
+    "consent_required"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "consent_required": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

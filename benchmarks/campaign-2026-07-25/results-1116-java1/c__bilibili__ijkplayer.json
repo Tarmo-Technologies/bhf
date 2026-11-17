@@ -1,0 +1,45 @@
+{
+ "repo": "bilibili/ijkplayer",
+ "sha": "30eb9441945da795079492041a791c121d2b8206",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "DashRendererBuilder.java",
+   "name": "DashRendererBuilder",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'DashRendererBuilder' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  },
+  {
+   "source": "ExtractorRendererBuilder.java",
+   "name": "ExtractorRendererBuilder",
+   "outcome": "unsupported_params",
+   "reason": "Java target 'ExtractorRendererBuilder' parameter #0 has an unsupported type `Context`",
+   "class": "Java-1 unsupported parameter type",
+   "before": 1,
+   "classes": [
+    "Java-1 unsupported parameter type"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}
