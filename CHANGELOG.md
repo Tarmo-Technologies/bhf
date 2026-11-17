@@ -70,6 +70,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The AFL++ lane runs afl-fuzz for its whole budget (#412). bhf set
+  `AFL_BENCH_UNTIL_CRASH=0`, and afl-fuzz stops at its first crash when that
+  variable is set at all, so a run reported one crash and left the rest of
+  `--time` or `--per-target-time` unused. The variable is now removed from
+  afl-fuzz's environment, including a value bhf inherited.
 - The daemon's operator role has fewer permissions than workspace_admin
   (#361): it runs scans and jobs, but a `staticScan` with its own `policy`,
   `suppressions`, `baseline`, `enabled_rules` or `disabled_rules` needs a

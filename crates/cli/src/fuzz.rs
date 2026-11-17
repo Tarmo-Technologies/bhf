@@ -6480,7 +6480,6 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         .arg(&main_afl)
         .env("AFL_NO_UI", "1")
         .env("AFL_SKIP_CPUFREQ", "1")
-        .env("AFL_BENCH_UNTIL_CRASH", "0")
         // AFL refuses to start on hosts where /proc/sys/kernel/core_pattern
         // pipes to a userland handler (apport, systemd-coredump). Acknowledge
         // we may miss the rare crash that gets intercepted by the handler;
@@ -6532,6 +6531,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     for (k, v) in &prepared.extra_env {
         afl_cmd.env(k, v);
     }
+    // #412: afl-fuzz stops at its first crash when AFL_BENCH_UNTIL_CRASH is
+    // set, whatever its value, so it never runs the rest of its budget.
+    afl_cmd.env_remove("AFL_BENCH_UNTIL_CRASH");
     // `symbolize=0` must be re-asserted AFTER `extra_env`, because that map
     // carries the builtin engine's sanitizer options — which deliberately keep
     // symbolization so a crash's file:line can be joined to the static finding at

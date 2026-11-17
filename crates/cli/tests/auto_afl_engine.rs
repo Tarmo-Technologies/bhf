@@ -533,3 +533,74 @@ fn the_afl_lane_runs_cmplog_and_solves_a_magic_no_dictionary_holds() {
         "the magic was not solved: {findings:#?}\n{log}"
     );
 }
+
+/// The `key : value` field of an afl-fuzz `fuzzer_stats` file.
+fn stats_field<'a>(stats: &'a str, key: &str) -> Option<&'a str> {
+    stats.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.trim() == key).then(|| value.trim())
+    })
+}
+
+/// #412: afl-fuzz runs its whole budget past the first crash. bhf set
+/// `AFL_BENCH_UNTIL_CRASH=0`, and AFL++ stops at its first crash when the
+/// variable is set at all, so a run found one crash and quit; one the caller
+/// sets is removed too. AFL++ is required under `BHF_REQUIRE_TOOLS=1`.
+#[test]
+fn afl_fuzz_runs_its_budget_past_the_first_crash() {
+    if !afl_present() || !which("make") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("easy.c"),
+        "#include <stdlib.h>\n\
+         int easy_crash(const unsigned char *d, size_t n) {\n\
+         \x20   char *slot;\n\
+         \x20   if (n < 2 || d[0] != 'A') return 0;\n\
+         \x20   slot = malloc(4);\n\
+         \x20   if (!slot) return 0;\n\
+         \x20   slot[4 + (n & 3)] = 1;\n\
+         \x20   free(slot);\n\
+         \x20   return 1;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--engine", "afl++", "--per-target-time", "10"])
+        .args(["--max-targets", "1", "--jobs", "1", "--no-discovery-cache"])
+        .env("AFL_BENCH_UNTIL_CRASH", "1")
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = afl_fuzzer_stats(&work);
+    let stats = stats
+        .first()
+        .unwrap_or_else(|| panic!("no fuzzer_stats: {log}"));
+    let crashes: u64 = stats_field(stats, "saved_crashes")
+        .or_else(|| stats_field(stats, "unique_crashes"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    assert!(crashes > 0, "{stats}");
+    let run_time: u64 = stats_field(stats, "run_time")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no run_time: {stats}"));
+    assert!(
+        run_time >= 5,
+        "afl-fuzz stopped after {run_time}s of its budget: {stats}"
+    );
+}
