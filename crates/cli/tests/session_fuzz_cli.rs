@@ -376,6 +376,125 @@ fn session_campaign_over_udp_reaches_the_second_state_and_the_oracle_fires() {
     std::fs::remove_dir_all(&work_dir).ok();
 }
 
+/// A pseudo-terminal: the master end, as a device's side of a UART, and the
+/// slave's path, which starts in the default cooked mode as a real tty does.
+#[cfg(target_os = "linux")]
+fn pty() -> (std::fs::File, String) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: libc calls on a fresh descriptor, each result checked.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master >= 0);
+        assert_eq!(libc::grantpt(master), 0);
+        assert_eq!(libc::unlockpt(master), 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(libc::ptsname_r(master, name.as_mut_ptr(), name.len()), 0);
+        (
+            std::fs::File::from(OwnedFd::from_raw_fd(master)),
+            std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// The toy service as a serial device on a pty's master: length-framed
+/// requests in, replies out, one device for every session.
+#[cfg(target_os = "linux")]
+fn serve_serial(mut device: std::fs::File) {
+    let mut current_handle: Option<u32> = None;
+    let mut tainted = false;
+    loop {
+        let mut len_buf = [0u8; 2];
+        if device.read_exact(&mut len_buf).is_err() {
+            return;
+        }
+        let mut req = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        if device.read_exact(&mut req).is_err() {
+            return;
+        }
+        let reply = handle_frame(&req, &mut current_handle, &mut tainted);
+        let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&reply);
+        if device.write_all(&frame).is_err() {
+            return;
+        }
+    }
+}
+
+/// `--session-transport serial:PATH` (#262): the session lane drives a UART
+/// command set. Over a pty the campaign reaches the second state and the
+/// boundary oracle, through binary length-prefixed frames with CRCs that a
+/// tty left cooked would edit and translate.
+#[cfg(target_os = "linux")]
+#[test]
+fn session_campaign_over_a_serial_pty_reaches_the_second_state_and_the_oracle_fires() {
+    let (master, slave) = pty();
+    thread::spawn(move || serve_serial(master));
+    let work_dir = temp_dir("serial-campaign");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(work_dir.path())
+        .args(["--harness", "H-session-serial", "--protocol-profile"])
+        .arg(toy_profile_path())
+        .args([
+            "--session-transport",
+            &format!("serial:{slave},baud=115200"),
+        ])
+        .args(["--session-reset", "none", "--iterations", "1500"])
+        .output()
+        .expect("run bhf fuzz");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["transport"], format!("serial:{slave},baud=115200"));
+    assert_eq!(summary["reset_fidelity"], "serial;reset=none");
+
+    let finding_dir =
+        find_session_finding(work_dir.path()).expect("the campaign emitted a session finding");
+    let testcase = read_session(&finding_dir);
+    assert!(
+        testcase.state_path.iter().any(|state| state == "opened"),
+        "{:?}",
+        testcase.state_path
+    );
+    let finding = std::fs::read_to_string(finding_dir.join("finding.json")).unwrap();
+    assert!(finding.contains("HDF7-PATHTRAV"), "{finding}");
+}
+
+/// A serial device has no port for `--session-server-cmd` to wait for, and a
+/// bad spec says what is wrong.
+#[test]
+fn a_serial_session_transport_spec_is_checked() {
+    let work_dir = temp_dir("serial-spec");
+    for (spec, extra, wanted) in [
+        ("serial:", &[][..], "the device path is empty"),
+        (
+            "serial:/dev/ttyUSB0,baud=fast",
+            &[][..],
+            "baud=fast is not a positive integer",
+        ),
+        (
+            "serial:/dev/ttyUSB0",
+            &["--session-server-cmd", "true"][..],
+            "needs a tcp: or udp: --session-transport",
+        ),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+            .arg("fuzz")
+            .arg(work_dir.path())
+            .args(["--harness", "H-session-serial", "--protocol-profile"])
+            .arg(toy_profile_path())
+            .args(["--session-transport", spec])
+            .args(extra)
+            .output()
+            .expect("run bhf fuzz");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{spec}: {stderr}");
+        assert!(stderr.contains(wanted), "{spec}: {stderr}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A session the service drops is a crash finding; a service that is gone
 // stops the campaign

@@ -167,15 +167,20 @@ pub(crate) enum SessionTransportPlan {
     /// A UDP backend: one datagram per message, one reply datagram awaited
     /// within the reply deadline, and a socket of its own per session.
     Udp { host: String, port: u16 },
+    /// A serial device (a UART, a pty), opened raw at `baud` when given (#262).
+    Serial { path: PathBuf, baud: Option<u32> },
 }
 
 /// A descriptive failure parsing a `--session-transport` spec. Never a silent
 /// `None`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionSpecError {
-    #[error("empty --session-transport spec; expected tcp:HOST:PORT or udp:HOST:PORT")]
+    #[error(
+        "empty --session-transport spec; expected tcp:HOST:PORT, udp:HOST:PORT or \
+         serial:PATH[,baud=N]"
+    )]
     Empty,
-    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp")]
+    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp, serial")]
     UnknownBackend { backend: String },
     #[error("malformed {backend} spec {spec:?}: {reason}")]
     Malformed {
@@ -200,6 +205,33 @@ impl SessionTransportPlan {
             let (host, port) = parse_host_port("udp", spec, rest)?;
             return Ok(Self::Udp { host, port });
         }
+        if let Some(rest) = spec.strip_prefix("serial:") {
+            let malformed = |reason: String| SessionSpecError::Malformed {
+                backend: "serial",
+                spec: spec.to_owned(),
+                reason,
+            };
+            let (path, baud) = match rest.split_once(",baud=") {
+                Some((path, baud)) => {
+                    let baud = baud
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|baud| *baud > 0)
+                        .ok_or_else(|| {
+                            malformed(format!("baud={baud} is not a positive integer"))
+                        })?;
+                    (path, Some(baud))
+                }
+                None => (rest, None),
+            };
+            if path.is_empty() {
+                return Err(malformed("the device path is empty".to_owned()));
+            }
+            return Ok(Self::Serial {
+                path: PathBuf::from(path),
+                baud,
+            });
+        }
         Err(SessionSpecError::UnknownBackend {
             backend: spec.split(':').next().unwrap_or(spec).to_owned(),
         })
@@ -210,14 +242,25 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
             Self::Udp { host, port } => format!("udp:{host}:{port}"),
+            Self::Serial { path, baud } => format!(
+                "serial:{}{}",
+                path.display(),
+                baud.map(|baud| format!(",baud={baud}")).unwrap_or_default()
+            ),
         }
     }
 
-    /// The host, port and whether it is UDP, for a service bhf starts.
-    fn endpoint(&self) -> (String, u16, bool) {
+    /// The host, port and whether it is UDP, for a service bhf starts; a
+    /// serial device has no port to wait for.
+    fn endpoint(&self) -> Result<(String, u16, bool), String> {
         match self {
-            Self::Tcp { host, port } => (host.clone(), *port, false),
-            Self::Udp { host, port } => (host.clone(), *port, true),
+            Self::Tcp { host, port } => Ok((host.clone(), *port, false)),
+            Self::Udp { host, port } => Ok((host.clone(), *port, true)),
+            Self::Serial { .. } => Err(format!(
+                "--session-server-cmd needs a tcp: or udp: --session-transport, whose port \
+                 bhf waits for; {} has none",
+                self.label()
+            )),
         }
     }
 
@@ -226,6 +269,7 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { .. } => "tcp",
             Self::Udp { .. } => "udp",
+            Self::Serial { .. } => "serial",
         }
     }
 
@@ -254,6 +298,15 @@ impl SessionTransportPlan {
                 framing,
                 reply_timeout.unwrap_or(UDP_REPLY_TIMEOUT),
             )),
+            Self::Serial { path, baud } => LiveTransport::Serial(SerialSessionTransport {
+                path,
+                baud,
+                reset,
+                framing,
+                io_timeout: reply_timeout.unwrap_or(SESSION_IO_TIMEOUT),
+                port: None,
+                pending: Vec::new(),
+            }),
         }
     }
 }
@@ -552,10 +605,115 @@ impl SessionTransport for UdpSessionTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The live serial backend
+// ---------------------------------------------------------------------------
+
+/// A serial [`SessionTransport`] (#262): a UART or a pty, opened raw (as the
+/// agent's `serial:` transport is: no echo, no line editing, no newline
+/// translation) at the given baud rate. Requests are framed as the profile
+/// says and replies read the same way, every read bounded by the reply
+/// deadline. A device has no connection, so `--session-reset reconnect`
+/// reopens it, which drops what it had sent; `none` keeps it open.
+pub(crate) struct SerialSessionTransport {
+    path: PathBuf,
+    baud: Option<u32>,
+    reset: SessionResetMode,
+    framing: Framing,
+    io_timeout: Duration,
+    port: Option<crate::serial_port::SerialPort>,
+    /// Bytes read past the end of the last reply.
+    pending: Vec<u8>,
+}
+
+impl SerialSessionTransport {
+    fn open(&mut self) -> Result<(), TransportError> {
+        self.port = None;
+        self.pending.clear();
+        let port = crate::serial_port::open(&self.path, self.baud, Some(self.io_timeout))
+            .map_err(|e| TransportError::new(format!("open {}: {e}", self.path.display())))?;
+        self.port = Some(port);
+        Ok(())
+    }
+
+    /// The device stopped answering, or failed: close it, so the next reset
+    /// opens it again whatever the reset mode.
+    fn lost(&mut self, message: String) -> TransportError {
+        self.port = None;
+        TransportError::session_lost(message)
+    }
+
+    /// Read until the framing has a whole reply. A raw reply is complete when
+    /// no byte arrives for its idle window after the first.
+    fn read_reply(&mut self) -> Result<Vec<u8>, TransportError> {
+        let idle = self.framing.reply_idle_ms().map(Duration::from_millis);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.framing.take_reply(&self.pending, MAX_REPLY_BYTES) {
+                ReplyProgress::Complete { reply, consumed } => {
+                    self.pending.drain(..consumed);
+                    return Ok(reply);
+                }
+                ReplyProgress::Invalid(reason) => {
+                    self.pending.clear();
+                    return Err(TransportError::new(format!("session reply: {reason}")));
+                }
+                ReplyProgress::NeedMore => {}
+            }
+            let quiet_completes = idle.is_some() && !self.pending.is_empty();
+            let wait = if quiet_completes {
+                idle
+            } else {
+                Some(self.io_timeout)
+            };
+            let port = self
+                .port
+                .as_mut()
+                .ok_or_else(|| TransportError::new("serial session is not open; reset first"))?;
+            if let Err(e) = port.set_read_timeout(wait) {
+                return Err(self.lost(format!("session read reply: {e}")));
+            }
+            match port.read(&mut chunk) {
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Err(e) if quiet_completes && e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(std::mem::take(&mut self.pending));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.lost(format!("session read reply: {e}"))),
+            }
+        }
+    }
+}
+
+impl SessionTransport for SerialSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let frame = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
+        let port = self
+            .port
+            .as_mut()
+            .ok_or_else(|| TransportError::new("serial session is not open; reset first"))?;
+        if let Err(e) = port.write_all(&frame).and_then(|()| port.flush()) {
+            return Err(self.lost(format!("session write: {e}")));
+        }
+        self.read_reply()
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.port.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.open()?;
+        }
+        Ok(())
+    }
+}
+
 /// A live backend, as `--session-transport` names it.
 pub(crate) enum LiveTransport {
     Tcp(TcpSessionTransport),
     Udp(UdpSessionTransport),
+    Serial(SerialSessionTransport),
 }
 
 impl SessionTransport for LiveTransport {
@@ -563,6 +721,7 @@ impl SessionTransport for LiveTransport {
         match self {
             LiveTransport::Tcp(transport) => transport.send_request(request),
             LiveTransport::Udp(transport) => transport.send_request(request),
+            LiveTransport::Serial(transport) => transport.send_request(request),
         }
     }
 
@@ -570,6 +729,7 @@ impl SessionTransport for LiveTransport {
         match self {
             LiveTransport::Tcp(transport) => transport.reset(),
             LiveTransport::Udp(transport) => transport.reset(),
+            LiveTransport::Serial(transport) => transport.reset(),
         }
     }
 }
@@ -1767,7 +1927,7 @@ fn replay_runtime_oracle(
         .ok_or_else(|| "the runtrace shim is unavailable".to_owned())?;
     let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
         .map_err(|e| e.to_string())?
-        .endpoint();
+        .endpoint()?;
     let dir = tempfile::Builder::new()
         .prefix("bhf-session-server-")
         .tempdir()
@@ -1865,7 +2025,7 @@ fn finding_server(
     }
     let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
         .map_err(|e| e.to_string())?
-        .endpoint();
+        .endpoint()?;
     let logs = tempfile::Builder::new()
         .prefix("bhf-session-server-")
         .tempdir()
@@ -2100,7 +2260,10 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     let transport_kind = plan.kind().to_owned();
     let mut server = match args.session_server_cmd.as_deref() {
         Some(command) => {
-            let (host, port, udp) = plan.endpoint();
+            let (host, port, udp) = plan.endpoint().map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz: {error}");
+                2
+            })?;
             let mut server = SessionServer::new(
                 command.to_owned(),
                 host,

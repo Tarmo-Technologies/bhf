@@ -2781,6 +2781,12 @@
   when bhf panics.
 
 ### Added
+- `--session-transport serial:PATH[,baud=N]` drives a protocol session over
+  a UART or a pty (#262), opened raw as the agent's serial transport is, with
+  the profile's framing and every read bounded by the reply deadline.
+  `--session-reset reconnect` reopens the device; `none` keeps it open. The
+  session lane reached only TCP and UDP services, not a device's command
+  set.
 - `bhf fuzz --session-server-cmd ... --runtime-oracles on` runs the service
   under the runtrace shim (#364). Before each session bhf writes the bytes
   the session carries where the shim matches its sinks against its input

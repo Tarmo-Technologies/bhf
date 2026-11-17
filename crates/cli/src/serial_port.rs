@@ -29,6 +29,18 @@ pub(crate) fn open(
     Ok(SerialPort { file, timeout })
 }
 
+impl SerialPort {
+    /// Bound the reads from now on by `timeout`: a session reading a raw
+    /// reply waits a short idle window once the first bytes are in.
+    pub(crate) fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        if timeout != self.timeout {
+            platform::set_timeouts(&self.file, timeout)?;
+            self.timeout = timeout;
+        }
+        Ok(())
+    }
+}
+
 fn timed_out(timeout: Option<Duration>) -> io::Error {
     let after = timeout.map_or_else(String::new, |t| format!(" within {}ms", t.as_millis()));
     io::Error::new(
@@ -135,6 +147,14 @@ mod platform {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    /// Nothing to set: each read's `poll` takes the port's timeout.
+    pub(super) fn set_timeouts(
+        _file: &std::fs::File,
+        _timeout: Option<Duration>,
+    ) -> io::Result<()> {
         Ok(())
     }
 
@@ -261,8 +281,13 @@ mod platform {
         if unsafe { SetCommState(handle, &dcb) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // A read returns once what it asked for has arrived or the deadline
-        // passed, with what it got; a write gives up at the same deadline.
+        set_timeouts(file, timeout)
+    }
+
+    /// A read returns once what it asked for has arrived or the deadline
+    /// passed, with what it got; a write gives up at the same deadline.
+    pub(super) fn set_timeouts(file: &std::fs::File, timeout: Option<Duration>) -> io::Result<()> {
+        let handle = file.as_raw_handle() as Handle;
         let millis = timeout.map_or(0, |t| u32::try_from(t.as_millis()).unwrap_or(u32::MAX));
         let timeouts = CommTimeouts {
             read_interval: 0,
