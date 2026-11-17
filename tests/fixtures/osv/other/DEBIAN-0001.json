@@ -1,0 +1,8 @@
+{
+  "id": "TEST-2026-0005",
+  "affected": [
+    {"package": {"ecosystem": "Debian:12", "name": "openssl"}, "versions": ["3.0.11-1"]},
+    {"package": {"ecosystem": "crates.io", "name": "openssl"},
+     "ranges": [{"type": "GIT", "repo": "https://example.invalid/openssl", "events": [{"introduced": "0123abcd"}]}]}
+  ]
+}

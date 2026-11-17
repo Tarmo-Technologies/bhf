@@ -23,6 +23,20 @@ pub enum PackCommand {
     Keygen(KeygenArgs),
     /// Sign the exact compressed distribution archive for external OpenSSL verification.
     SignArchive(SignArchiveArgs),
+    /// Build an advisory database for `bhf sbom --vuln-db` from OSV records
+    /// (an OSV ecosystem export, unzipped, or single record files).
+    /// Malformed records are reported and skipped.
+    ImportOsv(ImportFeedArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ImportFeedArgs {
+    /// Feed files, or directories searched for `.json` files.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// The advisory database to write.
+    #[arg(long)]
+    pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -150,6 +164,9 @@ pub fn run(args: PackArgs) -> i32 {
                 }
             }
         }
+        PackCommand::ImportOsv(args) => {
+            import_feed(governance::advisories::import_osv(&args.inputs), &args)
+        }
         PackCommand::SignArchive(args) => {
             match governance::sign_distribution_archive(&args.archive, &args.signing_key, &args.out)
             {
@@ -244,6 +261,41 @@ fn verify(args: VerifyArgs) -> i32 {
         }
         Err(error) => {
             bhfeprintln!("{error:#}");
+            1
+        }
+    }
+}
+
+/// Write the database an importer built, print its summary, and report each
+/// malformed record it skipped. Exit 1 when nothing could be imported from
+/// malformed input, else 0.
+fn import_feed(
+    import: Result<governance::advisories::AdvisoryImport, governance::GovernanceError>,
+    args: &ImportFeedArgs,
+) -> i32 {
+    let import = match import {
+        Ok(import) => import,
+        Err(error) => {
+            bhfeprintln!("bhf pack import-{}: {error:#}", "osv");
+            return 2;
+        }
+    };
+    for (source, reason) in &import.malformed {
+        bhfeprintln!(
+            "bhf pack import-{}: skipped {source}: {reason}",
+            import.format
+        );
+    }
+    match governance::advisories::write_advisory_db(&import, &args.inputs, &args.out) {
+        Ok(summary) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).unwrap_or_default()
+            );
+            i32::from(import.records.is_empty() && !import.malformed.is_empty())
+        }
+        Err(error) => {
+            bhfeprintln!("bhf pack import-{}: {error:#}", import.format);
             1
         }
     }

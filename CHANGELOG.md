@@ -2703,6 +2703,15 @@
   when bhf panics.
 
 ### Added
+- `bhf pack import-osv INPUT... --out cve-db.json` builds an advisory
+  database for `bhf sbom --vuln-db` from OSV records (#223): an unzipped OSV
+  ecosystem export or single record files. Each affected package becomes a
+  record with bhf's ecosystem name, explicit versions, version ranges and a
+  severity (the GitHub advisory rating, else the CVSS v3 base score's
+  rating). Malformed records are reported and skipped. The database format
+  takes `affected_ranges` (version bounds) beside `affected_versions`, and
+  `docs/site/inventory-assurance.md` documents it. No command built a
+  database from a public feed.
 - The persistent built-in engine calibrates the inputs it adds to the corpus
   (#232), as AFL++ does. It re-runs each one four times, each from a zeroed
   edge bitmap, and counts an edge that one run hit and another did not as
