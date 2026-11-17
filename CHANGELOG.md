@@ -2781,6 +2781,16 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --session-server-cmd ... --runtime-oracles on` runs the service
+  under the runtrace shim (#364). Before each session bhf writes the bytes
+  the session carries where the shim matches its sinks against its input
+  (`BHF_SHIM_INPUT_FILE_SHARED=1`, one file for every process of the
+  service). Each session's events are evaluated as that session's, and the
+  service's start-up is excluded. A command, path, library or query built
+  from a session's bytes is a finding of that session, once per rule and
+  sink API, which `bhf replay` reproduces under the shim. Sessions had only
+  the profile's response and state oracles, and the lane refused
+  `--runtime-oracles`.
 - A service the session lane runs with `--session-server-cmd` reports its
   code coverage (#363). It gets `BHF_COV_SHM`, an edge map bhf keeps for the
   campaign, which a service built with SanitizerCoverage and the new

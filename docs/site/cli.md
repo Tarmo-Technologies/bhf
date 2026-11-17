@@ -1575,6 +1575,18 @@ clang -fsanitize=address -fsanitize-coverage=trace-pc-guard \
   echo_server.c /path/to/bhf/c_runtime/bhf_service_cov.c -o build/echo_server
 ```
 
+With `--runtime-oracles on` (or `auto`) the service runs under the runtrace
+shim. Before each session bhf writes the bytes the session carries (its byte
+and TLV field values) where the shim matches sinks against its input. After
+the session, bhf evaluates the events the service logged during it, so what
+the service does before it serves is no session's. A command, path, library
+or query built from those bytes is a finding of that session, once per rule
+and sink API for the campaign (BHF-431 and BHF-304 for a command, for
+instance), with `session.json` and `session_meta.json`. `bhf replay` runs the
+service under the shim again and looks for the same hit. Without
+`--session-server-cmd` there is no process to trace, and `--runtime-oracles`
+is refused.
+
 GCC builds use `-fsanitize-coverage=trace-pc`. The summary's `coverage_edges`
 counts the service's edges. Its `coverage_source` is `service`, or
 `uninstrumented_service` for a service that never wrote the map; without

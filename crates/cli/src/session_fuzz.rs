@@ -129,7 +129,6 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
     "--sandbox",
     "--sandbox-tool",
     "--sandbox-strict",
-    "--runtime-oracles",
     "--structured-inputs",
     "--print-final-stats",
     "--collector",
@@ -143,10 +142,15 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
 ];
 
 /// The flags this run gives that the session lane would ignore.
+/// `--runtime-oracles` applies to a service bhf runs (#364): without
+/// `--session-server-cmd` there is no process to put under the shim.
 pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
     crate::fuzz::given_flags(args)
         .into_iter()
-        .filter(|flag| UNSUPPORTED_FLAGS.contains(flag))
+        .filter(|flag| {
+            UNSUPPORTED_FLAGS.contains(flag)
+                || (*flag == "--runtime-oracles" && args.session_server_cmd.is_none())
+        })
         .collect()
 }
 
@@ -772,6 +776,14 @@ struct SessionArtifactMeta {
     /// `--session-server-cmd`, when bhf ran the service: a replay starts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server_cmd: Option<String>,
+    /// For a runtime-oracle finding of the service (#364), the hit's
+    /// signature: a replay runs the service under the shim again and looks
+    /// for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_signature: Option<String>,
+    /// The runtrace mode (`reporting`, `attacking`) the service ran under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtrace_mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +930,135 @@ fn persist_disconnect(
     Ok(path)
 }
 
+/// The runtime sink oracles over a service bhf runs under the runtrace shim
+/// (#364): the sinks the campaign's sessions reached, and the session each
+/// input the tracker may confirm came from.
+#[derive(Default)]
+pub(crate) struct ServiceOracles {
+    tracker: crate::auto::runtrace::SinkTaintTracker,
+    sessions: std::collections::HashMap<Vec<u8>, SessionTestcase>,
+}
+
+/// The most sessions [`ServiceOracles`] keeps to attribute a confirmed sink to.
+const MAX_ORACLE_SESSIONS: usize = 4096;
+
+/// The key a runtime-oracle finding of the service is deduplicated by: its
+/// rule and sink API. Each session's fuzzed bytes make a new command or path,
+/// so keyed by the subject, as a replay matches it, one sink would be a
+/// finding per session; the first session to reach it is the finding.
+fn runtime_hit_key(hit: &OracleHit) -> String {
+    format!("runtime:{}:{}", hit.rule_id, hit.api)
+}
+
+/// The bytes a session carries, as the shim matches a sink against them: its
+/// messages' byte and TLV field values, in order. Integers and enum symbols
+/// are framing, not text a service passes to a command or a path.
+fn session_input_bytes(testcase: &SessionTestcase) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for message in &testcase.messages {
+        for field in &message.fields {
+            if let protocol_session::FieldValue::Bytes { value }
+            | protocol_session::FieldValue::Tlv { value } = &field.value
+            {
+                bytes.extend_from_slice(value);
+            }
+        }
+    }
+    bytes
+}
+
+/// Emit a runtime-oracle finding of `testcase`: the oracle hit, with the
+/// session as its testcase and the session artifacts beside it.
+fn emit_runtime_hit(
+    emitter: &FindingEmitter,
+    testcase: &SessionTestcase,
+    mut hit: OracleHit,
+    config: &SessionFuzzConfig,
+) -> Result<String, SessionFuzzError> {
+    let serialized = testcase.to_json().map_err(SessionFuzzError::Serialize)?;
+    hit.evidence.push(OracleEvidence::new(
+        "state_path",
+        testcase.state_path.join(" -> "),
+    ));
+    hit.evidence.push(OracleEvidence::new(
+        "messages",
+        testcase.messages.len().to_string(),
+    ));
+    let signature = crate::runtime_oracles::oracle_signature(&hit);
+    let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
+    write_session_artifacts(
+        &id.0,
+        &serialized,
+        &hit.oracle_name,
+        Some(&hit.rule_id),
+        Some(&signature),
+        config,
+    )?;
+    Ok(id.0)
+}
+
+/// Evaluate the events of the session `candidate` (its bytes `input`): emit
+/// the per-run oracle hits now, and fold its sinks into the tracker the
+/// campaign confirms at its end.
+#[allow(clippy::too_many_arguments)]
+fn observe_service_events(
+    events: &[crate::auto::runtrace::RuntraceEvent],
+    candidate: &SessionTestcase,
+    input: &[u8],
+    oracles: &mut ServiceOracles,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+) -> Result<bool, SessionFuzzError> {
+    if events.is_empty() {
+        return Ok(false);
+    }
+    let mut new_finding = false;
+    for hit in crate::auto::runtrace::oracle_hits_from_events(events) {
+        if seen.insert(runtime_hit_key(&hit)) {
+            finding_ids.push(emit_runtime_hit(emitter, candidate, hit, config)?);
+            new_finding = true;
+        }
+    }
+    oracles.tracker.observe(events, input);
+    if oracles.sessions.len() < MAX_ORACLE_SESSIONS || oracles.sessions.contains_key(input) {
+        oracles
+            .sessions
+            .entry(input.to_vec())
+            .or_insert_with(|| candidate.clone());
+    }
+    Ok(new_finding)
+}
+
+/// The findings of the sinks the campaign confirmed fuzz-controlled: tainted
+/// by a session's bytes, never reached without them.
+fn emit_confirmed_service_sinks(
+    oracles: ServiceOracles,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+) -> Result<(), SessionFuzzError> {
+    let ServiceOracles { tracker, sessions } = oracles;
+    for confirmed in tracker.into_confirmed() {
+        let Some(session) = sessions.get(&confirmed.input).or_else(|| {
+            sessions
+                .iter()
+                .find(|(bytes, _)| bytes.starts_with(&confirmed.input))
+                .map(|(_, session)| session)
+        }) else {
+            continue;
+        };
+        for hit in crate::auto::runtrace::confirmed_sink_hits(&confirmed) {
+            if seen.insert(runtime_hit_key(&hit)) {
+                finding_ids.push(emit_runtime_hit(emitter, session, hit, config)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drive one candidate against the transport, folding both novelty channels and
 /// emitting a finding (deduped by rule|oracle) on a clean-exit violation.
 /// Returns the state-novelty delta, how many service edges it reached first,
@@ -941,10 +1082,19 @@ fn drive_candidate(
     finding_ids: &mut Vec<String>,
     tally: &mut CrashTally,
     server: Option<&mut SessionServer>,
+    oracles: Option<&mut ServiceOracles>,
 ) -> Result<(StateNoveltyDelta, usize, bool), SessionFuzzError> {
+    // Under the runtrace shim the service matches its sinks against the
+    // bytes of the session in flight (#364).
+    let input = session_input_bytes(candidate);
+    if let Some(server) = server.as_deref() {
+        server
+            .publish_session_input(&input)
+            .map_err(SessionFuzzError::Server)?;
+    }
     // With a service bhf runs, a refused connection is the service gone: look
     // at it before counting a failure to connect.
-    let (driven, refused) = match server {
+    let (driven, refused) = match server.as_deref() {
         Some(_) => match runner.drive(&candidate.messages, transport) {
             Ok(run) => (Some(run), false),
             Err(protocol_session::RunnerError::Connect(_)) => (None, true),
@@ -958,10 +1108,25 @@ fn drive_candidate(
         ),
     };
     let mut new_edges = 0;
+    let mut oracle_finding = false;
     if let Some(server) = server {
         // The map outlives the process, so a session that crashed the service
         // still counts the code it reached.
         new_edges = code_novelty.observe(&server.coverage_edges());
+        // Its events, before a restart brings the start-up of the next.
+        if let Some(oracles) = oracles {
+            let events = server.take_session_events();
+            oracle_finding = observe_service_events(
+                &events,
+                candidate,
+                &input,
+                oracles,
+                emitter,
+                config,
+                seen,
+                finding_ids,
+            )?;
+        }
         let lost = refused
             || driven
                 .as_ref()
@@ -992,7 +1157,7 @@ fn drive_candidate(
                 finding_ids,
                 tally,
             )?;
-            return Ok((delta, new_edges, new_finding));
+            return Ok((delta, new_edges, new_finding || oracle_finding));
         }
         if refused {
             drive_counting(runner, &candidate.messages, transport, tally)?;
@@ -1000,7 +1165,7 @@ fn drive_candidate(
     }
     tally.previous = Some(candidate.clone());
     let Some(run) = driven else {
-        return Ok((StateNoveltyDelta::default(), new_edges, false));
+        return Ok((StateNoveltyDelta::default(), new_edges, oracle_finding));
     };
 
     let delta = state_novelty.observe(&run.state_ids, &run.transitions);
@@ -1019,7 +1184,7 @@ fn drive_candidate(
         });
         if !confirmed {
             tally.unconfirmed += 1;
-            return Ok((delta, new_edges, false));
+            return Ok((delta, new_edges, oracle_finding));
         }
         let _ = std::fs::remove_file(kept);
         tally.crashes += 1;
@@ -1068,7 +1233,7 @@ fn drive_candidate(
             new_finding = true;
         }
     }
-    Ok((delta, new_edges, new_finding))
+    Ok((delta, new_edges, new_finding || oracle_finding))
 }
 
 /// The service exited after `blamed` ran: start it again, drive `blamed`
@@ -1136,6 +1301,7 @@ fn confirm_server_crash(
             &serialized,
             SERVER_CRASH_ORACLE,
             Some(report.rule_id),
+            None,
             config,
         )?;
         finding_ids.push(id.0);
@@ -1194,6 +1360,11 @@ pub(crate) fn run_session_campaign(
     let mut finding_ids: Vec<String> = Vec::new();
     let mut seen_findings: HashSet<String> = HashSet::new();
     let mut tally = CrashTally::default();
+    // The runtime sink oracles, when the service runs under the shim (#364).
+    let mut service_oracles = server
+        .as_ref()
+        .is_some_and(|server| server.has_runtrace())
+        .then(ServiceOracles::default);
 
     // --- seed phase: drive every seed once; seeds are always corpus members. ---
     let seed_count = config.seeds.len();
@@ -1221,9 +1392,11 @@ pub(crate) fn run_session_campaign(
             &mut finding_ids,
             &mut tally,
             server.as_deref_mut(),
+            service_oracles.as_mut(),
         )?;
         executions += 1;
-        scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta, new_edges));
+        scheduler
+            .insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta, new_edges));
     }
 
     // --- mutation phase: scheduler-driven structured mutation. ---
@@ -1274,6 +1447,7 @@ pub(crate) fn run_session_campaign(
                 &mut finding_ids,
                 &mut tally,
                 server.as_deref_mut(),
+                service_oracles.as_mut(),
             )?;
             executions += 1;
             // A new protocol state, or new code in the service (#363).
@@ -1285,6 +1459,16 @@ pub(crate) fn run_session_campaign(
                 corpus_new += 1;
             }
         }
+    }
+
+    if let Some(oracles) = service_oracles {
+        emit_confirmed_service_sinks(
+            oracles,
+            &emitter,
+            config,
+            &mut seen_findings,
+            &mut finding_ids,
+        )?;
     }
 
     Ok(SessionFuzzSummary {
@@ -1363,7 +1547,7 @@ fn emit_session_finding(
     };
 
     let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
-    write_session_artifacts(&id.0, &serialized, oracle, rule_id, config)?;
+    write_session_artifacts(&id.0, &serialized, oracle, rule_id, None, config)?;
     Ok(id.0)
 }
 
@@ -1374,6 +1558,7 @@ fn write_session_artifacts(
     serialized: &str,
     oracle: &str,
     rule_id: Option<&str>,
+    runtime_signature: Option<&str>,
     config: &SessionFuzzConfig,
 ) -> Result<(), SessionFuzzError> {
     let finding_dir = corpus::layout::finding_dir(&config.work_dir, id);
@@ -1392,6 +1577,8 @@ fn write_session_artifacts(
             .reply_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         server_cmd: config.server_cmd.clone(),
+        runtime_signature: runtime_signature.map(str::to_owned),
+        runtrace_mode: runtime_signature.map(|_| config.mode.to_string().to_ascii_lowercase()),
     };
     let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(SessionFuzzError::Serialize)?;
     write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)
@@ -1474,6 +1661,9 @@ pub(crate) fn replay_session_outcome(
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
     let mut transport = build_live_transport(&meta, &model)?;
     let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    if let (Some(signature), Some(command)) = (&meta.runtime_signature, &meta.server_cmd) {
+        return replay_runtime_oracle(&testcase, &model, &meta, signature, command, &mut transport);
+    }
     if let Some(mut server) = finding_server(&meta)? {
         let runner = SessionRunner::new(&model);
         let (_, exit) = drive_against_server(&runner, &testcase, &mut transport, &mut server.0)?;
@@ -1554,6 +1744,88 @@ pub(crate) fn replay_session_outcome(
             "transport",
             format!("{} (reset {})", meta.transport, meta.reset),
         )],
+        history: "replay",
+        ..Default::default()
+    })
+}
+
+/// `bhf replay` of a runtime-oracle finding of the service (#364): start the
+/// service under the runtrace shim again, drive the session with its bytes as
+/// the shim's input, and look for the recorded hit among its events' hits.
+fn replay_runtime_oracle(
+    testcase: &SessionTestcase,
+    model: &ProtocolModel,
+    meta: &SessionArtifactMeta,
+    signature: &str,
+    command: &str,
+    transport: &mut dyn SessionTransport,
+) -> Result<crate::replay::LaneReplay, String> {
+    use crate::runtime_oracles::{RuntimeOracleMode, RuntimeOracles};
+    let mode = meta.runtrace_mode.as_deref().unwrap_or("reporting");
+    let oracles = RuntimeOracles::resolve(RuntimeOracleMode::On, mode)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the runtrace shim is unavailable".to_owned())?;
+    let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
+        .map_err(|e| e.to_string())?
+        .endpoint();
+    let dir = tempfile::Builder::new()
+        .prefix("bhf-session-server-")
+        .tempdir()
+        .map_err(|e| format!("create a dir for the service's logs: {e}"))?;
+    let mut server = SessionServer::new(command.to_owned(), host, port, udp, dir.path())
+        .with_runtime_oracles(&oracles, dir.path())?;
+    server.start()?;
+    let input = session_input_bytes(testcase);
+    server.publish_session_input(&input)?;
+    let _ = SessionRunner::new(model).replay(testcase, transport);
+    let events = server.take_session_events();
+    server.stop();
+    let mut hits = crate::auto::runtrace::oracle_hits_from_events(&events);
+    let mut tracker = crate::auto::runtrace::SinkTaintTracker::default();
+    tracker.observe(&events, &input);
+    for confirmed in tracker.into_confirmed() {
+        hits.extend(crate::auto::runtrace::confirmed_sink_hits(&confirmed));
+    }
+    let matched = hits
+        .iter()
+        .any(|hit| crate::runtime_oracles::oracle_signature(hit) == signature);
+    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    let replayed: Vec<String> = hits
+        .iter()
+        .map(|hit| format!("{} ({})", hit.oracle_name, hit.rule_id))
+        .collect();
+    Ok(crate::replay::LaneReplay {
+        lane: "session",
+        matched,
+        status_line: if matched {
+            "MATCH".to_owned()
+        } else {
+            "MISMATCH: the recorded session no longer reaches the service's sink".to_owned()
+        },
+        compared: format!(
+            "runtime oracle {} with rule {rule} in the service",
+            meta.oracle
+        ),
+        differences: if matched {
+            Vec::new()
+        } else {
+            vec![format!(
+                "verdict: recorded oracle {} with rule {rule}, replayed {}",
+                meta.oracle,
+                if replayed.is_empty() {
+                    "no runtime oracle hit".to_owned()
+                } else {
+                    replayed.join(", ")
+                }
+            )]
+        },
+        details: vec![
+            crate::replay::Detail::new(
+                "transport",
+                format!("{} (reset {})", meta.transport, meta.reset),
+            ),
+            crate::replay::Detail::new("service", command.to_owned()),
+        ],
         history: "replay",
         ..Default::default()
     })
@@ -1841,6 +2113,22 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
                 crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
                 2
             })?;
+            // `--runtime-oracles` runs the service under the runtrace shim (#364).
+            let mode_label = args.mode.to_string().to_ascii_lowercase();
+            let oracles =
+                crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                    .map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --runtime-oracles: {error}");
+                        2
+                    })?;
+            if let Some(oracles) = &oracles {
+                server = server
+                    .with_runtime_oracles(oracles, &args.work_dir.join("session_server"))
+                    .map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                        2
+                    })?;
+            }
             server.start().map_err(|error| {
                 crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
                 2
@@ -2368,6 +2656,8 @@ equals = 226
             oracle: oracle.to_owned(),
             reply_timeout_ms: None,
             server_cmd: None,
+            runtime_signature: None,
+            runtrace_mode: None,
         }
     }
 

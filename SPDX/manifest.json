@@ -3183,6 +3183,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/session_runtime_oracles_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/session_server_cli.rs",
       "license": "Apache-2.0"
     },
@@ -6040,6 +6044,10 @@
     },
     {
       "path": "tests/fixtures/session_server/echo_server.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/session_server/shell_server.c",
       "license": "Apache-2.0"
     },
     {
