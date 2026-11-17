@@ -163,9 +163,10 @@ free functions (methods, which need a receiver value, are skipped).
 The two **interpreted** lanes get **real coverage feedback**: Python edges flow
 through `sys.monitoring` (3.12+) / `sys.settrace`, and Perl through a
 `-d:BhfCov` (`DB::DB`) tracer, both into the same shared coverage map the
-C/C++/Ada/Rust engines use. Neither has behavioral/taint sink oracles yet:
-the LD_PRELOAD shim is not loaded into the interpreter, so only exceptions are
-reported. Go gets the shim natively. **Go** is the **fastest** lane: the generated harness
+C/C++/Ada/Rust engines use. Both run the LD_PRELOAD shim's behavioral/taint
+sink oracles: it is loaded into the interpreter and records from target
+entry on, so a path or command the input controls is reported beside
+exceptions. Go gets the shim natively. **Go** is the **fastest** lane: the generated harness
 compiles to a native fork-server binary that recovers panics into CWE-mapped
 findings. It normally builds with `-cover -covermode=atomic`, clears counters per
 input, and folds the executed-block set into BHF's shared edge map. A failed

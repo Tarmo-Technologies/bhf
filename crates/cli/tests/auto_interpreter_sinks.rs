@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The runtrace shim's sink oracles in the Python and Perl lanes (#300).
+//! The runtrace shim's sink oracles in the Python, Perl, Ruby, Lua and PHP
+//! lanes (#300, #301).
 //!
-//! The shim was never preloaded into an interpreter launcher, so a Python or
-//! Perl target that opened a path or ran a command its input controlled was
-//! never reported. It is now, recording only from target entry (the
+//! The shim was never preloaded into an interpreter launcher, so an
+//! interpreted target that opened a path or ran a command its input
+//! controlled was never reported. It is now, recording only from target entry (the
 //! interpreter's own start-up is not the target's), with the driver writing
 //! each input where the shim can match it against a sink's argument.
 
@@ -21,8 +22,12 @@ mod test_support;
 use test_support::TestDir;
 
 fn have(program: &str) -> bool {
+    have_with(program, "--version")
+}
+
+fn have_with(program: &str, version_flag: &str) -> bool {
     let present = Command::new(program)
-        .arg("--version")
+        .arg(version_flag)
         .output()
         .is_ok_and(|out| out.status.success());
     support::require_tool(present, program)
@@ -111,4 +116,45 @@ fn a_clean_python_target_has_no_findings() {
          return int(parts[0]) + int(parts[1])\n    except ValueError:\n        return -1\n",
     );
     assert!(rules.is_empty(), "{rules:?}");
+}
+
+/// #301: a command built from the input reaches a shell in Ruby (`system`),
+/// Lua (`os.execute`) and PHP (`shell_exec`): BHF-431 in each.
+#[test]
+fn ruby_lua_and_php_targets_running_an_input_command_are_command_findings() {
+    let cases = [
+        (
+            "ruby",
+            "--version",
+            "tool.rb",
+            "module Tool\n  def self.run_tool(arg)\n    return 0 if arg.bytesize > 40\n    \
+             system(\"echo #{arg} > /dev/null\")\n  end\nend\n",
+        ),
+        (
+            "lua",
+            "-v",
+            "tool.lua",
+            "local M = {}\n\nfunction M.run_tool(arg)\n  if #arg > 40 then return 0 end\n  \
+             return os.execute(\"echo \" .. arg .. \" > /dev/null\")\nend\n\nreturn M\n",
+        ),
+        (
+            "php",
+            "--version",
+            "tool.php",
+            "<?php\nfunction run_tool(string $arg): string {\n    \
+             if (strlen($arg) > 40) return '';\n    return (string)shell_exec('echo ' . $arg);\n}\n",
+        ),
+    ];
+    for (interpreter, version_flag, name, source) in cases {
+        if !have_with(interpreter, version_flag) {
+            eprintln!("skipping {interpreter}: not installed");
+            continue;
+        }
+        let root = TestDir::new(&format!("{interpreter}-sink-command"));
+        let rules = auto_rules(root.path(), name, source);
+        assert!(
+            rules.iter().any(|rule| rule == "BHF-431"),
+            "{interpreter}: {rules:?}"
+        );
+    }
 }

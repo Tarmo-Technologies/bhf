@@ -52,6 +52,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Ruby, Lua and PHP lanes run the runtrace shim's sink oracles too
+  (#301), as Python and Perl do: a command the input controls reaching
+  `system`, `os.execute` or `shell_exec` is a BHF-431. Their drivers
+  publish each input for the shim's taint match, and the shim treats an
+  `fopen` of the target-entry file (Lua's `io.open`) as entry. Only the C#
+  lane is left without sink oracles.
 - The Python and Perl lanes run the runtrace shim's sink oracles (#300): a
   path the input controls reaching `open` is a BHF-405 path finding, and a
   command reaching a shell a BHF-431. The shim was never preloaded into an

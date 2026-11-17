@@ -428,6 +428,12 @@ unsafe fn fopen_hooked(
     let file = real(path, mode);
     let saved_errno = save_errno();
     let path_bytes = path_bytes_from_ptr(path);
+    // A Lua driver marks target entry with io.open, which is fopen (#301).
+    crate::gate::note_open(path_bytes);
+    if crate::gate::is_bhf_file(path_bytes) {
+        restore_errno(saved_errno);
+        return file;
+    }
     if let Some(_g) = HookGuard::acquire() {
         if !file.is_null() {
             log_path_open(api, path_bytes, libc::fileno(file));

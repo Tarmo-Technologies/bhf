@@ -5181,12 +5181,12 @@ pub(crate) fn harness_launcher_lang(
 }
 
 /// The interpreter lanes whose process the runtrace shim is preloaded into,
-/// recording from target entry (#300): the interpreter's own start-up before
-/// it (imports, locale probes, its own comparisons) is not recorded. Their
-/// sinks (a file the target opens, a command it runs) are the shim's.
+/// recording from target entry (#300, #301): the interpreter's own start-up
+/// before it (imports, locale probes, its own comparisons) is not recorded.
+/// Their sinks (a file the target opens, a command it runs) are the shim's.
 pub(crate) fn shim_preloaded_into_launcher(lang: crate::auto::candidate::Lang) -> bool {
     use crate::auto::candidate::Lang;
-    matches!(lang, Lang::Python | Lang::Perl)
+    matches!(lang, Lang::Python | Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php)
 }
 
 /// The warning for a failed `make afl`: the builtin engine's results stand
@@ -13275,6 +13275,7 @@ mod stamp_tests {
             .expect("vulnerability-coverage.md names the lanes the shim is preloaded into");
         let without = doc
             .split_once(" have no sink oracles yet")
+            .or_else(|| doc.split_once(" has no sink oracles yet"))
             .and_then(|(before, _)| before.rsplit_once(". "))
             .map(|(_, list)| names(list))
             .expect("vulnerability-coverage.md names the lanes with no sink oracles");
