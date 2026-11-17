@@ -130,6 +130,9 @@ jobs:
       - name: Test the campaign sweep scripts
         run: python3 -m unittest discover -s benchmarks/campaign-2026-07-25 -p 'test_*.py' -v
 
+      - name: Test the engine-comparison scripts
+        run: python3 -m unittest discover -s benchmarks/engine-comparison -p 'test_*.py' -v
+
       - name: Build workspace
         run: cargo build --locked --workspace
 

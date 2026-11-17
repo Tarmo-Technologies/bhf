@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+import dataclasses
 import json
+import os
+import shutil
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import run
 
 import stats
 import targets
@@ -615,6 +622,117 @@ class DefectIdentityTests(unittest.TestCase):
         ]
         summary = trade_study.engine_summary(rows)
         self.assertEqual(summary["normalized_diagnostic_variants"], 2)
+
+
+
+def smoke_bhf() -> Path | None:
+    """The bhf binary a smoke run uses: $BHF_TRADE_STUDY_BHF, else the
+    release build, when it exists and clang does."""
+    candidate = Path(os.environ.get("BHF_TRADE_STUDY_BHF", str(run.DEFAULT_BHF)))
+    return candidate if candidate.is_file() and shutil.which("clang") else None
+
+
+class ProvidedHarnessTests(unittest.TestCase):
+    """#254: the bhf lane fuzzes a provided harness, the one every other
+    engine builds, instead of a hard-coded unsupported row."""
+
+    def test_provided_commands_wrap_the_shared_libfuzzer_harness(self):
+        spec = dataclasses.replace(
+            targets.builtin_fixture_targets(run.CASES)[0],
+            include_dirs=(Path("/src/lib/include"),),
+            extra_cflags=("-DNDEBUG", "-DLIB_STATIC=1"),
+            bhf_harness_mode=targets.BHF_PROVIDED,
+        )
+        generate, build = trade_study.bhf_provided_commands(
+            Path("/opt/bhf"), [Path("/t/adapter.c"), Path("/t/lib.c")], spec, Path("/w")
+        )
+        self.assertEqual(
+            generate,
+            [
+                "/opt/bhf",
+                "generate-harness",
+                str(trade_study.HARNESS_ROOT / "libfuzzer.c"),
+                "--target",
+                "LLVMFuzzerTestOneInput",
+                "--id",
+                "H-PROVIDED",
+                "--output",
+                "/w/harnesses",
+                "--extra-source",
+                "/t/adapter.c",
+                "--extra-source",
+                "/t/lib.c",
+                "--extra-include",
+                "/src/lib/include",
+            ],
+        )
+        self.assertEqual(
+            build,
+            [
+                "/opt/bhf",
+                "build",
+                "/w",
+                "--harness",
+                "H-PROVIDED",
+                "--cflags",
+                "-DNDEBUG -DLIB_STATIC=1",
+            ],
+        )
+
+    def test_the_dry_run_lists_the_provided_lane_as_runnable(self):
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(Path(trade_study.__file__)),
+                "--dry-run",
+                "--cases",
+                "magic_byte",
+                "--bhf-harness-mode",
+                "provided",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertIn("runnable lanes: bhf (provided harness)", out)
+        self.assertIn("runnable: 1/1", out)
+
+    @unittest.skipUnless(smoke_bhf(), "needs a bhf binary and clang")
+    def test_a_provided_smoke_run_produces_a_bhf_row(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "study.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(trade_study.__file__)),
+                    "--cases",
+                    "magic_byte",
+                    "--engines",
+                    "bhf",
+                    "--bhf-harness-mode",
+                    "provided",
+                    "--trials",
+                    "1",
+                    "--budget",
+                    "3",
+                    "--cpu",
+                    "none",
+                    "--bhf",
+                    str(smoke_bhf()),
+                    "--workdir",
+                    str(Path(tmp) / "work"),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            [row] = json.loads(output.read_text())["rows"]
+            self.assertEqual(row["engine"], "bhf")
+            self.assertEqual(row["bhf_harness_mode"], "provided")
+            self.assertEqual(row["build_rc"], 0)
+            self.assertNotEqual(row["outcome"], trade_study.OUTCOME_UNSUPPORTED)
+            self.assertGreater(row["common_cov_edges"] or 0, 0)
 
 
 if __name__ == "__main__":

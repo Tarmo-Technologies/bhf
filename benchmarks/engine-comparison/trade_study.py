@@ -33,6 +33,7 @@ visible so the effective sample size is never hidden. This is Experiment 1
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -161,6 +162,38 @@ def source_build_args(
     args.extend(spec.extra_cflags)
     args.extend(str(s) for s in target_sources)
     return args
+
+
+# The id the bhf lane gives a provided harness.
+BHF_PROVIDED_ID = "H-PROVIDED"
+
+
+def bhf_provided_commands(
+    bhf: Path, target_sources: list[Path], spec: targets.TargetSpec, work: Path
+) -> tuple[list[str], list[str]]:
+    """The bhf lane's commands for a provided harness (#254): wrap the
+    libfuzzer.c harness every other engine builds, with the target's sources
+    and include dirs, as docs/site/custom-harness.md describes, then build it
+    with the target's flags. Returns ``(generate, build)``."""
+    generate = [
+        str(bhf),
+        "generate-harness",
+        str(HARNESS_ROOT / "libfuzzer.c"),
+        "--target",
+        "LLVMFuzzerTestOneInput",
+        "--id",
+        BHF_PROVIDED_ID,
+        "--output",
+        str(work / "harnesses"),
+    ]
+    for source in target_sources:
+        generate.extend(["--extra-source", str(source)])
+    for include in spec.include_dirs:
+        generate.extend(["--extra-include", str(include)])
+    build_cmd = [str(bhf), "build", str(work), "--harness", BHF_PROVIDED_ID]
+    if spec.extra_cflags:
+        build_cmd.extend(["--cflags", " ".join(spec.extra_cflags)])
+    return generate, build_cmd
 
 
 def sanitizer_flags(spec: targets.TargetSpec) -> str:
@@ -488,39 +521,6 @@ def run_engine(
     final_corpus: list[Path] = []
     crash_artifact = None
 
-    # The engine-quality comparison is only honest when every engine drives the
-    # same fixed harness. bhf's "provided" mode (fuzz a supplied harness rather
-    # than generate one) is the correct real-code mode but its exact CLI is a
-    # documented maintainer step, so record a visible unsupported row instead of
-    # fabricating an invocation.
-    if engine == "bhf" and spec.bhf_harness_mode == targets.BHF_PROVIDED:
-        row.update(
-            {
-                "outcome": OUTCOME_UNSUPPORTED,
-                "build_rc": None,
-                "build_s": None,
-                "campaign_wall_s": None,
-                "supervisor_timeout": None,
-                "crash_found": False,
-                "crash_confirmed": False,
-                "crash_source": None,
-                "time_to_first_crash_s": None,
-                "crash_within_budget": None,
-                "crash_signature": None,
-                "common_cov_edges": None,
-                "common_cov_features": None,
-                "final_corpus_size": None,
-                "native_executions": None,
-                "native_execs_per_s": None,
-                "right_censor_s": None,
-                "unsupported_reason": (
-                    "bhf provided-harness mode is not wired to a CLI invocation; "
-                    "supply the exact `bhf fuzz` command for a pre-written harness"
-                ),
-            }
-        )
-        return row
-
     if engine == "libfuzzer":
         binary = engine_dir / "target"
         libcxx = run.find_libstdcxx_dir()
@@ -704,23 +704,31 @@ def run_engine(
     else:  # bhf
         work = engine_dir / "work"
         work.mkdir()
-        generated = work / "generated_harnesses"
-        generated.mkdir()
-        gen = [
-            str(args.bhf),
-            "generate-harness",
-            str(primary_source),
-            "--target",
-            "target_one_input",
-            "--output",
-            str(generated),
-        ]
-        gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
-        harnesses = sorted(p for p in generated.iterdir() if p.is_dir())
-        hid = harnesses[0].name if harnesses else None
+        if spec.bhf_harness_mode == targets.BHF_PROVIDED:
+            # The engine-quality comparison is only honest when every engine
+            # drives the same fixed harness: bhf wraps the libfuzzer.c harness
+            # the other engines build, with the same sources and flags.
+            gen, bcmd = bhf_provided_commands(args.bhf, target_sources, spec, work)
+            gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
+            hid = BHF_PROVIDED_ID if gen_rc == 0 else None
+        else:
+            generated = work / "generated_harnesses"
+            generated.mkdir()
+            gen = [
+                str(args.bhf),
+                "generate-harness",
+                str(primary_source),
+                "--target",
+                "target_one_input",
+                "--output",
+                str(generated),
+            ]
+            gen_s, gen_rc, _ = build(gen, args.cpu, engine_dir / "build-generate.log")
+            harnesses = sorted(p for p in generated.iterdir() if p.is_dir())
+            hid = harnesses[0].name if harnesses else None
+            bcmd = [str(args.bhf), "build", str(work), "--harness", hid] if hid else []
         build_s, build_rc = gen_s, gen_rc
         if build_rc == 0 and hid:
-            bcmd = [str(args.bhf), "build", str(work), "--harness", hid]
             bs, brc, _ = build(bcmd, args.cpu, engine_dir / "build-native.log")
             build_s += bs
             build_rc = brc
@@ -1091,6 +1099,10 @@ def load_targets(args) -> list[targets.TargetSpec]:
             raise SystemExit(f"--cases named unknown targets: {sorted(missing)}")
     if not specs:
         raise SystemExit("no targets selected")
+    if args.bhf_harness_mode:
+        specs = [
+            dataclasses.replace(s, bhf_harness_mode=args.bhf_harness_mode) for s in specs
+        ]
     return specs
 
 
@@ -1104,6 +1116,14 @@ def describe_plan(specs: list[targets.TargetSpec], args) -> None:
             f"    budget={budget}s max_len={max_len} sanitizer={spec.sanitizer_policy} "
             f"bhf_harness={spec.bhf_harness_mode}"
         )
+        if spec.status == targets.RUNNABLE:
+            lanes = [
+                "bhf (provided harness)"
+                if engine == "bhf" and spec.bhf_harness_mode == targets.BHF_PROVIDED
+                else engine
+                for engine in args.engines
+            ]
+            print(f"    runnable lanes: {', '.join(lanes)}")
         if spec.sources:
             print(f"    sources: {', '.join(p.name for p in spec.sources)}")
         if spec.source_sha256:
@@ -1179,6 +1199,12 @@ def main() -> int:
         "--list-targets",
         action="store_true",
         help="print the resolved target set and exit",
+    )
+    p.add_argument(
+        "--bhf-harness-mode",
+        choices=[targets.BHF_GENERATED, targets.BHF_PROVIDED],
+        default=None,
+        help="harness every target's bhf lane this way (default: each target's own mode)",
     )
     p.add_argument("--trials", type=int, default=10)
     p.add_argument("--budget", type=int, default=60, help="fuzz wall seconds per trial")

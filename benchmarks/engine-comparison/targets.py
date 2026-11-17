@@ -49,8 +49,8 @@ _STATUSES = frozenset({RUNNABLE, REQUIRES_BUILD_RECIPE, MANUAL})
 # (what the toy study measures — this conflates engine quality with harness
 # generation and is only honest on a self-contained single file). "provided"
 # holds the harness fixed across every engine, which is the correct mode for an
-# engine-quality comparison on real code; wiring the exact bhf invocation for a
-# provided harness is a documented maintainer step (see METHODOLOGY.md).
+# engine-quality comparison on real code: bhf wraps the same libfuzzer.c harness
+# with `generate-harness --target LLVMFuzzerTestOneInput` (see METHODOLOGY.md).
 BHF_GENERATED = "generated"
 BHF_PROVIDED = "provided"
 _BHF_MODES = frozenset({BHF_GENERATED, BHF_PROVIDED})

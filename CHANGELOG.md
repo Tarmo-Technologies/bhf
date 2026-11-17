@@ -2711,6 +2711,14 @@
   when bhf panics.
 
 ### Added
+- The engine trade study's bhf lane fuzzes a provided harness (#254): with
+  `bhf_harness_mode=provided` it wraps the same `harnesses/libfuzzer.c` every
+  other engine builds, with the target's sources, include dirs and flags
+  (`bhf generate-harness ... --target LLVMFuzzerTestOneInput`, then
+  `bhf build --cflags`), and runs the same `bhf fuzz` budget and seeds. The
+  dry run lists the lane as runnable, and `--bhf-harness-mode` sets the mode
+  for every target. It was a hard-coded unsupported row. CI runs the study's
+  unit tests.
 - `bhf pack import-nvd INPUT... --out cve-db.json` builds an advisory
   database from NVD CVE JSON 2.0 files (#387), with the OSV importer's
   writer. Each vulnerable CPE match becomes a record identified by its CPE,

@@ -146,21 +146,29 @@ does not yet capture; see limitations.
 - **Real-code multi-file builds.** The single clang/afl-cc/hfuzz-cc invocation
   cannot configure an arbitrary project build; such targets ship as
   `requires_build_recipe` (visible `unsupported` rows) until a recipe is wired.
-- **bhf provided-harness CLI.** `bhf_harness_mode=provided` is the correct
-  engine-quality mode for real code but is not wired to a concrete `bhf fuzz`
-  invocation here; the bhf lane records a visible `unsupported` row until a
-  maintainer supplies the exact command.
+- **bhf provided harness.** With `bhf_harness_mode=provided` (the correct
+  engine-quality mode for real code) the bhf lane wraps the same
+  `harnesses/libfuzzer.c` every other engine builds:
+  `bhf generate-harness harnesses/libfuzzer.c --target LLVMFuzzerTestOneInput
+  --id H-PROVIDED --output <work>/harnesses`, with each target source as
+  `--extra-source` and each include dir as `--extra-include`, then
+  `bhf build <work> --harness H-PROVIDED --cflags "<extra_cflags>"` and the
+  same `bhf fuzz` budget, seeds and flags as the generated mode.
+  `--bhf-harness-mode provided|generated` overrides the mode for every target
+  (the builtin fixtures default to `generated`).
 - **Native execution counters** are never compared across engines.
 
 ## CI boundary
 
-The powered campaign drivers are deliberately NOT in any workflow (`ci.yml` runs
-the Rust nextest fast/smoke only). The one per-PR-eligible piece is the
-deterministic classification/stats/manifest smoke in
-`benchmarks/engine-comparison/test_runner.py`, which builds and fuzzes nothing:
+The powered campaign drivers are deliberately NOT in any workflow. `ci.yml`
+runs the deterministic classification/stats/manifest tests in
+`benchmarks/engine-comparison/test_runner.py` ("Test the engine-comparison
+scripts"), before bhf is built, so they build and fuzz nothing; the provided-
+harness smoke among them runs only where a bhf binary (`$BHF_TRADE_STUDY_BHF`,
+else `target/release/bhf`) and clang exist:
 
 ```sh
-python3 -m pytest benchmarks/engine-comparison/
+python3 -m unittest discover -s benchmarks/engine-comparison -p 'test_*.py'
 ```
 
 Powered real-code studies are run offline/scheduled and publish their immutable
