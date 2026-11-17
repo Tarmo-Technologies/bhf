@@ -50,6 +50,23 @@ void HardFault_Handler(void){
 
 static QueueHandle_t q;
 
+#ifdef BHF_ISR_ENTRY
+/* The interrupt-driven entry point (#252): a receive interrupt hands the input
+ * to the consumer through the queue, from ISR context, as a UART RX handler
+ * hands a received byte to its task. QEMU ignores a debugger's writes to the
+ * NVIC, so main() pends the interrupt itself to stand for the byte arriving. */
+void IRQ0_Handler(void){
+  BaseType_t woken = pdFALSE;
+  uint8_t b = bhf_input[0];
+  emit_crumb(0x15A0);                              /* ISR-entry marker */
+  xQueueSendFromISR(q, &b, &woken);
+  portYIELD_FROM_ISR(woken);
+}
+#define NVIC_ISER0 (*(volatile uint32_t *)0xE000E100u)
+#define NVIC_ISPR0 (*(volatile uint32_t *)0xE000E200u)
+#define NVIC_IPR0  (*(volatile uint8_t  *)0xE000E400u)
+#endif
+
 /* Producer task: forward the fuzz input one message to the consumer. */
 static void producer(void *p){ (void)p;
   uint8_t b = bhf_input[0];
@@ -83,7 +100,15 @@ static void consumer(void *p){ (void)p;
 int main(void){
   q = xQueueCreate(4, sizeof(uint8_t));
   xTaskCreate(consumer, "consumer", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+#ifdef BHF_ISR_ENTRY
+  /* Below configMAX_SYSCALL_INTERRUPT_PRIORITY, so the handler may use the
+   * FromISR API. The kernel masks it until the first task starts. */
+  NVIC_IPR0 = 6 << (8 - configPRIO_BITS);
+  NVIC_ISER0 = 1u;
+  NVIC_ISPR0 = 1u;
+#else
   xTaskCreate(producer, "producer", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
+#endif
   vTaskStartScheduler();
   for(;;){}
 }

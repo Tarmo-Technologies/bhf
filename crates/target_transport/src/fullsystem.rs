@@ -393,6 +393,7 @@ pub struct FullSystemTransport<FQ, FG> {
     exec_deadline: Option<Duration>,
     input_contract: Option<crate::gdb::InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -416,7 +417,15 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             exec_deadline: None,
             input_contract: None,
             cycle_counter: None,
+            task_id_address: None,
         })
+    }
+
+    /// Read the 32-bit task identity word at `address` after each run and
+    /// report it in [`RunOutcome::target`] (#252).
+    pub fn with_task_id(mut self, address: Option<u64>) -> Self {
+        self.task_id_address = address;
+        self
     }
 
     /// Read `counter` around each run and report the cycles it took in
@@ -510,6 +519,7 @@ where
             exec_deadline: self.exec_deadline,
             input_contract: self.input_contract,
             cycle_counter: self.cycle_counter,
+            task_id_address: self.task_id_address,
         }))
     }
 }
@@ -525,6 +535,7 @@ pub struct FullSystemSession<CQ, CG> {
     exec_deadline: Option<Duration>,
     input_contract: Option<crate::gdb::InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -640,6 +651,14 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
                 Ok(cycles) => target.cycles = Some(cycles),
                 Err(err) => {
                     coverage_incomplete.get_or_insert_with(|| format!("cycle counter: {err}"));
+                }
+            }
+        }
+        if let Some(address) = self.task_id_address {
+            match crate::gdb::read_u32(&mut self.gdb, address) {
+                Ok(id) => target.task_id = Some(u64::from(id)),
+                Err(err) => {
+                    coverage_incomplete.get_or_insert_with(|| format!("task id: {err}"));
                 }
             }
         }

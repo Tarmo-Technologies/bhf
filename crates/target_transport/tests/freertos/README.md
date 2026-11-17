@@ -38,6 +38,14 @@ fails if it cannot obtain or verify that revision.
 
 ## What it demonstrates (target contract)
 
+- An **interrupt-driven entry point**: built with `-DBHF_ISR_ENTRY`, the image
+  gets its input from external interrupt 0 (UART0 RX on mps2-an385), whose
+  handler posts it to the consumer with `xQueueSendFromISR`, and no producer
+  task is created. QEMU ignores a debugger's writes to the NVIC, so `main()`
+  pends the interrupt itself, standing for the byte arriving. The CLI test
+  `cli_freertos_isr_entry_finds_a_fault_and_records_the_task` finds the
+  `0xF7` fault through it, and `task_id=` (the address of `bhf_task_id`)
+  records which task ran the input.
 - A **real FreeRTOS scheduler** with two tasks and a queue: a `producer` task
   forwards the fuzz input as one queue message; the `consumer` task (the
   selected entry point) receives it, records its **task identity**

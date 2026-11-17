@@ -14,7 +14,7 @@
 //!   `0x40028018`, which QEMU models).
 
 use crate::error::Result;
-use crate::gdb::GdbClient;
+use crate::gdb::{read_u32, GdbClient};
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -86,16 +86,6 @@ pub fn cycles_to_duration(cycles: u64, hz: u64) -> Option<Duration> {
     Some(Duration::from_nanos(
         u64::try_from(nanos).unwrap_or(u64::MAX),
     ))
-}
-
-/// A little-endian 32-bit word of target memory.
-fn read_u32<C: Read + Write>(gdb: &mut GdbClient<C>, address: u64) -> Result<u32> {
-    let bytes = gdb.read_memory(address, 4)?;
-    let mut word = [0u8; 4];
-    for (dst, src) in word.iter_mut().zip(&bytes) {
-        *dst = *src;
-    }
-    Ok(u32::from_le_bytes(word))
 }
 
 fn write_u32<C: Read + Write>(gdb: &mut GdbClient<C>, address: u64, value: u32) -> Result<()> {

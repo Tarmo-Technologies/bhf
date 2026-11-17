@@ -14,12 +14,16 @@ void MemManage_Handler(void)  __attribute__((weak, alias("Default_Handler")));
 void BusFault_Handler(void)   __attribute__((weak, alias("Default_Handler")));
 void UsageFault_Handler(void) __attribute__((weak, alias("Default_Handler")));
 void DebugMon_Handler(void)   __attribute__((weak, alias("Default_Handler")));
+/* External interrupt 0 (UART0 RX on mps2-an385); the BHF_ISR_ENTRY build of
+ * app.c receives its input here. */
+void IRQ0_Handler(void)       __attribute__((weak, alias("Default_Handler")));
 
 __attribute__((section(".isr_vector"), used))
 void (* const vectors[])(void) = {
   (void(*)(void))&_estack, Reset_Handler, NMI_Handler, HardFault_Handler,
   MemManage_Handler, BusFault_Handler, UsageFault_Handler, 0, 0, 0, 0,
   SVC_Handler, DebugMon_Handler, 0, PendSV_Handler, SysTick_Handler,
+  IRQ0_Handler,
 };
 
 void Reset_Handler(void){

@@ -220,6 +220,11 @@ bhf fuzz bhf_work --harness H-C0001 \
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
 `-kernel` boot) — the transport handles the rest.
 
+**Task identity.** `task_id=ADDR` (on `qemu-system:` and `gdb:`) names a
+32-bit word the firmware sets to the task that runs the input, such as the
+FreeRTOS handle `xTaskGetCurrentTaskHandle()` returns. BHF reads it after each
+run and records it in a fault finding as `target_task.id`.
+
 **Firmware identity.** `firmware=PATH` (on `qemu-system:`, and as
 `gdb:HOST:PORT,firmware=PATH`) names the ELF the target runs. Before anything
 connects, BHF reads it and records in each finding's `finding.json` and
@@ -442,6 +447,21 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
 
 ## What is and isn't proven
 
+- **Five levels of validation, kept apart:**
+  1. **Host stubs.** Vendor headers stubbed on the host test portable logic
+     only. They establish no RTOS behaviour.
+  2. **ISA emulation.** `qemu-user` checks instruction semantics and byte order.
+  3. **Full-system bare metal.** The `qemu-system-arm` mps2-an385 fixture checks
+     the reset, the coverage ring and fault classification, with no scheduler.
+  4. **An actual RTOS.** The FreeRTOS reference profile
+     (`crates/target_transport/tests/freertos/`) runs under `qemu-system-arm`
+     with a scheduler, a queue, and task- and interrupt-driven entry points. It
+     has clean, fault, timeout and state-contamination controls, firmware
+     identity, task identity and target cycles. Its CLI tests run with
+     `BHF_RTOS_CLI=1`.
+  5. **Silicon.** A physical board over gdb-remote is not validated here. A
+     board profile reuses the same transport contract and must record the
+     silicon, the probe and the RTOS versions it ran.
 - **Validated live on emulators (2026-09-27, QEMU 8.2.2):** the transport
   layer's own live lane passed — cross-endian fidelity (RV-1, `qemu-ppc64`), the
   gdb-remote client + coverage read (RV-2, `qemu-arm` gdbstub), and the

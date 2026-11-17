@@ -735,6 +735,7 @@ pub struct GdbRemoteTransport<F> {
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -746,6 +747,7 @@ impl<F> GdbRemoteTransport<F> {
             exec_deadline: None,
             input_contract: None,
             cycle_counter: None,
+            task_id_address: None,
         }
     }
 
@@ -760,6 +762,13 @@ impl<F> GdbRemoteTransport<F> {
     /// [`RunOutcome::target`] (#251).
     pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
         self.cycle_counter = counter;
+        self
+    }
+
+    /// Read the 32-bit task identity word at `address` after each run and
+    /// report it in [`RunOutcome::target`] (#252).
+    pub fn with_task_id(mut self, address: Option<u64>) -> Self {
+        self.task_id_address = address;
         self
     }
 
@@ -788,6 +797,7 @@ where
             exec_deadline: self.exec_deadline,
             input_contract: self.input_contract,
             cycle_counter: self.cycle_counter,
+            task_id_address: self.task_id_address,
         }))
     }
 }
@@ -816,6 +826,16 @@ pub fn read_coverage_ring<C: Read + Write>(
     MemoryBufferReader::new(image, write, wrapped)?.read_edges()
 }
 
+/// A little-endian 32-bit word of target memory.
+pub(crate) fn read_u32<C: Read + Write>(client: &mut GdbClient<C>, address: u64) -> Result<u32> {
+    let bytes = client.read_memory(address, 4)?;
+    let mut word = [0u8; 4];
+    for (dst, src) in word.iter_mut().zip(&bytes) {
+        *dst = *src;
+    }
+    Ok(u32::from_le_bytes(word))
+}
+
 /// A live GDB-driven session.
 pub struct GdbSession<C> {
     client: GdbClient<C>,
@@ -823,6 +843,7 @@ pub struct GdbSession<C> {
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -888,6 +909,14 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
             match counter.elapsed(&mut self.client, start) {
                 Ok(cycles) => target.cycles = Some(cycles),
                 Err(err) => cycles_failed = Some(format!("cycle counter: {err}")),
+            }
+        }
+        if let Some(address) = self.task_id_address {
+            match read_u32(&mut self.client, address) {
+                Ok(id) => target.task_id = Some(u64::from(id)),
+                Err(err) => {
+                    cycles_failed.get_or_insert_with(|| format!("task id: {err}"));
+                }
             }
         }
         let (coverage_edges, coverage_incomplete) =

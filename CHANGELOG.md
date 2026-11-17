@@ -2678,6 +2678,15 @@
   when bhf panics.
 
 ### Added
+- The FreeRTOS reference profile has an interrupt-driven entry point: its
+  `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
+  handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test
+  finds the planted fault through it. `task_id=ADDR` on a `qemu-system:` or
+  `gdb:` transport reads the firmware's task identity word after each run, and
+  a fault finding records it as `target_task.id`; `bhf_task_id` was written but
+  never read. on-target-fuzzing.md lists the five validation levels (host
+  stubs, ISA emulation, full-system bare metal, an actual RTOS, silicon) and
+  which ones BHF has validated.
 - On-target deadlines can be timed by the target: `cycles=dwt` on a `gdb:` or
   `qemu-system:` transport reads the Cortex-M DWT cycle counter around each
   run, `cycles=ADDR` a free-running 32-bit counter, and with `cpu_hz=N`

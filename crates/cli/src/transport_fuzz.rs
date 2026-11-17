@@ -185,6 +185,8 @@ pub(crate) enum TransportPlan {
         firmware: Option<PathBuf>,
         /// The target cycle counter read around each run (`cycles=`, #251).
         cycles: Option<CycleCounter>,
+        /// The address of the firmware's task identity word (`task_id=`, #252).
+        task_id: Option<u64>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -211,6 +213,8 @@ pub(crate) enum TransportPlan {
         firmware: Option<PathBuf>,
         /// The target cycle counter read around each run (`cycles=`, #251).
         cycles: Option<CycleCounter>,
+        /// The address of the firmware's task identity word (`task_id=`, #252).
+        task_id: Option<u64>,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -341,10 +345,11 @@ impl TransportPlan {
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
             let (map, input) = require_coverage_map("gdb", coverage_map)?;
-            // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]]`.
+            // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
             let mut parts = rest.split(',');
             let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
             let mut firmware = None;
+            let mut task_id = None;
             let mut cycles = CycleKeys::default();
             for part in parts.map(str::trim).filter(|part| !part.is_empty()) {
                 let unknown = || TransportSpecError::Malformed {
@@ -352,12 +357,13 @@ impl TransportPlan {
                     spec: spec.to_owned(),
                     reason: format!(
                         "unknown option {part:?}; allowed: firmware=PATH, cycles=dwt|ADDR, \
-                         cpu_hz=N"
+                         cpu_hz=N, task_id=ADDR"
                     ),
                 };
                 let (key, value) = part.split_once('=').ok_or_else(unknown)?;
                 match key.trim() {
                     "firmware" => firmware = Some(PathBuf::from(value.trim())),
+                    "task_id" => task_id = Some(parse_int("task_id", value)?),
                     key if cycles.take(key, value)? => {}
                     _ => return Err(unknown()),
                 }
@@ -369,6 +375,7 @@ impl TransportPlan {
                 input,
                 firmware,
                 cycles: cycles.counter("gdb", spec)?,
+                task_id,
             });
         }
 
@@ -408,6 +415,7 @@ impl TransportPlan {
                 input,
                 firmware: _,
                 cycles,
+                task_id,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
@@ -415,7 +423,8 @@ impl TransportPlan {
                     // an unbounded wait behind the per-read socket timeout (#70).
                     .with_exec_deadline(io_timeout)
                     .with_input_contract(Some(input))
-                    .with_cycle_counter(cycles),
+                    .with_cycle_counter(cycles)
+                    .with_task_id(task_id),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -429,6 +438,7 @@ impl TransportPlan {
                 fault_status,
                 firmware: _,
                 cycles,
+                task_id,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -438,7 +448,8 @@ impl TransportPlan {
                     snapshot_tag,
                 )?
                 .with_input_contract(Some(input))
-                .with_cycle_counter(cycles);
+                .with_cycle_counter(cycles)
+                .with_task_id(task_id);
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -543,6 +554,7 @@ fn parse_qemu_system(
     let mut fault_clear: u64 = 0;
     let mut firmware: Option<PathBuf> = None;
     let mut cycles = CycleKeys::default();
+    let mut task_id: Option<u64> = None;
 
     let malformed = |reason: String| TransportSpecError::Malformed {
         backend: "qemu-system",
@@ -569,11 +581,12 @@ fn parse_qemu_system(
             "fault_width" => fault_width = parse_int("fault_width", value)?,
             "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
             "firmware" => firmware = Some(PathBuf::from(value)),
+            "task_id" => task_id = Some(parse_int("task_id", value)?),
             key if cycles.take(key, value)? => {}
             other => {
                 return Err(malformed(format!(
                     "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
-                     fault, fault_width, fault_clear, firmware, cycles, cpu_hz"
+                     fault, fault_width, fault_clear, firmware, cycles, cpu_hz, task_id"
                 )))
             }
         }
@@ -628,6 +641,7 @@ fn parse_qemu_system(
         fault_status,
         firmware,
         cycles: cycles.counter("qemu-system", spec)?,
+        task_id,
         notes,
     })
 }
@@ -1485,10 +1499,30 @@ fn handle_outcome(
         line: None,
     });
     let id = emitter.emit_sanitizer_crash(input, &report)?;
+    // The task the firmware says ran the input (#252).
+    if let Some(task) = outcome.target.task_id {
+        record_target_task(emitter, &id.0, task);
+    }
     finding_ids.push(id.0);
     seen.insert(dedup_key);
     *count += 1;
     Ok(())
+}
+
+/// Add `target_task` (the firmware's task identity word, as hex) to the
+/// finding `id`.
+fn record_target_task(emitter: &FindingEmitter, id: &str, task: u64) {
+    let path = corpus::layout::finding_dir(emitter.root(), id).join("finding.json");
+    let Some(mut finding) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return;
+    };
+    finding["target_task"] = serde_json::json!({ "id": format!("{task:#x}") });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&finding) {
+        let _ = std::fs::write(&path, bytes);
+    }
 }
 
 /// A short, stable content hash of a testcase, used only to deduplicate repeated
@@ -1903,9 +1937,11 @@ mod tests {
                 input,
                 firmware,
                 cycles,
+                task_id,
             } => {
                 assert_eq!(firmware, None);
                 assert_eq!(cycles, None);
+                assert_eq!(task_id, None);
                 assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
@@ -1977,6 +2013,7 @@ mod tests {
                 fault_status,
                 firmware: _,
                 cycles: _,
+                task_id: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");

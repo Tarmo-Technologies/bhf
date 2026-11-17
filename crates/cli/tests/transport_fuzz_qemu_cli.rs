@@ -527,6 +527,12 @@ fn freertos_kernel(dir: &Path) -> PathBuf {
 /// Build the FreeRTOS reference profile into `dir/rtos.elf`, or `None` (a
 /// skip line printed) unless `BHF_RTOS_CLI=1`.
 fn build_freertos(test: &str, dir: &Path) -> Option<PathBuf> {
+    build_freertos_with(test, dir, "rtos.elf", &[])
+}
+
+/// [`build_freertos`] of the image `name` with extra compiler `defines`
+/// (`-DBHF_ISR_ENTRY` for the interrupt-driven entry point).
+fn build_freertos_with(test: &str, dir: &Path, name: &str, defines: &[&str]) -> Option<PathBuf> {
     if std::env::var("BHF_RTOS_CLI").ok().as_deref() != Some("1") {
         eprintln!("SKIP {test}: set BHF_RTOS_CLI=1");
         return None;
@@ -537,8 +543,9 @@ fn build_freertos(test: &str, dir: &Path) -> Option<PathBuf> {
     let kernel = freertos_kernel(dir);
     let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target_transport/tests/freertos");
     let inc_port = kernel.join("portable/GCC/ARM_CM3");
-    let elf = dir.join("rtos.elf");
+    let elf = dir.join(name);
     let built = Command::new(CC)
+        .args(defines)
         .args([
             "-mcpu=cortex-m3",
             "-mthumb",
@@ -850,4 +857,48 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
         cycles[1] > 8 * cycles[0],
         "sixteen times the busy work takes more cycles: {cycles:?}"
     );
+}
+
+/// #252: the interrupt-driven entry point. The `BHF_ISR_ENTRY` image gets its
+/// input from a receive interrupt, whose handler posts it to the consumer task
+/// with `xQueueSendFromISR`; no task forwards it. The planted `0xF7` fault is
+/// found through that path, and the finding records the task the firmware
+/// says ran it (`task_id=` reads `bhf_task_id`), a task control block in the
+/// kernel's heap.
+#[test]
+fn cli_freertos_isr_entry_finds_a_fault_and_records_the_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let Some(elf) = build_freertos_with(
+        "cli_freertos_isr_entry_finds_a_fault_and_records_the_task",
+        dir,
+        "rtos-isr.elf",
+        &["-DBHF_ISR_ENTRY"],
+    ) else {
+        return;
+    };
+    let task_word = format!("task_id={:#x}", nm_symbol(&elf, "bhf_task_id", false));
+    let heap = nm_symbol(&elf, "ucHeap", false);
+
+    let guest = RtosGuest::boot(&elf, dir, "isr-fault", None);
+    let work = dir.join("work-isr-fault");
+    let summary = guest.fuzz_with_spec(&elf, &work, &[0xF7], &[], &task_word);
+    assert!(summary["crashes"].as_u64().unwrap_or(0) > 0, "{summary}");
+    let finding = work
+        .join("results/findings")
+        .join(summary["findings"][0].as_str().unwrap());
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    let task = raw["target_task"]["id"].as_str().expect("the task id");
+    let task = u64::from_str_radix(task.trim_start_matches("0x"), 16).unwrap();
+    assert!(
+        (heap..heap + 32 * 1024).contains(&task),
+        "the task id {task:#x} is a TCB in the kernel heap at {heap:#x}: {raw:#}"
+    );
+    drop(guest);
+
+    let guest = RtosGuest::boot(&elf, dir, "isr-clean", None);
+    let summary = guest.fuzz_with_spec(&elf, &dir.join("work-isr-clean"), &[0x42], &[], &task_word);
+    assert_eq!(summary["executions"], 1, "{summary}");
+    assert_eq!(summary["crashes"], 0, "{summary}");
 }
