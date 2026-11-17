@@ -10,6 +10,10 @@
     "single clang/afl-cc/hfuzz-cc invocation cannot configure an arbitrary project",
     "build; they appear as VISIBLE 'unsupported' rows until a maintainer wires them.",
     "",
+    "A target with a 'recipe' (recipes.py) is runnable once fetched: at run time the",
+    "recipe checks the checkout's pinned files, generates what the project's build would,",
+    "and supplies sources/include_dirs/extra_cflags. Run with --sources <dir> (the --fetch root).",
+    "",
     "To make one runnable: (1) `trade_study.py --manifest this.json --fetch --sources",
     "<dir>` to clone each upstream at its pin; (2) add a small adapter .c that includes",
     "the library header and defines int target_one_input(const unsigned char*, size_t)",
@@ -22,10 +26,20 @@
     "name": "example-lib",
     "kind": "self_contained",
     "status": "runnable",
-    "upstream": {"url": "https://example.invalid/lib.git", "commit": "<40-hex>"},
-    "sources": ["adapters/example_adapter.c", "/abs/checkout/lib.c"],
-    "include_dirs": ["/abs/checkout/include"],
-    "extra_cflags": ["-DNDEBUG"],
+    "upstream": {
+      "url": "https://example.invalid/lib.git",
+      "commit": "<40-hex>"
+    },
+    "sources": [
+      "adapters/example_adapter.c",
+      "/abs/checkout/lib.c"
+    ],
+    "include_dirs": [
+      "/abs/checkout/include"
+    ],
+    "extra_cflags": [
+      "-DNDEBUG"
+    ],
     "seed_dir": "seeds/example-lib",
     "budget_s": 300,
     "max_len": 4096,
@@ -38,22 +52,31 @@
     {
       "name": "cjson",
       "kind": "self_contained",
-      "status": "requires_build_recipe",
-      "description": "cJSON_ParseWithLengthOpts — small single-TU JSON parser, canonical fuzz target",
-      "upstream": {"url": "https://github.com/DaveGamble/cJSON.git", "commit": "fb16e5cf358798aabb049655975cde8427101056"},
+      "status": "runnable",
+      "description": "cJSON_ParseWithLengthOpts \u2014 small single-TU JSON parser, canonical fuzz target",
+      "upstream": {
+        "url": "https://github.com/DaveGamble/cJSON.git",
+        "commit": "fb16e5cf358798aabb049655975cde8427101056"
+      },
       "target_callback": "cJSON_ParseWithLengthOpts",
-      "extra_cflags": ["-DNDEBUG"],
+      "extra_cflags": [
+        "-DNDEBUG"
+      ],
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic (heap-overflow/UAF) on a parsed input",
-      "notes": "runnable as a 1-TU target: adapter + cJSON.c, include_dirs=[checkout]. Primary single-file example."
+      "notes": "recipe cjson: adapters/cjson.c + cJSON.c (SHA-256 pinned), include_dirs=[checkout].",
+      "recipe": "cjson"
     },
     {
       "name": "zlib",
       "kind": "self_contained",
       "status": "requires_build_recipe",
-      "description": "uncompress2 — DEFLATE decompressor",
-      "upstream": {"url": "https://github.com/madler/zlib.git", "commit": "e3dc0a85b7032e98380dec011bc8f2c2ee0d8fca"},
+      "description": "uncompress2 \u2014 DEFLATE decompressor",
+      "upstream": {
+        "url": "https://github.com/madler/zlib.git",
+        "commit": "e3dc0a85b7032e98380dec011bc8f2c2ee0d8fca"
+      },
       "target_callback": "uncompress2",
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
@@ -64,8 +87,11 @@
       "name": "libpng",
       "kind": "self_contained",
       "status": "requires_build_recipe",
-      "description": "png_image_begin_read_from_memory — image decoder",
-      "upstream": {"url": "https://github.com/pnggroup/libpng.git", "commit": "d1d0abeffede1cc898ddc3d0e600839cf026d749"},
+      "description": "png_image_begin_read_from_memory \u2014 image decoder",
+      "upstream": {
+        "url": "https://github.com/pnggroup/libpng.git",
+        "commit": "d1d0abeffede1cc898ddc3d0e600839cf026d749"
+      },
       "target_callback": "png_image_begin_read_from_memory",
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
@@ -76,8 +102,11 @@
       "name": "libyaml",
       "kind": "self_contained",
       "status": "requires_build_recipe",
-      "description": "yaml_parser_parse — YAML 1.1 parser",
-      "upstream": {"url": "https://github.com/yaml/libyaml.git", "commit": "893682bb98d5ed663a3e314c46dceaf9b1c8802f"},
+      "description": "yaml_parser_parse \u2014 YAML 1.1 parser",
+      "upstream": {
+        "url": "https://github.com/yaml/libyaml.git",
+        "commit": "893682bb98d5ed663a3e314c46dceaf9b1c8802f"
+      },
       "target_callback": "yaml_parser_parse",
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
@@ -88,10 +117,15 @@
       "name": "re2",
       "kind": "self_contained",
       "status": "requires_build_recipe",
-      "description": "re2::Regexp::Parse — C++ regex engine (Abseil transitive deps)",
-      "upstream": {"url": "https://github.com/google/re2.git", "commit": "972a15cedd008d846f1a39b2e88ce48d7f166cbd"},
+      "description": "re2::Regexp::Parse \u2014 C++ regex engine (Abseil transitive deps)",
+      "upstream": {
+        "url": "https://github.com/google/re2.git",
+        "commit": "972a15cedd008d846f1a39b2e88ce48d7f166cbd"
+      },
       "target_callback": "re2::Regexp::Parse",
-      "extra_cflags": ["-std=c++17"],
+      "extra_cflags": [
+        "-std=c++17"
+      ],
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while parsing a pattern",
@@ -100,15 +134,21 @@
     {
       "name": "sqlite",
       "kind": "self_contained",
-      "status": "requires_build_recipe",
-      "description": "sqlite3_prepare_v2 — SQL statement compiler (amalgamation is single-TU)",
-      "upstream": {"url": "https://github.com/sqlite/sqlite.git", "commit": "14385e5a25cbb3537e465d1812b03afef5935267"},
+      "status": "runnable",
+      "description": "sqlite3_prepare_v2 \u2014 SQL statement compiler (amalgamation is single-TU)",
+      "upstream": {
+        "url": "https://github.com/sqlite/sqlite.git",
+        "commit": "14385e5a25cbb3537e465d1812b03afef5935267"
+      },
       "target_callback": "sqlite3_prepare_v2",
-      "extra_cflags": ["-DSQLITE_OMIT_LOAD_EXTENSION"],
+      "extra_cflags": [
+        "-DSQLITE_OMIT_LOAD_EXTENSION"
+      ],
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while preparing a statement",
-      "notes": "the amalgamation (sqlite3.c, generated by `make sqlite3.c`) is a single TU and is the closest real-code target to a runnable 1-TU build."
+      "notes": "recipe sqlite: the amalgamation `make sqlite3.c` generates out of tree (sqlite3.c/.h SHA-256 pinned) + adapters/sqlite.c, single-threaded, no extension loading.",
+      "recipe": "sqlite"
     }
   ]
 }

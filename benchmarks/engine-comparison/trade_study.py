@@ -44,6 +44,7 @@ import sys
 import time
 from pathlib import Path
 
+import recipes  # build recipes for the real-code targets
 import run  # reviewed helpers: sha256, monitor, fixture_source, make_corpus, CASES, ...
 import stats  # deterministic distribution/CI summaries (unit-tested in CI)
 import targets  # pluggable real-code target set + manifest schema
@@ -1103,7 +1104,30 @@ def load_targets(args) -> list[targets.TargetSpec]:
         specs = [
             dataclasses.replace(s, bhf_harness_mode=args.bhf_harness_mode) for s in specs
         ]
+    if not (args.fetch or args.dry_run or args.list_targets):
+        specs = [apply_recipe(s, args) for s in specs]
     return specs
+
+
+def apply_recipe(spec: targets.TargetSpec, args) -> targets.TargetSpec:
+    """A runnable target's sources from its build recipe (#255): the recipe
+    checks and builds the checkout ``--fetch`` made under ``--sources``."""
+    if spec.recipe is None or spec.status != targets.RUNNABLE:
+        return spec
+    sources_root = (args.sources or args.workdir / "sources").resolve()
+    try:
+        prepared = recipes.prepare(
+            spec.recipe, sources_root / spec.name, args.workdir / "recipes" / spec.name
+        )
+    except recipes.RecipeError as error:
+        raise SystemExit(f"[{spec.name}] {error}") from error
+    return dataclasses.replace(
+        spec,
+        sources=prepared.sources,
+        include_dirs=prepared.include_dirs + spec.include_dirs,
+        extra_cflags=prepared.extra_cflags + spec.extra_cflags,
+        source_sha256={src.name: sha256(src) for src in prepared.sources},
+    )
 
 
 def describe_plan(specs: list[targets.TargetSpec], args) -> None:
@@ -1129,6 +1153,8 @@ def describe_plan(specs: list[targets.TargetSpec], args) -> None:
         if spec.source_sha256:
             for name, digest in spec.source_sha256.items():
                 print(f"      {name}: {digest[:16]}")
+        if spec.recipe:
+            print(f"    recipe: {spec.recipe}")
         if spec.notes:
             print(f"    notes: {spec.notes}")
 

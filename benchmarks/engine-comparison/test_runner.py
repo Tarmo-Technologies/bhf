@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import recipes
 import run
 
 import stats
@@ -733,6 +734,74 @@ class ProvidedHarnessTests(unittest.TestCase):
             self.assertEqual(row["build_rc"], 0)
             self.assertNotEqual(row["outcome"], trade_study.OUTCOME_UNSUPPORTED)
             self.assertGreater(row["common_cov_edges"] or 0, 0)
+
+
+
+def fetched_sources() -> Path | None:
+    """The --fetch root a recipe smoke build uses: $BHF_TRADE_STUDY_SOURCES,
+    when it is a directory and clang exists."""
+    root = os.environ.get("BHF_TRADE_STUDY_SOURCES")
+    return Path(root) if root and Path(root).is_dir() and shutil.which("clang") else None
+
+
+class RecipeTests(unittest.TestCase):
+    """#255: pinned, checksum-verified recipes make real-code targets
+    runnable."""
+
+    def test_the_dry_run_lists_the_recipe_targets_as_runnable(self):
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(Path(trade_study.__file__)),
+                "--manifest",
+                str(Path(trade_study.__file__).parent / "experiment1-real-code.example.json"),
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for name in ("cjson", "sqlite"):
+            self.assertIn(f"- {name} [self_contained/runnable]", out)
+            self.assertIn(f"recipe: {name}", out)
+
+    def test_a_checksum_mismatch_or_a_missing_checkout_is_an_error(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cJSON.c").write_text("int moved_pin;\n")
+            (root / "cJSON.h").write_text("")
+            with self.assertRaisesRegex(recipes.RecipeError, "cJSON.c has SHA-256"):
+                recipes.prepare("cjson", root, root / "build")
+            with self.assertRaisesRegex(recipes.RecipeError, "run trade_study.py --fetch"):
+                recipes.prepare("cjson", root / "absent", root / "build")
+            with self.assertRaisesRegex(recipes.RecipeError, "no build recipe named"):
+                recipes.prepare("nope", root, root / "build")
+
+    @unittest.skipUnless(fetched_sources(), "needs $BHF_TRADE_STUDY_SOURCES and clang")
+    def test_a_recipe_smoke_build_produces_each_harness(self):
+        """Build and briefly run the libFuzzer harness of every recipe target."""
+        with TemporaryDirectory() as tmp:
+            for name in sorted(recipes.RECIPES):
+                prepared = recipes.prepare(
+                    name, fetched_sources() / name, Path(tmp) / "recipes" / name
+                )
+                binary = Path(tmp) / f"{name}-fuzzer"
+                subprocess.run(
+                    [
+                        "clang",
+                        "-O1",
+                        "-fsanitize=fuzzer,address",
+                        *[f"-I{inc}" for inc in prepared.include_dirs],
+                        *prepared.extra_cflags,
+                        str(trade_study.HARNESS_ROOT / "libfuzzer.c"),
+                        *[str(src) for src in prepared.sources],
+                        "-o",
+                        str(binary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run([str(binary), "-runs=200"], check=True, capture_output=True)
 
 
 if __name__ == "__main__":

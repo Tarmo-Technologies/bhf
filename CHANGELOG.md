@@ -2711,6 +2711,14 @@
   when bhf panics.
 
 ### Added
+- Pinned, checksum-verified build recipes for the trade study's cjson and
+  sqlite real-code targets (#255). `recipes.py` turns a checkout fetched at
+  its pin into the sources, include dirs and flags to compile: cjson is
+  `cJSON.c`; sqlite is the amalgamation its own `make sqlite3.c` generates out
+  of tree. Each recipe checks the SHA-256 of the files it takes or generates,
+  and each target has an adapter under `adapters/`. The dry run lists both as
+  runnable, and a smoke build (`BHF_TRADE_STUDY_SOURCES`) builds and runs both
+  harnesses.
 - The engine trade study's bhf lane fuzzes a provided harness (#254): with
   `bhf_harness_mode=provided` it wraps the same `harnesses/libfuzzer.c` every
   other engine builds, with the target's sources, include dirs and flags

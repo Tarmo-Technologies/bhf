@@ -108,6 +108,9 @@ class TargetSpec:
     expected_oracle: str = "any ASan/UBSan diagnostic"
     status: str = RUNNABLE
     notes: str = ""
+    # The build recipe (recipes.py) that turns the fetched checkout into
+    # ``sources``/``include_dirs``/``extra_cflags`` at run time.
+    recipe: str | None = None
     # Resolved at load time for self-contained targets; empty for fixtures.
     source_sha256: dict[str, str] = field(default_factory=dict)
 
@@ -134,6 +137,7 @@ class TargetSpec:
             "expected_oracle": self.expected_oracle,
             "status": self.status,
             "source_sha256": self.source_sha256,
+            "recipe": self.recipe,
             "notes": self.notes,
         }
 
@@ -212,11 +216,14 @@ def _parse_target(entry: dict, base: Path, *, resolve_sources: bool) -> TargetSp
     )
     status = _validate_choice(entry.get("status", RUNNABLE), _STATUSES, "status", name)
 
-    if kind == KIND_SELF_CONTAINED and status == RUNNABLE and not sources:
+    recipe = entry.get("recipe")
+    if recipe is not None and (not isinstance(recipe, str) or not recipe):
+        raise ManifestError(f"target {name!r}: recipe must be a non-empty string")
+    if kind == KIND_SELF_CONTAINED and status == RUNNABLE and not sources and not recipe:
         raise ManifestError(
             f"target {name!r}: a runnable self_contained target needs at least one "
-            f"source; mark it status={REQUIRES_BUILD_RECIPE!r} if sources are not "
-            f"yet materialized"
+            f"source or a build recipe; mark it status={REQUIRES_BUILD_RECIPE!r} if "
+            f"sources are not yet materialized"
         )
 
     extra_cflags = entry.get("extra_cflags", [])
@@ -292,6 +299,7 @@ def _parse_target(entry: dict, base: Path, *, resolve_sources: bool) -> TargetSp
         expected_oracle=str(entry.get("expected_oracle", "any ASan/UBSan diagnostic")),
         status=status,
         notes=str(entry.get("notes", "")),
+        recipe=recipe,
         source_sha256=source_sha,
     )
 
