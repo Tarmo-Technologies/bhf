@@ -9716,17 +9716,43 @@ fn run_harness_with_protocol(
     })
 }
 
-/// Replay a single corpus input through `runner` and return the grouped
-/// testcases it produced. Used by `bhf corpus minimize` to compute each
-/// input's coverage contribution. C/C++ libFuzzer harnesses do not emit an
-/// Ada event log, so they yield an empty vector (no runtrace coverage).
-pub(crate) fn replay_input_testcases(
-    runner: &replay_min::HarnessRunner,
-    work_dir: &Path,
-    input: &[u8],
-) -> Result<Vec<Testcase>, String> {
-    let run = run_harness(runner, work_dir, input, &[], PER_INPUT_TIMEOUT, 0, None)?;
-    Ok(run.testcases)
+/// An edge-coverage map for replaying inputs one at a time (#282): the
+/// `BHF_COV_SHM` file every lane's driver writes the edges an input reaches
+/// to. Removed when it drops.
+pub(crate) struct ReplayCoverageMap {
+    _map: shared_map::SharedMapFile,
+    path: String,
+}
+
+impl ReplayCoverageMap {
+    pub(crate) fn create(work_dir: &Path) -> Result<Self, String> {
+        let (map, path) = arm_shared_map(work_dir, BHF_COV_BITS)?;
+        Ok(Self { _map: map, path })
+    }
+
+    /// Replay `input` in a fresh process of `runner`'s harness with the map
+    /// cleared: the event-log testcases it gives (Ada's) and the edges its
+    /// driver wrote to the map.
+    pub(crate) fn replay(
+        &self,
+        runner: &replay_min::HarnessRunner,
+        work_dir: &Path,
+        input: &[u8],
+    ) -> Result<(Vec<Testcase>, Vec<u32>), String> {
+        fs::write(&self.path, vec![0u8; BHF_COV_BITS])
+            .map_err(|error| format!("clear the coverage map {}: {error}", self.path))?;
+        let env = [("BHF_COV_SHM".to_owned(), self.path.clone())];
+        let run = run_harness(runner, work_dir, input, &env, PER_INPUT_TIMEOUT, 0, None)?;
+        let map = fs::read(&self.path)
+            .map_err(|error| format!("read the coverage map {}: {error}", self.path))?;
+        let edges = map
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte != 0)
+            .filter_map(|(index, _)| u32::try_from(index).ok())
+            .collect();
+        Ok((run.testcases, edges))
+    }
 }
 
 /// Replay-verify a C/C++ sanitizer crash (#388): re-run the input in a fresh

@@ -70,6 +70,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf corpus minimize` minimizes on the harness's coverage map in every lane
+  (#282). Each input is replayed in a fresh process with the map cleared,
+  and kept when it reaches an edge no earlier input did or, for Ada, adds an
+  event-log signature. It read only the Ada event log, so a C, C++ or Python
+  harness kept nothing. A map whose edges differ between two runs of one
+  input (a driver that hashes addresses) is not used, and a relative
+  `--harness` path now resolves before the replays run.
 - The AFL++ lane runs afl-fuzz for its whole budget (#412). bhf set
   `AFL_BENCH_UNTIL_CRASH=0`, and afl-fuzz stops at its first crash when that
   variable is set at all, so a run reported one crash and left the rest of

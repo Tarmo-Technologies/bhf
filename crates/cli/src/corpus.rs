@@ -157,9 +157,12 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
         return 1;
     }
 
+    // The replays run in a scratch directory: a relative harness path is
+    // resolved here first.
+    let harness = std::path::absolute(&args.harness).unwrap_or_else(|_| args.harness.clone());
     // A cross-built harness runs under the emulator recorded beside it.
     let runner = match crate::runner::harness_runner_for(
-        args.harness.clone(),
+        harness,
         None,
         Vec::new(),
         crate::runner::SandboxModeArg::Auto,
@@ -180,24 +183,52 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
         }
     };
 
+    // #282: an input's coverage is the edges its harness's driver writes to
+    // the coverage map, in every lane, and an Ada harness's event log.
+    let map = match crate::fuzz::ReplayCoverageMap::create(work_dir.path()) {
+        Ok(map) => map,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return 1;
+        }
+    };
+    // A map whose edges differ between two runs of one input (a driver that
+    // hashes addresses a fresh process moves) cannot tell inputs apart.
+    let stable_edges = match (
+        map.replay(&runner, work_dir.path(), &inputs[0].1),
+        map.replay(&runner, work_dir.path(), &inputs[0].1),
+    ) {
+        (Ok((_, first)), Ok((_, second))) => {
+            if first != second {
+                bhfeprintln!(
+                    "note: the harness's coverage map differs between two runs of one input, \
+                     so its edges are not used to tell the inputs apart"
+                );
+            }
+            first == second
+        }
+        _ => true,
+    };
     let mut saw_coverage = false;
     let total = inputs.len();
     let selection = select_coverage_minimal(&inputs, |bytes| {
-        match crate::fuzz::replay_input_testcases(&runner, work_dir.path(), bytes) {
-            Ok(testcases) => {
-                if !testcases.is_empty() {
+        match map.replay(&runner, work_dir.path(), bytes) {
+            Ok((testcases, edges)) => {
+                let edges = if stable_edges { edges } else { Vec::new() };
+                if !testcases.is_empty() || !edges.is_empty() {
                     saw_coverage = true;
                 }
-                Ok(testcases)
+                Ok((testcases, edges))
             }
             // One unreplayable input must not abort the whole minimize: warn,
             // treat it as contributing no coverage, and keep going.
             Err(error) => {
                 bhfeprintln!("warning: skipping input (replay failed): {error}");
-                Ok(Vec::new())
+                Ok((Vec::new(), Vec::new()))
             }
         }
     });
+    drop(map);
     drop(work_dir);
 
     let kept = match selection {
@@ -217,9 +248,10 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
             return 1;
         }
         bhfeprintln!(
-            "error: {} records no corpus coverage when it replays an input (Ada harnesses \
-             do), so `bhf corpus minimize` cannot tell its inputs apart; copied all {total} \
-             inputs to {} unchanged. `bhf corpus merge` drops inputs with duplicate content",
+            "error: {} records no coverage when it replays an input (no edges in its \
+             coverage map, no event log), so `bhf corpus minimize` cannot tell its inputs \
+             apart; copied all {total} inputs to {} unchanged. `bhf corpus merge` drops \
+             inputs with duplicate content",
             harness_lane(&args.harness),
             args.output.display()
         );
@@ -345,23 +377,28 @@ fn testcase_signatures(testcase: &Testcase) -> Vec<CoverageSignature> {
 }
 
 /// Greedily select a coverage-minimal subset of `inputs` (libFuzzer `-merge`
-/// semantics): replay each input in order through `replay`, feed the resulting
-/// testcases into a running `CoverageProxy`, and keep an input only when it
-/// contributes at least one new coverage feature (breadcrumb, handler, raise,
-/// top-level, return class, mock call, or exception signature). Inputs that
-/// reproduce only already-seen coverage — or no coverage at all — are dropped.
+/// semantics): replay each input in order through `replay`, which gives its
+/// event-log testcases and the edges of its coverage map, and keep an input
+/// only when it reaches an edge no earlier one did (#282) or contributes a new
+/// event-log feature (breadcrumb, handler, raise, top-level, return class,
+/// mock call, or exception signature). Inputs that reproduce only
+/// already-seen coverage — or no coverage at all — are dropped.
 fn select_coverage_minimal<F>(
     inputs: &[(String, Vec<u8>)],
     mut replay: F,
 ) -> Result<Vec<String>, String>
 where
-    F: FnMut(&[u8]) -> Result<Vec<Testcase>, String>,
+    F: FnMut(&[u8]) -> Result<(Vec<Testcase>, Vec<u32>), String>,
 {
     let mut proxy = CoverageProxy::default();
+    let mut edges_seen = std::collections::HashSet::new();
     let mut kept = Vec::new();
     for (name, input) in inputs {
-        let testcases = replay(input)?;
+        let (testcases, edges) = replay(input)?;
         let mut added = false;
+        for edge in edges {
+            added |= edges_seen.insert(edge);
+        }
         for testcase in &testcases {
             let signatures = testcase_signatures(testcase);
             if !proxy
@@ -418,19 +455,45 @@ mod tests {
         ];
 
         let kept = select_coverage_minimal(&inputs, |input| {
-            Ok(match input {
-                // distinct breadcrumb -> novel coverage
-                b"a" => vec![testcase_with_crumbs(vec![1])],
-                // same breadcrumb as "a" -> no new coverage
-                b"b" => vec![testcase_with_crumbs(vec![1])],
-                // fresh breadcrumb -> novel coverage
-                b"c" => vec![testcase_with_crumbs(vec![2])],
-                // no events at all -> nothing to add
-                _ => Vec::new(),
-            })
+            Ok((
+                match input {
+                    // distinct breadcrumb -> novel coverage
+                    b"a" => vec![testcase_with_crumbs(vec![1])],
+                    // same breadcrumb as "a" -> no new coverage
+                    b"b" => vec![testcase_with_crumbs(vec![1])],
+                    // fresh breadcrumb -> novel coverage
+                    b"c" => vec![testcase_with_crumbs(vec![2])],
+                    // no events at all -> nothing to add
+                    _ => Vec::new(),
+                },
+                Vec::new(),
+            ))
         })
         .unwrap();
 
         assert_eq!(kept, vec!["a".to_owned(), "c".to_owned()]);
+    }
+
+    /// #282: the coverage map's edges tell inputs apart in a lane with no
+    /// event log: an input is kept when it reaches an edge no earlier one did.
+    #[test]
+    fn select_coverage_minimal_keeps_inputs_that_reach_new_edges() {
+        let inputs: Vec<(String, Vec<u8>)> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|name| ((*name).to_owned(), name.as_bytes().to_vec()))
+            .collect();
+        let kept = select_coverage_minimal(&inputs, |input| {
+            let edges = match input {
+                b"a" => vec![1, 2],
+                b"b" => vec![1, 2],
+                b"c" => vec![1, 3],
+                b"d" => vec![3],
+                b"e" => vec![4, 5],
+                _ => vec![1, 6],
+            };
+            Ok((Vec::new(), edges))
+        })
+        .unwrap();
+        assert_eq!(kept, ["a", "c", "e", "f"]);
     }
 }
