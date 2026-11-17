@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Changed
+- The in-crate lane for private Rust targets (#83) is `bhf auto
+  --rust-private` (#244), or `rust-private = true` in the config; it was
+  reachable only through the undocumented `BHF_RUST_INCRATE_PRIVATE`, which
+  still works. A target the lane admits but cannot set up has its own
+  outcome, `unsupported_setup` (`summary.unsupported_setup`), instead of
+  `unsupported_params`.
 - bhf's UTC timestamps come from `jiff` instead of `chrono`, which
   RUSTSEC-2026-0543 marks unmaintained and `cargo deny` refused. The
   timestamps are written in the same formats (#408).

@@ -298,6 +298,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         no_minimize: false,
         decoder_limits: Default::default(),
         force: false,
+        rust_private: false,
         differential: None,
     }
 }

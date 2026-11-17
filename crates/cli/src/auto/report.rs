@@ -108,6 +108,12 @@ struct Summary {
     /// own outcome). 0 (omitted) when none was.
     #[serde(skip_serializing_if = "is_zero")]
     unsafe_build_path: usize,
+    /// Targets the in-crate Rust lane (`--rust-private`) admitted but could
+    /// not set up (outcome `unsupported_setup`; counted in
+    /// `unsupported_params` before it had its own outcome). 0 (omitted) when
+    /// none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    unsupported_setup: usize,
     /// Targets whose lane's toolchain is not installed (outcome
     /// `missing_toolchain`: no `node` for JavaScript, no esbuild for
     /// TypeScript; counted in `unsupported_params` before it had its own
@@ -1447,6 +1453,9 @@ pub fn write_reports_with_output_limit(
             Outcome::UnsafeBuildPath { .. } => {
                 summary.unsafe_build_path += 1;
             }
+            Outcome::UnsupportedSetup { .. } => {
+                summary.unsupported_setup += 1;
+            }
             Outcome::MissingToolchain { .. } => {
                 summary.missing_toolchain += 1;
             }
@@ -1762,6 +1771,11 @@ pub fn write_reports_with_output_limit(
             )),
             crate::auto::attempt::Outcome::UnsafeBuildPath { reason } => Some((
                 IssueCategory::UnsafeBuildPath,
+                strip_target_prefix(reason),
+                context("harness-gen"),
+            )),
+            crate::auto::attempt::Outcome::UnsupportedSetup { reason } => Some((
+                IssueCategory::UnsupportedType,
                 strip_target_prefix(reason),
                 context("harness-gen"),
             )),
@@ -2738,6 +2752,7 @@ fn missing_language_package(outcome: &Outcome) -> Option<String> {
     let reason = match outcome {
         Outcome::UnsupportedParams { reason } => reason.as_str(),
         Outcome::UnsafeBuildPath { .. }
+        | Outcome::UnsupportedSetup { .. }
         | Outcome::MissingToolchain { .. }
         | Outcome::ConsentRequired { .. }
         | Outcome::FailedBuild { .. }
@@ -2773,6 +2788,7 @@ fn add_checkpoint_result(
         | Outcome::SanitizerRuntimeUnavailable { repairs, .. } => repairs,
         Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
+        | Outcome::UnsupportedSetup { .. }
         | Outcome::MissingToolchain { .. }
         | Outcome::ConsentRequired { .. }
         | Outcome::ReportOnly { .. } => &[],
@@ -3041,6 +3057,7 @@ fn add_checkpoint_result(
         Outcome::Built { .. }
         | Outcome::UnsupportedParams { .. }
         | Outcome::UnsafeBuildPath { .. }
+        | Outcome::UnsupportedSetup { .. }
         | Outcome::MissingToolchain { .. }
         | Outcome::ConsentRequired { .. }
         | Outcome::SanitizerRuntimeUnavailable { .. } => {}
@@ -3582,6 +3599,13 @@ fn render_md(r: &RunJson<'_>) -> String {
             s,
             "Refused (a path or flag cannot be quoted safely): {}",
             r.summary.unsafe_build_path
+        );
+    }
+    if r.summary.unsupported_setup > 0 {
+        let _ = writeln!(
+            s,
+            "Skipped (the in-crate Rust lane cannot set it up): {}",
+            r.summary.unsupported_setup
         );
     }
     if r.summary.missing_toolchain > 0 {

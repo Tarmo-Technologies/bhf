@@ -46,7 +46,7 @@ fn has_cargo_nightly() -> bool {
 }
 
 /// Run `bhf auto` on `fixture_dir`. When `incrate_private` is set, the opt-in
-/// `BHF_RUST_INCRATE_PRIVATE=1` lane is enabled. Returns (combined output, run.json).
+/// lane is enabled with `--rust-private`. Returns (combined output, run.json).
 fn run_auto(
     fixture_dir: &Path,
     work: &Path,
@@ -67,11 +67,10 @@ fn run_auto(
         work.to_str().unwrap(),
     ]);
     if incrate_private {
-        cmd.env("BHF_RUST_INCRATE_PRIVATE", "1");
-    } else {
-        // Ensure the ambient env never leaks the flag into the default-path test.
-        cmd.env_remove("BHF_RUST_INCRATE_PRIVATE");
+        cmd.arg("--rust-private");
     }
+    // The ambient env never turns the lane on behind a test's back.
+    cmd.env_remove("BHF_RUST_INCRATE_PRIVATE");
     let output = cmd.output().expect("run bhf auto");
     let combined = format!(
         "{}{}",
@@ -269,7 +268,7 @@ fn default_path_does_not_discover_the_non_pub_method() {
 
     assert!(
         find_attempt(&json, "open_dir").is_none(),
-        "without BHF_RUST_INCRATE_PRIVATE the pub(crate) `open_dir` must NOT be \
+        "without --rust-private the pub(crate) `open_dir` must NOT be \
          discovered (default Rust auto path byte-identical): run.json:\n{json}"
     );
 
@@ -322,4 +321,77 @@ fn discovery_cache_tracks_the_incrate_private_flag_toggle() {
          not retain it:\n{off2}"
     );
     let _ = std::fs::remove_dir_all(&w2);
+}
+
+/// #244: `rust-private = true` in the tree's config turns the lane on as the
+/// flag does, and a private target it admits but has no recipe for (a
+/// parameter of a crate type with no decoder that is not a path) is outcome
+/// `unsupported_setup`, apart from `unsupported_params`. Both are discovery
+/// and resolve properties, so neither needs a toolchain.
+#[test]
+fn the_config_key_enables_the_lane_and_an_unsupported_setup_has_its_own_outcome() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    let root = TestDir::new("incrate-setup");
+    let src = root.join("src");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(
+        src.join("Cargo.toml"),
+        "[package]\nname = \"setupcrate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("src/lib.rs"),
+        "pub struct Config {\n    pub depth: u32,\n}\n\n\
+         pub struct Store {\n    seen: u32,\n}\n\n\
+         impl Store {\n    pub fn new() -> Self {\n        Store { seen: 0 }\n    }\n\n    \
+         pub(crate) fn ingest(&mut self, cfg: Config) -> u32 {\n        \
+         self.seen += cfg.depth;\n        self.seen\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(src.join(".bhf.toml"), "rust-private = true\n").unwrap();
+
+    let work = root.join("work");
+    let output = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--run-untrusted",
+            "--per-target-time",
+            "2",
+            "--target",
+            "ingest",
+        ])
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .env_remove("BHF_RUST_INCRATE_PRIVATE")
+        .output()
+        .expect("run bhf auto");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    let ingest = find_attempt(&json, "ingest")
+        .unwrap_or_else(|| panic!("the config key admits the pub(crate) `ingest`:\n{combined}"));
+    assert_eq!(
+        ingest["outcome"]["outcome"], "unsupported_setup",
+        "{ingest:#}"
+    );
+    assert!(
+        ingest["outcome"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("unsupported in-crate setup")),
+        "{ingest:#}"
+    );
+    assert_eq!(
+        json["summary"]["unsupported_setup"], 1,
+        "{:#}",
+        json["summary"]
+    );
 }

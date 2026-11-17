@@ -73,6 +73,7 @@ pub fn outcome_bucket(outcome: &crate::auto::attempt::Outcome) -> &'static str {
         UnrecoverableRuntime { .. } => "runtime",
         UnsupportedParams { .. }
         | UnsafeBuildPath { .. }
+        | UnsupportedSetup { .. }
         | MissingToolchain { .. }
         | ConsentRequired { .. }
         | SanitizerRuntimeUnavailable { .. } => "skipped",

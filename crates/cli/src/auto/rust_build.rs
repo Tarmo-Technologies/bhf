@@ -60,13 +60,27 @@ pub(crate) fn resolve_failure_is_unsupported_setup(reason: &str) -> bool {
     reason.contains(UNSUPPORTED_SETUP_TAG)
 }
 
-/// Whether the opt-in in-crate PRIVATE harness lane (#83) is enabled. OFF by
-/// default (`BHF_RUST_INCRATE_PRIVATE` unset) so the Rust auto path is
-/// byte-identical; set to a truthy value (`1`/`true`/`yes`/`on`) to let the ranker
-/// admit `pub(crate)`/private methods and the build lane route them in-crate with a
-/// materialized path-backed resource. Follows the `BHF_*` env pattern
-/// ([`CargoTargetCleanup`]'s `BHF_KEEP_BUILD_ARTIFACTS`).
+/// `--rust-private` (or `rust-private = true` in the config) for this run.
+static INCRATE_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the in-crate private lane on for this process: `bhf auto
+/// --rust-private`, or `rust-private = true` in its config.
+pub(crate) fn enable_incrate_private() {
+    INCRATE_PRIVATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the opt-in in-crate PRIVATE harness lane (#83) is enabled: by
+/// `--rust-private` (or its config key), or `BHF_RUST_INCRATE_PRIVATE` set to
+/// a truthy value (`1`/`true`/`yes`/`on`). OFF by default, so the Rust auto
+/// path is unchanged; on, the ranker admits `pub(crate)`/private methods and
+/// the build lane routes them in-crate with a materialized path-backed
+/// resource.
 pub(crate) fn incrate_private_enabled() -> bool {
+    INCRATE_PRIVATE.load(std::sync::atomic::Ordering::Relaxed)
+        || incrate_private_env()
+}
+
+fn incrate_private_env() -> bool {
     std::env::var("BHF_RUST_INCRATE_PRIVATE")
         .ok()
         .is_some_and(|v| {
@@ -2593,8 +2607,8 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
             // method or free fn is unreachable from an external dependent crate
             // (E0603) even when its enclosing type is reachable at the crate root, so
             // route it to the in-crate build — a harness injected as a module of a
-            // copy of the crate reaches it by its `crate::...` path. Gated behind the
-            // env flag (off by default => the block never runs, default path
+            // copy of the crate reaches it by its `crate::...` path. Gated behind
+            // `--rust-private` (off by default => the block never runs, default path
             // byte-identical); a trait-impl method is left to the paths above (no
             // in-crate trait synthesis yet).
             if incrate_private_enabled()

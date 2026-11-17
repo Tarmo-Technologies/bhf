@@ -734,6 +734,7 @@ fn ingest_outcome(evidence: &mut Evidence, lang: &str, outcome: &Value) {
         tag,
         "unsupported_params"
             | "unsafe_build_path"
+            | "unsupported_setup"
             | "missing_toolchain"
             | "consent_required"
             | "sanitizer_runtime_unavailable"

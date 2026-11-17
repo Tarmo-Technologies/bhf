@@ -52,6 +52,8 @@ pub struct AutoConfig {
     pub ada_deps: Option<Vec<PathBuf>>,
     pub passes: Option<String>,
     pub force: Option<bool>,
+    /// `--rust-private`: the in-crate lane for private Rust targets.
+    pub rust_private: Option<bool>,
     /// `false` turns off seeding from the tree's own test data (`--no-seed-mining`).
     pub seed_mining: Option<bool>,
 
@@ -105,6 +107,7 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ("ada-deps", "ada-deps"),
     ("passes", "passes"),
     ("force", "force"),
+    ("rust-private", "rust-private"),
     ("no-seed-mining", "seed-mining"),
     ("build-command", "build-command"),
     ("run-untrusted", "run-untrusted"),
@@ -430,6 +433,9 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     if let Some(true) = config.force {
         args.force = true; // union: config or CLI enables it
     }
+    if let Some(true) = config.rust_private {
+        args.rust_private = true;
+    }
     if let Some(false) = config.seed_mining {
         // Union with `--no-seed-mining`: either one turns mining off. Turning it
         // off only narrows what the run reads, so the tree's own config may too.
@@ -533,6 +539,7 @@ mod tests {
             "per-target-time" | "max-targets" | "jobs" | "rss-limit-mb" | "max-work-dir-mb"
             | "max-corpus-mb" => "2",
             "force"
+            | "rust-private"
             | "seed-mining"
             | "run-untrusted"
             | "unsafe-search-and-run-build-commands"
