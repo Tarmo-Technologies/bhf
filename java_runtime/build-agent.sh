@@ -8,11 +8,15 @@
 # com.bhf.Driver`).
 #
 # ASM is fetched from Maven Central into a cache on first build (no repo binary),
-# retrying transient failures, and every copy, pre-staged, cached or fetched, must
-# have the SHA-256 pinned below. For air-gapped builds, pre-stage the two jars
-# into $BHF_JVM_CACHE or $ASM_JAR_DIR (the bhf offline-deps workflow handles
-# this). Downloads and the jar are written beside their place and renamed into
-# it, so concurrent first builds never read a partial file.
+# retrying transient failures. A fetched or cached jar must have the SHA-256
+# pinned below; a cached one that does not is fetched again. ASM_JAR_DIR names
+# jars the operator vouches for, used as they are: a distribution's own build of
+# ASM 9.7 (Debian's libasm-java, as the container image uses) is not
+# byte-identical to Maven Central's. For air-gapped builds, pre-stage Maven
+# Central's two jars into $BHF_JVM_CACHE, or any build of them into
+# $ASM_JAR_DIR (the bhf offline-deps workflow handles this). Downloads and the
+# jar are written beside their place and renamed into it, so concurrent first
+# builds never read a partial file.
 #
 # Usage: build-agent.sh [OUT_JAR]
 #   OUT_JAR defaults to $BHF_JVM_CACHE/bhf-jvm-agent.jar.
@@ -39,23 +43,24 @@ sha256_of() {
   fi
 }
 
-# Locate (or fetch) the two ASM jars we need: core + tree API, each with its
-# pinned SHA-256.
+# Locate (or fetch) the two ASM jars we need: core + tree API. A fetched or
+# cached one must have its pinned SHA-256.
 fetch_asm() {
   name="$1"
   want="$2"
-  # Prefer a pre-staged copy (offline), then the cache, then Maven Central.
-  for dir in "${ASM_JAR_DIR:-}" "$CACHE"; do
-    if [ -n "$dir" ] && [ -f "$dir/$name" ]; then
-      got=$(sha256_of "$dir/$name")
-      if [ "$got" = "$want" ]; then
-        echo "$dir/$name"
-        return 0
-      fi
-      echo "build-agent.sh: $dir/$name has SHA-256 $got, not ASM $ASM_VERSION's $want" >&2
-      return 1
+  # Prefer the operator's pre-staged copy, then the cache, then Maven Central.
+  if [ -n "${ASM_JAR_DIR:-}" ] && [ -f "$ASM_JAR_DIR/$name" ]; then
+    echo "$ASM_JAR_DIR/$name"
+    return 0
+  fi
+  if [ -f "$CACHE/$name" ]; then
+    if [ "$(sha256_of "$CACHE/$name")" = "$want" ]; then
+      echo "$CACHE/$name"
+      return 0
     fi
-  done
+    # Not the jar this script fetched: a partial or altered file.
+    rm -f "$CACHE/$name"
+  fi
   url="https://repo1.maven.org/maven2/org/ow2/asm/${name%-"$ASM_VERSION".jar}/$ASM_VERSION/$name"
   part="$CACHE/$name.part.$$"
   if command -v curl >/dev/null 2>&1; then

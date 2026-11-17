@@ -55,9 +55,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
-- The JVM agent's first build fetches ASM with retries and checks each jar
-  against its pinned SHA-256, a pre-staged or cached copy too (#410). It
-  writes the jars and the agent beside their place and renames them in, so
+- The JVM agent's first build fetches ASM with retries, and a fetched or
+  cached jar must have its pinned SHA-256: a cached one that does not is
+  fetched again (#410). `ASM_JAR_DIR` jars are the operator's, used as they
+  are, since a distribution's build of ASM (Debian's `libasm-java`, which
+  the container image uses) is not byte-identical to Maven Central's. The
+  jars and the agent are written beside their place and renamed in, so
   concurrent first builds never read a partial file. A Maven Central 429
   failed the Java lane's builds, and nothing checked what was fetched.
 - The Ruby, Lua and PHP lanes run the runtrace shim's sink oracles too
