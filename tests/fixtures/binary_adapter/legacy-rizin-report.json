@@ -1,0 +1,334 @@
+{
+  "adapter": {
+    "kind": "rizin",
+    "linked_into_bhf": false,
+    "trust_boundary": "external_subprocess"
+  },
+  "call_graph": [
+    {
+      "callee": "0x3fd8",
+      "caller": "entry0"
+    },
+    {
+      "callee": "fcn.00001050",
+      "caller": "__do_global_dtors_aux"
+    },
+    {
+      "callee": "deregister_tm_clones",
+      "caller": "__do_global_dtors_aux"
+    },
+    {
+      "callee": "strncmp",
+      "caller": "parse_header"
+    },
+    {
+      "callee": "parse_header",
+      "caller": "handle"
+    },
+    {
+      "callee": "puts",
+      "caller": "handle"
+    },
+    {
+      "callee": "handle",
+      "caller": "main"
+    }
+  ],
+  "errors": [],
+  "evidence_kind": "adapter_derived",
+  "functions": [
+    {
+      "address": "0x1000",
+      "imported": false,
+      "name": "_init",
+      "signature": "sym._init();",
+      "size": 27
+    },
+    {
+      "address": "0x1050",
+      "imported": false,
+      "name": "fcn.00001050",
+      "signature": "fcn.00001050();",
+      "size": 10
+    },
+    {
+      "address": "0x1060",
+      "imported": true,
+      "name": "strncmp",
+      "signature": "int sym.imp.strncmp(const char *s1, const char *s2, size_t n);",
+      "size": 10
+    },
+    {
+      "address": "0x1070",
+      "imported": true,
+      "name": "puts",
+      "signature": "int sym.imp.puts(const char *s);",
+      "size": 10
+    },
+    {
+      "address": "0x1080",
+      "imported": false,
+      "name": "entry0",
+      "signature": "entry0(void *rtld_fini);",
+      "size": 37
+    },
+    {
+      "address": "0x10b0",
+      "imported": false,
+      "name": "deregister_tm_clones",
+      "signature": "sym.deregister_tm_clones();",
+      "size": 41
+    },
+    {
+      "address": "0x10e0",
+      "imported": false,
+      "name": "register_tm_clones",
+      "signature": "sym.register_tm_clones();",
+      "size": 57
+    },
+    {
+      "address": "0x1120",
+      "imported": false,
+      "name": "__do_global_dtors_aux",
+      "signature": "sym.__do_global_dtors_aux();",
+      "size": 57
+    },
+    {
+      "address": "0x1160",
+      "imported": false,
+      "name": "entry.init0",
+      "signature": "entry.init0();",
+      "size": 9
+    },
+    {
+      "address": "0x1169",
+      "imported": false,
+      "name": "parse_header",
+      "signature": "sym.parse_header(const char *arg1);",
+      "size": 61
+    },
+    {
+      "address": "0x11a6",
+      "imported": false,
+      "name": "handle",
+      "signature": "sym.handle(int64_t arg1);",
+      "size": 56
+    },
+    {
+      "address": "0x11de",
+      "imported": false,
+      "name": "main",
+      "signature": "int main(int argc, char **argv, char **envp);",
+      "size": 53
+    },
+    {
+      "address": "0x1214",
+      "imported": false,
+      "name": "_fini",
+      "signature": "sym._fini();",
+      "size": 13
+    }
+  ],
+  "schema_version": "bhf.binary.adapter.v1",
+  "status": "ok",
+  "strings": [
+    {
+      "address": "0x2004",
+      "section": ".rodata",
+      "value": "LEGACY/1.0"
+    },
+    {
+      "address": "0x200f",
+      "section": ".rodata",
+      "value": "usage: legacy"
+    }
+  ],
+  "target": "legacy",
+  "tool": {
+    "path": "rizin",
+    "version": "rizin 0.9.1 @ linux-x86-64"
+  },
+  "truncated": [],
+  "xrefs": [
+    {
+      "from": "0x1008",
+      "kind": "data",
+      "to": "0x3fe8"
+    },
+    {
+      "from": "0x1026",
+      "kind": "code",
+      "to": "0x3fc0"
+    },
+    {
+      "from": "0x1039",
+      "kind": "code",
+      "to": "0x1020"
+    },
+    {
+      "from": "0x1044",
+      "kind": "data",
+      "to": "0x1"
+    },
+    {
+      "from": "0x1049",
+      "kind": "code",
+      "to": "0x1020"
+    },
+    {
+      "from": "0x1054",
+      "kind": "code",
+      "to": "0x3ff8"
+    },
+    {
+      "from": "0x1064",
+      "kind": "code",
+      "to": "0x3fc8"
+    },
+    {
+      "from": "0x1074",
+      "kind": "code",
+      "to": "0x3fd0"
+    },
+    {
+      "from": "0x1098",
+      "kind": "data",
+      "to": "0x11de"
+    },
+    {
+      "from": "0x109f",
+      "kind": "call",
+      "to": "0x3fd8"
+    },
+    {
+      "from": "0x10b0",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x10b7",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x10c3",
+      "kind": "data",
+      "to": "0x3fe0"
+    },
+    {
+      "from": "0x10e0",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x10e7",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x1104",
+      "kind": "data",
+      "to": "0x3ff0"
+    },
+    {
+      "from": "0x1124",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x112e",
+      "kind": "data",
+      "to": "0x3ff8"
+    },
+    {
+      "from": "0x113b",
+      "kind": "data",
+      "to": "0x4008"
+    },
+    {
+      "from": "0x1142",
+      "kind": "call",
+      "to": "0x1050"
+    },
+    {
+      "from": "0x1147",
+      "kind": "call",
+      "to": "0x10b0"
+    },
+    {
+      "from": "0x114c",
+      "kind": "data",
+      "to": "0x4010"
+    },
+    {
+      "from": "0x1164",
+      "kind": "code",
+      "to": "0x10e0"
+    },
+    {
+      "from": "0x1182",
+      "kind": "data",
+      "to": "0x2004"
+    },
+    {
+      "from": "0x118f",
+      "kind": "call",
+      "to": "0x1060"
+    },
+    {
+      "from": "0x119d",
+      "kind": "code",
+      "to": "0x11a4"
+    },
+    {
+      "from": "0x11bd",
+      "kind": "call",
+      "to": "0x1169"
+    },
+    {
+      "from": "0x11c6",
+      "kind": "data",
+      "to": "0x200f"
+    },
+    {
+      "from": "0x11d0",
+      "kind": "call",
+      "to": "0x1070"
+    },
+    {
+      "from": "0x11d5",
+      "kind": "code",
+      "to": "0x11dc"
+    },
+    {
+      "from": "0x1205",
+      "kind": "call",
+      "to": "0x11a6"
+    },
+    {
+      "from": "0x120a",
+      "kind": "code",
+      "to": "0x1211"
+    },
+    {
+      "from": "0x20a0",
+      "kind": "data",
+      "to": "0xff"
+    },
+    {
+      "from": "0x20b3",
+      "kind": "data",
+      "to": "0x3f"
+    },
+    {
+      "from": "0x20ba",
+      "kind": "data",
+      "to": "0x22"
+    },
+    {
+      "from": "0x20e0",
+      "kind": "data",
+      "to": "0xff"
+    }
+  ]
+}

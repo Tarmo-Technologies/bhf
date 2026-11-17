@@ -2817,6 +2817,15 @@
   (`scripts/ci/install-binary-analyzers.sh`), and runs each adapter on a
   fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
   addresses `nm` gives, its call edges, its magic string and a call xref.
+- `bhf binary fuzz` and `bhf binary scan` take `--adapter-report` (#267).
+  The strings the binary's code references seed the mutation dictionary
+  (the builtin engine's, and afl-fuzz's `-x`), and its own functions are
+  ranked as fuzz entry points by the input-handling imports they call, the
+  strings they reference and their calls, the first being the candidate
+  persistent address. `binary fuzz` records them in the run JSON's
+  `adapter_report`; `binary scan` adds them as `adapter` to the entry of the
+  binary whose SHA-256 the report records (its new `target_sha256`).
+  Nothing read the report before.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

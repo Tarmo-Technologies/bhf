@@ -13,6 +13,7 @@
 
 mod angr;
 mod ghidra;
+pub(crate) mod hints;
 mod rizin;
 
 use config::Profile;
@@ -500,6 +501,8 @@ fn base_report(args: &BinaryAdapterArgs, status: &str, trust_boundary: &str) -> 
         value: json!({
             "schema_version": ADAPTER_SCHEMA_VERSION,
             "target": args.target.to_string_lossy(),
+            // What `bhf binary scan --adapter-report` matches the report by.
+            "target_sha256": crate::replay::sha256_file(&args.target),
             "status": status,
             "evidence_kind": "adapter_derived",
             "adapter": {

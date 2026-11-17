@@ -1245,7 +1245,7 @@ struct ReplaySummary {
     compared_line: String,
 }
 
-fn sha256_file(path: &Path) -> Option<String> {
+pub(crate) fn sha256_file(path: &Path) -> Option<String> {
     use sha2::Digest;
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;

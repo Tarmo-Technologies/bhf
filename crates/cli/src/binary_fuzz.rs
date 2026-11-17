@@ -161,6 +161,14 @@ pub struct BinaryFuzzArgs {
     /// window (#60).
     #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
     pub collector_window_ms: u64,
+
+    /// A `bhf binary adapter` report of the binary (#267). The strings its
+    /// code references seed the mutation dictionary (the builtin engine's, and
+    /// afl-fuzz's `-x`), and its functions are ranked as fuzz entry points;
+    /// the run JSON's `adapter_report` records both, with the top-ranked
+    /// function as the candidate persistent address.
+    #[arg(long = "adapter-report")]
+    pub adapter_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -322,6 +330,11 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     // What each seed is, in order, for the lineage of a finding the builtin
     // engine saves: a seed runs as it is, a mutation of one a generation down.
     let lineages = seed_lineages(&args, &seeds);
+    let hints = match args.adapter_report.as_deref() {
+        Some(report) => Some(crate::binary_adapter::hints::load(report).map_err(|e| anyhow!(e))?),
+        None => None,
+    };
+    let adapter_report = adapter_report_provenance(&args, hints.as_ref());
     let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
@@ -344,7 +357,9 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     }
     let degraded = match engine {
         ResolvedEngine::AflQemu(aq) => {
-            return run_afl_qemu(&args, &aq, &seeds, &env, &findings_dir);
+            let mut summary = run_afl_qemu(&args, &aq, &seeds, hints.as_ref(), &env, &findings_dir)?;
+            summary["adapter_report"] = adapter_report;
+            return Ok(summary);
         }
         ResolvedEngine::Builtin { degraded } => degraded,
     };
@@ -355,7 +370,8 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         None => None,
     };
     let started = Instant::now();
-    let mut havoc = BlindHavoc::new(&seeds, args.rng_seed);
+    let tokens = hints.as_ref().map(|hints| hints.tokens.as_slice()).unwrap_or_default();
+    let mut havoc = BlindHavoc::new(&seeds, args.rng_seed, tokens);
 
     let tmp_dir = args.work_dir.join("binary_fuzz/tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
@@ -657,8 +673,21 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         "executions": executions,
         "runtime_oracles": runtime_oracle_provenance(args.runtime_oracles, oracles.as_ref()),
         "collector": collector_provenance,
+        "adapter_report": adapter_report,
         "findings": finding_ids
     }))
+}
+
+/// The run JSON's `adapter_report`: the report `--adapter-report` named and
+/// the hints taken from it, or null.
+fn adapter_report_provenance(
+    args: &BinaryFuzzArgs,
+    hints: Option<&crate::binary_adapter::hints::AdapterHints>,
+) -> Value {
+    match (args.adapter_report.as_deref(), hints) {
+        (Some(report), Some(hints)) => hints.provenance(report),
+        _ => Value::Null,
+    }
 }
 
 /// Where the collector replays run: the target command, its environment, the
@@ -861,7 +890,9 @@ struct BlindHavoc<'a> {
 }
 
 impl<'a> BlindHavoc<'a> {
-    fn new(seeds: &'a [Vec<u8>], rng_seed: u64) -> Self {
+    /// The mutator of `seeds`, its dictionary `tokens` (an adapter report's
+    /// strings, or none).
+    fn new(seeds: &'a [Vec<u8>], rng_seed: u64, tokens: &[Vec<u8>]) -> Self {
         let longest = seeds.iter().map(Vec::len).max().unwrap_or(0);
         Self {
             seeds,
@@ -869,7 +900,7 @@ impl<'a> BlindHavoc<'a> {
                 max_len: longest.saturating_mul(2).clamp(64, 1 << 16),
                 ..fuzz_engine_builtin::MutatorConfig::default()
             }),
-            dictionary: fuzz_engine_builtin::Dictionary::from_tokens(std::iter::empty::<Vec<u8>>()),
+            dictionary: fuzz_engine_builtin::Dictionary::from_tokens(tokens),
             rng: fuzz_engine_builtin::MutationRng::new(rng_seed),
         }
     }
@@ -1081,6 +1112,7 @@ fn run_afl_qemu(
     args: &BinaryFuzzArgs,
     aq: &AflQemu,
     seeds: &[Vec<u8>],
+    hints: Option<&crate::binary_adapter::hints::AdapterHints>,
     env: &BTreeMap<String, String>,
     findings_dir: &Path,
 ) -> anyhow::Result<Value> {
@@ -1106,7 +1138,7 @@ fn run_afl_qemu(
 
     let secs = afl_qemu_budget_secs(args.time.as_deref(), args.iterations);
     let (mem_arg, mem_provenance) = afl_mem_arg(&args.mem_mb)?;
-    let argv = afl_qemu_argv(
+    let mut argv = afl_qemu_argv(
         &args.binary,
         &seeds_dir,
         &out_dir,
@@ -1116,6 +1148,17 @@ fn run_afl_qemu(
         args.input_mode,
         &args.target_args,
     );
+    // An adapter report's strings are afl-fuzz's dictionary.
+    if let Some(hints) = hints.filter(|hints| !hints.tokens.is_empty()) {
+        let dictionary = afl_out.join("adapter.dict");
+        fs::write(
+            &dictionary,
+            crate::binary_adapter::hints::afl_dictionary(&hints.tokens),
+        )
+        .with_context(|| format!("write {}", dictionary.display()))?;
+        let at = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        argv.splice(at..at, ["-x".to_owned(), dictionary.display().to_string()]);
+    }
     let afl_trace_dir = aq
         .afl_qemu_trace
         .parent()
@@ -2934,6 +2977,7 @@ mod tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            adapter_report: None,
             rng_seed: 0,
         };
 
@@ -3315,6 +3359,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            adapter_report: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3403,6 +3448,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Auto,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            adapter_report: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3716,6 +3762,7 @@ mod afl_qemu_tests {
             reset_command: None,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            adapter_report: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");

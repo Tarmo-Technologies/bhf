@@ -397,7 +397,25 @@ kept. The real adapters are blocked in `strict-permissive` (they need
   there, or the Python cannot import angr.
 
 The mock adapter reads `--mock-output` JSON instead, for contract tests of a
-consumer.
+consumer. The report also records the binary's `target_sha256`.
+
+`bhf binary fuzz` and `bhf binary scan` take a report with
+`--adapter-report <binary-adapter-report.json>`. Only an `ok` report is
+taken. From it they get:
+- dictionary tokens: the strings the binary's code references first, then
+  its other data strings, at most 256 of 2 to 64 bytes. `binary fuzz` seeds
+  the builtin engine's mutation dictionary with them, and afl-fuzz's `-x`.
+- a ranking of the binary's own functions as fuzz entry points. A call to
+  an input-handling import (`strncmp`, `memcpy`, `read`, `sscanf`, ...)
+  scores 3, a referenced string 2, a call to another of its functions 1;
+  the C runtime's functions are left out. The first is the candidate
+  persistent address.
+
+`binary fuzz` records them in its run JSON's `adapter_report`: the token
+count, the top ten functions with their reasons, and `persistent_candidate`.
+`binary scan` adds the same object as `adapter` to the inventory entry whose
+SHA-256 is the report's `target_sha256`; a report of a binary the scan did
+not inventory is exit 1.
 
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
