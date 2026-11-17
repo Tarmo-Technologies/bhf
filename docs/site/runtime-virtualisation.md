@@ -109,11 +109,17 @@ taint-confirmed in the collector stream **only** when a `CollectorTaintGate`
 confirms it through the SAME cross-execution matching / constant-suppression
 the runtime oracles use — never from a single run's `taint_offset` — so a program
 constant echoed into one input is not presented as a taint-confirmed finding. On
-`bhf binary fuzz` the collector runs the target once under the shim as a
-**dedicated observation pass** (separate from the crash-detection loop, so
-`--runtime-oracles` behaviour is unchanged) and the gate reuses the campaign's
-accumulated taint evidence; on `bhf fuzz` it re-reads the loop's own
-`runtrace.jsonl` and matches across every execution it contains. The result
+`bhf binary fuzz` the collector replays the retained inputs one by one under
+the shim as a **dedicated observation pass** (separate from the crash-detection
+loop, so `--runtime-oracles` behaviour is unchanged): the input behind each of
+the run's findings, then (with `--engine afl-qemu`) the AFL++ queue entries that
+found new coverage, then the seeds, at most 16. The gate reuses the campaign's
+accumulated taint evidence plus every replay, and each finding keeps the input
+whose replay produced it. On `bhf fuzz` it replays the campaign's retained
+inputs the same way (the harness's crash findings, then its persisted corpus,
+at most 16), with the gate matching across the loop's own `runtrace.jsonl` and
+every replay; a sink only the campaign's other inputs reached is still reported
+from that log, as an aggregate finding with no input. The result
 feeds the same oracle registry and stored-evidence replay as the native Windows
 ETW provider — it is an additional view, not a second source. `--collector auto`
 stays inactive when the runtrace shim is unavailable, and when the shim exists but

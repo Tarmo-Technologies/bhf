@@ -8,8 +8,12 @@ fn docs_cli_flow_uses_current_command_flags() {
     let docs = read(repo_root().join("docs/site/cli.md"));
 
     assert!(docs.contains("bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented"));
-    assert!(docs.contains("bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --output bhf_work/generated_harnesses"));
-    assert!(docs.contains("bhf report --findings findings --out reports"));
+    assert!(docs.contains("bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --id H-PKG-PARSE --output bhf_work/generated_harnesses"));
+    assert!(docs.contains("bhf report --findings bhf_work/results/findings --out bhf_work/reports"));
+    // The Common Flow names its harness and reads findings where bhf writes
+    // them (#229).
+    assert!(!docs.contains("--target Pkg.Parse --output bhf_work/generated_harnesses"));
+    assert!(!docs.contains("bhf report --findings findings --out reports"));
     // Manual C/C++ harnesses go where `bhf auto` puts its own, so every triage
     // command finds them; the Ada example above keeps generated_harnesses.
     assert!(docs.contains(

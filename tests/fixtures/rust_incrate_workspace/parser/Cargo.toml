@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ws_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+checksum.workspace = true

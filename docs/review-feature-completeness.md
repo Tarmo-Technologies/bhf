@@ -59,7 +59,8 @@ operations.
 
 ## Validation completed
 
-- `cargo test -p fuzz_engine_nyx_adapter --locked` — 6 passed.
+- `cargo test -p fuzz_engine_nyx_adapter --locked` — 6 passed (the crate has
+  since been removed: nothing used it).
 - `cargo test -p fuzz_engine_nyx_adapter --features nyx-engine` — 3 passed.
 - `cargo test -p bhf --lib clean::tests` — 7 passed.
 - `cargo test -p bhf --lib auto::storage::tests` — 4 passed.

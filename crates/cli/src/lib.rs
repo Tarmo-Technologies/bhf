@@ -145,11 +145,13 @@ Run `bhf auto --help` for language selection, budgets, and build options.
 If BHF itself errors, use `--debug` and `bhf bug-report <work-dir> --preview`.
 
 COMMANDS BY AREA (run `bhf <command> --help` for details):
-  Pipeline      auto, scan, list, generate-harness, build, fuzz, report
+  Pipeline      auto, snippet, scan, list, generate-harness, build, fuzz, report, model
   Build support stub, instrument, fake-corba
-  Crash triage  corpus, minimize, replay, differential, relational, cmplog
+  Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
+                differential, relational, cmplog, explain, cartography, decode-args
   Binaries      binary (scan, adapter, fuzz — no source)
-  Supply chain  sbom, license-audit, static-scan, extract-state-machines
+  Projects      project (validate, list, run), extension (validate, evaluate)
+  Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export
   Ops & CI      ci, runners, clean, introspect, bug-report
@@ -230,6 +232,8 @@ enum Command {
     Fuzz(fuzz::FuzzArgs),
     /// Render findings to Markdown, SARIF 2.1.0, JUnit XML, and CSV with crash clustering and dedupe
     Report(report::ReportArgs),
+    /// Train a confidence model from labeled findings, for `bhf report --model`
+    Model(model::ModelArgs),
 
     // ── Build support: unblock a harness that won't compile ─────────────────
     /// Synthesize missing type/function stubs from build-loop diagnostics to unblock a harness (Ada/C/C++)
@@ -280,7 +284,11 @@ enum Command {
     // ── Supply chain & static analysis ──────────────────────────────────────
     /// Generate an SBOM from source/manifest/binaries with CVE matching and vulnerability gating
     Sbom(sbom::SbomArgs),
-    /// Verify reachable dependencies against the Apache-2.0/MIT/BSD license policy (SLSA/compliance)
+    /// Check the licenses of bhf's own Cargo dependencies against its Apache-2.0/MIT/BSD policy (in a bhf source checkout)
+    ///
+    /// Checks the crates a bhf build links, from the Cargo.lock and THIRD_PARTY.md of a bhf
+    /// source checkout. Not a license check of a scanned project: `bhf sbom` reports a tree's
+    /// dependencies and their licenses.
     LicenseAudit(license_audit::LicenseAuditArgs),
     /// Run static-analysis rules (MISRA, CWE) over source to a report/SARIF with baseline diff (SAST)
     StaticScan(static_scan::StaticScanArgs),
@@ -328,9 +336,6 @@ enum Command {
     /// Measure fuzz performance — seeded metrics or pattern coverage — against a manifest
     #[command(hide = true)]
     Benchmark(benchmark::BenchmarkArgs),
-    /// Train a confidence/severity model from labeled findings to improve signal-to-noise
-    #[command(hide = true)]
-    Model(model::ModelArgs),
 
     // ── Deprecated flat aliases (hidden): superseded by `binary`/`list` ──────
     // Kept so existing scripts and IDE integrations keep working.
@@ -932,10 +937,12 @@ mod tests {
         }
 
         // Internal/metrics commands are runnable but hidden.
-        for dev in ["benchmark", "model", "dashboard", "readiness"] {
+        for dev in ["benchmark", "dashboard", "readiness"] {
             let c = sub(dev).unwrap_or_else(|| panic!("`{dev}` missing"));
             assert!(c.is_hide_set(), "`{dev}` should be hidden");
         }
+        // `bhf model` trains the finding classifier a user labels: listed.
+        assert!(!sub("model").expect("`model` exists").is_hide_set());
     }
 
     #[test]

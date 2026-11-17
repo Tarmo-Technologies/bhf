@@ -253,9 +253,13 @@ compiles if `T: Default`, which cannot be tested at codegen time without type
 resolution. Emitting it speculatively trades a clean skip for a failed build —
 **measure before assuming that is an improvement**.
 
-### Rust-2. Private-module trait-impl method — 17 — **GAP**
+### Rust-2. Private-module trait-impl method — 17 — **[FIXED]**
 
-In-crate trait resolution is not implemented.
+The in-crate lane calls a static trait-impl method by UFCS with a
+`crate`-rooted trait path (a trait of the crate, private modules included) or
+a std conversion trait (`FromStr`, `TryFrom<&[u8]>`, `TryFrom<&str>`), and
+imports the trait of an instance method. A static method of another crate's
+trait is Rust-4's residue.
 
 ### Rust-3. `unsafe fn` with a caller-upheld precondition — 16 — **BY DESIGN**
 
@@ -578,8 +582,8 @@ By fixable targets, highest first:
 4. **Go undrivable parameters** (Go-1; 58 before `context.Context` was
    fixed) — the rest are project and library types (`*zap.Logger`,
    `*pflag.FlagSet`).
-5. **Rust decoders** (Rust-1; 42) + trait-impl resolution (Rust-2, Rust-4;
-   28).
+5. **Rust decoders** (Rust-1; 42) + static methods of another crate's trait
+   (Rust-4; 11).
 6. **Java generic/collection parameters** (Java-1; ~40 of the 75) — needs
    declared-type locals instead of `var`.
 7. **Python receiver-with-arguments** (Py-2; 25) and C# unforced receiver
@@ -589,8 +593,9 @@ By fixable targets, highest first:
 
 Closed since the list was first ranked, and dropped from it: the C++
 non-self-contained header (C++-1), the Go receiver with a sibling
-constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1) and
-the C++ compile-flag quoting (C++-6).
+constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1),
+the C++ compile-flag quoting (C++-6) and private-module trait-impl methods
+(Rust-2).
 
 ## Method
 

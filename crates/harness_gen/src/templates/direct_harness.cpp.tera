@@ -715,13 +715,64 @@ int main(int argc, char **argv) {
 {%- endif %}
 {%- endfor %}
 {%- endfor %}
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+#include <exception>
+#include <typeinfo>
+#if defined(__has_include)
+#if __has_include(<cxxabi.h>)
+#include <cxxabi.h>
+#define BHF_HAVE_CXXABI 1
+#endif
+#endif
+/* An exception that leaves the target would terminate a program that calls it
+ * the way this harness does (CWE-248): it is a finding, unless its type is one
+ * BHF_CXX_EXPECTED_EXCEPTIONS lists (comma-separated names, `*` for any type),
+ * which the API uses to tell its callers about bad input. */
+static int bhf_cxx_exception_expected(const char *type) {
+    const char *list = getenv("BHF_CXX_EXPECTED_EXCEPTIONS");
+    if (!list || !*list) return 0;
+    size_t want = strlen(type);
+    for (const char *p = list; *p;) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *name = p;
+        while (len && *name == ' ') { name++; len--; }
+        while (len && name[len - 1] == ' ') len--;
+        if ((len == 1 && *name == '*') || (len == want && strncmp(name, type, want) == 0)) return 1;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+static void bhf_cxx_uncaught(const char *what) {
+    const std::type_info *info = nullptr;
+#if defined(BHF_HAVE_CXXABI)
+    info = abi::__cxa_current_exception_type();
+#endif
+    const char *mangled = info ? info->name() : "unknown";
+    char *demangled = nullptr;
+#if defined(BHF_HAVE_CXXABI)
+    int status = 0;
+    if (info) demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+#endif
+    const char *type = demangled ? demangled : mangled;
+    if (bhf_cxx_exception_expected(type)) {
+        free(demangled);
+        return;
+    }
+    fprintf(stderr, "== bhf cpp finding: CWE-248: %s: %s\n", type, what ? what : "");
+    fflush(stderr);
+    _Exit(86);
+}
+#endif
 extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     BHF_PUBLISH_INPUT(Data, Size);
-    // The body is wrapped in try/catch to swallow expected C++ exceptions from
-    // rejected input — but only when exceptions are actually enabled. A project
-    // whose build context disables them (basis_universal compiles with
-    // `-fno-exceptions`) would otherwise fail with "cannot use 'try' with
-    // exceptions disabled"; there the body simply runs unguarded.
+    // The body is wrapped in try/catch, but only when exceptions are enabled:
+    // a project whose build context disables them (basis_universal compiles
+    // with `-fno-exceptions`) would otherwise fail with "cannot use 'try' with
+    // exceptions disabled"; there the body simply runs unguarded. An exception
+    // that leaves the target is reported (bhf_cxx_uncaught) unless its type is
+    // expected; an expected one is the target rejecting the input.
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
 #endif
@@ -902,7 +953,11 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endif %}
     return 0;
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+    } catch (const std::exception &_bhf_exception) {
+        bhf_cxx_uncaught(_bhf_exception.what());
+        return 0;
     } catch (...) {
+        bhf_cxx_uncaught(nullptr);
         return 0;
     }
 #endif

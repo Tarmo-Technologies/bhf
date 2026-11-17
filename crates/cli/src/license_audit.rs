@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub struct LicenseAuditArgs {
+    /// The bhf source checkout whose Cargo.lock and THIRD_PARTY.md to check.
     #[arg(long, default_value = ".")]
     root: PathBuf,
 
+    /// The workspace package whose dependency graph is audited.
     #[arg(long, default_value = "bhf")]
     package: String,
 }

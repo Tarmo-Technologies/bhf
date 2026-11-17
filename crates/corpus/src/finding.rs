@@ -236,6 +236,11 @@ pub struct ExtensionFinding {
 }
 
 impl FindingEmitter {
+    /// The work dir the findings are written under.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,

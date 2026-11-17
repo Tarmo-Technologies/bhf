@@ -124,6 +124,7 @@ impl TargetSession for HostChildSession {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Ok(RunOutcome {
+                            target: Default::default(),
                             exit: ExitKind::Timeout,
                             coverage_edges: Vec::new(),
                             fault: Some(Fault {
@@ -151,6 +152,7 @@ impl TargetSession for HostChildSession {
 
         let (exit, fault) = classify_status(&status);
         Ok(RunOutcome {
+            target: Default::default(),
             exit,
             coverage_edges: Vec::new(),
             fault,

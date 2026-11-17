@@ -147,7 +147,7 @@ fn collector_three_positive_classes_emit_semantic_findings_without_a_crash() {
         // rooted at the REAL replayed target PID the host launched under the observer
         // (#76), not a synthetic constant.
         assert!(f["collector"]["attributing_event"].is_object());
-        let replayed_pid = summary["collector"]["replayed_pid"]
+        let replayed_pid = summary["collector"]["replays"][0]["replayed_pid"]
             .as_u64()
             .expect("the replay records the launched target PID");
         assert!(

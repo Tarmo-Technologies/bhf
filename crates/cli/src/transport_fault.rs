@@ -171,13 +171,14 @@ pub fn fault_report(fault: &Fault) -> corpus::SanitizerReport {
 pub fn deadline_report(
     elapsed: std::time::Duration,
     deadline: std::time::Duration,
+    measured: &str,
 ) -> corpus::SanitizerReport {
     crash_report(
         "BHF-555",
         "transport-deadline-exceeded".to_owned(),
         format!(
-            "target transport completed but its host-observed execution time {}ms exceeded \
-             the configured deadline {}ms — a timing/availability finding",
+            "target transport completed but its {measured} {}ms exceeded the configured \
+             deadline {}ms — a timing/availability finding",
             elapsed.as_millis(),
             deadline.as_millis()
         ),
@@ -395,6 +396,7 @@ mod tests {
         assert!(outcome_finding(&RunOutcome::clean(vec![1, 2])).is_none());
 
         let bare_crash = RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Crash,
             coverage_edges: Vec::new(),
             fault: None,
@@ -406,6 +408,7 @@ mod tests {
         assert_eq!(report.rule_id, "BHF-210");
 
         let bare_timeout = RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Timeout,
             coverage_edges: Vec::new(),
             fault: None,

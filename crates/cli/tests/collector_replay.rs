@@ -158,14 +158,20 @@ fn replay_launches_the_target_and_records_its_real_pid_and_input() {
         .expect("marker holds the target PID");
     // The collector recorded THAT process as the replayed PID (so the observation
     // is genuinely about the launched target, launched after the readiness ack).
-    let replayed_pid = col["replayed_pid"].as_u64().expect("replayed_pid recorded");
+    // One retained input (the seed) was replayed.
+    let replays = col["replays"].as_array().expect("the replays are listed");
+    assert_eq!(replays.len(), 1, "{summary}");
+    assert_eq!(replays[0]["testcase"], "seed-0000", "{summary}");
+    let replayed_pid = replays[0]["replayed_pid"]
+        .as_u64()
+        .expect("replayed_pid recorded");
     assert_eq!(
         replayed_pid as u32, marker_pid,
         "the recorded replayed PID must be the real launched target's PID: {summary}"
     );
     // The replayed input's content hash is recorded for auditability.
     assert!(
-        col["replayed_input_sha256"]
+        replays[0]["input_sha256"]
             .as_str()
             .is_some_and(|h| h.len() == 64),
         "replayed input hash recorded: {summary}"
@@ -198,6 +204,100 @@ fn replay_launches_the_target_and_records_its_real_pid_and_input() {
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("MATCH"),
         "replay must reproduce the finding: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #247: the collector replays the inputs the campaign retained, not only the
+/// first seed. The target crashes on any input other than its seed, so the
+/// crash is a discovered (mutated) input; the mock observes the positive
+/// effects for every input but the seed. The finding keeps the discovered
+/// input, and the seed's replay is observed clean.
+#[test]
+fn a_discovered_input_is_replayed_and_its_finding_keeps_that_input() {
+    let seed = "SEEDSEED";
+    let root = temp_dir("discovered");
+    let target = root.join("target.sh");
+    fs::write(
+        &target,
+        format!("#!/bin/sh\ninput=$(cat)\n[ \"$input\" = {seed} ] && exit 0\nkill -SEGV $$\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    let work = root.join("work");
+    let output = Command::new(bhf_bin())
+        .args(["binary-fuzz", target.to_str().unwrap(), "--work-dir"])
+        .arg(&work)
+        .args([
+            "--engine",
+            "builtin",
+            "--iterations",
+            "200",
+            "--seed-input",
+            seed,
+        ])
+        .args(["--collector", mock_collector().to_str().unwrap()])
+        .args(["--collector-window-ms", "300"])
+        .env("BHF_MOCK_SCENARIO", "input_driven")
+        .env("BHF_MOCK_CLEAN_INPUT", seed)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_str(&stdout).unwrap();
+    let findings_dir = work.join("results/findings");
+    let crash = summary["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|id| !id.starts_with("COL-"))
+        .unwrap_or_else(|| panic!("the campaign found its crash: {summary}"))
+        .to_owned();
+    let discovered = fs::read(findings_dir.join(&crash).join("testcase.bin")).unwrap();
+    assert_ne!(discovered, seed.as_bytes(), "the crash is a mutated input");
+
+    let col = &summary["collector"];
+    let replays = col["replays"].as_array().expect("the replays are listed");
+    let named: Vec<&str> = replays
+        .iter()
+        .filter_map(|r| r["testcase"].as_str())
+        .collect();
+    assert_eq!(named, [crash.as_str(), "seed-0000"], "{summary}");
+    assert!(
+        replays.iter().all(|r| r["observed"] == Value::Bool(true)),
+        "{summary}"
+    );
+    assert!(replays[0]["findings"].as_u64().unwrap() > 0, "{summary}");
+    assert_eq!(
+        replays[1]["findings"], 0,
+        "the seed's replay is clean: {summary}"
+    );
+
+    let findings = collector_findings(&findings_dir);
+    assert!(!findings.is_empty(), "{summary}");
+    for (dir, f) in &findings {
+        assert_eq!(
+            fs::read(dir.join("testcase.bin")).unwrap(),
+            discovered,
+            "the finding keeps the discovered input: {f}"
+        );
+        assert_eq!(f["input"]["bytes"], discovered.len());
+    }
+    let (dir, _) = &findings[0];
+    let out = Command::new(bhf_bin())
+        .arg("replay")
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("MATCH"),
+        "stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

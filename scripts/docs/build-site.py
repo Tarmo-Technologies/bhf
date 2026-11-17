@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_BASE_URL = "https://docs.buildharnessfuzz.dev"
-REPO_README_URL = "https://github.com/Tarmo-Technologies/bhf/blob/main/README.md"
+# No public host serves the site: GitHub Pages is not enabled for the
+# repository, and no domain points at it. With no base URL the build writes
+# no canonical links and no sitemap; pass --base-url once a host serves it.
+DEFAULT_BASE_URL = ""
+REPO_BLOB_URL = "https://github.com/Tarmo-Technologies/bhf/blob/main"
+REPO_README_URL = f"{REPO_BLOB_URL}/README.md"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ PAGES = [
     Page("on-target-fuzzing", "on-target-fuzzing.md", "On-Target & Embedded"),
     Page("windows", "windows.md", "Windows"),
     Page("daemon", "daemon.md", "Daemon"),
+    Page("extension-protocol", "extension-protocol.md", "Extension Protocol"),
     Page("licensing", "licensing.md", "Licensing"),
     Page("ato", "ato.md", "ATO / RMF"),
     Page("inventory-assurance", "inventory-assurance.md", "Inventory Assurance"),
@@ -75,7 +81,7 @@ def main() -> None:
     parser.add_argument(
         "--base-url",
         default=DEFAULT_BASE_URL,
-        help="Canonical site URL used in sitemap and robots.txt",
+        help="Canonical site URL (canonical links, sitemap.xml, robots.txt); empty, the default, when no public host serves the site",
     )
     args = parser.parse_args()
 
@@ -91,7 +97,12 @@ def main() -> None:
 
     for page in PAGES:
         markdown = (source / page.source).read_text(encoding="utf-8")
-        write_page(out, page, render_markdown(rewrite_source_links(markdown, page)), base_url)
+        rewritten = rewrite_source_links(markdown, page, source)
+        write_page(out, page, render_markdown(rewritten), base_url)
+    if BROKEN_SOURCE_LINKS:
+        raise SystemExit(
+            "broken relative docs links (no such file):\n  " + "\n  ".join(BROKEN_SOURCE_LINKS)
+        )
 
     copy_assets(source, out)
     copy_cname(source, out)
@@ -117,25 +128,41 @@ def validate_manifest(source: Path) -> None:
         )
 
 
-def rewrite_source_links(markdown: str, page: Page) -> str:
-    """Turn GitHub-friendly links to sibling Markdown files into site routes."""
+BROKEN_SOURCE_LINKS: list[str] = []
+
+
+def rewrite_source_links(markdown: str, page: Page, source: Path = REPO_ROOT / "docs/site") -> str:
+    """Turn GitHub-friendly links to sibling Markdown files into site routes.
+
+    A link to a Markdown file the site does not publish goes to the file on
+    GitHub when it exists in the repository; one to a file that exists
+    nowhere is recorded in BROKEN_SOURCE_LINKS, which fails the build (a
+    link the renderer cannot route would otherwise reach the page as literal
+    Markdown)."""
     routes = {item.source: item.slug for item in PAGES}
 
     def replace(match: re.Match) -> str:
         label, target = match.group(1), match.group(2)
+        if target.startswith(("http://", "https://", "mailto:")):
+            return match.group(0)
         path, marker, fragment = target.partition("#")
-        if path == "../../README.md":
-            suffix = f"#{fragment}" if marker else ""
-            return f"[{label}]({REPO_README_URL}{suffix})"
+        suffix = f"#{fragment}" if marker else ""
         source_name = path.removeprefix("./")
         slug = routes.get(source_name)
         if slug is None:
+            resolved = (source / path).resolve()
+            try:
+                in_repo = resolved.relative_to(REPO_ROOT)
+            except ValueError:
+                in_repo = None
+            if in_repo is not None and resolved.is_file():
+                return f"[{label}]({REPO_BLOB_URL}/{in_repo.as_posix()}{suffix})"
+            BROKEN_SOURCE_LINKS.append(f"{page.source} -> {target}")
             return match.group(0)
         if page.slug == "index":
             route = "./" if slug == "index" else f"./{slug}/"
         else:
             route = "../" if slug == "index" else f"../{slug}/"
-        suffix = f"#{fragment}" if marker else ""
         return f"[{label}]({route}{suffix})"
 
     return re.sub(r"\[([^\]]+)\]\(([^)]+\.md(?:#[^)]+)?)\)", replace, markdown)
@@ -181,7 +208,12 @@ def render_shell(page: Page, content: str, base_url: str) -> str:
         f"{html.escape(item.title)}</a>"
         for item in PAGES
     )
-    canonical = canonical_url(base_url, page.slug)
+    canonical = (
+        f'\n  <link rel="canonical" href="{html.escape(canonical_url(base_url, page.slug), quote=True)}">'
+        if base_url
+        else ""
+    )
+    host = base_url.removeprefix("https://").removeprefix("http://") or "bhf documentation"
     title = "BHF Documentation" if page.slug == "index" else f"{page.title} - BHF"
     return f"""<!doctype html>
 <html lang="en">
@@ -189,7 +221,7 @@ def render_shell(page: Page, content: str, base_url: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
-  <link rel="canonical" href="{html.escape(canonical, quote=True)}">
+{canonical}
   <style>
     :root {{
       color-scheme: light;
@@ -332,7 +364,7 @@ def render_shell(page: Page, content: str, base_url: str) -> str:
   <header>
     <div class="masthead">
       <div class="brand">BHF Documentation</div>
-      <div class="domain">{html.escape(DEFAULT_BASE_URL.removeprefix("https://"))}</div>
+      <div class="domain">{html.escape(host)}</div>
     </div>
   </header>
   <div class="layout">
@@ -553,6 +585,9 @@ def copy_cname(source: Path, out: Path) -> None:
 
 
 def write_sitemap(out: Path, base_url: str) -> None:
+    # A sitemap names absolute URLs: none without a host.
+    if not base_url:
+        return
     urls = "\n".join(
         f"  <url><loc>{html.escape(canonical_url(base_url, page.slug))}</loc></url>"
         for page in PAGES
@@ -568,8 +603,9 @@ def write_sitemap(out: Path, base_url: str) -> None:
 
 
 def write_robots(out: Path, base_url: str) -> None:
+    sitemap = f"Sitemap: {base_url}/sitemap.xml\n" if base_url else ""
     out.joinpath("robots.txt").write_text(
-        f"User-agent: *\nAllow: /\nSitemap: {base_url}/sitemap.xml\n",
+        f"User-agent: *\nAllow: /\n{sitemap}",
         encoding="utf-8",
     )
 

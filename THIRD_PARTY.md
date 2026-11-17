@@ -27,7 +27,7 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | GNAT.Exception_Traces | Symbolic backtrace | GPLv3 + GCC RLE | **Optional plug-in** | Same | Opt-in. |
 | GNATfuzz | AdaCore fuzzing tool | Proprietary / non-free distribution | **Forbidden** | Direct competitor; license incompatible | Never depend on. |
 | GNATcoverage | Coverage tool | GPLv3 | **Forbidden** in core | Subprocess use still pulls in copyleft tooling expectations and doesn't fit MVP | `research-lab` only. |
-| AFL++ | Coverage-guided fuzzer | Apache-2.0 | **Optional adapter** | Low | Adapter in `crates/fuzz_engine/afl_adapter`. Not bundled binary; user-installed. **Native C/C++ targets only** — not Ada, Rust, Java, or cross-compiled/emulated targets. |
+| AFL++ | Coverage-guided fuzzer | Apache-2.0 | **Optional adapter** | Low | Run as a subprocess (`bhf fuzz --engine afl++`, `bhf auto --engine afl++`) on harnesses whose templates carry AFL++ entry blocks. Not bundled binary; user-installed. **Native C/C++ targets only** — not Ada, Rust, Java, or cross-compiled/emulated targets. |
 | LibAFL | Embeddable fuzzing library | MIT/Apache-2.0 dual | **Optional embedded** | Low | Optional Cargo feature `libafl-engine`. |
 | LLVM / libFuzzer | LLVM compiler infra and in-process fuzzer | Apache-2.0 with LLVM exceptions | **Deferred** | LLVM/Ada front end is not production-grade | Deferred — not yet implemented (awaiting Ada/LLVM toolchain). Only the builtin engine and AFL++ participate in the auto cascade. |
 | PolyORB | Free Ada ORB | GPLv3 | **Forbidden** as core dep | Copyleft | `research-lab` only. |

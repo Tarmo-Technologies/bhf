@@ -220,6 +220,29 @@ bhf fuzz bhf_work --harness H-C0001 \
 `savevm` needs a block device (attach a small scratch `qcow2` even for a diskless
 `-kernel` boot) — the transport handles the rest.
 
+**Task identity.** `task_id=ADDR` (on `qemu-system:` and `gdb:`) names a
+32-bit word the firmware sets to the task that runs the input, such as the
+FreeRTOS handle `xTaskGetCurrentTaskHandle()` returns. BHF reads it after each
+run and records it in a fault finding as `target_task.id`.
+
+**Firmware identity.** `firmware=PATH` (on `qemu-system:`, and as
+`gdb:HOST:PORT,firmware=PATH`) names the ELF the target runs. Before anything
+connects, BHF reads it and records in each finding's `finding.json` and
+`transport_profile.json` a `firmware_identity` block:
+
+- its SHA-256, size, architecture and GNU build-id;
+- the toolchain its `.comment` names (`GCC 13.2.1`);
+- the RTOS version string it carries: FreeRTOS's
+  `"FreeRTOS Kernel " tskKERNEL_VERSION_NUMBER`, or Zephyr's
+  `Zephyr OS build v…` banner.
+
+An image it cannot read, or one that is not an ELF file, stops the run with
+exit 2. `bhf replay` warns when the image at that path no longer has the
+recorded SHA-256. FreeRTOS keeps no version string in an image unless the
+application references one; the reference profile's `app.c` keeps
+`bhf_kernel_version` for this. Without `firmware=`, the profile says that no
+identity was recorded.
+
 ### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
 For a device running an agent that receives inputs and streams edges and
@@ -298,6 +321,35 @@ BHF_DEADLINE_MS=250 bhf fuzz bhf_work --harness H-C0001    # sub-second budget
 
 Use it for watchdog / control-loop / radar-frame deadlines where a late answer
 is a defect. Off by default — unset, hang handling is byte-for-byte unchanged.
+
+**Target time (`cycles=`, `cpu_hz=`).** The host's round-trip time includes the
+debugger link, the reset and the host's load. On the `gdb:` and `qemu-system:`
+transports, `cycles=dwt` reads the Cortex-M DWT cycle counter around each run
+instead: BHF enables it (`DEMCR.TRCENA`, `DWT_CTRL.CYCCNTENA`) and zeroes it
+after delivering the input. `cycles=ADDR` reads a free-running 32-bit up-counter
+at `ADDR` before and after the run. With `cpu_hz=N`, the counter's rate,
+`--deadline` times each run by the target (the BHF-555 message names the
+cycles), and the transport profile records that basis for `bhf replay`. The
+run summary's `target_cycles` gives the fewest and most cycles any run took.
+
+QEMU's Cortex-M models do not count `DWT_CYCCNT`, so on an emulator use a
+counter the machine models: on `mps2-an385` the FPGAIO `COUNTER` at
+`0x40028018` counts at 25 MHz, and under `-icount` it advances with the
+instructions run. A counter that never advances is reported once, and the
+deadline falls back to host time.
+
+```sh
+--target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,cycles=0x40028018,cpu_hz=25000000"
+```
+
+**Nondeterminism (`bhf replay --stability-runs N`).** `bhf replay` re-drives
+a transport finding's input through the recorded transport once. With
+`--stability-runs N` it runs it N times, each from the transport's reset, and
+its `runs` line says how many reproduced the finding. When some do and others
+do not, the result is `MISMATCH nondeterministic, K of N runs reproduced the
+finding` (exit 3), and the differences list what the other runs did. Such a
+finding depends on state the reset does not restore (a peripheral, timing,
+an uninitialized word), not only on its input.
 
 ---
 
@@ -395,6 +447,21 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
 
 ## What is and isn't proven
 
+- **Five levels of validation, kept apart:**
+  1. **Host stubs.** Vendor headers stubbed on the host test portable logic
+     only. They establish no RTOS behaviour.
+  2. **ISA emulation.** `qemu-user` checks instruction semantics and byte order.
+  3. **Full-system bare metal.** The `qemu-system-arm` mps2-an385 fixture checks
+     the reset, the coverage ring and fault classification, with no scheduler.
+  4. **An actual RTOS.** The FreeRTOS reference profile
+     (`crates/target_transport/tests/freertos/`) runs under `qemu-system-arm`
+     with a scheduler, a queue, and task- and interrupt-driven entry points. It
+     has clean, fault, timeout and state-contamination controls, firmware
+     identity, task identity and target cycles. Its CLI tests run with
+     `BHF_RTOS_CLI=1`.
+  5. **Silicon.** A physical board over gdb-remote is not validated here. A
+     board profile reuses the same transport contract and must record the
+     silicon, the probe and the RTOS versions it ran.
 - **Validated live on emulators (2026-09-27, QEMU 8.2.2):** the transport
   layer's own live lane passed — cross-endian fidelity (RV-1, `qemu-ppc64`), the
   gdb-remote client + coverage read (RV-2, `qemu-arm` gdbstub), and the

@@ -115,8 +115,13 @@ IDE and orchestration:
 
 The docs hosting architecture is intentionally small: Markdown sources live in `docs/site`,
 `scripts/docs/build-site.py` renders static HTML into `target/docs-site`,
-and GitHub Pages serves the generated artifact at `docs.buildharnessfuzz.dev` when
-Pages is enabled for the repository. The docs workflow validates and
-uploads the Pages artifact on every push. The deploy job is gated by the
-`BHF_PAGES_ENABLED` repository variable so the workflow stays green
-in repositories or plans where Pages is not available yet.
+and GitHub Pages can serve the generated artifact once Pages is enabled for the
+repository; it is not enabled today, and no domain points at the site, so no
+public host serves it. The docs workflow validates and uploads the Pages
+artifact on every push. The deploy job is gated by the `BHF_PAGES_ENABLED`
+repository variable so the workflow stays green where Pages is not available.
+The build writes canonical links, `sitemap.xml` and a `Sitemap:` line in
+`robots.txt` only for the host given with `--base-url`; by default there is
+none. It fails on a relative link to a Markdown file that does not exist; a
+link to a repository file the site does not publish goes to that file on
+GitHub.

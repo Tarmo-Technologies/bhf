@@ -140,7 +140,7 @@ or an enforced private work-directory boundary and a dedicated security review.
   smoke failure and activation failure preserving/restoring the prior install.
 - Optional LibAFL feature: 5 tests passed. Optional GNAT probe feature compiled
   under `BHF_PROFILE=external-tools` (zero tests; not runtime validation).
-- Nyx adapter: 6 default-feature tests and 3 `nyx-engine` tests passed; the latter
+- Nyx adapter (since removed, with the other crates nothing used): 6 default-feature tests and 3 `nyx-engine` tests passed; the latter
   checks explicit unsupported behavior, not real Nyx fuzzing.
 - Rebuilt CLI scan + C fuzz smoke: 1 target built and fuzzed, 32 executions,
   target entry observed, 10 coverage edges. Artifacts:

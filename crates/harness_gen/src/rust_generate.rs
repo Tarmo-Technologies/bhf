@@ -346,6 +346,10 @@ fn build_call_body(
     // only AFTER the front-partition decodes run).
     let mut arg_lines = Vec::new();
     let mut resource_arg_line: Option<String> = None;
+    // The rest channel takes what is left, so it is decoded after every other
+    // arg: decoded first, it left nothing for the args after it, and an enum
+    // pick or integer there was always its zero value (#217).
+    let mut rest_arg_line: Option<String> = None;
     let mut call_args = Vec::new();
     for (i, s) in slots.iter().enumerate() {
         let bind = format!("a{i}");
@@ -382,10 +386,13 @@ fn build_call_body(
         call_args.push(arg);
         if Some(i) == resource_param_index {
             resource_arg_line = Some(line);
+        } else if Some(i) == rest_idx {
+            rest_arg_line = Some(line);
         } else {
             arg_lines.push(line);
         }
     }
+    arg_lines.extend(rest_arg_line);
 
     let args = call_args.join(", ");
     // Receiver setup is decoded BEFORE the method args (so the method's rest
@@ -586,6 +593,19 @@ fn monomorphize_bound(bound: &str) -> Option<&'static str> {
             "Into<String>" => return Some("String"),
             _ => {}
         }
+        // #216: a path opener (`P: AsRef<Path>`, `impl Into<PathBuf>`), by the
+        // leaf so `std::path::Path` and `path::Path` match too. The in-crate
+        // lane drives it with a materialized path resource.
+        let generic_leaf = |prefix: &str| {
+            let inner = clause.strip_prefix(prefix)?.strip_suffix('>')?;
+            Some(inner.rsplit("::").next().unwrap_or(inner))
+        };
+        if generic_leaf("AsRef<") == Some("Path") {
+            return Some("&Path");
+        }
+        if generic_leaf("Into<") == Some("PathBuf") {
+            return Some("PathBuf");
+        }
         // Output-sink writer traits, matched by their leaf path so `std::fmt::Write`,
         // `core::fmt::Write`, and `fmt::Write` all resolve. A bare `Write` is
         // ambiguous (io vs fmt) and is intentionally NOT matched.
@@ -635,8 +655,25 @@ fn substitute_type_param(ty: &str, name: &str, concrete: &str) -> String {
 /// representation the generator uses, rather than rejecting a raw `T` that the
 /// generator would have monomorphized (the #83 flag-off regression).
 pub fn monomorphized_params(target: &RustFn) -> Result<Vec<RustParam>, RustGenerateError> {
+    // An argument-position `impl Bound` is an anonymous type parameter: it
+    // takes the concrete type its bound monomorphizes to (`impl AsRef<Path>`
+    // -> `&Path`, #216). One with no such bound is left for the decoder to
+    // refuse.
+    let impl_params = |params: &mut Vec<RustParam>| {
+        for p in params.iter_mut() {
+            if let Some(concrete) =
+                p.ty.trim()
+                    .strip_prefix("impl ")
+                    .and_then(monomorphize_bound)
+            {
+                p.ty = concrete.to_owned();
+            }
+        }
+    };
     if target.type_params.is_empty() {
-        return Ok(target.params.clone());
+        let mut params = target.params.clone();
+        impl_params(&mut params);
+        return Ok(params);
     }
     let mut subst: Vec<(&str, &'static str)> = Vec::new();
     for tp in &target.type_params {
@@ -684,6 +721,7 @@ pub fn monomorphized_params(target: &RustFn) -> Result<Vec<RustParam>, RustGener
             });
         }
     }
+    impl_params(&mut params);
     Ok(params)
 }
 
@@ -1555,6 +1593,44 @@ mod tests {
         );
     }
 
+    /// #216: a path bound monomorphizes to the type the path-resource recipe
+    /// drives, in a type parameter and in argument position.
+    #[test]
+    fn path_bounds_monomorphize_to_a_path() {
+        for (bound, concrete) in [
+            ("AsRef<Path>", Some("&Path")),
+            ("AsRef<std::path::Path>", Some("&Path")),
+            ("AsRef<Path> + ?Sized", Some("&Path")),
+            ("Into<PathBuf>", Some("PathBuf")),
+            ("Into<std::path::PathBuf>", Some("PathBuf")),
+            ("AsRef<OsStr>", None),
+            ("Into<Path>", None),
+        ] {
+            assert_eq!(monomorphize_bound(bound), concrete, "{bound}");
+        }
+        let mut generic = rust_fn("open", &[("p", "P")], true);
+        generic.type_params = vec![rust_parser::RustTypeParam {
+            name: "P".to_owned(),
+            bound: "AsRef<Path>".to_owned(),
+        }];
+        assert_eq!(monomorphized_params(&generic).unwrap()[0].ty, "&Path");
+        let apit = rust_fn(
+            "open_dir",
+            &[
+                ("data_dir", "impl AsRef<Path>"),
+                ("raw", "impl AsRef<[u8]>"),
+                ("w", "impl Display"),
+            ],
+            true,
+        );
+        let tys: Vec<String> = monomorphized_params(&apit)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.ty)
+            .collect();
+        assert_eq!(tys, ["&Path", "&[u8]", "impl Display"]);
+    }
+
     #[test]
     fn enum_param_uses_override_decoder_by_move() {
         // A unit-enum param the caller resolved variants for: the override expr
@@ -1600,6 +1676,11 @@ mod tests {
             "{}",
             h.harness_rs
         );
+        // #217: the pick reads its byte before the rest channel takes what is
+        // left; the other way round it always read 0, the first variant.
+        let pick = h.harness_rs.find("let mut a1 = ").unwrap();
+        let rest = h.harness_rs.find("let mut a0 = c.rest_string();").unwrap();
+        assert!(pick < rest, "{}", h.harness_rs);
     }
 
     #[test]

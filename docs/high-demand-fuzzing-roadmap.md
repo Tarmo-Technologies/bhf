@@ -69,13 +69,12 @@ not the **back half**:
   `qemu-system`, Renode, avatar2, Unicorn, JTAG/OpenOCD, gdbserver, or
   serial/TCP on-target agent) — only qemu-**user**/wine argv-prefix
   (`crates/cli/src/runner.rs:13-56`) and a host-only `afl-fuzz -Q` shell-out
-  (`crates/cli/src/binary_fuzz.rs`). The Nyx snapshot backend is a stub
-  (`crates/fuzz_engine/nyx_adapter/src/lib.rs` returns `NotImplemented`;
-  software replay collects zero coverage). Crash detection is `#[cfg(unix)]` on
-  `ExitStatus::signal()` (`crates/cli/src/fatal_signal.rs:38-58`). The
-  `fork_server` crate (AFL 198/199) is wired into nothing
-  (`crates/fork_server/src/lib.rs:20-24`); the `iiop` decoder and
-  `ada_state_machine` extractor are not wired into the engine.
+  (`crates/cli/src/binary_fuzz.rs`). The Nyx snapshot backend was a stub
+  that returned `NotImplemented`, and the AFL-protocol `fork_server` crate was
+  wired into nothing; both crates have since been removed with the other
+  unused ones. Crash detection is `#[cfg(unix)]` on
+  `ExitStatus::signal()` (`crates/cli/src/fatal_signal.rs:38-58`). The `iiop`
+  decoder and `ada_state_machine` extractor are not wired into the engine.
 
 The consequence: as shipped, a target must run as a **host Linux child
 process** (natively, sandboxed, or under qemu-user/wine) to be fuzzed with

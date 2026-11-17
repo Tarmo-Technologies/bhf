@@ -200,6 +200,7 @@ impl ScriptedResponse {
 
     fn to_outcome(&self) -> RunOutcome {
         RunOutcome {
+            target: Default::default(),
             exit: self.exit,
             coverage_edges: self.edges.clone(),
             fault: self.fault.clone(),

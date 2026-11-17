@@ -734,6 +734,8 @@ pub struct GdbRemoteTransport<F> {
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -744,6 +746,8 @@ impl<F> GdbRemoteTransport<F> {
             map,
             exec_deadline: None,
             input_contract: None,
+            cycle_counter: None,
+            task_id_address: None,
         }
     }
 
@@ -751,6 +755,20 @@ impl<F> GdbRemoteTransport<F> {
     /// its length word written first when the firmware reads one.
     pub fn with_input_contract(mut self, contract: Option<InputContract>) -> Self {
         self.input_contract = contract;
+        self
+    }
+
+    /// Read `counter` around each run and report the cycles it took in
+    /// [`RunOutcome::target`] (#251).
+    pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
+        self.cycle_counter = counter;
+        self
+    }
+
+    /// Read the 32-bit task identity word at `address` after each run and
+    /// report it in [`RunOutcome::target`] (#252).
+    pub fn with_task_id(mut self, address: Option<u64>) -> Self {
+        self.task_id_address = address;
         self
     }
 
@@ -778,6 +796,8 @@ where
             map: self.map,
             exec_deadline: self.exec_deadline,
             input_contract: self.input_contract,
+            cycle_counter: self.cycle_counter,
+            task_id_address: self.task_id_address,
         }))
     }
 }
@@ -806,12 +826,24 @@ pub fn read_coverage_ring<C: Read + Write>(
     MemoryBufferReader::new(image, write, wrapped)?.read_edges()
 }
 
+/// A little-endian 32-bit word of target memory.
+pub(crate) fn read_u32<C: Read + Write>(client: &mut GdbClient<C>, address: u64) -> Result<u32> {
+    let bytes = client.read_memory(address, 4)?;
+    let mut word = [0u8; 4];
+    for (dst, src) in word.iter_mut().zip(&bytes) {
+        *dst = *src;
+    }
+    Ok(u32::from_le_bytes(word))
+}
+
 /// A live GDB-driven session.
 pub struct GdbSession<C> {
     client: GdbClient<C>,
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
+    task_id_address: Option<u64>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -827,6 +859,11 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
             self.input_contract.as_ref(),
             input,
         )?;
+        // The cycle counter starts last, so it measures the run (#251).
+        let cycles_start = match &self.cycle_counter {
+            Some(counter) => Some(counter.start(&mut self.client)?),
+            None => None,
+        };
 
         // EXECUTION phase: bounded by the absolute per-input deadline (#70). A
         // target that never reaches its stop within the deadline is a first-class
@@ -844,6 +881,7 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
                     None => "no stop within the per-input execution deadline".to_owned(),
                 };
                 return Ok(RunOutcome {
+                    target: Default::default(),
                     exit: ExitKind::Timeout,
                     coverage_edges: Vec::new(),
                     fault: Some(Fault {
@@ -865,12 +903,29 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         // keep the exit classification and record the read failure as a diagnostic
         // instead of propagating an error that loses the crash.
         let exit = stop.to_exit_kind();
+        let mut target = crate::outcome::TargetObservation::default();
+        let mut cycles_failed = None;
+        if let (Some(counter), Some(start)) = (&self.cycle_counter, cycles_start) {
+            match counter.elapsed(&mut self.client, start) {
+                Ok(cycles) => target.cycles = Some(cycles),
+                Err(err) => cycles_failed = Some(format!("cycle counter: {err}")),
+            }
+        }
+        if let Some(address) = self.task_id_address {
+            match read_u32(&mut self.client, address) {
+                Ok(id) => target.task_id = Some(u64::from(id)),
+                Err(err) => {
+                    cycles_failed.get_or_insert_with(|| format!("task id: {err}"));
+                }
+            }
+        }
         let (coverage_edges, coverage_incomplete) =
             match read_coverage_ring(&mut self.client, &self.map) {
-                Ok(edges) => (edges, None),
+                Ok(edges) => (edges, cycles_failed),
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
         Ok(RunOutcome {
+            target,
             exit,
             coverage_edges,
             // Fault classification over the debug-probe path is HDF-2.

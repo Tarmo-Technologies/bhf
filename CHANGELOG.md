@@ -5,6 +5,13 @@
 ## Unreleased
 
 ### Changed
+- The unused workspace crates `discovery`, `semantic`, `fork_server`,
+  `fuzz_engine_nyx_adapter`, `fuzz_engine_libfuzzer_adapter` and
+  `fuzz_engine_afl_adapter` are removed: nothing depended on them (the AFL++
+  lane runs `afl-fuzz` on the harness templates' AFL++ blocks, not through
+  `afl_adapter`). `fuzz_engine_libafl_adapter`, `iiop` and
+  `continuous_daemon` stay. The cmplog crate's doc no longer names a
+  `cmplog-runtime` feature that does not exist.
 - The nightly installs AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross
   compilers, and qemu-user with the AArch64 cross compilers, and runs those
   lanes' tests, which skipped as passes; the skip allowlist no longer names a
@@ -45,6 +52,101 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The FreeRTOS reference profile has a timeout and a state-contamination
+  control, and a CLI test runs both. Input `0xD0` never reaches
+  `harness_done`, so the run ends at `--timeout` as a timeout finding.
+  Input `0xC5` sets a word that startup does not clear, and a `0x42` that
+  sees it faults. In one session, `0xC5` then `0x42` is clean, which shows
+  the snapshot reset restores the guest's memory between inputs.
+- An on-target finding records the firmware it was found on: `firmware=PATH`
+  on a `qemu-system:` or `gdb:` transport names the ELF, and `finding.json` and
+  `transport_profile.json` record its SHA-256, size, architecture, build-id,
+  the toolchain its `.comment` names and the RTOS version string it carries
+  (FreeRTOS `tskKERNEL_VERSION_NUMBER`, Zephyr's banner). The profile's
+  `firmware_identity` was always `null`. An image bhf cannot read, or that is
+  not an ELF file, stops the run with exit 2, and `bhf replay` warns when the
+  image's SHA-256 changed. A GCC `.comment` with a build date after the
+  version (Arm GNU Toolchain's) names the version, not the date.
+- The in-crate Rust lane drives a directory opener that takes
+  `impl AsRef<Path>` (or `P: AsRef<Path>`, `Into<PathBuf>`), and seeds the file
+  the opener's body joins onto the directory (`data_dir.join("db.zo")` seeds
+  `db.zo`) instead of always `db`. A zoxide-shaped `Database::open_dir` was
+  unreachable twice over. An argument-position `impl AsRef<[u8]>`,
+  `impl AsRef<str>` or `impl Into<String>` parameter monomorphizes as a type
+  parameter with that bound does, in both Rust lanes.
+- The in-crate Rust lane harnesses a trait-impl method of a type in a private
+  module, which it refused ("in-crate trait resolution is not yet
+  supported"): a static one is called by UFCS with a `crate`-rooted trait path
+  or a std conversion trait (`<crate::m::Header as FromStr>::from_str`), and an
+  instance one imports its trait. Its parameters take the overrides the
+  external lane gives them (an enum variant pick, a scratch slice, a `Default`
+  reference), rooted at `crate`.
+- A Rust harness reads a unit-enum parameter with a `match` on a fuzz byte:
+  indexing an array of the variants moved out of it, which compiled only for
+  a `Copy` enum. The parameter that takes the rest of the input is decoded
+  after the others; decoded first, it left nothing for them, so an enum pick
+  or integer after it was always zero.
+- The in-crate Rust lane builds a workspace member that inherits from its
+  workspace. A dependency declared `dep.workspace = true` was refused ("the
+  detached copy can't resolve it"); it is now resolved from the workspace's
+  `[workspace.dependencies]` as Cargo does (the workspace's entry, its path
+  anchored at the workspace root, with the member's features and `optional`).
+  An inherited `version` and `edition` come from `[workspace.package]` instead
+  of `0.0.0` and `2021`, so a 2024-edition member compiles. The workspace's
+  `Cargo.lock` is copied with the crate, so the offline build resolves the
+  versions the workspace locked.
+- `bhf fuzz --collector` replays the campaign's retained inputs one by one on
+  the harness: its crash findings, then its persisted corpus, at most 16, each
+  launched as `bhf replay` runs the harness. A sidecar now observes each one
+  (it was never run against an execution:
+  `harness_sidecar_replay_unsupported`), and the observation names the
+  testcase and the PID it ran as. On Linux each runs under the runtrace shim,
+  so a finding keeps the input whose replay reached the sink; the campaign's
+  runtrace log, which the collector read as one aggregate session with no
+  input, now adds only the sinks no replay reached.
+- `bhf binary fuzz --collector` replays every retained input under the
+  observer, one by one, instead of only the first seed: the input behind each
+  of the run's findings, then (with `--engine afl-qemu`, which ignored
+  `--collector`) the AFL++ queue entries that found new coverage, then the
+  seeds, at most 16. Each finding keeps the input whose replay produced it, so
+  a violation only a discovered input reaches is reported with that input, and
+  a sink several replays reach is one finding. The
+  run's `collector` block lists each replay (`replays`: testcase, input
+  SHA-256, PID, findings) and counts the inputs past the bound
+  (`replays_dropped`); it is a clean assurance only when every replay was
+  observed clean.
+- cli.md's Common Flow runs as written, and a test runs it: the Ada pipeline
+  names its harness with `--id H-PKG-PARSE` and replays, minimizes and reports
+  the finding under `bhf_work/results/findings/`, where `bhf fuzz` writes it,
+  instead of `findings/F-0001` and `build/H-PKG-PARSE/main`. `bhf replay` and
+  `bhf minimize` given a `--finding` that names no finding say which path
+  they looked at, before anything runs; replay said the harness had been run
+  as an Ada stdin harness.
+- An exception that leaves a C++ target is a finding, BHF-231
+  `bhf.cpp/uncaught-exception` (CWE-248): the C++ harness caught every
+  exception with `catch (...)` and returned, so a `std::out_of_range` from
+  `vector::at` on an input-derived index was never reported. The finding names
+  the exception type and its `what()`. `--cxx-expected-exception TYPE`
+  (repeatable, `*` for any) lists the types a target throws to reject an
+  input; the libstdc++ and libc++abi terminate messages are parsed the same
+  way.
+- The docs site publishes the extension protocol page (cli.md's link reached
+  the page as literal Markdown) and names no public host: index.md named
+  `docs.buildharnessfuzz.dev`, which has no DNS record, and GitHub Pages is
+  not enabled. The build writes canonical links, a sitemap and a `Sitemap:`
+  line only for a host given with `--base-url`, no longer ships a CNAME, and
+  fails on a relative link to a Markdown file that does not exist (a link to
+  an unpublished repository file goes to it on GitHub). install.md links the
+  README's resource requirements.
+- The help says what `report`, `model`, `snippet` and `license-audit` do:
+  `bhf report --sarif`/`--csv` and `bhf model` are no longer hidden, and
+  `model train`'s help and cli.md give its labels schema; `--junit` is
+  documented as the switch it is, not `--junit <PATH>`; snippet's help lists
+  its languages from the language enum (it named 8 of the 16); and
+  `license-audit` says it checks bhf's own Cargo dependency licenses, not a
+  scanned project's. The top-level "COMMANDS BY AREA" guide names every
+  visible command, as do cli.md's command map, and `model train` accepts a
+  finding's directory as `finding_path`.
 - `docs/expected-gaps.md` marks the fixed classes (Go-2, C++-1, C-1 in part)
   and its ranked work list names none of them; the Go lane's re-sweep is
   recorded in `docs/validation/2026-11-16-go-resweep.md`. It re-ran the 40 Go
@@ -2576,6 +2678,28 @@
   when bhf panics.
 
 ### Added
+- The FreeRTOS reference profile has an interrupt-driven entry point: its
+  `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
+  handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test
+  finds the planted fault through it. `task_id=ADDR` on a `qemu-system:` or
+  `gdb:` transport reads the firmware's task identity word after each run, and
+  a fault finding records it as `target_task.id`; `bhf_task_id` was written but
+  never read. on-target-fuzzing.md lists the five validation levels (host
+  stubs, ISA emulation, full-system bare metal, an actual RTOS, silicon) and
+  which ones BHF has validated.
+- On-target deadlines can be timed by the target: `cycles=dwt` on a `gdb:` or
+  `qemu-system:` transport reads the Cortex-M DWT cycle counter around each
+  run, `cycles=ADDR` a free-running 32-bit counter, and with `cpu_hz=N`
+  `--deadline` uses the target's time instead of the host's round-trip time.
+  The run summary's `target_cycles` gives the fewest and most cycles a run
+  took, the transport profile records the timing basis, and replay judges a
+  deadline finding by it. QEMU does not count `DWT_CYCCNT`, which the run
+  reports; the FreeRTOS profile's test reads the MPS2 FPGAIO counter.
+- `bhf replay --stability-runs N` re-drives an on-target transport finding's
+  input N times, each from the transport's reset, and reports how many runs
+  reproduced it. A finding some runs reproduce and others do not is
+  `MISMATCH nondeterministic, K of N runs reproduced the finding` (exit 3);
+  transport replay ran once and could not tell a flaky fault from a fixed one.
 - Seed lineage: the built-in engine records what each input it keeps was
   mutated from (`corpus/<harness-id>/lineage.jsonl`, one line per queue
   entry, beside the queue), and each finding's `finding.json` gains

@@ -33,9 +33,29 @@ pub fn resolve_finding_arg_in(
     raw
 }
 
+/// Why `finding_dir` is not a finding, naming the path that was looked at, or
+/// `None` when it holds a `finding.json` (or, for a session finding, a
+/// `session.json`). Replay and minimize check this before anything runs, so a
+/// mistyped path is not reported as a harness problem.
+pub fn missing_finding(finding_dir: &Path) -> Option<String> {
+    if finding_dir.join("finding.json").is_file() || finding_dir.join("session.json").is_file() {
+        return None;
+    }
+    let problem = if finding_dir.is_dir() {
+        format!("{} has no finding.json", finding_dir.display())
+    } else {
+        format!("{} does not exist", finding_dir.display())
+    };
+    Some(format!(
+        "no finding at {}: {problem}. Pass a finding directory, such as \
+         bhf_work/results/findings/<finding-id>, or the id of a finding in ./bhf_work",
+        finding_dir.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_finding_arg_in;
+    use super::{missing_finding, resolve_finding_arg_in};
     use std::path::PathBuf;
 
     #[test]
@@ -70,5 +90,30 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let got = resolve_finding_arg_in(&work, None, Some(PathBuf::from("F-does-not-exist")));
         assert_eq!(got, PathBuf::from("F-does-not-exist"));
+    }
+
+    #[test]
+    fn a_missing_finding_names_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("findings/F-0001");
+        let message = missing_finding(&absent).unwrap();
+        assert!(
+            message.starts_with(&format!("no finding at {}:", absent.display())),
+            "{message}"
+        );
+        assert!(message.contains("does not exist"), "{message}");
+
+        std::fs::create_dir_all(&absent).unwrap();
+        assert!(missing_finding(&absent)
+            .unwrap()
+            .contains("has no finding.json"));
+
+        // A session finding is its session.json.
+        std::fs::write(absent.join("session.json"), "{}").unwrap();
+        assert_eq!(missing_finding(&absent), None);
+        std::fs::remove_file(absent.join("session.json")).unwrap();
+
+        std::fs::write(absent.join("finding.json"), "{}").unwrap();
+        assert_eq!(missing_finding(&absent), None);
     }
 }

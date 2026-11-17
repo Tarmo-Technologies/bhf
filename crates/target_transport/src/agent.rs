@@ -182,6 +182,7 @@ pub fn read_response<R: Read>(reader: &mut R, limits: &AgentLimits) -> Result<Ru
     };
 
     Ok(RunOutcome {
+        target: Default::default(),
         exit,
         coverage_edges,
         fault,
@@ -416,6 +417,7 @@ mod tests {
     #[test]
     fn response_round_trips_through_encode_and_read() {
         let outcome = RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Crash,
             coverage_edges: vec![3, 1, 4, 1, 5],
             fault: Some(Fault {

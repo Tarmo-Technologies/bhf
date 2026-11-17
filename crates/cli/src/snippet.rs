@@ -31,8 +31,7 @@ pub struct SnippetArgs {
 
     /// Source language of the snippet. Auto-detected from the input file's
     /// extension or the snippet's content when omitted; pass it explicitly for a
-    /// stdin paste whose language is ambiguous. One of: ada, c, cpp, rust, java,
-    /// python, perl, go.
+    /// stdin paste whose language is ambiguous.
     #[arg(long, visible_alias = "lang", value_enum)]
     pub language: Option<LangSelector>,
 

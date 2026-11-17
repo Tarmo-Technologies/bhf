@@ -142,6 +142,21 @@ pub struct RunOutcome {
     /// run as a clean pass or invent a crash; it records it as inconclusive and
     /// retains the reason. `None` means the classification is trustworthy.
     pub inconclusive: Option<String>,
+    /// What the target itself measured about the run, when the backend reads
+    /// it (#251).
+    pub target: TargetObservation,
+}
+
+/// What the target measured about one execution, read through the backend:
+/// how many cycles of its counter the run took (#251), and which task it
+/// says ran the input (#252). Each field is `None` when the backend was not
+/// asked to read it, or could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetObservation {
+    /// Target cycles from the input's delivery to the completion stop.
+    pub cycles: Option<u64>,
+    /// The task identity word the firmware wrote (an RTOS task handle).
+    pub task_id: Option<u64>,
 }
 
 impl RunOutcome {
@@ -154,6 +169,7 @@ impl RunOutcome {
             stdout: Vec::new(),
             coverage_incomplete: None,
             inconclusive: None,
+            target: TargetObservation::default(),
         }
     }
 }

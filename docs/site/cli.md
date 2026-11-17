@@ -10,7 +10,7 @@ checks.
 
 | Area | Commands |
 |---|---|
-| Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report` |
+| Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report`, `model` |
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
@@ -19,7 +19,7 @@ checks.
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
 | Rules and governance | `rules`, `policy`, `audit`, `pack`, `export` |
 | Optional assistance | `llm` (`status`, `test`, `prompt`, `assist`) |
-| CI and operations | `ci`, `runners`, `clean`, `introspect` |
+| CI and operations | `ci`, `runners`, `clean`, `introspect`, `bug-report` |
 
 Run `bhf --help` for the live top-level inventory and `bhf <command>
 --help` for the exact language scope, defaults, and accepted values. In
@@ -35,30 +35,47 @@ files under the work dir keep the text as it was.
 
 ## Common Flow
 
+The manual pipeline for one Ada subprogram, run from the directory that holds
+`path/to/pkg.adb` and its spec `path/to/pkg.ads`:
+
+```sh
+bhf list targets path/to/pkg.adb --top 20
+bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented
+bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --id H-PKG-PARSE --output bhf_work/generated_harnesses
+bhf build bhf_work --harness H-PKG-PARSE
+bhf fuzz bhf_work --harness H-PKG-PARSE --iterations 1000 --seed-input smoke
+bhf replay --finding bhf_work/results/findings/<finding-id>
+bhf minimize --finding bhf_work/results/findings/<finding-id>
+bhf report --findings bhf_work/results/findings --out bhf_work/reports
+```
+
+`bhf instrument` copies the package spec beside the instrumented body, which
+the build needs. `--id` names the harness the later steps use; without it,
+`generate-harness` derives one from the file and target, the id `bhf list
+targets` prints. `<finding-id>` is the directory `bhf fuzz` writes under
+`bhf_work/results/findings/` (`bhf_work/results/INDEX.md` lists it), and
+`--finding <finding-id>` alone finds it in `./bhf_work`. Without `--harness`,
+`bhf replay` and `bhf minimize` run the harness the finding records, here
+`bhf_work/build/H-PKG-PARSE/obj/main`. A `--finding` that names no finding is
+refused with the path bhf looked at, before anything runs.
+
+Other entry points, on a source tree and on a binary:
+
 ```sh
 bhf scan path/to/src --work-dir bhf_work
 bhf static-scan path/to/src --out bhf_work/static --sarif
+bhf introspect path/to/src --work-dir bhf_work
 bhf binary scan path/to/bin-or-firmware --out bhf_work/binary
 bhf --profile external-tools binary adapter path/to/bin --adapter rizin --out bhf_work/binary-adapter
 bhf binary fuzz path/to/bin --work-dir bhf_work --input-mode stdin --seed-input smoke
-bhf list targets path/to/pkg.adb --top 20
-bhf instrument path/to/pkg.adb --output bhf_work/src_instrumented
-bhf generate-harness bhf_work/src_instrumented/pkg.adb --target Pkg.Parse --output bhf_work/generated_harnesses
-bhf build bhf_work --harness H-PKG-PARSE
-bhf fuzz bhf_work --harness H-PKG-PARSE --iterations 1000 --seed-input smoke
-bhf replay --finding findings/F-0001 --harness build/H-PKG-PARSE/main
-bhf minimize --finding findings/F-0001 --harness build/H-PKG-PARSE/main
-bhf report --findings findings --out reports
-bhf introspect path/to/src --work-dir bhf_work
 bhf clean bhf_work --build --corpus --reports
 ```
 
-The replay and minimize lines show the Ada layout. A C or C++ harness replays
-from the `build/<id>/main` that `bhf build` stages or from
-`bhf_work/harnesses/<id>/main` (`main.exe` on Windows, as every harness
-binary there is named: `main_cov.exe`, `main_afl.exe`, ...); without
-`--harness`, `bhf replay` and `bhf minimize` resolve the finding's harness in
-its work dir.
+The adapter line needs `rizin` on `PATH`; without it, it exits `1` saying so.
+To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
+that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
+Windows, as every harness binary there is named: `main_cov.exe`,
+`main_afl.exe`, ...).
 `bhf minimize` first runs the testcase and compares its crash with the finding
 the way `bhf replay` does, with the environment `bhf replay` gives the harness
 (the finding's recorded runtime mode and injected variables too), as does
@@ -93,10 +110,32 @@ harness is not its recorded build, or whose replay is unsymbolized (put
 the LLVM toolchain `bhf auto` uses on `PATH`) is listed and left as it was. Pass `--findings <DIR>` and/or `--out <DIR>` for the
 explicit mode shown above, which reports over an arbitrary findings directory
 and writes a standalone Markdown/JSON/SARIF/CSV report to `--out` instead of
-touching `results/`; `--sarif`/`--csv` are no-ops in work-dir mode (always
-written). `--junit <PATH>`, `--baseline <PATH>`, and `--model <PATH>` write
-into `<work-dir>/results/report/` (the `bhf.report.v2` snapshot baseline
-comparisons need).
+touching `results/`: `--sarif` and `--csv` add `<run>.sarif` and `<run>.csv`
+there. In work-dir mode they change nothing, since `results/findings.sarif`
+and `results/findings.csv` are always written. `--junit` (a switch, with no
+path) writes `<run>.junit.xml`, into `<work-dir>/results/report/` in work-dir
+mode, with the `bhf.report.v2` snapshot that `--baseline <PATH>` and
+`--model <PATH>` also write there (baseline comparisons need it).
+
+`bhf model train --labels <FILE> --out <MODEL>` trains the confidence model
+`bhf report --model` applies. The labels file is a JSON list of records (or an
+object whose `labels` holds that list); each record has a `label`,
+`true_positive`, `false_positive` or `low_value`, and its finding, either
+inline as `finding` (a `finding.json` object) or as `finding_path` (a
+`finding.json`, or the finding's directory, relative to the labels file):
+
+```json
+[
+  {"label": "true_positive", "finding_path": "bhf_work/results/findings/F-0001"},
+  {"label": "false_positive", "finding": {"rule_id": "BHF-205", "kind": "signed-integer-overflow"}}
+]
+```
+
+`bhf license-audit` checks bhf's own Cargo dependencies, in a checkout of
+bhf's source (`--root`, default `.`; `--package`, default `bhf`), against its
+Apache-2.0/MIT/BSD policy and the THIRD_PARTY.md matrix. It is not a license
+check of a scanned project; `bhf sbom` lists a tree's dependencies and their
+licenses.
 
 ## Actionability Modes
 
@@ -1874,7 +1913,7 @@ speaks the versioned `bhf.extension.v1` protocol (length-framed JSON over
 stdin/stdout). An extension lets a *private* semantic oracle judge whether a
 clean-exiting input violates a contract a crash-only fuzzer cannot see — without
 vendoring that oracle into bhf and in any language (see
-[`docs/extension-protocol.md`](../extension-protocol.md) and the Python
+[the extension protocol](extension-protocol.md) and the Python
 reference extension under `crates/extension_host/tests/fixtures/`).
 
 ```sh
@@ -1913,7 +1952,7 @@ run or a finding). `--json` emits a machine-readable report.
 `scenario.next`/`observe-response`, and `lifecycle.setup`/`reset`/`teardown`.
 Negotiation advertises them all as optional on top of the manifest's
 `required-capabilities`, so an extension that implements only a subset still
-works. See [`docs/extension-protocol.md`](../extension-protocol.md) for the wire
+works. See [the extension protocol](extension-protocol.md) for the wire
 shapes.
 
 **Trust boundary.** The manifest is only ever loaded through an explicit

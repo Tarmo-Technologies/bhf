@@ -45,7 +45,7 @@
 //! memory for the memory-read backends (gdb / qemu-system). The agent backend
 //! carries coverage over its protocol and rejects a coverage map.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use corpus::{CorpusError, FindingEmitter};
@@ -55,6 +55,7 @@ use fuzz_engine_builtin::{
     MutationRng, MutatorConfig, MutatorSuite, PowerScheduler,
 };
 use serde::Serialize;
+use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
     AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
     GuestFaultStatus, InputContract, RunOutcome, TargetSession, TargetTransport, TransportError,
@@ -179,6 +180,13 @@ pub(crate) enum TransportPlan {
         map: GdbMemoryMap,
         /// The staging region's capacity and length word.
         input: InputContract,
+        /// The firmware ELF the target runs (`firmware=`), whose identity each
+        /// finding records (#248).
+        firmware: Option<PathBuf>,
+        /// The target cycle counter read around each run (`cycles=`, #251).
+        cycles: Option<CycleCounter>,
+        /// The address of the firmware's task identity word (`task_id=`, #252).
+        task_id: Option<u64>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -200,6 +208,13 @@ pub(crate) enum TransportPlan {
         /// returns through the completion breakpoint is classified as a crash
         /// rather than a silent clean pass (#72).
         fault_status: Option<GuestFaultStatus>,
+        /// The firmware ELF the guest runs (`firmware=`), whose identity each
+        /// finding records (#248).
+        firmware: Option<PathBuf>,
+        /// The target cycle counter read around each run (`cycles=`, #251).
+        cycles: Option<CycleCounter>,
+        /// The address of the firmware's task identity word (`task_id=`, #252).
+        task_id: Option<u64>,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -330,12 +345,37 @@ impl TransportPlan {
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
             let (map, input) = require_coverage_map("gdb", coverage_map)?;
-            let (host, port) = parse_host_port("gdb", spec, rest)?;
+            // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
+            let mut parts = rest.split(',');
+            let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
+            let mut firmware = None;
+            let mut task_id = None;
+            let mut cycles = CycleKeys::default();
+            for part in parts.map(str::trim).filter(|part| !part.is_empty()) {
+                let unknown = || TransportSpecError::Malformed {
+                    backend: "gdb",
+                    spec: spec.to_owned(),
+                    reason: format!(
+                        "unknown option {part:?}; allowed: firmware=PATH, cycles=dwt|ADDR, \
+                         cpu_hz=N, task_id=ADDR"
+                    ),
+                };
+                let (key, value) = part.split_once('=').ok_or_else(unknown)?;
+                match key.trim() {
+                    "firmware" => firmware = Some(PathBuf::from(value.trim())),
+                    "task_id" => task_id = Some(parse_int("task_id", value)?),
+                    key if cycles.take(key, value)? => {}
+                    _ => return Err(unknown()),
+                }
+            }
             return Ok(Self::Gdb {
                 host,
                 port,
                 map,
                 input,
+                firmware,
+                cycles: cycles.counter("gdb", spec)?,
+                task_id,
             });
         }
 
@@ -373,13 +413,18 @@ impl TransportPlan {
                 port,
                 map,
                 input,
+                firmware: _,
+                cycles,
+                task_id,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
                     // deadline so a hung target is a bounded Timeout outcome, not
                     // an unbounded wait behind the per-read socket timeout (#70).
                     .with_exec_deadline(io_timeout)
-                    .with_input_contract(Some(input)),
+                    .with_input_contract(Some(input))
+                    .with_cycle_counter(cycles)
+                    .with_task_id(task_id),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -391,6 +436,9 @@ impl TransportPlan {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                firmware: _,
+                cycles,
+                task_id,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -399,7 +447,9 @@ impl TransportPlan {
                     map,
                     snapshot_tag,
                 )?
-                .with_input_contract(Some(input));
+                .with_input_contract(Some(input))
+                .with_cycle_counter(cycles)
+                .with_task_id(task_id);
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -425,6 +475,22 @@ impl TransportPlan {
     pub(crate) fn input_contract(&self) -> Option<InputContract> {
         match self {
             Self::Gdb { input, .. } | Self::QemuSystem { input, .. } => Some(*input),
+            _ => None,
+        }
+    }
+
+    /// The firmware ELF the spec names (`firmware=`), if any.
+    pub(crate) fn firmware(&self) -> Option<&Path> {
+        match self {
+            Self::Gdb { firmware, .. } | Self::QemuSystem { firmware, .. } => firmware.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The target cycle counter the spec names (`cycles=`), if any.
+    pub(crate) fn cycle_counter(&self) -> Option<CycleCounter> {
+        match self {
+            Self::Gdb { cycles, .. } | Self::QemuSystem { cycles, .. } => *cycles,
             _ => None,
         }
     }
@@ -486,6 +552,9 @@ fn parse_qemu_system(
     let mut fault: Option<u64> = None;
     let mut fault_width: u64 = 4;
     let mut fault_clear: u64 = 0;
+    let mut firmware: Option<PathBuf> = None;
+    let mut cycles = CycleKeys::default();
+    let mut task_id: Option<u64> = None;
 
     let malformed = |reason: String| TransportSpecError::Malformed {
         backend: "qemu-system",
@@ -511,10 +580,13 @@ fn parse_qemu_system(
             "fault" => fault = Some(parse_int("fault", value)?),
             "fault_width" => fault_width = parse_int("fault_width", value)?,
             "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
+            "firmware" => firmware = Some(PathBuf::from(value)),
+            "task_id" => task_id = Some(parse_int("task_id", value)?),
+            key if cycles.take(key, value)? => {}
             other => {
                 return Err(malformed(format!(
                     "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
-                     fault, fault_width, fault_clear"
+                     fault, fault_width, fault_clear, firmware, cycles, cpu_hz, task_id"
                 )))
             }
         }
@@ -567,8 +639,62 @@ fn parse_qemu_system(
         snapshot_tag,
         harness_done,
         fault_status,
+        firmware,
+        cycles: cycles.counter("qemu-system", spec)?,
+        task_id,
         notes,
     })
+}
+
+/// The `cycles=` and `cpu_hz=` keys of a memory-read spec (#251).
+#[derive(Default)]
+struct CycleKeys {
+    source: Option<CycleSource>,
+    hz: Option<u64>,
+}
+
+impl CycleKeys {
+    /// Take `key=value` when it is one of these keys.
+    fn take(&mut self, key: &str, value: &str) -> Result<bool, TransportSpecError> {
+        match key {
+            "cycles" => {
+                let value = value.trim();
+                self.source = Some(if value.eq_ignore_ascii_case("dwt") {
+                    CycleSource::Dwt
+                } else {
+                    CycleSource::Counter(parse_int("cycles", value)?)
+                });
+                Ok(true)
+            }
+            "cpu_hz" => {
+                self.hz = Some(parse_int("cpu_hz", value)?).filter(|hz| *hz > 0);
+                if self.hz.is_none() {
+                    return Err(TransportSpecError::Field {
+                        field: "cpu_hz".to_owned(),
+                        value: value.to_owned(),
+                    });
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn counter(
+        self,
+        backend: &'static str,
+        spec: &str,
+    ) -> Result<Option<CycleCounter>, TransportSpecError> {
+        match (self.source, self.hz) {
+            (Some(source), hz) => Ok(Some(CycleCounter { source, hz })),
+            (None, Some(_)) => Err(TransportSpecError::Malformed {
+                backend,
+                spec: spec.to_owned(),
+                reason: "cpu_hz= needs cycles=dwt or cycles=ADDR".to_owned(),
+            }),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 fn parse_host_port(
@@ -708,6 +834,12 @@ pub(crate) struct TransportFuzzConfig {
     /// The staging region contract the memory-read backends write inputs
     /// under, recorded in each finding's transport profile.
     pub input_contract: Option<InputContract>,
+    /// The identity of the firmware the spec's `firmware=` names, recorded in
+    /// each finding and its transport profile (#248).
+    pub firmware_identity: Option<serde_json::Value>,
+    /// The target cycle counter the spec's `cycles=` names (#251). With a
+    /// `cpu_hz=`, the deadline oracle times each run by it.
+    pub cycle_counter: Option<CycleCounter>,
     /// Deterministic mutation RNG seed.
     pub rng_seed: u64,
     /// Stop as soon as this many DISTINCT findings are emitted.
@@ -757,7 +889,56 @@ pub(crate) struct TransportFuzzSummary {
     /// is a normal result recorded in `findings`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub halted: Option<String>,
+    /// The target cycles the runs took, when the spec names a `cycles=`
+    /// counter (#251).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_cycles: Option<CycleStats>,
     pub elapsed_secs: f64,
+}
+
+/// The fewest and most target cycles any completed run took, over `runs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CycleStats {
+    pub runs: usize,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl CycleStats {
+    fn record(stats: &mut Option<Self>, cycles: Option<u64>) {
+        let Some(cycles) = cycles else {
+            return;
+        };
+        let entry = stats.get_or_insert(Self {
+            runs: 0,
+            min: cycles,
+            max: cycles,
+        });
+        entry.runs += 1;
+        entry.min = entry.min.min(cycles);
+        entry.max = entry.max.max(cycles);
+    }
+}
+
+/// How long a run took for the deadline oracle, and what measured it: the
+/// target's cycles at `cpu_hz` when the spec names both and the counter
+/// advanced, else the host's round-trip time.
+pub(crate) fn run_time(
+    counter: Option<CycleCounter>,
+    outcome: &RunOutcome,
+    host: Duration,
+) -> (Duration, String) {
+    let target = counter.and_then(|counter| {
+        let cycles = outcome.target.cycles.filter(|cycles| *cycles > 0)?;
+        Some((counter.duration(cycles)?, cycles, counter.hz?))
+    });
+    match target {
+        Some((duration, cycles, hz)) => (
+            duration,
+            format!("target execution time ({cycles} cycles at {hz} Hz)"),
+        ),
+        None => (host, "host-observed execution time".to_owned()),
+    }
 }
 
 /// A failure running a transport-driven campaign.
@@ -868,6 +1049,8 @@ pub(crate) fn run_transport_campaign(
     // Set when a run-control condition stops the campaign early (#70): a target
     // hang or a lost transport — a distinct, non-clean outcome.
     let mut halted: Option<String> = None;
+    // The target cycles of each completed run, when the spec reads a counter.
+    let mut target_cycles: Option<CycleStats> = None;
 
     // --- seed phase: run every seed once; seeds are always corpus members. ---
     let seed_count = config.seeds.len();
@@ -889,6 +1072,7 @@ pub(crate) fn run_transport_campaign(
             }
             Step::Ran(outcome, elapsed) => {
                 executions += 1;
+                CycleStats::record(&mut target_cycles, outcome.target.cycles);
                 if outcome.coverage_incomplete.is_some() {
                     incomplete_observations += 1;
                 }
@@ -913,7 +1097,7 @@ pub(crate) fn run_transport_campaign(
                 // either would fabricate a timing finding.
                 if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
                     maybe_emit_deadline(
-                        elapsed,
+                        run_time(config.cycle_counter, &outcome, elapsed),
                         config.deadline,
                         seed,
                         &emitter,
@@ -972,6 +1156,7 @@ pub(crate) fn run_transport_campaign(
                     }
                     Step::Ran(outcome, elapsed) => {
                         executions += 1;
+                        CycleStats::record(&mut target_cycles, outcome.target.cycles);
                         if outcome.coverage_incomplete.is_some() {
                             incomplete_observations += 1;
                         }
@@ -1010,7 +1195,7 @@ pub(crate) fn run_transport_campaign(
                         // proven clean completion).
                         if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
                             maybe_emit_deadline(
-                                elapsed,
+                                run_time(config.cycle_counter, &outcome, elapsed),
                                 config.deadline,
                                 &input,
                                 &emitter,
@@ -1044,6 +1229,7 @@ pub(crate) fn run_transport_campaign(
         inconclusive_observations,
         findings: finding_ids,
         halted,
+        target_cycles,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
 }
@@ -1085,6 +1271,12 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
     let timing = serde_json::json!({
         "per_input_timeout_ms": config.per_input_timeout.map(|d| d.as_millis()),
         "deadline_ms": config.deadline.map(|d| d.as_millis()),
+        // What times a run for the deadline (#251).
+        "basis": match config.cycle_counter {
+            Some(CycleCounter { hz: Some(_), .. }) => "target cycles",
+            _ => "host round-trip",
+        },
+        "cpu_hz": config.cycle_counter.and_then(|counter| counter.hz),
     });
     let profile = serde_json::json!({
         "schema_version": TRANSPORT_PROFILE_SCHEMA,
@@ -1100,9 +1292,12 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
             "capacity": contract.capacity,
             "length_word": contract.length_word,
         })),
-        "firmware_identity": serde_json::Value::Null,
-        "limitations":
-            "host-observed timing; firmware/build identity not captured by this backend",
+        "firmware_identity": config.firmware_identity,
+        "limitations": if config.firmware_identity.is_some() {
+            "host-observed timing"
+        } else {
+            "host-observed timing; firmware identity not recorded (name the ELF with firmware=)"
+        },
     });
     let Ok(body) = serde_json::to_vec_pretty(&profile) else {
         return;
@@ -1110,6 +1305,19 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
     for id in finding_ids {
         let dir = config.work_dir.join("results").join("findings").join(id);
         let _ = std::fs::write(dir.join(TRANSPORT_PROFILE_FILE), &body);
+        // The finding names the firmware it was found on, too (#248).
+        if let Some(identity) = &config.firmware_identity {
+            let path = dir.join("finding.json");
+            if let Some(mut finding) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            {
+                finding["firmware_identity"] = identity.clone();
+                if let Ok(bytes) = serde_json::to_vec_pretty(&finding) {
+                    let _ = std::fs::write(&path, bytes);
+                }
+            }
+        }
     }
 }
 
@@ -1184,7 +1392,7 @@ fn run_one_input(
 /// deadline is set or the run was fast enough.
 #[allow(clippy::too_many_arguments)]
 fn maybe_emit_deadline(
-    elapsed: Duration,
+    (elapsed, measured): (Duration, String),
     deadline: Option<Duration>,
     input: &[u8],
     emitter: &FindingEmitter,
@@ -1194,7 +1402,7 @@ fn maybe_emit_deadline(
 ) -> Result<(), CorpusError> {
     if let Some(deadline) = deadline {
         if elapsed > deadline {
-            let report = crate::transport_fault::deadline_report(elapsed, deadline);
+            let report = crate::transport_fault::deadline_report(elapsed, deadline, &measured);
             emit_report(input, &report, emitter, seen, finding_ids, crashes)?;
         }
     }
@@ -1291,10 +1499,30 @@ fn handle_outcome(
         line: None,
     });
     let id = emitter.emit_sanitizer_crash(input, &report)?;
+    // The task the firmware says ran the input (#252).
+    if let Some(task) = outcome.target.task_id {
+        record_target_task(emitter, &id.0, task);
+    }
     finding_ids.push(id.0);
     seen.insert(dedup_key);
     *count += 1;
     Ok(())
+}
+
+/// Add `target_task` (the firmware's task identity word, as hex) to the
+/// finding `id`.
+fn record_target_task(emitter: &FindingEmitter, id: &str, task: u64) {
+    let path = corpus::layout::finding_dir(emitter.root(), id).join("finding.json");
+    let Some(mut finding) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return;
+    };
+    finding["target_task"] = serde_json::json!({ "id": format!("{task:#x}") });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&finding) {
+        let _ = std::fs::write(&path, bytes);
+    }
 }
 
 /// A short, stable content hash of a testcase, used only to deduplicate repeated
@@ -1387,6 +1615,25 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
             args.max_len = contract.capacity;
         }
     }
+    // The firmware is read once, before anything runs: a finding recorded
+    // against an image bhf could not read would name no build.
+    let firmware_identity = match plan.firmware() {
+        Some(path) => Some(
+            binary_analysis::firmware_identity(path)
+                .map_err(|error| {
+                    crate::bhfeprintln!("bhf fuzz --target-transport: firmware=: {error}");
+                    2
+                })
+                .and_then(|identity| {
+                    serde_json::to_value(identity).map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --target-transport: firmware=: {error}");
+                        2
+                    })
+                })?,
+        ),
+        None => None,
+    };
+    let cycle_counter = plan.cycle_counter();
     let transport_label = plan.label();
     let transport = plan.into_transport(args.timeout).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
@@ -1419,6 +1666,8 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
         input_contract,
+        firmware_identity,
+        cycle_counter,
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
         mode: args.mode,
@@ -1426,10 +1675,23 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         grammar,
     };
 
-    run_transport_campaign(transport.as_ref(), &config).map_err(|error| {
+    let summary = run_transport_campaign(transport.as_ref(), &config).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
         1
-    })
+    })?;
+    // A counter that never moved times nothing: the deadline oracle used the
+    // host's time instead (#251).
+    if config.cycle_counter.is_some()
+        && summary.executions > 0
+        && summary.target_cycles.is_none_or(|stats| stats.max == 0)
+    {
+        crate::bhfeprintln!(
+            "bhf fuzz --target-transport: note: the cycles= counter never advanced (QEMU's \
+             Cortex-M models do not count DWT_CYCCNT; name a free-running counter with \
+             cycles=ADDR); deadlines used host-observed time"
+        );
+    }
+    Ok(summary)
 }
 
 /// Load seeds from `--seed-input` / `--seed-file`, bounding each to
@@ -1601,6 +1863,67 @@ mod tests {
         );
     }
 
+    /// #251: `cycles=` names DWT or a counter address, `cpu_hz=` its rate,
+    /// and a deadline is timed by the target only when both are known and
+    /// the counter moved.
+    #[test]
+    fn cycle_keys_parse_and_time_a_run_by_the_target() {
+        let map = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=512";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,cycles=0x40028018,cpu_hz=25000000",
+            Some(map),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.cycle_counter(),
+            Some(CycleCounter {
+                source: CycleSource::Counter(0x4002_8018),
+                hz: Some(25_000_000),
+            })
+        );
+        let plan = TransportPlan::parse("gdb:127.0.0.1:2,cycles=dwt", Some(map)).unwrap();
+        assert_eq!(
+            plan.cycle_counter(),
+            Some(CycleCounter {
+                source: CycleSource::Dwt,
+                hz: None,
+            })
+        );
+        let error = TransportPlan::parse("gdb:127.0.0.1:2,cpu_hz=1000", Some(map)).unwrap_err();
+        assert!(
+            error.to_string().contains("cpu_hz= needs cycles="),
+            "{error}"
+        );
+        assert!(TransportPlan::parse("gdb:127.0.0.1:2,cycles=dwt,cpu_hz=0", Some(map)).is_err());
+
+        let counter = Some(CycleCounter {
+            source: CycleSource::Dwt,
+            hz: Some(1_000_000),
+        });
+        let mut outcome = RunOutcome::clean(Vec::new());
+        let host = Duration::from_millis(40);
+        outcome.target.cycles = Some(2_500);
+        let (time, measured) = run_time(counter, &outcome, host);
+        assert_eq!(time, Duration::from_micros(2_500));
+        assert_eq!(
+            measured,
+            "target execution time (2500 cycles at 1000000 Hz)"
+        );
+        // A counter that did not move, or no rate, falls back to the host.
+        outcome.target.cycles = Some(0);
+        assert_eq!(run_time(counter, &outcome, host).0, host);
+        outcome.target.cycles = Some(2_500);
+        let no_rate = Some(CycleCounter {
+            source: CycleSource::Dwt,
+            hz: None,
+        });
+        assert_eq!(run_time(no_rate, &outcome, host).0, host);
+        assert_eq!(
+            run_time(None, &outcome, host).1,
+            "host-observed execution time"
+        );
+    }
+
     #[test]
     fn parses_gdb_spec_with_coverage_map() {
         let map_spec =
@@ -1612,7 +1935,13 @@ mod tests {
                 port,
                 map,
                 input,
+                firmware,
+                cycles,
+                task_id,
             } => {
+                assert_eq!(firmware, None);
+                assert_eq!(cycles, None);
+                assert_eq!(task_id, None);
                 assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
@@ -1682,6 +2011,9 @@ mod tests {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                firmware: _,
+                cycles: _,
+                task_id: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
@@ -1991,6 +2323,8 @@ mod tests {
             coverage_map: None,
             max_len: 4096,
             input_contract: None,
+            firmware_identity: None,
+            cycle_counter: None,
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
             mode: actionability::RunMode::Reporting,
@@ -2355,6 +2689,7 @@ mod tests {
         let mut finding_ids: Vec<String> = Vec::new();
         let mut crashes = 0usize;
         let bare_crash = || RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Crash,
             coverage_edges: Vec::new(),
             fault: None,
@@ -2433,6 +2768,7 @@ mod tests {
         let mut finding_ids: Vec<String> = Vec::new();
         let mut crashes = 0usize;
         let bare_crash = || RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Crash,
             coverage_edges: Vec::new(),
             fault: None,

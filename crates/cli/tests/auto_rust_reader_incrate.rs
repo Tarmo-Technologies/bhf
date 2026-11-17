@@ -213,3 +213,124 @@ fn private_module_target_builds_and_fuzzes_in_crate() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// #218: a member of a workspace that inherits its edition, its version and a
+/// dependency from the workspace (`*.workspace = true`) was refused by the
+/// in-crate lane ("can't resolve"). The detached copy now takes them from the
+/// workspace's `[workspace.package]` and `[workspace.dependencies]`, with the
+/// workspace's `Cargo.lock`, and builds offline.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn a_workspace_member_inheriting_its_dependencies_builds_and_fuzzes_in_crate() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-workspace");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_workspace"), &tmp, "12", "4");
+    let parse = find_attempt(&json, "parse");
+    assert!(
+        attempt_findings(parse, "parse") > 0,
+        "the planted out-of-bounds index in the member's private parser is found:\n{combined}"
+    );
+    let harness_id = parse["harness_id"]
+        .as_str()
+        .expect("parse has a harness_id");
+    let incrate = tmp.join("harnesses").join(harness_id).join("incrate");
+    let manifest = std::fs::read_to_string(incrate.join("Cargo.toml")).unwrap();
+    assert!(!manifest.contains("workspace = true"), "{manifest}");
+    assert!(manifest.contains("ws_checksum"), "{manifest}");
+    assert!(
+        incrate.join("Cargo.lock").is_file(),
+        "the workspace's lockfile is copied"
+    );
+}
+
+/// #217: the in-crate lane refused trait-impl methods ("in-crate trait
+/// resolution is not yet supported") and took no parameter overrides. A
+/// private module's `impl FromStr` and `impl TryFrom<&[u8]>` are now called by
+/// UFCS, and a unit-enum parameter gets a `crate`-rooted variant pick; each
+/// planted bug is found.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn private_trait_impls_and_an_enum_parameter_fuzz_in_crate() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-traits");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_traits"), &tmp, "12", "6");
+    for (name, call) in [
+        (
+            "from_str",
+            "<crate::internal::Header as ::core::str::FromStr>::from_str(",
+        ),
+        (
+            "try_from",
+            "<crate::internal::Packet as ::core::convert::TryFrom<&[u8]>>::try_from(",
+        ),
+        (
+            "decode",
+            "match (c.u8() as usize) % 2 { 0 => crate::internal::Mode::Strict, \
+             _ => crate::internal::Mode::Fast }",
+        ),
+    ] {
+        let attempt = find_attempt(&json, name);
+        assert!(
+            attempt_findings(attempt, name) > 0,
+            "the planted bug behind `{name}` is found:\n{combined}"
+        );
+        let harness_id = attempt["harness_id"].as_str().unwrap();
+        let module = tmp
+            .join("harnesses")
+            .join(harness_id)
+            .join("incrate/src/__bhf_harness.rs");
+        let text = std::fs::read_to_string(&module).unwrap();
+        assert!(text.contains(call), "{name}:\n{text}");
+    }
+}
+
+/// #216: a zoxide-shaped directory opener, `open_dir(data_dir: impl
+/// AsRef<Path>)` reading `<data_dir>/db.zo`, fuzzes in-crate. The path recipe
+/// took neither `impl AsRef<Path>` nor a seed name other than `db`, so the
+/// file the opener reads was never written.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn an_impl_asref_path_opener_fuzzes_with_the_file_it_joins() {
+    if !has_cargo_nightly() {
+        eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
+        return;
+    }
+    let tmp_guard = TestDir::new("incrate-zoxide");
+    let tmp = tmp_guard.join("tmp");
+    let (combined, json) = run_auto(&fixture("rust_incrate_zoxide"), &tmp, "12", "4");
+    let open_dir = find_attempt(&json, "open_dir");
+    assert!(
+        attempt_findings(open_dir, "open_dir") > 0,
+        "the planted out-of-bounds index behind the db.zo magic is found:\n{combined}"
+    );
+    let harness = tmp
+        .join("harnesses")
+        .join(open_dir["harness_id"].as_str().unwrap());
+    let module = std::fs::read_to_string(harness.join("incrate/src/__bhf_harness.rs")).unwrap();
+    assert!(
+        module.contains("__bhf_res_dir.join(\"db.zo\")"),
+        "the harness seeds db.zo:\n{module}"
+    );
+    let recipe = std::fs::read_to_string(harness.join("resource_recipe.json")).unwrap();
+    assert!(recipe.contains("`db.zo`"), "{recipe}");
+}

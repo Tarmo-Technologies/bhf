@@ -1735,6 +1735,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/collector_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/shared_map.rs",
       "license": "Apache-2.0"
     },
@@ -2239,6 +2243,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_cpp_uncaught_exception.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_csharp_isolation.rs",
       "license": "Apache-2.0"
     },
@@ -2683,11 +2691,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/cli_md_common_flow.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/cli_no_compiler.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/cli/tests/collector_aggregate_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/collector_fuzz_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2704,6 +2720,10 @@
     },
     {
       "path": "crates/cli/tests/collector_win_live.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/command_help_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3311,18 +3331,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/discovery/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/discovery/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/discovery/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/event_log/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3455,30 +3463,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/fork_server/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fork_server/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/c/bhf_afl_persistent_shim.c",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/afl_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/fuzz_engine/builtin/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3544,26 +3528,6 @@
     },
     {
       "path": "crates/fuzz_engine/libafl_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/libfuzzer_adapter/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/nyx_adapter/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/fuzz_engine/nyx_adapter/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4515,18 +4479,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/semantic/Cargo.toml",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/semantic/src/lib.rs",
-      "license": "Apache-2.0"
-    },
-    {
-      "path": "crates/semantic/src/main.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/spdx_check/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -4664,6 +4616,10 @@
     },
     {
       "path": "crates/target_transport/src/coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/cycles.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4867,10 +4823,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "docs/extension-protocol.md",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "docs/finding-report-fields.md",
       "license": "Apache-2.0"
     },
@@ -5000,6 +4952,10 @@
     },
     {
       "path": "docs/site/engine-parity-benchmark.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/extension-protocol.md",
       "license": "Apache-2.0"
     },
     {
@@ -5792,6 +5748,54 @@
     },
     {
       "path": "tests/fixtures/rust_incrate_private/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_traits/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_traits/src/internal.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_traits/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/checksum/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/checksum/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/src/internal.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_workspace/parser/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_zoxide/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_zoxide/src/db.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_zoxide/src/lib.rs",
       "license": "Apache-2.0"
     },
     {

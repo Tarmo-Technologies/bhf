@@ -1738,15 +1738,28 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The fuzz-byte-indexed variant-pick expression for a unit enum, e.g.
-/// `[crate::E::A, crate::E::B][(c.u8() as usize) % 2]`. `path` is the enum's
+/// `match (c.u8() as usize) % 2 { 0 => crate::E::A, _ => crate::E::B }`. A
+/// `match`, not an array index: indexing `[E::A, E::B]` moves out of the
+/// array, which compiles only for a `Copy` enum (#217). `path` is the enum's
 /// reachable path segments; `variants` are its unit variant names (non-empty).
 /// An [`EnumWrap::Option`] param wraps the pick so the fuzzer reaches both the
 /// `None` and `Some(variant)` paths.
 fn build_enum_decoder_expr(path: &[String], variants: &[String], wrap: EnumWrap) -> String {
     let prefix = path.join("::");
-    let arms: Vec<String> = variants.iter().map(|v| format!("{prefix}::{v}")).collect();
-    let n = arms.len();
-    let pick = format!("[{}][(c.u8() as usize) % {n}]", arms.join(", "));
+    let n = variants.len();
+    let arms: Vec<String> = variants
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let pattern = if i + 1 == n {
+                "_".to_owned()
+            } else {
+                i.to_string()
+            };
+            format!("{pattern} => {prefix}::{v}")
+        })
+        .collect();
+    let pick = format!("match (c.u8() as usize) % {n} {{ {} }}", arms.join(", "));
     match wrap {
         EnumWrap::Bare => pick,
         // `Some(pick)` pins the `Option<Enum>` type so the `None` arm infers.
@@ -1759,7 +1772,9 @@ fn build_enum_decoder_expr(path: &[String], variants: &[String], wrap: EnumWrap)
 /// its variant names. Prefers a crate-root re-export façade over the defining
 /// module path (same rule as the call-path resolver); returns `None` when no such
 /// enum is reachable from a dependent crate (unfound, has data variants, private,
-/// or reached only through a private module).
+/// or reached only through a private module). With `crate_name` `crate` (the
+/// in-crate lane, #217) the path is resolved from inside the crate, where a
+/// private module is reachable.
 fn find_unit_enum_path(
     manifest_dir: &Path,
     crate_name: &str,
@@ -1785,7 +1800,9 @@ fn find_unit_enum_path(
         let mut path = vec![crate_name.to_owned()];
         if !crate_root_reexports(crate_root_src, enum_name) {
             let module = module_path(manifest_dir, &file);
-            if module_chain_has_private(manifest_dir, crate_root_src, &module) {
+            if crate_name != IN_CRATE_ROOT
+                && module_chain_has_private(manifest_dir, crate_root_src, &module)
+            {
                 continue; // unreachable through a private module link (E0603)
             }
             path.extend(module);
@@ -2041,6 +2058,8 @@ fn parse_trait_impl<'a>(line: &'a str, trait_leaf: &str) -> Option<&'a str> {
 /// module) so the emitted UFCS can't fail with a privacy error. `None` when the
 /// trait isn't an in-crate public trait (a std/external trait — leave the call
 /// non-UFCS, so it skips/fails as before rather than emitting a wrong path).
+/// With `crate_name` `crate` (the in-crate lane) a trait in a private module
+/// resolves too.
 fn resolve_in_crate_trait_path(
     manifest_dir: &Path,
     crate_name: &str,
@@ -2066,7 +2085,9 @@ fn resolve_in_crate_trait_path(
         let mut path = vec![crate_name.to_owned()];
         if !reexported {
             let module = module_path(manifest_dir, file);
-            if module_chain_has_private(manifest_dir, crate_root_src, &module) {
+            if crate_name != IN_CRATE_ROOT
+                && module_chain_has_private(manifest_dir, crate_root_src, &module)
+            {
                 continue;
             }
             path.extend(module);
@@ -2966,13 +2987,19 @@ fn trait_supertrait_is_reader(supertrait: Option<&str>) -> bool {
     })
 }
 
+/// The root of an in-crate harness's paths: the harness is a module of the
+/// crate, so `crate::…` reaches a private module (#217).
+const IN_CRATE_ROOT: &str = "crate";
+
 /// §27.10: resolve a `pub` target in a PRIVATE module (E0603 from an external
 /// dependent crate) to an IN-CRATE build. The call path is rooted at `crate` (which
 /// reaches the private module from inside the crate) rather than the external crate
 /// name. Supports the common shapes — a free fn, or an instance/associated method
-/// on a type with a no-override-needed receiver ctor. Param/ctor-arg OVERRIDES
-/// (enum picks, scratch consts) and trait-impl methods are NOT supported in-crate
-/// (they would need `crate`-rooted override paths); such a target skips cleanly.
+/// on a type with a no-override-needed receiver ctor. A trait-impl method is
+/// called by UFCS (`<crate::m::T as Trait>::from_str`) or with its trait
+/// imported, and the target's params take the external lane's overrides (enum
+/// picks, scratch consts, `Default` refs) with `crate`-rooted paths (#217).
+/// Receiver-ctor overrides are not supported in-crate.
 #[allow(clippy::too_many_arguments)]
 fn resolve_in_crate_target(
     source: &str,
@@ -2984,18 +3011,45 @@ fn resolve_in_crate_target(
     module: &[String],
     in_fuzz_target: bool,
 ) -> Result<ResolvedTarget, String> {
-    // A trait-impl method needs its trait in scope via a `crate`-rooted path we do
-    // not yet synthesise in-crate; skip cleanly rather than emit a wrong path.
-    if target.impl_trait.is_some() {
+    // #217: a STATIC trait-impl method is called by UFCS with a `crate`-rooted
+    // trait path (a trait of this crate, private modules included) or a std
+    // conversion trait (`FromStr`, `TryFrom<&[u8]>`); an INSTANCE one imports its
+    // trait so the method call resolves.
+    let ufcs_trait = if target.is_static {
+        target
+            .impl_trait
+            .as_deref()
+            .and_then(|tr| {
+                resolve_in_crate_trait_path(manifest_dir, IN_CRATE_ROOT, crate_root_src, tr)
+            })
+            .or_else(|| {
+                if enclosing_impl_type_is_generic(source, target.line) {
+                    None
+                } else {
+                    std_ufcs_trait_path(&target)
+                }
+            })
+    } else {
+        None
+    };
+    if target.is_static && target.impl_trait.is_some() && ufcs_trait.is_none() {
         return Err(format!(
-            "Rust target '{}' is a private-module trait-impl method — in-crate trait \
-             resolution is not yet supported; skipped",
+            "Rust target '{}' (in-crate) is a static method of a trait impl whose trait \
+             has no path from inside the crate; skipped",
             target.name
         ));
     }
+    let method_trait_import = if target.is_static {
+        None
+    } else {
+        target.impl_trait.as_deref().and_then(|tr| {
+            resolve_in_crate_trait_path(manifest_dir, IN_CRATE_ROOT, crate_root_src, tr)
+                .or_else(|| std_trait_path(tr, &target.name))
+        })
+    };
     // Root the path at `crate` so the private module is reachable from inside the
     // injected harness module.
-    let mut call_path = vec!["crate".to_owned()];
+    let mut call_path = vec![IN_CRATE_ROOT.to_owned()];
     call_path.extend(module.iter().cloned());
     let mut receiver = None;
     let mut receiver_ctor_params = Vec::new();
@@ -3066,12 +3120,20 @@ fn resolve_in_crate_target(
             ))
         }
     };
+    // The external lane's overrides, rooted at `crate`: an enum param picks a
+    // variant, a scratch slice and a `Default` ref are filled.
+    let param_decoders =
+        resolve_param_overrides(manifest_dir, IN_CRATE_ROOT, crate_root_src, &target.params);
     let mut resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe> = None;
+    // The file a directory opener reads, from its body (`dir.join("db.zo")`).
+    let joined_file = joined_file_literal(source, target.line);
     for (i, p) in classify_params.iter().enumerate() {
-        if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok() {
+        if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok()
+            || param_decoders.get(i).is_some_and(Option::is_some)
+        {
             continue;
         }
-        match path_opener_recipe(&p.name, &p.ty) {
+        match path_opener_recipe(&p.name, &p.ty, joined_file.as_deref()) {
             Some((arg_pass, seed_file)) => {
                 if resource_recipe.is_some() {
                     return Err(format!(
@@ -3107,25 +3169,26 @@ fn resolve_in_crate_target(
         receiver,
         receiver_ctor_params,
         receiver_unwrap,
-        // In-crate mode uses only native decoders + an optional path-resource recipe
-        // (no `crate`-rooted enum/const overrides).
-        param_decoders: Vec::new(),
+        param_decoders,
         receiver_ctor_param_decoders: Vec::new(),
-        ufcs_trait: None,
-        method_trait_import: None,
+        ufcs_trait,
+        method_trait_import,
         resource_recipe,
     })
 }
 
 /// If a parameter is a path-backed resource opener (`&Path`/`&PathBuf`/`PathBuf`),
 /// the [`ArgPass`](harness_gen::rust_decoders::ArgPass) it wants and the seed-file
-/// name to materialize. A DIRECTORY opener (param named like a dir) seeds `<dir>/db`
-/// and receives the DIRECTORY path; a FILE opener receives a seed FILE path written
-/// with the fuzz input directly. `None` for any non-path type (and for a bare owned
-/// `Path`, which is unsized and not constructible).
+/// name to materialize. A DIRECTORY opener seeds `<dir>/<joined>` and receives the
+/// DIRECTORY path: a function whose body joins a file name onto a path
+/// (`joined`, from `data_dir.join("db.zo")`, #216) is one, and so is a param
+/// named like a dir, which seeds `<dir>/db` without one. A FILE opener receives a
+/// seed FILE path written with the fuzz input directly. `None` for any non-path
+/// type (and for a bare owned `Path`, which is unsized and not constructible).
 fn path_opener_recipe(
     param_name: &str,
     ty: &str,
+    joined: Option<&str>,
 ) -> Option<(harness_gen::rust_decoders::ArgPass, Option<String>)> {
     use harness_gen::rust_decoders::ArgPass;
     // Erase a leading reference lifetime BEFORE collapsing whitespace, else the
@@ -3153,10 +3216,74 @@ fn path_opener_recipe(
     if leaf == "Path" && arg_pass != ArgPass::Ref {
         return None;
     }
+    if let Some(file) = joined {
+        return Some((arg_pass, Some(file.to_owned())));
+    }
     let name = param_name.to_ascii_lowercase();
     let is_dir = name.contains("dir") || name == "root" || name == "base";
     let seed_file = if is_dir { Some("db".to_owned()) } else { None };
     Some((arg_pass, seed_file))
+}
+
+/// The first file name the body of the function at `fn_line` joins onto a path
+/// (`data_dir.join("db.zo")` -> `db.zo`): the file a directory opener reads.
+/// Only a plain file name counts, so a `.join(", ")` of strings or a nested
+/// `"a/b"` does not.
+fn joined_file_literal(source: &str, fn_line: u32) -> Option<String> {
+    let body = function_body(source, fn_line)?;
+    let mut rest = body;
+    while let Some(at) = rest.find(".join(\"") {
+        let tail = &rest[at + ".join(\"".len()..];
+        let end = tail.find('"')?;
+        let literal = &tail[..end];
+        let file_name = !literal.is_empty()
+            && literal != "."
+            && literal != ".."
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if file_name {
+            return Some(literal.to_owned());
+        }
+        rest = &tail[end..];
+    }
+    None
+}
+
+/// The `{ ... }` body of the function defined at the 1-based `fn_line`,
+/// braces matched outside string literals.
+fn function_body(source: &str, fn_line: u32) -> Option<&str> {
+    let start = source
+        .split_inclusive('\n')
+        .take(fn_line.saturating_sub(1) as usize)
+        .map(str::len)
+        .sum::<usize>();
+    let text = source.get(start..)?;
+    let open = text.find('{')?;
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, c) in text[open..].char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(open..=open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Locate the `c_runtime` directory (which holds `bhf_driver.c` +
@@ -3814,6 +3941,14 @@ fn build_in_crate(
             skip: false,
         };
     }
+    // A workspace member's lockfile is the workspace's: the copy, built
+    // `--offline` on its own, resolves the versions the workspace locked.
+    if let Err(e) = copy_workspace_lockfile(&resolved.manifest_dir, &crate_copy) {
+        return RustBuildResult::Failed {
+            reason: format!("copy the workspace Cargo.lock: {e}"),
+            skip: false,
+        };
+    }
 
     // Copy the C driver beside the binary as `main.c`.
     let driver_src = c_runtime_dir.join("bhf_driver.c");
@@ -4151,9 +4286,19 @@ fn toml_line_key(line: &str) -> Option<String> {
 /// points at its root with `workspace = ".."`; once detached, cargo can resolve
 /// neither and HARD-FAILS ("failed to parse manifest" / "cannot configure both
 /// `package.workspace` and `[workspace]`"). Resolve the two REQUIRED fields
-/// (`version`, `edition`) to concrete defaults, DROP every other (optional metadata)
-/// inherited field, and DROP the `package.workspace` pointer.
-fn strip_workspace_inheritance(manifest: &str) -> String {
+/// (`version`, `edition`) from the workspace's `[workspace.package]` when the
+/// crate's workspace is found (`workspace_package`), else to concrete defaults,
+/// DROP every other (optional metadata) inherited field, and DROP the
+/// `package.workspace` pointer. An inherited `edition` matters: a 2024-edition
+/// member built as 2021 does not compile.
+fn strip_workspace_inheritance(manifest: &str, workspace_package: Option<&toml::Table>) -> String {
+    let inherited = |key: &str, default: &str| {
+        let value = workspace_package
+            .and_then(|package| package.get(key))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(default);
+        format!("{key} = {}", toml::Value::String(value.to_owned()))
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut section = String::new();
     let mut have_version = false;
@@ -4182,11 +4327,11 @@ fn strip_workspace_inheritance(manifest: &str) -> String {
             if let Some(base) = inherited_field_key(trimmed) {
                 match base.as_str() {
                     "version" => {
-                        lines.push("version = \"0.0.0\"".to_owned());
+                        lines.push(inherited("version", "0.0.0"));
                         have_version = true;
                     }
                     "edition" => {
-                        lines.push("edition = \"2021\"".to_owned());
+                        lines.push(inherited("edition", "2021"));
                         have_edition = true;
                     }
                     // Every other inherited field is OPTIONAL metadata not needed to
@@ -4338,12 +4483,155 @@ fn rewrite_relative_path_deps(manifest: &str, manifest_dir: &Path) -> String {
     s
 }
 
+/// Copy the `Cargo.lock` of the workspace `manifest_dir`'s crate belongs to
+/// into `crate_copy`, unless the copy has its own.
+fn copy_workspace_lockfile(manifest_dir: &Path, crate_copy: &Path) -> std::io::Result<()> {
+    let target = crate_copy.join("Cargo.lock");
+    if target.exists() {
+        return Ok(());
+    }
+    match parent_workspace(manifest_dir).map(|(root, _)| root.join("Cargo.lock")) {
+        Some(lock) if lock.is_file() => std::fs::copy(lock, target).map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
+/// The Cargo workspace a crate in `manifest_dir` is a member of: the nearest
+/// directory at or above it whose `Cargo.toml` has a `[workspace]` table, and
+/// that manifest.
+fn parent_workspace(manifest_dir: &Path) -> Option<(PathBuf, toml::Table)> {
+    manifest_dir.ancestors().find_map(|dir| {
+        let text = crate::source_text::read_source_text(&dir.join("Cargo.toml")).ok()?;
+        let table = text.parse::<toml::Table>().ok()?;
+        table
+            .contains_key("workspace")
+            .then(|| (dir.to_path_buf(), table))
+    })
+}
+
+/// The dependency tables of a manifest: `[dependencies]`, its dev and build
+/// forms, and each `[target.<cfg>.*]` one.
+fn dependency_tables(manifest: &mut toml::Table) -> Vec<&mut toml::Table> {
+    const KINDS: &[&str] = &[
+        "dependencies",
+        "dev-dependencies",
+        "dev_dependencies",
+        "build-dependencies",
+        "build_dependencies",
+    ];
+    let mut tables = Vec::new();
+    for (key, value) in manifest.iter_mut() {
+        let toml::Value::Table(table) = value else {
+            continue;
+        };
+        if KINDS.contains(&key.as_str()) {
+            tables.push(table);
+        } else if key == "target" {
+            for (_, platform) in table.iter_mut() {
+                let toml::Value::Table(platform) = platform else {
+                    continue;
+                };
+                for (kind, deps) in platform.iter_mut() {
+                    if let toml::Value::Table(deps) = deps {
+                        if KINDS.contains(&kind.as_str()) {
+                            tables.push(deps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// Resolve each dependency the member inherits (`dep.workspace = true`) from
+/// the workspace's `[workspace.dependencies]`, as Cargo does: the workspace's
+/// entry, with its relative `path` anchored at the workspace root, plus the
+/// member's `features` (added) and `optional`. `Err` names the dependencies
+/// the workspace does not declare. A manifest that inherits none is returned
+/// as it was.
+fn resolve_workspace_inherited_deps(
+    manifest: &str,
+    workspace: Option<&(PathBuf, toml::Table)>,
+) -> Result<String, Vec<String>> {
+    let inherited = workspace_inherited_deps(manifest);
+    if inherited.is_empty() {
+        return Ok(manifest.to_owned());
+    }
+    let Some((root, workspace)) = workspace else {
+        return Err(inherited);
+    };
+    let Ok(mut parsed) = manifest.parse::<toml::Table>() else {
+        return Err(inherited);
+    };
+    let declared = workspace
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(toml::Value::as_table);
+    let mut missing = Vec::new();
+    for deps in dependency_tables(&mut parsed) {
+        for (name, value) in deps.iter_mut() {
+            let Some(member) = value.as_table() else {
+                continue;
+            };
+            if member.get("workspace").and_then(toml::Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(declared) = declared.and_then(|d| d.get(name.as_str())) else {
+                missing.push(name.clone());
+                continue;
+            };
+            let mut resolved = match declared {
+                toml::Value::String(version) => {
+                    let mut table = toml::Table::new();
+                    table.insert("version".to_owned(), toml::Value::String(version.clone()));
+                    table
+                }
+                toml::Value::Table(table) => table.clone(),
+                _ => {
+                    missing.push(name.clone());
+                    continue;
+                }
+            };
+            if let Some(path) = resolved.get("path").and_then(toml::Value::as_str) {
+                if !Path::new(path).is_absolute() {
+                    let abs = lexical_join(root, path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    resolved.insert("path".to_owned(), toml::Value::String(abs));
+                }
+            }
+            if let Some(extra) = member.get("features").and_then(toml::Value::as_array) {
+                let mut features = resolved
+                    .get("features")
+                    .and_then(toml::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for feature in extra {
+                    if !features.contains(feature) {
+                        features.push(feature.clone());
+                    }
+                }
+                resolved.insert("features".to_owned(), toml::Value::Array(features));
+            }
+            for key in ["optional", "default-features", "default_features"] {
+                if let Some(v) = member.get(key) {
+                    resolved.insert(key.to_owned(), v.clone());
+                }
+            }
+            *value = toml::Value::Table(resolved);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    toml::to_string(&parsed).map_err(|_| inherited)
+}
+
 /// Names of dependencies the member INHERITS from the workspace (`serde = {
 /// workspace = true }` / `serde.workspace = true` / a `[dependencies.serde]` subtable
-/// with `workspace = true`). The detached copy has no parent
-/// `[workspace.dependencies]` to inherit from, so such a dep can't be resolved and
-/// the in-crate build must skip cleanly. (Resolving these from the parent workspace
-/// is a future enhancement; today the external-API lane still covers the crate.)
+/// with `workspace = true`). [`resolve_workspace_inherited_deps`] rewrites them
+/// from the parent workspace's `[workspace.dependencies]`.
 fn workspace_inherited_deps(manifest: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut in_dep_section = false;
@@ -4390,30 +4678,37 @@ fn workspace_inherited_deps(manifest: &str) -> Vec<String> {
 /// (+ `rlib`) lib crate-type, and a detached `[workspace]` so cargo builds the copy
 /// standalone. `Err(reason)` requests a CLEAN SKIP (an actionable reason, like the
 /// private-module skips) when the copy can't be made to resolve — e.g. a dependency
-/// inherited from the parent `[workspace.dependencies]`.
+/// inherited from a `[workspace.dependencies]` that does not declare it.
 fn prepare_incrate_manifest(
     manifest: &str,
     manifest_dir: &Path,
     rust_runtime_dir: &Path,
 ) -> Result<String, String> {
-    // 0. Detach from the parent workspace BEFORE any other rewrite: resolve/strip
-    //    workspace-inherited package fields + the `workspace = ".."` pointer, then
-    //    make sibling path-deps absolute so they still resolve from the copy.
-    let stripped = strip_workspace_inheritance(manifest);
+    // 0. Detach from the parent workspace BEFORE any other rewrite: resolve the
+    //    workspace-inherited package fields and dependencies from it, drop the
+    //    `workspace = ".."` pointer, then make sibling path-deps absolute so they
+    //    still resolve from the copy.
+    let workspace = parent_workspace(manifest_dir);
+    let workspace_package = workspace
+        .as_ref()
+        .and_then(|(_, table)| table.get("workspace"))
+        .and_then(|w| w.get("package"))
+        .and_then(toml::Value::as_table);
+    let stripped = strip_workspace_inheritance(manifest, workspace_package);
     let stripped = rewrite_relative_path_deps(&stripped, manifest_dir);
-    let inherited = workspace_inherited_deps(&stripped);
-    if !inherited.is_empty() {
-        return Err(format!(
-            "in-crate build: target crate inherits {} from the parent workspace's \
-             [workspace.dependencies], which the detached copy can't resolve — skipped \
-             (the external-API lane still applies)",
-            inherited
-                .iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
+    let stripped =
+        resolve_workspace_inherited_deps(&stripped, workspace.as_ref()).map_err(|unresolved| {
+            format!(
+                "in-crate build: target crate inherits {} from a parent workspace that does \
+                 not declare it in [workspace.dependencies] — skipped (the external-API \
+                 lane still applies)",
+                unresolved
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
 
     let mut out = stripped;
     if !out.ends_with('\n') {
@@ -5691,17 +5986,21 @@ mod tests {
         ];
         assert_eq!(
             build_enum_decoder_expr(&path, &variants, EnumWrap::Bare),
-            "[ada_parser::ast::AdaStandard::Ada95, ada_parser::ast::AdaStandard::Ada2005, \
-             ada_parser::ast::AdaStandard::Ada2012, ada_parser::ast::AdaStandard::Ada2022]\
-             [(c.u8() as usize) % 4]"
+            "match (c.u8() as usize) % 4 { 0 => ada_parser::ast::AdaStandard::Ada95, \
+             1 => ada_parser::ast::AdaStandard::Ada2005, \
+             2 => ada_parser::ast::AdaStandard::Ada2012, \
+             _ => ada_parser::ast::AdaStandard::Ada2022 }"
         );
         // The Option form wraps the pick so both None and Some(variant) are reached.
         let opt = build_enum_decoder_expr(&path, &variants, EnumWrap::Option);
         assert!(
-            opt.starts_with("if c.u8() & 1 == 0 { None } else { Some(["),
+            opt.starts_with("if c.u8() & 1 == 0 { None } else { Some(match "),
             "{opt}"
         );
-        assert!(opt.ends_with("[(c.u8() as usize) % 4]) }"), "{opt}");
+        assert!(
+            opt.ends_with("_ => ada_parser::ast::AdaStandard::Ada2022 }) }"),
+            "{opt}"
+        );
     }
 
     #[test]
@@ -5744,10 +6043,11 @@ mod tests {
         assert_eq!(decoders[0], None, "&str param has no enum override");
         let (expr, _) = decoders[1].as_ref().expect("bare enum param resolved");
         assert!(
-            expr.starts_with("[ada_parser::ast::AdaStandard::Ada95,"),
+            expr.starts_with(
+                "match (c.u8() as usize) % 4 { 0 => ada_parser::ast::AdaStandard::Ada95,"
+            ),
             "{expr}"
         );
-        assert!(expr.ends_with("[(c.u8() as usize) % 4]"), "{expr}");
         let (opt, _) = decoders[2].as_ref().expect("Option<enum> param resolved");
         assert!(
             opt.starts_with("if c.u8() & 1 == 0 { None } else { Some("),
@@ -6675,10 +6975,78 @@ mod tests {
         );
     }
 
+    /// #218: an inherited dependency is the workspace's entry, its path
+    /// anchored at the workspace root, with the member's features added and
+    /// its `optional`; an inherited edition is the workspace's.
+    #[test]
+    fn inherited_dependencies_and_fields_resolve_from_the_workspace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"m\"]\n\n[workspace.package]\nedition = \"2024\"\n\
+             version = \"3.1.0\"\n\n[workspace.dependencies]\nserde = \"1.0\"\n\
+             helper = { package = \"ws-helper\", path = \"crates/helper\", features = [\"a\"] }\n",
+        )
+        .unwrap();
+        let member = root.path().join("m");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(member.join("src/lib.rs"), "").unwrap();
+        let manifest = "[package]\nname = \"m\"\nversion.workspace = true\n\
+            edition.workspace = true\n\n[dependencies]\nserde.workspace = true\n\
+            helper = { workspace = true, features = [\"b\"], optional = true }\n\n\
+            [target.'cfg(unix)'.dependencies.serde_alias]\nworkspace = true\n";
+        let err = prepare_incrate_manifest(manifest, &member, Path::new("/rt")).unwrap_err();
+        assert!(
+            err.contains("`serde_alias`") && !err.contains("`serde`"),
+            "{err}"
+        );
+
+        let manifest = manifest.replace("serde_alias", "serde");
+        let out = prepare_incrate_manifest(&manifest, &member, Path::new("/rt")).unwrap();
+        let parsed: toml::Table = out.parse().unwrap_or_else(|e| panic!("{e}:\n{out}"));
+        assert_eq!(parsed["package"]["edition"].as_str(), Some("2024"), "{out}");
+        assert_eq!(
+            parsed["package"]["version"].as_str(),
+            Some("3.1.0"),
+            "{out}"
+        );
+        let deps = &parsed["dependencies"];
+        assert_eq!(deps["serde"]["version"].as_str(), Some("1.0"), "{out}");
+        let helper = &deps["helper"];
+        assert_eq!(helper["package"].as_str(), Some("ws-helper"));
+        let path = helper["path"].as_str().unwrap();
+        assert!(
+            Path::new(path).is_absolute() && path.ends_with("crates/helper"),
+            "{path}"
+        );
+        let features: Vec<&str> = helper["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(features, ["a", "b"]);
+        assert_eq!(helper["optional"].as_bool(), Some(true));
+        let unix = &parsed["target"]["cfg(unix)"]["dependencies"]["serde"];
+        assert_eq!(unix["version"].as_str(), Some("1.0"), "{out}");
+        assert!(!out.contains("workspace = true"), "{out}");
+
+        // The workspace's lockfile goes with the copy.
+        std::fs::write(root.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let copy = root.path().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        copy_workspace_lockfile(&member, &copy).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(copy.join("Cargo.lock")).unwrap(),
+            "version = 4\n"
+        );
+    }
+
     #[test]
     fn prepare_incrate_manifest_skips_on_workspace_inherited_dep() {
-        // A `workspace = true` dependency can't be resolved by the detached copy (no
-        // parent `[workspace.dependencies]`) — request a CLEAN SKIP, not a hard error.
+        // A `workspace = true` dependency with no parent workspace to declare it
+        // can't be resolved by the detached copy — request a CLEAN SKIP, not a
+        // hard error.
         let runtime = Path::new("/tmp/rust_runtime");
         let crate_dir = Path::new("/tmp/crate");
         let manifest = "[package]\nname = \"m\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n\
@@ -6813,44 +7181,77 @@ mod tests {
         );
     }
 
+    /// #216: the file a directory opener reads comes from its body; a
+    /// `.join` of strings, a nested path or another function's join does not
+    /// count.
+    #[test]
+    fn a_directory_opener_seeds_the_file_its_body_joins() {
+        let source = "impl Database {\n\
+            \x20   pub fn open_dir(data_dir: impl AsRef<Path>) -> Result<Self> {\n\
+            \x20       let label = [\"a\", \"b\"].join(\", \");\n\
+            \x20       let nested = data_dir.as_ref().join(\"sub/x\");\n\
+            \x20       let path = data_dir.as_ref().join(\"db.zo\");\n\
+            \x20       let brace = \"}\";\n\
+            \x20       Self::read(path)\n\
+            \x20   }\n\
+            \x20   fn other(d: &Path) { d.join(\"other.db\"); }\n\
+            }\n";
+        assert_eq!(joined_file_literal(source, 2).as_deref(), Some("db.zo"));
+        assert_eq!(joined_file_literal(source, 9).as_deref(), Some("other.db"));
+        assert_eq!(
+            joined_file_literal("fn f(p: &Path) { p.exists(); }\n", 1),
+            None
+        );
+        use harness_gen::rust_decoders::ArgPass;
+        assert_eq!(
+            path_opener_recipe("data_dir", "&Path", Some("db.zo")),
+            Some((ArgPass::Ref, Some("db.zo".to_owned())))
+        );
+        // A file-named param that joins a name is a directory too.
+        assert_eq!(
+            path_opener_recipe("path", "&Path", Some("config.toml")),
+            Some((ArgPass::Ref, Some("config.toml".to_owned())))
+        );
+    }
+
     #[test]
     fn path_opener_recipe_classifies_path_types_and_dir_vs_file() {
         use harness_gen::rust_decoders::ArgPass;
         // A directory param (name contains "dir") -> seed `<dir>/db`, pass the dir by
         // reference (`&Path` coerces from `&PathBuf`).
         assert_eq!(
-            path_opener_recipe("dir", "&Path"),
+            path_opener_recipe("dir", "&Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         assert_eq!(
-            path_opener_recipe("data_dir", "&std::path::Path"),
+            path_opener_recipe("data_dir", "&std::path::Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         // A lifetime on the reference is erased.
         assert_eq!(
-            path_opener_recipe("dir", "&'a Path"),
+            path_opener_recipe("dir", "&'a Path", None),
             Some((ArgPass::Ref, Some("db".to_owned())))
         );
         // A FILE param (not a dir name) receives a seed file path directly.
         assert_eq!(
-            path_opener_recipe("path", "&Path"),
+            path_opener_recipe("path", "&Path", None),
             Some((ArgPass::Ref, None))
         );
         // Owned `PathBuf` is moved; `&PathBuf` is borrowed.
         assert_eq!(
-            path_opener_recipe("p", "PathBuf"),
+            path_opener_recipe("p", "PathBuf", None),
             Some((ArgPass::Move, None))
         );
         assert_eq!(
-            path_opener_recipe("p", "&PathBuf"),
+            path_opener_recipe("p", "&PathBuf", None),
             Some((ArgPass::Ref, None))
         );
         // A bare owned `Path` is unsized / not constructible -> not a recipe.
-        assert_eq!(path_opener_recipe("p", "Path"), None);
+        assert_eq!(path_opener_recipe("p", "Path", None), None);
         // Non-path types are never a recipe.
-        assert_eq!(path_opener_recipe("d", "&[u8]"), None);
-        assert_eq!(path_opener_recipe("s", "&str"), None);
-        assert_eq!(path_opener_recipe("n", "u32"), None);
+        assert_eq!(path_opener_recipe("d", "&[u8]", None), None);
+        assert_eq!(path_opener_recipe("s", "&str", None), None);
+        assert_eq!(path_opener_recipe("n", "u32", None), None);
     }
 
     /// Write a crate-root fixture with a `pub` type and a NON-PUB method, returning

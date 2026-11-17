@@ -780,8 +780,14 @@ cmplog, and ASan all work natively on Windows.
       up as the process it creates);
     - file create, open, write, rename and delete, with resolved paths;
     - image load.
-  - **Replay.** `bhf binary fuzz --collector auto` replays a retained input
-    under the sidecar.
+  - **Replay.** `bhf binary fuzz --collector auto` replays the retained inputs
+    under the sidecar one by one: the input behind each of the run's findings,
+    then (with `--engine afl-qemu`) the AFL++ queue entries that found new
+    coverage, then the seeds, at most 16 (`replays_dropped` in the run's
+    `collector` block counts the rest). `collector.replays` lists each replay
+    with its input's SHA-256, the PID it ran as and its findings, and a finding
+    keeps the input whose replay produced it. The run is a clean assurance only
+    when every replay was observed clean. For each replay:
     1. The host waits for the sidecar's readiness ack.
     2. It launches the target and writes its PID to the file
        `BHF_COLLECTOR_TARGET_PID` names.
@@ -801,8 +807,9 @@ cmplog, and ASan all work natively on Windows.
 
     The file and image-load classes are decoded and unit-tested against
     ETW-shaped records, but no live control covers a BHF-405 or BHF-435
-    finding yet. The `bhf fuzz` harness path does not replay under the sidecar
-    (`harness_sidecar_replay_unsupported`).
+    finding yet. `bhf fuzz --collector` replays the harness the same way, on
+    each of the campaign's retained inputs (its crash findings, then its
+    persisted corpus, at most 16), launched as `bhf replay` runs the harness.
   - **Rights.** Starting an ETW session needs session rights (an elevated
     prompt). Without them the provider records `fidelity.permission_denied`
     instead of reporting a silent clean run.

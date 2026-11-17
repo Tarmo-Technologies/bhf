@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
+mod collector_replay;
 mod shared_map;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};
@@ -1505,7 +1506,7 @@ pub fn run(args: FuzzArgs) -> i32 {
     let collector_spec = args.collector.clone();
     let collector_window_ms = args.collector_window_ms;
     let collector_work_dir = args.work_dir.clone();
-    let collector_harness = args.harness.clone();
+    let collector_harness_id = args.harness.clone();
     let quiet = args.quiet;
 
     let prepared = match prepare(args) {
@@ -1522,6 +1523,14 @@ pub fn run(args: FuzzArgs) -> i32 {
         .iter()
         .find(|(key, _)| key == "BHF_RUNTRACE_LOG")
         .map(|(_, value)| PathBuf::from(value));
+    // #246: the collector replays the campaign's retained inputs on this
+    // harness, the way the campaign's re-runs run it.
+    let collector_harness = collector_replay::CollectorHarness::new(
+        prepared.runner.clone(),
+        &prepared.work_dir,
+        &prepared.extra_env,
+        prepared.per_input_timeout,
+    );
 
     let progress_lines = (!quiet).then(ProgressLines::new);
     let print_progress = |tick: &FuzzTick| {
@@ -1550,8 +1559,9 @@ pub fn run(args: FuzzArgs) -> i32 {
                 &collector_spec,
                 collector_window_ms,
                 &collector_work_dir,
-                &collector_harness,
+                &collector_harness_id,
                 runtrace_log.as_deref(),
+                Some(&collector_harness),
             ) {
                 Ok(provenance) => {
                     value["collector"] = provenance;
@@ -1607,13 +1617,23 @@ fn duplicates_of_existing_note(ids: &[String], crashes: usize, harness_id: &str)
 /// collector-sourced `binary_semantic` findings written to the results tree).
 /// Inactive (the default, or no built-in provider on this platform) is a no-op
 /// that returns inactive provenance, so the historical behaviour is unchanged.
+///
+/// #246: the collector replays the campaign's retained inputs (this harness's
+/// crash findings, then its persisted corpus; at most
+/// [`crate::collector_run::MAX_REPLAYS`]) one by one on `harness`: under a
+/// sidecar, which observes the launched process, or on Linux under the
+/// runtrace shim. Each finding keeps the input whose replay produced it. On
+/// Linux a sink only the campaign's other inputs reached is still reported
+/// from the campaign's runtrace log, as an aggregate finding with no input.
 fn run_collector_for_fuzz(
     spec: &crate::collector_run::CollectorSpec,
     window_ms: u64,
     work_dir: &Path,
     harness_id: &str,
     runtrace_log: Option<&Path>,
+    harness: Option<&collector_replay::CollectorHarness>,
 ) -> anyhow::Result<serde_json::Value> {
+    use crate::collector_run::{CollectorOutcome, ObservationMode, ReplayTestcase};
     use anyhow::Context;
     let Some(resolved) = crate::collector_run::resolve(spec, window_ms)? else {
         return Ok(crate::collector_run::inactive_run_provenance(spec));
@@ -1621,47 +1641,47 @@ fn run_collector_for_fuzz(
     let findings_dir = corpus::layout::findings_dir(work_dir);
     std::fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
-    // #76: observation scope and (for a replay) the real triggering input the
-    // finding is reproducible from — never synthetic `testcase:"fuzz"`/empty input.
-    let (outcome, observation, finding_input): (
-        crate::collector_run::CollectorOutcome,
-        crate::collector_run::ObservationMode,
-        Vec<u8>,
-    ) = if resolved.runtrace_shim().is_some() {
-        // Linux built-in provider: re-express the LD_PRELOAD shim events the builtin
-        // fuzz loop already captured (`work_dir/runtrace.jsonl`) as collector events.
-        // The loop writes that log ONLY when the runtrace shim is armed (for example
-        // with `--runtime-oracles`), so `--collector auto` layers a collector-shaped
-        // view over the SAME shim events without changing the runtime-oracle
-        // behaviour or re-running the harness. This log spans the WHOLE campaign, so
-        // the observation is labeled AGGREGATE (not a per-testcase replay) and never
-        // fabricates a per-case testcase/pid (#76).
-        match runtrace_log.filter(|log| log.is_file()) {
-            None =>
-            // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
-            // off`), so the collector observed nothing this run. Record a degraded,
-            // not-observed run rather than evaluating an empty stream and claiming a
-            // clean collector assurance over coverage it never had.
-            {
-                (
-                    resolved.not_observed("runtime_shim_not_armed"),
-                    crate::collector_run::ObservationMode::Aggregate,
-                    Vec::new(),
-                )
+    let root = work_dir.display().to_string();
+    // The oracle lane already wrote these with their own testcases.
+    let mut reported = oracle_lane_rules(&findings_dir, harness_id);
+    let (replays, dropped) = match harness {
+        Some(_) => crate::collector_run::bounded_replay_set(
+            crate::collector_run::retained_replay_testcases(work_dir, harness_id),
+        ),
+        None => (Vec::new(), 0),
+    };
+    // The campaign's runtrace log, written only when the shim was armed.
+    let campaign_events = match (resolved.runtrace_shim(), runtrace_log) {
+        (Some(_), Some(log)) if log.is_file() => {
+            let mut events = crate::auto::runtrace::parse_log(log).unwrap_or_default();
+            crate::auto::runtrace::dedupe_in_place(&mut events);
+            Some(events)
+        }
+        _ => None,
+    };
+
+    let mut replayed: Option<crate::collector_run::ReplaySetOutcome> = None;
+    if let (Some(harness), false) = (harness, replays.is_empty()) {
+        let mut outcomes: Vec<(ReplayTestcase, CollectorOutcome)> = Vec::new();
+        if let Some(shim) = resolved.runtrace_shim() {
+            let mut runs = Vec::with_capacity(replays.len());
+            for replay in replays {
+                let events = harness.run_under_shim(shim, &replay.testcase, &replay.input)?;
+                runs.push((replay, events));
             }
-            Some(log) => {
-                let mut events = crate::auto::runtrace::parse_log(log).unwrap_or_default();
-                crate::auto::runtrace::dedupe_in_place(&mut events);
-                // Route sink confirmation through the SAME cross-execution correlation
-                // #59 uses: the aggregated log spans every execution, so the gate's
-                // never-untainted / constant-suppression applies across the whole run
-                // and no sink is single-run taint-confirmed.
-                let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
+            // A sink is taint-confirmed only from cross-execution correlation:
+            // the campaign's events (when its log was written) and every replay.
+            let mut evidence = campaign_events.clone().unwrap_or_default();
+            for (_, events) in &runs {
+                evidence.extend(events.iter().cloned());
+            }
+            let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&evidence);
+            for (replay, events) in runs {
                 let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                    testcase: "campaign-aggregate".to_owned(),
-                    worker: 0,
-                    // Synthetic anchor for the aggregate event tree; the shim events
-                    // carry the real pids. Not a per-case OS pid claim.
+                    testcase: replay.testcase.clone(),
+                    worker: replay.worker,
+                    // Synthetic anchor for this replayed execution's event tree;
+                    // the shim events carry the real pids, which drive attribution.
                     root_pid: 1,
                 };
                 let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
@@ -1670,70 +1690,150 @@ fn run_collector_for_fuzz(
                     harness_id,
                     &gate,
                 );
-                (
-                    resolved.evaluate_aggregate_jsonl(
-                        &jsonl,
-                        &work_dir.display().to_string(),
-                        &oracle_lane_rules(&findings_dir, harness_id),
-                    ),
-                    crate::collector_run::ObservationMode::Aggregate,
-                    // Aggregate: no single triggering input, so the finding is
-                    // campaign-level (its `coverage` says so), not reproducible from one.
-                    Vec::new(),
-                )
+                let outcome = resolved.evaluate_jsonl(&jsonl, &root);
+                outcomes.push((replay, outcome));
+            }
+        } else {
+            for replay in replays {
+                // A genuine REPLAY: the host launches the harness on this input
+                // UNDER the ready observer and records its real PID; `run_once`
+                // bounds the capture and degrades to not_observed otherwise (#76).
+                let launch: crate::collector_run::ReplayLauncher =
+                    Box::new(|| harness.launch(&replay.testcase, &replay.input));
+                let params = crate::collector_run::CollectorRunParams {
+                    testcase: replay.testcase.clone(),
+                    worker: replay.worker,
+                    root: root.clone(),
+                    root_image: harness_id.to_owned(),
+                    input: &replay.input,
+                    tmp_dir: work_dir.join("fuzz_scratch").join("collector"),
+                    launch: Some(launch),
+                };
+                let outcome = resolved.run_once(&params)?;
+                drop(params);
+                outcomes.push((replay, outcome));
             }
         }
-    } else {
-        // Sidecar provider on the generic `fuzz` (harness) path: an honest replay
-        // requires LAUNCHING the retained testcase under the ready observer, but a
-        // language/driver harness cannot be re-launched standalone with an input
-        // here (that launch is wired only on the binary-fuzz lane and the native
-        // ETW provider). Rather than spawn an observer that watches nothing and
-        // call it a replay, record a degraded, not-observed run — distinguishing
-        // "nothing retained" from "retained but not replayable on this host" (#76).
-        let reason = match crate::collector_run::select_replay_testcase(work_dir, harness_id) {
-            Some(_) => "harness_sidecar_replay_unsupported",
-            None => "no_retained_testcase_to_replay",
-        };
-        (
-            resolved.not_observed(reason),
-            crate::collector_run::ObservationMode::Replay,
-            Vec::new(),
-        )
-    };
-    let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
-    // An aggregate observation is one session, the whole campaign: written
-    // once, beside the findings, for all of them.
-    let shared_evidence = match (observation, outcome.findings.first()) {
-        (crate::collector_run::ObservationMode::Aggregate, Some(first)) => {
-            use sha2::Digest;
-            let digest = corpus::hex_lower(&sha2::Sha256::digest(first.session_jsonl.as_bytes()));
-            let name = format!("aggregate-{}.jsonl", &digest[..16]);
-            let dir = findings_dir.with_file_name("collector");
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            std::fs::write(dir.join(&name), first.session_jsonl.as_bytes())
-                .with_context(|| format!("write {}", dir.join(&name).display()))?;
-            Some(format!("../../collector/{name}"))
-        }
-        _ => None,
-    };
-    let mut ids = Vec::new();
-    for finding in &outcome.findings {
-        let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
-        let dir = findings_dir.join(&id);
-        crate::collector_run::write_finding_with_evidence(
-            &dir,
-            &id,
-            target.clone(),
-            finding,
-            &finding_input,
-            observation,
-            shared_evidence.as_deref(),
-        )?;
-        ids.push(id);
+        replayed = Some(crate::collector_run::merge_replays(outcomes, dropped));
     }
-    let mut provenance = outcome.run_provenance;
-    observation.stamp(&mut provenance);
+
+    let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
+    let mut ids = Vec::new();
+    let mut provenance = match &replayed {
+        Some(merged) => {
+            for (finding, replay) in &merged.findings {
+                if reported.contains(&finding.hit.rule_id) {
+                    continue;
+                }
+                let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
+                crate::collector_run::write_finding_with_evidence(
+                    &findings_dir.join(&id),
+                    &id,
+                    target.clone(),
+                    finding,
+                    &replay.input,
+                    ObservationMode::Replay,
+                    None,
+                )?;
+                reported.insert(finding.hit.rule_id.clone());
+                ids.push(id);
+            }
+            let mut provenance = merged.run_provenance.clone();
+            ObservationMode::Replay.stamp(&mut provenance);
+            provenance
+        }
+        None => serde_json::Value::Null,
+    };
+
+    // Linux: what the campaign's other inputs reached, from its runtrace log,
+    // as one aggregate session; a rule a replay or the oracle lane reported is
+    // left out. Without a log (the shim was not armed) and without a replay
+    // the collector observed nothing.
+    if resolved.runtrace_shim().is_some() {
+        let aggregate = match &campaign_events {
+            Some(events) => {
+                // Route sink confirmation through the SAME cross-execution
+                // correlation #59 uses: the log spans every execution, so no sink
+                // is single-run taint-confirmed.
+                let gate = crate::auto::runtrace::CollectorTaintGate::from_events(events);
+                let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                    testcase: "campaign-aggregate".to_owned(),
+                    worker: 0,
+                    // Synthetic anchor for the aggregate event tree; the shim
+                    // events carry the real pids. Not a per-case OS pid claim.
+                    root_pid: 1,
+                };
+                let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                    events,
+                    &adapter_ctx,
+                    harness_id,
+                    &gate,
+                );
+                Some(resolved.evaluate_aggregate_jsonl(&jsonl, &root, &reported))
+            }
+            None if replayed.is_none() => {
+                // #60 AC6: the shim was NOT armed, so the collector observed
+                // nothing this run. Record a degraded, not-observed run rather
+                // than evaluating an empty stream and claiming a clean assurance.
+                Some(resolved.not_observed("runtime_shim_not_armed"))
+            }
+            None => None,
+        };
+        if let Some(aggregate) = aggregate {
+            // One session, the whole campaign: written once, beside the
+            // findings, for all of them.
+            let shared_evidence = match aggregate.findings.first() {
+                Some(first) => {
+                    use sha2::Digest;
+                    let digest =
+                        corpus::hex_lower(&sha2::Sha256::digest(first.session_jsonl.as_bytes()));
+                    let name = format!("aggregate-{}.jsonl", &digest[..16]);
+                    let dir = findings_dir.with_file_name("collector");
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("create {}", dir.display()))?;
+                    std::fs::write(dir.join(&name), first.session_jsonl.as_bytes())
+                        .with_context(|| format!("write {}", dir.join(&name).display()))?;
+                    Some(format!("../../collector/{name}"))
+                }
+                None => None,
+            };
+            let mut aggregate_ids = Vec::new();
+            for finding in &aggregate.findings {
+                let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
+                // Aggregate: no single triggering input, so the finding is
+                // campaign-level (its `coverage` says so), not reproducible from one.
+                crate::collector_run::write_finding_with_evidence(
+                    &findings_dir.join(&id),
+                    &id,
+                    target.clone(),
+                    finding,
+                    &[],
+                    ObservationMode::Aggregate,
+                    shared_evidence.as_deref(),
+                )?;
+                aggregate_ids.push(id);
+            }
+            let mut aggregate_provenance = aggregate.run_provenance;
+            ObservationMode::Aggregate.stamp(&mut aggregate_provenance);
+            if provenance.is_null() {
+                provenance = aggregate_provenance;
+            } else {
+                aggregate_provenance["findings"] = serde_json::json!(aggregate_ids);
+                provenance["aggregate"] = aggregate_provenance;
+            }
+            ids.extend(aggregate_ids);
+        }
+    } else if provenance.is_null() {
+        // A sidecar with nothing retained to replay: a degraded, not-observed
+        // run, never a clean assurance over a run it did not watch (#76).
+        let reason = if harness.is_none() {
+            "harness_sidecar_replay_unsupported"
+        } else {
+            "no_retained_testcase_to_replay"
+        };
+        provenance = resolved.not_observed(reason).run_provenance;
+        ObservationMode::Replay.stamp(&mut provenance);
+    }
     provenance["findings"] = serde_json::json!(ids);
     Ok(provenance)
 }
@@ -16136,6 +16236,7 @@ exit 0
             crate::collector_run::DEFAULT_WINDOW_MS,
             &work,
             "harness",
+            None,
             None,
         )
         .expect("collector provenance");
