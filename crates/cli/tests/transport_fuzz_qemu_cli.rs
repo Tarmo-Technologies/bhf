@@ -830,10 +830,11 @@ fn cli_freertos_hang_times_out_and_the_reset_clears_state() {
 /// before and after the run. QEMU models no `DWT_CYCCNT`, so this reads the
 /// MPS2 FPGAIO `COUNTER` (a 25 MHz up-counter) under `-icount`, where it
 /// advances with the instructions run. Input `0xB0` busy-loops one unit,
-/// `0xB1` two and `0xBF` sixteen. Each run also counts the delivery and
-/// completion around the loop, a fixed cost that differs between QEMU
-/// builds, so the check is on differences: fifteen units more cost about
-/// fifteen times what one unit more does.
+/// `0xB7` eight and `0xBF` sixteen. Each run also counts the delivery and
+/// completion around the loop, a cost that differs between QEMU builds and,
+/// by a few thousand ticks, between boots, so the check is on differences
+/// that span several units: the eight units from `0xB7` to `0xBF` cost about
+/// what the seven from `0xB0` to `0xB7` do, unit for unit.
 #[test]
 fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
     let tmp = tempfile::tempdir().unwrap();
@@ -842,7 +843,7 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
         return;
     };
     let mut cycles = Vec::new();
-    for (tag, byte) in [("one", 0xB0_u8), ("two", 0xB1), ("sixteen", 0xBF)] {
+    for (tag, byte) in [("one", 0xB0_u8), ("eight", 0xB7), ("sixteen", 0xBF)] {
         let guest = RtosGuest::boot_with(&elf, dir, tag, None, &["-icount", "shift=0"]);
         let summary = guest.fuzz_with_spec(
             &elf,
@@ -856,15 +857,17 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
         cycles.push(stats["max"].as_u64().unwrap());
     }
     assert!(cycles[0] > 0, "{cycles:?}");
-    let unit = cycles[1].saturating_sub(cycles[0]);
-    let fifteen = cycles[2].saturating_sub(cycles[0]);
+    let seven = cycles[1].saturating_sub(cycles[0]);
+    let eight = cycles[2].saturating_sub(cycles[1]);
     assert!(
-        unit > 0,
-        "one more unit of busy work takes cycles: {cycles:?}"
+        seven > 0 && eight > 0,
+        "more busy work takes more cycles: {cycles:?}"
     );
+    let per_unit_ratio = (7 * eight) as f64 / (8 * seven) as f64;
     assert!(
-        (12 * unit..=18 * unit).contains(&fifteen),
-        "fifteen more units take about fifteen times one more: {cycles:?}"
+        (0.8..=1.2).contains(&per_unit_ratio),
+        "a unit of busy work costs about the same from 0xB7 to 0xBF as from 0xB0 to 0xB7: \
+         {cycles:?}"
     );
 }
 

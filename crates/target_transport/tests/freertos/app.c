@@ -86,10 +86,12 @@ static void consumer(void *p){ (void)p;
   else if (b == 0x42){ emit_crumb(0x200); emit_crumb(0x201); }
   /* A hang: never reaches harness_done, so the run ends at the deadline. */
   else if (b == 0xD0){ emit_crumb(0x2D0); for(;;){ __asm volatile("nop"); } }
-  /* Busy work that grows with the input, for the cycle counter (#251). */
+  /* Busy work that grows with the input, for the cycle counter (#251). A
+   * unit is long next to the run's delivery and completion, whose cost
+   * varies from boot to boot by a few thousand counter ticks. */
   else if (b >= 0xB0 && b <= 0xBF){
     emit_crumb(0x2B0);
-    for (volatile uint32_t i = 0; i < (uint32_t)(b - 0xAF) * 20000u; i++){}
+    for (volatile uint32_t i = 0; i < (uint32_t)(b - 0xAF) * 200000u; i++){}
   }
   /* Leaves state behind for the next input (see bhf_carryover). */
   else if (b == 0xC5){ emit_crumb(0x2C5); bhf_carryover = 0xC5u; }
