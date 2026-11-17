@@ -2678,6 +2678,11 @@
   when bhf panics.
 
 ### Added
+- `bhf replay --stability-runs N` re-drives an on-target transport finding's
+  input N times, each from the transport's reset, and reports how many runs
+  reproduced it. A finding some runs reproduce and others do not is
+  `MISMATCH nondeterministic, K of N runs reproduced the finding` (exit 3);
+  transport replay ran once and could not tell a flaky fault from a fixed one.
 - Seed lineage: the built-in engine records what each input it keeps was
   mutated from (`corpus/<harness-id>/lineage.jsonl`, one line per queue
   entry, beside the queue), and each finding's `finding.json` gains

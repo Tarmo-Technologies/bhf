@@ -65,7 +65,7 @@ struct FaultIdentity {
 pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str>) -> i32 {
     crate::replay::finish_lane(
         finding_dir,
-        replay_transport_outcome(finding_dir, endpoint),
+        replay_transport_outcome(finding_dir, endpoint, 1),
         crate::replay::OutputMode::default(),
     )
 }
@@ -129,6 +129,7 @@ fn with_recorded_input_cap(map: &str, len: usize) -> String {
 pub(crate) fn replay_transport_outcome(
     finding_dir: &Path,
     endpoint: Option<&str>,
+    runs: usize,
 ) -> Result<crate::replay::LaneReplay, String> {
     let profile_path = finding_dir.join(TRANSPORT_PROFILE_FILE);
     let profile: serde_json::Value = std::fs::read(&profile_path)
@@ -208,129 +209,208 @@ pub(crate) fn replay_transport_outcome(
              relocate it with --transport-endpoint HOST:PORT"
         )
     })?;
-    let started = Instant::now();
-    let outcome = session.run_input(&input).map_err(|error| {
-        format!("re-driving the recorded input through the transport failed: {error}")
-    })?;
-    let elapsed = started.elapsed();
-    let exit = transport_exit(outcome.exit, elapsed);
-
     // A "completed-but-slow" deadline finding (BHF-555, emitted by the deadline
-    // oracle on an Ok run) reproduces no fault — so a fault-identity check would
-    // always report "no fault reproduced". Match it by the SAME predicate it was
-    // found with: the replay must reproduce the completed-but-slow OUTCOME — a
-    // clean completion (ExitKind::Ok) whose host-observed time exceeds the recorded
-    // deadline. Elapsed time alone is not enough: a later crash or execution
-    // timeout that happens to exceed that duration is a DIFFERENT outcome, not a
-    // reproduction of the slow-clean run (#70 re-review).
-    if recorded_exception_name(finding_dir).as_deref() == Some(DEADLINE_EXCEPTION_NAME) {
-        let Some(deadline) = deadline else {
-            return Err(format!(
-                "deadline finding {} carries no recorded deadline in its transport profile; \
-                 cannot evaluate the timing predicate",
-                finding_dir.display()
-            ));
+    // oracle on an Ok run) reproduces no fault, so it is matched by the SAME
+    // predicate it was found with (see `judge_run`).
+    let timing_deadline =
+        if recorded_exception_name(finding_dir).as_deref() == Some(DEADLINE_EXCEPTION_NAME) {
+            let Some(deadline) = deadline else {
+                return Err(format!(
+                    "deadline finding {} carries no recorded deadline in its transport profile; \
+                     cannot evaluate the timing predicate",
+                    finding_dir.display()
+                ));
+            };
+            Some(deadline)
+        } else {
+            None
         };
+    // #250: the input is re-driven `runs` times, each from the transport's
+    // reset, so a fault that reproduces only sometimes is reported as such.
+    let mut judged = Vec::with_capacity(runs.max(1));
+    for _ in 0..runs.max(1) {
+        let started = Instant::now();
+        let outcome = session.run_input(&input).map_err(|error| {
+            format!("re-driving the recorded input through the transport failed: {error}")
+        })?;
+        judged.push(judge_run(
+            &recorded,
+            timing_deadline,
+            &outcome,
+            started.elapsed(),
+        ));
+    }
+    Ok(combine_runs(judged, &spec))
+}
+
+/// One re-driven run, judged against the finding.
+struct Judged {
+    matched: bool,
+    status_line: String,
+    compared: String,
+    differences: Vec<String>,
+    exit: crate::replay::ExitSummary,
+    history: &'static str,
+}
+
+/// Judge one run: a deadline finding (`timing_deadline`) by the
+/// completed-but-slow predicate it was found with, any other by its fault
+/// identity (rule and site).
+fn judge_run(
+    recorded: &FaultIdentity,
+    timing_deadline: Option<Duration>,
+    outcome: &target_transport::RunOutcome,
+    elapsed: Duration,
+) -> Judged {
+    let exit = transport_exit(outcome.exit, elapsed);
+    if let Some(deadline) = timing_deadline {
+        // The replay must reproduce the completed-but-slow OUTCOME: a clean
+        // completion (ExitKind::Ok) whose host-observed time exceeds the
+        // recorded deadline. A later crash or execution timeout that happens to
+        // exceed that duration is a DIFFERENT outcome (#70 re-review).
         let compared = format!(
             "completed-but-slow outcome (a clean run longer than {}ms)",
             deadline.as_millis()
         );
+        let history = "replay (transport timing)";
         if outcome.exit != ExitKind::Ok {
-            let line = format!(
-                "MISMATCH recorded=slow-clean(>{}ms) actual={:?} (a crash/timeout is a \
-                 different outcome, not a reproduction of the completed-but-slow run)",
-                deadline.as_millis(),
-                outcome.exit
-            );
-            let difference = format!("outcome: recorded slow-clean, replayed {:?}", outcome.exit);
-            return Ok(transport_lane(
-                false,
-                line,
+            return Judged {
+                matched: false,
+                status_line: format!(
+                    "MISMATCH recorded=slow-clean(>{}ms) actual={:?} (a crash/timeout is a \
+                     different outcome, not a reproduction of the completed-but-slow run)",
+                    deadline.as_millis(),
+                    outcome.exit
+                ),
                 compared,
-                vec![difference],
-                &spec,
+                differences: vec![format!(
+                    "outcome: recorded slow-clean, replayed {:?}",
+                    outcome.exit
+                )],
                 exit,
-                "replay (transport timing)",
-            ));
+                history,
+            };
         }
         if elapsed > deadline {
-            return Ok(transport_lane(
-                true,
-                "MATCH".to_owned(),
+            return Judged {
+                matched: true,
+                status_line: "MATCH".to_owned(),
                 compared,
-                Vec::new(),
-                &spec,
+                differences: Vec::new(),
                 exit,
-                "replay (transport timing)",
-            ));
+                history,
+            };
         }
-        let line = format!(
-            "MISMATCH recorded=slow-clean(>{}ms) actual=clean({}ms) (within the deadline)",
-            deadline.as_millis(),
-            elapsed.as_millis()
-        );
-        let difference = format!(
-            "duration: recorded longer than {}ms, replayed {}ms",
-            deadline.as_millis(),
-            elapsed.as_millis()
-        );
-        return Ok(transport_lane(
-            false,
-            line,
+        return Judged {
+            matched: false,
+            status_line: format!(
+                "MISMATCH recorded=slow-clean(>{}ms) actual=clean({}ms) (within the deadline)",
+                deadline.as_millis(),
+                elapsed.as_millis()
+            ),
             compared,
-            vec![difference],
-            &spec,
+            differences: vec![format!(
+                "duration: recorded longer than {}ms, replayed {}ms",
+                deadline.as_millis(),
+                elapsed.as_millis()
+            )],
             exit,
-            "replay (transport timing)",
-        ));
+            history,
+        };
     }
 
     let compared = format!(
         "fault identity {}|{} (rule and fault site)",
         recorded.rule_id, recorded.site
     );
-    let actual = replay_identity(&outcome);
-    Ok(match actual {
-        Some(actual) if actual == recorded => transport_lane(
-            true,
-            "MATCH".to_owned(),
+    let history = "replay (transport)";
+    match replay_identity(outcome) {
+        Some(actual) if actual == *recorded => Judged {
+            matched: true,
+            status_line: "MATCH".to_owned(),
             compared,
-            Vec::new(),
-            &spec,
+            differences: Vec::new(),
             exit,
-            "replay (transport)",
-        ),
-        Some(actual) => transport_lane(
-            false,
-            format!(
+            history,
+        },
+        Some(actual) => Judged {
+            matched: false,
+            status_line: format!(
                 "MISMATCH recorded={}|{} actual={}|{}",
                 recorded.rule_id, recorded.site, actual.rule_id, actual.site
             ),
             compared,
-            vec![format!(
+            differences: vec![format!(
                 "fault: recorded {}|{}, replayed {}|{}",
                 recorded.rule_id, recorded.site, actual.rule_id, actual.site
             )],
-            &spec,
             exit,
-            "replay (transport)",
-        ),
-        None => transport_lane(
-            false,
-            format!(
+            history,
+        },
+        None => Judged {
+            matched: false,
+            status_line: format!(
                 "MISMATCH recorded={}|{} actual=<no fault reproduced>",
                 recorded.rule_id, recorded.site
             ),
             compared,
-            vec![format!(
+            differences: vec![format!(
                 "fault: recorded {}|{}, no fault reproduced",
                 recorded.rule_id, recorded.site
             )],
-            &spec,
             exit,
-            "replay (transport)",
-        ),
-    })
+            history,
+        },
+    }
+}
+
+/// The replay of all the runs: a MATCH when every run reproduced the finding;
+/// otherwise the first run that did not, and, when some runs did, a
+/// `nondeterministic, K of N` status (#250). With more than one run, a `runs`
+/// detail says how many reproduced it.
+fn combine_runs(judged: Vec<Judged>, spec: &str) -> crate::replay::LaneReplay {
+    let total = judged.len();
+    let reproduced = judged.iter().filter(|run| run.matched).count();
+    let nondeterministic = reproduced > 0 && reproduced < total;
+    let mut differences: Vec<String> = Vec::new();
+    for run in judged.iter().filter(|run| !run.matched) {
+        for difference in &run.differences {
+            if !differences.contains(difference) {
+                differences.push(difference.clone());
+            }
+        }
+    }
+    let shown = judged.iter().position(|run| !run.matched).unwrap_or(0);
+    let run = judged.into_iter().nth(shown).expect("at least one run");
+    let status_line = if nondeterministic {
+        differences.insert(
+            0,
+            format!("nondeterministic: {reproduced} of {total} runs reproduced the finding"),
+        );
+        format!("MISMATCH nondeterministic, {reproduced} of {total} runs reproduced the finding")
+    } else {
+        run.status_line
+    };
+    let mut lane = transport_lane(
+        reproduced == total,
+        status_line,
+        run.compared,
+        if reproduced == total {
+            Vec::new()
+        } else {
+            differences
+        },
+        spec,
+        run.exit,
+        run.history,
+    );
+    if total > 1 {
+        lane.details.push(crate::replay::Detail::new(
+            "runs",
+            format!("{reproduced} of {total} reproduced the finding"),
+        ));
+    }
+    lane
 }
 
 /// Reconstruct the recorded fault identity from `finding.json`: its `rule_id`
@@ -547,6 +627,104 @@ mod tests {
 
     fn temp_dir(tag: &str) -> crate::test_support::TestDir {
         crate::test_support::TestDir::new(&format!("transport-replay-{tag}"))
+    }
+
+    /// Serve one MockAgent connection with `script`, one response per input.
+    #[allow(clippy::type_complexity)]
+    fn spawn_agent_script(
+        script: Vec<ScriptedResponse>,
+    ) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for_thread = Arc::clone(&received);
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = MockAgent::new(stream, script, received_for_thread).serve();
+            }
+        });
+        (port, received, handle)
+    }
+
+    /// #250: a target that faults on every other run is reported as
+    /// nondeterministic with the count, not as a MATCH or a plain MISMATCH;
+    /// one that faults every time is a MATCH that says so.
+    #[test]
+    fn stability_runs_report_a_fault_that_reproduces_only_sometimes() {
+        let fault = || Fault {
+            kind: FaultKind::MemoryProtection,
+            address: Some(0x2000_4000),
+            detail: "MPU".to_owned(),
+        };
+        let alternating = vec![
+            ScriptedResponse::crash(vec![1], fault()),
+            ScriptedResponse::ok(vec![1]),
+            ScriptedResponse::crash(vec![1], fault()),
+            ScriptedResponse::ok(vec![1]),
+        ];
+        let (port, received, handle) = spawn_agent_script(alternating);
+        let dir = temp_dir("stability");
+        write_profile(&dir, &format!("agent:tcp:127.0.0.1:{port}"));
+        write_finding(&dir, "BHF-210", "0x20004000");
+        let lane = replay_transport_outcome(&dir, None, 4).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            received.lock().unwrap().len(),
+            4,
+            "four runs reached the target"
+        );
+        assert!(!lane.matched);
+        assert_eq!(
+            lane.status_line,
+            "MISMATCH nondeterministic, 2 of 4 runs reproduced the finding"
+        );
+        assert_eq!(
+            lane.differences[0],
+            "nondeterministic: 2 of 4 runs reproduced the finding"
+        );
+        assert!(
+            lane.differences
+                .iter()
+                .any(|d| d.contains("no fault reproduced")),
+            "{:?}",
+            lane.differences
+        );
+        assert!(lane
+            .details
+            .iter()
+            .any(|d| format!("{d:?}").contains("2 of 4 reproduced the finding")));
+        assert_eq!(
+            crate::replay::finish_lane(&dir, Ok(lane), crate::replay::OutputMode::default()),
+            3
+        );
+
+        let (port, _received, handle) = spawn_agent_script(
+            (0..3)
+                .map(|_| ScriptedResponse::crash(vec![1], fault()))
+                .collect(),
+        );
+        write_profile(&dir, &format!("agent:tcp:127.0.0.1:{port}"));
+        let lane = replay_transport_outcome(&dir, None, 3).unwrap();
+        handle.join().unwrap();
+        assert!(lane.matched, "{}", lane.status_line);
+        assert_eq!(lane.status_line, "MATCH");
+        assert!(lane
+            .details
+            .iter()
+            .any(|d| format!("{d:?}").contains("3 of 3 reproduced the finding")));
+
+        // None of the runs reproducing it is a plain MISMATCH, not nondeterminism.
+        let (port, _received, handle) =
+            spawn_agent_script((0..2).map(|_| ScriptedResponse::ok(vec![1])).collect());
+        write_profile(&dir, &format!("agent:tcp:127.0.0.1:{port}"));
+        let lane = replay_transport_outcome(&dir, None, 2).unwrap();
+        handle.join().unwrap();
+        assert!(!lane.matched);
+        assert!(
+            lane.status_line.contains("no fault reproduced"),
+            "{}",
+            lane.status_line
+        );
     }
 
     #[test]

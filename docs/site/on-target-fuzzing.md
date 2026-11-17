@@ -317,6 +317,15 @@ BHF_DEADLINE_MS=250 bhf fuzz bhf_work --harness H-C0001    # sub-second budget
 Use it for watchdog / control-loop / radar-frame deadlines where a late answer
 is a defect. Off by default — unset, hang handling is byte-for-byte unchanged.
 
+**Nondeterminism (`bhf replay --stability-runs N`).** `bhf replay` re-drives
+a transport finding's input through the recorded transport once. With
+`--stability-runs N` it runs it N times, each from the transport's reset, and
+its `runs` line says how many reproduced the finding. When some do and others
+do not, the result is `MISMATCH nondeterministic, K of N runs reproduced the
+finding` (exit 3), and the differences list what the other runs did. Such a
+finding depends on state the reset does not restore (a peripheral, timing,
+an uninitialized word), not only on its input.
+
 ---
 
 ### Device registers on the host

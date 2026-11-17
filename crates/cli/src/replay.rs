@@ -85,6 +85,18 @@ pub struct ReplayArgs {
     #[arg(long = "transport-endpoint", value_name = "HOST:PORT")]
     pub transport_endpoint: Option<String>,
 
+    /// Re-drive an on-target transport finding's input N times, each from
+    /// the transport's reset, and report how many reproduced it: a finding
+    /// some runs reproduce and others do not is reported as `MISMATCH
+    /// nondeterministic, K of N` (exit 3). Applies to transport findings.
+    #[arg(
+        long = "stability-runs",
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u16).range(1..=1000)
+    )]
+    pub stability_runs: u16,
+
     /// Print the result as one `bhf.replay.v1` JSON document on stdout instead
     /// of the MATCH/MISMATCH/UNVERIFIED line and summary, for every kind of
     /// finding. Exit codes are unchanged (0 MATCH, 3 MISMATCH, 4 UNVERIFIED,
@@ -208,6 +220,7 @@ pub fn run(args: ReplayArgs) -> i32 {
         let lane = crate::transport_replay::replay_transport_outcome(
             &finding_dir,
             args.transport_endpoint.as_deref(),
+            usize::from(args.stability_runs),
         );
         return finish_lane(&finding_dir, lane, output);
     }
