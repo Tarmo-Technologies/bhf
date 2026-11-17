@@ -2733,6 +2733,20 @@
   when bhf panics.
 
 ### Added
+- The Go lane fuzzes a package outside every Go module (#237): a GOPATH-era
+  tree, or a dir of `.go` files. Its harness imports the target through a
+  module `replace`, which needs a dir with a `go.mod`, so these were skipped.
+  bhf copies the package into the harness dir (`bhf_target/`) with a `go.mod`
+  of its own, and the scanned tree is not written to. A `package main` is
+  renamed in the copy so it can be imported. From a dir of `go run` scripts,
+  each with its own `main`, only the target's file is copied. Each copied
+  file opens with a `//line` directive, so a finding names the project's
+  file and line, and the capsule ships the copy with the harness. Of the 17
+  targets the 2026-07-28 sweep skipped this way, 15 now build and fuzz; the
+  other 2 are SWIG bindings, which need `swig`
+  (`docs/validation/2026-11-16-go3-loose-packages.md`). `go1_rerun.py`
+  re-runs any Go class by name (`--class`), across every lane's rows
+  (`--all-lanes`).
 - The engine trade study records coverage over time and retained findings
   (#256). It snapshots each engine's corpus at 10, 25, 50 and 75% of the
   budget and replays each through the shared coverage binary, so a row has a

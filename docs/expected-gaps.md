@@ -228,10 +228,22 @@ Go lane finds the package's constructor for the receiver type
 `func (p *Parser) Parse(data []byte) int`, `bhf auto` without `--force` builds
 and fuzzes `Parse`. A receiver with no such constructor still skips unforced.
 
-### Go-3. `not inside a Go module (no go.mod)` — 17 — **GAP**
+### Go-3. `not inside a Go module (no go.mod)` — 17 — **[FIXED]**
 
-A GOPATH-era or vendored tree. Synthesizing a `go.mod` for such a tree is the
-same trick the harness module already uses.
+A package outside every Go module: a GOPATH-era tree, or a dir of `.go` files
+run with `go run`. The harness imports its target through a module `replace`,
+which needs a dir with a `go.mod`. bhf now copies the package into the harness
+dir with a `go.mod` of its own; the scanned tree is not written to.
+- A `package main` is renamed in the copy, so it can be imported.
+- A dir of `go run` scripts, each with its own `main`, is no package at all,
+  so only the target's file is copied.
+- `//line` directives keep a finding on the project's file and line.
+
+The [2026-11-16 re-run](validation/2026-11-16-go3-loose-packages.md) of the 17
+targets by name: 15 build and fuzz. The other 2 are SWIG bindings and fail
+for want of `swig` (ENVIRONMENT). The copy is one dir: a GOPATH tree's other
+packages, imported by their GOPATH paths, are resolved as modules, and a build
+fails when no module provides them.
 
 ### Go-4. `requires go >= X` — 135 of 261 on Go 1.22.2 — **ENVIRONMENT**
 

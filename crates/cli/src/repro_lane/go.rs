@@ -82,7 +82,11 @@ impl Lane for GoLane {
     fn plan_capsule(&self, harness: &HarnessContext) -> anyhow::Result<CapsulePlan> {
         let dir = &harness.harness_dir;
         let go_mod = std::fs::read_to_string(dir.join("go.mod"))?;
-        let replaced = replaced_dirs(&go_mod);
+        // A package outside every module was copied into the harness dir
+        // (`bhf_target/`), which ships with the harness.
+        let (copied, replaced): (Vec<PathBuf>, Vec<PathBuf>) = replaced_dirs(&go_mod)
+            .into_iter()
+            .partition(|module| module.starts_with(dir));
         let tree = super::recorded_source_root(&harness.work_dir)
             .filter(|root| replaced.iter().all(|module| module.starts_with(root)))
             .or_else(|| replaced.first().cloned())
@@ -110,6 +114,15 @@ impl Lane for GoLane {
                     )
             })
             .collect();
+        for module in &copied {
+            harness_files.extend(
+                std::fs::read_dir(module)?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .filter_map(|path| path.strip_prefix(dir).ok().map(Path::to_path_buf)),
+            );
+        }
         harness_files.sort();
         let mut relocator = Relocator {
             mounts: vec![
@@ -186,6 +199,14 @@ impl Lane for GoLane {
                 "the scanned tree holding the target module".to_owned(),
             ),
         ];
+        if !copied.is_empty() {
+            layout.push((
+                format!("harness/{}/", crate::auto::go_build::LOOSE_PACKAGE_DIR),
+                "the target's package, outside every Go module in sources/, copied into a \
+                 module of its own"
+                    .to_owned(),
+            ));
+        }
         if vendor.is_some() {
             layout.push((
                 "harness/vendor/".to_owned(),
