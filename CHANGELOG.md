@@ -2689,6 +2689,16 @@
   when bhf panics.
 
 ### Added
+- The persistent built-in engine calibrates the inputs it adds to the corpus
+  (#232), as AFL++ does. It re-runs each one four times, each from a zeroed
+  edge bitmap, and counts an edge that one run hit and another did not as
+  variable. An input whose only new coverage was variable edges is left out,
+  and the re-runs' edges count as seen. The run summary's `stability` gives
+  `stability_pct`, `variable_edges`, `calibrated_entries` and
+  `unstable_entries_dropped`; the status line shows the stability, and below
+  90% bhf says the harness keeps state between executions and suggests
+  `--no-fork-server`. A target that switches on a static call counter filled
+  the corpus with an entry per counter value, with no warning.
 - The runtime comparison log records integer comparison constants (#221):
   the C/C++ driver writes the constant of each comparison the compiler
   emitted against one as an `"int"` record, with its own size budget, and

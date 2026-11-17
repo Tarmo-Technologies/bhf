@@ -1045,6 +1045,10 @@ pub(crate) struct FuzzRunSummary {
     /// their confirmation (#207). Omitted when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) hangs: Option<HangRunSummary>,
+    /// The persistent engine's stability calibration of new corpus entries
+    /// (#232). Omitted when none was calibrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stability: Option<StabilitySummary>,
 }
 
 /// Fresh-process re-runs of new corpus inputs during one fork-server pass.
@@ -1910,7 +1914,7 @@ pub(crate) type FuzzProgressFn<'a> = &'a dyn Fn(&FuzzTick);
 /// dashboard needs coverage growth WHILE a pass runs, not only in the pass
 /// summary, because "no new edge for four minutes" is the signal that the rest
 /// of this target's budget is being wasted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FuzzTick {
     pub(crate) executions: usize,
     pub(crate) findings: usize,
@@ -1918,6 +1922,8 @@ pub(crate) struct FuzzTick {
     /// Inputs in the in-memory corpus the mutator draws from.
     pub(crate) corpus: usize,
     pub(crate) elapsed: Duration,
+    /// The stability calibration has measured so far (#232).
+    pub(crate) stability_pct: Option<f64>,
 }
 
 /// When `bhf fuzz` prints its progress lines: 2s into the run, then after
@@ -1949,8 +1955,12 @@ impl ProgressLines {
 
 fn format_progress_line(tick: &FuzzTick) -> String {
     let secs = tick.elapsed.as_secs_f64();
+    let stability = tick
+        .stability_pct
+        .map(|pct| format!(" | stability: {pct:.1}%"))
+        .unwrap_or_default();
     format!(
-        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {} | elapsed: {:.1}s",
+        "bhf: fuzz: {} execs ({:.0}/s) | corpus: {} | findings: {} | edges: {}{stability} | elapsed: {:.1}s",
         tick.executions,
         executions_per_sec(tick.executions, secs),
         tick.corpus,
@@ -3754,6 +3764,12 @@ impl CoverageTracker {
         added
     }
 
+    /// Take the cumulative edge count as the baseline without crediting an
+    /// input: calibration re-runs hit edges that are no new input's.
+    fn absorb_coverage(&mut self) {
+        self.last_count = self.count();
+    }
+
     /// Copy the raw edge bitmap (#400 colorization). Used to save the cumulative
     /// state before colorization probes and to compare per-exec footprints.
     fn snapshot(&self) -> Vec<u8> {
@@ -3918,6 +3934,7 @@ impl CoverageTracker {
     fn input_increased_coverage(&mut self) -> usize {
         0
     }
+    fn absorb_coverage(&mut self) {}
     fn snapshot(&self) -> Vec<u8> {
         Vec::new()
     }
@@ -3991,6 +4008,134 @@ impl CoverageNovelty {
             .saturating_add(self.comparison_advances)
             .saturating_add(self.deeper_stack.saturating_mul(4))
             .clamp(1, 4096) as u32
+    }
+}
+
+/// How many times the persistent engine re-runs a new corpus entry to see
+/// whether it hits the same edges each time (#232).
+const CALIBRATION_RERUNS: usize = 4;
+
+/// Below this stability the run says the harness carries state between
+/// executions (AFL++ colours its stability figure at the same mark).
+const STABILITY_HINT_PCT: f64 = 90.0;
+
+/// Stability calibration of the persistent engine's new corpus entries
+/// (#232), as AFL++ calibrates its queue: one process runs input after input,
+/// so a target that keeps state from one execution to the next hits edges
+/// that depend on what ran before rather than on the input.
+#[derive(Debug, Default)]
+struct Calibration {
+    /// Edges any calibration run hit.
+    observed: HashSet<u32>,
+    /// Edges one run of an input hit and another run of it did not.
+    variable: HashSet<u32>,
+    /// Edges every run of some calibrated input hit.
+    stable: HashSet<u32>,
+    entries: usize,
+    dropped: usize,
+}
+
+impl Calibration {
+    /// Fold the edge sets of one input's runs. Whether it keeps its place in
+    /// the corpus: it hit the same edges every time, or it hit, every time,
+    /// an edge no calibrated input hit every time before. Otherwise its new
+    /// coverage was edges that vary from run to run.
+    fn calibrate(&mut self, runs: &[Vec<u32>]) -> bool {
+        let Some((first, rest)) = runs.split_first() else {
+            return true;
+        };
+        let mut every: HashSet<u32> = first.iter().copied().collect();
+        let mut any = every.clone();
+        for run in rest {
+            let edges: HashSet<u32> = run.iter().copied().collect();
+            every.retain(|edge| edges.contains(edge));
+            any.extend(edges);
+        }
+        self.entries += 1;
+        self.variable.extend(any.difference(&every).copied());
+        let stable_input = any.len() == every.len();
+        let adds_a_stable_edge = every
+            .iter()
+            .any(|edge| !self.stable.contains(edge) && !self.variable.contains(edge));
+        self.observed.extend(any);
+        self.stable.extend(every);
+        let keep = stable_input || adds_a_stable_edge;
+        if !keep {
+            self.dropped += 1;
+        }
+        keep
+    }
+
+    /// The share of observed edges no run varied on, in percent; `None`
+    /// before any entry was calibrated.
+    fn stability_pct(&self) -> Option<f64> {
+        if self.entries == 0 {
+            return None;
+        }
+        if self.observed.is_empty() {
+            return Some(100.0);
+        }
+        let steady = self.observed.len() - self.variable.len();
+        Some((steady as f64 * 1000.0 / self.observed.len() as f64).round() / 10.0)
+    }
+
+    fn summary(&self) -> Option<StabilitySummary> {
+        Some(StabilitySummary {
+            stability_pct: self.stability_pct()?,
+            calibrated_entries: self.entries,
+            reruns_per_entry: CALIBRATION_RERUNS,
+            observed_edges: self.observed.len(),
+            variable_edges: self.variable.len(),
+            unstable_entries_dropped: self.dropped,
+        })
+    }
+}
+
+/// The run's stability calibration (#232).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StabilitySummary {
+    /// The share of the edges calibration runs hit that every run of the
+    /// same input hit, in percent: 100 for a target whose coverage depends
+    /// on its input alone.
+    pub(crate) stability_pct: f64,
+    /// New corpus entries that were re-run.
+    pub(crate) calibrated_entries: usize,
+    /// The re-runs of each.
+    pub(crate) reruns_per_entry: usize,
+    pub(crate) observed_edges: usize,
+    /// Edges one run of an input hit and another run of it did not.
+    pub(crate) variable_edges: usize,
+    /// Entries left out of the corpus because their new coverage was only
+    /// edges that vary from run to run.
+    pub(crate) unstable_entries_dropped: usize,
+}
+
+impl StabilitySummary {
+    /// What a stability below [`STABILITY_HINT_PCT`] means, and what to do.
+    fn hint(&self) -> Option<String> {
+        (self.stability_pct < STABILITY_HINT_PCT).then(|| {
+            format!(
+                "bhf fuzz: stability {:.1}%: {} of the {} edges calibration saw differ between \
+                 runs of the same input, so the harness keeps state from one execution to the \
+                 next and coverage follows what ran before. {} new corpus entr{} whose only new \
+                 coverage was such edges {} left out. Run with --no-fork-server to give each \
+                 input a fresh process, or reset the target's state at the start of each call.",
+                self.stability_pct,
+                self.variable_edges,
+                self.observed_edges,
+                self.unstable_entries_dropped,
+                if self.unstable_entries_dropped == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                if self.unstable_entries_dropped == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
+            )
+        })
     }
 }
 
@@ -4363,6 +4508,7 @@ fn run_builtin_with_progress(
     let mut corpus_new = 0_usize;
     let mut corpus_duplicates = 0_usize;
     let mut non_reproducible = 0_usize;
+    let mut calibration = Calibration::default();
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -5121,6 +5267,7 @@ fn run_builtin_with_progress(
                     edges: cov_tracker.as_ref().map_or(0, |cov| cov.count()),
                     corpus: pool.len(),
                     elapsed: start.elapsed(),
+                    stability_pct: calibration.stability_pct(),
                 });
                 last_tick = Instant::now();
             }
@@ -5350,10 +5497,53 @@ fn run_builtin_with_progress(
         if run.sanitizer.is_some() && crashing_inputs.len() < finding_dedup_limit {
             crashing_inputs.insert(crash_input_key(&input));
         }
-        let keep = made_progress
+        let mut keep = made_progress
             && run.sanitizer.is_none()
             && pool.len() < corpus_limits.entries
             && pool_bytes.saturating_add(input.len()) <= corpus_limits.bytes;
+        // #232: re-run an input the persistent process would enqueue, each
+        // run from a zeroed edge bitmap, and leave it out when its new
+        // coverage was only edges that vary from run to run (state the target
+        // kept from earlier inputs). The bitmap is put back with the re-runs'
+        // edges added, without crediting any input, so a state-dependent edge
+        // they reach is not new coverage later.
+        if let (true, true, Some(cov), Some(fork)) = (
+            keep && !input.is_empty(),
+            input_new_coverage && from_fork_server,
+            cov_tracker.as_mut(),
+            fork_server.as_mut(),
+        ) {
+            let mut seen = cov.snapshot();
+            let mut runs = Vec::with_capacity(CALIBRATION_RERUNS);
+            for _ in 0..CALIBRATION_RERUNS {
+                cov.zero();
+                cov.zero_counts();
+                cov.zero_progress();
+                cov.zero_stack();
+                let _ = fork.run_one(&input);
+                let hit = cov.snapshot();
+                runs.push(
+                    hit.iter()
+                        .enumerate()
+                        .filter(|(_, byte)| **byte != 0)
+                        .map(|(edge, _)| edge as u32)
+                        .collect::<Vec<u32>>(),
+                );
+                for (into, byte) in seen.iter_mut().zip(&hit) {
+                    *into |= *byte;
+                }
+            }
+            cov.restore(&seen);
+            cov.absorb_coverage();
+            let steady = calibration.calibrate(&runs);
+            let other_progress = !new_signatures.is_empty()
+                || input_novelty.comparison_advances > 0
+                || input_novelty.deeper_stack > 0;
+            if !steady && !other_progress {
+                keep = false;
+                corpus_new = corpus_new.saturating_sub(1);
+            }
+        }
         if !input.is_empty() && keep {
             if let Some(lane) = portfolio_lane.and_then(|lane| {
                 portfolio_feedback
@@ -5675,7 +5865,11 @@ fn run_builtin_with_progress(
         unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
         fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
         hangs: (hangs.observed > 0).then_some(hangs),
+        stability: calibration.summary(),
     };
+    if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
+        bhfeprintln!("{hint}");
+    }
     if prepared.print_final_stats {
         bhfeprintln!(
             "{}",
@@ -6528,6 +6722,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
         fresh_reruns: None,
         hangs: None,
+        stability: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -12001,6 +12196,85 @@ mod entropic_tests {
 }
 
 #[cfg(test)]
+mod calibration_tests {
+    use super::{Calibration, CALIBRATION_RERUNS};
+
+    /// A target whose coverage follows its input alone: every entry keeps its
+    /// place and stability is 100%, with no hint.
+    #[test]
+    fn a_deterministic_target_is_fully_stable() {
+        let mut calibration = Calibration::default();
+        assert_eq!(calibration.stability_pct(), None);
+        assert!(calibration.summary().is_none());
+        for edges in [vec![1, 2, 3], vec![1, 2, 4, 5]] {
+            assert!(calibration.calibrate(&vec![edges; CALIBRATION_RERUNS]));
+        }
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.stability_pct, 100.0);
+        assert_eq!((summary.observed_edges, summary.variable_edges), (5, 0));
+        assert_eq!(summary.calibrated_entries, 2);
+        assert_eq!(summary.unstable_entries_dropped, 0);
+        assert_eq!(summary.hint(), None);
+    }
+
+    /// A static counter picks the edge: runs of one input differ, the edges
+    /// that differ are variable, and an entry whose only news is such an
+    /// edge is left out, while the first one, whose shared edges are new,
+    /// stays.
+    #[test]
+    fn edges_that_vary_between_runs_of_an_input_lower_stability() {
+        let mut calibration = Calibration::default();
+        let shared = [1, 2, 3];
+        let runs = |cases: [u32; 4]| -> Vec<Vec<u32>> {
+            cases
+                .iter()
+                .map(|case| shared.iter().copied().chain([100 + case]).collect())
+                .collect()
+        };
+        assert!(
+            calibration.calibrate(&runs([0, 1, 2, 3])),
+            "new shared edges"
+        );
+        assert!(
+            !calibration.calibrate(&runs([4, 5, 6, 7])),
+            "only a varying edge"
+        );
+        // An unstable input that also reaches a new edge every time stays.
+        let mut deeper = runs([8, 9, 10, 11]);
+        for run in &mut deeper {
+            run.push(50);
+        }
+        assert!(calibration.calibrate(&deeper));
+
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.observed_edges, 3 + 12 + 1);
+        assert_eq!(summary.variable_edges, 12);
+        assert_eq!(summary.stability_pct, 25.0);
+        assert_eq!(summary.unstable_entries_dropped, 1);
+        let hint = summary.hint().expect("a hint below 90%");
+        assert!(hint.contains("stability 25.0%"), "{hint}");
+        assert!(hint.contains("12 of the 16 edges"), "{hint}");
+        assert!(hint.contains("1 new corpus entry whose"), "{hint}");
+        assert!(hint.contains("--no-fork-server"), "{hint}");
+    }
+
+    /// 90% is the mark: at it, no hint; just under, one.
+    #[test]
+    fn the_hint_starts_below_ninety_percent() {
+        let mut calibration = Calibration::default();
+        let mut runs = vec![(0..10).collect::<Vec<u32>>(); CALIBRATION_RERUNS];
+        runs[1].pop();
+        calibration.calibrate(&runs);
+        let summary = calibration.summary().unwrap();
+        assert_eq!(summary.stability_pct, 90.0);
+        assert_eq!(summary.hint(), None);
+        let mut lower = summary;
+        lower.stability_pct = 89.9;
+        assert!(lower.hint().is_some());
+    }
+}
+
+#[cfg(test)]
 mod vp_tokens_tests {
     use super::read_vp_tokens;
     use std::io::Write;
@@ -14763,6 +15037,7 @@ exit 0
                 edges: 37,
                 corpus: 5,
                 elapsed: Duration::from_secs(secs),
+                stability_pct: None,
             })
         };
         assert_eq!(at(1), None);
@@ -14781,6 +15056,24 @@ exit 0
         assert_eq!(at(61), None);
         assert!(at(62).is_some());
         assert!(at(92).is_some());
+    }
+
+    /// Once an entry was calibrated (#232), the status line gives stability.
+    #[test]
+    fn the_progress_line_gives_stability_once_measured() {
+        let line = format_progress_line(&FuzzTick {
+            executions: 800,
+            findings: 0,
+            edges: 37,
+            corpus: 5,
+            elapsed: Duration::from_secs(2),
+            stability_pct: Some(41.7),
+        });
+        assert_eq!(
+            line,
+            "bhf: fuzz: 800 execs (400/s) | corpus: 5 | findings: 0 | edges: 37 | stability: 41.7% \
+             | elapsed: 2.0s"
+        );
     }
 
     #[test]
