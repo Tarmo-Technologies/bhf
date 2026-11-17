@@ -111,6 +111,13 @@ def materialize_target(spec: targets.TargetSpec, dest: Path) -> tuple[list[Path]
         return [run_source], sha256(run_source)
     copied: list[Path] = []
     pairs: list[str] = []
+    names = [src.name for src in spec.sources]
+    clashing = sorted({name for name in names if names.count(name) > 1})
+    if clashing:
+        raise SystemExit(
+            f"[{spec.name}] sources share a file name, so one would overwrite "
+            f"another in the trial dir: {clashing}"
+        )
     for src in spec.sources:
         target_path = dest / src.name
         shutil.copy(src, target_path)
@@ -162,6 +169,7 @@ def source_build_args(
         args.extend(["-I", str(inc)])
     args.extend(spec.extra_cflags)
     args.extend(str(s) for s in target_sources)
+    args.extend(spec.link_flags)
     return args
 
 
@@ -194,6 +202,8 @@ def bhf_provided_commands(
     build_cmd = [str(bhf), "build", str(work), "--harness", BHF_PROVIDED_ID]
     if spec.extra_cflags:
         build_cmd.extend(["--cflags", " ".join(spec.extra_cflags)])
+    if spec.link_flags:
+        build_cmd.extend(["--ldflags", " ".join(spec.link_flags)])
     return generate, build_cmd
 
 
@@ -1126,6 +1136,7 @@ def apply_recipe(spec: targets.TargetSpec, args) -> targets.TargetSpec:
         sources=prepared.sources,
         include_dirs=prepared.include_dirs + spec.include_dirs,
         extra_cflags=prepared.extra_cflags + spec.extra_cflags,
+        link_flags=prepared.link_flags + spec.link_flags,
         source_sha256={src.name: sha256(src) for src in prepared.sources},
     )
 

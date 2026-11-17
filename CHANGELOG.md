@@ -2711,6 +2711,13 @@
   when bhf panics.
 
 ### Added
+- Pinned build recipes for the trade study's libpng and re2 targets
+  (#371), so all six real-code targets are runnable: libpng's library
+  sources with its prebuilt `pnglibconf.h`, linked with the zlib recipe, and
+  RE2 2023-06-01 (re-pinned: the latest release that builds with a
+  distribution Abseil) against the system Abseil. A recipe can name
+  libraries to link, which bhf's lane passes as `--ldflags`; adapters are
+  named `<target>_adapter`, and two sources with one file name are refused.
 - Pinned build recipes for the trade study's zlib and libyaml targets
   (#370): zlib's core translation units with its checked-in `zconf.h`, and
   libyaml's `src/*.c` with the `config.h` its configure writes for 0.2.5,

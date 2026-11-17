@@ -65,7 +65,7 @@
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic (heap-overflow/UAF) on a parsed input",
-      "notes": "recipe cjson: adapters/cjson.c + cJSON.c (SHA-256 pinned), include_dirs=[checkout].",
+      "notes": "recipe cjson: adapters/cjson_adapter.c + cJSON.c (SHA-256 pinned), include_dirs=[checkout].",
       "recipe": "cjson"
     },
     {
@@ -81,13 +81,13 @@
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic on a decompressed stream",
-      "notes": "recipe zlib: the core .c set (no gz* file I/O) with the checked-in zconf.h, SHA-256 pinned, + adapters/zlib.c.",
+      "notes": "recipe zlib: the core .c set (no gz* file I/O) with the checked-in zconf.h, SHA-256 pinned, + adapters/zlib_adapter.c.",
       "recipe": "zlib"
     },
     {
       "name": "libpng",
       "kind": "self_contained",
-      "status": "requires_build_recipe",
+      "status": "runnable",
       "description": "png_image_begin_read_from_memory \u2014 image decoder",
       "upstream": {
         "url": "https://github.com/pnggroup/libpng.git",
@@ -97,7 +97,8 @@
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while decoding",
-      "notes": "depends on zlib and pnglibconf.h; requires a project build recipe."
+      "notes": "recipe libpng: the library .c set with its prebuilt pnglibconf.h (SHA-256 pinned), linked with the zlib recipe's sources from the zlib checkout (fetch both), + adapters/libpng_adapter.c.",
+      "recipe": "libpng"
     },
     {
       "name": "libyaml",
@@ -112,26 +113,24 @@
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while parsing events",
-      "notes": "recipe libyaml: src/*.c (SHA-256 pinned) with the 0.2.5 version defines config.h would hold, + adapters/libyaml.c.",
+      "notes": "recipe libyaml: src/*.c (SHA-256 pinned) with the 0.2.5 version defines config.h would hold, + adapters/libyaml_adapter.c.",
       "recipe": "libyaml"
     },
     {
       "name": "re2",
       "kind": "self_contained",
-      "status": "requires_build_recipe",
-      "description": "re2::Regexp::Parse \u2014 C++ regex engine (Abseil transitive deps)",
+      "status": "runnable",
+      "description": "RE2 constructor (re2::Regexp::Parse) \u2014 regular expression compiler, 2023-06-01 release",
       "upstream": {
         "url": "https://github.com/google/re2.git",
-        "commit": "972a15cedd008d846f1a39b2e88ce48d7f166cbd"
+        "commit": "03da4fc0857c285e3a26782f6bc8931c4c950df4"
       },
       "target_callback": "re2::Regexp::Parse",
-      "extra_cflags": [
-        "-std=c++17"
-      ],
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while parsing a pattern",
-      "notes": "C++ target with an Abseil build closure; requires a full project/CMake build recipe."
+      "notes": "recipe re2: re2/*.cc + util/{rune,strutil}.cc (SHA-256 pinned) + adapters/re2_adapter.cc, against the system Abseil via pkg-config (libabsl-dev). Pinned to the 2023-06-01 release, the latest that builds with the Abseil distributions ship (20220623); later releases need absl_check.",
+      "recipe": "re2"
     },
     {
       "name": "sqlite",
@@ -149,7 +148,7 @@
       "sanitizer_policy": "asan_ubsan",
       "bhf_harness_mode": "provided",
       "expected_oracle": "any ASan/UBSan diagnostic while preparing a statement",
-      "notes": "recipe sqlite: the amalgamation `make sqlite3.c` generates out of tree (sqlite3.c/.h SHA-256 pinned) + adapters/sqlite.c, single-threaded, no extension loading.",
+      "notes": "recipe sqlite: the amalgamation `make sqlite3.c` generates out of tree (sqlite3.c/.h SHA-256 pinned) + adapters/sqlite_adapter.c, single-threaded, no extension loading.",
       "recipe": "sqlite"
     }
   ]

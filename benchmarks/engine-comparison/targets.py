@@ -98,6 +98,8 @@ class TargetSpec:
     sources: tuple[Path, ...] = ()
     include_dirs: tuple[Path, ...] = ()
     extra_cflags: tuple[str, ...] = ()
+    # Libraries linked after the sources (a recipe's, such as C++ runtimes).
+    link_flags: tuple[str, ...] = ()
     target_callback: str | None = None
     upstream: Upstream | None = None
     seed_dir: Path | None = None
@@ -127,6 +129,7 @@ class TargetSpec:
             "sources": [str(p) for p in self.sources],
             "include_dirs": [str(p) for p in self.include_dirs],
             "extra_cflags": list(self.extra_cflags),
+            "link_flags": list(self.link_flags),
             "target_callback": self.target_callback,
             "upstream": self.upstream.as_dict() if self.upstream else None,
             "seed_dir": str(self.seed_dir) if self.seed_dir else None,

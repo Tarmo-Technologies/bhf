@@ -109,17 +109,24 @@ A target with a `recipe` needs no hand-listed sources. At run time
 (`trade_study.py --manifest ... --sources <fetch root>`), `recipes.py` takes the
 checkout `--fetch` cloned at the pin, checks the SHA-256 of every file it uses,
 generates whatever the project's own build would, checks the generated files
-too, and returns the adapter (`adapters/<name>.c`) and the project's
+too, and returns the adapter (`adapters/<name>_adapter.c`) and the project's
 translation units, include dirs and flags. A checksum mismatch stops the run:
 a moved pin or a changed generator is not the variant the manifest names.
 Generated files live under `<workdir>/recipes/<name>/`.
 
 | Recipe | Builds |
 |---|---|
-| `cjson` | `cJSON.c` (pinned) with `adapters/cjson.c`, which parses the input with `cJSON_ParseWithLengthOpts` and prints what parsed |
-| `sqlite` | the amalgamation SQLite 3.54.0's `configure --disable-tcl && make sqlite3.c` generates out of tree (deterministic under its bundled jimsh; `sqlite3.c`/`sqlite3.h` pinned), with `adapters/sqlite.c`, which runs the input as SQL on an in-memory database (`sqlite3_prepare_v2`, a progress budget and a row cap); `SQLITE_THREADSAFE=0`, no extension loading |
-| `zlib` | the core translation units (no `gz*` file I/O) with the checked-in `zconf.h`, all pinned, with `adapters/zlib.c`, which decompresses the input with `uncompress2` into a 64 KiB buffer |
-| `libyaml` | `src/*.c` (pinned) with the `config.h` its configure writes for 0.2.5, generated into the recipe dir (a header, since a quoted string define does not survive bhf's make recipe), with `adapters/libyaml.c`, which parses the input event by event |
+| `cjson` | `cJSON.c` (pinned) with `adapters/cjson_adapter.c`, which parses the input with `cJSON_ParseWithLengthOpts` and prints what parsed |
+| `sqlite` | the amalgamation SQLite 3.54.0's `configure --disable-tcl && make sqlite3.c` generates out of tree (deterministic under its bundled jimsh; `sqlite3.c`/`sqlite3.h` pinned), with `adapters/sqlite_adapter.c`, which runs the input as SQL on an in-memory database (`sqlite3_prepare_v2`, a progress budget and a row cap); `SQLITE_THREADSAFE=0`, no extension loading |
+| `zlib` | the core translation units (no `gz*` file I/O) with the checked-in `zconf.h`, all pinned, with `adapters/zlib_adapter.c`, which decompresses the input with `uncompress2` into a 64 KiB buffer |
+| `libyaml` | `src/*.c` (pinned) with the `config.h` its configure writes for 0.2.5, generated into the recipe dir (a header, since a quoted string define does not survive bhf's make recipe), with `adapters/libyaml_adapter.c`, which parses the input event by event |
+| `libpng` | the library translation units with the `pnglibconf.h` it ships prebuilt (pinned), linked with the `zlib` recipe's sources from the zlib checkout beside it (fetch both), with `adapters/libpng_adapter.c`, which decodes the input to RGBA with the simplified API |
+| `re2` | RE2 2023-06-01: `re2/*.cc` and `util/{rune,strutil}.cc` (pinned) against the system Abseil through pkg-config (`libabsl-dev`), with `adapters/re2_adapter.cc`, which compiles the input as a pattern under a memory budget and matches it; `-fno-sanitize=vptr`, since the C driver links no UBSan C++ runtime. The pin is the latest release that builds with the Abseil distributions ship (20220623); later ones need `absl_check` |
+
+Each adapter is named `<target>_adapter`, since the trial dir holds every
+source by its file name and RE2 has its own `re2.cc`; two sources with one
+name stop the run. A recipe's libraries (`link_flags`) follow the sources on
+every compiler line, and reach bhf as `bhf build --ldflags`.
 
 A smoke build, `BHF_TRADE_STUDY_SOURCES=<fetch root> python3 -m unittest
 test_runner`, prepares every recipe and builds and runs its libFuzzer harness.

@@ -764,6 +764,20 @@ class RecipeTests(unittest.TestCase):
         for name in sorted(recipes.RECIPES):
             self.assertIn(f"- {name} [self_contained/runnable]", out)
             self.assertIn(f"recipe: {name}", out)
+        # #371: with the three recipe slices, every real-code target runs.
+        self.assertIn("runnable: 6/6", out)
+
+    def test_sources_that_share_a_file_name_are_refused(self):
+        with TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "a" / "re2.cc", Path(tmp) / "b" / "re2.cc"
+            for path in (first, second):
+                path.parent.mkdir()
+                path.write_text("")
+            spec = targets.TargetSpec(
+                name="clash", kind=targets.KIND_SELF_CONTAINED, sources=(first, second)
+            )
+            with self.assertRaisesRegex(SystemExit, "share a file name"):
+                trade_study.materialize_target(spec, Path(tmp) / "dest")
 
     def test_a_checksum_mismatch_or_a_missing_checkout_is_an_error(self):
         with TemporaryDirectory() as tmp:
@@ -795,6 +809,7 @@ class RecipeTests(unittest.TestCase):
                         *prepared.extra_cflags,
                         str(trade_study.HARNESS_ROOT / "libfuzzer.c"),
                         *[str(src) for src in prepared.sources],
+                        *prepared.link_flags,
                         "-o",
                         str(binary),
                     ],
