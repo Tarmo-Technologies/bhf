@@ -284,10 +284,10 @@ ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl winafl libfuzzer msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
+.PHONY: all afl afl_cmplog winafl libfuzzer msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
 all: main$(EXEEXT)
 # The bare goal names, for the binaries named with $(EXEEXT).
-BHF_BINARIES = main main_afl main_winafl main_libfuzzer main_msan main_tsan main_cov main_diff main_prov
+BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_msan main_tsan main_cov main_diff main_prov
 ifneq ($(EXEEXT),)
 .PHONY: $(BHF_BINARIES)
 $(BHF_BINARIES): %: %$(EXEEXT)
@@ -356,6 +356,14 @@ afl: main_afl$(EXEEXT)
 main_afl$(EXEEXT): main.c $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
 	$(AFLPP_CC) $(AFLPP_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(AFLPP_CFLAGS)) -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(AFLPP_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
+# The CmpLog build afl-fuzz runs beside main_afl (`-c main_afl_cmplog`): the
+# same compile under AFL_LLVM_CMPLOG=1, whose comparison operands AFL++'s
+# input-to-state stage reads to solve magic values and checksums.
+afl_cmplog: main_afl_cmplog$(EXEEXT)
+
+main_afl_cmplog$(EXEEXT): main.c $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
+	AFL_LLVM_CMPLOG=1 $(AFLPP_CC) $(AFLPP_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(AFLPP_CFLAGS)) -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(AFLPP_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+
 # Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
 {%- if passthrough_libfuzzer_entrypoint is defined and passthrough_libfuzzer_entrypoint %}
 # The project's own source defines `LLVMFuzzerTestOneInput`, so libFuzzer drives
@@ -414,5 +422,5 @@ main_prov$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_PROV_OBJEC
 BHF_WINAFL_RUN_MARKERS = $(wildcard main_winafl-*.bhf-run)
 
 clean:
-	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_afl_cmplog$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_afl_cmplog main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
 	rm -rf context_objs repair_context_objs

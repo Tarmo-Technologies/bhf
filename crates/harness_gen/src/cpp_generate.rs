@@ -3978,10 +3978,14 @@ mod tests {
         assert!(main.contains("int LLVMFuzzerTestOneInput"));
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
-        assert!(makefile.contains(".PHONY: all afl winafl libfuzzer cov diff syntaxcheck clean"));
+        assert!(makefile
+            .contains(".PHONY: all afl afl_cmplog winafl libfuzzer cov diff syntaxcheck clean"));
         assert!(makefile.contains("winafl: main_winafl"));
         assert!(makefile.contains("AFLPP_CXX ?= afl-clang-fast++"));
         assert!(makefile.contains("afl: main_afl"));
+        // The CmpLog build afl-fuzz runs with `-c` (#274).
+        assert!(makefile.contains("afl_cmplog: main_afl_cmplog$(EXEEXT)"));
+        assert!(makefile.contains("\tAFL_LLVM_CMPLOG=1 $(AFLPP_CXX) $(AFLPP_CXXFLAGS)"));
         assert!(makefile.contains("libfuzzer: main_libfuzzer"));
         assert!(makefile.contains("LIBFUZZER_CXX ?= clang++"));
         assert!(makefile.contains("cov: main_cov"));

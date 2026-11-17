@@ -56,7 +56,13 @@ Generated C/C++ harnesses are Makefile-based. The default build target creates
 runtime), built with ASan and UBSan. It is not a libFuzzer binary;
 `make libfuzzer` builds one for other fuzzers (see the harness's
 `PORTABILITY.md`). `bhf build --c-engine afl++` runs `make afl` and stages
-`main_afl` for `bhf fuzz --engine afl++`. `main_afl` has no bhf driver, so
+`main_afl` for `bhf fuzz --engine afl++`, and `make afl_cmplog` for
+`main_afl_cmplog`, the same build under `AFL_LLVM_CMPLOG=1`; `bhf auto
+--engine afl++` builds both. afl-fuzz runs with `-c main_afl_cmplog -l 2AT`,
+AFL++'s input-to-state stage over the comparison operands it logs, which
+solves magic values and checksums no dictionary holds. Without the CmpLog
+binary (its build failed, or it is older than `main_afl`) afl-fuzz runs
+without `-c`, and bhf says so. `main_afl` has no bhf driver, so
 the comparison evidence of an AFL++ finding (`finding.json` `gates`) is
 recorded by replaying its input through the `main` beside it, which is
 built from the same harness source.

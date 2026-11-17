@@ -426,3 +426,110 @@ fn an_over_read_of_the_input_is_a_heap_buffer_overflow_in_both_engines() {
         );
     }
 }
+
+/// The findings `bhf auto` wrote under `work`.
+fn findings_under(work: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path().join("finding.json")).ok()?;
+            serde_json::from_str(&text).ok()
+        })
+        .collect()
+}
+
+/// The `fuzzer_stats` of every afl-fuzz instance under `work`.
+fn afl_fuzzer_stats(work: &Path) -> Vec<String> {
+    let mut stats = Vec::new();
+    for harness in std::fs::read_dir(work.join("afl_out"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for instance in std::fs::read_dir(harness.path().join("out"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Ok(text) = std::fs::read_to_string(instance.path().join("fuzzer_stats")) {
+                stats.push(text);
+            }
+        }
+    }
+    stats
+}
+
+/// #274: the AFL++ lane builds `main_afl_cmplog` and runs afl-fuzz with
+/// `-c` on it, so AFL++'s input-to-state stage solves a 32-bit magic no
+/// dictionary holds: the constant is combined with a volatile at run time.
+/// Without CmpLog, AFL++ guesses 32 bits blind. AFL++ is required under
+/// `BHF_REQUIRE_TOOLS=1`.
+#[test]
+fn the_afl_lane_runs_cmplog_and_solves_a_magic_no_dictionary_holds() {
+    if !afl_present() || !which("make") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("magic.c"),
+        "#include <stdint.h>\n\
+         #include <stdlib.h>\n\
+         #include <string.h>\n\
+         static volatile uint32_t key = 0x5a5a5a5au;\n\
+         int check_magic(const unsigned char *d, size_t n) {\n\
+         \x20   uint32_t v;\n\
+         \x20   char *slot;\n\
+         \x20   if (n < 4) return 0;\n\
+         \x20   memcpy(&v, d, 4);\n\
+         \x20   if (v != (0x13579bdfu ^ key)) return 0;\n\
+         \x20   slot = malloc(4);\n\
+         \x20   if (!slot) return 0;\n\
+         \x20   slot[4 + (n & 3)] = 1;\n\
+         \x20   free(slot);\n\
+         \x20   return 1;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--engine", "afl++", "--per-target-time", "30"])
+        .args(["--max-targets", "1", "--jobs", "1", "--no-discovery-cache"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(walk_for(&work, "main_afl_cmplog"), "{log}");
+    let stats = afl_fuzzer_stats(&work);
+    let command_line = stats
+        .iter()
+        .flat_map(|text| text.lines())
+        .find(|line| line.starts_with("command_line"))
+        .unwrap_or_else(|| panic!("no fuzzer_stats: {log}"));
+    assert!(
+        command_line.contains(" -c ")
+            && command_line.contains("main_afl_cmplog")
+            && command_line.contains("-l 2AT"),
+        "{command_line}"
+    );
+    let findings = findings_under(&work);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["exception"]["name"] == "ASAN_HEAP_BUFFER_OVERFLOW"),
+        "the magic was not solved: {findings:#?}\n{log}"
+    );
+}

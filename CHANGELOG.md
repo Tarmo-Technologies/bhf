@@ -2781,6 +2781,14 @@
   when bhf panics.
 
 ### Added
+- The AFL++ lane runs CmpLog (#274). The harness Makefile has an
+  `afl_cmplog` target that builds `main_afl_cmplog` under
+  `AFL_LLVM_CMPLOG=1`. `bhf auto --engine afl++` and `bhf build --c-engine
+  afl++` build it beside `main_afl`, and afl-fuzz runs with `-c
+  main_afl_cmplog -l 2AT`, so AFL++ solves magic values and checksums no
+  dictionary holds. The run's `afl` block records `cmplog_binary`. A CmpLog
+  binary older than `main_afl` is not used. The lane ran without CmpLog,
+  which bhf's own comparison measures AFL++ with.
 - `--session-transport transport:<spec>` drives a protocol session through a
   `--target-transport` backend (#261): an on-target agent, a debug probe or
   an emulator, with `--transport-coverage-map` for the gdb and qemu-system

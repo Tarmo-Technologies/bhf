@@ -474,7 +474,7 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 
 | Lane | Black-box (Mayhem base-exe / AFL file) | libFuzzer | AFL++ persistent |
 |---|---|---|---|
-| C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl` |
+| C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl`, `make afl_cmplog` → `./main_afl_cmplog` (`-c`) |
 | Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | — |
 | Ada | `./main < input` (stdin) | — | — |
 

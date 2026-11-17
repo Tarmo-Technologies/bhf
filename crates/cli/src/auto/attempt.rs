@@ -4027,6 +4027,25 @@ fn run_attempt(
                     }
                     crate::auto::lanes::record(&harness_dir, crate::auto::lanes::AFL, afl_lane);
                     if afl_built {
+                        // The CmpLog build afl-fuzz runs with `-c` (#274); without
+                        // it AFL++ still runs, without its input-to-state stage.
+                        let cmplog = crate::build::try_run_c_make_afl_cmplog_build_with_extras(
+                            work_dir,
+                            &candidate.harness_id,
+                            &extra_sources,
+                            &extra_includes,
+                        );
+                        if !cmplog.status.success() {
+                            let _ = std::fs::remove_file(crate::auto::layout::harness_exe(
+                                &harness_dir,
+                                crate::build::AFL_CMPLOG_BINARY,
+                            ));
+                            bhfeprintln!(
+                                "bhf auto: note: {}: `make afl_cmplog` failed, so AFL++ runs \
+                                 without CmpLog (-c)",
+                                candidate.harness_id
+                            );
+                        }
                         // Seed AFL from the corpus the builtin passes grew (deep inputs
                         // reached once stay reachable), plus the base/user seeds.
                         let mut afl_seeds = seeds.clone();

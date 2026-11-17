@@ -1097,6 +1097,35 @@ pub(crate) struct AflRunProvenance {
     pub(crate) afl_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) inst_ranges: Vec<String>,
+    /// The CmpLog binary afl-fuzz ran with `-c` (#274), when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cmplog_binary: Option<PathBuf>,
+}
+
+/// The CmpLog build beside `main_afl` that afl-fuzz runs with `-c` (#274):
+/// `main_afl_cmplog`, for a compile-time-instrumented run, when it is at
+/// least as new as `main_afl` (an older one was built from other sources).
+fn afl_cmplog_binary(main_afl: &Path, mode: AflMode) -> Option<PathBuf> {
+    if mode != AflMode::Native {
+        return None;
+    }
+    let cmplog = main_afl.with_file_name(crate::auto::layout::harness_exe_name(
+        crate::build::AFL_CMPLOG_BINARY,
+    ));
+    let modified = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    match (modified(&cmplog), modified(main_afl)) {
+        (Some(cmplog_time), Some(afl_time)) if cmplog_time >= afl_time => Some(cmplog),
+        (Some(_), _) => {
+            bhfeprintln!(
+                "bhf: {} is older than {}, so afl-fuzz runs without CmpLog (-c); rebuild it \
+                 with `make afl_cmplog`",
+                cmplog.display(),
+                main_afl.display()
+            );
+            None
+        }
+        (None, _) => None,
+    }
 }
 
 /// Throughput in executions/sec, guarding the zero-elapsed case (returns 0.0
@@ -6347,6 +6376,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     // wire up afl-fuzz's persistent-mode handshake and afl-fuzz will
     // hang or behave unpredictably.
     let main_afl = prepared.harness_path.clone();
+    let cmplog_binary = afl_cmplog_binary(&main_afl, prepared.afl_mode);
     let staged_name = main_afl
         .file_name()
         .and_then(|n| n.to_str())
@@ -6420,6 +6450,12 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     // source-less dependency still gets coverage. `native` adds nothing.
     if let Some(mode_flag) = prepared.afl_mode.flag() {
         afl_cmd.arg(mode_flag);
+    }
+    // #274: AFL++'s input-to-state stage over the CmpLog build's comparison
+    // operands, with arithmetic and transform solving (`-l 2AT`), as AFL++
+    // recommends for a CmpLog binary.
+    if let Some(cmplog) = &cmplog_binary {
+        afl_cmd.arg("-c").arg(cmplog).arg("-l").arg("2AT");
     }
     if let Some(dictionary) = &generated_dictionary {
         afl_cmd.arg("-x").arg(dictionary);
@@ -6798,6 +6834,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             mode: prepared.afl_mode.as_str().to_owned(),
             afl_path: prepared.afl_path.clone(),
             inst_ranges: prepared.afl_inst_ranges.clone(),
+            cmplog_binary,
         }),
         winafl: None,
         // The extension `oracle.evaluate` pass is a builtin-engine feature
@@ -11887,9 +11924,10 @@ int bhf_run_one(const uint8_t *data, size_t size) {
 #[cfg(test)]
 mod engine_list_tests {
     use super::{
-        parse_engine_list, read_bounded_head_tail, read_seed_file_prefix, resolve_afl_fuzz,
-        AflMode, FuzzEngine,
+        afl_cmplog_binary, parse_engine_list, read_bounded_head_tail, read_seed_file_prefix,
+        resolve_afl_fuzz, AflMode, FuzzEngine,
     };
+    use std::path::Path;
 
     #[test]
     fn diagnostic_capture_keeps_both_ends_under_a_fixed_bound() {
@@ -11988,6 +12026,35 @@ mod engine_list_tests {
             Some(empty.join("afl-fuzz"))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #274: afl-fuzz runs `-c` on the CmpLog build beside `main_afl` in a
+    /// compile-time-instrumented run, unless it is older than `main_afl`.
+    #[test]
+    fn the_cmplog_build_beside_main_afl_is_used_unless_it_is_stale() {
+        let dir = crate::test_support::TestDir::new("afl-cmplog");
+        let main_afl = dir.join(crate::auto::layout::harness_exe_name("main_afl"));
+        let cmplog = dir.join(crate::auto::layout::harness_exe_name("main_afl_cmplog"));
+        std::fs::write(&main_afl, b"afl").unwrap();
+        assert_eq!(afl_cmplog_binary(&main_afl, AflMode::Native), None);
+        std::fs::write(&cmplog, b"cmplog").unwrap();
+        let at = |path: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        at(&main_afl, 1_000);
+        at(&cmplog, 1_001);
+        assert_eq!(
+            afl_cmplog_binary(&main_afl, AflMode::Native),
+            Some(cmplog.clone())
+        );
+        assert_eq!(afl_cmplog_binary(&main_afl, AflMode::Qemu), None);
+        at(&cmplog, 999);
+        assert_eq!(afl_cmplog_binary(&main_afl, AflMode::Native), None);
     }
 
     #[test]
