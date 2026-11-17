@@ -258,12 +258,19 @@ and retries; these are the ones where that is not enough: a dependency needs
 
 ## Rust
 
-### Rust-1. No native byte decoder — 42 — **GAP**
+### Rust-1. No native byte decoder — 42 — **partly [FIXED]**
 
-A type-system fact: Rust has no universal zero value, and `T::default()` only
-compiles if `T: Default`, which cannot be tested at codegen time without type
-resolution. Emitting it speculatively trades a clean skip for a failed build —
-**measure before assuming that is an improvement**.
+Measured (#338, [the rerun](validation/2026-11-17-rust-trait-and-param-classes.md)).
+An owned parameter of a crate type with a `Default` impl or derive that the
+lane can reach is built from `T::default()`. That moved RecordFlux's
+`Identifier::new(&str, Location)` from a skip to built and fuzzed, and no
+target to a failed build. `Option<T>` of a decodable `T` and `i128`/`u128`
+decode too. Of the 42:
+- 5 build and fuzz;
+- 20 are in-crate setups the lane (#244) cannot complete;
+- 3 fail their build;
+- 12 have no decoder still: references to project types, raw pointers,
+  engine handles (`v8::PinScope`), `&Path`, and the `bytes` crate's `Bytes`.
 
 ### Rust-2. Private-module trait-impl method — 17 — **[FIXED]**
 
@@ -271,14 +278,26 @@ The in-crate lane calls a static trait-impl method by UFCS with a
 `crate`-rooted trait path (a trait of the crate, private modules included) or
 a std conversion trait (`FromStr`, `TryFrom<&[u8]>`, `TryFrom<&str>`), and
 imports the trait of an instance method. A static method of another crate's
-trait is Rust-4's residue.
+trait was Rust-4, fixed since.
 
 ### Rust-3. `unsafe fn` with a caller-upheld precondition — 16 — **BY DESIGN**
 
 Driving it from fuzz bytes means violating the contract, and the resulting crash
 is BHF's fault, not a finding. Correct to refuse.
 
-### Rust-4. Static method of a non-in-crate trait impl — 11 — **GAP**
+### Rust-4. Static method of a non-in-crate trait impl — 11 — **[FIXED]**, residue in #409
+
+A dependency's trait is resolved through the impl file's `use` declarations
+or its full spelling, and the harness crate depends on the trait's crate
+with the target's spec (#338). `From<&[u8]>`/`From<&str>` join the standard
+conversions. In [the rerun](validation/2026-11-17-rust-trait-and-param-classes.md):
+- 7 of meilisearch's 9 `BytesDecode` codecs resolve, then fail to link with
+  undefined monomorphized generics (#409);
+- 2 are impls on a generic type, which need a type argument;
+- one is a `Default::default`, which takes no input;
+- one was not discovered.
+
+The last three refusals now say what they are.
 
 ---
 
@@ -606,8 +625,8 @@ By fixable targets, highest first:
 4. **Go undrivable parameters** (Go-1; 58 before `context.Context` was
    fixed) — the rest are project and library types (`*zap.Logger`,
    `*pflag.FlagSet`).
-5. **Rust decoders** (Rust-1; 42) + static methods of another crate's trait
-   (Rust-4; 11).
+5. **Rust project-type and handle parameters** (Rust-1; 12 of 42 left) and
+   the staticlib link of large workspaces (#409, the Rust-4 residue).
 6. **Java project-type parameters** (Java-1; 29 of the 57 that `results-0728`
    left) — a project or dependency type with no no-arg constructor, factory or
    constant to build it from. JDK collections are decoded since #236.

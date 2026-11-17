@@ -2826,6 +2826,22 @@
   `adapter_report`; `binary scan` adds them as `adapter` to the entry of the
   binary whose SHA-256 the report records (its new `target_sha256`).
   Nothing read the report before.
+- The Rust lane harnesses more targets (#338,
+  `docs/validation/2026-11-17-rust-trait-and-param-classes.md`):
+  - A static method of a dependency's trait impl (`impl heed::BytesDecode
+    for Codec`) is called by UFCS: the trait is resolved through the impl
+    file's `use` declarations or its full spelling, and the harness crate
+    depends on the trait's crate with the target's spec. `From<&[u8]>` and
+    `From<&str>` join the standard conversions.
+  - An owned parameter of a crate type with `Default` is built from
+    `T::default()`, as a `&T` one was; `Option<T>` of a decodable `T` and
+    `i128`/`u128` decode.
+  - The harness crate's `Cargo.lock` starts as the target's, so an offline
+    build resolves a git dependency with no rev and the versions the target
+    was built with.
+
+  A trait-impl method that takes no input, or one on a generic type, is
+  refused with its own reason instead of as an outside trait.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

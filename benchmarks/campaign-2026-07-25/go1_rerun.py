@@ -11,6 +11,8 @@ current bhf drives.
   BHF_BIN=... go1_rerun.py results-0728 results-1116-go3 --class Go-3 --all-lanes
   BHF_BIN=... go1_rerun.py results-0728 results-1116-java1 --lang java --class Java-1 \\
       --all-lanes --jobs 2
+  BHF_BIN=... go1_rerun.py results-0728 results-1117-rust4 --lang rust --class Rust-4 \\
+      --all-lanes --run-untrusted
 
 `--all-lanes` reads every lane's rows, not only the language's own: a project
 the sweep chose for another language can hold its code too. `--jobs` re-runs
@@ -47,8 +49,33 @@ def java_class(target):
     return outcome or "other"
 
 
-# Per language: its source suffix, its classifier, and its lane name.
-LANGS = {"go": (".go", go_class), "java": (".java", java_class)}
+def rust_class(target):
+    """The expected-gaps.md class of a Rust target's outcome."""
+    outcome = target.get("outcome") or ""
+    reason = target.get("reason") or ""
+    if outcome == "built_and_fuzzed":
+        return "built and fuzzed"
+    if "has no bhf-native byte decoder" in reason:
+        return "Rust-1 no byte decoder"
+    if "static method of a non-in-crate trait impl" in reason:
+        return "Rust-4 static method of an outside trait impl"
+    if "trait impl on a generic type" in reason:
+        return "Rust-4 static method of an impl on a generic type"
+    if "takes no input" in reason:
+        return "no input"
+    if outcome == "consent_required":
+        return "consent required"
+    if outcome == "failed_build":
+        return "failed build"
+    return outcome or "other"
+
+
+# Per language: its source suffix and its classifier.
+LANGS = {
+    "go": (".go", go_class),
+    "java": (".java", java_class),
+    "rust": (".rs", rust_class),
+}
 
 
 def wanted_targets(

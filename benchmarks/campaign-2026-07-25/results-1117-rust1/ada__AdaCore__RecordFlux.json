@@ -1,0 +1,46 @@
+{
+ "repo": "AdaCore/RecordFlux",
+ "sha": "d13da982a2277eda4850fe7875e2a6d723d8bd0f",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "identifier.rs",
+   "name": "new",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type 'Location' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  },
+  {
+   "source": "ty.rs",
+   "name": "check_type",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&Ty' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 9,
+  "discovered_total": 9,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 2,
+  "unsupported_params": 6,
+  "unsupported_setup": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

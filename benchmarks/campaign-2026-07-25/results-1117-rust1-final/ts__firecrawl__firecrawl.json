@@ -1,0 +1,34 @@
+{
+ "repo": "firecrawl/firecrawl",
+ "sha": "f18fbe46ffc2bcf91d519e0fc7c4b3605090e328",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "parse.rs",
+   "name": "from_bytes",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `serde_with` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-1-ts__firecrawl__firecrawl/harnesses/H-R0018-5991C4F5/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

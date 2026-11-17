@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "recordapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wiredep = { path = "../wiredep" }

@@ -1,0 +1,107 @@
+{
+ "repo": "AdaCore/RecordFlux",
+ "sha": "d13da982a2277eda4850fe7875e2a6d723d8bd0f",
+ "rc": 0,
+ "targets": [
+  {
+   "source": "identifier.rs",
+   "name": "new",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "ty.rs",
+   "name": "check_type",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&Ty' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 9,
+  "discovered_total": 9,
+  "built": 4,
+  "built_and_fuzzed": 4,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 4,
+  "unsupported_setup": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 2,
+  "fidelity": {
+   "reduced_fidelity_targets": 0,
+   "dimensions": {
+    "arch": {
+     "status": "exercised",
+     "reason": "fuzzed natively on the host x86_64 target"
+    },
+    "endianness": {
+     "status": "exercised",
+     "reason": "native host target ran in little-endian"
+    },
+    "rtos_runtime": {
+     "status": "not_applicable",
+     "reason": "host process target has no RTOS runtime"
+    },
+    "hardware_peripherals": {
+     "status": "not_applicable",
+     "reason": "host process target has no hardware peripherals"
+    },
+    "concurrency": {
+     "status": "not_exercised",
+     "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+    },
+    "sanitizers": {
+     "status": "exercised",
+     "reason": "ran under asan+ubsan"
+    }
+   }
+  }
+ },
+ "findings_detail": [
+  {
+   "id": "F-0000-9dca1100",
+   "rule": "BHF-210",
+   "cwe": [
+    "CWE-617"
+   ],
+   "cwe_name": "Reachable Assertion",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": null,
+   "harness": "H-R0025-D5FD658B",
+   "frames": [
+    "<rust panic>"
+   ],
+   "message": "Rust panic: assertion `left != right` failed"
+  },
+  {
+   "id": "F-0001-9dca1100",
+   "rule": "BHF-210",
+   "cwe": [
+    "CWE-617"
+   ],
+   "cwe_name": "Reachable Assertion",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": null,
+   "harness": "H-R0233-98A906AE",
+   "frames": [
+    "<rust panic>"
+   ],
+   "message": "Rust panic: assertion failed: lower <= upper"
+  }
+ ]
+}
