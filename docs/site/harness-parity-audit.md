@@ -26,7 +26,10 @@ same normalized semantic entrypoint in 13/16 lanes, up from 6/16 before the audi
 The three conservative selection differences were:
 
 - Rust/zoxide, where the expert uses a private in-package database method that a
-  separate public harness crate cannot see;
+  separate public harness crate cannot see. The in-crate lane (`--rust-private`)
+  now reaches it: [rerun on 2026-11-17](../validation/2026-11-17-zoxide-incrate-parity.md),
+  auto picks the private `Database::deserialize` and, run at the expert's
+  endpoint, drives `Database::open_dir` with its database file;
 - COBOL/webbol, where auto and the expert select two different viable deep
   surfaces and both file-resource setup and target entry are supported;
 - PHP/Monolog, where auto and the expert select different viable formatters, but
@@ -56,9 +59,10 @@ reported separately because neither substitutes for the other.
 
 ## Remaining expert-parity gaps
 
-1. **Private Rust and resource recipes.** A controlled in-crate test/fuzz module
-   is needed for private targets, followed by nearby-call-site inference for
-   path-backed constructors and openers.
+1. **Private Rust and resource recipes.** Closed by the in-crate lane
+   (`--rust-private`, #83): it harnesses private targets as a module of a copy
+   of the crate and materializes a resource for a path-backed opener. Zoxide's
+   expert endpoint is entered and covered with it.
 2. **Build-graph fidelity.** Generated files, features, platform SDKs, and full
    project artifacts still defeat reduced source closures in some large Ada,
    C++, C#, Fortran, Java, and Rust projects.

@@ -260,6 +260,8 @@ def run_one(project: dict[str, str], args, output: Path) -> dict[str, object]:
         "bhf_version": args.bhf_version,
         "bhf_sha256": args.bhf_sha256,
     }
+    if args.bhf_arg:
+        row["bhf_args"] = list(args.bhf_arg)
     if source_error:
         row.update(status="source_error", diagnostic=source_error)
     else:
@@ -297,6 +299,7 @@ def run_one(project: dict[str, str], args, output: Path) -> dict[str, object]:
             "--profile",
             "external-tools",
             "--fresh-discovery",
+            *args.bhf_arg,
         ]
         rc, timed_out = run_command(
             argv,
@@ -467,6 +470,9 @@ def main() -> None:
     )
     parser.add_argument("--keep-sources", action="store_true")
     parser.add_argument("--only", action="append", default=[])
+    # Extra `bhf auto` arguments for every project, e.g. `--bhf-arg=--rust-private`;
+    # they are recorded in each row.
+    parser.add_argument("--bhf-arg", action="append", default=[])
     parser.add_argument("--only-language", action="append", default=[])
     parser.add_argument("--limit-per-language", type=int)
     args = parser.parse_args()

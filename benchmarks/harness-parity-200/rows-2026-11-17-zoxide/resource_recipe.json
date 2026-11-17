@@ -1,0 +1,8 @@
+{
+  "schema": "bhf.resource_recipe.v1",
+  "target": "crate::db::Database::open_dir",
+  "path_param": "data_dir: impl AsRef<Path>",
+  "param_index": 0,
+  "kind": "directory opener; a temp dir is seeded with `db.zo` = fuzz input",
+  "assumption": "The fuzzed path points at a bhf-materialized, bounded resource under the supervising runner's per-harness scratch directory (BHF_RES_SCRATCH_DIR), which the runner sweeps after both normal and abnormal child exits; the harness requires that directory and skips target entry if it is absent (no unmanaged temp resource). A finding assumes the target trusts a file beneath the passed path; the fuzz input reaches the target through that file, not through fabricated path bytes."
+}

@@ -1,0 +1,21 @@
+{"e":"shim_loaded"}
+{"e":"exec","a":"execvp","p":"<harness>/main <harness>/main <replay>/input.bin"}
+{"e":"fopen","p":"<replay>/input.bin","d":4,"r":4}
+{"e":"close","d":4,"r":0}
+{"e":"fopen","p":"<replay>/input.bin","d":4,"r":4}
+{"e":"close","d":4,"r":0}
+{"e":"fs_destroy","a":"mkdir","p":"<replay>/res/bhf_res_694485_0"}
+{"e":"open","p":"<replay>/res/bhf_res_694485_0/db.zo","d":4,"r":4}
+{"e":"close","d":4,"r":0}
+{"e":"close","d":4,"r":0}
+{"e":"open","p":"<replay>/res/bhf_res_694485_0/db.zo","d":4,"r":4}
+{"e":"close","d":4,"r":0}
+{"e":"getenv","n":"RUST_LIB_BACKTRACE","r":null}
+{"e":"getenv","n":"RUST_BACKTRACE","r":null}
+{"e":"openat","p":"<replay>/res/bhf_res_694485_0","d":4,"r":4}
+{"e":"fs_destroy","a":"unlinkat","p":"db.zo"}
+{"e":"unlinkat","p":"db.zo","r":0}
+{"e":"fs_destroy","a":"unlinkat","p":"<replay>/res/bhf_res_694485_0"}
+{"e":"unlinkat","p":"<replay>/res/bhf_res_694485_0","r":0}
+{"e":"close","d":1,"r":0}
+{"e":"close","d":2,"r":0}

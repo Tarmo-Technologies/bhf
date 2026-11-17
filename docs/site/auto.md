@@ -315,9 +315,9 @@ assembly. Go coverage retries the exact selected package when module-wide
 instrumentation is blocked by unrelated platform packages.
 
 These behaviors and their residual limits are measured in the
-[200-project expert-parity audit](./harness-parity-audit.md). They do not make
-every project automatically harnessable: private Rust in-crate targets, generated
-or platform-specific build graphs, framework hosts, scientific arrays with coupled
+[200-project expert-parity audit](./harness-parity-audit.md). Private Rust
+targets need `--rust-private`. These behaviors do not make every project
+automatically harnessable: generated or platform-specific build graphs, framework hosts, scientific arrays with coupled
 dimensions, and general constructor/feed/execute/cleanup protocols remain explicit
 gaps rather than silently fabricated successes.
 

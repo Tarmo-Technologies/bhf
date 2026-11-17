@@ -395,3 +395,55 @@ fn the_config_key_enables_the_lane_and_an_unsupported_setup_has_its_own_outcome(
         json["summary"]
     );
 }
+
+/// A private associated function of a module (`Store::decode` in
+/// `src/store/mod.rs`) is visible only inside that module: the harness is
+/// declared as its child, so it builds, fuzzes and finds the planted bug.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
+              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
+)]
+fn a_private_associated_function_of_a_submodule_builds_and_its_bug_is_found() {
+    if !bhf_bin().exists() || !has_cargo_nightly() {
+        eprintln!("skip: needs the bhf binary and `cargo +nightly`");
+        return;
+    }
+    let root = TestDir::new("incrate-assoc");
+    let work = root.join("work");
+    let output = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--run-untrusted",
+            "--rust-private",
+            "--target",
+            "decode",
+        ])
+        .args(["--per-target-time", "15"])
+        .arg(fixture("rust_incrate_private_assoc"))
+        .arg("--work-dir")
+        .arg(&work)
+        .env_remove("BHF_RUST_INCRATE_PRIVATE")
+        .output()
+        .expect("run bhf auto");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    let decode = find_attempt(&json, "decode")
+        .unwrap_or_else(|| panic!("`decode` was attempted:\n{combined}"));
+    assert!(
+        attempt_findings(decode, "decode") > 0,
+        "the planted out-of-bounds read in Store::decode is found:\n{combined}"
+    );
+    let harness = work
+        .join("harnesses")
+        .join(decode["harness_id"].as_str().unwrap());
+    let module = std::fs::read_to_string(harness.join("incrate/src/store/__bhf_harness.rs"))
+        .expect("the harness module is a child of `store`");
+    assert!(module.contains("crate::store::Store::decode("), "{module}");
+}

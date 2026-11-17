@@ -2768,6 +2768,16 @@
   when bhf panics.
 
 ### Added
+- The zoxide harness-parity row is rerun with the in-crate lane (#245,
+  completing #83): with `--rust-private`, auto picks the private
+  `Database::deserialize` and enters and covers it (754 edges), and run at
+  the expert's `Database::open_dir` it materializes `db.zo` and enters and
+  covers that (961 edges)
+  (`docs/validation/2026-11-17-zoxide-incrate-parity.md`). The in-crate lane
+  declares its harness module beside the file that defines the target, so
+  a private associated function of a submodule (zoxide's `deserialize`)
+  compiles; at the crate root it was E0624. The parity runner passes extra
+  `bhf auto` arguments with `--bhf-arg` and records them in each row.
 - `bhf fuzz --session-server-cmd COMMAND` runs the service the session lane
   fuzzes (#260). bhf starts it with its stderr kept, waits until it serves
   the transport's port, and after each session checks whether it exited. A
