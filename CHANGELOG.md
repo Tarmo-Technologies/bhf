@@ -2781,6 +2781,15 @@
   when bhf panics.
 
 ### Added
+- A service the session lane runs with `--session-server-cmd` reports its
+  code coverage (#363). It gets `BHF_COV_SHM`, an edge map bhf keeps for the
+  campaign, which a service built with SanitizerCoverage and the new
+  `c_runtime/bhf_service_cov.c` fills. A session that reaches new code is
+  kept and scheduled as one that reaches a new state is. The summary's
+  `coverage_edges` counts the service's edges, and `coverage_source` says
+  whether it is `service`, `uninstrumented_service` or `none`. The lane
+  folded an empty edge set, so on a one-state protocol it kept nothing past
+  the seeds.
 - The zoxide harness-parity row is rerun with the in-crate lane (#245,
   completing #83): with `--rust-private`, auto picks the private
   `Database::deserialize` and enters and covers it (754 edges), and run at

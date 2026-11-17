@@ -439,6 +439,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "c_runtime/bhf_service_cov.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/actionability/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3168,6 +3172,10 @@
     },
     {
       "path": "crates/cli/tests/seed_lineage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/session_coverage_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -6024,6 +6032,10 @@
     },
     {
       "path": "tests/fixtures/rust_reader_trait/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/session_server/command_server.c",
       "license": "Apache-2.0"
     },
     {

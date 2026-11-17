@@ -26,7 +26,10 @@
 //! (`states_covered` / `transitions_covered`) in distinct fields — never merged
 //! into one number. A plain request/response transport reports no code edges, so
 //! the code channel is honestly zero on such targets while the state channel
-//! carries the novelty.
+//! carries the novelty. A service bhf runs (`--session-server-cmd`) built with
+//! `c_runtime/bhf_service_cov.c` reports its edges after each session (#363),
+//! and a session that reaches new code is kept as one that reaches a new state
+//! is.
 //!
 //! Nothing here names a downstream consumer: a finding is emitted for importers /
 //! SARIF / vulnerability-management tools to read.
@@ -707,6 +710,10 @@ pub(crate) struct SessionFuzzSummary {
     pub coverage_edges: usize,
     /// Code-coverage channel (block/hit-count bits).
     pub coverage_blocks: usize,
+    /// Where the code channel's edges come from: `service`, a service bhf
+    /// runs with an edge map (#363); `uninstrumented_service`, one that never
+    /// wrote it; or `none`.
+    pub coverage_source: String,
     /// Protocol-state channel: distinct states visited.
     pub states_covered: usize,
     /// Protocol-state channel: distinct transitions walked.
@@ -801,11 +808,12 @@ fn should_stop(
 /// Turn a capped state-novelty delta into scheduler feedback. The state
 /// contribution rides the breadcrumb channel (weighted by the scheduler's
 /// `breadcrumb_bit_bonus`) and is clamped so it cannot dominate code coverage.
-fn schedule_feedback(delta: StateNoveltyDelta) -> ScheduleFeedback {
-    let bits = (delta.new_states + delta.new_transitions).min(STATE_NOVELTY_CAP) as u32;
+fn schedule_feedback(delta: StateNoveltyDelta, new_edges: usize) -> ScheduleFeedback {
+    let state = (delta.new_states + delta.new_transitions).min(STATE_NOVELTY_CAP);
     ScheduleFeedback {
         new_exception_signatures: 0,
-        new_breadcrumb_bits: bits,
+        // The service's new code edges count in full (#363).
+        new_breadcrumb_bits: u32::try_from(state.saturating_add(new_edges)).unwrap_or(u32::MAX),
     }
 }
 
@@ -912,7 +920,8 @@ fn persist_disconnect(
 
 /// Drive one candidate against the transport, folding both novelty channels and
 /// emitting a finding (deduped by rule|oracle) on a clean-exit violation.
-/// Returns the state-novelty delta and whether a NEW finding was emitted.
+/// Returns the state-novelty delta, how many service edges it reached first,
+/// and whether a NEW finding was emitted.
 ///
 /// A session the target drops is a crash candidate: it is kept, driven again
 /// on a new connection, and written as a finding when the target drops it at
@@ -932,7 +941,7 @@ fn drive_candidate(
     finding_ids: &mut Vec<String>,
     tally: &mut CrashTally,
     server: Option<&mut SessionServer>,
-) -> Result<(StateNoveltyDelta, bool), SessionFuzzError> {
+) -> Result<(StateNoveltyDelta, usize, bool), SessionFuzzError> {
     // With a service bhf runs, a refused connection is the service gone: look
     // at it before counting a failure to connect.
     let (driven, refused) = match server {
@@ -948,7 +957,11 @@ fn drive_candidate(
             false,
         ),
     };
+    let mut new_edges = 0;
     if let Some(server) = server {
+        // The map outlives the process, so a session that crashed the service
+        // still counts the code it reached.
+        new_edges = code_novelty.observe(&server.coverage_edges());
         let lost = refused
             || driven
                 .as_ref()
@@ -979,7 +992,7 @@ fn drive_candidate(
                 finding_ids,
                 tally,
             )?;
-            return Ok((delta, new_finding));
+            return Ok((delta, new_edges, new_finding));
         }
         if refused {
             drive_counting(runner, &candidate.messages, transport, tally)?;
@@ -987,13 +1000,10 @@ fn drive_candidate(
     }
     tally.previous = Some(candidate.clone());
     let Some(run) = driven else {
-        return Ok((StateNoveltyDelta::default(), false));
+        return Ok((StateNoveltyDelta::default(), new_edges, false));
     };
 
     let delta = state_novelty.observe(&run.state_ids, &run.transitions);
-    // The session seam carries no code-coverage edges; fold an empty set so the
-    // code channel stays present (and honestly zero) alongside the state channel.
-    code_novelty.observe(&[]);
 
     let mut new_finding = false;
     if let SessionVerdict::Disconnected {
@@ -1009,7 +1019,7 @@ fn drive_candidate(
         });
         if !confirmed {
             tally.unconfirmed += 1;
-            return Ok((delta, false));
+            return Ok((delta, new_edges, false));
         }
         let _ = std::fs::remove_file(kept);
         tally.crashes += 1;
@@ -1058,7 +1068,7 @@ fn drive_candidate(
             new_finding = true;
         }
     }
-    Ok((delta, new_finding))
+    Ok((delta, new_edges, new_finding))
 }
 
 /// The service exited after `blamed` ran: start it again, drive `blamed`
@@ -1199,7 +1209,7 @@ pub(crate) fn run_session_campaign(
             break;
         }
         let serialized = seed.to_json().map_err(SessionFuzzError::Serialize)?;
-        let (delta, _) = drive_candidate(
+        let (delta, new_edges, _) = drive_candidate(
             seed,
             &runner,
             transport,
@@ -1213,7 +1223,7 @@ pub(crate) fn run_session_campaign(
             server.as_deref_mut(),
         )?;
         executions += 1;
-        scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
+        scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta, new_edges));
     }
 
     // --- mutation phase: scheduler-driven structured mutation. ---
@@ -1252,7 +1262,7 @@ pub(crate) fn run_session_campaign(
             }
             let candidate = mutate_one(&parent, model, &mut rng, &dictionary, config.max_messages);
             let serialized = candidate.to_json().map_err(SessionFuzzError::Serialize)?;
-            let (delta, _) = drive_candidate(
+            let (delta, new_edges, _) = drive_candidate(
                 &candidate,
                 &runner,
                 transport,
@@ -1266,8 +1276,12 @@ pub(crate) fn run_session_campaign(
                 server.as_deref_mut(),
             )?;
             executions += 1;
-            if delta.is_novel() {
-                scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
+            // A new protocol state, or new code in the service (#363).
+            if delta.is_novel() || new_edges > 0 {
+                scheduler.insert_with_feedback(
+                    serialized.into_bytes(),
+                    schedule_feedback(delta, new_edges),
+                );
                 corpus_new += 1;
             }
         }
@@ -1286,6 +1300,14 @@ pub(crate) fn run_session_campaign(
         corpus_new,
         coverage_edges: code_novelty.edges_covered(),
         coverage_blocks: 0,
+        coverage_source: match server.as_ref().is_some_and(|server| server.has_coverage()) {
+            true if code_novelty.edges_covered() > 0 => "service",
+            // A map the service never wrote: it was not built with
+            // `c_runtime/bhf_service_cov.c` and SanitizerCoverage.
+            true => "uninstrumented_service",
+            false => "none",
+        }
+        .to_owned(),
         states_covered: state_novelty.states_covered(),
         transitions_covered: state_novelty.transitions_covered(),
         crashes: tally.crashes,
@@ -1813,7 +1835,12 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
                 port,
                 udp,
                 &args.work_dir.join("session_server"),
-            );
+            )
+            .with_coverage(&args.work_dir)
+            .map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                2
+            })?;
             server.start().map_err(|error| {
                 crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
                 2

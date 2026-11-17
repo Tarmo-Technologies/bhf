@@ -13,6 +13,11 @@
 //!
 //! The command runs through the platform shell (`sh -c`, `cmd /C`) in its own
 //! process group, which is killed when the server is stopped or bhf exits.
+//!
+//! With [`SessionServer::with_coverage`] the service also gets `BHF_COV_SHM`
+//! (#363): a map bhf owns, one byte per edge, that a service built with
+//! SanitizerCoverage and `c_runtime/bhf_service_cov.c` fills. It outlives a
+//! restart, so coverage accumulates over the campaign.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -30,6 +35,8 @@ pub(crate) const SERVER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const UDP_SETTLE: Duration = Duration::from_millis(300);
 /// How much of a service's stderr a finding keeps.
 const STDERR_CAP: u64 = 256 * 1024;
+/// The size of the service's edge map: one byte per edge, as bhf_driver.c's.
+const COVERAGE_MAP_BYTES: usize = 1 << 16;
 /// The sanitizer options a service runs with unless the environment sets its
 /// own: report and exit on the first error, with no leak check at exit.
 const DEFAULT_ASAN_OPTIONS: &str = "halt_on_error=1:abort_on_error=0:detect_leaks=0:symbolize=1";
@@ -52,6 +59,13 @@ pub(crate) struct SessionServer {
     log_dir: PathBuf,
     child: Option<Running>,
     starts: usize,
+    coverage: Option<CoverageMap>,
+}
+
+/// The edge map a service writes, and the path it is told.
+struct CoverageMap {
+    _file: crate::fuzz::shared_map::SharedMapFile,
+    path: String,
 }
 
 struct Running {
@@ -72,7 +86,39 @@ impl SessionServer {
             log_dir: log_dir.to_path_buf(),
             child: None,
             starts: 0,
+            coverage: None,
         }
+    }
+
+    /// Give the service an edge map in `work_dir`'s shared-map dir, which it
+    /// fills when built with `c_runtime/bhf_service_cov.c`.
+    pub(crate) fn with_coverage(mut self, work_dir: &Path) -> Result<Self, String> {
+        let (file, path) =
+            crate::fuzz::shared_map::SharedMapFile::create(work_dir, COVERAGE_MAP_BYTES)?;
+        self.coverage = Some(CoverageMap { _file: file, path });
+        Ok(self)
+    }
+
+    /// Whether the service is given an edge map.
+    pub(crate) fn has_coverage(&self) -> bool {
+        self.coverage.is_some()
+    }
+
+    /// The edges the service has reached so far, by index; none when it has
+    /// no map, or is not instrumented.
+    pub(crate) fn coverage_edges(&self) -> Vec<u64> {
+        let Some(coverage) = &self.coverage else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(&coverage.path) else {
+            return Vec::new();
+        };
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte != 0)
+            .map(|(index, _)| index as u64)
+            .collect()
     }
 
     /// The command line the service runs.
@@ -105,6 +151,9 @@ impl SessionServer {
             .stderr(stderr);
         if std::env::var_os("ASAN_OPTIONS").is_none() {
             command.env("ASAN_OPTIONS", DEFAULT_ASAN_OPTIONS);
+        }
+        if let Some(coverage) = &self.coverage {
+            command.env("BHF_COV_SHM", &coverage.path);
         }
         replay_min::process::isolate_process_group(&mut command);
         let child = command

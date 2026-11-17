@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
-mod shared_map;
+pub(crate) mod shared_map;
 pub(crate) mod typed_spans;
 mod winafl;
 pub use winafl::{WinaflInstrumentation, WinaflSettings};

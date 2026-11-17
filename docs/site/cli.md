@@ -1564,6 +1564,22 @@ exits before it serves its port, or does not serve it within 10s, stops the
 run with exit `2` and its stderr. `bhf replay` and `bhf minimize` of such a
 finding start the service for each drive.
 
+The service also gets `BHF_COV_SHM`, an edge map bhf keeps for the campaign.
+A service built with SanitizerCoverage and bhf's `c_runtime/bhf_service_cov.c`
+fills it: bhf reads the edges after each session and keeps a session that
+reached new code, as one that reached a new protocol state is. The map
+outlives a restart of the service.
+
+```sh
+clang -fsanitize=address -fsanitize-coverage=trace-pc-guard \
+  echo_server.c /path/to/bhf/c_runtime/bhf_service_cov.c -o build/echo_server
+```
+
+GCC builds use `-fsanitize-coverage=trace-pc`. The summary's `coverage_edges`
+counts the service's edges. Its `coverage_source` is `service`, or
+`uninstrumented_service` for a service that never wrote the map; without
+`--session-server-cmd` it is `none`.
+
 ```sh
 bhf fuzz bhf_work --harness H-PROTO \
   --protocol-profile profiles/echo.toml \
