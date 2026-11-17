@@ -315,6 +315,24 @@ The `kind`, `addr`, `detail_len` and `detail` fields are sent only when
 edges or a detail over 64 KiB before it allocates. The agent has no stdout
 channel.
 
+### Several targets at once
+
+`--workers N` drives N targets, one per worker: name each worker's in the spec
+with `{worker}` (0 to N-1) or `{BASE+worker}`:
+
+```sh
+bhf fuzz bhf_work --harness H-C0001 --workers 4 \
+  --target-transport agent:tcp:127.0.0.1:{9000+worker}
+```
+
+The workers share one corpus, coverage map and schedule, so an input one
+worker keeps is mutated by all of them. They also share one finding set: a
+fault several workers reach is one finding. Its transport profile names the
+spec of the worker that found it, and `bhf replay` re-drives it there.
+`--iterations` and `--time` are the whole campaign's, and the summary's
+`workers` counts the workers. A run-control halt on one target (a hang, a
+lost link) stops the campaign, as it does for one worker.
+
 ### 3d. Protocol sessions on the target
 
 A stateful command set on the board is fuzzed as sessions by naming the
@@ -540,9 +558,9 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   each connection/read/write (`--timeout`), and dials the resource on the first
   execution (a dead endpoint fails with a connection error, not
   "unimplemented"). It takes the seed, length, time, iteration, timeout,
-  deadline and RNG-seed flags; a host-lane flag it does not wire (`--workers`,
-  `--grammar`, `--cmplog-log` and the others [cli.md](cli.md) lists) is
-  refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
+  deadline, RNG-seed, `--dict`, `--grammar` and `--workers` flags; a host-lane
+  flag it does not wire (`--cmplog-log`, `--len-control` and the others
+  [cli.md](cli.md) lists) is refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
   when `qemu-system-arm` + `arm-none-eabi-gcc` are installed) drives the real
   mps2-an385 fixture through the shipped `bhf fuzz --target-transport
   qemu-system:…` binary and asserts it plants the breakpoint itself and persists

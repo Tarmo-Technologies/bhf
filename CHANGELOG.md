@@ -2812,6 +2812,13 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --target-transport ... --workers N` drives N targets at once
+  (#316). The spec names each worker's with `{worker}` or `{BASE+worker}`
+  (`agent:tcp:127.0.0.1:{9000+worker}`). The workers share one corpus,
+  coverage map, schedule and finding set, the iteration cap and time budget
+  are the campaign's, and a finding's transport profile names the spec of
+  the worker that found it. A spec without a template is refused with
+  `--workers`. The transport lane was single-worker.
 - The reference agent runs as a FreeRTOS task under `qemu-system-arm`
   (#290). `crates/target_transport/tests/freertos/agent_task.c` serves the
   agent protocol over UART0 of `mps2-an385`, which `-serial tcp:` makes a
