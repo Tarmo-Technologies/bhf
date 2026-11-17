@@ -46,6 +46,7 @@
 //! backend is exercised end-to-end with no hardware.
 
 pub mod agent;
+pub mod cmplog;
 pub mod coverage;
 pub mod cycles;
 pub mod error;
@@ -60,6 +61,7 @@ mod wire;
 pub mod host;
 
 pub use agent::{AgentLimits, AgentSession, AgentTransport};
+pub use cmplog::{CmpLogRegion, Comparison};
 pub use coverage::{edges_from_events, MemoryBufferReader, SemihostingReader};
 pub use error::{Result, TransportError};
 pub use fullsystem::{

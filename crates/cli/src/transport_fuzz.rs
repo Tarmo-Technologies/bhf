@@ -57,7 +57,7 @@ use fuzz_engine_builtin::{
 use serde::Serialize;
 use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
-    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
+    AgentTransport, CmpLogRegion, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
     GuestFaultStatus, InputContract, RunOutcome, TargetSession, TargetTransport, TransportError,
 };
 
@@ -188,6 +188,8 @@ pub(crate) enum TransportPlan {
         cycles: Option<CycleCounter>,
         /// The address of the firmware's task identity word (`task_id=`, #252).
         task_id: Option<u64>,
+        /// The firmware's comparison record (`cmplog=`, #386).
+        cmplog: Option<CmpLogRegion>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -216,6 +218,8 @@ pub(crate) enum TransportPlan {
         cycles: Option<CycleCounter>,
         /// The address of the firmware's task identity word (`task_id=`, #252).
         task_id: Option<u64>,
+        /// The firmware's comparison record (`cmplog=`, #386).
+        cmplog: Option<CmpLogRegion>,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -272,9 +276,12 @@ pub(crate) enum TransportSpecError {
 
     #[error(
         "--transport-coverage-map has unknown key {key:?} (allowed: input, input_cap, \
-         input_len, ring, write, wrapped, cap)"
+         input_len, ring, write, wrapped, cap, cmplog, cmplog_cap)"
     )]
     UnknownMapKey { key: String },
+
+    #[error("--transport-coverage-map: {0}")]
+    CmpLog(String),
 
     #[error("coverage ring capacity {cap} is not representable as a host-sized length")]
     CapTooLarge { cap: u64 },
@@ -345,7 +352,7 @@ impl TransportPlan {
         }
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
-            let (map, input) = require_coverage_map("gdb", coverage_map)?;
+            let (map, input, cmplog) = require_coverage_map("gdb", coverage_map)?;
             // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
             let mut parts = rest.split(',');
             let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
@@ -377,12 +384,13 @@ impl TransportPlan {
                 firmware,
                 cycles: cycles.counter("gdb", spec)?,
                 task_id,
+                cmplog,
             });
         }
 
         if let Some(rest) = spec.strip_prefix("qemu-system:") {
-            let (map, input) = require_coverage_map("qemu-system", coverage_map)?;
-            return parse_qemu_system(spec, rest, map, input);
+            let (map, input, cmplog) = require_coverage_map("qemu-system", coverage_map)?;
+            return parse_qemu_system(spec, rest, map, input, cmplog);
         }
 
         Err(TransportSpecError::UnknownBackend {
@@ -417,6 +425,7 @@ impl TransportPlan {
                 firmware: _,
                 cycles,
                 task_id,
+                cmplog,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
@@ -425,7 +434,8 @@ impl TransportPlan {
                     .with_exec_deadline(io_timeout)
                     .with_input_contract(Some(input))
                     .with_cycle_counter(cycles)
-                    .with_task_id(task_id),
+                    .with_task_id(task_id)
+                    .with_cmplog(cmplog),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -440,6 +450,7 @@ impl TransportPlan {
                 firmware: _,
                 cycles,
                 task_id,
+                cmplog,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -450,7 +461,8 @@ impl TransportPlan {
                 )?
                 .with_input_contract(Some(input))
                 .with_cycle_counter(cycles)
-                .with_task_id(task_id);
+                .with_task_id(task_id)
+                .with_cmplog(cmplog);
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -496,6 +508,14 @@ impl TransportPlan {
         }
     }
 
+    /// The firmware's comparison record the coverage map names (`cmplog=`).
+    pub(crate) fn cmplog(&self) -> Option<CmpLogRegion> {
+        match self {
+            Self::Gdb { cmplog, .. } | Self::QemuSystem { cmplog, .. } => *cmplog,
+            _ => None,
+        }
+    }
+
     /// What the parser corrected in the spec (a Thumb `done=` address).
     pub(crate) fn notes(&self) -> &[String] {
         match self {
@@ -531,7 +551,7 @@ fn reject_coverage_map(coverage_map: Option<&str>) -> Result<(), TransportSpecEr
 fn require_coverage_map(
     backend: &'static str,
     coverage_map: Option<&str>,
-) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
     let map = coverage_map
         .filter(|m| !m.trim().is_empty())
         .ok_or(TransportSpecError::MissingCoverageMap { backend })?;
@@ -543,6 +563,7 @@ fn parse_qemu_system(
     rest: &str,
     map: GdbMemoryMap,
     input: InputContract,
+    cmplog: Option<CmpLogRegion>,
 ) -> Result<TransportPlan, TransportSpecError> {
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
@@ -643,6 +664,7 @@ fn parse_qemu_system(
         firmware,
         cycles: cycles.counter("qemu-system", spec)?,
         task_id,
+        cmplog,
         notes,
     })
 }
@@ -723,7 +745,12 @@ fn parse_host_port(
     Ok((host.to_owned(), port))
 }
 
-fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
+/// The most CmpLog entries one read takes: the gdb client's read cap.
+const MAX_CMPLOG_CAPACITY: u64 = 43_690;
+
+fn parse_coverage_map(
+    spec: &str,
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
     let mut input = None;
     let mut ring = None;
     let mut write = None;
@@ -731,6 +758,8 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
     let mut cap = None;
     let mut input_cap = None;
     let mut input_len = None;
+    let mut cmplog = None;
+    let mut cmplog_cap = None;
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -752,6 +781,8 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
             "cap" => cap = Some(parse_int(key, value)?),
             "input_cap" => input_cap = Some(parse_int(key, value)?),
             "input_len" => input_len = Some(parse_int(key, value)?),
+            "cmplog" => cmplog = Some(parse_int(key, value)?),
+            "cmplog_cap" => cmplog_cap = Some(parse_int(key, value)?),
             other => {
                 return Err(TransportSpecError::UnknownMapKey {
                     key: other.to_owned(),
@@ -778,7 +809,33 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
     let capacity = usize::try_from(input_cap)
         .map_err(|_| TransportSpecError::CapTooLarge { cap: input_cap })?;
     let contract = InputContract::new(capacity, input_len)?;
-    Ok((map, contract))
+    // The comparison record (#386): its address and its entry capacity, which
+    // the firmware's declaration fixes, so neither is guessed.
+    let cmplog = match (cmplog, cmplog_cap) {
+        (None, None) => None,
+        (Some(address), Some(cap)) if (1..=MAX_CMPLOG_CAPACITY).contains(&cap) => {
+            Some(CmpLogRegion {
+                address,
+                capacity: cap as usize,
+            })
+        }
+        (Some(_), Some(cap)) => {
+            return Err(TransportSpecError::CmpLog(format!(
+                "cmplog_cap={cap} is outside 1..={MAX_CMPLOG_CAPACITY}"
+            )))
+        }
+        (Some(_), None) => {
+            return Err(TransportSpecError::CmpLog(
+                "cmplog= needs cmplog_cap=N, the record's entry capacity".to_owned(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(TransportSpecError::CmpLog(
+                "cmplog_cap= needs cmplog=ADDR, the record's address".to_owned(),
+            ))
+        }
+    };
+    Ok((map, contract, cmplog))
 }
 
 /// Parse a decimal or `0x`-hex unsigned integer.
@@ -903,6 +960,9 @@ pub(crate) struct TransportFuzzSummary {
     pub target_cycles: Option<CycleStats>,
     /// The workers that drove the campaign, one transport each (#316).
     pub workers: usize,
+    /// The comparisons the firmware's CmpLog record reported, over all runs
+    /// (`cmplog=`, #386).
+    pub comparisons: usize,
     pub elapsed_secs: f64,
 }
 
@@ -1107,6 +1167,10 @@ struct CampaignState {
     halted: Option<String>,
     // The target cycles of each completed run, when the spec reads a counter.
     target_cycles: Option<CycleStats>,
+    /// The comparisons each corpus member's run recorded (#386), keyed by the
+    /// member's bytes: the mutator splices their operands into it.
+    cmplogs: std::collections::HashMap<Vec<u8>, std::sync::Arc<cmplog::CmpLog>>,
+    comparisons: usize,
 }
 
 impl Campaign {
@@ -1138,6 +1202,8 @@ impl Campaign {
                 class_counts: std::collections::HashMap::new(),
                 halted: None,
                 target_cycles: None,
+                cmplogs: std::collections::HashMap::new(),
+                comparisons: 0,
             }),
         }
     }
@@ -1183,6 +1249,7 @@ impl Campaign {
         if outcome.inconclusive.is_some() {
             state.inconclusive_observations += 1;
         }
+        state.comparisons += outcome.target.comparisons.len();
         let feedback = fold_coverage(&mut state.coverage, &outcome.coverage_edges);
         if seed {
             // Seeds are always corpus members.
@@ -1190,6 +1257,7 @@ impl Campaign {
                 .scheduler
                 .insert_with_feedback(input, feedback.to_schedule_feedback());
             state.seeds_in_flight -= 1;
+            keep_cmplog(state, input, outcome);
         } else if outcome.exit == ExitKind::Ok
             && outcome.inconclusive.is_none()
             && (feedback.new_bitmap_bits() > 0 || feedback.new_exception_signatures > 0)
@@ -1203,6 +1271,7 @@ impl Campaign {
                 .scheduler
                 .insert_with_feedback(input, feedback.to_schedule_feedback());
             state.corpus_new += 1;
+            keep_cmplog(state, input, outcome);
         }
         let before = state.finding_ids.len();
         handle_outcome(
@@ -1266,8 +1335,30 @@ impl Campaign {
             halted: state.halted,
             target_cycles: state.target_cycles,
             workers: config.worker_specs.len().max(1),
+            comparisons: state.comparisons,
             elapsed_secs: start.elapsed().as_secs_f64(),
         })
+    }
+}
+
+/// Keep the comparisons a new corpus member's run recorded, as the CmpLog
+/// its mutations splice from: an operand found in the input is replaced with
+/// the value it was compared against (#386).
+fn keep_cmplog(state: &mut CampaignState, input: &[u8], outcome: &RunOutcome) {
+    let mut log = cmplog::CmpLog::new();
+    for comparison in &outcome.target.comparisons {
+        log.record(cmplog::CmpEntry {
+            site_id: u64::from(comparison.site),
+            operand_a: comparison.lhs_bytes(),
+            operand_b: comparison.rhs_bytes(),
+            kind: cmplog::CmpKind::IntegerCompare,
+        });
+    }
+    log.retain_spliceable(input);
+    if !log.entries.is_empty() {
+        state
+            .cmplogs
+            .insert(input.to_vec(), std::sync::Arc::new(log));
     }
 }
 
@@ -1336,7 +1427,10 @@ fn run_worker(
                 break;
             }
             match state.scheduler.select_next() {
-                Some(scheduled) => scheduled,
+                Some(scheduled) => {
+                    let cmplog = state.cmplogs.get(&scheduled.bytes).cloned();
+                    (scheduled, cmplog)
+                }
                 // Another worker's seed may yet arrive.
                 None if state.seeds_in_flight > 0 => {
                     drop(state);
@@ -1347,6 +1441,7 @@ fn run_worker(
                 None => break,
             }
         };
+        let (scheduled, cmplog) = scheduled;
         // The scheduler's power schedule sets how many children this seed earns.
         let children = scheduled.energy.max(1);
         for _ in 0..children {
@@ -1372,13 +1467,12 @@ fn run_worker(
                             )
                         })
                         .unwrap_or_default();
-                    mutator
-                        .mutate(
-                            &MutationInput::new(&scheduled.bytes, &dictionary)
-                                .with_typed_spans(&spans),
-                            &mut rng,
-                        )
-                        .map(|result| result.bytes)
+                    let mut input =
+                        MutationInput::new(&scheduled.bytes, &dictionary).with_typed_spans(&spans);
+                    if let Some(log) = cmplog.as_deref() {
+                        input = input.with_cmplog(log);
+                    }
+                    mutator.mutate(&input, &mut rng).map(|result| result.bytes)
                 }
             };
             let input = generated.unwrap_or_else(|| scheduled.bytes.clone());
@@ -2200,10 +2294,12 @@ mod tests {
                 firmware,
                 cycles,
                 task_id,
+                cmplog,
             } => {
                 assert_eq!(firmware, None);
                 assert_eq!(cycles, None);
                 assert_eq!(task_id, None);
+                assert_eq!(cmplog, None);
                 assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
@@ -2276,6 +2372,7 @@ mod tests {
                 firmware: _,
                 cycles: _,
                 task_id: _,
+                cmplog: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
@@ -2349,6 +2446,41 @@ mod tests {
                 assert_eq!(status.clear_value, 0xff);
             }
             other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    /// #386: `cmplog=` and `cmplog_cap=` name the firmware's comparison
+    /// record, both or neither, with a capacity one read can take.
+    #[test]
+    fn the_coverage_map_names_a_cmplog_record() {
+        let base = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2",
+            Some(&format!("{base},cmplog=0x20000258,cmplog_cap=32")),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.cmplog(),
+            Some(CmpLogRegion {
+                address: 0x2000_0258,
+                capacity: 32
+            })
+        );
+        let plan = TransportPlan::parse("gdb:h:2", Some(base)).unwrap();
+        assert_eq!(plan.cmplog(), None);
+        for (extra, says) in [
+            (",cmplog=0x2000", "cmplog= needs cmplog_cap=N"),
+            (",cmplog_cap=8", "cmplog_cap= needs cmplog=ADDR"),
+            (",cmplog=0x2000,cmplog_cap=0", "cmplog_cap=0 is outside"),
+            (
+                ",cmplog=0x2000,cmplog_cap=43691",
+                "cmplog_cap=43691 is outside",
+            ),
+        ] {
+            let error = TransportPlan::parse("gdb:h:2", Some(&format!("{base}{extra}")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(says), "{extra}: {error}");
         }
     }
 

@@ -293,6 +293,8 @@ pub struct MockGdbStub<C: Read + Write> {
     /// Raw payloads emitted as `O<hex>` console-output packets before the stop
     /// reply on a `c`, modeling a target that prints while it runs.
     console_output: Vec<Vec<u8>>,
+    /// Memory the target writes while it runs, applied on each `c`.
+    run_writes: Vec<(u64, Vec<u8>)>,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -305,7 +307,15 @@ impl<C: Read + Write> MockGdbStub<C> {
             stop_reply: b"S05".to_vec(),
             registers: vec![0_u8; 4],
             console_output: Vec::new(),
+            run_writes: Vec::new(),
         }
+    }
+
+    /// On each `c`, write `data` at `address` before the stop reply, modeling
+    /// a target that records something (a comparison log) while it runs.
+    pub fn with_run_write(mut self, address: u64, data: Vec<u8>) -> Self {
+        self.run_writes.push((address, data));
+        self
     }
 
     /// Register a memory region served for `m`/`M`.
@@ -383,6 +393,13 @@ impl<C: Read + Write> MockGdbStub<C> {
                     self.connection.send_packet(&reply)?;
                 }
                 b'c' => {
+                    for (address, data) in self.run_writes.clone() {
+                        for region in &mut self.regions {
+                            if let Some(offset) = region.contains(address, data.len()) {
+                                region.data[offset..offset + data.len()].copy_from_slice(&data);
+                            }
+                        }
+                    }
                     // Emit any scripted console output as `O<hex>` packets first,
                     // exactly as a real stub does while the target prints, then
                     // the terminal stop reply.

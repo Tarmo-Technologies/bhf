@@ -394,6 +394,7 @@ pub struct FullSystemTransport<FQ, FG> {
     input_contract: Option<crate::gdb::InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
+    cmplog: Option<crate::cmplog::CmpLogRegion>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -418,6 +419,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             input_contract: None,
             cycle_counter: None,
             task_id_address: None,
+            cmplog: None,
         })
     }
 
@@ -432,6 +434,14 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// [`RunOutcome::target`] (#251).
     pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
         self.cycle_counter = counter;
+        self
+    }
+
+    /// Clear the firmware's CmpLog record in `region` before each run and
+    /// report the comparisons it holds after it in [`RunOutcome::target`]
+    /// (#386).
+    pub fn with_cmplog(mut self, region: Option<crate::cmplog::CmpLogRegion>) -> Self {
+        self.cmplog = region;
         self
     }
 
@@ -520,6 +530,7 @@ where
             input_contract: self.input_contract,
             cycle_counter: self.cycle_counter,
             task_id_address: self.task_id_address,
+            cmplog: self.cmplog,
         }))
     }
 }
@@ -536,6 +547,7 @@ pub struct FullSystemSession<CQ, CG> {
     input_contract: Option<crate::gdb::InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
+    cmplog: Option<crate::cmplog::CmpLogRegion>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -560,6 +572,10 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
             self.input_contract.as_ref(),
             input,
         )?;
+        // The snapshot holds the record as it was at arm: start it empty.
+        if let Some(region) = &self.cmplog {
+            crate::cmplog::clear(&mut self.gdb, region)?;
+        }
         // The cycle counter starts last, so it measures the run, not the setup.
         let cycles_start = match &self.cycle_counter {
             Some(counter) => Some(counter.start(&mut self.gdb)?),
@@ -659,6 +675,14 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
                 Ok(id) => target.task_id = Some(u64::from(id)),
                 Err(err) => {
                     coverage_incomplete.get_or_insert_with(|| format!("task id: {err}"));
+                }
+            }
+        }
+        if let Some(region) = &self.cmplog {
+            match crate::cmplog::read(&mut self.gdb, region) {
+                Ok(comparisons) => target.comparisons = comparisons,
+                Err(err) => {
+                    coverage_incomplete.get_or_insert_with(|| format!("cmplog: {err}"));
                 }
             }
         }

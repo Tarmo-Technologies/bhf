@@ -231,13 +231,22 @@ impl SessionTransportPlan {
             return Ok(Self::Udp { host, port });
         }
         if let Some(rest) = spec.strip_prefix("transport:") {
-            crate::transport_fuzz::TransportPlan::parse(rest, coverage_map).map_err(|error| {
-                SessionSpecError::Malformed {
-                    backend: "transport",
-                    spec: spec.to_owned(),
-                    reason: error.to_string(),
-                }
-            })?;
+            let malformed = |reason: String| SessionSpecError::Malformed {
+                backend: "transport",
+                spec: spec.to_owned(),
+                reason,
+            };
+            let plan = crate::transport_fuzz::TransportPlan::parse(rest, coverage_map)
+                .map_err(|error| malformed(error.to_string()))?;
+            // The session mutator edits messages, not one input's bytes: it
+            // has no use for the comparisons, so the reads would be wasted.
+            if plan.cmplog().is_some() {
+                return Err(malformed(
+                    "the session lane does not use cmplog=; it is read by \
+                     `bhf fuzz --target-transport`"
+                        .to_owned(),
+                ));
+            }
             return Ok(Self::Target {
                 spec: rest.to_owned(),
                 coverage_map: coverage_map.map(str::to_owned),
@@ -3295,6 +3304,16 @@ equals = 226
         let error = SessionTransportPlan::parse("transport:gdb:127.0.0.1:3333").unwrap_err();
         assert!(
             error.to_string().contains("--transport-coverage-map"),
+            "{error}"
+        );
+        // #386: the session mutator has no use for a CmpLog record.
+        let error = SessionTransportPlan::parse_with_map(
+            "transport:gdb:127.0.0.1:3333",
+            Some("input=1,input_cap=8,ring=2,write=3,wrapped=4,cap=8,cmplog=5,cmplog_cap=4"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not use cmplog="),
             "{error}"
         );
         let model = toy_model();

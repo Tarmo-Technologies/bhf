@@ -85,6 +85,48 @@ void HardFault_Handler(void){
   bhf_fault_flag = 0xDEADFA11u;
   harness_done();
 }
+#ifdef BHF_CMPLOG
+/* The comparison record bhf reads after each run (#386), filled by the
+ * trace-cmp callbacks of the code under test (check.c). */
+#define BHF_CMPLOG_CAP 32
+struct bhf_cmp { uint64_t lhs, rhs; uint32_t width, site; };
+volatile struct {
+  uint32_t count;
+  uint32_t reserved;
+  struct bhf_cmp entries[BHF_CMPLOG_CAP];
+} bhf_cmplog;
+#define BHF_CMP(w) do { \
+  uint32_t n = bhf_cmplog.count; \
+  if (n < BHF_CMPLOG_CAP) { \
+    bhf_cmplog.entries[n].lhs = a; \
+    bhf_cmplog.entries[n].rhs = b; \
+    bhf_cmplog.entries[n].width = w; \
+    bhf_cmplog.entries[n].site = (uint32_t)__builtin_return_address(0); \
+  } \
+  bhf_cmplog.count = n + 1; \
+} while (0)
+void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b){ BHF_CMP(1); }
+void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b){ BHF_CMP(2); }
+void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b){ BHF_CMP(4); }
+void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b){ BHF_CMP(8); }
+void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b){ BHF_CMP(1); }
+void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b){ BHF_CMP(2); }
+void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b){ BHF_CMP(4); }
+void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b){ BHF_CMP(8); }
+void __sanitizer_cov_trace_switch(uint64_t v, uint64_t *cases){ (void)v; (void)cases; }
+int bhf_check(const volatile uint8_t *in);
+/* A fault behind a 4-byte magic, and no other: random mutation does not
+ * find 1 in 2^32. */
+void Reset_Handler(void){
+  emit_crumb(0x100);
+  if (bhf_check(bhf_input)) {
+    emit_crumb(0x4FA);
+    __asm volatile("udf #0");
+  }
+  emit_crumb(0x400);
+  harness_done();
+}
+#else
 void Reset_Handler(void){
   emit_crumb(0x100);
   emit_crumb(0x101);
@@ -100,6 +142,18 @@ void Reset_Handler(void){
     emit_crumb(0x300);
   }
   harness_done();
+}
+#endif
+"#;
+
+/// The code under test of the CmpLog variant, built with
+/// `-fsanitize-coverage=trace-cmp`: GCC calls
+/// `__sanitizer_cov_trace_const_cmp4(0x5AFEC0DE, word)` before the compare.
+const CHECK_C: &str = r#"#include <stdint.h>
+int bhf_check(const volatile uint8_t *in){
+  uint32_t word = (uint32_t)in[0] | ((uint32_t)in[1] << 8) |
+                  ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+  return word == 0x5AFEC0DEu;
 }
 "#;
 
@@ -178,10 +232,28 @@ struct Fixture {
     wrapped_addr: u64,
     fault_flag: u64,
     harness_done: u64,
+    /// `bhf_cmplog`, in the CmpLog variant.
+    cmplog_addr: Option<u64>,
 }
+
+const ARM_FLAGS: [&str; 7] = [
+    "-mcpu=cortex-m3",
+    "-mthumb",
+    "-nostdlib",
+    "-nostartfiles",
+    "-ffreestanding",
+    "-O0",
+    "-g",
+];
 
 impl Fixture {
     fn boot(test: &str, dir: &Path) -> Option<Self> {
+        Self::boot_variant(test, dir, false)
+    }
+
+    /// Boot the fixture; with `cmplog`, the variant whose only fault is
+    /// behind a 4-byte magic its trace-cmp callbacks record.
+    fn boot_variant(test: &str, dir: &Path, cmplog: bool) -> Option<Self> {
         for tool in [CC, QEMU, QEMU_IMG, NM] {
             if !tool_present(tool) {
                 eprintln!("SKIP {test}: {tool} not on PATH");
@@ -194,17 +266,25 @@ impl Fixture {
         std::fs::write(&src, HARNESS_C).unwrap();
         std::fs::write(&ld, HARNESS_LD).unwrap();
 
-        let built = Command::new(CC)
-            .args([
-                "-mcpu=cortex-m3",
-                "-mthumb",
-                "-nostdlib",
-                "-nostartfiles",
-                "-ffreestanding",
-                "-O0",
-                "-g",
-                "-T",
-            ])
+        let mut link = Command::new(CC);
+        link.args(ARM_FLAGS);
+        if cmplog {
+            let check = dir.join("check.c");
+            let object = dir.join("check.o");
+            std::fs::write(&check, CHECK_C).unwrap();
+            let compiled = Command::new(CC)
+                .args(ARM_FLAGS)
+                .args(["-fsanitize-coverage=trace-cmp", "-c"])
+                .arg(&check)
+                .arg("-o")
+                .arg(&object)
+                .status()
+                .unwrap_or_else(|e| panic!("run {CC}: {e}"));
+            assert!(compiled.success(), "{CC} failed to build check.c");
+            link.arg("-DBHF_CMPLOG").arg(&object);
+        }
+        let built = link
+            .arg("-T")
             .arg(&ld)
             .arg("-o")
             .arg(&elf)
@@ -264,6 +344,7 @@ impl Fixture {
             wrapped_addr: nm_symbol(&elf, "adafuzz_probe_memory_buffer_wrapped", false),
             fault_flag: nm_symbol(&elf, "bhf_fault_flag", false),
             harness_done: nm_symbol(&elf, "harness_done", true),
+            cmplog_addr: cmplog.then(|| nm_symbol(&elf, "bhf_cmplog", false)),
         })
     }
 
@@ -434,6 +515,80 @@ fn cli_qemu_system_inputs_longer_than_the_cap_never_reach_the_fault_word() {
     assert!(
         uncapped["crashes"].as_u64().unwrap_or(0) >= 1,
         "a cap past the fault word lets the overwrite through: {uncapped}\n{stderr}"
+    );
+}
+
+/// On-target CmpLog (#386): the comparison operands the firmware records
+/// solve a 4-byte magic within a fixed execution count, and the same run
+/// without `cmplog=` does not. Each run boots its own guest: a campaign's
+/// baseline snapshot is the guest as arm finds it, and one left at the
+/// completion breakpoint by an earlier campaign never runs an input again.
+#[test]
+fn cli_qemu_system_cmplog_solves_a_four_byte_magic() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run = |name: &str, cmplog: bool| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Fixture::boot_variant(
+            "cli_qemu_system_cmplog_solves_a_four_byte_magic",
+            &dir,
+            true,
+        )?;
+        let mut map = fixture.coverage_map(64);
+        if cmplog {
+            map.push_str(&format!(
+                ",cmplog={:#x},cmplog_cap=32",
+                fixture.cmplog_addr.unwrap()
+            ));
+        }
+        let seed = dir.join("seed.bin");
+        std::fs::write(&seed, b"AAAA").unwrap();
+        let out = Command::new(bhf_bin())
+            .args(["fuzz", "--target-transport", &fixture.spec()])
+            .args(["--transport-coverage-map", &map])
+            .args(["--harness", "cortex-m-cmplog"])
+            .arg("--seed-file")
+            .arg(&seed)
+            .args(["--iterations", "300", "--rng-seed", "7", "--time", "120s"])
+            .arg(dir.join("work"))
+            .output()
+            .expect("run bhf fuzz");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{name}: {stderr}");
+        let summary: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{name} summary JSON: {e}\n{stdout}\n{stderr}"));
+        Some((summary, dir.join("work/results/findings")))
+    };
+
+    let Some((without, _)) = run("without", false) else {
+        return;
+    };
+    assert_eq!(without["executions"], 300, "{without:#}");
+    assert_eq!(without["comparisons"], 0, "{without:#}");
+    assert_eq!(
+        without["findings"],
+        serde_json::json!([]),
+        "random mutation found the magic: {without:#}"
+    );
+
+    let (with, findings_dir) = run("with", true).unwrap();
+    assert_eq!(with["incomplete_observations"], 0, "{with:#}");
+    assert!(
+        with["comparisons"].as_u64().unwrap_or(0) >= 1,
+        "the firmware's comparisons were not read: {with:#}"
+    );
+    let findings = with["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "the magic was not solved: {with:#}");
+    let input = std::fs::read(
+        findings_dir
+            .join(findings[0].as_str().unwrap())
+            .join("testcase.bin"),
+    )
+    .unwrap();
+    assert!(
+        input.starts_with(&0x5AFE_C0DE_u32.to_le_bytes()),
+        "the finding's input is the magic: {input:02x?}"
     );
 }
 

@@ -2812,6 +2812,15 @@
   when bhf panics.
 
 ### Added
+- On-target CmpLog for the `gdb` and `qemu-system` transports (#386).
+  `--transport-coverage-map ...,cmplog=ADDR,cmplog_cap=N` names a record the
+  firmware's `-fsanitize-coverage=trace-cmp` callbacks fill, `{u32 count,
+  u32 reserved}` then `{u64 lhs, u64 rhs, u32 width, u32 site}` entries. bhf
+  zeroes the count before each run and reads the entries after it. A mutation
+  of a corpus entry splices the operands its run compared. The summary's
+  `comparisons` counts them. On the mps2-an385 fixture a 4-byte magic is
+  solved within 300 executions with `cmplog=` and not without it. The
+  transport lane had no comparison feedback.
 - `bhf fuzz --target-transport ... --workers N` drives N targets at once
   (#316). The spec names each worker's with `{worker}` or `{BASE+worker}`
   (`agent:tcp:127.0.0.1:{9000+worker}`). The workers share one corpus,

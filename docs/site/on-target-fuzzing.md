@@ -148,7 +148,7 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 (addresses are decimal or `0x`-hex, from your linker map / `nm`):
 
 ```
---transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
+--transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>[,cmplog=<addr>,cmplog_cap=<n>]
 ```
 
 - `input`   — where BHF writes the fuzz input on the target
@@ -164,9 +164,55 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 - `write`   — the ring's write cursor
 - `wrapped` — the ring's wrapped flag
 - `cap`     — ring capacity in **bytes** (the length read back), not a record count
+- `cmplog`, `cmplog_cap` — optional, together: the address of the firmware's
+  comparison record and how many entries it holds (at most 43690, one
+  read's worth). See [CmpLog on the target](#cmplog-on-the-target).
 
 The `agent` transport carries coverage over its own protocol and rejects this
 option.
+
+### CmpLog on the target
+
+A 4-byte magic compare is out of reach of random mutation. Build the code
+under test with `-fsanitize-coverage=trace-cmp` (GCC or clang) and give the
+firmware callbacks that record each comparison in RAM:
+
+```c
+#define BHF_CMPLOG_CAP 32
+volatile struct {
+  uint32_t count;      /* bhf zeroes it before each run */
+  uint32_t reserved;
+  struct { uint64_t lhs, rhs; uint32_t width, site; } entries[BHF_CMPLOG_CAP];
+} bhf_cmplog;
+
+void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) {
+  uint32_t n = bhf_cmplog.count;
+  if (n < BHF_CMPLOG_CAP) {
+    bhf_cmplog.entries[n].lhs = a;
+    bhf_cmplog.entries[n].rhs = b;
+    bhf_cmplog.entries[n].width = 4;
+    bhf_cmplog.entries[n].site = (uint32_t)__builtin_return_address(0);
+  }
+  bhf_cmplog.count = n + 1;
+}
+/* ... and the same for __sanitizer_cov_trace_cmp{1,2,4,8} and
+ * __sanitizer_cov_trace_const_cmp{1,2,8}, at their widths. */
+```
+
+Keep the callbacks out of the instrumented files. Then name the record in
+the coverage map: `cmplog=<addr of bhf_cmplog>,cmplog_cap=32`. All fields
+are little-endian. A `count` past the capacity means the record filled; bhf
+reads the entries it holds.
+
+bhf zeroes `count` before each run on the `gdb` and `qemu-system`
+transports, and reads the record after the run. It keeps the comparisons of
+each corpus entry's run. A mutation of that entry then replaces an operand
+it finds in the input with the value it was compared against. The run
+summary's `comparisons` counts the comparisons read.
+
+The gated `transport_fuzz_qemu_cli` test solves a 4-byte magic on the
+mps2-an385 fixture within 300 executions with `cmplog=`, and not without it.
+A session-lane spec (`--session-transport transport:…`) rejects `cmplog=`.
 
 ### 3a. Debug probe / emulator gdbstub (`gdb:HOST:PORT`)
 
