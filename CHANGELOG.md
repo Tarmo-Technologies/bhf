@@ -70,6 +70,15 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Continuous scheduler jobs are tenant-aware, and orphaned jobs are
+  reconciled on start (#385). `submitJob` records the caller's tenant and
+  workspace root on the job (`Scheduler::submit_as` with a `JobOwner`). That
+  tenant and the other tenants of the same workspace root see and cancel it
+  (`list_jobs_as`, `cancel_as`); others, nested workspace roots included,
+  get "no job". A job a crashed scheduler left `running` is `failed` on the
+  next start with a `reason`, and its process (recorded under
+  `<data-dir>/running/`) is stopped if it still runs. Visibility was by
+  workspace prefix, and such jobs were queued to run again.
 - The continuous scheduler's stop and its webhook are bounded (#272).
   Dropping a `Scheduler` waits for its workers for the shutdown timeout
   plus 1 s, then 1 s more for the results refresh. A thread still running

@@ -125,8 +125,11 @@ on-prem continuous fuzzing. It queues fuzz jobs and dispatches them to a
 worker pool (`--job-workers N`, default 1) that spawns `bhf fuzz` per job:
 the `bhf` beside `bhf-daemon`, else the one on `PATH`, or `--bhf PATH`. Jobs
 are persisted to `DIR/jobs.jsonl`, so a daemon restart recovers the known job
-set. Jobs that were running at shutdown are queued again, since in-flight
-work is assumed lost.
+set. Jobs that were running when the daemon stopped are queued again, since
+in-flight work is assumed lost. A job a daemon that crashed left `running`
+is `failed` on the next start, with a `reason` saying so. If its `bhf fuzz`
+still runs (it records its process id under `DIR/running/`), that process
+is stopped.
 
 The JSON-RPC methods:
 - `submitJob` takes `project_dir`, `harness_id` and `time_budget_secs`
@@ -140,8 +143,11 @@ The JSON-RPC methods:
   job's state is returned as it is.
 
 Under `--security-config` a tenant submits jobs for projects inside its
-workspace root and sees and cancels only those; another tenant's job is
-"no job". Without `--jobs-dir` the job methods say how to start the
+workspace root. Each job records the tenant that submitted it and that
+tenant's workspace root (`tenant`, `workspace`). That tenant and the other
+tenants of the same workspace root, such as its viewer, see the job and,
+with the operator role, cancel it. To any other tenant, a nested workspace
+root included, it is "no job". Without `--jobs-dir` the job methods say how to start the
 scheduler. The library API is `continuous_daemon::Scheduler` (`submit`,
 `list_jobs`, `cancel`). When the library's `webhook_url` is configured, the
 scheduler POSTs a notification to it once a job reaches a terminal state
