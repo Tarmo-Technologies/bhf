@@ -47,6 +47,7 @@
 
 pub mod agent;
 pub mod coverage;
+pub mod cycles;
 pub mod error;
 pub mod fullsystem;
 pub mod gdb;
@@ -68,7 +69,7 @@ pub use gdb::{
     read_coverage_ring, stage_input, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport,
     GdbSession, InputContract, StopReply,
 };
-pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome};
+pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome, TargetObservation};
 pub use transport::{TargetSession, TargetTransport};
 
 #[cfg(unix)]

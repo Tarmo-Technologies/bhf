@@ -392,6 +392,7 @@ pub struct FullSystemTransport<FQ, FG> {
     fault_status: Option<GuestFaultStatus>,
     exec_deadline: Option<Duration>,
     input_contract: Option<crate::gdb::InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -414,7 +415,15 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             fault_status: None,
             exec_deadline: None,
             input_contract: None,
+            cycle_counter: None,
         })
+    }
+
+    /// Read `counter` around each run and report the cycles it took in
+    /// [`RunOutcome::target`] (#251).
+    pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
+        self.cycle_counter = counter;
+        self
     }
 
     /// Stage each input under `contract`: cut to the guest staging region's
@@ -500,6 +509,7 @@ where
             fault_status: self.fault_status.clone(),
             exec_deadline: self.exec_deadline,
             input_contract: self.input_contract,
+            cycle_counter: self.cycle_counter,
         }))
     }
 }
@@ -514,6 +524,7 @@ pub struct FullSystemSession<CQ, CG> {
     fault_status: Option<GuestFaultStatus>,
     exec_deadline: Option<Duration>,
     input_contract: Option<crate::gdb::InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -538,6 +549,11 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
             self.input_contract.as_ref(),
             input,
         )?;
+        // The cycle counter starts last, so it measures the run, not the setup.
+        let cycles_start = match &self.cycle_counter {
+            Some(counter) => Some(counter.start(&mut self.gdb)?),
+            None => None,
+        };
         let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
         let (stop, stdout) = match self.gdb.cont_until(deadline)? {
             (ContStop::Stopped(stop), stdout) => (stop, stdout),
@@ -550,6 +566,7 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
                     None => "no completion stop within the per-input execution deadline".to_owned(),
                 };
                 return Ok(RunOutcome {
+                    target: Default::default(),
                     exit: ExitKind::Timeout,
                     coverage_edges: Vec::new(),
                     fault: Some(Fault {
@@ -615,6 +632,18 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
             }
         }
 
+        // The cycles the run took (#251), best-effort like coverage: a failed
+        // read leaves the classification alone.
+        let mut target = crate::outcome::TargetObservation::default();
+        if let (Some(counter), Some(start)) = (&self.cycle_counter, cycles_start) {
+            match counter.elapsed(&mut self.gdb, start) {
+                Ok(cycles) => target.cycles = Some(cycles),
+                Err(err) => {
+                    coverage_incomplete.get_or_insert_with(|| format!("cycle counter: {err}"));
+                }
+            }
+        }
+
         // Harvest coverage from the in-guest ring, best-effort (#74).
         let coverage_edges = match read_coverage_ring(&mut self.gdb, &self.map) {
             Ok(edges) => edges,
@@ -625,6 +654,7 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         };
 
         Ok(RunOutcome {
+            target,
             exit,
             coverage_edges,
             fault,

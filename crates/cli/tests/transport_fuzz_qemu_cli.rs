@@ -586,6 +586,17 @@ impl RtosGuest {
     /// Boot `elf` stopped, with a scratch drive for `savevm`, on fresh ports
     /// (or `ports`, to replay at the recorded endpoints).
     fn boot(elf: &Path, dir: &Path, tag: &str, ports: Option<(u16, u16)>) -> Self {
+        Self::boot_with(elf, dir, tag, ports, &[])
+    }
+
+    /// [`Self::boot`] with extra `qemu-system-arm` arguments.
+    fn boot_with(
+        elf: &Path,
+        dir: &Path,
+        tag: &str,
+        ports: Option<(u16, u16)>,
+        qemu_args: &[&str],
+    ) -> Self {
         let scratch = dir.join(format!("scratch-{tag}.qcow2"));
         assert!(Command::new(QEMU_IMG)
             .args(["create", "-f", "qcow2"])
@@ -608,6 +619,7 @@ impl RtosGuest {
             ))
             .arg("-qmp")
             .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+            .args(qemu_args)
             .spawn()
             .unwrap();
         let guest = Self {
@@ -646,7 +658,23 @@ impl RtosGuest {
 
     /// `bhf fuzz` of this guest with one seed file per byte of `seeds`.
     fn fuzz(&self, elf: &Path, work: &Path, seeds: &[u8], extra: &[&str]) -> serde_json::Value {
-        let (spec, map) = self.spec_and_map(elf);
+        self.fuzz_with_spec(elf, work, seeds, extra, "")
+    }
+
+    /// [`Self::fuzz`] with `,`-joined keys added to the transport spec.
+    fn fuzz_with_spec(
+        &self,
+        elf: &Path,
+        work: &Path,
+        seeds: &[u8],
+        extra: &[&str],
+        spec_keys: &str,
+    ) -> serde_json::Value {
+        let (mut spec, map) = self.spec_and_map(elf);
+        if !spec_keys.is_empty() {
+            spec.push(',');
+            spec.push_str(spec_keys);
+        }
         let mut cmd = Command::new(bhf_bin());
         cmd.args([
             "fuzz",
@@ -788,5 +816,38 @@ fn cli_freertos_hang_times_out_and_the_reset_clears_state() {
     assert_eq!(
         summary["crashes"], 0,
         "the 0x42 after a 0xC5 is clean: {summary}"
+    );
+}
+
+/// #251: a run's target cycles come from a counter the guest keeps, read
+/// before and after the run. QEMU models no `DWT_CYCCNT`, so this reads the
+/// MPS2 FPGAIO `COUNTER` (a 25 MHz up-counter) under `-icount`, where it
+/// advances with the instructions run. Input `0xBF` busy-loops sixteen times
+/// as long as `0xB0`.
+#[test]
+fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let Some(elf) = build_freertos("cli_freertos_target_cycles_grow_with_a_busy_loop", dir) else {
+        return;
+    };
+    let mut cycles = Vec::new();
+    for (tag, byte) in [("short", 0xB0_u8), ("long", 0xBF)] {
+        let guest = RtosGuest::boot_with(&elf, dir, tag, None, &["-icount", "shift=0"]);
+        let summary = guest.fuzz_with_spec(
+            &elf,
+            &dir.join(format!("work-{tag}")),
+            &[byte],
+            &[],
+            "cycles=0x40028018,cpu_hz=25000000",
+        );
+        let stats = &summary["target_cycles"];
+        assert_eq!(stats["runs"], 1, "{summary}");
+        cycles.push(stats["max"].as_u64().unwrap());
+    }
+    assert!(cycles[0] > 0, "{cycles:?}");
+    assert!(
+        cycles[1] > 8 * cycles[0],
+        "sixteen times the busy work takes more cycles: {cycles:?}"
     );
 }

@@ -200,6 +200,7 @@ pub(crate) fn replay_transport_outcome(
             ),
         }
     }
+    let cycle_counter = plan.cycle_counter();
     let transport = plan
         .into_transport(per_input_timeout)
         .map_err(|error| format!("rebuild transport from profile: {error}"))?;
@@ -233,12 +234,10 @@ pub(crate) fn replay_transport_outcome(
         let outcome = session.run_input(&input).map_err(|error| {
             format!("re-driving the recorded input through the transport failed: {error}")
         })?;
-        judged.push(judge_run(
-            &recorded,
-            timing_deadline,
-            &outcome,
-            started.elapsed(),
-        ));
+        // A deadline recorded against target time is judged by target time.
+        let (elapsed, _) =
+            crate::transport_fuzz::run_time(cycle_counter, &outcome, started.elapsed());
+        judged.push(judge_run(&recorded, timing_deadline, &outcome, elapsed));
     }
     Ok(combine_runs(judged, &spec))
 }
@@ -937,6 +936,7 @@ mod tests {
         // the transport is rebuilt with the recorded per-input deadline (#70).
         use target_transport::{Fault, FaultKind, RunOutcome};
         let outcome = RunOutcome {
+            target: Default::default(),
             exit: ExitKind::Timeout,
             coverage_edges: Vec::new(),
             fault: Some(Fault {

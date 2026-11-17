@@ -2678,6 +2678,14 @@
   when bhf panics.
 
 ### Added
+- On-target deadlines can be timed by the target: `cycles=dwt` on a `gdb:` or
+  `qemu-system:` transport reads the Cortex-M DWT cycle counter around each
+  run, `cycles=ADDR` a free-running 32-bit counter, and with `cpu_hz=N`
+  `--deadline` uses the target's time instead of the host's round-trip time.
+  The run summary's `target_cycles` gives the fewest and most cycles a run
+  took, the transport profile records the timing basis, and replay judges a
+  deadline finding by it. QEMU does not count `DWT_CYCCNT`, which the run
+  reports; the FreeRTOS profile's test reads the MPS2 FPGAIO counter.
 - `bhf replay --stability-runs N` re-drives an on-target transport finding's
   input N times, each from the transport's reset, and reports how many runs
   reproduced it. A finding some runs reproduce and others do not is

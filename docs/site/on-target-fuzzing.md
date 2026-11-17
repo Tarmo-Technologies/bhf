@@ -317,6 +317,26 @@ BHF_DEADLINE_MS=250 bhf fuzz bhf_work --harness H-C0001    # sub-second budget
 Use it for watchdog / control-loop / radar-frame deadlines where a late answer
 is a defect. Off by default — unset, hang handling is byte-for-byte unchanged.
 
+**Target time (`cycles=`, `cpu_hz=`).** The host's round-trip time includes the
+debugger link, the reset and the host's load. On the `gdb:` and `qemu-system:`
+transports, `cycles=dwt` reads the Cortex-M DWT cycle counter around each run
+instead: BHF enables it (`DEMCR.TRCENA`, `DWT_CTRL.CYCCNTENA`) and zeroes it
+after delivering the input. `cycles=ADDR` reads a free-running 32-bit up-counter
+at `ADDR` before and after the run. With `cpu_hz=N`, the counter's rate,
+`--deadline` times each run by the target (the BHF-555 message names the
+cycles), and the transport profile records that basis for `bhf replay`. The
+run summary's `target_cycles` gives the fewest and most cycles any run took.
+
+QEMU's Cortex-M models do not count `DWT_CYCCNT`, so on an emulator use a
+counter the machine models: on `mps2-an385` the FPGAIO `COUNTER` at
+`0x40028018` counts at 25 MHz, and under `-icount` it advances with the
+instructions run. A counter that never advances is reported once, and the
+deadline falls back to host time.
+
+```sh
+--target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,cycles=0x40028018,cpu_hz=25000000"
+```
+
 **Nondeterminism (`bhf replay --stability-runs N`).** `bhf replay` re-drives
 a transport finding's input through the recorded transport once. With
 `--stability-runs N` it runs it N times, each from the transport's reset, and

@@ -734,6 +734,7 @@ pub struct GdbRemoteTransport<F> {
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -744,6 +745,7 @@ impl<F> GdbRemoteTransport<F> {
             map,
             exec_deadline: None,
             input_contract: None,
+            cycle_counter: None,
         }
     }
 
@@ -751,6 +753,13 @@ impl<F> GdbRemoteTransport<F> {
     /// its length word written first when the firmware reads one.
     pub fn with_input_contract(mut self, contract: Option<InputContract>) -> Self {
         self.input_contract = contract;
+        self
+    }
+
+    /// Read `counter` around each run and report the cycles it took in
+    /// [`RunOutcome::target`] (#251).
+    pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
+        self.cycle_counter = counter;
         self
     }
 
@@ -778,6 +787,7 @@ where
             map: self.map,
             exec_deadline: self.exec_deadline,
             input_contract: self.input_contract,
+            cycle_counter: self.cycle_counter,
         }))
     }
 }
@@ -812,6 +822,7 @@ pub struct GdbSession<C> {
     map: GdbMemoryMap,
     exec_deadline: Option<Duration>,
     input_contract: Option<InputContract>,
+    cycle_counter: Option<crate::cycles::CycleCounter>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -827,6 +838,11 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
             self.input_contract.as_ref(),
             input,
         )?;
+        // The cycle counter starts last, so it measures the run (#251).
+        let cycles_start = match &self.cycle_counter {
+            Some(counter) => Some(counter.start(&mut self.client)?),
+            None => None,
+        };
 
         // EXECUTION phase: bounded by the absolute per-input deadline (#70). A
         // target that never reaches its stop within the deadline is a first-class
@@ -844,6 +860,7 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
                     None => "no stop within the per-input execution deadline".to_owned(),
                 };
                 return Ok(RunOutcome {
+                    target: Default::default(),
                     exit: ExitKind::Timeout,
                     coverage_edges: Vec::new(),
                     fault: Some(Fault {
@@ -865,12 +882,21 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         // keep the exit classification and record the read failure as a diagnostic
         // instead of propagating an error that loses the crash.
         let exit = stop.to_exit_kind();
+        let mut target = crate::outcome::TargetObservation::default();
+        let mut cycles_failed = None;
+        if let (Some(counter), Some(start)) = (&self.cycle_counter, cycles_start) {
+            match counter.elapsed(&mut self.client, start) {
+                Ok(cycles) => target.cycles = Some(cycles),
+                Err(err) => cycles_failed = Some(format!("cycle counter: {err}")),
+            }
+        }
         let (coverage_edges, coverage_incomplete) =
             match read_coverage_ring(&mut self.client, &self.map) {
-                Ok(edges) => (edges, None),
+                Ok(edges) => (edges, cycles_failed),
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
         Ok(RunOutcome {
+            target,
             exit,
             coverage_edges,
             // Fault classification over the debug-probe path is HDF-2.

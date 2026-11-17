@@ -68,8 +68,11 @@ fails if it cannot obtain or verify that revision.
   exercised; this profile makes no real-time or exhaustive-interleaving claim.
 - Single core; **no peripheral / DMA / MMIO / cache modeling** beyond what the
   mps2-an385 machine provides; no multi-core.
-- Host round-trip time is distinct from target execution time (the transport
-  measures host-observed timing; see `--deadline`).
+- Host round-trip time is distinct from target execution time. `--deadline`
+  uses host-observed time unless the spec reads a target counter
+  (`cycles=`, `cpu_hz=`). QEMU does not count `DWT_CYCCNT`; the CLI test reads
+  the FPGAIO `COUNTER` under `-icount`, and input `0xB0`..`0xBF` busy-loops in
+  proportion to its low nibble.
 - This is an **emulator** profile. A physical board reuses the same transport
   contract (`docs/hil-bringup.md`) and must record the actual silicon / probe /
   RTOS versions; absence of board validation stays explicit.
