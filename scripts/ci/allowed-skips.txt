@@ -19,5 +19,10 @@ bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  ski
 # cli_freertos_ test with BHF_RTOS_CLI=1.
 bhf::transport_fuzz_qemu_cli::cli_freertos_*  skip cli_freertos_*: set BHF_RTOS_CLI=1
 
+# The binary analyzers' tests need the pinned Rizin, Ghidra and angr; the
+# nightly's binary-analyzers job installs them and runs every one with
+# BHF_BINARY_ANALYZERS=1.
+bhf::binary_adapter_tools::*  skip binary_adapter_tools: set BHF_BINARY_ANALYZERS=1
+
 # The arrow-key installer prompt needs a real terminal, which no CI job has.
 bhf::offline_dist_scripts::offline_dist_installer_interactive_prompt_accepts_down_arrow_to_ok  skip: interactive arrow-key TUI needs a real terminal*

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod memory_budget;
+mod pinned_path;
+mod security_config;
+
+pub use security_config::{load_security_config, MIN_TOKEN_CHARS};
 
 use ada_parser::ast::{AdaStandard, Span, StructuralAst, SubprogramId};
 use serde::de::DeserializeOwned;
@@ -26,19 +30,47 @@ pub fn run_json_rpc_with_security<R: BufRead, W: Write>(
     writer: W,
     security: DaemonSecurityConfig,
 ) -> Result<(), JsonRpcServerError> {
-    let limit = memory_budget::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
-    run_json_rpc_with_limit(reader, writer, security, limit)
+    run_json_rpc_with_services(reader, writer, security, &DaemonServices::default())
 }
 
+/// What the daemon serves besides its stateless methods.
+#[derive(Default)]
+pub struct DaemonServices {
+    /// The continuous fuzzing scheduler the job methods drive (#271), when
+    /// the daemon runs one (`bhf-daemon --jobs-dir`).
+    pub jobs: Option<continuous_daemon::Scheduler>,
+}
+
+pub fn run_json_rpc_with_services<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    security: DaemonSecurityConfig,
+    services: &DaemonServices,
+) -> Result<(), JsonRpcServerError> {
+    let limit = memory_budget::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
+    serve_json_rpc(reader, writer, security, limit, services)
+}
+
+#[cfg(test)]
 fn run_json_rpc_with_limit<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    security: DaemonSecurityConfig,
+    limit: usize,
+) -> Result<(), JsonRpcServerError> {
+    serve_json_rpc(reader, writer, security, limit, &DaemonServices::default())
+}
+
+fn serve_json_rpc<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     security: DaemonSecurityConfig,
     limit: usize,
+    services: &DaemonServices,
 ) -> Result<(), JsonRpcServerError> {
     while let Some(frame) = read_frame_with_limit(&mut reader, limit)? {
         let response = match serde_json::from_slice::<JsonRpcRequest>(&frame) {
-            Ok(request) => handle_json_rpc_request(request, &security, limit),
+            Ok(request) => handle_json_rpc_request(request, &security, limit, services),
             Err(error) => Some(error_response(
                 Value::Null,
                 RpcFailure::invalid_request(format!("invalid JSON-RPC request: {error}")),
@@ -364,6 +396,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
             Some(params.arguments),
             &AuthorizedIdentity::Local,
             limit,
+            &DaemonServices::default(),
         ),
         "bhf_list_targets" => {
             let mut parsed: ListTargetsRpcParams = serde_json::from_value(params.arguments)
@@ -686,11 +719,12 @@ fn handle_json_rpc_request(
     request: JsonRpcRequest,
     security: &DaemonSecurityConfig,
     limit: usize,
+    services: &DaemonServices,
 ) -> Option<Value> {
     let id = request.id;
     let Some(response_id) = id.clone() else {
         let _ = authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit, services)
         });
         return None;
     };
@@ -704,7 +738,7 @@ fn handle_json_rpc_request(
 
     Some(
         match authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit, services)
                 .map(|result| (result, identity))
         }) {
             Ok((result, identity)) => {
@@ -729,63 +763,213 @@ fn dispatch_json_rpc_method(
     params: Option<Value>,
     identity: &AuthorizedIdentity,
     limit: usize,
+    services: &DaemonServices,
+) -> Result<Value, RpcFailure> {
+    if let Some(result) = dispatch_job_method(method, params.clone(), identity, services) {
+        return result;
+    }
+    // The paths the request was authorized to use stay pinned until the
+    // response is built, which names them resolved (#362).
+    let mut pins = pinned_path::Pins::default();
+    let result = dispatch_authorized(method, params, identity, limit, &mut pins)?;
+    Ok(pins.unpin(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitJobParams {
+    project_dir: PathBuf,
+    harness_id: String,
+    /// The job's fuzz time, in seconds; 0 runs it until it is cancelled.
+    time_budget_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListJobsParams {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_job_page")]
+    limit: usize,
+}
+
+fn default_job_page() -> usize {
+    100
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelJobParams {
+    job_id: String,
+}
+
+/// The job methods (#271), or `None` for another method. A tenant submits
+/// jobs for projects inside its workspace root, and sees and cancels only
+/// those; an operator may submit and cancel, a viewer only list.
+fn dispatch_job_method(
+    method: &str,
+    params: Option<Value>,
+    identity: &AuthorizedIdentity,
+    services: &DaemonServices,
+) -> Option<Result<Value, RpcFailure>> {
+    let access = match method {
+        "submitJob" | "cancelJob" => MethodAccess::Operate,
+        "listJobs" => MethodAccess::Read,
+        _ => return None,
+    };
+    Some((|| {
+        authorize_method(identity, access)?;
+        let scheduler = services.jobs.as_ref().ok_or_else(|| {
+            RpcFailure::server_error(
+                "this daemon runs no job scheduler; start it with `bhf-daemon --jobs-dir DIR`",
+            )
+        })?;
+        let visible = |job: &continuous_daemon::FuzzJob| match identity {
+            AuthorizedIdentity::Local => true,
+            AuthorizedIdentity::Tenant(tenant) => tenant
+                .workspace_root
+                .canonicalize()
+                .is_ok_and(|root| job.project_dir.starts_with(root)),
+        };
+        let job_error =
+            |error: continuous_daemon::DaemonError| RpcFailure::server_error(error.to_string());
+        match method {
+            "submitJob" => {
+                let params = parse_params::<SubmitJobParams>(params)?;
+                // The job runs later, by the path: queue the resolved one.
+                let mut pins = pinned_path::Pins::default();
+                authorize_path(identity, &params.project_dir, &mut pins)?;
+                let project_dir = canonicalize_for_auth(&params.project_dir)?;
+                let job_id = scheduler
+                    .submit(
+                        project_dir,
+                        params.harness_id,
+                        std::time::Duration::from_secs(params.time_budget_secs),
+                    )
+                    .map_err(job_error)?;
+                Ok(json!({ "job_id": job_id, "state": continuous_daemon::JobState::Queued }))
+            }
+            "listJobs" => {
+                let params = parse_params::<ListJobsParams>(params)?;
+                let jobs: Vec<_> = scheduler
+                    .list_jobs()
+                    .map_err(job_error)?
+                    .into_iter()
+                    .filter(|job| visible(job))
+                    .collect();
+                let page: Vec<_> = jobs
+                    .iter()
+                    .skip(params.offset)
+                    .take(params.limit.clamp(1, 1000))
+                    .collect();
+                Ok(json!({ "total": jobs.len(), "jobs": page }))
+            }
+            _ => {
+                let params = parse_params::<CancelJobParams>(params)?;
+                // Another tenant's job is no job of this one's.
+                let known = scheduler
+                    .list_jobs()
+                    .map_err(job_error)?
+                    .iter()
+                    .any(|job| job.job_id == params.job_id && visible(job));
+                if !known {
+                    return Err(RpcFailure::invalid_params(format!(
+                        "no job {}",
+                        params.job_id
+                    )));
+                }
+                let state = scheduler.cancel(&params.job_id).map_err(job_error)?;
+                Ok(json!({ "job_id": params.job_id, "state": state }))
+            }
+        }
+    })())
+}
+
+fn dispatch_authorized(
+    method: &str,
+    params: Option<Value>,
+    identity: &AuthorizedIdentity,
+    limit: usize,
+    pins: &mut pinned_path::Pins,
 ) -> Result<Value, RpcFailure> {
     match method {
         "scan" => {
-            let params = parse_params::<PathParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
-            authorize_path(identity, &params.path)?;
+            let mut params = parse_params::<PathParams>(params)?;
+            authorize_method(identity, MethodAccess::Read)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(scan(params.path))
         }
         "listTargets" => {
-            let params = parse_params::<ListTargetsRpcParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
-            authorize_path(identity, &params.path)?;
+            let mut params = parse_params::<ListTargetsRpcParams>(params)?;
+            authorize_method(identity, MethodAccess::Read)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(list_targets(params.path, params.top))
         }
         "findings" => {
-            let params = parse_params::<FindingsParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
-            authorize_path(identity, &params.findings)?;
+            let mut params = parse_params::<FindingsParams>(params)?;
+            authorize_method(identity, MethodAccess::Read)?;
+            params.findings = authorize_path(identity, &params.findings, pins)?;
             to_result(load_findings(params.findings, limit))
         }
         "rankAt" => {
-            let params = parse_params::<RankAtParams>(params)?;
-            authorize_method(identity, MethodAccess::ReadWorkspace)?;
-            authorize_path(identity, &params.path)?;
+            let mut params = parse_params::<RankAtParams>(params)?;
+            authorize_method(identity, MethodAccess::Read)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(rank_at(params))
         }
         "instrumentPreview" => {
-            let params = parse_params::<PathParams>(params)?;
-            authorize_method(identity, MethodAccess::OperateWorkspace)?;
-            authorize_path(identity, &params.path)?;
+            let mut params = parse_params::<PathParams>(params)?;
+            authorize_method(identity, MethodAccess::Operate)?;
+            params.path = authorize_path(identity, &params.path, pins)?;
             to_result(instrument_preview(params.path))
         }
         "staticScan" => {
             let mut params = parse_params::<StaticScanParams>(params)?;
-            authorize_method(identity, MethodAccess::OperateWorkspace)?;
-            authorize_path(identity, &params.path)?;
-            authorize_optional_path(identity, params.suppressions.as_deref())?;
-            authorize_optional_path(identity, params.baseline.as_deref())?;
-            authorize_optional_path(identity, params.policy.as_deref())?;
+            authorize_method(identity, MethodAccess::Operate)?;
+            // The policy, suppressions and baseline decide which findings
+            // count or are hidden, and the enabled or disabled rules which of
+            // the rule pack run: an administrator's choice (#361).
+            if params.policy.is_some()
+                || params.suppressions.is_some()
+                || params.baseline.is_some()
+                || !params.enabled_rules.is_empty()
+                || !params.disabled_rules.is_empty()
+            {
+                authorize_method(identity, MethodAccess::Administer)?;
+            }
+            params.path = authorize_path(identity, &params.path, pins)?;
+            params.suppressions = authorize_optional_path(identity, params.suppressions, pins)?;
+            params.baseline = authorize_optional_path(identity, params.baseline, pins)?;
+            params.policy = authorize_optional_path(identity, params.policy, pins)?;
             if params.out.is_none() {
                 if let AuthorizedIdentity::Tenant(tenant) = identity {
                     params.out = Some(tenant.workspace_root.join("bhf_work/static"));
                 }
             }
-            if let Some(out) = params.out.as_deref() {
-                authorize_output_path(identity, out)?;
+            if let Some(out) = params.out.take() {
+                params.out = Some(authorize_output_path(identity, &out, pins)?);
             }
-            to_result(static_scan(params, limit))
+            let result = to_result(static_scan(params, limit))?;
+            // The reports it wrote name the paths it was given.
+            let written: Vec<PathBuf> = ["json_path", "markdown_path", "sarif_path"]
+                .iter()
+                .filter_map(|key| result["summary"][key].as_str().map(PathBuf::from))
+                .collect();
+            let written: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
+            pins.unpin_files(&written).map_err(|error| {
+                RpcFailure::server_error(format!("rewrite the reports: {error}"))
+            })?;
+            Ok(result)
         }
         _ => Err(RpcFailure::method_not_found()),
     }
 }
 
+/// What a method does to a workspace, which decides the roles that may call
+/// it: a viewer reads, an operator also runs scans and jobs, and a workspace
+/// administrator also sets the scan policy and the rule pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MethodAccess {
-    ReadWorkspace,
-    OperateWorkspace,
+    Read,
+    Operate,
+    Administer,
 }
 
 fn authorize_request(
@@ -826,55 +1010,84 @@ fn authorize_method(identity: &AuthorizedIdentity, access: MethodAccess) -> Resu
         return Ok(());
     };
     match (tenant.role, access) {
-        (DaemonRole::Viewer, MethodAccess::OperateWorkspace) => Err(RpcFailure::permission_denied(
-            "role viewer cannot perform workspace operations",
+        (DaemonRole::Viewer, MethodAccess::Operate | MethodAccess::Administer) => Err(
+            RpcFailure::permission_denied("role viewer cannot perform workspace operations"),
+        ),
+        (DaemonRole::Operator, MethodAccess::Administer) => Err(RpcFailure::permission_denied(
+            "role operator cannot set the scan policy or the rule pack (policy, \
+                 suppressions, baseline, enabled or disabled rules); a workspace_admin can",
         )),
         _ => Ok(()),
     }
 }
 
-fn authorize_path(identity: &AuthorizedIdentity, path: &Path) -> Result<(), RpcFailure> {
+/// Authorize `path` for `identity` and return the path the operation opens:
+/// for a tenant, the path pinned beneath its workspace root (#362); for the
+/// local user, `path` as it is.
+fn authorize_path(
+    identity: &AuthorizedIdentity,
+    path: &Path,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
+    authorize_beneath(identity, path, path, None, pins)
+}
+
+/// Authorize `existing` (`requested` itself, or the nearest ancestor of it
+/// that exists) and pin it, with `rest` the components still to be made.
+fn authorize_beneath(
+    identity: &AuthorizedIdentity,
+    requested: &Path,
+    existing: &Path,
+    rest: Option<&Path>,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
     let AuthorizedIdentity::Tenant(tenant) = identity else {
-        return Ok(());
+        return Ok(requested.to_path_buf());
     };
     let root = canonicalize_for_auth(&tenant.workspace_root)?;
-    let target = canonicalize_for_auth(path)?;
-    if target.starts_with(&root) {
-        Ok(())
-    } else {
-        Err(RpcFailure::workspace_denied(format!(
+    let target = canonicalize_for_auth(existing)?;
+    if !target.starts_with(&root) {
+        return Err(RpcFailure::workspace_denied(format!(
             "path {} is outside authorized workspace {}",
-            path.display(),
+            requested.display(),
             tenant.workspace_root.display()
-        )))
+        )));
     }
+    Ok(pins
+        .pin(&root, &target, rest)
+        .map_err(|error| RpcFailure::workspace_denied(error.0))?
+        .unwrap_or_else(|| requested.to_path_buf()))
 }
 
 fn authorize_optional_path(
     identity: &AuthorizedIdentity,
-    path: Option<&Path>,
-) -> Result<(), RpcFailure> {
-    if let Some(path) = path {
-        authorize_path(identity, path)?;
-    }
-    Ok(())
+    path: Option<PathBuf>,
+    pins: &mut pinned_path::Pins,
+) -> Result<Option<PathBuf>, RpcFailure> {
+    path.map(|path| authorize_path(identity, &path, pins))
+        .transpose()
 }
 
-fn authorize_output_path(identity: &AuthorizedIdentity, path: &Path) -> Result<(), RpcFailure> {
+fn authorize_output_path(
+    identity: &AuthorizedIdentity,
+    path: &Path,
+    pins: &mut pinned_path::Pins,
+) -> Result<PathBuf, RpcFailure> {
     let AuthorizedIdentity::Tenant(_) = identity else {
-        return Ok(());
+        return Ok(path.to_path_buf());
     };
-    if path.exists() {
-        return authorize_path(identity, path);
-    }
-    let mut current = path.parent();
-    while let Some(parent) = current {
-        if parent.exists() {
-            return authorize_path(identity, parent);
+    let mut existing = path;
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => return authorize_path(identity, path, pins),
         }
-        current = parent.parent();
     }
-    authorize_path(identity, path)
+    let rest = path
+        .strip_prefix(existing)
+        .ok()
+        .filter(|rest| !rest.as_os_str().is_empty());
+    authorize_beneath(identity, path, existing, rest, pins)
 }
 
 fn canonicalize_for_auth(path: &Path) -> Result<PathBuf, RpcFailure> {
@@ -2849,6 +3062,123 @@ mod tests {
         assert_eq!(responses[0]["bhfAudit"]["role"], "viewer");
         assert_eq!(responses[0]["bhfAudit"]["method"], "rankAt");
         assert_eq!(responses[1]["error"]["code"], -32002);
+    }
+
+    /// One `staticScan` as `role`, with or without a policy override, and the
+    /// response.
+    fn static_scan_as(role: super::DaemonRole, params: serde_json::Value) -> serde_json::Value {
+        let (_workspace_guard, workspace) = temp_dir("json-rpc-policy-role");
+        let source = workspace.join("legacy.c");
+        fs::write(&source, "void f(void) {}\n").unwrap();
+        let policy = workspace.join("policy.json");
+        fs::write(&policy, "{}\n").unwrap();
+        let mut params = params;
+        params["path"] = serde_json::json!(source);
+        if params.get("policy").is_some() {
+            params["policy"] = serde_json::json!(policy);
+        }
+        let security = super::DaemonSecurityConfig::multi_tenant(vec![super::TenantConfig {
+            tenant: "t".to_owned(),
+            token: "token-t".to_owned(),
+            workspace_root: workspace.clone(),
+            role,
+        }]);
+        let request = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "staticScan",
+            "auth": { "tenant": "t", "token": "token-t" },
+            "params": params
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        parse_frames(&output).remove(0)
+    }
+
+    /// An operator runs scans, but the scan policy and the rule pack are an
+    /// administrator's (#361): it could hide findings with them.
+    #[test]
+    fn operator_cannot_call_policy_or_pack_methods() {
+        let plain = static_scan_as(super::DaemonRole::Operator, serde_json::json!({}));
+        assert!(plain.get("result").is_some(), "{plain}");
+        for params in [
+            serde_json::json!({ "policy": "" }),
+            serde_json::json!({ "disabled_rules": ["BHF-101"] }),
+            serde_json::json!({ "enabledRules": ["BHF-101"] }),
+        ] {
+            let denied = static_scan_as(super::DaemonRole::Operator, params.clone());
+            assert_eq!(denied["error"]["code"], -32002, "{params}: {denied}");
+            assert!(
+                denied["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("role operator")),
+                "{denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_can_call_policy_and_pack_methods() {
+        for params in [
+            serde_json::json!({ "policy": "" }),
+            serde_json::json!({ "disabled_rules": ["BHF-101"] }),
+        ] {
+            let allowed = static_scan_as(super::DaemonRole::WorkspaceAdmin, params.clone());
+            assert!(allowed.get("result").is_some(), "{params}: {allowed}");
+            assert_eq!(allowed["bhfAudit"]["role"], "workspace_admin");
+        }
+        // A viewer can do neither.
+        let viewer = static_scan_as(
+            super::DaemonRole::Viewer,
+            serde_json::json!({ "policy": "" }),
+        );
+        assert_eq!(viewer["error"]["code"], -32002, "{viewer}");
+    }
+
+    /// A tenant's paths are pinned for the operation (#362), and what the
+    /// response and the written reports name is the resolved path, never the
+    /// handle's.
+    #[test]
+    fn a_tenant_static_scan_names_its_paths_resolved() {
+        let (_workspace_guard, workspace) = temp_dir("tenant-pinned-static");
+        let source = workspace.join("legacy.c");
+        fs::write(&source, "void f(char *s) { char b[4]; strcpy(b, s); }\n").unwrap();
+        let security = super::DaemonSecurityConfig::workspace_shared(super::TenantConfig {
+            tenant: "alpha".to_owned(),
+            token: "token-alpha".to_owned(),
+            workspace_root: workspace.clone(),
+            role: super::DaemonRole::Operator,
+        });
+        let request = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "staticScan",
+            "auth": { "tenant": "alpha", "token": "token-alpha" },
+            "params": { "path": source }
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        let response = parse_frames(&output).remove(0);
+        let text = response.to_string();
+        assert!(response.get("result").is_some(), "{text}");
+        assert!(!text.contains("/proc/"), "{text}");
+        let json_path = response["result"]["summary"]["json_path"].as_str().unwrap();
+        // Resolved on Linux; elsewhere the request's own spelling.
+        assert!(
+            std::path::Path::new(json_path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(workspace.canonicalize().unwrap()),
+            "{json_path}"
+        );
+        let report = fs::read_to_string(json_path).unwrap();
+        assert!(!report.contains("/proc/"), "{report}");
     }
 
     #[test]

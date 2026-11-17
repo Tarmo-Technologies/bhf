@@ -106,6 +106,16 @@ impl<'a> Cursor<'a> {
         i64::from_le_bytes(self.take_le::<8>())
     }
 
+    #[inline]
+    pub fn u128(&mut self) -> u128 {
+        u128::from_le_bytes(self.take_le::<16>())
+    }
+
+    #[inline]
+    pub fn i128(&mut self) -> i128 {
+        i128::from_le_bytes(self.take_le::<16>())
+    }
+
     /// `usize`/`isize` decode as their 64-bit cousins (bhf targets 64-bit
     /// hosts); a target that uses the value as a length sees a wide range.
     #[inline]
@@ -223,6 +233,19 @@ mod tests {
         // u32 from remaining four read bytes? cursor at pos 3 now: 04 05 06 07.
         assert_eq!(c.u32(), 0x0706_0504);
         assert_eq!(c.remaining(), 1);
+    }
+
+    #[test]
+    fn wide_integers_read_sixteen_bytes_little_endian() {
+        let mut bytes = [0u8; 17];
+        bytes[0] = 0x01;
+        bytes[15] = 0x80;
+        bytes[16] = 0xff;
+        let mut c = Cursor::new(&bytes);
+        assert_eq!(c.u128(), 0x8000_0000_0000_0000_0000_0000_0000_0001);
+        // One byte left: the rest of an i128 is zero-filled.
+        assert_eq!(c.i128(), 0xff);
+        assert_eq!(c.remaining(), 0);
     }
 
     #[test]

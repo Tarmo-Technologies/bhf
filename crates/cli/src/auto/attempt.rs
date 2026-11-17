@@ -827,6 +827,13 @@ pub enum Outcome {
     UnsafeBuildPath {
         reason: String,
     },
+    /// The in-crate Rust lane (`--rust-private`) admitted the target but has
+    /// no recipe for one of its parameters or the resource it opens; the
+    /// reason names which. Before it had its own outcome such a target was
+    /// recorded as `unsupported_params`.
+    UnsupportedSetup {
+        reason: String,
+    },
     /// The target's lane cannot build anything on this host because its
     /// toolchain is not installed (no `node` for JavaScript, no esbuild for
     /// TypeScript); the reason names the tool. An environment problem with one
@@ -1034,6 +1041,16 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::UnsupportedSetup { reason } => AttemptTrace {
+                terminal_stage: "generation".to_owned(),
+                fallback_chain: vec!["unsupported_setup".to_owned()],
+                reason_category: Some("unsupported_setup".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::MissingToolchain { reason } => AttemptTrace {
                 terminal_stage: "toolchain".to_owned(),
                 fallback_chain: vec!["missing_toolchain".to_owned()],
@@ -1150,6 +1167,7 @@ impl Outcome {
             | Outcome::SanitizerRuntimeUnavailable { repairs, .. } => repairs.as_slice(),
             Outcome::UnsupportedParams { .. }
             | Outcome::UnsafeBuildPath { .. }
+            | Outcome::UnsupportedSetup { .. }
             | Outcome::MissingToolchain { .. }
             | Outcome::ConsentRequired { .. }
             | Outcome::ReportOnly { .. } => return None,
@@ -2976,7 +2994,7 @@ fn run_attempt(
             crate::auto::rust_build::RustBuildResult::UnsupportedSetup { reason } => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
-                    outcome: Outcome::UnsupportedParams { reason },
+                    outcome: Outcome::UnsupportedSetup { reason },
                     harness_dir,
                 });
             }

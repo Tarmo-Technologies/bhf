@@ -147,6 +147,8 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
     "--session-transport",
     "--session-reset",
     "--max-session-messages",
+    "--session-reply-timeout",
+    "--session-server-cmd",
 ];
 
 /// The flags this run gives that the transport lane would ignore.

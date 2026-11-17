@@ -5,6 +5,21 @@
 ## Unreleased
 
 ### Changed
+- The in-crate lane for private Rust targets (#83) is `bhf auto
+  --rust-private` (#244), or `rust-private = true` in the config; it was
+  reachable only through the undocumented `BHF_RUST_INCRATE_PRIVATE`, which
+  still works. A target the lane admits but cannot set up has its own
+  outcome, `unsupported_setup` (`summary.unsupported_setup`), instead of
+  `unsupported_params`.
+- A protocol profile declares how its messages are framed on the wire
+  (#257), in a `[framing]` table: `raw` (the default: a request is written as
+  it is, and a reply ends when the peer goes quiet or closes),
+  `length_prefix` (width 1, 2 or 4, either byte order, with or without the
+  prefix counted), `delimiter` or `fixed`. The session transport put a
+  big-endian u16 length before every request and read every reply the same
+  way, which no real protocol uses. A profile that relied on it declares
+  `kind = "length_prefix"`, as the toy OPEN/WRITE profile now does. The run
+  summary's `framing` names the framing.
 - bhf's UTC timestamps come from `jiff` instead of `chrono`, which
   RUSTSEC-2026-0543 marks unmaintained and `cargo deny` refused. The
   timestamps are written in the same formats (#408).
@@ -55,6 +70,28 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The daemon's operator role has fewer permissions than workspace_admin
+  (#361): it runs scans and jobs, but a `staticScan` with its own `policy`,
+  `suppressions`, `baseline`, `enabled_rules` or `disabled_rules` needs a
+  workspace_admin, since those decide which findings count or are hidden and
+  which rules run. Only a viewer was restricted, so an operator was an
+  administrator. daemon.md has the permission table.
+- On Linux the daemon pins each path a tenant was authorized to use (#362):
+  it opens the path beneath a handle on the workspace root without
+  following a symlink (`openat2`, `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`)
+  and works through that handle. It used to check the resolved path and
+  then open the request's path again, so a component swapped for a symlink
+  in between could redirect the call outside the root. Responses and a
+  static scan's reports name the resolved paths.
+- The insecure-permissions oracle judges a directory by the mode it was
+  created with (#407). The runtrace shim checked the mode `mkdir` and
+  `mkdirat` were asked for, and `0777` is the mode they are normally called
+  with, which the umask makes `0755`: each such call was a BHF-416 finding
+  with no world-writable directory. The shim now stats a directory it saw
+  created and tests that mode; a `mkdir` that fails assigns nothing.
+- The JVM agent's first build fetches ASM with retries and checks each jar
+  against its pinned SHA-256, a pre-staged or cached copy too (#410). It
+  writes the jars and the agent beside their place and renames them in, so
 - The JVM agent's first build fetches ASM with retries, and a fetched or
   cached jar must have its pinned SHA-256: a cached one that does not is
   fetched again (#410). `ASM_JAR_DIR` jars are the operator's, used as they
@@ -2744,6 +2781,106 @@
   when bhf panics.
 
 ### Added
+- The zoxide harness-parity row is rerun with the in-crate lane (#245,
+  completing #83): with `--rust-private`, auto picks the private
+  `Database::deserialize` and enters and covers it (754 edges), and run at
+  the expert's `Database::open_dir` it materializes `db.zo` and enters and
+  covers that (961 edges)
+  (`docs/validation/2026-11-17-zoxide-incrate-parity.md`). The in-crate lane
+  declares its harness module beside the file that defines the target, so
+  a private associated function of a submodule (zoxide's `deserialize`)
+  compiles; at the crate root it was E0624. The parity runner passes extra
+  `bhf auto` arguments with `--bhf-arg` and records them in each row.
+- `bhf fuzz --session-server-cmd COMMAND` runs the service the session lane
+  fuzzes (#260). bhf starts it with its stderr kept, waits until it serves
+  the transport's port, and after each session checks whether it exited. A
+  session after which it exits, again on a restart, is a finding: from the
+  sanitizer report in its stderr (oracle `session-server-crash`, with
+  `sanitizer.log`), else a BHF-210 exit (`session-server-exit`). The service
+  is started again and the campaign goes on; `server_starts` counts the
+  starts. A service that does not start is exit 2 with its stderr, and
+  `bhf replay` and `bhf minimize` start it for each drive. The lane could not
+  start a service, so it had no sanitizer oracle and stopped once the service
+  crashed.
+- `bhf binary adapter --adapter rizin` runs Rizin's analysis (#264):
+  `rizin -q -c 'aaa; aflj; axlj; izj'`, under `--timeout-secs` (default 900)
+  and a 128 MiB output cap. It maps the functions (with `imported` for an
+  import stub), the call edges, the xrefs and the data-section strings into
+  the report, each array capped, with `truncated` naming one that was cut.
+  The adapter only ran the tool's version probe and wrote empty arrays, and
+  the probe it ran, `rizin --version`, opens a file named `--version` in
+  Rizin's shell and waits; it is `rizin -v`. A failed analysis is `status:
+  error`, exit 1, with `timeout`, `tool_error`, `output_too_large` or
+  `bad_output`.
+- `bhf binary adapter --adapter ghidra` runs Ghidra headless (#265):
+  `analyzeHeadless` imports and analyzes the binary in a throwaway project
+  and the bundled `BhfExport.java` post-script exports its functions, calls,
+  defined strings and references. Addresses are moved back from Ghidra's
+  load base (`0x100000` for a PIE) to the binary's own, so they match
+  Rizin's and `nm`'s; an import's function in Ghidra's EXTERNAL block is
+  left out for its PLT thunk. The version is read from the install's
+  `application.properties`.
+- `bhf binary adapter --adapter angr` runs the bundled `angr_export.py`
+  (#266): CFGFast over the main object, with data and cross references,
+  moved back from angr's load base (`0x400000` for a PIE). A Python that
+  cannot import angr is `skipped`, exit 1; the adapter ran `python3
+  --version` and reported a successful analysis without angr.
+- The nightly's binary-analyzers job installs Rizin 0.9.1, Ghidra 12.2 with
+  a JDK 25, and angr 10.0.7, pinned by digest
+  (`scripts/ci/install-binary-analyzers.sh`), and runs each adapter on a
+  fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
+  addresses `nm` gives, its call edges, its magic string and a call xref.
+- `bhf binary fuzz` and `bhf binary scan` take `--adapter-report` (#267).
+  The strings the binary's code references seed the mutation dictionary
+  (the builtin engine's, and afl-fuzz's `-x`), and its own functions are
+  ranked as fuzz entry points by the input-handling imports they call, the
+  strings they reference and their calls, the first being the candidate
+  persistent address. `binary fuzz` records them in the run JSON's
+  `adapter_report`; `binary scan` adds them as `adapter` to the entry of the
+  binary whose SHA-256 the report records (its new `target_sha256`).
+  Nothing read the report before.
+- The Rust lane harnesses more targets (#338,
+  `docs/validation/2026-11-17-rust-trait-and-param-classes.md`):
+  - A static method of a dependency's trait impl (`impl heed::BytesDecode
+    for Codec`) is called by UFCS: the trait is resolved through the impl
+    file's `use` declarations or its full spelling, and the harness crate
+    depends on the trait's crate with the target's spec. `From<&[u8]>` and
+    `From<&str>` join the standard conversions.
+  - An owned parameter of a crate type with `Default` is built from
+    `T::default()`, as a `&T` one was; `Option<T>` of a decodable `T` and
+    `i128`/`u128` decode.
+  - The harness crate's `Cargo.lock` starts as the target's, so an offline
+    build resolves a git dependency with no rev and the versions the target
+    was built with.
+
+  A trait-impl method that takes no input, or one on a generic type, is
+  refused with its own reason instead of as an outside trait.
+- `bhf-daemon --security-config FILE` runs the JSON-RPC daemon with
+  workspace-scoped security (#273): `workspace_shared` or `multi_tenant`
+  tenants, each with a token read from its own `token_file`, a workspace
+  root and a role. A token file its group or others can read or write, a
+  short or shared token, or an unknown field stops the daemon at start with
+  exit 2 and the reason. The shipped daemon always ran single-user, so a
+  shared deployment that followed daemon.md ran with no authentication.
+- `bhf-daemon --jobs-dir DIR` runs the continuous fuzzing scheduler behind
+  the `submitJob`, `listJobs` and `cancelJob` JSON-RPC methods (#271), with
+  `--job-workers` and `--bhf`. A tenant submits, sees and cancels only jobs
+  for projects inside its workspace root; a viewer only lists them. The
+  scheduler gained `Scheduler::cancel` and a `cancelled` state: a queued
+  job never starts, and a running one's process tree is killed. It had no
+  consumer at all.
+- A protocol profile's response captures take TLV records (#259): a `tlv`
+  capture walks the records from its offset to the one with its `tag` and
+  binds the value, which a later request echoes from a `bytes` or `tlv`
+  reference field. A profile with a TLV capture did not compile, and a
+  reference field could only be an integer.
+- The session lane has a UDP backend (#258): `--session-transport
+  udp:HOST:PORT` sends each message as one datagram, framed as the profile
+  says, from a socket of its own per session, and waits for one reply
+  datagram. `--session-reply-timeout` sets how long a reply may take, over
+  TCP (5s by default) or UDP (1s); a UDP reply that does not come, or a
+  datagram the host refuses, ends the session as a dropped TCP connection
+  does. The lane accepted only `tcp:HOST:PORT`.
 - The Java lane fuzzes a target that takes a JDK collection (#236):
   `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
   nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The

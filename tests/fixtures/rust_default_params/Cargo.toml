@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "default_params"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

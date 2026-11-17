@@ -60,13 +60,26 @@ pub(crate) fn resolve_failure_is_unsupported_setup(reason: &str) -> bool {
     reason.contains(UNSUPPORTED_SETUP_TAG)
 }
 
-/// Whether the opt-in in-crate PRIVATE harness lane (#83) is enabled. OFF by
-/// default (`BHF_RUST_INCRATE_PRIVATE` unset) so the Rust auto path is
-/// byte-identical; set to a truthy value (`1`/`true`/`yes`/`on`) to let the ranker
-/// admit `pub(crate)`/private methods and the build lane route them in-crate with a
-/// materialized path-backed resource. Follows the `BHF_*` env pattern
-/// ([`CargoTargetCleanup`]'s `BHF_KEEP_BUILD_ARTIFACTS`).
+/// `--rust-private` (or `rust-private = true` in the config) for this run.
+static INCRATE_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the in-crate private lane on for this process: `bhf auto
+/// --rust-private`, or `rust-private = true` in its config.
+pub(crate) fn enable_incrate_private() {
+    INCRATE_PRIVATE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the opt-in in-crate PRIVATE harness lane (#83) is enabled: by
+/// `--rust-private` (or its config key), or `BHF_RUST_INCRATE_PRIVATE` set to
+/// a truthy value (`1`/`true`/`yes`/`on`). OFF by default, so the Rust auto
+/// path is unchanged; on, the ranker admits `pub(crate)`/private methods and
+/// the build lane routes them in-crate with a materialized path-backed
+/// resource.
 pub(crate) fn incrate_private_enabled() -> bool {
+    INCRATE_PRIVATE.load(std::sync::atomic::Ordering::Relaxed) || incrate_private_env()
+}
+
+fn incrate_private_env() -> bool {
     std::env::var("BHF_RUST_INCRATE_PRIVATE")
         .ok()
         .is_some_and(|v| {
@@ -1655,6 +1668,10 @@ struct ResolvedTarget {
     /// read_u32(..)` — which needs no `use` of the trait. `None` for an inherent or
     /// free fn. The type path is the `call_path` minus the method.
     ufcs_trait: Option<Vec<String>>,
+    /// The dependency of the target crate that `ufcs_trait` comes from, when
+    /// it is a dependency's trait: the external harness crate depends on it
+    /// too, with the target's spec.
+    ufcs_trait_dependency: Option<String>,
     /// For an INSTANCE method of a trait impl (`impl Buf for Bytes { fn
     /// remaining(&self) }`), the reachable trait path to bring into scope so
     /// `recv.remaining()` resolves (emitted as `use bytes::Buf as _;`). `None` for
@@ -1877,6 +1894,17 @@ fn resolve_param_overrides(
                         ArgPass::Ref
                     };
                     return Some((format!("{}::default()", path.join("::")), by_ref));
+                }
+            }
+            // #338: an OWNED parameter of a reachable crate type with
+            // `Default` (RecordFlux's `Location`) is built from
+            // `T::default()`, as F7 builds a reference's; the target's byte
+            // and string parameters still fuzz.
+            if let Some(leaf) = simple_type_ident(p.ty.trim()) {
+                if let Some(path) =
+                    find_default_type_path(manifest_dir, crate_name, crate_root_src, leaf)
+                {
+                    return Some((format!("{}::default()", path.join("::")), ArgPass::Move));
                 }
             }
             None
@@ -2198,7 +2226,206 @@ fn std_ufcs_trait_path(target: &rust_parser::RustFn) -> Option<Vec<String>> {
             }
         }
     }
+    // `From<&[u8]>` / `From<&str>`::`from(arg)` (#338), the same shape.
+    if base == "From" && target.name == "from" {
+        if let Some(arg) = leaf
+            .find('<')
+            .and_then(|i| leaf[i + 1..].rfind('>').map(|j| leaf[i + 1..][..j].trim()))
+            .map(normalize_ref_arg)
+        {
+            if (arg == "&[u8]" || arg == "&str") && single_ref_param_is(target, &arg) {
+                return Some(vec![format!("::core::convert::From<{arg}>")]);
+            }
+        }
+    }
     None
+}
+
+/// The absolute path of a trait the target crate takes from one of its
+/// dependencies, for a static trait-impl method called by UFCS (#338): the
+/// trait spelled with the dependency's name (`impl dep::Decode for T`), or
+/// imported by a `use` of the impl's file (`use dep::codec::Decode;`, then
+/// `impl Decode for T`). Returns the path (`["::dep", "codec", "Decode"]`) and
+/// the dependency's key in the manifest. A trait generic only over lifetimes
+/// (`BytesDecode<'a>`) is named without them, which a path in an expression
+/// may. `None` for a trait generic over a type, or one no dependency of the
+/// manifest provides.
+fn dependency_trait_path(
+    source: &str,
+    manifest_dir: &Path,
+    trait_spelling: &str,
+) -> Option<(Vec<String>, String)> {
+    let mut spelling: String = trait_spelling
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if let Some(open) = spelling.find('<') {
+        let args = spelling[open + 1..].strip_suffix('>')?;
+        if !args.split(',').all(|arg| arg.starts_with('\'')) {
+            return None;
+        }
+        spelling.truncate(open);
+    }
+    let spelling = spelling.trim_start_matches("::");
+    let segments: Vec<&str> = spelling.split("::").collect();
+    let path: Vec<String> = if segments.len() > 1 {
+        segments.iter().map(|s| (*s).to_owned()).collect()
+    } else {
+        use_paths(source)
+            .into_iter()
+            .find(|(_, name)| name == spelling)
+            .map(|(path, _)| path)?
+    };
+    let first = path.first()?;
+    let dependency = manifest_dependency_keys(manifest_dir)
+        .into_iter()
+        .find(|key| key.replace('-', "_") == *first)?;
+    let mut absolute = vec![format!("::{first}")];
+    absolute.extend(path[1..].iter().cloned());
+    Some((absolute, dependency))
+}
+
+/// Every item a file's `use` declarations bring into scope, as (path, the
+/// name it is visible by): `use a::b::{C, d::E as F};` gives `[a, b, C]` as
+/// `C` and `[a, b, d, E]` as `F`. Globs and `self` are left out.
+fn use_paths(source: &str) -> Vec<(Vec<String>, String)> {
+    fn expand(prefix: &[String], tree: &str, out: &mut Vec<(Vec<String>, String)>) {
+        let tree = tree.trim();
+        if let Some(open) = tree.find('{') {
+            let Some(inner) = tree[open + 1..].strip_suffix('}') else {
+                return;
+            };
+            let mut base = prefix.to_vec();
+            base.extend(
+                tree[..open]
+                    .trim_end_matches("::")
+                    .split("::")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+            );
+            let mut depth = 0;
+            let mut start = 0;
+            for (i, ch) in inner.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        expand(&base, &inner[start..i], out);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            expand(&base, &inner[start..], out);
+            return;
+        }
+        let (path, alias) = match tree.split_once(" as ") {
+            Some((path, alias)) => (path.trim(), Some(alias.trim())),
+            None => (tree, None),
+        };
+        let mut full = prefix.to_vec();
+        full.extend(
+            path.split("::")
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+        let Some(last) = full.last().cloned() else {
+            return;
+        };
+        if last == "*" || last == "self" || alias == Some("_") {
+            return;
+        }
+        out.push((full, alias.unwrap_or(&last).to_owned()));
+    }
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("use ") {
+        let before = &rest[..at];
+        let starts_item = before
+            .chars()
+            .last()
+            .is_none_or(|c| c.is_whitespace() || c == ';' || c == '}' || c == '{');
+        rest = &rest[at + 4..];
+        let Some(end) = rest.find(';') else { break };
+        if starts_item {
+            let tree: String = rest[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+            let tree = tree.trim_start_matches("::");
+            expand(&[], tree, &mut out);
+        }
+    }
+    out
+}
+
+/// The dependency keys of a manifest's `[dependencies]` (and per-target
+/// dependency tables), as written.
+fn manifest_dependency_keys(manifest_dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(manifest_dir.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .map(|deps| deps.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            if let Some(deps) = target.get("dependencies").and_then(toml::Value::as_table) {
+                keys.extend(deps.keys().cloned());
+            }
+        }
+    }
+    keys
+}
+
+/// A dependency of the target manifest written for the external harness
+/// crate (`key = { version = .., path = <absolute> }`), or `None` for one it
+/// cannot copy (inherited from a workspace).
+fn dependency_spec(manifest_dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).ok()?;
+    // A dependency the member inherits from its workspace, resolved as Cargo
+    // resolves it.
+    let text = resolve_workspace_inherited_deps(&text, parent_workspace(manifest_dir).as_ref())
+        .unwrap_or(text);
+    let manifest = text.parse::<toml::Table>().ok()?;
+    let from_target = || {
+        manifest
+            .get("target")?
+            .as_table()?
+            .values()
+            .find_map(|target| target.get("dependencies")?.get(key).cloned())
+    };
+    let spec = manifest
+        .get("dependencies")
+        .and_then(|deps| deps.get(key))
+        .cloned()
+        .or_else(from_target)?;
+    let rendered = match spec {
+        toml::Value::String(version) => format!("{key} = {}", toml::Value::String(version)),
+        toml::Value::Table(table) => {
+            if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                return None;
+            }
+            let fields: Vec<String> = table
+                .into_iter()
+                .filter(|(field, _)| field != "optional")
+                .map(|(field, value)| {
+                    let value = match (field.as_str(), value) {
+                        ("path", toml::Value::String(path)) => toml::Value::String(
+                            manifest_dir.join(path).to_string_lossy().into_owned(),
+                        ),
+                        (_, value) => value,
+                    };
+                    format!("{field} = {value}")
+                })
+                .collect();
+            format!("{key} = {{ {} }}", fields.join(", "))
+        }
+        _ => return None,
+    };
+    Some(rendered)
 }
 
 /// True when `target` takes exactly one parameter whose (lifetime-erased,
@@ -2593,8 +2820,8 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
             // method or free fn is unreachable from an external dependent crate
             // (E0603) even when its enclosing type is reachable at the crate root, so
             // route it to the in-crate build — a harness injected as a module of a
-            // copy of the crate reaches it by its `crate::...` path. Gated behind the
-            // env flag (off by default => the block never runs, default path
+            // copy of the crate reaches it by its `crate::...` path. Gated behind
+            // `--rust-private` (off by default => the block never runs, default path
             // byte-identical); a trait-impl method is left to the paths above (no
             // in-crate trait synthesis yet).
             if incrate_private_enabled()
@@ -2789,6 +3016,24 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
             } else {
                 None
             };
+            // #338: a dependency's trait (`impl dep::Decode for T`, or `Decode`
+            // imported by a `use` of the impl's file). The harness crate gets the
+            // dependency, with the target's spec, to name it.
+            let (ufcs_trait, ufcs_trait_dependency) = match ufcs_trait {
+                Some(path) => (Some(path), None),
+                None if target.is_static
+                    && !enclosing_impl_type_is_generic(&source, target.line) =>
+                {
+                    match target.impl_trait.as_deref().and_then(|tr| {
+                        dependency_trait_path(&source, &manifest_dir, tr)
+                            .filter(|(_, dep)| dependency_spec(&manifest_dir, dep).is_some())
+                    }) {
+                        Some((path, dep)) => (Some(path), Some(dep)),
+                        None => (None, None),
+                    }
+                }
+                None => (None, None),
+            };
             // A STATIC trait-impl method is only callable by UFCS (`Type::method`
             // needs the trait in scope). If the trait isn't an in-crate, reachable
             // trait (a std/external trait like `From`/`Default`, or a private one),
@@ -2796,6 +3041,24 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
             // that fails to build. Keeps the in-crate-trait win (byteorder) without
             // flooding discovery with std-conversion impls.
             if target.is_static && target.impl_trait.is_some() && ufcs_trait.is_none() {
+                // Say what stops it: no input (`Default::default`), an impl on
+                // a generic type (`impl BytesDecode for Codec<C>`, which needs
+                // a type argument), or a trait no path reaches.
+                if target.params.is_empty() {
+                    return Err(format!(
+                        "Rust target '{}' is a trait-impl method that takes no input; \
+                         nothing to fuzz",
+                        target.name
+                    ));
+                }
+                if enclosing_impl_type_is_generic(&source, target.line) {
+                    return Err(format!(
+                        "Rust target '{}' is a static method of a trait impl on a generic \
+                         type, which needs a type argument a harness cannot choose; not \
+                         auto-harnessable",
+                        target.name
+                    ));
+                }
                 return Err(format!(
                     "Rust target '{}' is a static method of a non-in-crate trait impl \
                      (callable only by UFCS with an in-crate trait); not auto-harnessable",
@@ -2854,6 +3117,7 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
                 param_decoders,
                 receiver_ctor_param_decoders,
                 ufcs_trait,
+                ufcs_trait_dependency,
                 method_trait_import,
                 resource_recipe: None,
             })
@@ -2961,6 +3225,7 @@ fn resolve_reader_trait_method(
         param_decoders,
         receiver_ctor_param_decoders,
         ufcs_trait: None,
+        ufcs_trait_dependency: None,
         method_trait_import,
         resource_recipe: None,
     })
@@ -3026,12 +3291,21 @@ fn resolve_in_crate_target(
                 if enclosing_impl_type_is_generic(source, target.line) {
                     None
                 } else {
-                    std_ufcs_trait_path(&target)
+                    std_ufcs_trait_path(&target).or_else(|| {
+                        // #338: a dependency's trait; the crate already
+                        // depends on it.
+                        target
+                            .impl_trait
+                            .as_deref()
+                            .and_then(|tr| dependency_trait_path(source, manifest_dir, tr))
+                            .map(|(path, _)| path)
+                    })
                 }
             })
     } else {
         None
     };
+    let ufcs_trait_dependency = None;
     if target.is_static && target.impl_trait.is_some() && ufcs_trait.is_none() {
         return Err(format!(
             "Rust target '{}' (in-crate) is a static method of a trait impl whose trait \
@@ -3172,6 +3446,7 @@ fn resolve_in_crate_target(
         param_decoders,
         receiver_ctor_param_decoders: Vec::new(),
         ufcs_trait,
+        ufcs_trait_dependency,
         method_trait_import,
         resource_recipe,
     })
@@ -3500,6 +3775,7 @@ pub fn build_rust_harness(
     if resolved.build_mode == BuildMode::InCrate {
         return build_in_crate(
             &resolved,
+            &candidate.source_path,
             &harness,
             work_dir,
             harness_id,
@@ -3525,9 +3801,20 @@ pub fn build_rust_harness(
         &resolved.crate_name,
         &resolved.manifest_dir,
         &target_features,
+        resolved.ufcs_trait_dependency.as_slice(),
     ) {
         return RustBuildResult::Failed {
             reason: e,
+            skip: false,
+        };
+    }
+    // Built `--offline`, the harness crate resolves its dependencies on its
+    // own: a git dependency with no rev (meilisearch's `bbqueue`) does not
+    // resolve at all, and others can pick versions the target never built
+    // with. Its lockfile starts as the target's, which pins them.
+    if let Err(e) = seed_harness_lockfile(&resolved.manifest_dir, &crate_dir) {
+        return RustBuildResult::Failed {
+            reason: format!("copy the target's Cargo.lock: {e}"),
             skip: false,
         };
     }
@@ -3798,9 +4085,31 @@ fn emit_rust_portability(
     }
 }
 
+/// The file of the crate copy the in-crate harness module is declared in: the
+/// copy of the file that defines the target, or the lib root when the target
+/// sits in an inline `mod {}` block or its file is not in the copy.
+fn incrate_harness_host(
+    resolved: &ResolvedTarget,
+    target_file: &Path,
+    crate_copy: &Path,
+    lib_root: &Path,
+) -> PathBuf {
+    if !resolved.target.inline_modules.is_empty() {
+        return lib_root.to_path_buf();
+    }
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(target_file)
+        .strip_prefix(canonical(&resolved.manifest_dir))
+        .ok()
+        .map(|relative| crate_copy.join(relative))
+        .filter(|copied| copied.is_file())
+        .unwrap_or_else(|| lib_root.to_path_buf())
+}
+
 /// §27.10: build an in-crate harness. Copies the target crate, injects the harness
-/// as a `#[doc(hidden)] pub mod __bhf_harness;` of its lib root (so its
-/// `crate::...` paths reach private modules), builds the copy as a `staticlib`, and
+/// as a `#[doc(hidden)] pub mod __bhf_harness;` child of the module that defines
+/// the target (so its `crate::...` paths reach private modules, and the target
+/// module's own private items too), builds the copy as a `staticlib`, and
 /// clang-links it with the C fork-server driver — the same execution artifact the
 /// external lane produces, but reaching the crate's private API.
 /// `target_features`: the crate features the candidate's `#[cfg(feature)]`
@@ -3810,6 +4119,7 @@ fn emit_rust_portability(
 #[allow(clippy::too_many_arguments)]
 fn build_in_crate(
     resolved: &ResolvedTarget,
+    target_file: &Path,
     harness: &harness_gen::rust_generate::GeneratedRustHarness,
     work_dir: &Path,
     harness_id: &str,
@@ -3891,21 +4201,43 @@ fn build_in_crate(
     // `#[no_mangle]` export must use the `#[unsafe(no_mangle)]` form — a bare
     // `#[no_mangle]` is a HARD ERROR on edition 2024 ("unsafe attribute used without
     // unsafe"). The wrapped form is accepted on every edition (rustc ≥ 1.82).
+    //
+    // The module is a child of the file that defines the target: a private
+    // associated function (`impl Database { fn deserialize(..) }` in
+    // `src/db/mod.rs`) is visible only inside its module and the module's
+    // descendants, and a child of that module still sees everything the crate
+    // root does. A target inside an inline `mod {}` block keeps the lib root.
     let harness_module = incrate_harness_with_unsafe_no_mangle(&harness.harness_rs);
-    if let Err(e) = std::fs::write(src.join("__bhf_harness.rs"), &harness_module) {
+    let host = incrate_harness_host(resolved, target_file, &crate_copy, &lib_root);
+    let host_dir = host.parent().unwrap_or(&src).to_path_buf();
+    if let Err(e) = std::fs::write(host_dir.join("__bhf_harness.rs"), &harness_module) {
         return RustBuildResult::Failed {
             reason: format!("write in-crate harness module: {e}"),
             skip: false,
         };
     }
-    let mut text = lib_text;
+    let mut text = if host == lib_root {
+        lib_text
+    } else {
+        match crate::source_text::read_source_text(&host) {
+            Ok(t) => t,
+            Err(e) => {
+                return RustBuildResult::Failed {
+                    reason: format!("read {} for injection: {e}", host.display()),
+                    skip: false,
+                }
+            }
+        }
+    };
+    // `#[path]` is relative to the declaring file's dir whether it is a
+    // `mod.rs` or not, so the module is the file written beside it.
     text.push_str(
         "\n// GENERATED by bhf — in-crate fuzz harness module (§27.10).\n\
-         #[doc(hidden)]\npub mod __bhf_harness;\n",
+         #[doc(hidden)]\n#[path = \"__bhf_harness.rs\"]\npub mod __bhf_harness;\n",
     );
-    if let Err(e) = std::fs::write(&lib_root, text) {
+    if let Err(e) = std::fs::write(&host, text) {
         return RustBuildResult::Failed {
-            reason: format!("inject harness module into {}: {e}", lib_root.display()),
+            reason: format!("inject harness module into {}: {e}", host.display()),
             skip: false,
         };
     }
@@ -4496,6 +4828,18 @@ fn copy_workspace_lockfile(manifest_dir: &Path, crate_copy: &Path) -> std::io::R
     }
 }
 
+/// Seed the harness crate `crate_dir` with the lockfile of the target crate
+/// in `manifest_dir`: its workspace's, else its own.
+fn seed_harness_lockfile(manifest_dir: &Path, crate_dir: &Path) -> std::io::Result<()> {
+    copy_workspace_lockfile(manifest_dir, crate_dir)?;
+    let own = manifest_dir.join("Cargo.lock");
+    let target = crate_dir.join("Cargo.lock");
+    if !target.exists() && own.is_file() {
+        std::fs::copy(own, target)?;
+    }
+    Ok(())
+}
+
 /// The Cargo workspace a crate in `manifest_dir` is a member of: the nearest
 /// directory at or above it whose `Cargo.toml` has a `[workspace]` table, and
 /// that manifest.
@@ -5051,6 +5395,7 @@ fn emit_harness_crate(
     target_crate: &str,
     target_manifest_dir: &Path,
     target_features: &[String],
+    extra_dependencies: &[String],
 ) -> Result<(), String> {
     let src = crate_dir.join("src");
     std::fs::create_dir_all(&src).map_err(|e| format!("mkdir {}: {e}", src.display()))?;
@@ -5088,7 +5433,15 @@ fn emit_harness_crate(
             .join(", ");
         props.push(format!("features = [{feats}]"));
     }
-    let target_dep = format!("{target_crate} = {{ {} }}", props.join(", "));
+    let mut target_dep = format!("{target_crate} = {{ {} }}", props.join(", "));
+    // A dependency the harness names itself (the crate of a trait it calls
+    // by UFCS, #338), with the target's spec.
+    for dependency in extra_dependencies {
+        if let Some(spec) = dependency_spec(target_manifest_dir, dependency) {
+            target_dep.push('\n');
+            target_dep.push_str(&spec);
+        }
+    }
     let cargo_toml = format!(
         "# SPDX-License-Identifier: Apache-2.0\n\
          # GENERATED by bhf — staticlib harness crate.\n\
@@ -5332,7 +5685,7 @@ mod tests {
             bhfeprintln!("skipping: rust_runtime crate not locatable");
             return;
         }
-        emit_harness_crate(&harness, "fn _x() {}", "data_url", &target, &[]).unwrap();
+        emit_harness_crate(&harness, "fn _x() {}", "data_url", &target, &[], &[]).unwrap();
         let cargo = std::fs::read_to_string(harness.join("Cargo.toml")).unwrap();
         assert!(
             cargo.contains("data_url = { path =") && cargo.contains("package = \"data-url\""),
@@ -5348,7 +5701,7 @@ mod tests {
         )
         .unwrap();
         let h2 = tmp.path().join("h2");
-        emit_harness_crate(&h2, "fn _x() {}", "serde_json", &plain, &[]).unwrap();
+        emit_harness_crate(&h2, "fn _x() {}", "serde_json", &plain, &[], &[]).unwrap();
         let cargo2 = std::fs::read_to_string(h2.join("Cargo.toml")).unwrap();
         assert!(
             cargo2.contains("serde_json = { path =") && !cargo2.contains("package ="),
@@ -5363,6 +5716,7 @@ mod tests {
             "serde_json",
             &plain,
             &["escape-html".to_owned()],
+            &[],
         )
         .unwrap();
         let cargo3 = std::fs::read_to_string(h3.join("Cargo.toml")).unwrap();
@@ -5927,6 +6281,7 @@ mod tests {
             "url",
             Path::new("/tmp/some/url"),
             &[],
+            &[],
         )
         .expect("emit harness crate");
         let toml = std::fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap();
@@ -6433,13 +6788,23 @@ mod tests {
             "try_from",
         );
         assert_eq!(std_ufcs_trait_path(&owned), None);
-        // `From<&str>` (infallible `from`) is not one of the handled shapes.
+        // `From<&str>` (infallible `from`) is handled like `TryFrom<&str>`
+        // (#338); `From<u32>` is not a byte/str arg and keeps skipping.
         let from = parse_fn(
             "impl From<&str> for T {\n\
              fn from(s: &str) -> Self { todo!() }\n}",
             "from",
         );
-        assert_eq!(std_ufcs_trait_path(&from), None);
+        assert_eq!(
+            std_ufcs_trait_path(&from),
+            Some(vec!["::core::convert::From<&str>".to_owned()])
+        );
+        let from_int = parse_fn(
+            "impl From<u32> for T {\n\
+             fn from(v: u32) -> Self { todo!() }\n}",
+            "from",
+        );
+        assert_eq!(std_ufcs_trait_path(&from_int), None);
         // A FromStr with an UNEXPECTED parameter shape must not misfire.
         let weird = parse_fn(
             "impl FromStr for T {\n\
@@ -7042,6 +7407,49 @@ mod tests {
         );
     }
 
+    /// The harness crate's lockfile is the target's: its workspace's when it
+    /// is a member, else its own; one the harness crate has is kept.
+    #[test]
+    fn the_harness_crate_starts_from_the_targets_lockfile() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("crates/codec");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/codec\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("Cargo.lock"), "# workspace\n").unwrap();
+        let harness = root.path().join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        seed_harness_lockfile(&member, &harness).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(harness.join("Cargo.lock")).unwrap(),
+            "# workspace\n"
+        );
+
+        let single = tempfile::tempdir().unwrap();
+        std::fs::write(
+            single.path().join("Cargo.toml"),
+            "[package]\nname = \"one\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(single.path().join("Cargo.lock"), "# own\n").unwrap();
+        let harness = single.path().join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        seed_harness_lockfile(single.path(), &harness).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(harness.join("Cargo.lock")).unwrap(),
+            "# own\n"
+        );
+        std::fs::write(single.path().join("Cargo.lock"), "# changed\n").unwrap();
+        seed_harness_lockfile(single.path(), &harness).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(harness.join("Cargo.lock")).unwrap(),
+            "# own\n"
+        );
+    }
+
     #[test]
     fn prepare_incrate_manifest_skips_on_workspace_inherited_dep() {
         // A `workspace = true` dependency with no parent workspace to declare it
@@ -7450,6 +7858,87 @@ mod tests {
         let generic = "Rust target 'x' is a &self method and no no-arg receiver \
                        constructor was found; not auto-harnessable";
         assert!(!resolve_failure_is_unsupported_setup(generic), "{generic}");
+    }
+
+    #[test]
+    fn use_declarations_expand_to_the_names_they_bring_into_scope() {
+        let source = "use wiredep::Decode;\n\
+                      use std::{fmt, io::{self, Read as R}};\n\
+                      pub use crate::codec::*;\n\
+                      fn reuse() {}\n";
+        let mut paths: Vec<(String, String)> = use_paths(source)
+            .into_iter()
+            .map(|(path, name)| (path.join("::"), name))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                ("std::fmt".to_owned(), "fmt".to_owned()),
+                ("std::io::Read".to_owned(), "R".to_owned()),
+                ("wiredep::Decode".to_owned(), "Decode".to_owned()),
+            ]
+        );
+    }
+
+    /// #338: a dependency's trait resolves to an absolute path and the
+    /// dependency's key; a trait no dependency provides, or a generic one,
+    /// does not.
+    #[test]
+    fn a_dependency_trait_resolves_through_use_or_its_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             wire-dep = { path = \"../wire\", version = \"0.1\" }\nserde = \"1\"\n",
+        )
+        .unwrap();
+        let source = "use wire_dep::codec::Decode;\n";
+        let resolve = |spelling: &str| dependency_trait_path(source, dir.path(), spelling);
+        assert_eq!(
+            resolve("Decode"),
+            Some((
+                vec![
+                    "::wire_dep".to_owned(),
+                    "codec".to_owned(),
+                    "Decode".to_owned()
+                ],
+                "wire-dep".to_owned()
+            ))
+        );
+        assert_eq!(
+            resolve("serde::Deserialize"),
+            Some((
+                vec!["::serde".to_owned(), "Deserialize".to_owned()],
+                "serde".to_owned()
+            ))
+        );
+        assert_eq!(resolve("Encode"), None);
+        // A lifetime-only generic is named without it; a type argument is not
+        // resolved.
+        assert_eq!(
+            resolve("serde::Deserialize<'de>").map(|(path, _)| path),
+            Some(vec!["::serde".to_owned(), "Deserialize".to_owned()])
+        );
+        assert_eq!(resolve("serde::Convert<u8>"), None);
+        assert_eq!(resolve("std::convert::From"), None);
+
+        // Compared as TOML: a Windows path renders as a literal string.
+        let spec: toml::Table = dependency_spec(dir.path(), "wire-dep")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let wire = dir.path().join("../wire");
+        assert_eq!(
+            spec["wire-dep"]["path"].as_str(),
+            Some(wire.to_string_lossy().as_ref()),
+            "{spec}"
+        );
+        assert_eq!(spec["wire-dep"]["version"].as_str(), Some("0.1"), "{spec}");
+        assert_eq!(
+            dependency_spec(dir.path(), "serde").as_deref(),
+            Some("serde = \"1\"")
+        );
     }
 
     #[test]

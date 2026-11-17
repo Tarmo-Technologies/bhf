@@ -170,20 +170,105 @@ fn fake_tool(root: &Path, name: &str, code: i32) -> PathBuf {
     path
 }
 
-/// The Rizin, Ghidra and angr adapters run no analysis: with their tool they
-/// say so (exit 3), without it they are skipped (exit 1). They wrote empty
-/// arrays as a successful `smoke_tested` analysis, and angr's ran
-/// `python3 --version`, which succeeds without angr.
+/// The adapters that run an external analyzer.
+#[cfg(unix)]
+const ANALYZERS: &[&str] = &["rizin", "ghidra", "angr"];
+
+/// A tool that answers its probe and writes, or prints, the analysis its real
+/// counterpart recorded for `tests/fixtures/binary_adapter/legacy.c`: rizin
+/// prints it, `analyzeHeadless` and angr's Python write it where the bundled
+/// script would.
+#[cfg(unix)]
+fn recording_tool(root: &Path, kind: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let recorded = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/binary_adapter/testdata");
+    let script = match kind {
+        "rizin" => format!(
+            "#!/bin/sh\n[ \"$1\" = -v ] && {{ echo 'rizin 0.9.1 @ linux-x86-64'; exit 0; }}\n\
+             cat '{}'\n",
+            recorded.join("rizin-legacy.out").display()
+        ),
+        // analyzeHeadless <project> <name> -import <binary> -scriptPath <dir>
+        //   -postScript BhfExport.java <export> <limit> -deleteProject
+        "ghidra" => format!(
+            "#!/bin/sh\nscripts=$6\n[ \"$7 $8\" = '-postScript BhfExport.java' ] || exit 9\n\
+             grep -q 'class BhfExport' \"$scripts/BhfExport.java\" || exit 9\n\
+             cp '{}' \"$9\"\n",
+            recorded.join("ghidra-legacy.json").display()
+        ),
+        // python <angr_export.py> <binary> <export> <limit>
+        "angr" => format!(
+            "#!/bin/sh\n[ \"$1\" = -c ] && {{ echo 10.0.7; exit 0; }}\n\
+             grep -q CFGFast \"$1\" || exit 9\ncp '{}' \"$3\"\n",
+            recorded.join("angr-legacy.json").display()
+        ),
+        other => panic!("{other}"),
+    };
+    let path = root.join(format!("{kind}-recording"));
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Each real adapter maps what its tool exports into the report: the
+/// functions at the binary's own addresses, the call graph, the strings and
+/// the xrefs, `ok` and exit 0. They used to run only the tool's `--version`
+/// and write empty arrays.
 #[cfg(unix)]
 #[test]
-fn each_real_adapter_is_not_implemented_with_its_tool_and_skipped_without() {
-    for kind in ["rizin", "ghidra", "angr"] {
+fn each_real_adapter_reports_the_analysis_its_tool_exports() {
+    for &kind in ANALYZERS {
+        let root = temp_dir(&format!("recorded-{kind}"));
+        let (code, report) = run_adapter(&root, kind, &recording_tool(&root, kind));
+        assert_eq!(code, Some(0), "{kind}: {report:#}");
+        assert_eq!(report["status"], "ok", "{kind}");
+        assert_eq!(report["errors"], json!([]), "{kind}");
+        assert_eq!(report["truncated"], json!([]), "{kind}");
+        let parse_header = report["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["name"] == "parse_header")
+            .unwrap_or_else(|| panic!("{kind}: {report:#}"));
+        assert_eq!(parse_header["address"], "0x1169", "{kind}");
+        assert!(
+            report["call_graph"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({ "caller": "handle", "callee": "parse_header" })),
+            "{kind}: {report:#}"
+        );
+        assert!(
+            report["strings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|string| string["value"] == "LEGACY/1.0"),
+            "{kind}"
+        );
+        assert!(
+            report["xrefs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|xref| xref["kind"] == "call" && xref["to"] == "0x1169"),
+            "{kind}"
+        );
+    }
+}
+
+/// A tool that prints no analysis is an error, a tool that is not there is
+/// skipped, and so is a Python that cannot import angr: exit 1 each time.
+#[cfg(unix)]
+#[test]
+fn a_real_adapter_without_an_analysis_is_an_error_or_skipped() {
+    for &kind in ANALYZERS {
         let root = temp_dir(&format!("real-{kind}"));
         let present = fake_tool(&root, &format!("{kind}-tool"), 0);
         let (code, report) = run_adapter(&root, kind, &present);
-        assert_eq!(code, Some(3), "{kind}: {report:#}");
-        assert_eq!(report["status"], "not_implemented", "{kind}");
-        assert_eq!(report["errors"][0]["reason"], "not_implemented", "{kind}");
+        assert_eq!(code, Some(1), "{kind}: {report:#}");
+        assert_eq!(report["status"], "error", "{kind}");
+        assert_eq!(report["errors"][0]["reason"], "bad_output", "{kind}");
         assert_eq!(report["functions"], json!([]), "{kind}");
 
         let (code, report) = run_adapter(&root, kind, &root.join("no-such-tool"));
@@ -191,29 +276,26 @@ fn each_real_adapter_is_not_implemented_with_its_tool_and_skipped_without() {
         assert_eq!(report["status"], "skipped", "{kind}");
         assert_eq!(report["errors"][0]["reason"], "tool_not_found", "{kind}");
     }
-    // A Python that cannot import angr is no angr.
     let root = temp_dir("real-angr-missing");
     let python_without_angr = fake_tool(&root, "python-no-angr", 1);
     let (code, report) = run_adapter(&root, "angr", &python_without_angr);
     assert_eq!(code, Some(1), "{report:#}");
+    assert_eq!(report["status"], "skipped");
     assert_eq!(report["errors"][0]["reason"], "tool_not_found");
 }
 
 #[test]
-fn the_adapter_help_does_not_claim_an_analysis() {
+fn the_adapter_help_names_the_analyzers_it_runs() {
     let output = Command::new(bhf_bin())
         .args(["binary", "--help"])
         .output()
         .unwrap();
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !help.contains("Analyze a binary via external adapters"),
+        help.contains("Rizin, Ghidra headless or angr, run as subprocesses"),
         "{help}"
     );
-    assert!(
-        help.contains("no analysis through them is implemented yet"),
-        "{help}"
-    );
+    assert!(!help.contains("no analysis through them"), "{help}");
 }
 
 fn assert_success(output: std::process::Output) {

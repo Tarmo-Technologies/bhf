@@ -1,0 +1,48 @@
+{
+ "repo": "router-for-me/CLIProxyAPI",
+ "sha": "c9417c8ae9b16fabc0386ca35d36f13bf8b1d678",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "lib.rs",
+   "name": "cliproxy_plugin_init",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '*const CliproxyHostApi' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 2,
+   "classes": [
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder",
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 15,
+  "discovered_total": 15,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 15,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

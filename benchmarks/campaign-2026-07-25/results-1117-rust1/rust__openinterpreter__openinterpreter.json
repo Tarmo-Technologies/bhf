@@ -1,0 +1,45 @@
+{
+ "repo": "openinterpreter/openinterpreter",
+ "sha": "f7112ffc791e01c4dfb06ad4a4e03a191bee6c4a",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "bundle_loader.rs",
+   "name": "cloud_config_bundle_loader",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type 'Arc<AuthManager>' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  },
+  {
+   "source": "session_index.rs",
+   "name": "append_thread_name",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&Path' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

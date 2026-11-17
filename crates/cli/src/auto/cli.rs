@@ -119,7 +119,7 @@ pub struct AutoArgs {
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, cxx-expected-exception, seed-file, seed-dir, sanitizers,
-    /// engine, languages, project, ada-deps, passes, force, build-command,
+    /// engine, languages, project, ada-deps, passes, force, rust-private, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
     /// msbuild-evaluate, winafl-path, dynamorio-path (`seed-mining = false` is
     /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
@@ -791,6 +791,16 @@ pub struct AutoArgs {
     #[arg(long = "force", visible_alias = "force-fuzz")]
     pub force: bool,
 
+    /// Harness private Rust targets in-crate (#83): admit `pub(crate)` and
+    /// private functions and methods, and inject each harness as a module into
+    /// a copy of the crate, so it can call what no external crate can.
+    /// Off by default; `rust-private = true` in the config, or
+    /// `BHF_RUST_INCRATE_PRIVATE=1`, turns it on too. A target the lane admits
+    /// but cannot set up (a parameter or resource it has no recipe for) is
+    /// outcome `unsupported_setup`.
+    #[arg(long = "rust-private")]
+    pub rust_private: bool,
+
     /// Two-compiler differential fuzzing (C/C++). Format `A:B`, e.g. `clang:gcc`:
     /// after the normal run, rebuild each C/C++ harness under both compilers via a
     /// portable build and replay the fuzz corpus through both, flagging any input
@@ -1284,6 +1294,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     };
     for note in config_notes {
         bhfeprintln!("bhf auto: {note}");
+    }
+    if args.rust_private {
+        crate::auto::rust_build::enable_incrate_private();
     }
     if args.max_corpus_mb == 0 {
         anyhow::bail!("--max-corpus-mb must be at least 1");
@@ -4658,9 +4671,10 @@ impl AutoSummary {
                     coverage_edges = coverage_edges
                         .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
                 }
-                UnsafeBuildPath { .. } | MissingToolchain { .. } | ConsentRequired { .. } => {
-                    skipped += 1
-                }
+                UnsafeBuildPath { .. }
+                | UnsupportedSetup { .. }
+                | MissingToolchain { .. }
+                | ConsentRequired { .. } => skipped += 1,
                 UnsupportedParams { reason } => {
                     skipped += 1;
                     // An interpreted target that could not LOAD because a package
@@ -5528,6 +5542,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         UnsupportedParams { .. } => "skipped: could not auto-harness",
         // Not a missing feature: a path or flag no quoting makes safe.
         UnsafeBuildPath { .. } => "refused: a path or flag cannot be quoted safely",
+        // The in-crate Rust lane has no recipe for one parameter or resource.
+        UnsupportedSetup { .. } => "skipped: the in-crate Rust lane cannot set it up",
         // Not a missing feature: the lane's toolchain is not installed here.
         MissingToolchain { .. } => "skipped: toolchain not installed",
         // Not unsupported: the build runs project code, which needs consent.
@@ -5588,6 +5604,7 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
         }
         UnsupportedParams { reason }
         | UnsafeBuildPath { reason }
+        | UnsupportedSetup { reason }
         | MissingToolchain { reason }
         | ConsentRequired { reason } => lines.push(reason.clone()),
         UnrecoverableLink { missing, .. } => {

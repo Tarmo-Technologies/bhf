@@ -1,0 +1,45 @@
+{
+ "repo": "denoland/deno",
+ "sha": "697ba729af9cdbf0a53117a754463f6c3205ce55",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ops_builtin_v8.rs",
+   "name": "deserialize_broadcast",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&mut v8::PinScope' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  },
+  {
+   "source": "stream_resource.rs",
+   "name": "op_readable_stream_resource_write_error",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '*const c_void' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

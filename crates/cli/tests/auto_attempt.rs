@@ -3234,6 +3234,10 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         Outcome::ConsentRequired { reason } => {
             panic!("an Ada candidate was refused for consent: {reason}")
         }
+        // Only the in-crate Rust lane reports an unsupported setup.
+        Outcome::UnsupportedSetup { reason } => {
+            panic!("an Ada candidate was routed to the in-crate Rust lane: {reason}")
+        }
     }
 }
 

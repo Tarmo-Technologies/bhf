@@ -87,6 +87,8 @@ pub enum JobState {
     Running,
     Complete,
     Failed,
+    /// Cancelled with [`Scheduler::cancel`] before it finished (#271).
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +112,8 @@ pub enum DaemonError {
     Shutdown,
     #[error("job ID space exhausted")]
     IdExhausted,
+    #[error("no job {0}")]
+    UnknownJob(String),
     #[error("invalid job time budget: {0}")]
     InvalidBudget(String),
     #[error("invalid scheduler limits")]
@@ -157,6 +161,8 @@ struct SharedState {
 struct InnerState {
     queue: VecDeque<FuzzJob>,
     seen: Vec<FuzzJob>,
+    /// Running jobs a [`Scheduler::cancel`] asked their worker to stop.
+    cancel_requested: HashSet<String>,
     shutdown: bool,
     next_id: u64,
     snapshot_bytes_reserved: usize,
@@ -225,6 +231,7 @@ impl Scheduler {
                 next_id: 0,
                 snapshot_bytes_reserved: 0,
                 storage_fault: None,
+                cancel_requested: HashSet::new(),
             }),
             cv: Condvar::new(),
         });
@@ -444,6 +451,45 @@ impl Scheduler {
         Ok(job_id)
     }
 
+    /// Cancel job `job_id` (#271). A queued job leaves the queue and is
+    /// `Cancelled` at once; a running one is stopped by its worker, which
+    /// kills the fuzz process tree and records `Cancelled`. Returns the job's
+    /// state after the request: `Cancelled`, `Running` while its worker stops
+    /// it, or the terminal state it already had.
+    pub fn cancel(&self, job_id: &str) -> Result<JobState, DaemonError> {
+        let mut guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.shutdown {
+            return Err(DaemonError::Shutdown);
+        }
+        let Some(index) = guard.seen.iter().position(|job| job.job_id == job_id) else {
+            return Err(DaemonError::UnknownJob(job_id.to_owned()));
+        };
+        match guard.seen[index].state {
+            JobState::Queued => {
+                guard.queue.retain(|job| job.job_id != job_id);
+                guard.seen[index].state = JobState::Cancelled;
+                if guard.storage_fault.is_none() {
+                    if let Err(failure) = persist_jobs(&self.data_dir, &guard.seen) {
+                        health::latch_storage_fault(
+                            &self.state,
+                            &mut guard,
+                            PersistencePhase::Cancellation,
+                            job_id,
+                            &failure,
+                        );
+                        return Err(DaemonError::Io(failure.error));
+                    }
+                }
+                Ok(JobState::Cancelled)
+            }
+            JobState::Running => {
+                guard.cancel_requested.insert(job_id.to_owned());
+                Ok(JobState::Running)
+            }
+            finished => Ok(finished),
+        }
+    }
+
     pub fn list_jobs(&self) -> Result<Vec<FuzzJob>, DaemonError> {
         let guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         Ok(guard.seen.clone())
@@ -464,7 +510,8 @@ impl Scheduler {
 
 fn reserved_job_bytes(job: &FuzzJob) -> Result<usize, DaemonError> {
     let mut worst = job.clone();
-    worst.state = JobState::Complete;
+    // The longest state name the record can be persisted with.
+    worst.state = JobState::Cancelled;
     Ok(serde_json::to_vec(&worst)?.len().saturating_add(1))
 }
 
@@ -561,6 +608,12 @@ fn worker_loop(
             }
         };
         let outcome = run_one_job(&bin, &job, &state, shutdown_timeout, job_wall_grace);
+        state
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_requested
+            .remove(&job.job_id);
         refresh.job_finished(&job.project_dir, outcome);
         let final_state = match outcome {
             JobOutcome::Finished(state) => state,
@@ -622,6 +675,16 @@ fn validate_wall_budget(budget_secs: u64, grace: Duration) -> Result<(), DaemonE
     Ok(())
 }
 
+/// Whether a [`Scheduler::cancel`] asked to stop job `job_id`.
+fn is_cancel_requested(state: &SharedState, job_id: &str) -> bool {
+    state
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .cancel_requested
+        .contains(job_id)
+}
+
 fn is_shutting_down(state: &SharedState) -> bool {
     state
         .inner
@@ -671,6 +734,11 @@ fn run_one_job(
             kill_owned_tree(&mut child, shutdown_timeout);
             reap_after_kill(&mut child, shutdown_timeout);
             return JobOutcome::Interrupted;
+        }
+        if is_cancel_requested(state, &job.job_id) {
+            kill_owned_tree(&mut child, shutdown_timeout);
+            reap_after_kill(&mut child, shutdown_timeout);
+            return JobOutcome::Finished(JobState::Cancelled);
         }
         match child.try_wait() {
             Ok(Some(status)) => {

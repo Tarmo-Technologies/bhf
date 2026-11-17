@@ -1,0 +1,34 @@
+{
+  "key": "rust__ajeetdsouza__zoxide",
+  "language": "rust",
+  "repo": "ajeetdsouza/zoxide",
+  "commit": "cf086b057dfcc7c306450c70829b2788a3e64219",
+  "prior_status": "fuzzed",
+  "bhf_version": "bhf v0.3.0-dev+fb6f2da9\ncommit: fb6f2da9",
+  "bhf_sha256": "6338815f1c315af52f94a467188cc3e1e4d10f10dab9034aa768fb98a8fe2db0",
+  "bhf_args": [
+    "--rust-private",
+    "--run-untrusted"
+  ],
+  "exit_code": 0,
+  "timed_out": false,
+  "status": "built_and_fuzzed",
+  "diagnostic": "-",
+  "target": "deserialize",
+  "source_path": "src/db/mod.rs",
+  "harness_id": "H-R00CF-F9EA1383",
+  "launcher_fuzzed": true,
+  "target_entry": true,
+  "target_entry_evidence": "checkpoint",
+  "dynamic_coverage_edges": 754,
+  "target_body_reached": true,
+  "attempt_count": 1,
+  "terminal_stage": "fuzz",
+  "fallback_chain": [
+    "generated",
+    "built",
+    "fuzzed"
+  ],
+  "repair_count": 0,
+  "generated_covered_lines": null
+}

@@ -1,0 +1,103 @@
+{
+ "repo": "meilisearch/meilisearch",
+ "sha": "b884653ff5bb649ff0d59a559f486756c2b4d6d8",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "beu16_str_codec.rs",
+   "name": "bytes_decode",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `heed` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-4-rust__meilisearch__meilisearch/harnesses/H-R000C-D0BADBB1/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "field_doc_id_facet_codec.rs",
+   "name": "bytes_decode",
+   "outcome": "unsupported_params",
+   "reason": "Rust target 'bytes_decode' is a static method of a non-in-crate trait impl (callable only by UFCS with an in-crate trait); not auto-harnessable",
+   "class": "Rust-4 static method of an outside trait impl",
+   "before": 1,
+   "classes": [
+    "Rust-4 static method of an outside trait impl"
+   ]
+  },
+  {
+   "source": "field_id_word_count_codec.rs",
+   "name": "bytes_decode",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `heed` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-4-rust__meilisearch__meilisearch/harnesses/H-R000D-318BAF6C/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "mod.rs",
+   "name": "bytes_decode",
+   "outcome": "unsupported_params",
+   "reason": "Rust target 'bytes_decode' is a static method of a non-in-crate trait impl (callable only by UFCS with an in-crate trait); not auto-harnessable",
+   "class": "Rust-4 static method of an outside trait impl",
+   "before": 3,
+   "classes": [
+    "Rust-4 static method of an outside trait impl",
+    "failed build",
+    "failed build"
+   ]
+  },
+  {
+   "source": "ordered_f64_codec.rs",
+   "name": "bytes_decode",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `heed` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-4-rust__meilisearch__meilisearch/harnesses/H-R000F-464E5363/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "str_str_u8_codec.rs",
+   "name": "bytes_decode",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `heed` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-4-rust__meilisearch__meilisearch/harnesses/H-R000E-E7710F95/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build",
+    "failed build"
+   ]
+  },
+  {
+   "source": "version.rs",
+   "name": "bytes_decode",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"cargo build failed: error: no matching package named `heed` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-4-rust__meilisearch__meilisearch/harnesses/H-R001E-CCACD089/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 28,
+  "discovered_total": 28,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 24,
+  "unsupported_params": 4,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

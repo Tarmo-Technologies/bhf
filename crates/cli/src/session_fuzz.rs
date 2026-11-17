@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,13 +41,14 @@ use corpus::{CorpusError, FindingEmitter};
 use finding_rules::oracle_sdk::{OracleEvidence, OracleHit};
 use fuzz_engine_builtin::{MutationRng, PowerScheduler, ScheduleFeedback};
 use protocol_session::{
-    mutate_fields, mutate_sequence, BoundValue, CodeCoverageNovelty, FieldRole, Profile,
-    ProtocolModel, SessionRun, SessionRunner, SessionTestcase, SessionTransport, SessionVerdict,
-    StateNovelty, StateNoveltyDelta, TransportError,
+    mutate_fields, mutate_sequence, BoundValue, CodeCoverageNovelty, FieldRole, Framing, Profile,
+    ProtocolModel, ReplyProgress, SessionRun, SessionRunner, SessionTestcase, SessionTransport,
+    SessionVerdict, StateNovelty, StateNoveltyDelta, TransportError,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::fuzz::FuzzArgs;
+use crate::session_server::{ServerExit, SessionServer, SERVER_EXIT_GRACE};
 
 /// The versioned name of the per-finding session artifact sidecar.
 const SESSION_ARTIFACT_SCHEMA: &str = "bhf.session-artifact.v1";
@@ -60,6 +61,9 @@ const SESSION_META: &str = "session_meta.json";
 const MAX_REPLY_BYTES: usize = 1 << 20;
 /// Per-request socket read/write timeout, so a silent peer cannot hang a run.
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a UDP request waits for its reply datagram. A datagram the target
+/// drops is not answered at all, so the deadline is shorter than TCP's.
+const UDP_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Cap on the state-novelty contribution folded into the shared scheduler's
 /// breadcrumb channel, so protocol novelty can never dominate code coverage.
 const STATE_NOVELTY_CAP: usize = 8;
@@ -153,15 +157,18 @@ pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
 pub(crate) enum SessionTransportPlan {
     /// A TCP request/response backend: one socket connected per session.
     Tcp { host: String, port: u16 },
+    /// A UDP backend: one datagram per message, one reply datagram awaited
+    /// within the reply deadline, and a socket of its own per session.
+    Udp { host: String, port: u16 },
 }
 
 /// A descriptive failure parsing a `--session-transport` spec. Never a silent
 /// `None`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionSpecError {
-    #[error("empty --session-transport spec; expected tcp:HOST:PORT")]
+    #[error("empty --session-transport spec; expected tcp:HOST:PORT or udp:HOST:PORT")]
     Empty,
-    #[error("unknown --session-transport backend {backend:?}; supported: tcp")]
+    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp")]
     UnknownBackend { backend: String },
     #[error("malformed {backend} spec {spec:?}: {reason}")]
     Malformed {
@@ -182,6 +189,10 @@ impl SessionTransportPlan {
             let (host, port) = parse_host_port("tcp", spec, rest)?;
             return Ok(Self::Tcp { host, port });
         }
+        if let Some(rest) = spec.strip_prefix("udp:") {
+            let (host, port) = parse_host_port("udp", spec, rest)?;
+            return Ok(Self::Udp { host, port });
+        }
         Err(SessionSpecError::UnknownBackend {
             backend: spec.split(':').next().unwrap_or(spec).to_owned(),
         })
@@ -191,6 +202,15 @@ impl SessionTransportPlan {
     fn label(&self) -> String {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
+            Self::Udp { host, port } => format!("udp:{host}:{port}"),
+        }
+    }
+
+    /// The host, port and whether it is UDP, for a service bhf starts.
+    fn endpoint(&self) -> (String, u16, bool) {
+        match self {
+            Self::Tcp { host, port } => (host.clone(), *port, false),
+            Self::Udp { host, port } => (host.clone(), *port, true),
         }
     }
 
@@ -198,14 +218,35 @@ impl SessionTransportPlan {
     fn kind(&self) -> &'static str {
         match self {
             Self::Tcp { .. } => "tcp",
+            Self::Udp { .. } => "udp",
         }
     }
 
     /// Build the live transport this plan describes. The socket is dialed lazily
     /// on the first [`SessionTransport::reset`], so this itself touches nothing.
-    fn into_transport(self, reset: SessionResetMode) -> TcpSessionTransport {
+    /// `reply_timeout` overrides the backend's deadline for a reply
+    /// ([`SESSION_IO_TIMEOUT`] over TCP, [`UDP_REPLY_TIMEOUT`] over UDP).
+    fn into_transport(
+        self,
+        reset: SessionResetMode,
+        framing: Framing,
+        reply_timeout: Option<Duration>,
+    ) -> LiveTransport {
         match self {
-            Self::Tcp { host, port } => TcpSessionTransport::new(host, port, reset),
+            Self::Tcp { host, port } => LiveTransport::Tcp(TcpSessionTransport::new(
+                host,
+                port,
+                reset,
+                framing,
+                reply_timeout.unwrap_or(SESSION_IO_TIMEOUT),
+            )),
+            Self::Udp { host, port } => LiveTransport::Udp(UdpSessionTransport::new(
+                host,
+                port,
+                reset,
+                framing,
+                reply_timeout.unwrap_or(UDP_REPLY_TIMEOUT),
+            )),
         }
     }
 }
@@ -239,34 +280,51 @@ fn parse_host_port(
 // The live TCP request/response backend
 // ---------------------------------------------------------------------------
 
-/// A real TCP [`SessionTransport`]. Each request is length-prefixed
-/// (`[u16 BE len][frame]`) and the reply is read the same way, with a bounded
-/// read (`MAX_REPLY_BYTES`) and a read/write timeout so neither a huge reply nor
-/// a silent peer can wedge a campaign.
+/// A real TCP [`SessionTransport`]. Each request is framed as the profile's
+/// `[framing]` says and the reply is read the same way: a length-prefixed,
+/// delimited or fixed-size reply ends by its content, and a raw one when the
+/// peer goes quiet. The read is bounded (`MAX_REPLY_BYTES`) and the socket has
+/// a read/write timeout, so neither a huge reply nor a silent peer can wedge a
+/// campaign.
 pub(crate) struct TcpSessionTransport {
     host: String,
     port: u16,
     reset: SessionResetMode,
+    framing: Framing,
+    /// How long a reply may take to start, and a write to finish.
+    io_timeout: Duration,
     stream: Option<TcpStream>,
+    /// Bytes read past the end of the last reply.
+    pending: Vec<u8>,
 }
 
 impl TcpSessionTransport {
-    fn new(host: String, port: u16, reset: SessionResetMode) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        reset: SessionResetMode,
+        framing: Framing,
+        io_timeout: Duration,
+    ) -> Self {
         Self {
             host,
             port,
             reset,
+            framing,
+            io_timeout,
             stream: None,
+            pending: Vec::new(),
         }
     }
 
     fn connect(&mut self) -> Result<(), TransportError> {
         self.stream = None;
+        self.pending.clear();
         let stream = TcpStream::connect((self.host.as_str(), self.port)).map_err(|e| {
             TransportError::new(format!("connect {}:{}: {e}", self.host, self.port))
         })?;
-        stream.set_read_timeout(Some(SESSION_IO_TIMEOUT)).ok();
-        stream.set_write_timeout(Some(SESSION_IO_TIMEOUT)).ok();
+        stream.set_read_timeout(Some(self.io_timeout)).ok();
+        stream.set_write_timeout(Some(self.io_timeout)).ok();
         // Disable Nagle: a request/response session sends one small frame then
         // blocks on the reply, so Nagle + delayed-ACK would add a ~40ms stall per
         // round-trip. We frame explicitly, so coalescing buys nothing.
@@ -274,10 +332,62 @@ impl TcpSessionTransport {
         self.stream = Some(stream);
         Ok(())
     }
+
+    /// Read until the framing has a whole reply. A raw reply is complete when
+    /// no byte arrives for its idle window after the first, or the peer closes.
+    fn read_reply(&mut self) -> Result<Vec<u8>, TransportError> {
+        let idle = self.framing.reply_idle_ms().map(Duration::from_millis);
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.framing.take_reply(&self.pending, MAX_REPLY_BYTES) {
+                ReplyProgress::Complete { reply, consumed } => {
+                    self.pending.drain(..consumed);
+                    return Ok(reply);
+                }
+                ReplyProgress::Invalid(reason) => {
+                    self.pending.clear();
+                    return Err(TransportError::new(format!("session reply: {reason}")));
+                }
+                ReplyProgress::NeedMore => {}
+            }
+            let quiet_completes = idle.is_some() && !self.pending.is_empty();
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
+            let wait = if quiet_completes {
+                idle
+            } else {
+                Some(self.io_timeout)
+            };
+            stream.set_read_timeout(wait).ok();
+            match stream.read(&mut chunk) {
+                Ok(0) if quiet_completes => return Ok(std::mem::take(&mut self.pending)),
+                Ok(0) => {
+                    return Err(lost(
+                        &mut self.stream,
+                        "session read reply: the connection closed".to_owned(),
+                    ))
+                }
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if quiet_completes
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    return Ok(std::mem::take(&mut self.pending));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(lost(&mut self.stream, format!("session read reply: {e}"))),
+            }
+        }
+    }
 }
 
 /// The target ended the session (a closed or reset connection, or one that
-/// stopped answering within [`SESSION_IO_TIMEOUT`]): drop the stream, so the
+/// stopped answering within the reply deadline): drop the stream, so the
 /// next reset connects again whatever the reset mode.
 fn lost(stream: &mut Option<TcpStream>, message: String) -> TransportError {
     *stream = None;
@@ -286,47 +396,19 @@ fn lost(stream: &mut Option<TcpStream>, message: String) -> TransportError {
 
 impl SessionTransport for TcpSessionTransport {
     fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
-        if request.len() > u16::MAX as usize {
-            return Err(TransportError::new(format!(
-                "request frame is {} bytes, exceeding the {} wire-length cap",
-                request.len(),
-                u16::MAX
-            )));
-        }
+        let frame = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-        let len = (request.len() as u16).to_be_bytes();
         stream
-            .write_all(&len)
-            .and_then(|()| stream.write_all(request))
+            .write_all(&frame)
             .and_then(|()| stream.flush())
             .map_err(|e| lost(&mut self.stream, format!("session write: {e}")))?;
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-
-        let mut len_buf = [0u8; 2];
-        stream
-            .read_exact(&mut len_buf)
-            .map_err(|e| lost(&mut self.stream, format!("session read reply length: {e}")))?;
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| TransportError::new("tcp session is not connected; reset first"))?;
-        let reply_len = usize::from(u16::from_be_bytes(len_buf));
-        if reply_len > MAX_REPLY_BYTES {
-            return Err(TransportError::new(format!(
-                "reply length {reply_len} exceeds the {MAX_REPLY_BYTES}-byte cap"
-            )));
-        }
-        let mut reply = vec![0u8; reply_len];
-        stream
-            .read_exact(&mut reply)
-            .map_err(|e| lost(&mut self.stream, format!("session read reply body: {e}")))?;
-        Ok(reply)
+        self.read_reply()
     }
 
     fn reset(&mut self) -> Result<(), TransportError> {
@@ -336,6 +418,152 @@ impl SessionTransport for TcpSessionTransport {
             self.connect()?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live UDP backend
+// ---------------------------------------------------------------------------
+
+/// A UDP [`SessionTransport`]: each request is one datagram, framed as the
+/// profile says, and its reply is the next datagram that comes back within
+/// the reply deadline. A reset opens a new socket, so the target sees a new
+/// source port and keeps no state for it. A reply that does not arrive, or a
+/// datagram the target's host refuses (port unreachable), ends the session.
+pub(crate) struct UdpSessionTransport {
+    host: String,
+    port: u16,
+    reset: SessionResetMode,
+    framing: Framing,
+    reply_timeout: Duration,
+    socket: Option<UdpSocket>,
+}
+
+impl UdpSessionTransport {
+    fn new(
+        host: String,
+        port: u16,
+        reset: SessionResetMode,
+        framing: Framing,
+        reply_timeout: Duration,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            reset,
+            framing,
+            reply_timeout,
+            socket: None,
+        }
+    }
+
+    fn open(&mut self) -> Result<(), TransportError> {
+        self.socket = None;
+        let target = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|e| TransportError::new(format!("resolve {}:{}: {e}", self.host, self.port)))?
+            .next()
+            .ok_or_else(|| {
+                TransportError::new(format!(
+                    "{}:{} resolves to no address",
+                    self.host, self.port
+                ))
+            })?;
+        let local: SocketAddr = if target.is_ipv4() {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = UdpSocket::bind(local)
+            .and_then(|socket| socket.connect(target).map(|()| socket))
+            .map_err(|e| TransportError::new(format!("open udp socket to {target}: {e}")))?;
+        socket.set_read_timeout(Some(self.reply_timeout)).ok();
+        socket.set_write_timeout(Some(self.reply_timeout)).ok();
+        self.socket = Some(socket);
+        Ok(())
+    }
+
+    fn lost(&mut self, message: String) -> TransportError {
+        self.socket = None;
+        TransportError::session_lost(message)
+    }
+}
+
+impl SessionTransport for UdpSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let datagram = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| TransportError::new("udp session is not open; reset first"))?;
+        if let Err(e) = socket.send(&datagram) {
+            return Err(self.lost(format!("session send: {e}")));
+        }
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let socket = self
+                .socket
+                .as_ref()
+                .ok_or_else(|| TransportError::new("udp session is not open; reset first"))?;
+            match socket.recv(&mut buf) {
+                Ok(n) => {
+                    return match self.framing.datagram_reply(&buf[..n], MAX_REPLY_BYTES) {
+                        ReplyProgress::Complete { reply, .. } => Ok(reply),
+                        ReplyProgress::Invalid(reason) => {
+                            Err(TransportError::new(format!("session reply: {reason}")))
+                        }
+                        ReplyProgress::NeedMore => Err(TransportError::new(
+                            "session reply: the datagram holds part of a reply",
+                        )),
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(self.lost(format!(
+                        "no reply datagram within {} ms",
+                        self.reply_timeout.as_millis()
+                    )))
+                }
+                Err(e) => return Err(self.lost(format!("session receive: {e}"))),
+            }
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.socket.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.open()?;
+        }
+        Ok(())
+    }
+}
+
+/// A live backend, as `--session-transport` names it.
+pub(crate) enum LiveTransport {
+    Tcp(TcpSessionTransport),
+    Udp(UdpSessionTransport),
+}
+
+impl SessionTransport for LiveTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        match self {
+            LiveTransport::Tcp(transport) => transport.send_request(request),
+            LiveTransport::Udp(transport) => transport.send_request(request),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        match self {
+            LiveTransport::Tcp(transport) => transport.reset(),
+            LiveTransport::Udp(transport) => transport.reset(),
+        }
     }
 }
 
@@ -432,6 +660,10 @@ pub(crate) struct SessionFuzzConfig {
     pub transport_kind: String,
     /// How a session is reset between testcases.
     pub reset: SessionResetMode,
+    /// `--session-reply-timeout`, recorded so a replay waits as long.
+    pub reply_timeout: Option<Duration>,
+    /// `--session-server-cmd`, recorded so a replay can start the service.
+    pub server_cmd: Option<String>,
     /// Bounded cap on messages per session.
     pub max_messages: usize,
     /// The valid seed session(s) the campaign mutates.
@@ -465,6 +697,8 @@ pub(crate) struct SessionFuzzSummary {
     pub profile_sha256: String,
     pub transport: String,
     pub reset_fidelity: String,
+    /// How the profile frames messages on the wire (`raw`, `length_prefix(u16 big)`).
+    pub framing: String,
     pub seeds: usize,
     pub executions: usize,
     pub corpus_new: usize,
@@ -483,6 +717,10 @@ pub(crate) struct SessionFuzzSummary {
     /// Sessions the target dropped once but not when driven again; each is
     /// kept under `<work_dir>/session_disconnects/` for triage.
     pub unconfirmed_disconnects: usize,
+    /// How many times bhf started the service (`--session-server-cmd`): once,
+    /// and again after each crash. Zero when bhf did not run it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub server_starts: usize,
     /// Distinct finding ids written to `<work_dir>/results/findings/`.
     pub findings: Vec<String>,
     pub elapsed_secs: f64,
@@ -502,6 +740,8 @@ pub(crate) enum SessionFuzzError {
         path: String,
         source: std::io::Error,
     },
+    #[error("the service did not start again: {0}")]
+    Server(String),
 }
 
 /// The self-contained replay/minimize sidecar written next to a session finding.
@@ -519,6 +759,12 @@ struct SessionArtifactMeta {
     reset_fidelity: String,
     rule_id: Option<String>,
     oracle: String,
+    /// `--session-reply-timeout`, when the run gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_timeout_ms: Option<u64>,
+    /// `--session-server-cmd`, when bhf ran the service: a replay starts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_cmd: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +827,12 @@ fn mutate_one(
 
 /// The oracle name of a session the target dropped.
 pub(crate) const DISCONNECT_ORACLE: &str = "session-disconnect";
+/// The oracle of a finding whose session crashed the service bhf runs
+/// (`--session-server-cmd`), with the sanitizer report from its stderr.
+pub(crate) const SERVER_CRASH_ORACLE: &str = "session-server-crash";
+/// The oracle of a finding whose session made the service exit with no
+/// sanitizer report.
+pub(crate) const SERVER_EXIT_ORACLE: &str = "session-server-exit";
 /// The rule of a session the target dropped: a reachable crash of the
 /// service (at least a denial of service).
 const DISCONNECT_RULE: &str = "BHF-210";
@@ -598,6 +850,9 @@ struct CrashTally {
     unconfirmed: usize,
     /// Failures to connect in a row; any drive that connects resets it.
     connect_failures: usize,
+    /// The session driven before the current one: when the service is found
+    /// gone before a session connects, that one is what crashed it.
+    previous: Option<SessionTestcase>,
 }
 
 /// Drive `messages`, counting a failure to connect: `None` when the drive
@@ -676,8 +931,62 @@ fn drive_candidate(
     seen: &mut HashSet<String>,
     finding_ids: &mut Vec<String>,
     tally: &mut CrashTally,
+    server: Option<&mut SessionServer>,
 ) -> Result<(StateNoveltyDelta, bool), SessionFuzzError> {
-    let Some(run) = drive_counting(runner, &candidate.messages, transport, tally)? else {
+    // With a service bhf runs, a refused connection is the service gone: look
+    // at it before counting a failure to connect.
+    let (driven, refused) = match server {
+        Some(_) => match runner.drive(&candidate.messages, transport) {
+            Ok(run) => (Some(run), false),
+            Err(protocol_session::RunnerError::Connect(_)) => (None, true),
+            // A candidate the profile cannot drive (an encode or a response
+            // error) says nothing about the service.
+            Err(_) => (None, false),
+        },
+        None => (
+            drive_counting(runner, &candidate.messages, transport, tally)?,
+            false,
+        ),
+    };
+    if let Some(server) = server {
+        let lost = refused
+            || driven
+                .as_ref()
+                .is_some_and(|run| matches!(run.verdict, SessionVerdict::Disconnected { .. }));
+        let grace = if lost {
+            SERVER_EXIT_GRACE
+        } else {
+            Duration::ZERO
+        };
+        if server.exited_within(grace).is_some() {
+            let blamed = match (refused, &tally.previous) {
+                (true, Some(previous)) => previous.clone(),
+                _ => candidate.clone(),
+            };
+            tally.previous = Some(candidate.clone());
+            let delta = driven
+                .as_ref()
+                .map(|run| state_novelty.observe(&run.state_ids, &run.transitions))
+                .unwrap_or_default();
+            let new_finding = confirm_server_crash(
+                &blamed,
+                runner,
+                transport,
+                server,
+                emitter,
+                config,
+                seen,
+                finding_ids,
+                tally,
+            )?;
+            return Ok((delta, new_finding));
+        }
+        if refused {
+            drive_counting(runner, &candidate.messages, transport, tally)?;
+        }
+    }
+    tally.previous = Some(candidate.clone());
+    let Some(run) = driven else {
         return Ok((StateNoveltyDelta::default(), false));
     };
 
@@ -752,6 +1061,98 @@ fn drive_candidate(
     Ok((delta, new_finding))
 }
 
+/// The service exited after `blamed` ran: start it again, drive `blamed`
+/// once more, and if the service exits again write the finding, from the
+/// sanitizer report in its stderr when there is one. Either way the service
+/// is running again for the campaign. `Ok(true)` when a new finding was
+/// written.
+#[allow(clippy::too_many_arguments)]
+fn confirm_server_crash(
+    blamed: &SessionTestcase,
+    runner: &SessionRunner,
+    transport: &mut dyn SessionTransport,
+    server: &mut SessionServer,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+    tally: &mut CrashTally,
+) -> Result<bool, SessionFuzzError> {
+    server.start().map_err(SessionFuzzError::Server)?;
+    tally.connect_failures = 0;
+    let again = runner.drive(&blamed.messages, transport).ok();
+    let exit = server.exited_within(SERVER_EXIT_GRACE);
+    if exit.is_some() {
+        server.start().map_err(SessionFuzzError::Server)?;
+    }
+    let (Some(exit), Some(run)) = (exit, again) else {
+        tally.unconfirmed += 1;
+        let kept = SessionRun {
+            testcase: blamed.clone(),
+            verdict: SessionVerdict::Clean,
+            state_ids: Vec::new(),
+            transitions: Vec::new(),
+            sent_frames: Vec::new(),
+        };
+        persist_disconnect(config, &kept)?;
+        return Ok(false);
+    };
+    tally.crashes += 1;
+    let serialized = run
+        .testcase
+        .to_json()
+        .map_err(SessionFuzzError::Serialize)?;
+    let message = run
+        .testcase
+        .messages
+        .last()
+        .map_or("?", |message| message.message.as_str())
+        .to_owned();
+    if let Some(report) = corpus::sanitizer::parse_sanitizer_report(&exit.stderr) {
+        let top = report
+            .stack
+            .first()
+            .map_or("", |frame| frame.function.as_str());
+        if !seen.insert(format!("{SERVER_CRASH_ORACLE}|{}|{top}", report.rule_id)) {
+            return Ok(false);
+        }
+        let id = emitter.emit_sanitizer_crash_with_log(
+            serialized.as_bytes(),
+            &report,
+            Some(exit.stderr.as_bytes()),
+        )?;
+        write_session_artifacts(
+            &id.0,
+            &serialized,
+            SERVER_CRASH_ORACLE,
+            Some(report.rule_id),
+            config,
+        )?;
+        finding_ids.push(id.0);
+        return Ok(true);
+    }
+    if !seen.insert(format!("{SERVER_EXIT_ORACLE}|{message}")) {
+        return Ok(false);
+    }
+    let detail = format!(
+        "the service ({}) exited with {} after the session, and again when the session was \
+         driven on the service started again; its stderr has no sanitizer report",
+        server.command(),
+        exit.status
+    );
+    let id = emit_session_finding(
+        emitter,
+        &run,
+        SERVER_EXIT_ORACLE,
+        Some(DISCONNECT_RULE),
+        &message,
+        &detail,
+        config,
+    )?;
+    finding_ids.push(id);
+    Ok(true)
+}
+
 /// Drive a bounded, coverage- and state-guided session campaign against
 /// `transport`, reusing the builtin [`PowerScheduler`] for seed selection and
 /// `protocol_session`'s graph-gated structured mutation. Returns the run summary;
@@ -760,6 +1161,7 @@ pub(crate) fn run_session_campaign(
     model: &ProtocolModel,
     transport: &mut dyn SessionTransport,
     config: &SessionFuzzConfig,
+    mut server: Option<&mut SessionServer>,
 ) -> Result<SessionFuzzSummary, SessionFuzzError> {
     let start = Instant::now();
     let runner = SessionRunner::new(model);
@@ -808,6 +1210,7 @@ pub(crate) fn run_session_campaign(
             &mut seen_findings,
             &mut finding_ids,
             &mut tally,
+            server.as_deref_mut(),
         )?;
         executions += 1;
         scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
@@ -860,6 +1263,7 @@ pub(crate) fn run_session_campaign(
                 &mut seen_findings,
                 &mut finding_ids,
                 &mut tally,
+                server.as_deref_mut(),
             )?;
             executions += 1;
             if delta.is_novel() {
@@ -876,6 +1280,7 @@ pub(crate) fn run_session_campaign(
         profile_sha256: config.profile_sha256.clone(),
         transport: config.transport_label.clone(),
         reset_fidelity: config.reset_fidelity(),
+        framing: model.framing().label(),
         seeds: seed_count,
         executions,
         corpus_new,
@@ -885,6 +1290,7 @@ pub(crate) fn run_session_campaign(
         transitions_covered: state_novelty.transitions_covered(),
         crashes: tally.crashes,
         unconfirmed_disconnects: tally.unconfirmed,
+        server_starts: server.as_ref().map_or(0, |server| server.starts()),
         findings: finding_ids,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
@@ -918,13 +1324,15 @@ fn emit_session_finding(
         evidence.push(OracleEvidence::new(source.clone(), format_bound(value)));
     }
 
-    let disconnect = oracle == DISCONNECT_ORACLE;
+    let disconnect = oracle == DISCONNECT_ORACLE || oracle == SERVER_EXIT_ORACLE;
     let hit = OracleHit {
         oracle_name: oracle.to_owned(),
         rule_id: rule_id.unwrap_or("HDF7-SESSION").to_owned(),
         category: if disconnect { "crash" } else { "logic-bug" }.to_owned(),
         api: message.to_owned(),
-        message: if disconnect {
+        message: if oracle == SERVER_EXIT_ORACLE {
+            format!("the service exited during the protocol session: {detail}")
+        } else if disconnect {
             format!("the target dropped the protocol session: {detail}")
         } else {
             format!("protocol session reached a clean-exit violation: {detail}")
@@ -933,10 +1341,21 @@ fn emit_session_finding(
     };
 
     let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
-    let finding_dir = corpus::layout::finding_dir(&config.work_dir, &id.0);
+    write_session_artifacts(&id.0, &serialized, oracle, rule_id, config)?;
+    Ok(id.0)
+}
 
+/// Write a session finding's `session.json` and `session_meta.json` into its
+/// finding dir.
+fn write_session_artifacts(
+    id: &str,
+    serialized: &str,
+    oracle: &str,
+    rule_id: Option<&str>,
+    config: &SessionFuzzConfig,
+) -> Result<(), SessionFuzzError> {
+    let finding_dir = corpus::layout::finding_dir(&config.work_dir, id);
     write_artifact(&finding_dir.join(SESSION_ARTIFACT), serialized.as_bytes())?;
-
     let meta = SessionArtifactMeta {
         schema: SESSION_ARTIFACT_SCHEMA.to_owned(),
         profile_sha256: config.profile_sha256.clone(),
@@ -947,11 +1366,17 @@ fn emit_session_finding(
         reset_fidelity: config.reset_fidelity(),
         rule_id: rule_id.map(str::to_owned),
         oracle: oracle.to_owned(),
+        reply_timeout_ms: config
+            .reply_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        server_cmd: config.server_cmd.clone(),
     };
     let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(SessionFuzzError::Serialize)?;
-    write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)?;
+    write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)
+}
 
-    Ok(id.0)
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 fn write_artifact(path: &Path, bytes: &[u8]) -> Result<(), SessionFuzzError> {
@@ -1005,10 +1430,17 @@ fn load_session_finding(
     Ok((testcase, model, meta))
 }
 
-fn build_live_transport(meta: &SessionArtifactMeta) -> Result<TcpSessionTransport, String> {
+fn build_live_transport(
+    meta: &SessionArtifactMeta,
+    model: &ProtocolModel,
+) -> Result<LiveTransport, String> {
     let plan = SessionTransportPlan::parse(&meta.transport).map_err(|e| e.to_string())?;
     let reset = SessionResetMode::parse(&meta.reset)?;
-    Ok(plan.into_transport(reset))
+    Ok(plan.into_transport(
+        reset,
+        model.framing().clone(),
+        meta.reply_timeout_ms.map(Duration::from_millis),
+    ))
 }
 
 /// `bhf replay` of a session finding: re-drive the recorded session against a
@@ -1018,10 +1450,54 @@ pub(crate) fn replay_session_outcome(
     finding_dir: &Path,
 ) -> Result<crate::replay::LaneReplay, String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let mut transport = build_live_transport(&meta)?;
+    let mut transport = build_live_transport(&meta, &model)?;
+    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    if let Some(mut server) = finding_server(&meta)? {
+        let runner = SessionRunner::new(&model);
+        let (_, exit) = drive_against_server(&runner, &testcase, &mut transport, &mut server.0)?;
+        let matched = exit
+            .as_ref()
+            .is_some_and(|exit| server_exit_reproduces(exit, &meta));
+        let replayed = match &exit {
+            Some(exit) => format!(
+                "the service exited with {}{}",
+                exit.status,
+                corpus::sanitizer::parse_sanitizer_report(&exit.stderr)
+                    .map(|report| format!(", rule {}", report.rule_id))
+                    .unwrap_or_default()
+            ),
+            None => "the service did not exit".to_owned(),
+        };
+        return Ok(crate::replay::LaneReplay {
+            lane: "session",
+            matched,
+            status_line: if matched {
+                "MATCH".to_owned()
+            } else {
+                "MISMATCH: the recorded session no longer makes the service exit".to_owned()
+            },
+            compared: format!("session oracle {} with rule {rule}", meta.oracle),
+            differences: if matched {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "verdict: recorded oracle {} with rule {rule}, replayed {replayed}",
+                    meta.oracle
+                )]
+            },
+            details: vec![
+                crate::replay::Detail::new(
+                    "transport",
+                    format!("{} (reset {})", meta.transport, meta.reset),
+                ),
+                crate::replay::Detail::new("service", server.0.command().to_owned()),
+            ],
+            history: "replay",
+            ..Default::default()
+        });
+    }
     let verdict = replay_verdict(&model, &testcase, &mut transport)?;
     let matched = verdict_reproduces(&verdict, &meta);
-    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
     let replayed = match &verdict {
         SessionVerdict::Finding {
             oracle, rule_id, ..
@@ -1081,6 +1557,55 @@ fn verdict_reproduces(verdict: &SessionVerdict, meta: &SessionArtifactMeta) -> b
     }
 }
 
+/// The service a finding's run started, ready to start again for a replay or
+/// a minimization, with a scratch dir for its logs; `None` when bhf did not
+/// run the service or the finding is not of its exit.
+fn finding_server(
+    meta: &SessionArtifactMeta,
+) -> Result<Option<(SessionServer, tempfile::TempDir)>, String> {
+    let Some(command) = &meta.server_cmd else {
+        return Ok(None);
+    };
+    if meta.oracle != SERVER_CRASH_ORACLE && meta.oracle != SERVER_EXIT_ORACLE {
+        return Ok(None);
+    }
+    let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
+        .map_err(|e| e.to_string())?
+        .endpoint();
+    let logs = tempfile::Builder::new()
+        .prefix("bhf-session-server-")
+        .tempdir()
+        .map_err(|e| format!("create a dir for the service's logs: {e}"))?;
+    let server = SessionServer::new(command.clone(), host, port, udp, logs.path());
+    Ok(Some((server, logs)))
+}
+
+/// Start the service, drive `testcase` against it, and return the run and
+/// how the service exited, if it did.
+fn drive_against_server(
+    runner: &SessionRunner,
+    testcase: &SessionTestcase,
+    transport: &mut dyn SessionTransport,
+    server: &mut SessionServer,
+) -> Result<(Option<SessionRun>, Option<ServerExit>), String> {
+    server.start()?;
+    let run = runner.replay(testcase, transport).ok();
+    let exit = server.exited_within(SERVER_EXIT_GRACE);
+    server.stop();
+    Ok((run, exit))
+}
+
+/// Whether the service's exit is the one a finding recorded: for a
+/// sanitizer report, one with the same rule.
+fn server_exit_reproduces(exit: &ServerExit, meta: &SessionArtifactMeta) -> bool {
+    match meta.oracle.as_str() {
+        SERVER_CRASH_ORACLE => corpus::sanitizer::parse_sanitizer_report(&exit.stderr)
+            .is_some_and(|report| Some(report.rule_id) == meta.rule_id.as_deref()),
+        SERVER_EXIT_ORACLE => true,
+        _ => false,
+    }
+}
+
 /// Re-drive `testcase` against `transport` and return the verdict it reaches.
 fn replay_verdict(
     model: &ProtocolModel,
@@ -1131,8 +1656,14 @@ pub(crate) fn minimize_session_finding(finding_dir: &Path) -> i32 {
 
 fn minimize_session_inner(finding_dir: &Path) -> Result<(usize, usize, bool), String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let (original_len, run, reproduces) =
-        minimize_session_core(&model, &testcase, &meta, || build_live_transport(&meta))?;
+    let mut server = finding_server(&meta)?;
+    let (original_len, run, reproduces) = minimize_session_core(
+        &model,
+        &testcase,
+        &meta,
+        || build_live_transport(&meta, &model),
+        server.as_mut().map(|(server, _)| server),
+    )?;
     let minimized_len = run.testcase.messages.len();
 
     let serialized = run
@@ -1166,6 +1697,7 @@ fn minimize_session_core<T, F>(
     testcase: &SessionTestcase,
     meta: &SessionArtifactMeta,
     mut make_transport: F,
+    mut server: Option<&mut SessionServer>,
 ) -> Result<(usize, SessionRun, bool), String>
 where
     T: SessionTransport,
@@ -1174,40 +1706,44 @@ where
     let runner = SessionRunner::new(model);
     let original_len = testcase.messages.len();
 
+    // Drive one candidate on a fresh transport (fresh handle) and, for a
+    // finding of the service's exit, a service started again; only the
+    // RECORDED oracle counts as still reproducing — a smaller sequence that
+    // trips a different oracle must not be accepted.
+    let mut drive = |candidate: &SessionTestcase| -> Result<(Option<SessionRun>, bool), String> {
+        let mut transport = make_transport()?;
+        match server.as_deref_mut() {
+            Some(server) => {
+                let (run, exit) = drive_against_server(&runner, candidate, &mut transport, server)?;
+                let reproduces = exit
+                    .as_ref()
+                    .is_some_and(|exit| server_exit_reproduces(exit, meta));
+                Ok((run, reproduces))
+            }
+            None => {
+                let run = runner
+                    .replay(candidate, &mut transport)
+                    .map_err(|e| format!("replay session: {e}"))?;
+                let reproduces = verdict_reproduces(&run.verdict, meta);
+                Ok((Some(run), reproduces))
+            }
+        }
+    };
+
     // Baseline: the recorded session must still reproduce the SAME recorded
     // oracle before we minimize it.
-    {
-        let mut transport = make_transport()?;
-        let run = runner
-            .replay(testcase, &mut transport)
-            .map_err(|e| format!("baseline replay: {e}"))?;
-        if !verdict_reproduces(&run.verdict, meta) {
-            return Err(
-                "the recorded session no longer reproduces; refusing to minimize".to_owned(),
-            );
-        }
+    let (_, reproduces) = drive(testcase).map_err(|e| format!("baseline {e}"))?;
+    if !reproduces {
+        return Err("the recorded session no longer reproduces; refusing to minimize".to_owned());
     }
 
-    // Each predicate candidate re-drives on a fresh transport (fresh handle),
-    // and only a finding for the RECORDED oracle counts as still reproducing —
-    // a smaller sequence that trips a different oracle must not be accepted.
-    let predicate = |candidate: &SessionTestcase| -> bool {
-        let Ok(mut transport) = make_transport() else {
-            return false;
-        };
-        runner
-            .replay(candidate, &mut transport)
-            .map(|run| verdict_reproduces(&run.verdict, meta))
-            .unwrap_or(false)
-    };
-    let minimized = runner.minimize(testcase, predicate);
+    let minimized = runner.minimize(testcase, |candidate| {
+        drive(candidate).is_ok_and(|(_, reproduces)| reproduces)
+    });
 
     // Re-drive the minimized testcase once to capture its fresh evidence.
-    let mut transport = make_transport()?;
-    let run = runner
-        .replay(&minimized, &mut transport)
-        .map_err(|e| format!("drive minimized session: {e}"))?;
-    let reproduces = verdict_reproduces(&run.verdict, meta);
+    let (run, reproduces) = drive(&minimized).map_err(|e| format!("drive minimized {e}"))?;
+    let run = run.ok_or_else(|| "drive minimized session: it did not connect".to_owned())?;
     Ok((original_len, run, reproduces))
 }
 
@@ -1268,7 +1804,29 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     })?;
     let transport_label = plan.label();
     let transport_kind = plan.kind().to_owned();
-    let mut transport = plan.into_transport(args.session_reset);
+    let mut server = match args.session_server_cmd.as_deref() {
+        Some(command) => {
+            let (host, port, udp) = plan.endpoint();
+            let mut server = SessionServer::new(
+                command.to_owned(),
+                host,
+                port,
+                udp,
+                &args.work_dir.join("session_server"),
+            );
+            server.start().map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                2
+            })?;
+            Some(server)
+        }
+        None => None,
+    };
+    let mut transport = plan.into_transport(
+        args.session_reset,
+        model.framing().clone(),
+        args.session_reply_timeout,
+    );
 
     let seeds = seed_sessions(&model);
     if seeds.is_empty() {
@@ -1287,6 +1845,8 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         transport_label,
         transport_kind,
         reset: args.session_reset,
+        reply_timeout: args.session_reply_timeout,
+        server_cmd: args.session_server_cmd.clone(),
         max_messages: args.max_session_messages,
         seeds,
         iterations: args.effective_iterations(),
@@ -1296,7 +1856,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         mode: args.mode,
     };
 
-    run_session_campaign(&model, &mut transport, &config).map_err(|error| {
+    run_session_campaign(&model, &mut transport, &config, server.as_mut()).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --protocol-profile: {error}");
         1
     })
@@ -1427,6 +1987,8 @@ mod tests {
             transport_label: "scripted".to_owned(),
             transport_kind: "scripted".to_owned(),
             reset: SessionResetMode::Reconnect,
+            reply_timeout: None,
+            server_cmd: None,
             max_messages: 64,
             seeds: seed_sessions(model),
             iterations,
@@ -1535,7 +2097,7 @@ mod tests {
         )];
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
 
         assert!(
             summary.transitions_covered >= 2,
@@ -1557,7 +2119,7 @@ mod tests {
         let cfg = config(&model, work_dir.to_path_buf(), 200);
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
 
         assert_eq!(summary.profile_sha256, model.profile_sha256());
         assert_eq!(summary.reset_fidelity, "scripted;reset=reconnect");
@@ -1576,7 +2138,7 @@ mod tests {
         let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.time_budget = Some(Duration::from_secs(0));
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(summary.executions, 0, "zero-budget run does nothing");
         assert!(summary.findings.is_empty());
         std::fs::remove_dir_all(&work_dir).ok();
@@ -1586,7 +2148,7 @@ mod tests {
         let mut cfg = config(&model, work_dir.to_path_buf(), 10_000);
         cfg.stop_after_findings = Some(1);
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(
             summary.findings.len(),
             1,
@@ -1609,7 +2171,7 @@ mod tests {
         cfg.stop_after_findings = Some(1);
 
         let mut service = ToyService::new();
-        let summary = run_session_campaign(&model, &mut service, &cfg).unwrap();
+        let summary = run_session_campaign(&model, &mut service, &cfg, None).unwrap();
         assert_eq!(
             summary.findings.len(),
             1,
@@ -1777,6 +2339,8 @@ equals = 226
             reset_fidelity: "scripted;reset=reconnect".to_owned(),
             rule_id: Some(rule_id.to_owned()),
             oracle: oracle.to_owned(),
+            reply_timeout_ms: None,
+            server_cmd: None,
         }
     }
 
@@ -1833,11 +2397,14 @@ equals = 226
         // happily shrink the BUMP away. Gating on the recorded oracle keeps it.
         let recorded = session_of(&model, &["OPEN", "BUMP", "WRITE"]);
 
-        let (original_len, run, reproduces) =
-            minimize_session_core(&model, &recorded, &meta, || {
-                Ok::<_, String>(MultiOracleService::new())
-            })
-            .unwrap();
+        let (original_len, run, reproduces) = minimize_session_core(
+            &model,
+            &recorded,
+            &meta,
+            || Ok::<_, String>(MultiOracleService::new()),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(original_len, 3);
         assert!(reproduces, "the minimized sequence still reproduces O1");
@@ -1859,13 +2426,204 @@ equals = 226
         // Recorded as O1, but the only sequence we hand minimize reproduces O2.
         let meta = multi_oracle_meta(&model, "O1", "R1");
         let drifted = session_of(&model, &["OPEN", "WRITE"]);
-        let err = minimize_session_core(&model, &drifted, &meta, || {
-            Ok::<_, String>(MultiOracleService::new())
-        })
+        let err = minimize_session_core(
+            &model,
+            &drifted,
+            &meta,
+            || Ok::<_, String>(MultiOracleService::new()),
+            None,
+        )
         .unwrap_err();
         assert!(
             err.contains("no longer reproduces"),
             "baseline must refuse to minimize a non-reproducing O1 finding, got {err:?}"
         );
+    }
+
+    /// A peer that answers each request it reads with `reply:` and the
+    /// request, framed as `framing` frames it. A raw reply goes out in two
+    /// writes 10 ms apart, inside the reply's idle window.
+    fn framed_echo_server(framing: Framing) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let framing = framing.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buffered = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let request = match framing.take_reply(&buffered, MAX_REPLY_BYTES) {
+                            ReplyProgress::Complete { reply, consumed } => {
+                                buffered.drain(..consumed);
+                                reply
+                            }
+                            _ if framing.reply_idle_ms().is_some() && !buffered.is_empty() => {
+                                std::mem::take(&mut buffered)
+                            }
+                            _ => match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buffered.extend_from_slice(&chunk[..n]);
+                                    continue;
+                                }
+                            },
+                        };
+                        let mut reply = b"reply:".to_vec();
+                        reply.extend_from_slice(&request);
+                        let wire = framing.encode(&reply).unwrap();
+                        if framing.reply_idle_ms().is_some() {
+                            let (head, tail) = wire.split_at(wire.len() / 2);
+                            stream.write_all(head).unwrap();
+                            std::thread::sleep(Duration::from_millis(10));
+                            stream.write_all(tail).unwrap();
+                        } else {
+                            stream.write_all(&wire).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// #257: every framing mode frames the request and reads the reply over
+    /// a real socket, twice on one connection.
+    #[test]
+    fn each_framing_mode_carries_requests_and_replies_over_tcp() {
+        let cases = [
+            (Framing::default(), b"reply:ping".to_vec()),
+            (
+                Framing::LengthPrefix {
+                    width: 2,
+                    endian: protocol_session::ByteOrder::Big,
+                    includes_prefix: false,
+                },
+                b"reply:ping".to_vec(),
+            ),
+            (
+                Framing::LengthPrefix {
+                    width: 4,
+                    endian: protocol_session::ByteOrder::Little,
+                    includes_prefix: true,
+                },
+                b"reply:ping".to_vec(),
+            ),
+            (
+                Framing::Delimiter {
+                    delimiter: b"\r\n".to_vec(),
+                },
+                b"reply:ping".to_vec(),
+            ),
+            // The request is padded to 8 bytes, and the reply cut to 8.
+            (Framing::Fixed { size: 8 }, b"reply:pi".to_vec()),
+        ];
+        for (framing, expected) in cases {
+            let label = framing.label();
+            let port = framed_echo_server(framing.clone());
+            let mut transport = TcpSessionTransport::new(
+                "127.0.0.1".to_owned(),
+                port,
+                SessionResetMode::None,
+                framing,
+                SESSION_IO_TIMEOUT,
+            );
+            transport.reset().unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    transport.send_request(b"ping").unwrap(),
+                    expected,
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// A raw peer that closes after its reply has answered: the reply is the
+    /// bytes before the close.
+    #[test]
+    fn a_raw_reply_ends_when_the_peer_closes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0u8; 64];
+            let _ = stream.read(&mut chunk);
+            stream.write_all(b"bye").unwrap();
+        });
+        let mut transport = TcpSessionTransport::new(
+            "127.0.0.1".to_owned(),
+            port,
+            SessionResetMode::Reconnect,
+            Framing::Raw {
+                reply_idle_ms: 5_000,
+            },
+            SESSION_IO_TIMEOUT,
+        );
+        transport.reset().unwrap();
+        let started = Instant::now();
+        assert_eq!(transport.send_request(b"hi").unwrap(), b"bye");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "waited for the idle window"
+        );
+    }
+
+    /// #258: a `udp:` spec, and a datagram per message: an echo peer answers,
+    /// a silent one misses the reply deadline and a closed port refuses, and
+    /// either ends the session.
+    #[test]
+    fn udp_sends_a_datagram_per_message_and_a_missing_reply_ends_the_session() {
+        assert_eq!(
+            SessionTransportPlan::parse("udp:127.0.0.1:9").unwrap(),
+            SessionTransportPlan::Udp {
+                host: "127.0.0.1".to_owned(),
+                port: 9
+            }
+        );
+        let udp = |port: u16, timeout_ms: u64| {
+            let mut transport = UdpSessionTransport::new(
+                "127.0.0.1".to_owned(),
+                port,
+                SessionResetMode::Reconnect,
+                Framing::default(),
+                Duration::from_millis(timeout_ms),
+            );
+            transport.reset().unwrap();
+            transport
+        };
+
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let mut reply = b"reply:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = echo.send_to(&reply, peer);
+            }
+        });
+        let mut transport = udp(echo_port, 2_000);
+        assert_eq!(transport.send_request(b"ping").unwrap(), b"reply:ping");
+        assert_eq!(transport.send_request(b"pong").unwrap(), b"reply:pong");
+
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let error = udp(silent.local_addr().unwrap().port(), 100)
+            .send_request(b"ping")
+            .unwrap_err();
+        assert!(error.session_lost, "{error}");
+        assert!(
+            error.message.contains("no reply datagram within 100 ms"),
+            "{error}"
+        );
+
+        let closed_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = udp(closed_port, 1_000).send_request(b"ping").unwrap_err();
+        assert!(error.session_lost, "{error}");
     }
 }

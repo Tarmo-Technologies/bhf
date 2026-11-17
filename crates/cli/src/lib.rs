@@ -103,6 +103,7 @@ mod sbom;
 mod scan;
 mod serial_port;
 mod session_fuzz;
+mod session_server;
 mod sloc;
 mod snippet;
 mod source_text;
@@ -372,7 +373,7 @@ struct BinaryArgs {
 enum BinaryCommand {
     /// Inventory binaries and firmware, extract archives, match CVE components for SBOM/SCA
     Scan(binary_scan::BinaryScanArgs),
-    /// Check for an external binary-analysis adapter (Rizin, Ghidra, angr; no analysis through them is implemented yet, exit 3) or run the mock adapter's JSON contract
+    /// List a binary's functions, call edges, strings and xrefs with Rizin, Ghidra headless or angr, run as subprocesses (or the mock adapter's JSON contract)
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),

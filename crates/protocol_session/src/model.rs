@@ -29,7 +29,7 @@ use fuzz_engine_builtin::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::binding::Bindings;
+use crate::binding::{Bindings, BoundValue};
 use crate::profile::{ByteOrder, FieldDef, FieldType, MessageDef, OracleDef, Profile, SessionDef};
 
 /// A concrete value assigned to a data field of a message instance.
@@ -54,7 +54,23 @@ pub enum FieldRole {
     /// A later-request reference to a captured response value.
     Ref {
         source: String,
-        width: IntWidth,
+        /// How the bound value is written into the frame.
+        encoding: RefEncoding,
+    },
+}
+
+/// How a reference field writes the value it is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefEncoding {
+    /// An integer (or an enum's code) at the field's width.
+    Int { width: IntWidth, endian: Endian },
+    /// Captured bytes, as they are.
+    Bytes,
+    /// Captured bytes as the value of a TLV record with `tag`.
+    Tlv {
+        tag: u64,
+        tag_width: IntWidth,
+        len_width: IntWidth,
         endian: Endian,
     },
 }
@@ -132,6 +148,14 @@ pub enum CaptureSpec {
     },
     Bytes {
         len: usize,
+    },
+    /// The value of a TLV record: the records from the capture's offset are
+    /// walked until one has `tag` (the first, when `tag` is `None`).
+    Tlv {
+        tag: Option<u64>,
+        tag_width: IntWidth,
+        len_width: IntWidth,
+        endian: Endian,
     },
 }
 
@@ -215,11 +239,41 @@ impl CompiledMessage {
                 FieldRole::Computed(spec) => fields.push(lower_computed_field(&field.name, spec)),
                 FieldRole::Ref {
                     source,
-                    width,
-                    endian,
+                    encoding: RefEncoding::Int { width, endian },
                 } => {
                     fields.push(Field::bytes(&field.name, vec![0u8; width.size()]));
                     refs.push((field.name.clone(), source.clone(), *width, *endian));
+                }
+                // A byte-valued reference is resolved before the frame is
+                // encoded, since its length is the bound value's: a length
+                // or CRC that covers it is computed over it.
+                FieldRole::Ref { source, encoding } => {
+                    let bytes = bindings
+                        .get(source)
+                        .and_then(BoundValue::as_bytes)
+                        .ok_or_else(|| EncodeError::Unresolved {
+                            field: field.name.clone(),
+                            reference: source.clone(),
+                        })?
+                        .to_vec();
+                    fields.push(match encoding {
+                        RefEncoding::Tlv {
+                            tag,
+                            tag_width,
+                            len_width,
+                            endian,
+                        } => lower_data_field(
+                            &field.name,
+                            &DataSpec::Tlv {
+                                tag: *tag,
+                                tag_width: *tag_width,
+                                len_width: *len_width,
+                                endian: *endian,
+                            },
+                            &FieldValue::Tlv { value: bytes },
+                        )?,
+                        _ => Field::bytes(&field.name, bytes),
+                    });
                 }
             }
         }
@@ -264,6 +318,7 @@ pub struct ProtocolModel {
     graph: ProtocolStateGraph,
     oracles: Vec<OracleDef>,
     session: SessionDef,
+    framing: crate::framing::Framing,
 }
 
 impl ProtocolModel {
@@ -285,6 +340,7 @@ impl ProtocolModel {
             graph,
             oracles: profile.oracles().to_vec(),
             session: profile.session().clone(),
+            framing: profile.framing().clone(),
         })
     }
 
@@ -318,6 +374,11 @@ impl ProtocolModel {
 
     pub fn session(&self) -> &SessionDef {
         &self.session
+    }
+
+    /// How messages are delimited on the wire.
+    pub fn framing(&self) -> &crate::framing::Framing {
+        &self.framing
     }
 }
 
@@ -373,15 +434,26 @@ fn compile_field(
     let role = if let Some(spec) = &def.computed {
         compile_computed(message, def, spec, field_names, optional_names)?
     } else if let Some(source) = &def.reference {
-        let width = int_width(def.ty).ok_or_else(|| ModelError::IllegalFieldType {
-            message: message.to_owned(),
-            field: def.name.clone(),
-            reason: "reference fields must be u8/u16/u32".to_owned(),
-        })?;
+        let encoding = match def.ty {
+            FieldType::Bytes => RefEncoding::Bytes,
+            FieldType::Tlv => RefEncoding::Tlv {
+                tag: def.tag.unwrap_or(0),
+                tag_width: IntWidth::U16,
+                len_width: IntWidth::U16,
+                endian,
+            },
+            ty => RefEncoding::Int {
+                width: int_width(ty).ok_or_else(|| ModelError::IllegalFieldType {
+                    message: message.to_owned(),
+                    field: def.name.clone(),
+                    reason: "reference fields must be u8/u16/u32, bytes or tlv".to_owned(),
+                })?,
+                endian,
+            },
+        };
         FieldRole::Ref {
             source: source.clone(),
-            width,
-            endian,
+            encoding,
         }
     } else {
         FieldRole::Data(compile_data_spec(message, def, endian)?)
@@ -593,11 +665,20 @@ fn compile_capture(
             })?,
         },
         FieldType::Tlv => {
-            return Err(ModelError::IllegalFieldType {
-                message: message.to_owned(),
-                field: def.name.clone(),
-                reason: "tlv response captures are not supported".to_owned(),
-            })
+            let width = |declared: Option<FieldType>, key: &str| match declared {
+                None => Ok(IntWidth::U16),
+                Some(ty) => int_width(ty).ok_or_else(|| ModelError::IllegalFieldType {
+                    message: message.to_owned(),
+                    field: def.name.clone(),
+                    reason: format!("a tlv capture's `{key}` must be u8, u16 or u32"),
+                }),
+            };
+            CaptureSpec::Tlv {
+                tag: def.tag,
+                tag_width: width(def.tag_width, "tag_width")?,
+                len_width: width(def.len_width, "len_width")?,
+                endian,
+            }
         }
     };
     Ok(CompiledCapture {

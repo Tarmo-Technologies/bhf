@@ -72,6 +72,7 @@ bhf clean bhf_work --build --corpus --reports
 ```
 
 The adapter line needs `rizin` on `PATH`; without it, it exits `1` saying so.
+It writes the binary's functions, call edges, strings and xrefs.
 To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
 that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
 Windows, as every harness binary there is named: `main_cov.exe`,
@@ -364,17 +365,57 @@ promoted into packed-binary or binary-layout review triage. Use
 limit.
 
 `bhf binary adapter <BINARY> --adapter mock|rizin|ghidra|angr --out <DIR>`
-writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`: functions,
-call-graph hints, strings, xrefs and errors). The command never links
-external tools into BHF. Only the mock adapter fills the report: it reads
-`--mock-output` JSON, for contract tests of a consumer. The Rizin, Ghidra and
-angr adapters run no analysis yet. They are blocked in `strict-permissive`
-(they need `--profile external-tools` or `research-lab`), look for their tool
-(`rizin`, Ghidra's `analyzeHeadless`, a Python that imports `angr`; `--tool`
-names another), and write `status: not_implemented` with a `not_implemented`
-error and exit 3 when it is there, or `status: skipped` with `tool_not_found`
-and exit 1 when it is not. They used to report the tool's `--version` as a
-successful `smoke_tested` analysis with empty arrays.
+writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`). It holds:
+- `functions`: name, address, size, signature, and `imported` for an import
+  stub;
+- `call_graph`: caller and callee by name;
+- `strings`: address, value and section, without the symbol-table sections;
+- `xrefs`: from, to, and `kind` `call`, `code`, `data` or `string`;
+- `truncated` and `errors`.
+
+Addresses are the binary's link-time virtual addresses, as its headers and
+`nm` give them; a PIE's are offsets from 0, whatever base the tool loaded it
+at. The command never links an external tool into BHF: each runs as a
+subprocess, with a fixed command or a bundled script:
+
+| Adapter | Tool (`--tool` names another) | What runs |
+|---|---|---|
+| `rizin` | `rizin` | `rizin -q -c 'aaa; aflj; axlj; izj'` |
+| `ghidra` | Ghidra's `support/analyzeHeadless` (Ghidra 12 needs a JDK 25) | an import and auto-analysis in a throwaway project, then the bundled `BhfExport.java` post-script |
+| `angr` | a Python that imports `angr` | the bundled `angr_export.py`: CFGFast over the main object, with data and cross references |
+
+Each run is bounded by `--timeout-secs` (default 900) and 128 MiB of output.
+Each array keeps at most 50,000 functions or strings, or 200,000 call edges
+or xrefs; `truncated` names an array that was cut and how many entries it
+kept. The real adapters are blocked in `strict-permissive` (they need
+`--profile external-tools` or `research-lab`). They write:
+- `status: ok` and exit 0, with the analysis;
+- `status: error` and exit 1 when the analysis failed: `timeout`,
+  `tool_error`, `output_too_large` or `bad_output`, with the tool's last
+  output;
+- `status: skipped` with `tool_not_found` and exit 1 when the tool is not
+  there, or the Python cannot import angr.
+
+The mock adapter reads `--mock-output` JSON instead, for contract tests of a
+consumer. The report also records the binary's `target_sha256`.
+
+`bhf binary fuzz` and `bhf binary scan` take a report with
+`--adapter-report <binary-adapter-report.json>`. Only an `ok` report is
+taken. From it they get:
+- dictionary tokens: the strings the binary's code references first, then
+  its other data strings, at most 256 of 2 to 64 bytes. `binary fuzz` seeds
+  the builtin engine's mutation dictionary with them, and afl-fuzz's `-x`.
+- a ranking of the binary's own functions as fuzz entry points. A call to
+  an input-handling import (`strncmp`, `memcpy`, `read`, `sscanf`, ...)
+  scores 3, a referenced string 2, a call to another of its functions 1;
+  the C runtime's functions are left out. The first is the candidate
+  persistent address.
+
+`binary fuzz` records them in its run JSON's `adapter_report`: the token
+count, the top ten functions with their reasons, and `persistent_candidate`.
+`binary scan` adds the same object as `adapter` to the inventory entry whose
+SHA-256 is the report's `target_sha256`; a report of a binary the scan did
+not inventory is exit 1.
 
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
@@ -1385,7 +1426,8 @@ so a run whose crashes were all known does not read as clean.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there. `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
-- `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. Required with `--protocol-profile`.
+- `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. Required with `--protocol-profile`.
+- `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
 - `--dict <PATH>` — an AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose tokens the mutator splices into inputs, on top of the harness's own `dictionary.txt`. The host loop and the transport lane read it; a file that cannot be read stops the run. The transport lane also reads the harness's `dictionary.txt` and `--grammar`: with a grammar, a seed is a derivation of it when no `--seed-input` or `--seed-file` is given, and every other input is a fresh derivation, so a target that parses the grammar receives only its sentences.
 - The transport (`--target-transport`) and session (`--protocol-profile`) lanes run their own loops and refuse, with exit `2` and the flags named, a host-lane flag they do not wire rather than ignore it: `--workers`, `--cmplog-log`, `--len-control`, `--rss-limit-mb`, the fork-server, qemu-user, extension, sanitizer, symbolic-seed, sandbox, runtime-oracle, structured-input, final-stats and collector flags. The transport lane also refuses the session flags; the session lane, whose seeds come from the profile, also refuses `--grammar`, `--dict`, `--seed-input`, `--seed-file`, `--max-len`, `--timeout`, `--deadline` and `--transport-coverage-map`.
 - `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
@@ -1471,6 +1513,63 @@ optional fields), the computed fields (`length(..)`, `crc32(..)`/`crc16(..)`/
 response captures a reply exposes, the session `reset`, and the `[[oracle]]`
 that marks the clean-exit finding. The seed session is synthesized from the
 profile (a legal, reference-satisfying walk).
+
+How messages are delimited on the wire is the profile's `[framing]`, and the
+transport adds nothing of its own:
+
+| `kind` | A request is | A reply ends |
+|---|---|---|
+| `raw` (the default) | written as it is | when no byte arrives for `reply_idle_ms` (50) after the first, or the peer closes |
+| `length_prefix` | preceded by its length in `width` bytes (1, 2 or 4; 2 by default), `endian` `big` (the default) or `little`; `includes_prefix = true` when the length counts the prefix | after the length its prefix declares |
+| `delimiter` | followed by `delimiter` (`"\r\n"`) | at the delimiter, which is not part of the reply |
+| `fixed` | `size` bytes: a shorter request is padded with zeros, a longer one cut | after `size` bytes |
+
+```toml
+[framing]
+kind = "length_prefix"
+width = 2
+endian = "big"
+```
+
+The run summary's `framing` names it (`length_prefix(u16 big)`).
+
+A response capture of `type = "tlv"` takes the value of a tag-length-value
+record in the reply: the records from `at` are walked until one has `tag`
+(the record at `at` when there is no `tag`), each with a `tag_width` and a
+`len_width` of `u8`, `u16` (the default) or `u32` in the capture's `endian`.
+The value is bytes, which a later request echoes from a `bytes` field
+(`ref = "HELLO.response.cookie"`) or a `tlv` field of its own `tag`; a
+`length(..)` or CRC that covers it is computed over it.
+
+```toml
+[[message.response.capture]]
+name = "cookie"
+type = "tlv"
+at = 1
+tag = 2
+```
+
+`--session-server-cmd COMMAND` has bhf run the service itself, through the
+shell, with its stderr kept under `<work_dir>/session_server/`. bhf waits until
+it serves the `--session-transport` port, and after each session checks
+whether it exited. A session after which it exits is driven again on the
+service started again; if it exits again, that is a finding, written from the
+sanitizer report in the service's stderr (with its rule, stack and
+`sanitizer.log`, oracle `session-server-crash`) or, with no report, a BHF-210
+finding (oracle `session-server-exit`). The service is started again and the
+campaign goes on; the summary's `server_starts` counts the starts. Unless the
+environment sets `ASAN_OPTIONS`, the service runs with
+`halt_on_error=1:abort_on_error=0:detect_leaks=0:symbolize=1`. A service that
+exits before it serves its port, or does not serve it within 10s, stops the
+run with exit `2` and its stderr. `bhf replay` and `bhf minimize` of such a
+finding start the service for each drive.
+
+```sh
+bhf fuzz bhf_work --harness H-PROTO \
+  --protocol-profile profiles/echo.toml \
+  --session-transport tcp:127.0.0.1:9000 \
+  --session-server-cmd './build/echo_server 9000' --iterations 2000
+```
 
 ```sh
 bhf fuzz bhf_work --harness H-PROTO \

@@ -24,6 +24,7 @@ x86_64-pc-windows-msvc = ["bhf-daemon"]
 ada_parser = { path = "../ada_parser" }
 c_parser = { path = "../c_parser" }
 cli = { package = "bhf", path = "../cli", default-features = false }
+continuous_daemon = { path = "../continuous_daemon" }
 cpp_parser = { path = "../cpp_parser" }
 bhf_report = { package = "report", path = "../report" }
 instrumenter = { path = "../instrumenter" }
@@ -32,6 +33,9 @@ serde.workspace = true
 serde_json.workspace = true
 static_analysis = { path = "../static_analysis" }
 target_rank = { path = "../target_rank" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

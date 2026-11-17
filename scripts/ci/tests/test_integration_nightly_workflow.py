@@ -344,7 +344,7 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
         self.assertIn("name: Integration tests (bhf) (WinAFL, Windows)", self.job)
         self.assertIn("runs-on: windows-2022", self.job)
         report = job_block("report-failure")
-        self.assertIn("needs: [gate, build, integration, winafl]", report)
+        self.assertIn("needs: [gate, build, integration, binary-analyzers, winafl]", report)
         self.assertIn("needs.winafl.result == 'failure'", report)
 
     def test_a_cache_hit_skips_the_build(self) -> None:
@@ -367,6 +367,52 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
         self.assertIn("cargo test --locked -p bhf --test winafl_engine -- --ignored --test-threads 1", self.job)
         self.assertIn("BHF_WINAFL_PATH: C:\\tools\\bhf-winafl\\winafl", self.job)
         self.assertIn("BHF_DYNAMORIO_PATH: C:\\tools\\bhf-winafl\\DynamoRIO-Windows-11.91.20763", self.job)
+
+
+class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
+    """The binary adapters run nightly against the real Rizin, Ghidra and angr
+    (#264, #265, #266), pinned by digest."""
+
+    def setUp(self) -> None:
+        self.job = job_block("binary-analyzers")
+
+    def test_the_job_counts_as_an_integration_shard_and_reports_its_failure(self) -> None:
+        self.assertIn("name: Integration tests (bhf) (binary analyzers)", self.job)
+        self.assertIn("    needs: [gate, build]\n", self.job)
+        report = job_block("report-failure")
+        self.assertIn("needs.binary-analyzers.result == 'failure'", report)
+        self.assertIn("needs.binary-analyzers.result == 'cancelled'", report)
+
+    def test_it_runs_the_analyzer_tests_from_the_archive_with_the_tools_required(self) -> None:
+        self.assertIn(f"cargo nextest run {ARCHIVE} \\\n", self.job)
+        self.assertIn("-E 'binary(=binary_adapter_tools)'", self.job)
+        self.assertIn('BHF_BINARY_ANALYZERS: "1"', self.job)
+        self.assertIn('BHF_REQUIRE_TOOLS: "1"', self.job)
+        self.assertIn("java-version: 25", self.job)
+        self.assertIn(
+            'run: bash scripts/ci/install-binary-analyzers.sh "$RUNNER_TEMP/analyzers" >> "$GITHUB_ENV"',
+            self.job,
+        )
+
+    def test_every_download_is_pinned_by_digest(self) -> None:
+        script = (ROOT / "scripts/ci/install-binary-analyzers.sh").read_text()
+        self.assertEqual(script.count('"$here/fetch.sh" \\\n'), 2, script)
+        for pin in (
+            "rizin_sha256=9102249a9f0b6319c5334a2e5cf8d9cc3f2035e1d3def027c41f6a90f647e8cf",
+            "ghidra_sha256=2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67",
+            "angr_version=10.0.7",
+        ):
+            self.assertIn(pin, script)
+        self.assertNotIn("curl", script)
+
+    def test_the_hash_shards_may_skip_only_the_analyzer_tests(self) -> None:
+        allowed = (ROOT / "scripts/ci/allowed-skips.txt").read_text()
+        self.assertIn(
+            "bhf::binary_adapter_tools::*  skip binary_adapter_tools: set BHF_BINARY_ANALYZERS=1",
+            allowed,
+        )
+        tests = (ROOT / "crates/cli/tests/binary_adapter_tools.rs").read_text()
+        self.assertIn('eprintln!("skip binary_adapter_tools: set BHF_BINARY_ANALYZERS=1");', tests)
 
 
 if __name__ == "__main__":

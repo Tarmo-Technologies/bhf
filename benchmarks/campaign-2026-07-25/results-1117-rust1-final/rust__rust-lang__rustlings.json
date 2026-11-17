@@ -1,0 +1,68 @@
+{
+ "repo": "rust-lang/rustlings",
+ "sha": "734461f2fb8c7bb8403f4a9bd1fc7f983d32860b",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "cargo_toml.rs",
+   "name": "append_bins",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'append_bins' (unsupported in-crate setup): parameter `exercise_infos: &[ExerciseInfo]` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  },
+  {
+   "source": "exercise.rs",
+   "name": "solution_link_line",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'solution_link_line' (unsupported in-crate setup): parameter `stdout: &mut StdoutLock` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  },
+  {
+   "source": "notify_event.rs",
+   "name": "build",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'build' (unsupported in-crate setup): parameter `watch_event_sender: Sender<WatchEvent>` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  },
+  {
+   "source": "term.rs",
+   "name": "terminal_file_link",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'terminal_file_link' (unsupported in-crate setup): parameter `writer: &mut impl CountedWrite<'a>` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 9,
+  "discovered_total": 9,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 1,
+  "unsupported_params": 1,
+  "unsupported_setup": 7,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

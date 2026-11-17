@@ -1,0 +1,45 @@
+{
+ "repo": "FuelLabs/sway",
+ "sha": "91be236f71fbb541ee6639ef0d955b2b8cf0a658",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "tx_utils.rs",
+   "name": "decode_fuel_vm_log_data",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&fuel_abi_types::abi::program::ProgramABI' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  },
+  {
+   "source": "tx_utils.rs",
+   "name": "decode_log_data",
+   "outcome": "unsupported_params",
+   "reason": "Rust parameter type '&ProgramABI' has no bhf-native byte decoder",
+   "class": "Rust-1 no byte decoder",
+   "before": 1,
+   "classes": [
+    "Rust-1 no byte decoder"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

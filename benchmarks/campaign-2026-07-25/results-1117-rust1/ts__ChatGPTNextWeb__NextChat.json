@@ -1,0 +1,35 @@
+{
+ "repo": "ChatGPTNextWeb/NextChat",
+ "sha": "706a18b95b714ab29b2a4842d3b9ff4f887935d5",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "stream.rs",
+   "name": "stream_fetch",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'stream_fetch' (unsupported in-crate setup): parameter `window: tauri::Window` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "unsupported_setup": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

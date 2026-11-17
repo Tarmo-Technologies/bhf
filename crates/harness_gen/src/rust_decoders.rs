@@ -195,6 +195,8 @@ pub fn select_rust_decoder(ty: &str) -> Result<RustParamEmission, RustDecodeErro
         "i32" => Some("c.i32()"),
         "u64" => Some("c.u64()"),
         "i64" => Some("c.i64()"),
+        "u128" => Some("c.u128()"),
+        "i128" => Some("c.i128()"),
         "usize" => Some("c.usize()"),
         "isize" => Some("c.isize()"),
         "bool" => Some("c.bool()"),
@@ -406,6 +408,8 @@ fn decode_owned_expr(c: &str, depth: u8) -> Option<String> {
         "i32" => return Some("c.i32()".to_owned()),
         "u64" => return Some("c.u64()".to_owned()),
         "i64" => return Some("c.i64()".to_owned()),
+        "u128" => return Some("c.u128()".to_owned()),
+        "i128" => return Some("c.i128()".to_owned()),
         "usize" => return Some("c.usize()".to_owned()),
         "isize" => return Some("c.isize()".to_owned()),
         "bool" => return Some("c.bool()".to_owned()),
@@ -458,6 +462,12 @@ fn decode_owned_expr(c: &str, depth: u8) -> Option<String> {
         // `Cow<T>` over an owned, `ToOwned`-able element.
         let e = decode_owned_expr(owned, depth - 1)?;
         return Some(format!("std::borrow::Cow::Owned({e})"));
+    }
+    // `Option<U>` over an owned element: a flag byte, then the value when it
+    // is set (#338: RecordFlux's `Option<String>`).
+    if let Some(inner) = generic_inner(c, "Option") {
+        let e = decode_owned_expr(inner, depth - 1)?;
+        return Some(format!("if c.bool() {{ Some({e}) }} else {{ None }}"));
     }
     // `Vec<U>` over an owned element: bounded count then a push loop.
     if let Some(inner) = generic_inner(c, "Vec") {
@@ -554,6 +564,35 @@ mod tests {
             assert_eq!(e.by_ref, ArgPass::Move);
             assert!(!e.rest_eligible);
         }
+    }
+
+    /// #338: 128-bit integers and `Option`s of a decodable type, which the
+    /// RecordFlux Rust-1 targets take.
+    #[test]
+    fn wide_integers_and_options_of_decodable_types_decode() {
+        assert_eq!(
+            select_rust_decoder("i128").unwrap().bounded_expr,
+            "c.i128()"
+        );
+        assert_eq!(
+            select_rust_decoder("u128").unwrap().bounded_expr,
+            "c.u128()"
+        );
+        let option = select_rust_decoder("Option<String>").unwrap();
+        assert_eq!(
+            option.bounded_expr,
+            format!("if c.bool() {{ Some(c.string({RUST_BOUNDED_MAX})) }} else {{ None }}")
+        );
+        assert_eq!(option.by_ref, ArgPass::Move);
+        assert_eq!(
+            select_rust_decoder("Option<(u8, i128)>")
+                .unwrap()
+                .bounded_expr,
+            "if c.bool() { Some((c.u8(), c.i128())) } else { None }"
+        );
+        // An `Option` of a type with no decoder is still refused.
+        assert!(select_rust_decoder("Option<PathBuf>").is_err());
+        assert!(select_rust_decoder("Option<&str>").is_err());
     }
 
     #[test]

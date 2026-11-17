@@ -144,6 +144,7 @@ is to bound the recursion depth.
 | `--sbom` | off | Write an evidence-graded SBOM and VEX bundle at the end of the run into `<work>/sbom/` (`sbom.json`, `cyclonedx.json`, `vulnerabilities.json`, `openvex.json`, `sbom.csv`). The tree's components are enriched with the run's `auto/run.json`, so libraries a harness drove are marked exercised. `bhf sbom` gives finer `--emit` and `--ecosystems` control |
 | `--sloc <FILE>` | unset | Write a per-language SLOC breakdown (files, total, comments, blanks, SLOC) of the tree, then run as usual. A relative path lands in `<work>/auto/`; a `.json` name writes JSON, anything else a text table |
 | `--force` / `--force-fuzz` | off | Adds a SECOND pass. The sweep first runs exactly as it would without the flag, then re-attempts only the targets that did not reach the fuzz phase — forced: a best-effort driver for opaque/function-pointer/unknown params, stubs for whatever the compiler reports undefined, and no hard failure (report-only is the floor). The managed lanes have their own force paths: Go drives an undrivable parameter as its type's zero value and calls a method on a zero receiver, and C# allocates a receiver whose type has no accessible parameterless constructor without running one. A forced retry may only ever *replace* a target's outcome by fuzzing it, so `--force` cannot lower the fuzzed count; it also cannot rescue a target whose parameters were never the problem. Findings from a forced build are floored to **Low** confidence with a `forced` note and counted separately — a forced crash may be a stub artifact, not a real defect. With `--resume` over a finished campaign it keeps every target that already fuzzed and forces only the rest, without repeating the unforced attempt. Persistence honors `--max-repair-rounds`; does not imply `--static` |
+| `--rust-private` | off | Harnesses private Rust targets in-crate (#83): admits `pub(crate)` and private functions and methods, and injects each harness as a module into a copy of the crate, so it calls them by their `crate::` path, with a materialized path-backed resource for a target that opens one. `rust-private = true` in the config, or `BHF_RUST_INCRATE_PRIVATE=1`, turns it on too. A target the lane admits but cannot set up (a parameter or resource it has no recipe for) is outcome `unsupported_setup`, apart from `unsupported_params`. The crate's build needs `--run-untrusted`, as every Rust target's does |
 | `--static-dynamic` | — | Deprecated, no effect. `results/findings.csv` always tells a static-scan row from a fuzzed one, in its `kind` column, and says whether fuzzing confirmed it in `confirmation` |
 | `--install-deps` | off | After the sweep, fetch still-blocking deps from the manifest (apt-get / `alr get`). Opt-in and the only ONLINE part of `auto`; nothing is fatal |
 | `--list-fakes` | — | Print the fake-resource plugin inventory and exit |
@@ -173,7 +174,7 @@ each spelled like its flag:
   `exclude-path`, `project`, `ada-deps`, `cxx-expected-exception`.
 - Seeds and selection: `seed-file`, `seed-dir`, `seed-mining = false` (the
   `--no-seed-mining` flag), `sanitizers`, `engine`, `languages`, `passes`,
-  `force`.
+  `force`, `rust-private`.
 - Explicit `--config` only, because they execute something: `build-command`,
   `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`,
   `msbuild-evaluate`, `winafl-path` and `dynamorio-path` (the WinAFL and
@@ -314,9 +315,9 @@ assembly. Go coverage retries the exact selected package when module-wide
 instrumentation is blocked by unrelated platform packages.
 
 These behaviors and their residual limits are measured in the
-[200-project expert-parity audit](./harness-parity-audit.md). They do not make
-every project automatically harnessable: private Rust in-crate targets, generated
-or platform-specific build graphs, framework hosts, scientific arrays with coupled
+[200-project expert-parity audit](./harness-parity-audit.md). Private Rust
+targets need `--rust-private`. These behaviors do not make every project
+automatically harnessable: generated or platform-specific build graphs, framework hosts, scientific arrays with coupled
 dimensions, and general constructor/feed/execute/cleanup protocols remain explicit
 gaps rather than silently fabricated successes.
 
@@ -1029,6 +1030,10 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
   "needs --run-untrusted"): its build runs project-controlled code, so the
   remedy is that consent, with the dependencies staged and the network
   isolated; `--force` cannot help, and `--resume` tries it again.
+  A private Rust target `--rust-private` admits but cannot set up (a parameter
+  or a resource the in-crate lane has no recipe for) has the outcome
+  `unsupported_setup` (`summary.unsupported_setup`, terminal label "skipped:
+  the in-crate Rust lane cannot set it up"); its reason names what is missing.
   A C/C++ target whose harness built but whose sanitizer runtime cannot start
   on the host has the outcome `sanitizer_runtime_unavailable`
   (`summary.sanitizer_runtime_unavailable`; see [Sanitizers](sanitizers.md)),

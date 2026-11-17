@@ -1215,6 +1215,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/mkdir_modes.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/mmio_virtualization.rs",
       "license": "Apache-2.0"
     },
@@ -1659,6 +1663,22 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/binary_adapter/angr.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/binary_adapter/ghidra.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/binary_adapter/hints.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/binary_adapter/rizin.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/binary_fuzz.rs",
       "license": "Apache-2.0"
     },
@@ -1988,6 +2008,10 @@
     },
     {
       "path": "crates/cli/src/session_fuzz.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/session_server.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2603,7 +2627,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_rust_default_params.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_rust_discovery.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_rust_external_trait.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2704,6 +2736,14 @@
     },
     {
       "path": "crates/cli/tests/binary_adapter_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/binary_adapter_hints_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/binary_adapter_tools.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3135,6 +3175,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/session_server_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/single_file_tool_main.rs",
       "license": "Apache-2.0"
     },
@@ -3412,6 +3456,22 @@
     },
     {
       "path": "crates/daemon/src/memory_budget.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/daemon/src/pinned_path.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/daemon/src/security_config.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/daemon/tests/jobs_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/daemon/tests/security_config_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4132,6 +4192,10 @@
     },
     {
       "path": "crates/protocol_session/src/binding.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/framing.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5275,6 +5339,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/validation/2026-11-17-rust-trait-and-param-classes.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-17-zoxide-incrate-parity.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/verified-distribution-handoff.md",
       "license": "Apache-2.0"
     },
@@ -5444,6 +5516,10 @@
     },
     {
       "path": "tests/fixtures/ada_multidir_gpr/src/parser/line_parser.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/binary_adapter/legacy.c",
       "license": "Apache-2.0"
     },
     {
@@ -5807,6 +5883,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "tests/fixtures/rust_default_params/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_default_params/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "tests/fixtures/rust_discovery/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -5820,6 +5904,22 @@
     },
     {
       "path": "tests/fixtures/rust_discovery/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_ext_trait/app/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_ext_trait/app/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_ext_trait/wiredep/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_ext_trait/wiredep/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5848,6 +5948,18 @@
     },
     {
       "path": "tests/fixtures/rust_incrate_private/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_private_assoc/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_private_assoc/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_private_assoc/src/store/mod.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5912,6 +6024,10 @@
     },
     {
       "path": "tests/fixtures/rust_reader_trait/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/session_server/echo_server.c",
       "license": "Apache-2.0"
     },
     {

@@ -336,6 +336,7 @@ fn blocker_kind(outcome: &str) -> &'static str {
         "failed_build" => "build_blocked",
         "unsupported_params" => "unsupported_params",
         "unsafe_build_path" => "unsafe_build_path",
+        "unsupported_setup" => "unsupported_setup",
         "missing_toolchain" => "missing_toolchain",
         "consent_required" => "consent_required",
         "sanitizer_runtime_unavailable" => "sanitizer_runtime_unavailable",
@@ -365,6 +366,12 @@ fn recommendation_for(blocker_kind: &str, candidate: &Candidate) -> String {
         "unsafe_build_path" => {
             "Refused because a source path, include dir or compile flag holds a character that \
              cannot be quoted safely in a build recipe; rename or move that path."
+                .to_owned()
+        }
+        "unsupported_setup" => {
+            "The in-crate Rust lane (--rust-private) admitted it previously but has no recipe \
+             for one of its parameters or the resource it opens (the reason names which); give \
+             the parameter a decoder or the resource a fixture."
                 .to_owned()
         }
         "missing_toolchain" => {

@@ -1,0 +1,35 @@
+{
+ "repo": "tailwindlabs/tailwindcss",
+ "sha": "6de87c62c4633007872986339f7b3a11600de923",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "boundary.rs",
+   "name": "has_valid_boundaries",
+   "outcome": "unsupported_setup",
+   "reason": "Rust target 'has_valid_boundaries' (unsupported in-crate setup): parameter `span: &Span` is neither byte-decodable nor a path-backed resource the recipe can materialize; skipped",
+   "class": "unsupported_setup",
+   "before": 1,
+   "classes": [
+    "unsupported_setup"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "unsupported_setup": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

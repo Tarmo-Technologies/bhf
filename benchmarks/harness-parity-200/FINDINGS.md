@@ -132,7 +132,9 @@ the expert public parser with 558 edges and 216 covered project lines.
 The three conservative exact-target differences are Rust, COBOL, and PHP:
 
 - zoxide: auto is restricted to a public separate-crate surface, while the expert
-  runs in-package, materializes a database, and calls private `Database::open_dir`;
+  runs in-package, materializes a database, and calls private `Database::open_dir`
+  (closed since by the in-crate lane, `--rust-private`: see the
+  [2026-11-17 rerun](../../docs/validation/2026-11-17-zoxide-incrate-parity.md));
 - webbol: auto chooses the higher-ranked pure `URL-DECODE`, while the expert
   intentionally uses `FILE-OPS` to test file/output resource synthesis (that
   synthesis is implemented and separately exercised);
@@ -176,10 +178,11 @@ surface selection, which is why this audit reports both.
 
 ## Remaining major paths
 
-1. **Rust in-package private harnesses and resource recipes.** Add a controlled
-   in-crate test/fuzz module mode so private targets remain visible, then infer
-   path-backed constructors/openers from nearby call sites. That closes zoxide's
-   `Database::open_dir` gap without making private APIs public.
+1. **Rust in-package private harnesses and resource recipes.** Closed: the
+   in-crate lane (`--rust-private`) harnesses private targets in a copy of the
+   crate and seeds a resource for path-backed openers. The
+   [2026-11-17 rerun](../../docs/validation/2026-11-17-zoxide-incrate-parity.md)
+   enters and covers zoxide's `Database::open_dir` with its database file.
 
 2. **Build-graph fidelity.** Large Ada, C++, C#, Fortran, Java, and Rust projects
    still fail primarily when a reduced source closure cannot reproduce generated

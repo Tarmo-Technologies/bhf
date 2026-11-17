@@ -1,0 +1,18 @@
+{
+ "repo": "Kong/kong",
+ "sha": "391ee48d3a68e8d0bbd0405ec1d02d75f768aa92",
+ "rc": 2,
+ "targets": [
+  {
+   "source": "types.rs",
+   "name": "default",
+   "outcome": "not_discovered",
+   "reason": null,
+   "class": "not discovered",
+   "before": 1,
+   "classes": []
+  }
+ ],
+ "summary": {},
+ "findings_detail": []
+}

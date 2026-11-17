@@ -1,0 +1,45 @@
+{
+ "repo": "spacedriveapp/spacedrive",
+ "sha": "60369e9f00b5abe07f4518626bf36f6a7453476f",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "native_deps.rs",
+   "name": "download_android_deps",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"in-crate cargo build failed: error: no matching package named `mustache` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-1-rust__spacedriveapp__spacedrive/harnesses/H-R0054-687422F0/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "native_deps.rs",
+   "name": "download_ios_deps",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"in-crate cargo build failed: error: no matching package named `mustache` found (exit status 101) [stderr: /home/ubuntu/bhf-sweep-work/rust-1-rust__spacedriveapp__spacedrive/harnesses/H-R0054-687422F0/cargo-build-stderr.log]\"}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 2,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}
