@@ -52,6 +52,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The Fortran lane fuzzes a `bind(C)` procedure that takes a
+  `character(kind=c_char), dimension(*)` buffer (#235). It calls the
+  procedure by its binding name with the C ABI: the buffer is the input's
+  exact bytes, a `value` integer length is passed by value, and no hidden
+  length follows. Every character array went to the descriptor wrapper,
+  which supports one form only, so the most C-callable Fortran parser shape
+  was skipped. A Fortran target the lane cannot call is no longer advised
+  `--force`, which built the same harness.
 - `bhf fuzz` arms the C/C++ driver's per-exec hit-count map, as `bhf auto`
   does (#401), so its built-in engine gets hit-count bucket feedback: an
   input that runs a loop or a recursion more times on the same edges is new

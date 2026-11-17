@@ -542,12 +542,32 @@ pub(crate) fn glue_source(
             extern_sig.insert(0, "char **".to_owned());
         }
     }
+    glue_file(
+        entry,
+        &extern_sig,
+        &decls,
+        &fills,
+        &all_args.join(", "),
+        &frees,
+    )
+}
+
+/// The glue's C file: `extern void entry(extern_sig)`, the trace-pc hook and
+/// `LLVMFuzzerTestOneInput` running `decls`, `fills`, `entry(call)` and
+/// `frees`.
+fn glue_file(
+    entry: &str,
+    extern_sig: &[String],
+    decls: &str,
+    fills: &str,
+    call: &str,
+    frees: &str,
+) -> String {
     let extern_sig = if extern_sig.is_empty() {
         "void".to_owned()
     } else {
         extern_sig.join(", ")
     };
-    let call = all_args.join(", ");
 
     format!(
         "/* SPDX-License-Identifier: Apache-2.0 */\n\
@@ -599,6 +619,89 @@ pub(crate) fn glue_source(
          }}\n",
         marker = crate::replay::GENERATED_ENTRY_MARKER,
     )
+}
+
+/// The glue of a `BIND(C)` procedure (#235): C calls it by its binding
+/// name with the C ABI, so an assumed- or explicit-size array dummy (and a
+/// `character(kind=c_char)` one) is a bare pointer to the input, a `VALUE`
+/// integer is passed by value, and no character dummy has a hidden length.
+/// The input length goes to the integer named like a length, else the one
+/// after the buffer. `None` when a `VALUE` dummy is not an integer: its C type
+/// is not known here.
+pub(crate) fn bind_c_glue_source(entry: &str, args: &[FortranArg]) -> Option<String> {
+    let is_buffer = |a: &FortranArg| {
+        matches!(
+            a.kind,
+            FortranArgKind::CharBuffer { .. } | FortranArgKind::CharArray { .. }
+        )
+    };
+    let primary = args.iter().position(is_buffer)?;
+    let len_idx = args
+        .iter()
+        .position(|a| {
+            matches!(a.kind, FortranArgKind::Integer) && {
+                let u = a.name.to_ascii_uppercase();
+                u.contains("LEN") || u == "N" || u.contains("SIZE") || u.contains("COUNT")
+            }
+        })
+        .or_else(|| {
+            args.get(primary + 1)
+                .filter(|a| matches!(a.kind, FortranArgKind::Integer))
+                .map(|_| primary + 1)
+        });
+    let (mut decls, mut fills, mut frees) = (String::new(), String::new(), String::new());
+    let mut call_args = Vec::new();
+    let mut extern_sig = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let var = format!("bhf_a{i}");
+        match a.kind {
+            _ if a.by_value && !matches!(a.kind, FortranArgKind::Integer) => return None,
+            FortranArgKind::CharBuffer { .. } | FortranArgKind::CharArray { .. }
+                if i == primary =>
+            {
+                // Exactly the input's bytes, so a read past them lands in
+                // ASan's redzone.
+                decls.push_str(&format!(
+                    "    char *{var} = (char *)malloc(Size ? Size : 1);\n"
+                ));
+                fills.push_str(&format!(
+                    "    if (!{var}) return 0;\n    if (Size) memcpy({var}, Data, Size);\n    bhf_primary_len = Size;\n"
+                ));
+                frees.push_str(&format!("    free({var});\n"));
+                call_args.push(var);
+                extern_sig.push("char *".to_owned());
+            }
+            FortranArgKind::Integer => {
+                decls.push_str(&format!("    int {var} = 0;\n"));
+                if Some(i) == len_idx {
+                    fills.push_str(&format!(
+                        "    {var} = Size > 0x7fffffff ? 0x7fffffff : (int)Size;\n"
+                    ));
+                }
+                if a.by_value {
+                    call_args.push(var);
+                    extern_sig.push("int".to_owned());
+                } else {
+                    call_args.push(format!("&{var}"));
+                    extern_sig.push("int *".to_owned());
+                }
+            }
+            _ => {
+                decls.push_str(&format!("    static unsigned char {var}[256];\n"));
+                fills.push_str(&format!("    memset({var}, 0, sizeof {var});\n"));
+                call_args.push(format!("(void *){var}"));
+                extern_sig.push("void *".to_owned());
+            }
+        }
+    }
+    Some(glue_file(
+        entry,
+        &extern_sig,
+        &decls,
+        &fills,
+        &call_args.join(", "),
+        &frees,
+    ))
 }
 
 fn array_wrapper_source(proc: &crate::auto::fortran::FortranProc) -> Option<String> {
@@ -750,12 +853,21 @@ pub fn build_fortran_harness(
         fortran_o
     };
 
-    let has_array_arg = proc
-        .args
-        .iter()
-        .any(|arg| matches!(arg.kind, FortranArgKind::CharArray { .. }));
+    // #235: a BIND(C) procedure is called from C by its binding name; only
+    // an assumed-shape dummy would still need a descriptor.
+    let bind_c = proc
+        .bind_c
+        .as_deref()
+        .filter(|_| !proc.args.iter().any(|arg| arg.assumed_shape));
+    let has_array_arg = bind_c.is_none()
+        && proc
+            .args
+            .iter()
+            .any(|arg| matches!(arg.kind, FortranArgKind::CharArray { .. }));
     let mut wrapper_object = None;
-    let entry = if has_array_arg {
+    let entry = if let Some(name) = bind_c {
+        name.to_owned()
+    } else if has_array_arg {
         let Some(wrapper) = array_wrapper_source(proc) else {
             return FortranBuildResult::Skip(format!(
                 "{}: character-array dummy needs a Fortran descriptor; automatic \
@@ -785,10 +897,19 @@ pub fn build_fortran_harness(
     } else {
         proc.result
     };
-    if let Err(e) = std::fs::write(
-        &glue_c,
-        glue_source(&entry, &proc.args, glue_result, has_array_arg),
-    ) {
+    let glue = match bind_c {
+        Some(_) => match bind_c_glue_source(&entry, &proc.args) {
+            Some(glue) => glue,
+            None => {
+                return FortranBuildResult::Skip(format!(
+                    "{}: a BIND(C) VALUE dummy that is not an integer",
+                    candidate.name
+                ))
+            }
+        },
+        None => glue_source(&entry, &proc.args, glue_result, has_array_arg),
+    };
+    if let Err(e) = std::fs::write(&glue_c, glue) {
         return FortranBuildResult::Failed(format!("write glue: {e}"));
     }
 
@@ -1081,6 +1202,8 @@ mod tests {
         FortranArg {
             name: name.to_owned(),
             kind,
+            by_value: false,
+            assumed_shape: false,
         }
     }
 
@@ -1276,6 +1399,7 @@ end module m
             module: Some("functional".to_owned()),
             public: true,
             result: FortranResult::AllocChar,
+            bind_c: None,
         };
         let wrapper = array_wrapper_source(&proc).expect("supported wrapper");
         assert!(wrapper.contains("use functional, only: bhf_target => arrstr"));
@@ -1292,5 +1416,44 @@ end module m
         assert!(glue.contains("malloc(Size ? Size : 1)"));
         assert!(glue.contains("bhf_fortran_array_entry(bhf_a0, Size);"));
         assert!(!glue.contains("(size_t)1"));
+    }
+
+    /// #235: C calls a BIND(C) procedure directly: the buffer is the
+    /// input's exact bytes, the `VALUE` length is the input size by value, and
+    /// no hidden character length follows.
+    #[test]
+    fn bind_c_glue_passes_the_buffer_and_its_length_by_value() {
+        let mut n = arg("N", FortranArgKind::Integer);
+        n.by_value = true;
+        let args = [arg("BUF", FortranArgKind::CharArray { len: 1 }), n];
+        let glue = bind_c_glue_source("parse_rec", &args).expect("glue");
+        assert!(
+            glue.contains("extern void parse_rec(char *, int);"),
+            "{glue}"
+        );
+        assert!(glue.contains("parse_rec(bhf_a0, bhf_a1);"), "{glue}");
+        assert!(glue.contains("malloc(Size ? Size : 1)"), "{glue}");
+        assert!(
+            glue.contains("bhf_a1 = Size > 0x7fffffff ? 0x7fffffff : (int)Size;"),
+            "{glue}"
+        );
+        assert!(!glue.contains("size_t)"), "no hidden length: {glue}");
+
+        // A length by reference is a pointer.
+        let args = [
+            arg("BUF", FortranArgKind::CharArray { len: 1 }),
+            arg("LEN", FortranArgKind::Integer),
+        ];
+        let glue = bind_c_glue_source("rd", &args).expect("glue");
+        assert!(glue.contains("extern void rd(char *, int *);"), "{glue}");
+        assert!(glue.contains("rd(bhf_a0, &bhf_a1);"), "{glue}");
+
+        // A by-value real has a C type the lane does not know.
+        let mut x = arg("X", FortranArgKind::Other);
+        x.by_value = true;
+        assert_eq!(
+            bind_c_glue_source("f", &[arg("BUF", FortranArgKind::CharArray { len: 1 }), x]),
+            None
+        );
     }
 }

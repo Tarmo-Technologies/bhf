@@ -3557,6 +3557,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 })
                 .count(),
             skipped_missing_toolchain: missing_toolchain_by_lane(&results),
+            skipped_lane_cannot_call: results
+                .iter()
+                .filter(|result| {
+                    result.candidate.lang == crate::auto::candidate::Lang::Fortran
+                        && matches!(
+                            &result.outcome,
+                            crate::auto::attempt::Outcome::UnsupportedParams { .. }
+                        )
+                })
+                .count(),
             skipped_consent_required: results
                 .iter()
                 .filter(|result| {
