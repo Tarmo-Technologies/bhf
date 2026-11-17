@@ -52,6 +52,12 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The engine trade study sees the crashes its bhf lane finds (#403). It read
+  bhf's crash input and findings from `<work>/findings/`, and bhf writes
+  them to `<work>/results/findings/` since that layout, so a study run since
+  then gave every bhf trial no native time-to-first-crash and confirmed a
+  crash only when the corpus backstop held it. The 2026-09-27 published study
+  predates the layout. The campaign surface script read the same place.
 - The Fortran lane fuzzes a `bind(C)` procedure that takes a
   `character(kind=c_char), dimension(*)` buffer (#235). It calls the
   procedure by its binding name with the C ABI: the buffer is the input's

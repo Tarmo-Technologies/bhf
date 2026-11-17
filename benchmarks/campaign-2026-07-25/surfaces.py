@@ -109,13 +109,20 @@ def harness_binary(work: Path, finding_dir: Path) -> Path | None:
     return next((c for c in candidates if c.is_file()), None)
 
 
+def findings_dir(work: Path) -> Path:
+    """Where bhf writes a run's findings: ``results/findings/``, or the
+    ``findings/`` of a release before that layout (#403)."""
+    current = work / "results" / "findings"
+    return current if current.is_dir() or not (work / "findings").is_dir() else work / "findings"
+
+
 def find_finding(work: Path) -> tuple[Path, Path] | None:
     """First finding directory with a crash input, and its harness dir."""
-    findings = work / "findings"
+    findings = findings_dir(work)
     if not findings.is_dir():
         return None
     for entry in sorted(findings.iterdir()):
-        for name in ("input", "crash", "input.bin", "testcase"):
+        for name in ("testcase.bin", "input", "crash", "input.bin", "testcase"):
             candidate = entry / name
             if candidate.is_file():
                 return entry, candidate
@@ -180,7 +187,7 @@ def main() -> int:
     # --- reporting surfaces
     s.run(
         "report all formats",
-        ["report", "--findings", str(auto_work / "findings"),
+        ["report", "--findings", str(findings_dir(auto_work)),
          "--out", str(args.work / "reports"), "--sarif", "--junit", "--csv"],
         timeout=300,
         allow_exit=(0, 1),

@@ -626,6 +626,25 @@ class DefectIdentityTests(unittest.TestCase):
 
 
 
+class BhfFindingsLayoutTests(unittest.TestCase):
+    """#403: bhf writes findings to results/findings/<id>/; the study read
+    the legacy findings/<id>/ and never saw a bhf crash."""
+
+    def test_bhf_crashes_are_read_from_either_layout(self):
+        for layout in ("results/findings", "findings"):
+            with TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                self.assertIsNone(run.bhf_crash_artifact(work))
+                finding = work / layout / "F-0000-ab"
+                finding.mkdir(parents=True)
+                (finding / "testcase.bin").write_bytes(b"crash")
+                (finding / "finding.json").write_text("{}")
+                self.assertEqual(run.bhf_crash_artifact(work), finding / "testcase.bin")
+                log = work / "run.log"
+                log.write_text("")
+                self.assertEqual(parse_bhf_fuzz(log, work)["finding_count"], 1, layout)
+
+
 def smoke_bhf() -> Path | None:
     """The bhf binary a smoke run uses: $BHF_TRADE_STUDY_BHF, else the
     release build, when it exists and clang does."""
