@@ -771,3 +771,81 @@ fn an_afl_hang_is_a_confirmed_hang_finding() {
     let text = hang.to_string();
     assert!(text.contains("spin"), "the stack names the loop: {hang:#}");
 }
+
+/// #276: `bhf fuzz --engine afl++ --workers 2` runs one `-M main` and one
+/// `-S sec1` afl-fuzz in one output directory, which sync each other's
+/// queues, and both queues are taken into the bhf corpus. It ran two bhf
+/// workers with an afl-fuzz each, in their own directories, never synced.
+/// AFL++ is required under `BHF_REQUIRE_TOOLS=1`.
+#[test]
+fn afl_workers_are_synced_main_and_secondary_instances() {
+    if !afl_present() || !which("make") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("branches.c"),
+        "#include <stddef.h>\n\
+         int branches(const unsigned char *d, size_t n) {\n\
+         \x20   int r = 0;\n\
+         \x20   if (n > 0 && d[0] == 'a') r += 1;\n\
+         \x20   if (n > 1 && d[1] == 'b') r += 2;\n\
+         \x20   if (n > 2 && d[2] == 'c') r += 4;\n\
+         \x20   return r;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let built = auto_afl(&src, &work, "2", &[]);
+    let id = afl_harness_dir(&work)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(&work)
+        .args(["--harness", &id, "--engine", "afl++", "--workers", "2"])
+        .args(["--time", "8"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{built}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert_eq!(
+        summary["afl"]["instances"],
+        serde_json::json!(["main", "sec1"]),
+        "{summary:#}"
+    );
+    let out = work.join("afl_out").join(&id).join("out");
+    for (instance, role, peer) in [("main", "-M main", "sec1"), ("sec1", "-S sec1", "main")] {
+        let stats = std::fs::read_to_string(out.join(instance).join("fuzzer_stats"))
+            .unwrap_or_else(|error| panic!("{instance}: {error}\n{stderr}"));
+        let command_line = stats_field(&stats, "command_line").unwrap();
+        assert!(command_line.contains(role), "{command_line}");
+        assert!(
+            out.join(instance).join(".synced").join(peer).exists(),
+            "{instance} synced {peer}'s queue"
+        );
+    }
+    // CmpLog runs on the main instance only.
+    assert!(
+        stats_field(
+            &std::fs::read_to_string(out.join("sec1/fuzzer_stats")).unwrap(),
+            "command_line"
+        )
+        .is_some_and(|line| !line.contains(" -c ")),
+        "{summary:#}"
+    );
+    assert!(
+        summary["corpus_persisted"].as_u64().is_some(),
+        "{summary:#}"
+    );
+    let corpus = files_in(&work.join("corpus").join(&id).join("queue"));
+    assert!(!corpus.is_empty(), "both queues are in the corpus");
+}

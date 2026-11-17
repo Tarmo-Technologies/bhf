@@ -119,7 +119,24 @@ fn kill_processes_by_exe(_exe: &Path) {}
 /// is `None` when the file or key is absent (afl-fuzz never wrote stats). The file
 /// is `key : value` lines.
 fn parse_afl_fuzzer_stats(out_dir: &Path) -> (Option<u64>, Option<f64>) {
-    let text = match fs::read_to_string(out_dir.join("default").join("fuzzer_stats")) {
+    // Every instance's, summed (#276): `default`, or `main` and `sec1`...
+    let mut total: (Option<u64>, Option<f64>) = (None, None);
+    for instance in afl_instance_dirs(out_dir) {
+        let (execs, per_sec) = parse_afl_instance_stats(&instance);
+        if let Some(execs) = execs {
+            total.0 = Some(total.0.unwrap_or(0) + execs);
+        }
+        if let Some(per_sec) = per_sec {
+            total.1 = Some(total.1.unwrap_or(0.0) + per_sec);
+        }
+    }
+    total
+}
+
+/// `execs_done` and `execs_per_sec` from one afl-fuzz instance's
+/// `fuzzer_stats`.
+fn parse_afl_instance_stats(instance: &Path) -> (Option<u64>, Option<f64>) {
+    let text = match fs::read_to_string(instance.join("fuzzer_stats")) {
         Ok(text) => text,
         Err(_) => return (None, None),
     };
@@ -1100,6 +1117,23 @@ pub(crate) struct AflRunProvenance {
     /// The CmpLog binary afl-fuzz ran with `-c` (#274), when there was one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cmplog_binary: Option<PathBuf>,
+    /// The `-M`/`-S` instances `--workers` ran (#276); absent for one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) instances: Vec<String>,
+}
+
+/// How many afl-fuzz instances a run of `engine` with `--workers` runs
+/// (#276): `--workers N` for AFL++, `auto` one per core; one otherwise.
+fn afl_worker_count(engine: FuzzEngine, workers: Option<FuzzWorkerCount>) -> usize {
+    match (engine, workers) {
+        (FuzzEngine::AflPlusPlus, Some(FuzzWorkerCount::Fixed(n))) => {
+            usize::try_from(n).unwrap_or(1).max(1)
+        }
+        (FuzzEngine::AflPlusPlus, Some(FuzzWorkerCount::Auto)) => {
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        }
+        _ => 1,
+    }
 }
 
 /// The CmpLog build beside `main_afl` that afl-fuzz runs with `-c` (#274):
@@ -1347,6 +1381,8 @@ struct PreparedFuzzRun {
     /// `-G` (maximum generated input length) for afl-fuzz. Set only by the
     /// `bhf auto` AFL++ stage, from the run's resolved `--max-len`.
     afl_max_len: Option<usize>,
+    /// afl-fuzz instances `--workers` asks for (#276): one `-M`, the rest `-S`.
+    afl_workers: usize,
     /// Explicitly-trusted extension manifest (`--extension`). When set, the
     /// builtin engine drives `oracle.evaluate` over the retained corpus after the
     /// run. `None` leaves fuzzing byte-for-byte unchanged.
@@ -1549,7 +1585,10 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     }
-    if multicore_requested(&args) {
+    // #276: AFL++ runs `--workers` as its own -M/-S instances, which sync
+    // as they run; a sanitizer matrix still runs one worker per sanitizer.
+    let afl_instances = args.engine == FuzzEngine::AflPlusPlus && args.sanitizers.len() <= 1;
+    if multicore_requested(&args) && !afl_instances {
         if let Some(error) = multicore_flag_conflict(&args) {
             bhfeprintln!("{error}");
             return 2;
@@ -3470,6 +3509,7 @@ fn prepare_with_runner(
     #[cfg(not(any(target_os = "linux", windows)))]
     let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
+    let afl_workers = afl_worker_count(args.engine, args.workers);
     Ok(PreparedFuzzRun {
         work_dir,
         harness_id: args.harness,
@@ -3517,6 +3557,7 @@ fn prepare_with_runner(
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
         afl_max_len: None,
+        afl_workers,
         extension_manifest: args.extension,
     })
 }
@@ -6352,6 +6393,96 @@ const AFL_EXEC_TIMEOUT: Duration = Duration::from_millis(1000);
 /// The instance directory a single afl-fuzz writes in its `-o` directory.
 const AFL_INSTANCE: &str = "default";
 
+/// One afl-fuzz of a run: its instance name (its directory in `-o`), its
+/// `-M`/`-S` role (none for a run of one), whether it runs CmpLog, and the
+/// file its console output goes to.
+struct AflInstance {
+    name: String,
+    role: Option<&'static str>,
+    cmplog: bool,
+    log: PathBuf,
+}
+
+/// The afl-fuzz instances of a run of `workers` (#276): `default` alone, or
+/// a `-M main` and `-S sec1`..: one shared output directory, in which each
+/// syncs the others' queues as AFL++ does. CmpLog runs on the main instance,
+/// as AFL++ advises for one or two of a campaign's instances.
+fn afl_instances(workers: usize, afl_out: &Path) -> Vec<AflInstance> {
+    if workers <= 1 {
+        return vec![AflInstance {
+            name: AFL_INSTANCE.to_owned(),
+            role: None,
+            cmplog: true,
+            log: afl_out.join("afl-fuzz.log"),
+        }];
+    }
+    (0..workers)
+        .map(|index| {
+            let name = if index == 0 {
+                "main".to_owned()
+            } else {
+                format!("sec{index}")
+            };
+            AflInstance {
+                log: afl_out.join(format!("afl-fuzz-{name}.log")),
+                role: Some(if index == 0 { "-M" } else { "-S" }),
+                cmplog: index == 0,
+                name,
+            }
+        })
+        .collect()
+}
+
+/// The minutes between the syncs of a `-M`/`-S` campaign of `budget`:
+/// a quarter of it, from 1 to AFL++'s default of 30.
+fn afl_sync_minutes(budget: Duration) -> u64 {
+    (budget.as_secs() / 60 / 4).clamp(1, 30)
+}
+
+/// Why an afl-fuzz exited with `status`, from the tail of its log; empty when
+/// every seed aborts the harness, which skips the lane for the target.
+fn afl_failure(status: &std::process::ExitStatus, log: &Path) -> String {
+    // afl-fuzz's console output was redirected to a file (not an undrained
+    // pipe), so read it back for the diagnostic hints.
+    let afl_log_bytes =
+        read_bounded_file_head_tail(log, max_captured_stderr_bytes()).unwrap_or_default();
+    let buf = String::from_utf8_lossy(&afl_log_bytes);
+    // Strip ANSI sequences so the error is readable on dumb stderr.
+    let cleaned: String = buf
+        .chars()
+        .filter(|ch| {
+            let c = *ch as u32;
+            ch.is_ascii_graphic() || ch.is_ascii_whitespace() || c >= 0x80
+        })
+        .collect();
+    if cleaned.contains("at least one valid input seed that does not crash") {
+        return String::new();
+    }
+    let mut hint = String::new();
+    if cleaned.contains("core_pattern") {
+        hint.push_str(
+            "\nHint: AFL detected a host `core_pattern` that would swallow \
+             crashes. Run `sudo sysctl kernel.core_pattern=core` or set \
+             AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 (bhf already sets \
+             this; check the harness env).",
+        );
+    }
+    format!(
+        "afl-fuzz exited non-zero ({:?}). Output tail:\n{}{}",
+        status.code(),
+        cleaned
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        hint
+    )
+}
+
 /// Whether `instance` holds a session afl-fuzz can resume: a queue.
 fn afl_session_exists(instance: &Path) -> bool {
     !afl_entries(&instance.join("queue")).is_empty()
@@ -6653,9 +6784,6 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     let out_dir = afl_out.join("out");
     fs::create_dir_all(&out_dir)
         .map_err(|error| format!("create AFL out dir '{}': {error}", out_dir.display()))?;
-    // afl-fuzz's console output goes here instead of an undrained pipe (see the
-    // stdout/stderr redirect below — a piped, undrained child deadlocks).
-    let afl_log = afl_out.join("afl-fuzz.log");
     let mut seed_count = 0_usize;
     for (idx, seed) in prepared.seeds.iter().enumerate() {
         if seed.is_empty() {
@@ -6673,7 +6801,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
     // A resumed session reads its queue, not `-i`: the seeds it does not hold
     // yet (a builtin pass's corpus, new operator seeds) join that queue.
-    let mut resuming = afl_session_exists(&out_dir.join(AFL_INSTANCE));
+    // #276: `--workers N` is one `-M` instance and N-1 `-S` instances in the
+    // one output directory, which sync their queues as they run.
+    let instances = afl_instances(prepared.afl_workers, &afl_out);
+    let first_instance = out_dir.join(&instances[0].name);
+    let mut resuming = afl_session_exists(&first_instance);
     let offered_path = afl_out.join(AFL_OFFERED_SEEDS);
     let mut offered = if resuming {
         read_offered_seeds(&offered_path)
@@ -6681,11 +6813,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         HashSet::new()
     };
     if resuming {
-        add_resume_seeds(
-            &out_dir.join(AFL_INSTANCE).join("queue"),
-            &prepared.seeds,
-            &mut offered,
-        )?;
+        // The main instance shares them with the others.
+        add_resume_seeds(&first_instance.join("queue"), &prepared.seeds, &mut offered)?;
     } else {
         offered.extend(prepared.seeds.iter().map(|seed| afl_seed_hash(seed)));
     }
@@ -6698,9 +6827,12 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     });
 
     let start = Instant::now();
-    let build_afl_command = || -> Result<Command, String> {
-        let afl_log_file = std::fs::File::create(&afl_log)
-            .map_err(|error| format!("create afl log '{}': {error}", afl_log.display()))?;
+    let build_afl_command = |instance: &AflInstance| -> Result<Command, String> {
+        // afl-fuzz's console output goes to a file instead of an undrained
+        // pipe (see the stdout/stderr redirect below — a piped, undrained
+        // child deadlocks).
+        let afl_log_file = std::fs::File::create(&instance.log)
+            .map_err(|error| format!("create afl log '{}': {error}", instance.log.display()))?;
         // AFL stops at the first of -V or -E; pass only the time budget so the
         // caller's `--time` (or our iterations-derived default) actually applies.
         let mut afl_cmd = Command::new(&afl_fuzz);
@@ -6727,10 +6859,19 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         if let Some(mode_flag) = prepared.afl_mode.flag() {
             afl_cmd.arg(mode_flag);
         }
+        if let Some(role) = instance.role {
+            afl_cmd.arg(role).arg(&instance.name);
+            // Instances sync at start and then every AFL_SYNC_TIME minutes,
+            // 30 by default: a quarter of a shorter budget, at least one,
+            // unless the caller set it.
+            if std::env::var_os("AFL_SYNC_TIME").is_none() {
+                afl_cmd.env("AFL_SYNC_TIME", afl_sync_minutes(time_budget).to_string());
+            }
+        }
         // #274: AFL++'s input-to-state stage over the CmpLog build's comparison
         // operands, with arithmetic and transform solving (`-l 2AT`), as AFL++
         // recommends for a CmpLog binary.
-        if let Some(cmplog) = &cmplog_binary {
+        if let Some(cmplog) = cmplog_binary.as_ref().filter(|_| instance.cmplog) {
             afl_cmd.arg("-c").arg(cmplog).arg("-l").arg("2AT");
         }
         if let Some(dictionary) = &generated_dictionary {
@@ -6853,40 +6994,61 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         }
         Ok(afl_cmd)
     };
-    let (status, hard_deadline) = loop {
-        let mut afl_cmd = build_afl_command()?;
-        let mut child = afl_cmd
-            .spawn()
-            .map_err(|error| format!("spawn afl-fuzz '{}': {error}", afl_fuzz.display()))?;
+    let (statuses, hard_deadline) = loop {
+        let mut children = Vec::with_capacity(instances.len());
+        for instance in &instances {
+            let mut afl_cmd = build_afl_command(instance)?;
+            match afl_cmd.spawn() {
+                Ok(child) => children.push(child),
+                Err(error) => {
+                    for child in &mut children {
+                        kill_process_group(child);
+                        let _ = child.wait();
+                    }
+                    return Err(format!("spawn afl-fuzz '{}': {error}", afl_fuzz.display()));
+                }
+            }
+        }
         // afl-fuzz is supposed to self-terminate at its `-V` budget, but a
         // fork-server / persistent-mode handshake wedge can leave its internal
         // `run_time` stuck at 0 so the `-V` check never fires and afl-fuzz hangs
         // forever (observed: 20 execs, 69 min wall). A bare `child.wait()` would then
         // block `auto` indefinitely, blowing past `--per-target-time`. Bound the wait
         // with a hard wall-clock deadline (generous margin over the budget) and kill
-        // the process group if exceeded; any crashes found before the wedge are still
-        // harvested from `out/default/crashes` below.
+        // the process groups if exceeded; any crashes found before the wedge are
+        // still harvested from each instance's `crashes/` below.
         let hard_deadline =
             Instant::now() + time_budget.saturating_mul(2) + Duration::from_secs(30);
         let mut timed_out = false;
-        let status = loop {
-            match child
-                .try_wait()
-                .map_err(|error| format!("wait afl-fuzz: {error}"))?
-            {
-                Some(status) => break status,
-                None => {
-                    if Instant::now() >= hard_deadline {
-                        timed_out = true;
-                        kill_process_group(&mut child);
-                        break child
-                            .wait()
-                            .map_err(|error| format!("reap timed-out afl-fuzz: {error}"))?;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
+        let mut statuses: Vec<Option<std::process::ExitStatus>> = vec![None; children.len()];
+        while statuses.iter().any(Option::is_none) {
+            for (child, status) in children.iter_mut().zip(statuses.iter_mut()) {
+                if status.is_none() {
+                    *status = child
+                        .try_wait()
+                        .map_err(|error| format!("wait afl-fuzz: {error}"))?;
                 }
             }
-        };
+            if statuses.iter().all(Option::is_some) {
+                break;
+            }
+            if Instant::now() >= hard_deadline {
+                timed_out = true;
+                for (child, status) in children.iter_mut().zip(statuses.iter_mut()) {
+                    if status.is_none() {
+                        kill_process_group(child);
+                        *status = Some(
+                            child
+                                .wait()
+                                .map_err(|error| format!("reap timed-out afl-fuzz: {error}"))?,
+                        );
+                    }
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let statuses: Vec<std::process::ExitStatus> = statuses.into_iter().flatten().collect();
         if timed_out {
             // Reap any persistent-mode worker that setsid()'d out of the killed group.
             kill_processes_by_exe(&main_afl);
@@ -6898,7 +7060,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         }
         // #275: a session afl-fuzz cannot resume is started over, once, after
         // its queue is taken into bhf's corpus.
-        if resuming && !timed_out && status.code().is_some_and(|code| code != 0) {
+        let failed_resume = statuses
+            .iter()
+            .zip(&instances)
+            .find(|(status, _)| status.code().is_some_and(|code| code != 0));
+        if let (true, false, Some((_, instance))) = (resuming, timed_out, failed_resume) {
             import_afl_queues(
                 &prepared.work_dir,
                 &prepared.harness_id,
@@ -6909,7 +7075,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                 "bhf: afl-fuzz could not resume the session in {} (see {}); starting it over, \
              with its queue kept in bhf's corpus",
                 out_dir.display(),
-                afl_log.display()
+                instance.log.display()
             );
             fs::remove_dir_all(&out_dir)
                 .and_then(|()| fs::create_dir_all(&out_dir))
@@ -6917,69 +7083,62 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             resuming = false;
             continue;
         }
-        break (status, hard_deadline);
+        break (statuses, hard_deadline);
     };
     // AFL terminates itself with a signal when the -V time budget expires (or when
     // we hard-kill a hung run above), surfacing as status.code() == None. Treat
     // that as success - it's the *intended* end of a time-bounded run. Real
     // failures show up as a positive exit code.
-    let exited_by_signal = status.code().is_none();
-    if !status.success() && !exited_by_signal {
-        // afl-fuzz's console output was redirected to a file (not an undrained
-        // pipe), so read it back for the diagnostic hints.
-        let afl_log_bytes =
-            read_bounded_file_head_tail(&afl_log, max_captured_stderr_bytes()).unwrap_or_default();
-        let buf = String::from_utf8_lossy(&afl_log_bytes);
-        // Strip ANSI sequences so the error is readable on dumb stderr.
-        let cleaned: String = buf
-            .chars()
-            .filter(|ch| {
-                let c = *ch as u32;
-                ch.is_ascii_graphic() || ch.is_ascii_whitespace() || c >= 0x80
-            })
-            .collect();
-        if cleaned.contains("at least one valid input seed that does not crash") {
-            // GRACEFUL SKIP, not an error: every seed aborts the harness, so
-            // afl-fuzz can't start. This is a property of the TARGET (a pervasive
-            // sanitizer finding that fires on every input — e.g. a UBSan
-            // member-access on tinyexpr's over-allocated nodes), not a bhf
-            // failure. afl-fuzz already skips individual crashing seeds; it only
-            // aborts when ALL crash. Returning an Err here would emit a scary
-            // warning and lose the target; instead fall through to an empty
-            // summary. The builtin engine surfaces such crashes directly, so
-            // `--engine builtin,afl++` still reports them.
+    let failures: Vec<(String, &AflInstance)> = statuses
+        .iter()
+        .zip(&instances)
+        .filter(|(status, _)| !status.success() && status.code().is_some())
+        .map(|(status, instance)| (afl_failure(status, &instance.log), instance))
+        .collect();
+    let every_seed_aborts = |message: &String| message.is_empty();
+    if failures.len() == instances.len()
+        && !failures
+            .iter()
+            .all(|(message, _)| every_seed_aborts(message))
+    {
+        let (message, _) = failures
+            .iter()
+            .find(|(message, _)| !every_seed_aborts(message))
+            .expect("a failure that is not every seed aborting");
+        return Err(message.clone());
+    }
+    if failures
+        .iter()
+        .any(|(message, _)| every_seed_aborts(message))
+    {
+        // GRACEFUL SKIP, not an error: every seed aborts the harness, so
+        // afl-fuzz can't start. This is a property of the TARGET (a pervasive
+        // sanitizer finding that fires on every input — e.g. a UBSan
+        // member-access on tinyexpr's over-allocated nodes), not a bhf
+        // failure. afl-fuzz already skips individual crashing seeds; it only
+        // aborts when ALL crash. Returning an Err here would emit a scary
+        // warning and lose the target; instead fall through to an empty
+        // summary. The builtin engine surfaces such crashes directly, so
+        // `--engine builtin,afl++` still reports them.
+        bhfeprintln!(
+            "bhf: afl-fuzz could not start for {} — every seed aborts the \
+             harness (a pervasive sanitizer finding that fires on all inputs); \
+             skipping AFL for this target. Use `--engine builtin,afl++` so the \
+             builtin engine surfaces the crash.",
+            prepared.harness_id
+        );
+    }
+    // Some instances ran: the others are reported, and what the ones that
+    // ran found is harvested.
+    if failures.len() < instances.len() {
+        for (message, instance) in failures
+            .iter()
+            .filter(|(message, _)| !every_seed_aborts(message))
+        {
             bhfeprintln!(
-                "bhf: afl-fuzz could not start for {} — every seed aborts the \
-                 harness (a pervasive sanitizer finding that fires on all inputs); \
-                 skipping AFL for this target. Use `--engine builtin,afl++` so the \
-                 builtin engine surfaces the crash.",
-                prepared.harness_id
+                "bhf: warning: afl-fuzz instance {} failed, and the others ran: {message}",
+                instance.name
             );
-            // fall through: the empty crashes dir yields a 0-finding summary below.
-        } else {
-            let mut hint = String::new();
-            if cleaned.contains("core_pattern") {
-                hint.push_str(
-                    "\nHint: AFL detected a host `core_pattern` that would swallow \
-                     crashes. Run `sudo sysctl kernel.core_pattern=core` or set \
-                     AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 (bhf already sets \
-                     this; check the harness env).",
-                );
-            }
-            return Err(format!(
-                "afl-fuzz exited non-zero ({:?}). Output tail:\n{}{}",
-                status.code(),
-                cleaned
-                    .lines()
-                    .rev()
-                    .take(10)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                hint
-            ));
         }
     }
     let elapsed = start.elapsed();
@@ -7202,6 +7361,14 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             afl_path: prepared.afl_path.clone(),
             inst_ranges: prepared.afl_inst_ranges.clone(),
             cmplog_binary,
+            instances: if instances.len() > 1 {
+                instances
+                    .iter()
+                    .map(|instance| instance.name.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }),
         winafl: None,
         // The extension `oracle.evaluate` pass is a builtin-engine feature
@@ -12395,6 +12562,55 @@ mod engine_list_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// #276: `--workers N` is one `-M main` running CmpLog and N-1 `-S`
+    /// instances, each logging to its own file; one worker is `default`, with
+    /// no role. Only the AFL++ engine takes the count, and its instances sync
+    /// every quarter of the budget, between 1 and 30 minutes.
+    #[test]
+    fn afl_workers_are_one_main_and_secondary_instances() {
+        use super::{afl_instances, afl_sync_minutes, afl_worker_count, FuzzWorkerCount};
+        let dir = Path::new("/w/afl_out/H");
+        let one = afl_instances(1, dir);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "default");
+        assert_eq!(one[0].role, None);
+        assert!(one[0].cmplog);
+        assert_eq!(one[0].log, dir.join("afl-fuzz.log"));
+        let three = afl_instances(3, dir);
+        let plan: Vec<(&str, Option<&str>, bool)> = three
+            .iter()
+            .map(|instance| (instance.name.as_str(), instance.role, instance.cmplog))
+            .collect();
+        assert_eq!(
+            plan,
+            [
+                ("main", Some("-M"), true),
+                ("sec1", Some("-S"), false),
+                ("sec2", Some("-S"), false)
+            ]
+        );
+        assert_eq!(three[2].log, dir.join("afl-fuzz-sec2.log"));
+        assert_eq!(
+            afl_worker_count(FuzzEngine::AflPlusPlus, Some(FuzzWorkerCount::Fixed(4))),
+            4
+        );
+        assert_eq!(afl_worker_count(FuzzEngine::AflPlusPlus, None), 1);
+        assert_eq!(
+            afl_worker_count(FuzzEngine::Builtin, Some(FuzzWorkerCount::Fixed(4))),
+            1
+        );
+        assert!(afl_worker_count(FuzzEngine::AflPlusPlus, Some(FuzzWorkerCount::Auto)) >= 1);
+        assert_eq!(afl_sync_minutes(std::time::Duration::from_secs(60)), 1);
+        assert_eq!(
+            afl_sync_minutes(std::time::Duration::from_secs(40 * 60)),
+            10
+        );
+        assert_eq!(
+            afl_sync_minutes(std::time::Duration::from_secs(24 * 3600)),
+            30
+        );
+    }
+
     /// #275: the crashes and hangs of every instance are harvested with the
     /// `<kind>.<date>/` a resumed session moved the last one's to, and those
     /// backups are removed after; AFL++'s README is not an input.
@@ -12498,19 +12714,32 @@ mod engine_list_tests {
     #[test]
     fn parse_afl_fuzzer_stats_reads_execs() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("default");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("fuzzer_stats"),
-            "start_time        : 1000\n\
-             execs_done        : 443314\n\
-             execs_per_sec     : 73873.50\n\
-             cycles_done       : 2\n",
-        )
-        .unwrap();
+        let instance = |name: &str, execs: u64, per_sec: f64| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(dir.join("queue")).unwrap();
+            std::fs::write(
+                dir.join("fuzzer_stats"),
+                format!(
+                    "start_time        : 1000\n\
+                     execs_done        : {execs}\n\
+                     execs_per_sec     : {per_sec:.2}\n\
+                     cycles_done       : 2\n"
+                ),
+            )
+            .unwrap();
+        };
+        instance("default", 443314, 73873.50);
         let (execs, per_sec) = super::parse_afl_fuzzer_stats(tmp.path());
         assert_eq!(execs, Some(443314));
         assert_eq!(per_sec, Some(73873.50));
+        // #276: a -M/-S campaign's instances add up.
+        std::fs::remove_dir_all(tmp.path().join("default")).unwrap();
+        instance("main", 1000, 10.0);
+        instance("sec1", 500, 5.5);
+        assert_eq!(
+            super::parse_afl_fuzzer_stats(tmp.path()),
+            (Some(1500), Some(15.5))
+        );
         // Missing file -> (None, None), never a panic.
         let missing = tempfile::tempdir().unwrap();
         assert_eq!(super::parse_afl_fuzzer_stats(missing.path()), (None, None));

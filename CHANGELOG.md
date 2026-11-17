@@ -2786,6 +2786,13 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --engine afl++ --workers N` runs AFL++'s own parallel mode
+  (#276): a `-M main` instance, which runs CmpLog, and N-1 `-S` instances in
+  one output directory. They sync each other's queues at start and every
+  quarter of `--time` (1 to 30 minutes, unless `AFL_SYNC_TIME` is set). All
+  their crashes, hangs and queues are harvested, the summary's
+  `afl.instances` names them, and the stats add up. It ran N bhf workers
+  with an afl-fuzz each, in their own directories, that never synced.
 - The AFL++ lane keeps its session (#275). `afl_out/<harness>/out` is kept
   between runs, `bhf auto` runs included, and afl-fuzz resumes it
   (`AFL_AUTORESUME`). Seeds the session was not given before join its queue
