@@ -697,7 +697,10 @@ mod one_core {
             );
         }
 
-        let second = loaded_pass(&[], "15s");
+        // Each re-run sleeps 1.5 s before it runs on the loaded core: give
+        // the pass the time to finish those it submits first, however many a
+        // slower machine left.
+        let second = loaded_pass(&[], &format!("{}s", 15.max(4 * unchecked)));
         assert_eq!(second.exit, Some(0), "{}", second.stderr);
         assert!(
             second.summary["fresh_reruns"]["submitted"].as_u64() >= Some(unchecked),
