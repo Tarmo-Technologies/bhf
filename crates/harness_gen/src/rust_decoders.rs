@@ -570,8 +570,14 @@ mod tests {
     /// RecordFlux Rust-1 targets take.
     #[test]
     fn wide_integers_and_options_of_decodable_types_decode() {
-        assert_eq!(select_rust_decoder("i128").unwrap().bounded_expr, "c.i128()");
-        assert_eq!(select_rust_decoder("u128").unwrap().bounded_expr, "c.u128()");
+        assert_eq!(
+            select_rust_decoder("i128").unwrap().bounded_expr,
+            "c.i128()"
+        );
+        assert_eq!(
+            select_rust_decoder("u128").unwrap().bounded_expr,
+            "c.u128()"
+        );
         let option = select_rust_decoder("Option<String>").unwrap();
         assert_eq!(
             option.bounded_expr,
@@ -579,7 +585,9 @@ mod tests {
         );
         assert_eq!(option.by_ref, ArgPass::Move);
         assert_eq!(
-            select_rust_decoder("Option<(u8, i128)>").unwrap().bounded_expr,
+            select_rust_decoder("Option<(u8, i128)>")
+                .unwrap()
+                .bounded_expr,
             "if c.bool() { Some((c.u8(), c.i128())) } else { None }"
         );
         // An `Option` of a type with no decoder is still refused.

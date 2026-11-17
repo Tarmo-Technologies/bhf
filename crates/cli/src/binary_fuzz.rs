@@ -357,7 +357,8 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     }
     let degraded = match engine {
         ResolvedEngine::AflQemu(aq) => {
-            let mut summary = run_afl_qemu(&args, &aq, &seeds, hints.as_ref(), &env, &findings_dir)?;
+            let mut summary =
+                run_afl_qemu(&args, &aq, &seeds, hints.as_ref(), &env, &findings_dir)?;
             summary["adapter_report"] = adapter_report;
             return Ok(summary);
         }
@@ -370,7 +371,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         None => None,
     };
     let started = Instant::now();
-    let tokens = hints.as_ref().map(|hints| hints.tokens.as_slice()).unwrap_or_default();
+    let tokens = hints
+        .as_ref()
+        .map(|hints| hints.tokens.as_slice())
+        .unwrap_or_default();
     let mut havoc = BlindHavoc::new(&seeds, args.rng_seed, tokens);
 
     let tmp_dir = args.work_dir.join("binary_fuzz/tmp");
@@ -1156,7 +1160,10 @@ fn run_afl_qemu(
             crate::binary_adapter::hints::afl_dictionary(&hints.tokens),
         )
         .with_context(|| format!("write {}", dictionary.display()))?;
-        let at = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        let at = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(argv.len());
         argv.splice(at..at, ["-x".to_owned(), dictionary.display().to_string()]);
     }
     let afl_trace_dir = aq
