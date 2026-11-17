@@ -70,6 +70,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The continuous scheduler's stop and its webhook are bounded (#272).
+  Dropping a `Scheduler` waits for its workers for the shutdown timeout
+  plus 1 s, then 1 s more for the results refresh. A thread still running
+  after that finishes in the background, holding the data directory's lock
+  until it has. The webhook resolves its host within its 10 s deadline
+  (`continuous_daemon::resolve_with_timeout`). Shutdown joined every thread
+  with no deadline, and name resolution had none.
 - `bhf auto`'s minimize pass minimizes Ada findings (#281), on their
   event-log signature as `bhf minimize` does, within the group's 30 s, so
   an Ada finding has a `min_testcase.bin`. The pass skipped them.

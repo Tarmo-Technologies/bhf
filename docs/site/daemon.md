@@ -146,8 +146,15 @@ scheduler. The library API is `continuous_daemon::Scheduler` (`submit`,
 `list_jobs`, `cancel`). When the library's `webhook_url` is configured, the
 scheduler POSTs a notification to it once a job reaches a terminal state
 (`complete`, `failed` or `cancelled`). That is HTTP only in v0.1: front an
-`https://` endpoint with a TLS-terminating proxy. `bhf-daemon` sets no
-webhook.
+`https://` endpoint with a TLS-terminating proxy. The post, resolving its host
+included, has a 10 s deadline. `bhf-daemon` sets no webhook.
+
+Stopping the scheduler is bounded too. Each worker kills and reaps its job
+within the shutdown timeout (2 s), and the job is queued again. The scheduler
+waits for its workers that long plus 1 s, then 1 s more for the results
+refresh. A thread still running after that, such as a webhook post or a long
+results rebuild, finishes in the background. Until it has, the data
+directory stays locked, so no other scheduler starts on it.
 
 ### Results refresh
 

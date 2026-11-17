@@ -33,6 +33,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long past the child shutdown timeout dropping a [`Scheduler`] waits
+/// for its threads (#272): a worker stops its job within the shutdown
+/// timeout, and one still busy past this (posting a webhook, say) finishes
+/// in the background.
+const SHUTDOWN_SLACK: Duration = Duration::from_secs(1);
 const DEFAULT_JOB_WALL_GRACE: Duration = Duration::from_secs(30);
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_WORKERS: u32 = 64;
@@ -149,8 +154,10 @@ pub struct Scheduler {
     data_dir: PathBuf,
     job_wall_grace: Duration,
     limits: SchedulerLimits,
-    // Retained until Drop has joined every worker. The pathname is never removed.
-    _storage_lease: storage_lock::StorageLease,
+    shutdown_timeout: Duration,
+    // Retained until every worker has stopped (by Drop, or by the thread a
+    // Drop past its deadline leaves them to). The pathname is never removed.
+    storage_lease: Option<storage_lock::StorageLease>,
 }
 
 struct SharedState {
@@ -360,7 +367,8 @@ impl Scheduler {
             data_dir: config.data_dir.clone(),
             job_wall_grace,
             limits,
-            _storage_lease: storage_lease,
+            shutdown_timeout,
+            storage_lease: Some(storage_lease),
         })
     }
 
@@ -516,15 +524,73 @@ fn reserved_job_bytes(job: &FuzzJob) -> Result<usize, DaemonError> {
 }
 
 impl Drop for Scheduler {
+    /// Stop the workers, then the results refresh (which records what they
+    /// ran), waiting for each until a deadline (#272): the workers the
+    /// shutdown timeout they kill and reap their jobs within plus
+    /// [`SHUTDOWN_SLACK`], the refresh [`SHUTDOWN_SLACK`] more. A thread still
+    /// running then (a webhook post, a long results rebuild) is left to a
+    /// background thread that joins it, and that thread holds the data dir's
+    /// lock until it has, so no other scheduler takes the data dir while it
+    /// may still write.
     fn drop(&mut self) {
         self.request_shutdown();
+        let deadline = Instant::now() + self.shutdown_timeout + SHUTDOWN_SLACK;
+        let mut running: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
         for handle in self.workers.drain(..) {
-            let _ = handle.join();
+            if join_by(&handle, deadline) {
+                let _ = handle.join();
+            } else {
+                running.push(("worker", handle));
+            }
         }
         if let Some(refresher) = self.refresher.take() {
-            stop_refresher(&self.refresh, refresher);
+            self.refresh.request_shutdown();
+            if join_by(&refresher, Instant::now().max(deadline) + SHUTDOWN_SLACK) {
+                stop_refresher(&self.refresh, refresher);
+            } else {
+                running.push(("results refresh", refresher));
+            }
+        }
+        if running.is_empty() {
+            return;
+        }
+        eprintln!(
+            "scheduler shutdown: {} thread(s) still running after {:?} ({}); they finish in \
+             the background, holding {}",
+            running.len(),
+            self.shutdown_timeout + SHUTDOWN_SLACK * 2,
+            running
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.data_dir.display()
+        );
+        let lease = self.storage_lease.take();
+        let reaper = std::thread::Builder::new()
+            .name("bhf-scheduler-reaper".to_owned())
+            .spawn(move || {
+                for (_, handle) in running {
+                    let _ = handle.join();
+                }
+                drop(lease);
+            });
+        if let Err(error) = reaper {
+            eprintln!("scheduler shutdown: could not leave the threads to finish: {error}");
         }
     }
+}
+
+/// Wait until `handle`'s thread has finished or `deadline` passes; whether it
+/// finished.
+fn join_by(handle: &JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
 }
 
 /// Stop the refresh thread once every worker has stopped; it records what
@@ -853,15 +919,58 @@ fn reap_after_kill(child: &mut Child, timeout: Duration) {
 /// — the v0.1 audience is on-prem (likely plain HTTP webhook to a
 /// chatops bot or local notification proxy).
 ///
-/// Socket work has a 10-second overall deadline and a 64 KiB response cap.
-/// Synchronous DNS resolution happens before this deadline and remains an
-/// unbounded platform operation for hostnames.
+/// The webhook post, name resolution included, has a 10-second overall
+/// deadline (#272) and a 64 KiB response cap.
 pub fn post_webhook(url: &str, payload: &str) -> Result<(), DaemonError> {
     post_webhook_with_timeout(url, payload, Duration::from_secs(10))
 }
 
-/// As [`post_webhook`] but with a caller-supplied overall socket deadline.
-/// DNS resolution for a hostname is not covered by this deadline.
+/// Resolve `host:port` within `timeout` (#272). The platform resolver
+/// blocks for as long as it takes, so it runs on a thread of its own: past
+/// the deadline the caller gets a `TimedOut` error, and the thread ends when
+/// the resolver returns.
+pub fn resolve_with_timeout(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    resolve_with(host, port, timeout, |host, port| {
+        use std::net::ToSocketAddrs;
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+}
+
+/// [`resolve_with_timeout`] with the resolver given.
+fn resolve_with(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    resolve: impl FnOnce(String, u16) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    // A literal address needs no resolver.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = host.to_owned();
+    std::thread::Builder::new()
+        .name("bhf-webhook-resolve".to_owned())
+        .spawn(move || {
+            let _ = sender.send(resolve(owned, port));
+        })?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("resolving {host} took longer than {timeout:?}"),
+        )),
+    }
+}
+
+/// As [`post_webhook`] but with a caller-supplied overall deadline, which
+/// covers resolving the host too.
 pub fn post_webhook_with_timeout(
     url: &str,
     payload: &str,
@@ -880,20 +989,17 @@ pub fn post_webhook_with_timeout(
         )));
     }
     use std::io::{Read, Write};
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = (parsed.host.as_str(), parsed.port)
-        .to_socket_addrs()?
-        .collect();
-    let addr = addrs.first().ok_or_else(|| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("could not resolve {}:{}", parsed.host, parsed.port),
-        ))
-    })?;
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "webhook deadline overflows",
+        ))
+    })?;
+    let addrs = resolve_with_timeout(&parsed.host, parsed.port, timeout)?;
+    let addr = addrs.first().ok_or_else(|| {
+        DaemonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not resolve {}:{}", parsed.host, parsed.port),
         ))
     })?;
     let mut stream = std::net::TcpStream::connect_timeout(addr, remaining_webhook_time(deadline)?)?;
@@ -1761,6 +1867,109 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// #272: a host the resolver takes too long on is an error at the
+    /// deadline, not a wait as long as the resolver's; a literal address
+    /// needs no resolver.
+    #[test]
+    fn unresolvable_target_host_times_out_within_bound() {
+        let started = Instant::now();
+        let error = resolve_with("never.invalid", 80, Duration::from_millis(200), |_, _| {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let literal = resolve_with("127.0.0.1", 9, Duration::ZERO, |_, _| {
+            unreachable!("a literal address is not resolved")
+        })
+        .unwrap();
+        assert_eq!(literal, ["127.0.0.1:9".parse().unwrap()]);
+        // The webhook's own deadline covers resolving its host.
+        let started = Instant::now();
+        let _ = post_webhook_with_timeout(
+            "http://bhf-unresolvable.invalid:9/hook",
+            "{}",
+            Duration::from_millis(300),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #272: dropping the scheduler returns within its shutdown deadline
+    /// while one worker runs a job and another is posting a webhook to a
+    /// server that never answers (10 s of socket deadline). The running job
+    /// is stopped and requeued, and the data dir stays locked until the
+    /// webhook worker is done.
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_shutdown_returns_within_deadline_with_running_jobs() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir_guard, dir) = tempdir("shutdown-deadline");
+        // Accepts and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let script = dir.join("fake-bhf.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh
+[ \"$4\" = fast ] && exit 0
+sleep 30
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = ok_config(dir.clone(), script);
+        config.webhook_url = Some(format!("http://127.0.0.1:{port}/hook"));
+        let shutdown_timeout = Duration::from_millis(500);
+        let scheduler = Scheduler::start_with_shutdown_timeout(&config, shutdown_timeout).unwrap();
+        let fast = scheduler
+            .submit(dir.clone(), "fast".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &fast, JobState::Complete);
+        let slow = scheduler
+            .submit(dir.clone(), "slow".to_owned(), Duration::from_secs(60))
+            .unwrap();
+        wait_for_state(&scheduler, &slow, JobState::Running);
+        // The fast job's worker is in its webhook post by now.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        drop(scheduler);
+        let took = started.elapsed();
+        assert!(
+            took < shutdown_timeout + SHUTDOWN_SLACK * 2 + Duration::from_millis(700),
+            "shutdown took {took:?}"
+        );
+        let jobs: Vec<FuzzJob> = std::fs::read_to_string(dir.join("jobs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let slow_job = jobs.iter().find(|job| job.job_id == slow).unwrap();
+        assert_eq!(slow_job.state, JobState::Queued, "{jobs:?}");
+        assert!(
+            matches!(
+                Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))),
+                Err(DaemonError::DataDirInUse(_))
+            ),
+            "the webhook worker still holds the data dir"
+        );
     }
 
     #[cfg(target_os = "linux")]
