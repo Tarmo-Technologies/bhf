@@ -213,9 +213,9 @@ impl Dialect {
     pub fn fuzz_support(self) -> FuzzSupport {
         match self {
             // Discovered + statically analyzed, not fuzzed end-to-end. K&R C
-            // fuzzes through the prototype its declaration block gives (#283).
-            Dialect::Ada83 // Phase 4: parses + builds -gnat83 but report-only for now
-            | Dialect::CppPre98 // Phase 5: no modern compiler accepts cfront/ARM
+            // fuzzes through the prototype its declaration block gives (#283),
+            // Ada 83 from an Ada 2012 harness (#284).
+            Dialect::CppPre98 // Phase 5: no modern compiler accepts cfront/ARM
             | Dialect::Python2 => FuzzSupport::ReportOnly, // Phase 2: needs python2
             // Perl 4 fuzzes via the Perl 5 lane (Perl 5 is backward-compatible and
             // runs most Perl 4 — M22 Phase 5 design), so it is Fuzzable, not
@@ -869,10 +869,11 @@ mod tests {
 
     #[test]
     fn legacy_dialects_are_report_only_modern_are_fuzzable() {
-        for d in [Dialect::Ada83, Dialect::CppPre98, Dialect::Python2] {
+        for d in [Dialect::CppPre98, Dialect::Python2] {
             assert_eq!(d.fuzz_support(), FuzzSupport::ReportOnly, "{d:?}");
         }
         for d in [
+            Dialect::Ada83,
             Dialect::CKAndR,
             Dialect::Ada95,
             Dialect::C89,

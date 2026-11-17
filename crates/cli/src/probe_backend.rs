@@ -80,6 +80,13 @@ pub(crate) fn materialize_runtime_sources(
         "adafuzz-decode.adb",
         "adafuzz-decode.adb",
     )?;
+    // The probe under a library-level name, for Ada 83 units (#284).
+    copy_runtime_file(
+        &runtime_source_dir,
+        destination,
+        "adafuzz_probe83.ads",
+        "adafuzz_probe83.ads",
+    )?;
     // The trace-pc edge-coverage callback (#412). Built by the runtime gpr at
     // `-g` (uninstrumented) and linked into the static archive; the instrumented
     // Ada + binder objects pull it in via the unresolved `__sanitizer_cov_trace_pc`.

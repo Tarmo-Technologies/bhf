@@ -2812,6 +2812,13 @@
   when bhf panics.
 
 ### Added
+- `bhf auto` fuzzes Ada 83 units from an Ada 2012 harness (#284). Ada 83 has
+  no child units, so an instrumented Ada 83 unit names the probe through the
+  runtime's library-level `AdaFuzz_Probe83`, which renames the probe's
+  subprograms, and its exception handlers are not rewritten: their probe binds
+  the occurrence, which Ada 83 cannot. The dialect was report-only, and the
+  instrumented unit's `with AdaFuzz.Probe;` did not compile under
+  `pragma Ada_83`.
 - `bhf auto` fuzzes K&R C definitions (#283). The harness declares the
   prototype the definition's parameter declarations give, with the default
   argument promotions (`char` and `short` as `int`, `float` as `double`), and

@@ -25,10 +25,12 @@ pub struct Breadcrumb {
 pub const EXTENDED_RETURN_PHASE2_LIMITATION: &str =
     "nested-statement breadcrumbs inside extended return statements are deferred";
 
+/// `probe` is the package the calls name ([`crate::instrument::probe_package`]).
 pub fn collect_breadcrumb_insertions(
     ast: &StructuralAst,
     source: &str,
     source_path: &Path,
+    probe: &str,
     rewriter: &mut SourceRewriter<'_>,
 ) -> Result<Vec<Breadcrumb>, InstrumenterError> {
     let mut statements = ast.statements.iter().collect::<Vec<_>>();
@@ -52,7 +54,7 @@ pub fn collect_breadcrumb_insertions(
         let indent = leading_indent(source, byte_offset);
         rewriter.add_insertion(Insertion {
             byte_offset,
-            text: format!("AdaFuzz.Probe.Breadcrumb ({id});\n{indent}"),
+            text: format!("{probe}.Breadcrumb ({id});\n{indent}"),
             kind: InsertionKind::BreadcrumbBefore,
         });
         breadcrumbs.push(Breadcrumb {
@@ -182,9 +184,14 @@ mod tests {
 
     fn collect(ast: &StructuralAst, source: &str) -> (Vec<Breadcrumb>, String) {
         let mut rewriter = SourceRewriter::new(source);
-        let breadcrumbs =
-            collect_breadcrumb_insertions(ast, source, Path::new("pkg.adb"), &mut rewriter)
-                .unwrap();
+        let breadcrumbs = collect_breadcrumb_insertions(
+            ast,
+            source,
+            Path::new("pkg.adb"),
+            "AdaFuzz.Probe",
+            &mut rewriter,
+        )
+        .unwrap();
         (breadcrumbs, rewriter.apply().unwrap())
     }
 

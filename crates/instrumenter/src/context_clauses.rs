@@ -5,7 +5,6 @@ use crate::rewriter::{Insertion, InsertionKind, SourceRewriter};
 use ada_parser::ast::{StructuralAst, Unit};
 use ada_parser::lexer::{Token, TokenKind};
 
-const ADAFUZZ_PROBE_WITH: &str = "AdaFuzz.Probe";
 const ADA_EXCEPTIONS_WITH: &str = "Ada.Exceptions";
 
 pub fn library_item_offset(_source: &str, tokens: &[Token]) -> Option<u32> {
@@ -24,14 +23,17 @@ pub fn library_item_offset(_source: &str, tokens: &[Token]) -> Option<u32> {
     None
 }
 
+/// `probe` is the package the instrumented calls name
+/// ([`crate::instrument::probe_package`]).
 pub fn missing_with_clauses(
     unit: &Unit,
+    probe: &str,
     needs_probe: bool,
     needs_ada_exceptions: bool,
 ) -> Vec<String> {
     let mut clauses = Vec::new();
-    if needs_probe && !has_with(unit, ADAFUZZ_PROBE_WITH) {
-        clauses.push(ADAFUZZ_PROBE_WITH.to_owned());
+    if needs_probe && !has_with(unit, probe) {
+        clauses.push(probe.to_owned());
     }
     if needs_ada_exceptions && !has_with(unit, ADA_EXCEPTIONS_WITH) {
         clauses.push(ADA_EXCEPTIONS_WITH.to_owned());
@@ -44,6 +46,7 @@ pub fn collect_context_clause_insertions(
     source: &str,
     ast: &StructuralAst,
     tokens: &[Token],
+    probe: &str,
     needs_probe: bool,
     needs_ada_exceptions: bool,
     rewriter: &mut SourceRewriter<'_>,
@@ -55,7 +58,7 @@ pub fn collect_context_clause_insertions(
     let Some(unit) = ast.units.first() else {
         return Ok(());
     };
-    let missing = missing_with_clauses(unit, needs_probe, needs_ada_exceptions);
+    let missing = missing_with_clauses(unit, probe, needs_probe, needs_ada_exceptions);
     if missing.is_empty() {
         return Ok(());
     }
@@ -192,7 +195,7 @@ mod tests {
         let unit = ast.units.first().unwrap();
 
         assert_eq!(
-            missing_with_clauses(unit, true, true),
+            missing_with_clauses(unit, "AdaFuzz.Probe", true, true),
             vec!["Ada.Exceptions".to_owned()]
         );
     }
@@ -207,6 +210,7 @@ mod tests {
             source,
             &ast,
             &tokens(source),
+            "AdaFuzz.Probe",
             true,
             false,
             &mut rewriter,

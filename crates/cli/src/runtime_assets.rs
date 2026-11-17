@@ -77,6 +77,10 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         include_bytes!("../../../ada_runtime/adafuzz_cov.c"),
     ),
     (
+        "ada_runtime/adafuzz_probe83.ads",
+        include_bytes!("../../../ada_runtime/adafuzz_probe83.ads"),
+    ),
+    (
         "c_runtime/bhf_asan.h",
         include_bytes!("../../../c_runtime/bhf_asan.h"),
     ),
