@@ -56,10 +56,39 @@ out to the `bhf` CLI for replay, minimization, and reproducer workflows.
 ## Security Modes
 
 The default editor path is local single-user mode and requires no token. Shared
-or hosted deployments must opt into workspace-scoped security:
+or hosted deployments must opt into workspace-scoped security with
+`bhf-daemon --security-config FILE`:
 
 - `workspace_shared`: one token for one workspace.
 - `multi_tenant`: one token, workspace root, and role per tenant.
+
+```json
+{
+  "mode": "multi_tenant",
+  "tenants": [
+    { "tenant": "alpha", "token_file": "alpha.token",
+      "workspace_root": "/srv/alpha", "role": "operator" },
+    { "tenant": "audit", "token_file": "audit.token",
+      "workspace_root": "/srv/alpha", "role": "viewer" }
+  ]
+}
+```
+
+Each tenant's token is read from its `token_file`, never from the config.
+Relative paths are relative to the config file. The daemon reads the config
+before it serves anything, and exits `2` with the reason when it cannot use
+it:
+- an unknown field, or no tenant;
+- more than one tenant under `workspace_shared`;
+- a workspace root that is not a directory;
+- two tenants sharing a name or a token;
+- a token shorter than 16 characters;
+- a token file its group or others can read or write (`chmod 600` it). On
+  Windows the file's ACL is not checked: keep it readable by the service
+  account only.
+
+`--security-config` applies to JSON-RPC; `--mcp` has no authentication and
+serves one local user, so the two together are refused.
 
 Secure JSON-RPC requests use a top-level `auth` object with `tenant` and
 `token`. Authorized secure responses include `bhfAudit`; denied requests use

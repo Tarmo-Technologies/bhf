@@ -2848,6 +2848,13 @@
 
   A trait-impl method that takes no input, or one on a generic type, is
   refused with its own reason instead of as an outside trait.
+- `bhf-daemon --security-config FILE` runs the JSON-RPC daemon with
+  workspace-scoped security (#273): `workspace_shared` or `multi_tenant`
+  tenants, each with a token read from its own `token_file`, a workspace
+  root and a role. A token file its group or others can read or write, a
+  short or shared token, or an unknown field stops the daemon at start with
+  exit 2 and the reason. The shipped daemon always ran single-user, so a
+  shared deployment that followed daemon.md ran with no authentication.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

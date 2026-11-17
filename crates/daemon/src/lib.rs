@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod memory_budget;
+mod security_config;
+
+pub use security_config::{load_security_config, MIN_TOKEN_CHARS};
 
 use ada_parser::ast::{AdaStandard, Span, StructuralAst, SubprogramId};
 use serde::de::DeserializeOwned;
