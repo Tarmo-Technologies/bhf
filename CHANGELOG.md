@@ -2789,6 +2789,20 @@
   `bhf replay` and `bhf minimize` start it for each drive. The lane could not
   start a service, so it had no sanitizer oracle and stopped once the service
   crashed.
+- `bhf binary adapter --adapter rizin` runs Rizin's analysis (#264):
+  `rizin -q -c 'aaa; aflj; axlj; izj'`, under `--timeout-secs` (default 900)
+  and a 128 MiB output cap. It maps the functions (with `imported` for an
+  import stub), the call edges, the xrefs and the data-section strings into
+  the report, each array capped, with `truncated` naming one that was cut.
+  The adapter only ran the tool's version probe and wrote empty arrays, and
+  the probe it ran, `rizin --version`, opens a file named `--version` in
+  Rizin's shell and waits; it is `rizin -v`. A failed analysis is `status:
+  error`, exit 1, with `timeout`, `tool_error`, `output_too_large` or
+  `bad_output`.
+- The nightly's binary-analyzers job installs Rizin 0.9.1, pinned by digest
+  (`scripts/ci/install-binary-analyzers.sh`), and runs the adapter on a
+  fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
+  addresses `nm` gives, its call edges, its magic string and a call xref.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

@@ -314,6 +314,72 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # The binary adapters against the real analyzers: the pinned Rizin that
+  # scripts/ci/install-binary-analyzers.sh installs, the download cached under
+  # the script's hash. The hash shards
+  # run binary_adapter_tools too, where it skips without BHF_BINARY_ANALYZERS
+  # (scripts/ci/allowed-skips.txt).
+  binary-analyzers:
+    name: Integration tests (bhf) (binary analyzers)
+    needs: [gate, build]
+    if: needs.gate.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache the analyzer downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/bhf-fetch
+          key: binary-analyzers-${{ hashFiles('scripts/ci/install-binary-analyzers.sh') }}
+
+      - name: Install Rizin
+        run: bash scripts/ci/install-binary-analyzers.sh "$RUNNER_TEMP/analyzers" >> "$GITHUB_ENV"
+
+      - name: Install cargo-nextest
+        run: bash scripts/ci/install-nextest.sh
+
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nightly-tests-${{ github.run_id }}
+
+      # BHF_REQUIRE_TOOLS=1 fails a test whose analyzer is missing instead of
+      # skipping it.
+      - name: Binary analyzer tests
+        env:
+          BHF_BINARY_ANALYZERS: "1"
+          BHF_REQUIRE_TOOLS: "1"
+        run: |
+          cargo nextest run --archive-file nightly-tests.tar.zst --workspace-remap . --extract-to . \
+            --no-fail-fast --profile ci -E 'binary(=binary_adapter_tools)'
+
+      - name: Fail on unexpected skip lines
+        if: ${{ always() }}
+        run: python3 scripts/ci/check-no-skips.py --allowlist scripts/ci/allowed-skips.txt target/nextest/ci/junit.xml
+
+      - name: Summarize the nextest report
+        if: ${{ always() }}
+        run: python3 scripts/ci/junit-summary.py --title "Binary analyzers" target/nextest/ci/junit.xml
+
+      - name: Retain the nextest report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-nightly-binary-analyzers-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: warn
+          retention-days: 30
+
   # The WinAFL campaigns of winafl_engine (x64, x64 under PageHeap, x86), which
   # need WinAFL and DynamoRIO: the pinned pair (docs/site/windows.md) built by
   # scripts/ci/build-winafl.ps1, x64 and x86, and cached under its versions
@@ -377,8 +443,8 @@ jobs:
   # cancelled by a newer one reports nothing.
   report-failure:
     name: Report a failed nightly
-    needs: [gate, build, integration, winafl]
-    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.build.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled' || needs.winafl.result == 'failure' || needs.winafl.result == 'cancelled') }}
+    needs: [gate, build, integration, binary-analyzers, winafl]
+    if: ${{ !cancelled() && (needs.gate.result == 'failure' || needs.build.result == 'failure' || needs.integration.result == 'failure' || needs.integration.result == 'cancelled' || needs.binary-analyzers.result == 'failure' || needs.binary-analyzers.result == 'cancelled' || needs.winafl.result == 'failure' || needs.winafl.result == 'cancelled') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

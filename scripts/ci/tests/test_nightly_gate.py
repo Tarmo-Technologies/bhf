@@ -174,7 +174,7 @@ class NightlyWorkflowTests(unittest.TestCase):
     def test_only_the_failure_report_can_write_issues(self):
         self.assertEqual(self.source.count("issues: write"), 1)
         self.assertIn("    permissions:\n      contents: read\n      issues: write\n", self.report)
-        self.assertIn("    needs: [gate, build, integration, winafl]\n", self.report)
+        self.assertIn("    needs: [gate, build, integration, binary-analyzers, winafl]\n", self.report)
         condition = re.search(r"(?m)^    if: (.+)$", self.report)[1]
         # Runs after a failed or timed-out shard, or a failed archive build,
         # not after the whole run was cancelled by a newer one, nor after a
@@ -186,6 +186,8 @@ class NightlyWorkflowTests(unittest.TestCase):
         self.assertIn("needs.gate.result == 'failure'", condition)
         self.assertIn("needs.winafl.result == 'failure'", condition)
         self.assertIn("needs.winafl.result == 'cancelled'", condition)
+        self.assertIn("needs.binary-analyzers.result == 'failure'", condition)
+        self.assertIn("needs.binary-analyzers.result == 'cancelled'", condition)
 
     def report_failure(self, state: Path, sha: str, run_id: int) -> None:
         with tempfile.TemporaryDirectory() as scratch:

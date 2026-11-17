@@ -72,6 +72,7 @@ bhf clean bhf_work --build --corpus --reports
 ```
 
 The adapter line needs `rizin` on `PATH`; without it, it exits `1` saying so.
+It writes the binary's functions, call edges, strings and xrefs.
 To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
 that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
 Windows, as every harness binary there is named: `main_cov.exe`,
@@ -364,17 +365,40 @@ promoted into packed-binary or binary-layout review triage. Use
 limit.
 
 `bhf binary adapter <BINARY> --adapter mock|rizin|ghidra|angr --out <DIR>`
-writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`: functions,
-call-graph hints, strings, xrefs and errors). The command never links
-external tools into BHF. Only the mock adapter fills the report: it reads
-`--mock-output` JSON, for contract tests of a consumer. The Rizin, Ghidra and
-angr adapters run no analysis yet. They are blocked in `strict-permissive`
-(they need `--profile external-tools` or `research-lab`), look for their tool
-(`rizin`, Ghidra's `analyzeHeadless`, a Python that imports `angr`; `--tool`
-names another), and write `status: not_implemented` with a `not_implemented`
-error and exit 3 when it is there, or `status: skipped` with `tool_not_found`
-and exit 1 when it is not. They used to report the tool's `--version` as a
-successful `smoke_tested` analysis with empty arrays.
+writes `binary-adapter-report.json` (`bhf.binary.adapter.v1`). It holds:
+- `functions`: name, address, size, signature, and `imported` for an import
+  stub;
+- `call_graph`: caller and callee by name;
+- `strings`: address, value and section, without the symbol-table sections;
+- `xrefs`: from, to, and `kind` `call`, `code`, `data` or `string`;
+- `truncated` and `errors`.
+
+Addresses are the binary's link-time virtual addresses, as its headers and
+`nm` give them; a PIE's are offsets from 0, whatever base the tool loaded it
+at. The command never links an external tool into BHF: each runs as a
+subprocess, with a fixed command or a bundled script:
+
+| Adapter | Tool (`--tool` names another) | What runs |
+|---|---|---|
+| `rizin` | `rizin` | `rizin -q -c 'aaa; aflj; axlj; izj'` |
+
+Each run is bounded by `--timeout-secs` (default 900) and 128 MiB of output.
+Each array keeps at most 50,000 functions or strings, or 200,000 call edges
+or xrefs; `truncated` names an array that was cut and how many entries it
+kept. The real adapters are blocked in `strict-permissive` (they need
+`--profile external-tools` or `research-lab`). They write:
+- `status: ok` and exit 0, with the analysis;
+- `status: error` and exit 1 when the analysis failed: `timeout`,
+  `tool_error`, `output_too_large` or `bad_output`, with the tool's last
+  output;
+- `status: skipped` with `tool_not_found` and exit 1 when the tool is not
+  there, or the Python cannot import angr.
+
+The Ghidra and angr adapters run no analysis yet: with their tool they
+write `status: not_implemented` and exit 3.
+
+The mock adapter reads `--mock-output` JSON instead, for contract tests of a
+consumer.
 
 `bhf binary fuzz <BINARY>` executes source-unavailable binaries through
 `--input-mode stdin|file`, `--seed-input` / `--seed-file`, `--timeout-ms`, and
