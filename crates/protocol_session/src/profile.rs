@@ -113,6 +113,17 @@ pub struct CaptureDef {
     /// captures that follow it are read at the right offset.
     #[serde(default)]
     pub width: Option<FieldType>,
+    /// For a `tlv` capture: the tag of the record whose value is captured.
+    /// The records from `at` are walked until one has it; without a tag, the
+    /// record at `at` is captured.
+    #[serde(default)]
+    pub tag: Option<u64>,
+    /// For a `tlv` capture: the width of each record's tag and length
+    /// (`u8`/`u16`/`u32`, `u16` by default, as a `tlv` field encodes them).
+    #[serde(default)]
+    pub tag_width: Option<FieldType>,
+    #[serde(default)]
+    pub len_width: Option<FieldType>,
 }
 
 /// The response specification attached to a message.

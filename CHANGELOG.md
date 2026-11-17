@@ -2759,6 +2759,11 @@
   when bhf panics.
 
 ### Added
+- A protocol profile's response captures take TLV records (#259): a `tlv`
+  capture walks the records from its offset to the one with its `tag` and
+  binds the value, which a later request echoes from a `bytes` or `tlv`
+  reference field. A profile with a TLV capture did not compile, and a
+  reference field could only be an integer.
 - The session lane has a UDP backend (#258): `--session-transport
   udp:HOST:PORT` sends each message as one datagram, framed as the profile
   says, from a socket of its own per session, and waits for one reply

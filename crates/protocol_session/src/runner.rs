@@ -627,6 +627,98 @@ mod tests {
         assert_eq!(&replay.sent_frames[1][1..5], &0x2222_2222u32.to_be_bytes());
     }
 
+    /// #259: a cookie captured from a TLV record of a reply is echoed in the
+    /// next request, as bytes (with the length that covers it recomputed) and
+    /// as the value of a TLV record of its own.
+    #[test]
+    fn a_tlv_captured_value_is_echoed_in_the_next_request() {
+        const PROFILE: &str = r#"
+schema = "bhf.protocol.v1"
+start = "start"
+
+[[message]]
+name = "HELLO"
+[[message.field]]
+name = "op"
+type = "u8"
+value = 1
+[message.response]
+[[message.response.capture]]
+name = "cookie"
+type = "tlv"
+at = 1
+tag = 2
+endian = "big"
+
+[[message]]
+name = "ECHO"
+[[message.field]]
+name = "op"
+type = "u8"
+value = 2
+[[message.field]]
+name = "len"
+type = "u16"
+endian = "big"
+computed = "length(cookie)"
+[[message.field]]
+name = "cookie"
+type = "bytes"
+ref = "HELLO.response.cookie"
+[[message.field]]
+name = "again"
+type = "tlv"
+tag = 9
+endian = "big"
+ref = "HELLO.response.cookie"
+
+[[transition]]
+from = "start"
+send = "HELLO"
+to = "greeted"
+
+[[transition]]
+from = "greeted"
+send = "ECHO"
+to = "greeted"
+"#;
+        let model = ProtocolModel::from_profile(&Profile::from_toml(PROFILE).unwrap()).unwrap();
+        // A status byte, then a tag-1 record and the tag-2 record with the
+        // cookie: tag and length are big-endian u16s.
+        let hello_reply = b"\x00\x00\x01\x00\x02ab\x00\x02\x00\x04C00K".to_vec();
+        let mut transport = ScriptedTransport::single(vec![hello_reply, vec![0x00]]);
+        let messages = vec![
+            MessageInstance::from_seed(model.message("HELLO").unwrap()),
+            MessageInstance::from_seed(model.message("ECHO").unwrap()),
+        ];
+        let run = SessionRunner::new(&model)
+            .drive(&messages, &mut transport)
+            .expect("drive");
+        assert_eq!(
+            run.testcase
+                .bindings
+                .get("HELLO.response.cookie")
+                .and_then(BoundValue::as_bytes),
+            Some(&b"C00K"[..])
+        );
+        assert_eq!(
+            run.sent_frames[1],
+            b"\x02\x00\x04C00K\x00\x09\x00\x04C00K".to_vec()
+        );
+
+        // A reply without the tagged record names it.
+        let error = crate::response::extract(
+            "HELLO",
+            &model.message("HELLO").unwrap().response,
+            b"\x00\x00\x01\x00\x02ab",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tlv response capture \"cookie\" found no record with tag 2"
+        );
+    }
+
     #[test]
     fn ddmin_finds_a_minimal_passing_subset() {
         // A toy predicate: a subset passes iff it contains both indices 1 and 3.

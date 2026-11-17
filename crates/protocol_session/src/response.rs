@@ -53,6 +53,45 @@ fn extract_one(capture: &CompiledCapture, reply: &[u8]) -> Result<BoundValue, Re
                 })?;
             Ok(BoundValue::Enum { symbol, code })
         }
+        CaptureSpec::Tlv {
+            tag,
+            tag_width,
+            len_width,
+            endian,
+        } => {
+            let mut at = capture.at;
+            loop {
+                if at >= reply.len() {
+                    return Err(ResponseError::TlvNotFound {
+                        field: capture.name.clone(),
+                        tag: *tag,
+                    });
+                }
+                let record_tag = read_uint(reply, at, *tag_width, *endian, &capture.name)?;
+                let len_at = at + tag_width.size();
+                let len = read_uint(reply, len_at, *len_width, *endian, &capture.name)?;
+                let start = len_at + len_width.size();
+                let end = usize::try_from(len)
+                    .ok()
+                    .and_then(|len| start.checked_add(len))
+                    .ok_or(ResponseError::Truncated {
+                        field: capture.name.clone(),
+                        needed: usize::MAX,
+                        got: reply.len(),
+                    })?;
+                let value = reply.get(start..end).ok_or(ResponseError::Truncated {
+                    field: capture.name.clone(),
+                    needed: end,
+                    got: reply.len(),
+                })?;
+                if tag.is_none_or(|tag| tag == record_tag) {
+                    return Ok(BoundValue::Bytes {
+                        value: value.to_vec(),
+                    });
+                }
+                at = end;
+            }
+        }
         CaptureSpec::Bytes { len } => {
             let end = capture
                 .at
@@ -117,6 +156,8 @@ pub enum ResponseError {
     },
     #[error("enum response capture {field:?} saw out-of-range value {value}")]
     OutOfRange { field: String, value: u64 },
+    #[error("tlv response capture {field:?} found no record{}", tag.map(|tag| format!(" with tag {tag}")).unwrap_or_default())]
+    TlvNotFound { field: String, tag: Option<u64> },
 }
 
 #[cfg(test)]

@@ -1492,6 +1492,22 @@ endian = "big"
 
 The run summary's `framing` names it (`length_prefix(u16 big)`).
 
+A response capture of `type = "tlv"` takes the value of a tag-length-value
+record in the reply: the records from `at` are walked until one has `tag`
+(the record at `at` when there is no `tag`), each with a `tag_width` and a
+`len_width` of `u8`, `u16` (the default) or `u32` in the capture's `endian`.
+The value is bytes, which a later request echoes from a `bytes` field
+(`ref = "HELLO.response.cookie"`) or a `tlv` field of its own `tag`; a
+`length(..)` or CRC that covers it is computed over it.
+
+```toml
+[[message.response.capture]]
+name = "cookie"
+type = "tlv"
+at = 1
+tag = 2
+```
+
 ```sh
 bhf fuzz bhf_work --harness H-PROTO \
   --protocol-profile profiles/toy-open-write.toml \

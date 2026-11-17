@@ -35,7 +35,7 @@ pub use binding::{Bindings, BoundValue};
 pub use framing::{Framing, FramingError, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
 pub use model::{
     CaptureSpec, CompiledCapture, CompiledField, CompiledMessage, ComputedSpec, DataSpec,
-    EncodeError, FieldRole, FieldValue, ModelError, ProtocolModel,
+    EncodeError, FieldRole, FieldValue, ModelError, ProtocolModel, RefEncoding,
 };
 pub use mutate::{
     delete_message, insert_message, mutate_field_value, mutate_fields, mutate_sequence, reorder,
