@@ -2939,6 +2939,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/java_agent_build.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/java_driver_noise.rs",
       "license": "Apache-2.0"
     },

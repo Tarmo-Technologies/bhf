@@ -55,6 +55,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The JVM agent's first build fetches ASM with retries and checks each jar
+  against its pinned SHA-256, a pre-staged or cached copy too (#410). It
+  writes the jars and the agent beside their place and renames them in, so
+  concurrent first builds never read a partial file. A Maven Central 429
+  failed the Java lane's builds, and nothing checked what was fetched.
 - The Ruby, Lua and PHP lanes run the runtrace shim's sink oracles too
   (#301), as Python and Perl do: a command the input controls reaching
   `system`, `os.execute` or `shell_exec` is a BHF-431. Their drivers
