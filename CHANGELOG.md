@@ -2812,6 +2812,16 @@
   when bhf panics.
 
 ### Added
+- A reference target-side agent ships for `agent:tcp` and `agent:serial`
+  (#289): `c_runtime/bhf_agent.{h,c}`, freestanding C99 with no heap. It
+  serves the agent protocol over the board's read and write callbacks and
+  collects each input's SanitizerCoverage guards. It reports a fault from
+  the board's vector or signal handler (`bhf_agent_fault`) and goes on with
+  the next input. An input longer than its buffer is refused, a new
+  protocol status (`3`) the host takes as an inconclusive run.
+  `c_runtime/examples/agent_posix.c` runs it over TCP, and a loopback test
+  and a `bhf fuzz` run drive it to a fault that `bhf replay` reproduces.
+  Users had to implement the protocol from its description.
 - The JS lane runs browser-oriented modules (#288). A module that needs
   `window`, `document` or `navigator`, at load or when called, gets inert
   stand-ins for the browser globals Node lacks, and for any

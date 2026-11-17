@@ -15,8 +15,10 @@
 //!                      {u32 le kind}{u64 le addr}{u32 le detail_len}{detail bytes}
 //! ```
 //!
-//! `status` is [`STATUS_OK`] / [`STATUS_CRASH`] / [`STATUS_TIMEOUT`]; any other
-//! value is a protocol error. Every inbound length (`n_edges`, `detail_len`,
+//! `status` is [`STATUS_OK`] / [`STATUS_CRASH`] / [`STATUS_TIMEOUT`], or
+//! [`STATUS_REFUSED`] when the agent did not run the input because it is
+//! longer than the agent's input buffer (the run is inconclusive); any other
+//! value is a protocol error. The reference agent is `c_runtime/bhf_agent.c`. Every inbound length (`n_edges`, `detail_len`,
 //! and the on-target input length) is checked against a configurable cap in
 //! [`AgentLimits`] *before* allocating, so a malformed oversized length is a
 //! descriptive [`crate::error::TransportError::LengthCap`], never an allocation
@@ -39,6 +41,9 @@ pub const STATUS_OK: u32 = 0;
 pub const STATUS_CRASH: u32 = 1;
 /// `status` word: the target timed out.
 pub const STATUS_TIMEOUT: u32 = 2;
+/// `status` word: the agent did not run the input, which is longer than its
+/// input buffer (#289). The run is inconclusive, not clean.
+pub const STATUS_REFUSED: u32 = 3;
 
 /// `fault_present` word values.
 const FAULT_ABSENT: u32 = 0;
@@ -84,7 +89,7 @@ pub fn exit_of(status: u32) -> Result<ExitKind> {
         STATUS_CRASH => Ok(ExitKind::Crash),
         STATUS_TIMEOUT => Ok(ExitKind::Timeout),
         other => Err(TransportError::protocol(format!(
-            "agent status word {other} is not one of ok(0)/crash(1)/timeout(2)"
+            "agent status word {other} is not one of ok(0)/crash(1)/timeout(2)/refused(3)"
         ))),
     }
 }
@@ -144,7 +149,13 @@ pub fn encode_response(outcome: &RunOutcome) -> Vec<u8> {
 
 /// Read a target -> host response (host side), enforcing `limits`.
 pub fn read_response<R: Read>(reader: &mut R, limits: &AgentLimits) -> Result<RunOutcome> {
-    let exit = exit_of(read_u32_le(reader, "agent response status")?)?;
+    let status = read_u32_le(reader, "agent response status")?;
+    let refused = status == STATUS_REFUSED;
+    let exit = if refused {
+        ExitKind::Ok
+    } else {
+        exit_of(status)?
+    };
 
     let declared_edges = read_u32_le(reader, "agent response edge count")?;
     let n_edges = cap_len(declared_edges as u64, limits.max_edges, "agent edge count")?;
@@ -188,7 +199,11 @@ pub fn read_response<R: Read>(reader: &mut R, limits: &AgentLimits) -> Result<Ru
         fault,
         stdout: Vec::new(),
         coverage_incomplete: None,
-        inconclusive: None,
+        inconclusive: refused.then(|| {
+            "the agent refused the input: it is longer than the agent's input buffer; set \
+             --max-len to the agent's capacity"
+                .to_owned()
+        }),
     })
 }
 
@@ -254,6 +269,31 @@ mod tests {
     use crate::testsupport::{duplex, MockAgent, ScriptedResponse};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    /// #289: a refused input (longer than the agent's buffer) is an
+    /// inconclusive run, not a clean one or a crash.
+    #[test]
+    fn a_refused_input_is_inconclusive() {
+        let mut frame = Vec::new();
+        for word in [STATUS_REFUSED, 0, 0] {
+            frame.extend_from_slice(&word.to_le_bytes());
+        }
+        let outcome = read_response(&mut frame.as_slice(), &AgentLimits::default()).unwrap();
+        assert_eq!(outcome.exit, ExitKind::Ok);
+        assert!(outcome.fault.is_none() && outcome.coverage_edges.is_empty());
+        assert!(
+            outcome
+                .inconclusive
+                .as_deref()
+                .is_some_and(|reason| reason.contains("--max-len")),
+            "{outcome:?}"
+        );
+        let mut bad = Vec::new();
+        for word in [4u32, 0, 0] {
+            bad.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(read_response(&mut bad.as_slice(), &AgentLimits::default()).is_err());
+    }
 
     #[test]
     fn agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault() {

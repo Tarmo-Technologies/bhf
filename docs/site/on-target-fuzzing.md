@@ -261,17 +261,42 @@ and no newline translation, so every frame byte crosses unchanged, at
 and macOS the device is a tty path; on Windows it is a COM port (`COM3`,
 `COM10`).
 
-BHF ships the host side of this lane only. No target-side agent ships yet: a
-reference agent in portable C ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), a FreeRTOS task running it
-([#290](https://github.com/Tarmo-Technologies/bhf/issues/290)) and Zephyr glue ([#291](https://github.com/Tarmo-Technologies/bhf/issues/291)) are tracked. Until then the
-agent is yours to write, to this frame format. Every integer is little-endian;
-one round trip per input:
+BHF ships a reference target-side agent in freestanding C99,
+`c_runtime/bhf_agent.{h,c}`: no heap, and no libc beyond `<stdint.h>`,
+`<stddef.h>` and `<setjmp.h>`. The board gives it:
+
+- read and write callbacks over its UART, socket or debug channel;
+- an input buffer (a longer input is refused, not run);
+- an edge buffer;
+- the function under test, which has `LLVMFuzzerTestOneInput`'s signature.
+
+Build the code under test with `-fsanitize-coverage=trace-pc-guard`. The
+agent provides the SanitizerCoverage callbacks and reports each guard an input
+reaches once. Build the agent itself without them. A fault vector or signal
+handler calls `bhf_agent_fault(kind, addr, detail)`: the agent reports the
+fault for the running input and goes on with the next, returning from the
+handler by `longjmp`. On a target where that is not safe, define
+`BHF_AGENT_NO_SETJMP`, reset, and report the fault the reset kept.
+`c_runtime/examples/agent_posix.c` runs it on a POSIX host for `agent:tcp`:
+
+```sh
+cc -c c_runtime/bhf_agent.c
+cc -I c_runtime -c c_runtime/examples/agent_posix.c
+clang -fsanitize-coverage=trace-pc-guard -c target.c   # defines LLVMFuzzerTestOneInput
+cc -o agent agent_posix.o bhf_agent.o target.o
+./agent 9000 &
+bhf fuzz bhf_work --harness H-agent --target-transport agent:tcp:127.0.0.1:9000 --max-len 4096
+```
+
+Set `--max-len` to the agent's input buffer. An agent that implements the
+protocol itself uses this frame format. Every integer is little-endian, one
+round trip per input:
 
 | Direction | Field | Size | Meaning |
 |---|---|---|---|
 | host → target | `len` | `u32` | input length in bytes |
 | host → target | `input` | `len` bytes | the input |
-| target → host | `status` | `u32` | `0` ran to completion, `1` crashed, `2` timed out; any other value is a protocol error |
+| target → host | `status` | `u32` | `0` ran to completion, `1` crashed, `2` timed out, `3` refused: the input is longer than the agent's buffer and was read and dropped, not run (the run is inconclusive); any other value is a protocol error |
 | target → host | `n_edges` | `u32` | number of coverage edges that follow |
 | target → host | `edges` | `n_edges` × `u32` | the edge ids this input hit |
 | target → host | `fault_present` | `u32` | `1` when a fault block follows, else `0` |
