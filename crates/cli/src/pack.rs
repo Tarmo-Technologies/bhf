@@ -27,6 +27,11 @@ pub enum PackCommand {
     /// (an OSV ecosystem export, unzipped, or single record files).
     /// Malformed records are reported and skipped.
     ImportOsv(ImportFeedArgs),
+    /// Build an advisory database for `bhf sbom --vuln-db` from NVD CVE
+    /// JSON 2.0 files (yearly feeds or API responses): each vulnerable CPE
+    /// match, with its version range. Malformed records are reported and
+    /// skipped.
+    ImportNvd(ImportFeedArgs),
 }
 
 #[derive(Debug, Args)]
@@ -164,9 +169,16 @@ pub fn run(args: PackArgs) -> i32 {
                 }
             }
         }
-        PackCommand::ImportOsv(args) => {
-            import_feed(governance::advisories::import_osv(&args.inputs), &args)
-        }
+        PackCommand::ImportOsv(args) => import_feed(
+            "osv",
+            governance::advisories::import_osv(&args.inputs),
+            &args,
+        ),
+        PackCommand::ImportNvd(args) => import_feed(
+            "nvd",
+            governance::advisories::import_nvd(&args.inputs),
+            &args,
+        ),
         PackCommand::SignArchive(args) => {
             match governance::sign_distribution_archive(&args.archive, &args.signing_key, &args.out)
             {
@@ -270,13 +282,14 @@ fn verify(args: VerifyArgs) -> i32 {
 /// malformed record it skipped. Exit 1 when nothing could be imported from
 /// malformed input, else 0.
 fn import_feed(
+    format: &str,
     import: Result<governance::advisories::AdvisoryImport, governance::GovernanceError>,
     args: &ImportFeedArgs,
 ) -> i32 {
     let import = match import {
         Ok(import) => import,
         Err(error) => {
-            bhfeprintln!("bhf pack import-{}: {error:#}", "osv");
+            bhfeprintln!("bhf pack import-{format}: {error:#}");
             return 2;
         }
     };

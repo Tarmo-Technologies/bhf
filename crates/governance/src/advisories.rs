@@ -9,7 +9,8 @@
 //! versions (`"*"` is every version), and `affected_ranges` lists ranges, each
 //! an object of optional bounds `start_including`, `start_excluding`,
 //! `end_including` and `end_excluding` (an empty object is every version).
-//! `bhf pack import-osv` maps OSV records onto that format.
+//! `bhf pack import-osv` maps OSV records onto that format, and
+//! `bhf pack import-nvd` NVD CVE records (#387).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -221,7 +222,7 @@ pub fn severity_of_score(score: f64) -> &'static str {
 /// The records an importer read, and the ones it reported and skipped.
 #[derive(Debug, Default)]
 pub struct AdvisoryImport {
-    /// The feed's format (`osv`).
+    /// The feed's format (`osv`, `nvd`).
     pub format: &'static str,
     /// Database records, one per affected package.
     pub records: Vec<Value>,
@@ -550,6 +551,218 @@ fn osv_severity(record: &Value) -> String {
         )
 }
 
+/// Read the NVD CVE records in `inputs` (NVD CVE JSON 2.0: feed files or
+/// API responses, `{"vulnerabilities": [{"cve": ...}, ...]}`, or
+/// directories of them) into database records: one per vulnerable CPE
+/// match of a CVE's configurations, identified by its CPE and affecting the
+/// version its CPE names or the versions its bounds take.
+pub fn import_nvd(inputs: &[PathBuf]) -> Result<AdvisoryImport, GovernanceError> {
+    let mut import = AdvisoryImport {
+        format: "nvd",
+        ..AdvisoryImport::default()
+    };
+    for path in json_files(inputs)? {
+        import.files += 1;
+        let source = path.display().to_string();
+        let value: Value = match std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        {
+            Ok(value) => value,
+            Err(error) => {
+                import
+                    .malformed
+                    .push((source, format!("not JSON: {error}")));
+                continue;
+            }
+        };
+        let Some(items) = value.get("vulnerabilities").and_then(Value::as_array) else {
+            import.malformed.push((
+                source,
+                "no vulnerabilities array: not an NVD CVE JSON 2.0 file".to_owned(),
+            ));
+            continue;
+        };
+        for item in items {
+            import.feed_records += 1;
+            nvd_record(item.get("cve").unwrap_or(item), &source, &mut import);
+        }
+    }
+    import.records.sort_by(record_order);
+    Ok(import)
+}
+
+/// Map one NVD CVE onto database records.
+fn nvd_record(cve: &Value, source: &str, import: &mut AdvisoryImport) {
+    let Some(id) = cve
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    else {
+        import
+            .malformed
+            .push((source.to_owned(), "a CVE record without an id".to_owned()));
+        return;
+    };
+    let at = format!("{source} ({id})");
+    if cve.get("vulnStatus").and_then(Value::as_str) == Some("Rejected") {
+        return;
+    }
+    let configurations = match cve.get("configurations") {
+        None | Some(Value::Null) => {
+            import.without_versions += 1;
+            return;
+        }
+        Some(Value::Array(configurations)) => configurations,
+        Some(_) => {
+            import
+                .malformed
+                .push((at, "configurations is not an array".to_owned()));
+            return;
+        }
+    };
+    let summary = cve
+        .get("descriptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|description| description.get("lang").and_then(Value::as_str) == Some("en"))
+        .and_then(|description| description.get("value").and_then(Value::as_str))
+        .unwrap_or_default();
+    let severity = nvd_severity(cve);
+    let (mut matched, mut malformed) = (0usize, 0usize);
+    for (config_index, configuration) in configurations.iter().enumerate() {
+        let nodes = configuration
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for node in nodes {
+            if node.get("negate").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            let matches = node
+                .get("cpeMatch")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for cpe_match in matches {
+                if cpe_match.get("vulnerable").and_then(Value::as_bool) != Some(true) {
+                    continue;
+                }
+                match nvd_cpe_record(id, cpe_match, &severity, summary) {
+                    Ok(record) => {
+                        matched += 1;
+                        import.records.push(record);
+                    }
+                    Err(reason) => {
+                        malformed += 1;
+                        import.malformed.push((
+                            at.clone(),
+                            format!("configurations[{config_index}]: {reason}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if matched == 0 && malformed == 0 {
+        import.without_versions += 1;
+    }
+}
+
+/// The database record of one vulnerable NVD CPE match.
+fn nvd_cpe_record(
+    id: &str,
+    cpe_match: &Value,
+    severity: &str,
+    summary: &str,
+) -> Result<Value, String> {
+    let criteria = cpe_match
+        .get("criteria")
+        .and_then(Value::as_str)
+        .ok_or("a CPE match without criteria")?;
+    let fields: Vec<&str> = criteria
+        .strip_prefix("cpe:2.3:")
+        .ok_or_else(|| format!("criteria `{criteria}` is not a CPE 2.3 string"))?
+        .split(':')
+        .collect();
+    if fields.len() < 4 {
+        return Err(format!(
+            "criteria `{criteria}` names no product and version"
+        ));
+    }
+    let mut range = Map::new();
+    for (nvd_key, bound) in [
+        ("versionStartIncluding", "start_including"),
+        ("versionStartExcluding", "start_excluding"),
+        ("versionEndIncluding", "end_including"),
+        ("versionEndExcluding", "end_excluding"),
+    ] {
+        match cpe_match.get(nvd_key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(version)) if !version.trim().is_empty() => {
+                range.insert(bound.to_owned(), json!(version));
+            }
+            Some(_) => return Err(format!("{nvd_key} is not a version")),
+        }
+    }
+    // The CPE's own version field: a version, or `*` (any) / `-` (none).
+    let version = fields[3];
+    let (affected_versions, affected_ranges) = if !range.is_empty() {
+        (Vec::new(), vec![Value::Object(range)])
+    } else if version == "*" || version == "-" {
+        (vec![json!("*")], Vec::new())
+    } else {
+        (vec![json!(version.replace('\\', ""))], Vec::new())
+    };
+    let mut record = json!({
+        "id": id,
+        "source": "nvd",
+        "package": { "cpe": criteria },
+        "affected_versions": affected_versions,
+        "affected_ranges": affected_ranges,
+        "severity": severity,
+    });
+    if !summary.is_empty() {
+        record["summary"] = json!(summary);
+    }
+    Ok(record)
+}
+
+/// A CVE's NVD severity: the base severity of its CVSS v4.0, v3.1, v3.0 or
+/// v2 metric, the first that has one (the NVD's own primary score first),
+/// else `unknown`.
+fn nvd_severity(cve: &Value) -> String {
+    for key in [
+        "cvssMetricV40",
+        "cvssMetricV31",
+        "cvssMetricV30",
+        "cvssMetricV2",
+    ] {
+        let Some(metrics) = cve
+            .pointer(&format!("/metrics/{key}"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let primary = metrics
+            .iter()
+            .find(|metric| metric.get("type").and_then(Value::as_str) == Some("Primary"))
+            .or_else(|| metrics.first());
+        let severity = primary.and_then(|metric| {
+            metric
+                .pointer("/cvssData/baseSeverity")
+                .or_else(|| metric.get("baseSeverity"))
+                .and_then(Value::as_str)
+        });
+        if let Some(severity) = severity {
+            return severity.to_ascii_lowercase();
+        }
+    }
+    "unknown".to_owned()
+}
+
 /// Write `import`'s records as an advisory database at `out`, with what was
 /// read, and return the summary `bhf pack` prints.
 pub fn write_advisory_db(
@@ -644,6 +857,51 @@ mod tests {
         assert_eq!(cvss3_base_score("CVSS:3.1/AV:X/AC:L"), None);
         assert_eq!(severity_of_score(9.8), "critical");
         assert_eq!(severity_of_score(6.1), "medium");
+    }
+
+    #[test]
+    fn an_nvd_cpe_match_takes_its_bounds_or_its_cpe_version() {
+        let ranged = nvd_cpe_record(
+            "CVE-2026-1",
+            &json!({"vulnerable": true,
+                    "criteria": "cpe:2.3:a:openssl:openssl:*:*:*:*:*:*:*:*",
+                    "versionStartIncluding": "1.0.2", "versionEndExcluding": "1.0.2u"}),
+            "high",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            ranged["package"]["cpe"],
+            "cpe:2.3:a:openssl:openssl:*:*:*:*:*:*:*:*"
+        );
+        assert_eq!(
+            ranged["affected_ranges"],
+            json!([{"start_including": "1.0.2", "end_excluding": "1.0.2u"}])
+        );
+        let pinned = nvd_cpe_record(
+            "CVE-2026-2",
+            &json!({"vulnerable": true, "criteria": "cpe:2.3:a:zlib:zlib:1.2.11:*:*:*:*:*:*:*"}),
+            "medium",
+            "",
+        )
+        .unwrap();
+        assert_eq!(pinned["affected_versions"], json!(["1.2.11"]));
+        let any = nvd_cpe_record(
+            "CVE-2026-3",
+            &json!({"vulnerable": true, "criteria": "cpe:2.3:a:zlib:zlib:*:*:*:*:*:*:*:*"}),
+            "low",
+            "",
+        )
+        .unwrap();
+        assert_eq!(any["affected_versions"], json!(["*"]));
+        assert!(nvd_cpe_record("X", &json!({"criteria": "openssl"}), "low", "").is_err());
+        assert!(nvd_cpe_record(
+            "X",
+            &json!({"criteria": "cpe:2.3:a:o:o:*:*:*:*:*:*:*:*", "versionEndExcluding": 3}),
+            "low",
+            ""
+        )
+        .is_err());
     }
 
     #[test]

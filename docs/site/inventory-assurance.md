@@ -115,6 +115,22 @@ package in an ecosystem bhf does not catalog, or with only a git commit
 range, is counted and left out. The command exits 1 when malformed input left
 nothing to import.
 
+`bhf pack import-nvd INPUT... --out cve-db.json` builds one from NVD CVE JSON
+2.0 files (the yearly feeds, or API responses saved to disk), for the C and C++
+libraries an SBOM or `bhf binary scan` identifies by CPE. Each vulnerable CPE
+match in a CVE's configurations becomes a record whose `package.cpe` is the
+match's `criteria` (a CPE 2.3 string: `cpe:2.3:part:vendor:product:version:...`,
+`*` fields are wildcards). Its versions are its bounds, `versionStartIncluding`,
+`versionStartExcluding`, `versionEndIncluding` and `versionEndExcluding`, which
+become an `affected_ranges` entry; without bounds, the CPE's own version field
+(`*` or `-` is every version). A match marked not vulnerable (the platform of an
+`AND` configuration) and a negated node are left out, and so is a rejected CVE.
+The severity is the base severity of the CVE's CVSS v4.0, v3.1, v3.0 or v2
+metric, the first present, the NVD's primary score first. Malformed records are
+reported and skipped as with OSV, and a CVE with no configuration is counted
+under `without_versions`. A component matches a CPE record when its CPE agrees
+field by field and its version lies in the record's range.
+
 ## Reviewer and integration boundaries
 
 The queue is a work product for analyst review, not an approval store. This change

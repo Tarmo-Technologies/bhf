@@ -2703,6 +2703,12 @@
   when bhf panics.
 
 ### Added
+- `bhf pack import-nvd INPUT... --out cve-db.json` builds an advisory
+  database from NVD CVE JSON 2.0 files (#387), with the OSV importer's
+  writer. Each vulnerable CPE match becomes a record identified by its CPE,
+  with its version bounds as a range (or the CPE's own version) and the
+  CVE's CVSS base severity, so a C or C++ library named by CPE matches by
+  CPE and version range. Malformed records are reported and skipped.
 - `bhf pack import-osv INPUT... --out cve-db.json` builds an advisory
   database for `bhf sbom --vuln-db` from OSV records (#223): an unzipped OSV
   ecosystem export or single record files. Each affected package becomes a

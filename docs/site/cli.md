@@ -1212,6 +1212,7 @@ bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-ro
 bhf pack create --root packs/current --pack-id rules-2026-06 --item rules:rules/static.json --signing-key keys/offline-root.der --key-id offline-root --out packs/current/update-pack.json
 bhf pack verify update-pack.json --root packs/current --out bhf_work/pack-verify.json
 bhf pack import-osv osv/crates.io osv/PyPI --out packs/current/cve-db.json
+bhf pack import-nvd nvd/nvdcve-2.0-2025.json nvd/nvdcve-2.0-2026.json --out packs/current/cve-db-nvd.json
 bhf sbom path/to/src --out bhf_work/sbom --vuln-db packs/current/cve-db.json --policy bhf-policy.json
 bhf ci . --work-dir bhf_work --policy bhf-policy.json --runner-plan bhf_work/runner-plan.json --dashboard-out bhf_work/ci-dashboard.json
 bhf export --work-dir bhf_work --out bhf_work/export-manifest.json --bundle-dir bhf_work/export-bundle --policy bhf-policy.json --update-pack update-pack.json --runner-plan bhf_work/runner-plan.json
@@ -1267,8 +1268,8 @@ JSON with component purls, declared component CPEs, hashes, dependency
 relationships, declared component supplier/license metadata, BHF evidence
 properties, and BHF tool metadata including supplier, license, and package
 URL, then matches against an offline
-`--vuln-db` from an update pack, or one `bhf pack import-osv` builds from OSV
-records (see [Inventory assurance](inventory-assurance.md#advisory-database-format)
+`--vuln-db` from an update pack, or one `bhf pack import-osv` or
+`bhf pack import-nvd` builds from OSV or NVD records (see [Inventory assurance](inventory-assurance.md#advisory-database-format)
 for the format). Vulnerability entries can identify packages by
 `package.ecosystem`/`package.name`, or by `package.purl` or `package.cpe`,
 plus `affected_versions` (exact versions, `*` for all) or `affected_ranges`
