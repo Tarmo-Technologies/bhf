@@ -52,6 +52,17 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- One unbounded recursion is one finding. A stack overflow's cluster key is
+  the functions of the recursion, not the frame that ran out of stack: that
+  was whichever of a comparison hook, a coverage callback, the recursive
+  function or a helper it calls was running, so one recursion was reported
+  several times.
+- The input-to-state mutator no longer slows the engine to a few executions
+  a second on long inputs. A loop counter compared on every iteration filled
+  the comparison log, and every mutation scanned the input once per logged
+  comparison. Comparisons whose operands do not occur in the input are now
+  dropped when the log is captured. An operand that occurs throughout the
+  input yields at most 32 offsets, spread across it.
 - The FreeRTOS reference profile has a timeout and a state-contamination
   control, and a CLI test runs both. Input `0xD0` never reaches
   `harness_done`, so the run ends at `--timeout` as a timeout finding.
@@ -2678,6 +2689,14 @@
   when bhf panics.
 
 ### Added
+- Stack depth is a coverage channel of the C/C++ driver (#220): it records
+  the deepest stack each execution reached, and the built-in engine keeps an
+  input that recursed a quarter deeper again than every input before it,
+  though it ran no new edge. A new mutator doubles the longest run of a
+  nesting opener (`[`, `{`, `(`, `<`) in an input. An unbounded recursion now
+  reaches the end of the stack and is reported as a BHF-207 stack overflow;
+  edge coverage kept none of the deeper inputs, so it was not found.
+  `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
 - `bhf auto --collector SPEC` (and `--collector-window-ms`) observes each
   fuzzed target with the runtime-event collector: after its passes, the
   target's retained inputs are replayed one by one under it, as

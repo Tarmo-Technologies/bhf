@@ -60,18 +60,23 @@
 #endif
 
 /* MSVC (`cl.exe`, the MSVC harness lane): no GNU attributes or builtins.
- * `_ReturnAddress` is the intrinsic for `__builtin_return_address(0)`, and a
- * callback MSVC's `libsancov.lib` looks up at start-up must be exported from
- * the executable for it to be found. */
+ * `_ReturnAddress` is the intrinsic for `__builtin_return_address(0)`, the
+ * slot `_AddressOfReturnAddress` names is a stack address of the current frame
+ * as `__builtin_frame_address(0)` is, and a callback MSVC's `libsancov.lib`
+ * looks up at start-up must be exported from the executable for it to be
+ * found. */
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #pragma intrinsic(_ReturnAddress)
+#pragma intrinsic(_AddressOfReturnAddress)
 #define BHF_MSVC 1
 #define BHF_RA _ReturnAddress()
+#define BHF_FA _AddressOfReturnAddress()
 #define BHF_MEMCPY memcpy
 #define BHF_EXPORT __declspec(dllexport)
 #else
 #define BHF_RA __builtin_return_address(0)
+#define BHF_FA __builtin_frame_address(0)
 #define BHF_MEMCPY __builtin_memcpy
 #define BHF_EXPORT
 #endif
@@ -611,6 +616,39 @@ BHF_NOCOV static void bhf_cov_cnt_open(void) {
     void *m = bhf_map_shared(p, BHF_COV_BITS);
     if (m) bhf_cov_cnt_map = (unsigned char *)m;
 }
+/* Stack depth (#220): a FOURTH MAP_SHARED word named by BHF_STACK_DEPTH_SHM,
+ * 8 bytes: the deepest this exec's stack reached, in bytes below the frame the
+ * framed loop ran the input from. The coverage callbacks note their own frame
+ * address, just below the instrumented function's, so the lowest one an exec
+ * sees bounds its recursion depth, the measure libFuzzer takes with
+ * -fsanitize-coverage=stack-depth, without that instrumentation. A frame more than 64 MiB away is another
+ * thread's and is ignored. The engine zeroes it before every exec and rewards a
+ * new deepest bucket. A no-op when unset. The layout MUST stay in sync with the
+ * other driver copies (direct_harness.c.tera, direct_harness.cpp.tera,
+ * c_runtime/bhf_driver.c) and the CoverageTracker reader in crates/cli/src/fuzz.rs. */
+static uint64_t *bhf_stack_map = 0;
+static uintptr_t bhf_stack_base = 0, bhf_stack_low = 0;
+static void bhf_stack_open(void) {
+    if (bhf_stack_map) return;
+    const char *p = getenv("BHF_STACK_DEPTH_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, 8);
+    if (m) bhf_stack_map = (uint64_t *)m;
+}
+#define BHF_STACK_NOTE() do { \
+    uintptr_t bhf_fp_ = (uintptr_t)BHF_FA; \
+    if (bhf_fp_ < bhf_stack_low && bhf_stack_base - bhf_fp_ < ((uintptr_t)64 << 20)) \
+        bhf_stack_low = bhf_fp_; \
+} while (0)
+#define BHF_STACK_BEGIN() do { \
+    if (bhf_stack_map) bhf_stack_base = bhf_stack_low = (uintptr_t)BHF_FA; \
+} while (0)
+#define BHF_STACK_END() do { \
+    if (bhf_stack_map) { \
+        uint64_t bhf_depth_ = (uint64_t)(bhf_stack_base - bhf_stack_low); \
+        if (bhf_depth_ > *bhf_stack_map) *bhf_stack_map = bhf_depth_; \
+    } \
+} while (0)
 /* laf-intel comparison-progress (#421): a THIRD map, BHF_CMP_PROGRESS_SHM,
  * one byte per hashed compare site recording the MAX leading-byte match this
  * exec, so the engine can reward an input one byte closer to a multi-byte gate.
@@ -793,6 +831,7 @@ BHF_NOCOV BHF_EXPORT void __sanitizer_cov_8bit_counters_init(unsigned char *star
     bhf_c8_modules++;
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmp_open();
     bhf_cmpp_open();
     bhf_ev_open();
@@ -823,12 +862,14 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *st
     for (uint32_t *x = start; x < stop; x++) *x = ++bhf_cov_next;
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmp_open();
     bhf_cmpp_open();
     bhf_ev_open();
 }
 BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     if (!*guard || !bhf_cov_map) return;
+    if (bhf_stack_map) BHF_STACK_NOTE();
     bhf_cov_map[*guard & (BHF_COV_BITS - 1)] = 1;
     if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
         bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
@@ -839,6 +880,7 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
  * engine's coverage reader stays platform-agnostic. */
 BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
     if (!bhf_cov_map) return;
+    if (bhf_stack_map) BHF_STACK_NOTE();
     uintptr_t pc = (uintptr_t)BHF_RA;
     uint32_t h = ((uint32_t)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);
     bhf_cov_map[h] = 1;
@@ -1220,6 +1262,7 @@ int main(int argc, char **argv) {
      * silently degrades to black-box (zero-coverage) fuzzing. */
     bhf_cov_open();
     bhf_cov_cnt_open();
+    bhf_stack_open();
     bhf_cmpp_open();
     bhf_cmp_open();
     bhf_vp_open();
@@ -1258,7 +1301,9 @@ int main(int argc, char **argv) {
             uint8_t *input = (uint8_t *)malloc(len ? (size_t)len : 1);
             if (!input) return 1;
             if (len && !bhf_read_n(0, input, len)) { free(input); break; }
+            BHF_STACK_BEGIN();
             bhf_run_one_bytes(input, len);
+            BHF_STACK_END();
             free(input);
             unsigned char sync = 1;
             if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;

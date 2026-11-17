@@ -182,31 +182,62 @@ impl CmpLog {
     /// vice versa). Used by the builtin engine's mutator to
     /// learn magic-byte expectations from runtime evidence.
     pub fn splice_candidates(&self, input: &[u8]) -> Vec<SpliceCandidate> {
-        let mut out = Vec::new();
-        for entry in &self.entries {
-            for (src, dst) in [
+        self.splice_candidate_iter(input).collect()
+    }
+
+    /// Drop the entries that yield no splice into `input`: neither operand
+    /// occurs in it, or the occurrence already holds the other operand. A
+    /// loop counter compared on every iteration fills the log with such
+    /// entries, and the mutator scans the input once per entry it keeps.
+    pub fn retain_spliceable(&mut self, input: &[u8]) {
+        self.entries.retain(|entry| {
+            [
                 (&entry.operand_a, &entry.operand_b),
                 (&entry.operand_b, &entry.operand_a),
-            ] {
-                if src.is_empty() {
-                    continue;
-                }
+            ]
+            .into_iter()
+            .any(|(src, dst)| !src.is_empty() && src != dst && find_subslice(input, src).is_some())
+        });
+    }
+
+    /// The candidates of `splice_candidates`, found lazily. An operand is
+    /// taken at most once per `1/SPLICE_OFFSETS_PER_OPERAND` of the input,
+    /// so a one-byte operand in a long run of that byte yields a bounded,
+    /// spread set rather than one candidate per offset.
+    pub fn splice_candidate_iter<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> impl Iterator<Item = SpliceCandidate> + 'a {
+        let stride = (input.len() / SPLICE_OFFSETS_PER_OPERAND).max(1);
+        self.entries
+            .iter()
+            .flat_map(|entry| {
+                [
+                    (entry, &entry.operand_a, &entry.operand_b),
+                    (entry, &entry.operand_b, &entry.operand_a),
+                ]
+            })
+            .filter(|(_, src, _)| !src.is_empty())
+            .flat_map(move |(entry, src, dst)| {
                 let mut search_from = 0usize;
-                while let Some(pos) = find_subslice(&input[search_from..], src) {
+                std::iter::from_fn(move || {
+                    let pos = find_subslice(input.get(search_from..)?, src)?;
                     let absolute = search_from + pos;
-                    out.push(SpliceCandidate {
+                    search_from = (absolute / stride + 1) * stride;
+                    Some(SpliceCandidate {
                         site_id: entry.site_id,
                         offset: absolute,
                         replacement: dst.clone(),
                         original_len: src.len(),
-                    });
-                    search_from = absolute + 1;
-                }
-            }
-        }
-        out
+                    })
+                })
+            })
     }
 }
+
+/// The most offsets `CmpLog::splice_candidate_iter` takes for one operand,
+/// give or take one: an input shorter than twice this keeps every offset.
+pub const SPLICE_OFFSETS_PER_OPERAND: usize = 32;
 
 /// Whether `a` and `b` differ by exactly one byte substituted, inserted or
 /// removed.
@@ -354,6 +385,56 @@ mod tests {
         assert_eq!(first.offset, 2);
         assert_eq!(first.replacement, b"MAGIC");
         assert_eq!(first.original_len, 4);
+    }
+
+    #[test]
+    fn a_repeated_operand_yields_a_bounded_spread_of_offsets() {
+        let mut log = CmpLog::new();
+        log.record(CmpEntry {
+            site_id: 1,
+            operand_a: b"[".to_vec(),
+            operand_b: b"{".to_vec(),
+            kind: CmpKind::IntegerCompare,
+        });
+        let short = vec![b'['; 2 * SPLICE_OFFSETS_PER_OPERAND - 1];
+        assert_eq!(log.splice_candidates(&short).len(), short.len());
+
+        let input = vec![b'['; 1 << 20];
+        let offsets: Vec<usize> = log
+            .splice_candidates(&input)
+            .iter()
+            .map(|c| c.offset)
+            .collect();
+        assert_eq!(offsets.len(), SPLICE_OFFSETS_PER_OPERAND);
+        assert_eq!(offsets[0], 0);
+        assert!(offsets
+            .windows(2)
+            .all(|w| w[1] - w[0] == input.len() / SPLICE_OFFSETS_PER_OPERAND));
+    }
+
+    #[test]
+    fn retain_spliceable_keeps_only_entries_that_splice_into_the_input() {
+        let mut log = CmpLog::new();
+        for (a, b) in [
+            (&b"ab"[..], &b"zz"[..]),
+            (b"\x07\x00\x00\x00", b"\x09\x00\x00\x00"),
+            (b"zz", b"ab"),
+            (b"ab", b"ab"),
+        ] {
+            log.record(CmpEntry {
+                site_id: 1,
+                operand_a: a.to_vec(),
+                operand_b: b.to_vec(),
+                kind: CmpKind::IntegerCompare,
+            });
+        }
+        log.retain_spliceable(b"xxabyy");
+        let kept: Vec<(&[u8], &[u8])> = log
+            .entries
+            .iter()
+            .map(|e| (e.operand_a.as_slice(), e.operand_b.as_slice()))
+            .collect();
+        assert_eq!(kept, [(&b"ab"[..], &b"zz"[..]), (b"zz", b"ab")]);
     }
 
     #[test]

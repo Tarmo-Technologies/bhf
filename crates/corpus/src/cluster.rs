@@ -170,6 +170,11 @@ const ALLOC_RUNTIME: &[&str] = &[
 /// call. Returns an empty `Vec` when every frame was noise — callers fall
 /// back to the per-input signature in that case.
 pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
+    normalize_frames_up_to(input, TOP_FRAMES)
+}
+
+/// [`normalize_frames`] keeping up to `limit` frames.
+fn normalize_frames_up_to(input: &[InputFrame], limit: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut stdlib: Vec<String> = Vec::new();
     for frame in input {
@@ -203,13 +208,13 @@ pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
             continue;
         }
         if is_cpp_stdlib_frame(&no_args, frame.file.as_deref()) {
-            if stdlib.len() < TOP_FRAMES {
+            if stdlib.len() < limit {
                 stdlib.push(no_args);
             }
             continue;
         }
         out.push(no_args);
-        if out.len() >= TOP_FRAMES {
+        if out.len() >= limit {
             break;
         }
     }
@@ -482,7 +487,10 @@ pub fn cluster_for_sanitizer(report: &SanitizerReport) -> ClusterKey {
 /// no pc offset it is the placeholder.
 pub fn cluster_for_sanitizer_scoped(report: &SanitizerReport, scope: &str) -> ClusterKey {
     let input: Vec<InputFrame> = report.stack.iter().map(InputFrame::from).collect();
-    let frames = normalize_frames(&input);
+    let frames = match report.kind.as_str() {
+        "stack-overflow" => recursion_frames(&input),
+        _ => normalize_frames(&input),
+    };
     let site = sanitizer_site(report, &frames);
     if frames.is_empty() && site.is_none() {
         if scope.is_empty() && report.pc_offset.is_none() {
@@ -537,6 +545,27 @@ pub fn cluster_for_sanitizer_scoped(report: &SanitizerReport, scope: &str) -> Cl
         frames,
         fallback: false,
     }
+}
+
+/// The root cause of a stack overflow is the recursion, not the frame that
+/// ran out of stack (a comparison hook, a coverage callback, a helper the
+/// recursive function calls): the functions from the first one that recurs on
+/// the printed stack, or, when none recurs, the top frames. They are sorted:
+/// the sanitizer's stack lists each call site once, so a cycle of functions
+/// prints in the order the overflow happened to enter it.
+fn recursion_frames(input: &[InputFrame]) -> Vec<String> {
+    let frames = normalize_frames_up_to(input, usize::MAX);
+    let start = frames
+        .iter()
+        .enumerate()
+        .position(|(index, frame)| frames[index + 1..].contains(frame));
+    let mut cycle = match start {
+        Some(start) => frames[start..].to_vec(),
+        None => frames.into_iter().take(TOP_FRAMES).collect(),
+    };
+    cycle.sort();
+    cycle.dedup();
+    cycle
 }
 
 /// The reported site that identifies `report`'s root cause: always for UBSan
@@ -2257,5 +2286,83 @@ mod tests {
         let mut oracle = earlier_missing_return("H-C0001", "/src/widget/parse.cpp:12:1");
         oracle["oracle"] = serde_json::json!({"name": "path-traversal"});
         assert_eq!(legacy_fallback_cluster_key(&oracle), None);
+    }
+
+    /// An ASan stack-overflow report whose stack is `top` above a run of
+    /// recursive frames.
+    fn stack_overflow(top: &[&str]) -> SanitizerReport {
+        let mut text = "==7==ERROR: AddressSanitizer: stack-overflow on address 0x7ffd54c5cff8 \
+                        (pc 0x1 bp 0x0 sp 0x7ffd54c5d000 T0)\n"
+            .to_owned();
+        let mut frames: Vec<&str> = top.to_vec();
+        frames.extend(["walk /src/nest.c:6:30"; 40]);
+        for (index, frame) in frames.iter().enumerate() {
+            text.push_str(&format!("    #{index} 0x{:x} in {frame}\n", 0x5a00 + index));
+        }
+        text.push_str("\nSUMMARY: AddressSanitizer: stack-overflow /src/nest.c:4:15 in walk\n");
+        crate::sanitizer::parse_sanitizer_report(&text).expect("an ASan report")
+    }
+
+    /// The frame a stack overflow lands in is whichever ran out of stack:
+    /// bhf's comparison hooks, a coverage callback, the recursive function
+    /// itself or a helper it calls. The root cause is the recursion, and so
+    /// is the key.
+    #[test]
+    fn a_stack_overflow_keys_on_the_recursion_whatever_frame_ran_out() {
+        let tops: [&[&str]; 4] = [
+            &[
+                "bhf_cmp_armed /w/c_runtime/bhf_driver.c:711:9",
+                "bhf_cmp_int /w/c_runtime/bhf_driver.c:737:10",
+                "__sanitizer_cov_trace_cmp8 /w/c_runtime/bhf_driver.c:888:113",
+                "walk /src/nest.c:4:15",
+            ],
+            &[
+                "__sanitizer_cov_trace_switch /w/c_runtime/bhf_driver.c",
+                "walk /src/nest.c:6:13",
+            ],
+            &["walk /src/nest.c:5:9"],
+            &["next_token /src/lex.c:20:3", "walk /src/nest.c:5:20"],
+        ];
+        let keys: Vec<ClusterKey> = tops
+            .iter()
+            .map(|top| cluster_for_sanitizer(&stack_overflow(top)))
+            .collect();
+        for key in &keys {
+            assert_eq!(key.frames, ["walk"], "{key:?}");
+            assert_eq!(key.full, keys[0].full);
+        }
+
+        // Mutual recursion is one root cause whichever function is on top.
+        let mutual = |top: &str, under: &str| {
+            let mut text = "==7==ERROR: AddressSanitizer: stack-overflow on address 0x1 \
+                            (pc 0x1 bp 0x0 sp 0x1 T0)\n"
+                .to_owned();
+            for index in 0..40 {
+                let frame = if index % 2 == 0 { top } else { under };
+                text.push_str(&format!("    #{index} 0x{index:x} in {frame}\n"));
+            }
+            text.push_str("\nSUMMARY: AddressSanitizer: stack-overflow\n");
+            cluster_for_sanitizer(&crate::sanitizer::parse_sanitizer_report(&text).unwrap())
+        };
+        let value_first = mutual("value /src/json.c:30:5", "array /src/json.c:50:9");
+        let array_first = mutual("array /src/json.c:50:9", "value /src/json.c:30:5");
+        assert_eq!(value_first.frames, ["array", "value"]);
+        assert_eq!(value_first.full, array_first.full);
+        assert_ne!(value_first.full, keys[0].full);
+    }
+
+    /// One oversized frame overflows the stack without recursing; its key
+    /// is its top frames.
+    #[test]
+    fn a_stack_overflow_without_recursion_keys_on_its_top_frames() {
+        let text = "==7==ERROR: AddressSanitizer: stack-overflow on address 0x1 \
+                    (pc 0x1 bp 0x0 sp 0x1 T0)\n    \
+                    #0 0x1 in parse_block /src/a.c:3:5\n    \
+                    #1 0x2 in caller /src/a.c:9:5\n    \
+                    #2 0x3 in run /src/a.c:20:5\n    \
+                    #3 0x4 in main /src/a.c:30:5\n\n\
+                    SUMMARY: AddressSanitizer: stack-overflow /src/a.c:3:5 in parse_block\n";
+        let key = cluster_for_sanitizer(&crate::sanitizer::parse_sanitizer_report(text).unwrap());
+        assert_eq!(key.frames, ["caller", "parse_block", "run"]);
     }
 }

@@ -5301,6 +5301,14 @@ fn run_fuzz_with_runtrace(
             harness_dir.join("vp.shm").display().to_string(),
         ),
     ];
+    // #220: the deepest stack each exec reached, beside the other maps. The
+    // engine zeroes it before every exec, so passes can share it.
+    if std::env::var("BHF_DISABLE_STACK_DEPTH").as_deref() != Ok("1") {
+        child_env.push((
+            "BHF_STACK_DEPTH_SHM".to_owned(),
+            harness_dir.join("stack_depth.shm").display().to_string(),
+        ));
+    }
 
     // #83 runner-owned resource scratch: the opt-in in-crate path-opener harness
     // materializes each case's seeded resource under a directory the SUPERVISOR

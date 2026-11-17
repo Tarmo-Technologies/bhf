@@ -26,6 +26,7 @@ coming from `clang -fsanitize=fuzzer` know what to reach for.
 | `-dict=FILE` | auto dictionary + `--cmplog-log` | A dictionary is mined automatically (string/byte literals) and from recovered comparison operands. |
 | `-use_value_profile=1` | cmplog / RedQueen (`--cmplog-log`) | See below. |
 | `inline-8bit-counters` / AFL `COUNT` buckets | always on (C/C++ driver) | Edge hit counts are bucketed (`1, 2, 3, 4-7, 8-15, …`) so a deeper loop or recursion is new coverage, not just edge presence (#420). |
+| `-fsanitize-coverage=stack-depth` (libFuzzer's stack-depth feature) | always on (C/C++ driver) | An input that recurses deeper than every one before it is kept on the same edges, and a mutator doubles its run of a nesting opener, so unbounded recursion reaches a BHF-207 stack overflow (#220). `BHF_DISABLE_STACK_DEPTH=1` turns it off. |
 | laf-intel comparison split | `auto --comparison-progress` | Opt-in leading-byte-match gradient on multi-byte gates (#421); an `auto`-only flag. See below. |
 | `-merge=1` | `bhf corpus merge` (content duplicate handling) / `bhf corpus minimize --harness` (coverage-minimal, Ada harnesses only) | `merge` handles duplicates by content; `minimize` replays each input and keeps only those that add a new corpus signature, which only an Ada harness records. With any other harness it copies every input through, names the harness's lane and exits `2`, so it is not a coverage merge for C, C++ or the other lanes. |
 | `-minimize_crash=1` | `bhf minimize` | Shrink a crashing input by binary search while preserving the finding. |
@@ -34,11 +35,12 @@ coming from `clang -fsanitize=fuzzer` know what to reach for.
 
 ## Coverage granularity
 
-The C/C++ driver tracks three coverage channels, not just edge presence: edge
+The C/C++ driver tracks four coverage channels, not just edge presence: edge
 presence (`trace-pc-guard`), AFL-style logarithmic hit-count buckets (#420, the
-equivalent of libFuzzer's `inline-8bit-counters`), and the opt-in laf-intel
-comparison-progress gradient (#421, `--comparison-progress`). An input is
-retained in the corpus if it advances **any** of the three.
+equivalent of libFuzzer's `inline-8bit-counters`), the opt-in laf-intel
+comparison-progress gradient (#421, `--comparison-progress`), and the deepest
+stack an execution reached (#220, libFuzzer's stack-depth feature). An input is
+retained in the corpus if it advances **any** of the four.
 
 The Ada lane is also coverage-guided: since #412 an instrumented Ada harness is
 compiled with `-fsanitize-coverage=trace-pc` (GNAT/GCC rejects `trace-pc-guard`)

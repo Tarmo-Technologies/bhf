@@ -66,7 +66,7 @@ C/C++ direct harnesses are instrumented at compile time, not by source
 rewriting. The generated Makefile compiles each driver with
 `-fsanitize-coverage=trace-pc-guard,trace-cmp`, and the harness ships a built-in
 SanitizerCoverage runtime — no LLVM, libFuzzer, or sanitizer-fuzzer runtime is
-linked. The runtime exposes three coverage-feedback channels, each a separate
+linked. The runtime exposes four coverage-feedback channels, each a separate
 `MAP_SHARED` region read by the engine once per execution:
 
 - **Edge presence** — `trace-pc-guard` sets one bit per instrumented edge in a
@@ -81,6 +81,14 @@ linked. The runtime exposes three coverage-feedback channels, each a separate
   matched at each compare site, a laf-intel-style gradient that rewards getting
   one more byte of a multi-byte gate correct. Enabled with
   `--comparison-progress`; inert when the env var is unset.
+- **Stack depth** (#220) — an 8-byte word (`BHF_STACK_DEPTH_SHM`) holds the
+  deepest stack the execution reached, measured from the frame of the call
+  into the target. An input that recursed a quarter deeper again than every
+  input before it is kept, though it ran no new edge, and the repeat-token
+  mutator doubles the longest run of a nesting opener (`[`, `{`, `(`, `<`) in
+  it. Hit-count buckets stop growing at 128 hits; this channel does not, so
+  an unbounded recursion reaches the end of the stack and is reported as a
+  BHF-207 stack overflow. `BHF_DISABLE_STACK_DEPTH=1` turns it off.
 
 The same `trace-cmp` callbacks also feed RedQueen/cmplog input-to-state operand
 capture (#400) and value-profile dictionary mining (#398). See

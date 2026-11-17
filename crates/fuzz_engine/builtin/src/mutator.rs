@@ -55,10 +55,17 @@ pub enum MutationKind {
     /// without paying the dictionary-token loss of positional
     /// information.
     CmpLogSplice,
+    /// Lengthen the longest run of a nesting opener in the input (`[`, `{`,
+    /// `(`, `<`, or a one-byte dictionary token) to twice its length, at
+    /// least 16 (#220). A recursive-descent parser recurses once per opener,
+    /// so each retained child is twice as deep: stack exhaustion that needs
+    /// thousands of levels is a few compounding steps away rather than a
+    /// lucky draw.
+    RepeatToken,
 }
 
 impl MutationKind {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::BitFlip,
         Self::ByteFlip,
         Self::Arithmetic,
@@ -82,6 +89,7 @@ impl MutationKind {
         Self::TypedValue,
         Self::OpSequence,
         Self::CmpLogSplice,
+        Self::RepeatToken,
     ];
 
     /// Whether an input of this kind is an edit of the base it was given. The
@@ -98,7 +106,8 @@ impl MutationKind {
             | Self::DictionaryInsert
             | Self::TypedValue
             | Self::OpSequence
-            | Self::CmpLogSplice => true,
+            | Self::CmpLogSplice
+            | Self::RepeatToken => true,
             Self::StructuredRecord
             | Self::StructuredJson
             | Self::StructuredXml
@@ -645,6 +654,7 @@ impl MutatorSuite {
                 self.operation_sequence(input.bytes, input.operation_sequence?, rng)
             }
             MutationKind::CmpLogSplice => self.cmplog_splice(input.bytes, input.cmplog?, rng),
+            MutationKind::RepeatToken => self.repeat_token(input.bytes, input.dictionary, rng),
         }?;
 
         Some(MutationResult { bytes, kind })
@@ -741,9 +751,13 @@ impl MutatorSuite {
                     .operation_sequence_actions(input.bytes, layout)
                     .is_empty()
             }),
-            MutationKind::CmpLogSplice => input.cmplog.is_some_and(|log| {
-                !input.bytes.is_empty() && !cmplog_splice_candidates(log, input.bytes).is_empty()
-            }),
+            MutationKind::RepeatToken => {
+                input.bytes.len() < self.config.max_len
+                    && !nesting_openers(input.bytes, input.dictionary).is_empty()
+            }
+            MutationKind::CmpLogSplice => input
+                .cmplog
+                .is_some_and(|log| cmplog_splice_candidates(log, input.bytes).next().is_some()),
         }
     }
 
@@ -849,13 +863,54 @@ impl MutatorSuite {
         }
     }
 
+    /// [`MutationKind::RepeatToken`]: double the longest run of one of the
+    /// input's nesting openers, at least to 16, within `max_len`.
+    fn repeat_token(
+        &self,
+        bytes: &[u8],
+        dictionary: &Dictionary,
+        rng: &mut MutationRng,
+    ) -> Option<Vec<u8>> {
+        let openers = nesting_openers(bytes, dictionary);
+        let opener = openers[rng.choose_index(openers.len())?];
+        // The longest run of it, or where it is first, to grow in place.
+        let (mut start, mut len) = (bytes.len(), 0usize);
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == opener {
+                let run_start = i;
+                while i < bytes.len() && bytes[i] == opener {
+                    i += 1;
+                }
+                if i - run_start > len {
+                    (start, len) = (run_start, i - run_start);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if len == 0 {
+            start = rng.choose_index(bytes.len() + 1)?;
+        }
+        let room = self.config.max_len.checked_sub(bytes.len())?;
+        let grow = len.max(16).min(room);
+        if grow == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() + grow);
+        out.extend_from_slice(&bytes[..start]);
+        out.resize(start + grow, opener);
+        out.extend_from_slice(&bytes[start..]);
+        Some(out)
+    }
+
     fn cmplog_splice(
         &self,
         bytes: &[u8],
         log: &cmplog::CmpLog,
         rng: &mut MutationRng,
     ) -> Option<Vec<u8>> {
-        let mut candidates = cmplog_splice_candidates(log, bytes);
+        let mut candidates: Vec<_> = cmplog_splice_candidates(log, bytes).collect();
         while !candidates.is_empty() {
             let index = rng.choose_index(candidates.len())?;
             let candidate = candidates.swap_remove(index);
@@ -2051,6 +2106,26 @@ fn interesting(bytes: &[u8], rng: &mut MutationRng) -> Option<Vec<u8>> {
     Some(output)
 }
 
+/// The nesting openers [`MutationKind::RepeatToken`] can grow: the bytes
+/// `[`, `{`, `(` and `<` the input holds, and the one-byte dictionary tokens
+/// that are among them.
+fn nesting_openers(bytes: &[u8], dictionary: &Dictionary) -> Vec<u8> {
+    const OPENERS: &[u8] = b"[{(<";
+    let mut found: Vec<u8> = OPENERS
+        .iter()
+        .copied()
+        .filter(|opener| bytes.contains(opener))
+        .collect();
+    for token in dictionary.tokens() {
+        if let [byte] = token {
+            if OPENERS.contains(byte) && !found.contains(byte) {
+                found.push(*byte);
+            }
+        }
+    }
+    found
+}
+
 fn interesting_placements(bytes: &[u8]) -> Vec<(usize, Vec<u8>)> {
     interesting_candidates(bytes.len())
         .into_iter()
@@ -2071,19 +2146,19 @@ fn interesting_placements(bytes: &[u8]) -> Vec<(usize, Vec<u8>)> {
 /// byte, and (c) the operand was found in the input. Used both by
 /// `kind_available` and `cmplog_splice` so the availability gate and
 /// the mutation see the same set.
-fn cmplog_splice_candidates(log: &cmplog::CmpLog, bytes: &[u8]) -> Vec<cmplog::SpliceCandidate> {
-    log.splice_candidates(bytes)
-        .into_iter()
-        .filter(|candidate| {
-            let Some(end) = candidate.offset.checked_add(candidate.original_len) else {
-                return false;
-            };
-            if end > bytes.len() {
-                return false;
-            }
-            bytes[candidate.offset..end] != candidate.replacement[..]
-        })
-        .collect()
+fn cmplog_splice_candidates<'a>(
+    log: &'a cmplog::CmpLog,
+    bytes: &'a [u8],
+) -> impl Iterator<Item = cmplog::SpliceCandidate> + 'a {
+    log.splice_candidate_iter(bytes).filter(|candidate| {
+        let Some(end) = candidate.offset.checked_add(candidate.original_len) else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        bytes[candidate.offset..end] != candidate.replacement[..]
+    })
 }
 
 fn json_escaped_fragment(token: &[u8], max_len: usize) -> String {
@@ -2540,6 +2615,75 @@ mod tests {
             max_len: 64,
             ..MutatorConfig::default()
         })
+    }
+
+    /// #220: the repeat-token mutator doubles the longest run of a nesting
+    /// opener in place (at least to 16), keeps the rest of the input, stops
+    /// at `max_len`, and needs an opener in the input or the dictionary.
+    #[test]
+    fn repeat_token_doubles_the_longest_run_of_a_nesting_opener() {
+        let suite = MutatorSuite::new(MutatorConfig {
+            max_len: 4096,
+            ..MutatorConfig::default()
+        });
+        let empty = Dictionary::default();
+        let mut rng = MutationRng::new(7);
+        let base = b"x[[[y[z]]]";
+        let out = suite
+            .try_mutate_with_kind(
+                &MutationInput::new(base, &empty),
+                MutationKind::RepeatToken,
+                &mut rng,
+            )
+            .unwrap()
+            .bytes;
+        assert_eq!(out.len(), base.len() + 16, "{out:?}");
+        assert!(out.starts_with(b"x"), "{out:?}");
+        assert_eq!(
+            &out[1..20],
+            &[b'['; 19][..],
+            "the run of three grew to nineteen"
+        );
+        assert!(out.ends_with(b"y[z]]]"), "{out:?}");
+
+        // Each step doubles a run that is long already.
+        let mut grown = vec![b'('; 100];
+        for _ in 0..3 {
+            grown = suite
+                .try_mutate_with_kind(
+                    &MutationInput::new(&grown, &empty),
+                    MutationKind::RepeatToken,
+                    &mut rng,
+                )
+                .unwrap()
+                .bytes;
+        }
+        assert_eq!(grown.len(), 800);
+
+        // Capped by max_len.
+        let near = vec![b'{'; 4090];
+        let capped = suite
+            .try_mutate_with_kind(
+                &MutationInput::new(&near, &empty),
+                MutationKind::RepeatToken,
+                &mut rng,
+            )
+            .unwrap()
+            .bytes;
+        assert_eq!(capped.len(), 4096);
+
+        // No opener in the input or the dictionary: not available. A one-byte
+        // dictionary opener makes it available, inserted where it is absent.
+        let plain = MutationInput::new(b"abc", &empty);
+        assert!(!suite.kind_available(&plain, MutationKind::RepeatToken));
+        let with_token = Dictionary::from_tokens([&b"<"[..]]);
+        let input = MutationInput::new(b"abc", &with_token);
+        assert!(suite.kind_available(&input, MutationKind::RepeatToken));
+        let out = suite
+            .try_mutate_with_kind(&input, MutationKind::RepeatToken, &mut rng)
+            .unwrap()
+            .bytes;
+        assert_eq!(out.iter().filter(|&&b| b == b'<').count(), 16, "{out:?}");
     }
 
     #[test]

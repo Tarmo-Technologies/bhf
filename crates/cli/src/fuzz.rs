@@ -1272,6 +1272,8 @@ struct PreparedFuzzRun {
     _local_cmp_map: Option<shared_map::SharedMapFile>,
     /// Keeps the value-profile (#398) map alive for the run.
     _local_vp_map: Option<shared_map::SharedMapFile>,
+    /// Keeps the stack-depth (#220) word alive for the run.
+    _local_stack_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
@@ -3337,6 +3339,22 @@ fn prepare_with_runner(
             None
         };
 
+    // #220 stack depth: the driver records each exec's deepest stack, and a
+    // deeper one is novelty, so recursion depth compounds toward exhaustion.
+    // `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
+    let local_stack_map = if builtin_framed
+        && !extra_env
+            .iter()
+            .any(|(key, _)| key == "BHF_STACK_DEPTH_SHM")
+        && std::env::var("BHF_DISABLE_STACK_DEPTH").as_deref() != Ok("1")
+    {
+        let (path, value) = arm_shared_map(&work_dir, BHF_STACK_DEPTH_BYTES)?;
+        extra_env.push(("BHF_STACK_DEPTH_SHM".to_owned(), value));
+        Some(path)
+    } else {
+        None
+    };
+
     // In-campaign input-to-state channels — armed BY DEFAULT for the raw
     // `bhf fuzz` path so the built-in engine solves magic-value / integer
     // comparison gates out of the box, matching what `bhf auto` already wires
@@ -3403,6 +3421,7 @@ fn prepare_with_runner(
         _local_coverage_map: local_coverage_map,
         _local_cmp_map: local_cmp_map,
         _local_vp_map: local_vp_map,
+        _local_stack_map: local_stack_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
         dict_file: args.dict_file,
@@ -3609,6 +3628,32 @@ struct CoverageTracker {
     cmpp_map: *mut u8,
     cmpp_len: usize,
     virgin_progress: Vec<u8>,
+    /// #220 stack depth: a FOURTH channel. `stack_map` is the driver's 8-byte
+    /// word of the deepest stack (bytes) this exec reached
+    /// (`BHF_STACK_DEPTH_SHM`); null when unset. `deepest` is the highest
+    /// [`stack_depth_bucket`] any input has reached, so an input that recurses
+    /// deeper than every prior one is novel on the same edges.
+    stack_map: *mut u8,
+    deepest: u32,
+}
+
+/// The bytes of the driver's stack-depth word (#220).
+const BHF_STACK_DEPTH_BYTES: usize = 8;
+
+/// A stack depth's novelty bucket: four per doubling (the two bits after the
+/// leading one), so a recursion a quarter deeper again than any before is new,
+/// while a few frames' jitter within one is not. 0 for no depth.
+fn stack_depth_bucket(depth: u64) -> u32 {
+    if depth == 0 {
+        return 0;
+    }
+    let log = 63 - depth.leading_zeros();
+    let fraction = if log >= 2 {
+        ((depth >> (log - 2)) & 3) as u32
+    } else {
+        ((depth << (2 - log)) & 3) as u32
+    };
+    1 + log * 4 + fraction
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -3657,6 +3702,13 @@ impl CoverageTracker {
         } else {
             vec![0u8; BHF_CMPP_BITS]
         };
+        // #220: optionally map the driver's stack-depth word, a fourth channel;
+        // null (inert) when BHF_STACK_DEPTH_SHM is unset.
+        let stack_map = extra_env
+            .iter()
+            .find(|(k, _)| k == "BHF_STACK_DEPTH_SHM")
+            .and_then(|(_, path)| map_shared_file(path, BHF_STACK_DEPTH_BYTES))
+            .unwrap_or(std::ptr::null_mut());
         let mut tracker = Self {
             map,
             len: BHF_COV_BITS,
@@ -3667,6 +3719,8 @@ impl CoverageTracker {
             cmpp_map,
             cmpp_len,
             virgin_progress,
+            stack_map,
+            deepest: 0,
         };
         // Start from whatever coverage already exists (so a later pass only counts
         // edges beyond the earlier passes' accumulated bitmap as "new").
@@ -3762,6 +3816,36 @@ impl CoverageTracker {
         novel
     }
 
+    /// Zero the stack-depth word (#220) so the next exec records its own
+    /// deepest stack; the driver only raises it. No-op when it is absent.
+    fn zero_stack(&self) {
+        if self.stack_map.is_null() {
+            return;
+        }
+        // SAFETY: when non-null, `self.stack_map` is our writable 8-byte mapping.
+        unsafe { std::ptr::write_bytes(self.stack_map, 0, BHF_STACK_DEPTH_BYTES) }
+    }
+
+    /// 1 when the just-executed input reached a deeper stack bucket than any
+    /// input before it (#220), else 0: deeper recursion over the same edges is
+    /// progress toward stack exhaustion. Stateful; call once per main exec,
+    /// after it and before [`Self::zero_stack`] for the next. 0 without the word.
+    fn input_deepened_stack(&mut self) -> usize {
+        if self.stack_map.is_null() {
+            return 0;
+        }
+        // SAFETY: when non-null, `self.stack_map` is a valid 8-byte mapping the
+        // driver writes with one aligned store between execs.
+        let depth = unsafe { std::ptr::read_volatile(self.stack_map as *const u64) };
+        let bucket = stack_depth_bucket(depth);
+        if bucket > self.deepest {
+            self.deepest = bucket;
+            1
+        } else {
+            0
+        }
+    }
+
     /// Zero the per-exec comparison-progress map (#421) so the NEXT exec records
     /// its per-site leading-byte-match in isolation; the harness only ever raises
     /// a site via a `max`-write. Called before EVERY main exec. No-op when the
@@ -3816,6 +3900,7 @@ impl Drop for CoverageTracker {
         unmap_shared(self.map, self.len);
         unmap_shared(self.cnt_map, self.cnt_len);
         unmap_shared(self.cmpp_map, self.cmpp_len);
+        unmap_shared(self.stack_map, BHF_STACK_DEPTH_BYTES);
     }
 }
 
@@ -3844,6 +3929,10 @@ impl CoverageTracker {
     }
     fn zero_progress(&self) {}
     fn input_advanced_comparisons(&mut self) -> usize {
+        0
+    }
+    fn zero_stack(&self) {}
+    fn input_deepened_stack(&mut self) -> usize {
         0
     }
 }
@@ -3883,11 +3972,16 @@ struct CoverageNovelty {
     new_edges: usize,
     new_buckets: usize,
     comparison_advances: usize,
+    /// #220: the input reached a deeper stack than any before it.
+    deeper_stack: usize,
 }
 
 impl CoverageNovelty {
     fn made_progress(self) -> bool {
-        self.new_edges > 0 || self.new_buckets > 0 || self.comparison_advances > 0
+        self.new_edges > 0
+            || self.new_buckets > 0
+            || self.comparison_advances > 0
+            || self.deeper_stack > 0
     }
 
     fn scheduling_energy(self) -> u32 {
@@ -3895,6 +3989,7 @@ impl CoverageNovelty {
             .saturating_mul(8)
             .saturating_add(self.new_buckets.saturating_mul(2))
             .saturating_add(self.comparison_advances)
+            .saturating_add(self.deeper_stack.saturating_mul(4))
             .clamp(1, 4096) as u32
     }
 }
@@ -4812,7 +4907,9 @@ fn run_builtin_with_progress(
                     let log = if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         cmplog::CmpLog::default()
                     } else {
-                        capture_cmplog(reader, fork, &colored)
+                        let mut log = capture_cmplog(reader, fork, &colored);
+                        log.retain_spliceable(&colored);
+                        log
                     };
                     if let Some(entry) = pool.get_mut(base_index) {
                         entry.cmplog = Some(log);
@@ -4858,6 +4955,8 @@ fn run_builtin_with_progress(
             // per-site leading-byte-match is recorded in isolation (the harness
             // only ever `max`-raises it). No-op when the progress map is absent.
             cov.zero_progress();
+            // #220: and the stack-depth word.
+            cov.zero_stack();
         }
         // Whether this run came from the persistent fork-server (vs a fresh
         // per-spawn process). Fork-server findings are replay-validated below so
@@ -4984,10 +5083,12 @@ fn run_builtin_with_progress(
                 let new_edges = t.input_increased_coverage();
                 let new_buckets = t.input_grew_buckets();
                 let comparison_advances = t.input_advanced_comparisons();
+                let deeper_stack = t.input_deepened_stack();
                 CoverageNovelty {
                     new_edges,
                     new_buckets,
                     comparison_advances,
+                    deeper_stack,
                 }
             })
             .unwrap_or_default();
@@ -10395,6 +10496,7 @@ fn fresh_rerun_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
     const SHARED_WITH_THE_FORK_SERVER: &[&str] = &[
         "BHF_COV_SHM",
         "BHF_COV_CNT_SHM",
+        "BHF_STACK_DEPTH_SHM",
         "BHF_CMP_PROGRESS_SHM",
         "BHF_CMP_SHM",
         "BHF_VP_SHM",
@@ -11876,11 +11978,13 @@ mod entropic_tests {
             new_edges: 40,
             new_buckets: 3,
             comparison_advances: 1,
+            deeper_stack: 0,
         };
         let narrow_lane = CoverageNovelty {
             new_edges: 0,
             new_buckets: 1,
             comparison_advances: 0,
+            deeper_stack: 0,
         };
         assert!(broad_lane.scheduling_energy() > narrow_lane.scheduling_energy() * 100);
         assert!(broad_lane.made_progress());
@@ -11952,7 +12056,9 @@ mod resolve_iterations_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod coverage_tracker_tests {
-    use super::{count_to_bucket, CoverageTracker, BHF_COV_BITS};
+    use super::{
+        count_to_bucket, stack_depth_bucket, CoverageNovelty, CoverageTracker, BHF_COV_BITS,
+    };
     use std::io::{Seek, SeekFrom, Write};
 
     // Set one bitmap byte (an "edge") the way the driver's coverage runtime would.
@@ -12171,6 +12277,74 @@ mod coverage_tracker_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stack-depth buckets: four per doubling, so depth a quarter beyond
+    /// a bucket is the next one, and nothing below that is.
+    #[test]
+    fn stack_depth_buckets_split_each_doubling_in_four() {
+        assert_eq!(stack_depth_bucket(0), 0);
+        let buckets: Vec<u32> = [1, 2, 3, 4, 5, 6, 7, 8].map(stack_depth_bucket).to_vec();
+        assert_eq!(buckets, [1, 5, 7, 9, 10, 11, 12, 13]);
+        assert_eq!(stack_depth_bucket(4096), stack_depth_bucket(5119));
+        assert_eq!(stack_depth_bucket(5120), stack_depth_bucket(4096) + 1);
+        assert_eq!(stack_depth_bucket(8192), stack_depth_bucket(4096) + 4);
+        assert_eq!(stack_depth_bucket(u64::MAX), 1 + 63 * 4 + 3);
+    }
+
+    // #220: an input that recursed deeper than every input before it is novel
+    // with no new edge, once per bucket; a shallower or equal one is not.
+    #[test]
+    fn a_deeper_stack_on_the_same_edges_is_novelty() {
+        let dir = crate::test_support::TestDir::new("stack-depth");
+        let cov = dir.join("coverage.shm");
+        let stack = dir.join("stack.shm");
+        let env = vec![
+            ("BHF_COV_SHM".to_owned(), cov.display().to_string()),
+            (
+                "BHF_STACK_DEPTH_SHM".to_owned(),
+                stack.display().to_string(),
+            ),
+        ];
+        let mut tracker = CoverageTracker::new(&env).expect("tracker maps the stack word");
+        set_edge(&cov, 42);
+        assert_eq!(tracker.input_increased_coverage(), 1);
+
+        let exec = |tracker: &mut CoverageTracker, depth: u64| -> CoverageNovelty {
+            tracker.zero_stack();
+            assert_eq!(std::fs::read(&stack).unwrap(), [0; 8]);
+            std::fs::write(&stack, depth.to_ne_bytes()).unwrap();
+            CoverageNovelty {
+                new_edges: tracker.input_increased_coverage(),
+                deeper_stack: tracker.input_deepened_stack(),
+                ..CoverageNovelty::default()
+            }
+        };
+        let first = exec(&mut tracker, 4096);
+        assert_eq!((first.new_edges, first.deeper_stack), (0, 1));
+        assert!(first.made_progress());
+        assert!(!exec(&mut tracker, 4096).made_progress());
+        assert!(
+            !exec(&mut tracker, 5000).made_progress(),
+            "within the bucket"
+        );
+        assert!(!exec(&mut tracker, 512).made_progress(), "shallower");
+        assert!(exec(&mut tracker, 5120).made_progress());
+        let deep = exec(&mut tracker, 1 << 20);
+        assert_eq!(deep.deeper_stack, 1);
+        assert!(deep.scheduling_energy() > 1);
+    }
+
+    /// Without the stack word (a harness built before it, or a lane that
+    /// does not arm it) the channel reports nothing.
+    #[test]
+    fn coverage_tracker_without_stack_word_is_inert() {
+        let dir = crate::test_support::TestDir::new("stack-absent");
+        let cov = dir.join("coverage.shm");
+        let env = vec![("BHF_COV_SHM".to_owned(), cov.display().to_string())];
+        let mut tracker = CoverageTracker::new(&env).expect("tracker maps the bitmap");
+        tracker.zero_stack();
+        assert_eq!(tracker.input_deepened_stack(), 0);
     }
 
     // #421: the comparison-progress channel is inert (always false) when its map
