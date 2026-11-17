@@ -626,6 +626,91 @@ class DefectIdentityTests(unittest.TestCase):
 
 
 
+class CoverageOverTimeTests(unittest.TestCase):
+    """#256: corpus snapshots at fixed fractions of the budget become a
+    coverage curve, and the crash inputs an engine kept are its retained
+    findings."""
+
+    def test_checkpoints_fall_due_once_each_in_order(self):
+        taken: set[float] = set()
+        self.assertEqual(stats.due_checkpoints(0.5, 10, taken), [])
+        self.assertEqual(stats.due_checkpoints(2.6, 10, taken), [0.1, 0.25])
+        taken.update([0.1, 0.25])
+        self.assertEqual(stats.due_checkpoints(2.6, 10, taken), [])
+        self.assertEqual(stats.due_checkpoints(9.9, 10, taken), [0.5, 0.75])
+
+    def test_a_curve_summarizes_each_fraction_over_the_trials(self):
+        series = [
+            [{"fraction": 0.1, "t_s": 6.0, "edges": 10}, {"fraction": 1.0, "t_s": 60.0, "edges": 40}],
+            [{"fraction": 0.1, "t_s": 6.0, "edges": 20}, {"fraction": 1.0, "t_s": 60.0, "edges": 50}],
+            # A trial that ended before its first checkpoint has its final point only.
+            [{"fraction": 1.0, "t_s": 60.0, "edges": 60}],
+        ]
+        curve = stats.coverage_curve(series)
+        self.assertEqual([point["fraction"] for point in curve], [0.1, 1.0])
+        self.assertEqual(curve[0]["t_s"], 6.0)
+        self.assertEqual(curve[0]["edges"]["n"], 2)
+        self.assertEqual(curve[0]["edges"]["median"], 15.0)
+        self.assertEqual(curve[1]["edges"]["n"], 3)
+        self.assertEqual(curve[1]["edges"]["median"], 50.0)
+        self.assertEqual(stats.coverage_curve([]), [])
+
+    def test_retained_findings_replay_every_kept_crash_input(self):
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # A stand-in oracle: an input starting with "A" or "B" trips one
+            # of two sanitizer reports; anything else runs clean.
+            oracle = tmp / "oracle.sh"
+            oracle.write_text(
+                "#!/bin/sh\n"
+                "head=$(head -c1)\n"
+                'case "$head" in\n'
+                "  A) echo '==11==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60200000eff1' >&2; exit 1;;\n"
+                "  B) echo 'runtime error: signed integer overflow' >&2; exit 1;;\n"
+                "esac\n"
+            )
+            oracle.chmod(0o755)
+            artifacts = []
+            for index, body in enumerate([b"A1", b"A2", b"B", b"clean"]):
+                path = tmp / f"crash-{index}"
+                path.write_bytes(body)
+                artifacts.append(path)
+            self.assertEqual(
+                trade_study.retained_findings(oracle, artifacts, "tgt"),
+                {"kept": 4, "replayed": 4, "confirmed": 3, "distinct_diagnostics": 2},
+            )
+
+    def test_each_engines_crash_artifacts_and_corpus_are_found(self):
+        with TemporaryDirectory() as tmp:
+            engine_dir = Path(tmp)
+            for path in [
+                "artifacts/crash-1",
+                "afl-output/default/crashes/id:000000,sig:11",
+                "afl-output/default/queue/id:000001",
+                "hf-crashes/SIGSEGV.1",
+                "work/results/findings/F-0000-a/testcase.bin",
+                "live-corpus/ab.bin",
+                "corpus/seed-0000",
+            ]:
+                (engine_dir / path).parent.mkdir(parents=True, exist_ok=True)
+                (engine_dir / path).write_bytes(b"x")
+            for engine, crash in [
+                ("libfuzzer", "crash-1"),
+                ("aflpp", "id:000000,sig:11"),
+                ("honggfuzz", "SIGSEGV.1"),
+                ("bhf", "testcase.bin"),
+            ]:
+                found = trade_study.engine_crash_artifacts(engine, engine_dir)
+                self.assertEqual([p.name for p in found], [crash], engine)
+            self.assertEqual(
+                [p.name for p in trade_study.engine_corpus_files("bhf", engine_dir)], ["ab.bin"]
+            )
+            self.assertEqual(
+                [p.name for p in trade_study.engine_corpus_files("aflpp", engine_dir)],
+                ["id:000001"],
+            )
+
+
 class BhfFindingsLayoutTests(unittest.TestCase):
     """#403: bhf writes findings to results/findings/<id>/; the study read
     the legacy findings/<id>/ and never saw a bhf crash."""

@@ -4029,6 +4029,17 @@ impl CoverageNovelty {
     }
 }
 
+/// Write `input` into the live corpus dir (#256) as `<sha256>.bin`, the
+/// queue's naming. Best effort: the dir is an observer's, not the run's.
+fn write_live_corpus_entry(dir: &Path, input: &[u8]) {
+    use sha2::Digest;
+    let name = corpus::hex_lower(&sha2::Sha256::digest(input));
+    let path = dir.join(format!("{name}.bin"));
+    if !path.exists() {
+        let _ = fs::write(path, input);
+    }
+}
+
 /// How many times the persistent engine re-runs a new corpus entry to see
 /// whether it hits the same edges each time (#232).
 const CALIBRATION_RERUNS: usize = 4;
@@ -4535,6 +4546,16 @@ fn run_builtin_with_progress(
     let mut corpus_duplicates = 0_usize;
     let mut non_reproducible = 0_usize;
     let mut calibration = Calibration::default();
+    // #256: `BHF_LIVE_CORPUS_DIR` gets each input as the pool keeps it, so a
+    // harness that watches the corpus over a campaign (the engine trade
+    // study's coverage-over-time snapshots) sees it grow. The queue is
+    // written when the pass ends, after its re-run checks.
+    let live_corpus_dir = std::env::var_os("BHF_LIVE_CORPUS_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    if let Some(dir) = live_corpus_dir.as_deref() {
+        let _ = fs::create_dir_all(dir);
+    }
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -5587,6 +5608,9 @@ fn run_builtin_with_progress(
                 lane.retained_inputs = lane.retained_inputs.saturating_add(1);
             }
             lineage.retain(&input, parents);
+            if let Some(dir) = live_corpus_dir.as_deref() {
+                write_live_corpus_entry(dir, &input);
+            }
             pool_bytes = pool_bytes.saturating_add(input.len());
             pool.push(PoolEntry {
                 bytes: input,

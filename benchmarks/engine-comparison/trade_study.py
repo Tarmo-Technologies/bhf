@@ -486,6 +486,84 @@ def parse_honggfuzz(log_path: Path) -> dict:
 # --- one engine on one target for one trial --------------------------------
 
 
+def engine_corpus_files(engine: str, engine_dir: Path) -> list[Path]:
+    """The corpus an engine has on disk while it runs (#256): bhf's is the
+    live corpus dir ``BHF_LIVE_CORPUS_DIR`` names, since it writes its queue
+    when the pass ends."""
+    dirs = {
+        "libfuzzer": [engine_dir / "corpus"],
+        "aflpp": [engine_dir / "afl-output" / "default" / "queue"],
+        "honggfuzz": [engine_dir / "hf-corpus"],
+        "bhf": [engine_dir / "live-corpus"],
+    }.get(engine, [])
+    return sorted(p for d in dirs if d.is_dir() for p in d.iterdir() if p.is_file())
+
+
+def engine_crash_artifacts(engine: str, engine_dir: Path) -> list[Path]:
+    """Every crash input an engine kept by the end of its campaign."""
+    if engine == "libfuzzer":
+        found = (engine_dir / "artifacts").glob("crash-*")
+    elif engine == "aflpp":
+        found = (engine_dir / "afl-output" / "default" / "crashes").glob("id:*")
+    elif engine == "honggfuzz":
+        found = (engine_dir / "hf-crashes").glob("*")
+    elif engine == "bhf":
+        work = engine_dir / "work"
+        found = [p for d in run.bhf_findings_dirs(work) for p in d.glob("*/testcase.bin")]
+    else:
+        found = []
+    return sorted(p for p in found if p.is_file())
+
+
+def snapshot_corpus(files: list[Path], dest: Path) -> Path:
+    """Copy a corpus as it stands into ``dest`` (an engine may later reduce
+    or replace an entry)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for index, path in enumerate(files):
+        try:
+            shutil.copy(path, dest / f"{index:06d}-{path.name.replace(':', '_')}")
+        except OSError:
+            pass  # the engine removed it mid-copy
+    return dest
+
+
+def curve_point(fraction: float, budget: int, coverage: dict) -> dict:
+    return {
+        "fraction": fraction,
+        "t_s": round(fraction * budget, 1),
+        "edges": coverage.get("edges"),
+        "features": coverage.get("features"),
+        "corpus_size": coverage.get("corpus_size"),
+    }
+
+
+# The most kept crash inputs one trial replays for its retained findings.
+RETAINED_REPLAY_CAP = 64
+
+
+def retained_findings(oracle: Path, artifacts: list[Path], target: str) -> dict:
+    """The crash inputs an engine kept, replayed through the independent
+    oracle (#256): how many it kept, how many reproduce, and how many
+    distinct normalized diagnostics they give (a grouping aid like
+    ``normalized_diagnostic_variants``, not a defect count)."""
+    replayed = artifacts[:RETAINED_REPLAY_CAP]
+    confirmed = 0
+    identities: set[str] = set()
+    for artifact in replayed:
+        verdict = replay_oracle(oracle, artifact)
+        if verdict.get("confirmed"):
+            confirmed += 1
+            identity = normalize_defect_signature(verdict.get("signature"), target)
+            if identity:
+                identities.add(identity)
+    return {
+        "kept": len(artifacts),
+        "replayed": len(replayed),
+        "confirmed": confirmed,
+        "distinct_diagnostics": len(identities),
+    }
+
+
 def run_engine(
     engine,
     args,
@@ -525,6 +603,17 @@ def run_engine(
         "seed_sha256s": seed_sha256s,
     }
     src_suffix = source_build_args(target_sources, spec)
+    # #256: the engine's corpus at fixed fractions of the budget, for its
+    # coverage-over-time curve.
+    snapshots: dict[float, Path] = {}
+
+    def snapshot_poll(elapsed_s: float) -> None:
+        for fraction in stats.due_checkpoints(elapsed_s, budget, set(snapshots)):
+            snapshots[fraction] = snapshot_corpus(
+                engine_corpus_files(engine, engine_dir),
+                engine_dir / "snapshots" / f"{round(fraction * 100):03d}",
+            )
+
     build_s = 0.0
     build_rc = 0
     measure = None
@@ -575,6 +664,7 @@ def run_engine(
                 cpu=args.cpu,
                 timeout_s=budget + 20,
                 crash_probe=lambda: run.libfuzzer_crash_artifact(artifacts),
+                on_poll=snapshot_poll,
             )
             native = (
                 run.parse_libfuzzer(Path(measure["log"])) if measure.get("log") else {}
@@ -647,6 +737,7 @@ def run_engine(
                 timeout_s=budget + 25,
                 crash_probe=lambda: run.afl_crash_artifact(output),
                 env=renv,
+                on_poll=snapshot_poll,
             )
             native = run.parse_afl(output)
             final_corpus = afl_corpus(output)
@@ -707,6 +798,7 @@ def run_engine(
                 timeout_s=budget + 25,
                 crash_probe=hf_crash,
                 env=renv,
+                on_poll=snapshot_poll,
             )
             native = parse_honggfuzz(engine_dir / "run.log")
             final_corpus = hongg_corpus(outcorp)
@@ -783,6 +875,8 @@ def run_engine(
                     cpu=args.cpu,
                     timeout_s=budget + 25,
                     crash_probe=bhf_crash,
+                    env={**os.environ, "BHF_LIVE_CORPUS_DIR": str(engine_dir / "live-corpus")},
+                    on_poll=snapshot_poll,
                 )
                 native = (
                     run.parse_bhf_fuzz(Path(measure["log"]), work)
@@ -810,6 +904,21 @@ def run_engine(
 
     # Engine-neutral coverage of the FINAL corpus.
     cov = common_coverage(cov_binary, final_corpus, args.cpu, engine_dir / "cov")
+    seeds = sorted(p for p in corpus.iterdir() if p.is_file())
+    curve = []
+    for fraction, snapshot in sorted(snapshots.items()):
+        point = common_coverage(
+            cov_binary,
+            seeds + sorted(snapshot.iterdir()),
+            args.cpu,
+            engine_dir / f"cov-{round(fraction * 100):03d}",
+        )
+        curve.append(curve_point(fraction, budget, point))
+    if measure is not None:
+        curve.append(curve_point(1.0, budget, cov))
+    retained = retained_findings(
+        oracle, engine_crash_artifacts(engine, engine_dir), case
+    )
 
     # Precise TTFC only from the engine's native crash artifact (honggfuzz's
     # persistent+ASan loop does not record one, so its TTFC is null even when the
@@ -842,6 +951,10 @@ def run_engine(
             "common_cov_edges": cov.get("edges"),
             "common_cov_features": cov.get("features"),
             "final_corpus_size": cov.get("corpus_size"),
+            # #256: engine-neutral coverage at each checkpoint, and every crash
+            # input the engine kept, replayed through the oracle.
+            "coverage_over_time": curve,
+            "retained_findings": retained,
             "native_executions": native.get("executions_native"),
         }
     )
@@ -1015,6 +1128,20 @@ def aggregate(rows: list[dict], engines, cases) -> dict:
             "ttfc_s": "distribution over oracle-confirmed trials with a native TTFC",
             "common_cov_edges": "engine-neutral shared-sancov edges; median + IQR + range + bootstrap CI",
             "native_execs_per_s": "per-engine only; NOT comparable across engines (counter semantics differ)",
+            "coverage_over_time": (
+                "engine-neutral shared-sancov edges of the corpus snapshotted at each "
+                "fraction of the budget (seeds included), the final corpus at 1.0; a "
+                "trial that ended earlier (libFuzzer stops at its first crash) is "
+                "missing from the later points, so n stays visible"
+            ),
+            "retained_confirmed_findings": (
+                "crash inputs the engine kept by the end of a trial that the oracle "
+                "reproduces (at most 64 replayed per trial)"
+            ),
+            "retained_distinct_diagnostics": (
+                "distinct normalized diagnostics among them: a grouping aid, NOT a "
+                "defect count"
+            ),
         },
     }
 
@@ -1093,6 +1220,17 @@ def engine_summary(sub: list[dict]) -> dict:
         "right_censored_s": sorted(
             r["right_censor_s"] for r in censored if r.get("right_censor_s") is not None
         ),
+        # #256: engine-neutral coverage at each checkpoint over the trials, and
+        # the crash inputs each trial kept and the oracle confirmed.
+        "coverage_over_time": stats.coverage_curve(
+            [r["coverage_over_time"] for r in sub if r.get("coverage_over_time")]
+        ),
+        "retained_confirmed_findings": stats.summarize(
+            [(r.get("retained_findings") or {}).get("confirmed") for r in sub]
+        ).as_dict(),
+        "retained_distinct_diagnostics": stats.summarize(
+            [(r.get("retained_findings") or {}).get("distinct_diagnostics") for r in sub]
+        ).as_dict(),
     }
 
 

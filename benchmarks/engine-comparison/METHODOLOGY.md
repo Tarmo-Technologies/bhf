@@ -41,6 +41,26 @@ What issue #85 added on top:
   campaigns keep their censor time.
 - **Native counters are not a shared unit.** `native_execs_per_s` is reported
   per-engine with `comparable_across_engines: false`; it is never pooled.
+- **Coverage over time** (#256). While a campaign runs, the study copies the
+  engine's on-disk corpus at 10, 25, 50 and 75% of the budget
+  (`stats.CHECKPOINT_FRACTIONS`; libFuzzer's corpus dir, AFL++'s queue,
+  honggfuzz's output corpus, and for bhf the `BHF_LIVE_CORPUS_DIR` it is
+  given, since bhf writes its queue when the pass ends). After the campaign
+  each snapshot, with the seeds, is replayed through the shared sancov binary;
+  the final corpus is the 1.0 point. A row's `coverage_over_time` lists the
+  points (`fraction`, `t_s`, `edges`, `features`, `corpus_size`), and the
+  summary's `coverage_over_time` gives each fraction's distribution over the
+  trials. A trial that ended early (libFuzzer stops at its first crash) is
+  missing from the later points, which their `n` shows.
+- **Retained findings** (#256). After a campaign every crash input the engine
+  kept (libFuzzer's `crash-*` artifacts, AFL++'s `crashes/`, honggfuzz's crash
+  dir, bhf's `results/findings/*/testcase.bin`), at most 64, is replayed
+  through the oracle. A row's `retained_findings` gives how many were kept,
+  replayed and confirmed, and how many distinct normalized diagnostics the
+  confirmed ones give (a grouping aid, not a defect count); the summary has
+  the distributions of the confirmed count and of the diagnostics. It shows
+  what an engine keeps past its first crash: libFuzzer stops there, AFL++ and
+  bhf go on.
 
 ### Running Experiment 1
 
@@ -156,8 +176,8 @@ python3 benchmarks/harness-parity-20/run.py --seconds 15 --jobs 2 \
 ```
 
 "Useful retained findings" in the issue's sense (confirmed crash/sanitizer
-findings, not just coverage parity) is a dimension this coverage-parity suite
-does not yet capture; see limitations.
+findings, not just coverage parity) is measured per engine by Experiment 1
+(`retained_findings`); this coverage-parity suite does not capture it.
 
 ## Limitations (what is not established)
 
@@ -169,9 +189,6 @@ does not yet capture; see limitations.
   State the niche and the measured number; do not extrapolate.
 - **No licensed-tool comparison.** No Mayhem (or other licensed tool) evaluation
   has been run; make no such parity claim without an actual authorized run.
-- **Coverage-over-time** is not yet recorded — Experiment 1 measures final-corpus
-  coverage, not a time series. A powered study should snapshot corpora over the
-  budget.
 - **Real-code multi-file builds.** The single clang/afl-cc/hfuzz-cc invocation
   cannot configure an arbitrary project build; a target without a build recipe
   ships as `requires_build_recipe` (visible `unsupported` rows).

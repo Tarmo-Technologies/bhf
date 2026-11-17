@@ -2717,6 +2717,15 @@
   when bhf panics.
 
 ### Added
+- The engine trade study records coverage over time and retained findings
+  (#256). It snapshots each engine's corpus at 10, 25, 50 and 75% of the
+  budget and replays each through the shared coverage binary, so a row has a
+  coverage curve and the summary its distribution per checkpoint; and it
+  replays every crash input an engine kept through the oracle, so a row
+  counts the kept, confirmed and distinct findings and the summary gives
+  their distributions. `BHF_LIVE_CORPUS_DIR` makes bhf's built-in engine
+  write each input it keeps there as it keeps it, since its queue is written
+  when the pass ends.
 - Pinned build recipes for the trade study's libpng and re2 targets
   (#371), so all six real-code targets are runnable: libpng's library
   sources with its prebuilt `pnglibconf.h`, linked with the zlib recipe, and

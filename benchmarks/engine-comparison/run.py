@@ -185,6 +185,7 @@ def monitor(
     timeout_s: float,
     crash_probe: Callable[[], Path | None],
     env: dict | None = None,
+    on_poll: Callable[[float], None] | None = None,
 ) -> dict:
     started = time.monotonic()
     first_crash_s = None
@@ -200,6 +201,8 @@ def monitor(
         )
         while process.poll() is None:
             elapsed = time.monotonic() - started
+            if on_poll is not None:
+                on_poll(elapsed)
             found_artifact = crash_probe()
             if first_crash_s is None and found_artifact is not None:
                 first_crash_s = elapsed
