@@ -30,19 +30,47 @@ pub fn run_json_rpc_with_security<R: BufRead, W: Write>(
     writer: W,
     security: DaemonSecurityConfig,
 ) -> Result<(), JsonRpcServerError> {
-    let limit = memory_budget::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
-    run_json_rpc_with_limit(reader, writer, security, limit)
+    run_json_rpc_with_services(reader, writer, security, &DaemonServices::default())
 }
 
+/// What the daemon serves besides its stateless methods.
+#[derive(Default)]
+pub struct DaemonServices {
+    /// The continuous fuzzing scheduler the job methods drive (#271), when
+    /// the daemon runs one (`bhf-daemon --jobs-dir`).
+    pub jobs: Option<continuous_daemon::Scheduler>,
+}
+
+pub fn run_json_rpc_with_services<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    security: DaemonSecurityConfig,
+    services: &DaemonServices,
+) -> Result<(), JsonRpcServerError> {
+    let limit = memory_budget::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
+    serve_json_rpc(reader, writer, security, limit, services)
+}
+
+#[cfg(test)]
 fn run_json_rpc_with_limit<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    security: DaemonSecurityConfig,
+    limit: usize,
+) -> Result<(), JsonRpcServerError> {
+    serve_json_rpc(reader, writer, security, limit, &DaemonServices::default())
+}
+
+fn serve_json_rpc<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     security: DaemonSecurityConfig,
     limit: usize,
+    services: &DaemonServices,
 ) -> Result<(), JsonRpcServerError> {
     while let Some(frame) = read_frame_with_limit(&mut reader, limit)? {
         let response = match serde_json::from_slice::<JsonRpcRequest>(&frame) {
-            Ok(request) => handle_json_rpc_request(request, &security, limit),
+            Ok(request) => handle_json_rpc_request(request, &security, limit, services),
             Err(error) => Some(error_response(
                 Value::Null,
                 RpcFailure::invalid_request(format!("invalid JSON-RPC request: {error}")),
@@ -368,6 +396,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
             Some(params.arguments),
             &AuthorizedIdentity::Local,
             limit,
+            &DaemonServices::default(),
         ),
         "bhf_list_targets" => {
             let mut parsed: ListTargetsRpcParams = serde_json::from_value(params.arguments)
@@ -690,11 +719,12 @@ fn handle_json_rpc_request(
     request: JsonRpcRequest,
     security: &DaemonSecurityConfig,
     limit: usize,
+    services: &DaemonServices,
 ) -> Option<Value> {
     let id = request.id;
     let Some(response_id) = id.clone() else {
         let _ = authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit, services)
         });
         return None;
     };
@@ -708,7 +738,7 @@ fn handle_json_rpc_request(
 
     Some(
         match authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit, services)
                 .map(|result| (result, identity))
         }) {
             Ok((result, identity)) => {
@@ -733,12 +763,123 @@ fn dispatch_json_rpc_method(
     params: Option<Value>,
     identity: &AuthorizedIdentity,
     limit: usize,
+    services: &DaemonServices,
 ) -> Result<Value, RpcFailure> {
+    if let Some(result) = dispatch_job_method(method, params.clone(), identity, services) {
+        return result;
+    }
     // The paths the request was authorized to use stay pinned until the
     // response is built, which names them resolved (#362).
     let mut pins = pinned_path::Pins::default();
     let result = dispatch_authorized(method, params, identity, limit, &mut pins)?;
     Ok(pins.unpin(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitJobParams {
+    project_dir: PathBuf,
+    harness_id: String,
+    /// The job's fuzz time, in seconds; 0 runs it until it is cancelled.
+    time_budget_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListJobsParams {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_job_page")]
+    limit: usize,
+}
+
+fn default_job_page() -> usize {
+    100
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelJobParams {
+    job_id: String,
+}
+
+/// The job methods (#271), or `None` for another method. A tenant submits
+/// jobs for projects inside its workspace root, and sees and cancels only
+/// those; an operator may submit and cancel, a viewer only list.
+fn dispatch_job_method(
+    method: &str,
+    params: Option<Value>,
+    identity: &AuthorizedIdentity,
+    services: &DaemonServices,
+) -> Option<Result<Value, RpcFailure>> {
+    let access = match method {
+        "submitJob" | "cancelJob" => MethodAccess::Operate,
+        "listJobs" => MethodAccess::Read,
+        _ => return None,
+    };
+    Some((|| {
+        authorize_method(identity, access)?;
+        let scheduler = services.jobs.as_ref().ok_or_else(|| {
+            RpcFailure::server_error(
+                "this daemon runs no job scheduler; start it with `bhf-daemon --jobs-dir DIR`",
+            )
+        })?;
+        let visible = |job: &continuous_daemon::FuzzJob| match identity {
+            AuthorizedIdentity::Local => true,
+            AuthorizedIdentity::Tenant(tenant) => tenant
+                .workspace_root
+                .canonicalize()
+                .is_ok_and(|root| job.project_dir.starts_with(root)),
+        };
+        let job_error =
+            |error: continuous_daemon::DaemonError| RpcFailure::server_error(error.to_string());
+        match method {
+            "submitJob" => {
+                let params = parse_params::<SubmitJobParams>(params)?;
+                // The job runs later, by the path: queue the resolved one.
+                let mut pins = pinned_path::Pins::default();
+                authorize_path(identity, &params.project_dir, &mut pins)?;
+                let project_dir = canonicalize_for_auth(&params.project_dir)?;
+                let job_id = scheduler
+                    .submit(
+                        project_dir,
+                        params.harness_id,
+                        std::time::Duration::from_secs(params.time_budget_secs),
+                    )
+                    .map_err(job_error)?;
+                Ok(json!({ "job_id": job_id, "state": continuous_daemon::JobState::Queued }))
+            }
+            "listJobs" => {
+                let params = parse_params::<ListJobsParams>(params)?;
+                let jobs: Vec<_> = scheduler
+                    .list_jobs()
+                    .map_err(job_error)?
+                    .into_iter()
+                    .filter(|job| visible(job))
+                    .collect();
+                let page: Vec<_> = jobs
+                    .iter()
+                    .skip(params.offset)
+                    .take(params.limit.clamp(1, 1000))
+                    .collect();
+                Ok(json!({ "total": jobs.len(), "jobs": page }))
+            }
+            _ => {
+                let params = parse_params::<CancelJobParams>(params)?;
+                // Another tenant's job is no job of this one's.
+                let known = scheduler
+                    .list_jobs()
+                    .map_err(job_error)?
+                    .iter()
+                    .any(|job| job.job_id == params.job_id && visible(job));
+                if !known {
+                    return Err(RpcFailure::invalid_params(format!(
+                        "no job {}",
+                        params.job_id
+                    )));
+                }
+                let state = scheduler.cancel(&params.job_id).map_err(job_error)?;
+                Ok(json!({ "job_id": params.job_id, "state": state }))
+            }
+        }
+    })())
 }
 
 fn dispatch_authorized(

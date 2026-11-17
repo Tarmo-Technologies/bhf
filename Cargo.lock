@@ -234,6 +234,7 @@ dependencies = [
  "ada_parser",
  "bhf",
  "c_parser",
+ "continuous_daemon",
  "cpp_parser",
  "instrumenter",
  "libc",

@@ -11,6 +11,7 @@ pub enum PersistencePhase {
     Admission,
     Start,
     Completion,
+    Cancellation,
 }
 
 /// First storage error since startup. A snapshot may be installed but not durable.
@@ -37,6 +38,8 @@ pub struct SchedulerHealth {
     pub running_jobs: usize,
     pub complete_jobs: usize,
     pub failed_jobs: usize,
+    #[serde(default)]
+    pub cancelled_jobs: usize,
     pub max_jobs: usize,
     pub max_queued_jobs: usize,
     pub snapshot_bytes_reserved: usize,
@@ -59,6 +62,7 @@ impl Scheduler {
             running_jobs: 0,
             complete_jobs: 0,
             failed_jobs: 0,
+            cancelled_jobs: 0,
             max_jobs: self.limits.max_jobs,
             max_queued_jobs: self.limits.max_queued_jobs,
             snapshot_bytes_reserved: guard.snapshot_bytes_reserved,
@@ -71,6 +75,7 @@ impl Scheduler {
                 JobState::Running => health.running_jobs += 1,
                 JobState::Complete => health.complete_jobs += 1,
                 JobState::Failed => health.failed_jobs += 1,
+                JobState::Cancelled => health.cancelled_jobs += 1,
             }
         }
         health

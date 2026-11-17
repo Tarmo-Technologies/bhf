@@ -2,8 +2,15 @@
 # Scheduler reliability and operational health
 
 This document describes the `continuous_daemon::Scheduler` library. It does not
-introduce a network service, a new CLI subcommand, a multi-tenant security
-boundary, or a guarantee of exactly-once execution.
+introduce a network service or a guarantee of exactly-once execution.
+`bhf-daemon --jobs-dir` serves it over the daemon's JSON-RPC job methods, where
+`--security-config` scopes each tenant to its workspace's jobs
+([daemon.md](site/daemon.md#continuous-daemon)).
+
+A job can be cancelled (`Scheduler::cancel`). A queued one is `Cancelled` and
+persisted at once. A running one is stopped by its worker, which kills the job's
+process tree as for a deadline and records `Cancelled`. A failed persistence of
+a queued cancellation latches the `Cancellation` storage fault.
 
 ## One owner per storage directory
 

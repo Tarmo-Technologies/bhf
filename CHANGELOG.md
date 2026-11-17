@@ -2862,6 +2862,13 @@
   short or shared token, or an unknown field stops the daemon at start with
   exit 2 and the reason. The shipped daemon always ran single-user, so a
   shared deployment that followed daemon.md ran with no authentication.
+- `bhf-daemon --jobs-dir DIR` runs the continuous fuzzing scheduler behind
+  the `submitJob`, `listJobs` and `cancelJob` JSON-RPC methods (#271), with
+  `--job-workers` and `--bhf`. A tenant submits, sees and cancels only jobs
+  for projects inside its workspace root; a viewer only lists them. The
+  scheduler gained `Scheduler::cancel` and a `cancelled` state: a queued
+  job never starts, and a running one's process tree is killed. It had no
+  consumer at all.
 - A protocol profile's response captures take TLV records (#259): a `tlv`
   capture walks the records from its offset to the one with its `tag` and
   binds the value, which a later request echoes from a `bytes` or `tlv`

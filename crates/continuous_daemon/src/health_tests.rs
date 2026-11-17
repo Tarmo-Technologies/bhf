@@ -44,6 +44,7 @@ fn shared(job: FuzzJob) -> SharedState {
             next_id: 1,
             snapshot_bytes_reserved: 1024,
             storage_fault: None,
+            cancel_requested: Default::default(),
         }),
         cv: Condvar::new(),
     }
@@ -568,4 +569,64 @@ fn real_worker_completion_storage_failure_stops_the_next_job() {
     assert!(!health.accepting_submissions);
     assert!(!dir.path().join("entered-second").exists());
     assert_eq!(scheduler.list_jobs().unwrap()[1].state, JobState::Queued);
+}
+
+/// `cancel` (#271): a queued job is `Cancelled` at once and never starts; a
+/// running one is stopped by its worker and recorded `Cancelled`; a finished
+/// or unknown one is reported as it is.
+#[cfg(unix)]
+#[test]
+fn queued_and_running_jobs_are_cancelled() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("worker.sh");
+    fs::write(
+        &script,
+        b"#!/bin/sh\ntouch \"$2/entered-$4\"\nwhile [ ! -f \"$2/release\" ]; do sleep 0.01; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cfg = config(dir.path());
+    cfg.bhf_bin = script;
+    let scheduler = Scheduler::start(&cfg).unwrap();
+    let running = scheduler
+        .submit(dir.path().to_owned(), "running".into(), Duration::ZERO)
+        .unwrap();
+    wait_for(|| dir.path().join("entered-running").exists());
+    let queued = scheduler
+        .submit(dir.path().to_owned(), "queued".into(), Duration::ZERO)
+        .unwrap();
+
+    assert_eq!(scheduler.cancel(&queued).unwrap(), JobState::Cancelled);
+    assert_eq!(scheduler.cancel(&running).unwrap(), JobState::Running);
+    let state = |id: &str| {
+        scheduler
+            .list_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.job_id == id)
+            .unwrap()
+            .state
+    };
+    wait_for(|| state(&running) == JobState::Cancelled);
+    assert_eq!(state(&queued), JobState::Cancelled);
+    // The worker is free, and the cancelled job never started.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!dir.path().join("entered-queued").exists());
+    assert_eq!(scheduler.cancel(&running).unwrap(), JobState::Cancelled);
+    assert!(matches!(
+        scheduler.cancel("J-999999"),
+        Err(DaemonError::UnknownJob(_))
+    ));
+    let health = scheduler.health();
+    assert_eq!(health.cancelled_jobs, 2);
+    assert_eq!(health.running_jobs, 0);
+    // Persisted: a restart keeps both cancelled.
+    drop(scheduler);
+    let restarted = Scheduler::start(&cfg).unwrap();
+    assert!(restarted
+        .list_jobs()
+        .unwrap()
+        .iter()
+        .all(|job| job.state == JobState::Cancelled));
 }
