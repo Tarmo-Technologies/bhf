@@ -274,7 +274,7 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
 /// "the C harness", "the Java harness": the lane of the harness executable
 /// `harness`, read from its harness dir (`<dir>/main`, or `<dir>/obj/main` for
 /// an Ada build), else "the harness".
-fn harness_lane(harness: &std::path::Path) -> String {
+pub(crate) fn harness_lane(harness: &std::path::Path) -> String {
     let mut dir = harness.parent();
     if dir
         .and_then(|dir| dir.file_name())

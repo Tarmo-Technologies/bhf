@@ -77,6 +77,14 @@ To pass `--harness`, a C or C++ harness replays from the `build/<id>/main`
 that `bhf build` stages or from `bhf_work/harnesses/<id>/main` (`main.exe` on
 Windows, as every harness binary there is named: `main_cov.exe`,
 `main_afl.exe`, ...).
+`--strategy typed` reduces the values of the arguments the harness decodes
+and keeps the input's layout: each integer or flag to the first of 0, 1, -1
+and its type's limits that still crashes, then an integer to the value
+nearest zero that does, the boundary its crash starts at. It applies to an Ada
+harness and to a generated C/C++ harness, by the `arg-layout.json` beside it.
+Another lane, a binary finding and an on-target transport finding have no
+argument layout and are refused by name; minimize them with `--strategy
+bytes`, the default.
 An on-target transport finding minimizes through the transport it was found
 on, rebuilt from its profile (`--transport-endpoint HOST:PORT` relocates it),
 on the same fault rule and site (see

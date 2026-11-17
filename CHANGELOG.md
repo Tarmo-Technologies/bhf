@@ -2796,6 +2796,14 @@
   when bhf panics.
 
 ### Added
+- `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
+  finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
+  integer or flag to the first of 0, 1, -1 and its type's limits that still
+  crashes, then an integer to the value nearest zero that does, keeping the
+  input's layout. `minimization.typed` records what it tried and kept. A
+  lane without an argument layout, a binary finding and a transport finding
+  are refused by name. The strategy was Ada-only, and it refused every other
+  harness as "C/C++".
 - `bhf minimize` minimizes on-target transport findings (#280). It rebuilds
   the transport from the finding's profile as `bhf replay` does
   (`--transport-endpoint` relocates it), then delta-debugs the input,

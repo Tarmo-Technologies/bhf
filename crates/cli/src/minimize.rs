@@ -81,7 +81,12 @@ pub struct MinimizeArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MinimizeStrategy {
+    /// Delta-debug the input's bytes.
     Bytes,
+    /// Reduce each decoded argument's value, keeping the input's layout: to
+    /// 0, 1, -1 or its type's limits, then an integer to the value nearest
+    /// zero that still crashes. For Ada harnesses and generated C/C++
+    /// harnesses, from their `arg-layout.json`.
     Typed,
 }
 
@@ -176,22 +181,47 @@ fn minimize_c_engine_until(
     let harness = runner.harness_path();
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    if strategy != MinimizeStrategy::Bytes {
-        return Err(anyhow!(
-            "minimize --strategy {} is not yet supported for C/C++ harnesses",
-            strategy.as_str()
-        ));
-    }
     let testcase_path = finding_dir.join("testcase.bin");
     let original_input =
         fs::read(&testcase_path).with_context(|| format!("read {}", testcase_path.display()))?;
-
-    let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
-    let tmp_dir = scratch.path();
     let raw = fs::read(finding_dir.join("finding.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .unwrap_or(serde_json::Value::Null);
+    // #279: the typed strategy reduces the arguments the harness decodes,
+    // which its `arg-layout.json` locates in the input.
+    let typed_spans = match strategy {
+        MinimizeStrategy::Bytes => None,
+        MinimizeStrategy::Typed => {
+            let work_dir = corpus::layout::work_dir_for_finding(finding_dir).unwrap_or_default();
+            let harness_id = raw["harness_id"].as_str().unwrap_or_default();
+            let layout =
+                crate::fuzz::typed_spans::find_arg_layout(&work_dir, harness_id, Some(harness))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "minimize --strategy typed reduces the arguments a harness decodes, \
+                             by the arg-layout.json a generated C/C++ harness has; {} has none \
+                             ({}), so minimize it with --strategy bytes",
+                            crate::corpus::harness_lane(harness),
+                            harness.display()
+                        )
+                    })?;
+            let spans = crate::fuzz::typed_spans::arg_layout_typed_spans(&layout, &original_input);
+            if spans.is_empty() {
+                return Err(anyhow!(
+                    "minimize --strategy typed: the testcase decodes no integer or flag \
+                     argument of {} ({} bytes), so there is no value to reduce; minimize it \
+                     with --strategy bytes",
+                    harness.display(),
+                    original_input.len()
+                ));
+            }
+            Some(spans)
+        }
+    };
+
+    let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
+    let tmp_dir = scratch.path();
     let input = match io {
         CEngineIo::ArgvFile => crate::replay::CInput::ArgvFile,
         CEngineIo::Stdin => crate::replay::CInput::Stdin,
@@ -325,7 +355,7 @@ fn minimize_c_engine_until(
         )?;
     }
 
-    let result = replay_min::ddmin_bytes(&original_input, |candidate| -> anyhow::Result<bool> {
+    let holds = |candidate: &[u8]| -> anyhow::Result<bool> {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(false); // budget spent: reject further reductions, keep best-so-far
         }
@@ -336,7 +366,24 @@ fn minimize_c_engine_until(
                 .is_some_and(|report| crate::crash_identity::same_crash(baseline, &report)),
             Held::Oracle => run.observed.is_some_and(|observed| observed.reproduced()),
         })
-    })?;
+    };
+    let mut typed_record = None;
+    let result = match &typed_spans {
+        None => replay_min::ddmin_bytes(&original_input, holds)?,
+        Some(spans) => {
+            let typed = minimize_decoded_values(&original_input, spans, holds)?;
+            typed_record = Some(json!({
+                "spans": spans.len(),
+                "values_tried": typed.tried,
+                "values_kept": typed.kept,
+            }));
+            replay_min::ByteMinimization {
+                original_len: original_input.len(),
+                minimized: typed.minimized,
+                predicate_runs: typed.tried,
+            }
+        }
+    };
     drop(scratch);
     drop(runtrace_log);
 
@@ -362,6 +409,9 @@ fn minimize_c_engine_until(
         // The minimized input reproduces this crash, not the recorded one.
         metadata["other_crash"] = json!(differences);
     }
+    if let Some(typed) = typed_record {
+        metadata["typed"] = typed;
+    }
     update_finding_record(
         finding_dir,
         &MinimizeOutput {
@@ -380,6 +430,101 @@ fn minimize_c_engine_until(
         removed_bytes: removed,
         reduced,
         unverified,
+    })
+}
+
+/// What the typed reduction of a C/C++ testcase did.
+struct DecodedValueMinimization {
+    minimized: Vec<u8>,
+    /// Values run.
+    tried: usize,
+    /// Values kept: the reduction still crashed as the testcase does.
+    kept: usize,
+}
+
+/// Reduce the value of each decoded argument in `spans` (#279), keeping its
+/// width so the arguments after it decode where they did: first to the
+/// first of 0, 1, -1 and the type's limits ([`decoded_arg_candidates`]) that
+/// `holds`, then an integer to the value nearest zero that `holds`, by
+/// bisection between it and zero, the boundary the crash starts at.
+///
+/// [`decoded_arg_candidates`]: fuzz_engine_builtin::decoded_arg_candidates
+fn minimize_decoded_values(
+    input: &[u8],
+    spans: &[fuzz_engine_builtin::TypedSpan],
+    mut holds: impl FnMut(&[u8]) -> anyhow::Result<bool>,
+) -> anyhow::Result<DecodedValueMinimization> {
+    use fuzz_engine_builtin::TypedValueKind;
+    let mut current = input.to_vec();
+    let (mut tried, mut kept) = (0, 0);
+    for span in spans {
+        let range = span.range.clone();
+        if range.end > current.len() || range.is_empty() {
+            continue;
+        }
+        let width = range.len();
+        let with = |current: &[u8], value: &[u8]| {
+            let mut candidate = current.to_vec();
+            candidate[range.clone()].copy_from_slice(value);
+            candidate
+        };
+        let dictionary = fuzz_engine_builtin::Dictionary::default();
+        for value in fuzz_engine_builtin::decoded_arg_candidates(span.kind, width, &dictionary) {
+            if value.len() != width || value == current[range.clone()] {
+                continue;
+            }
+            let candidate = with(&current, &value);
+            tried += 1;
+            if holds(&candidate)? {
+                current = candidate;
+                kept += 1;
+                break;
+            }
+        }
+        let signed = match span.kind {
+            TypedValueKind::SignedInteger => true,
+            TypedValueKind::UnsignedInteger => false,
+            _ => continue,
+        };
+        if width > 8 {
+            continue;
+        }
+        // The value as the decoder reads it: little-endian at its width.
+        let bits = (width * 8) as u32;
+        let mut raw = [0u8; 8];
+        raw[..width].copy_from_slice(&current[range.clone()]);
+        let unsigned = u64::from_le_bytes(raw);
+        let value: i128 = if signed && bits < 64 {
+            i128::from(((unsigned << (64 - bits)) as i64) >> (64 - bits))
+        } else if signed {
+            i128::from(unsigned as i64)
+        } else {
+            i128::from(unsigned)
+        };
+        let encode = |value: i128| -> Vec<u8> { (value as u64).to_le_bytes()[..width].to_vec() };
+        // Bisect between zero (taken not to hold) and the value (holds) for
+        // the one nearest zero that holds.
+        let (mut near, mut far) = (0_i128, value);
+        while (far - near).abs() > 1 {
+            let mid = near + (far - near) / 2;
+            let candidate = with(&current, &encode(mid));
+            tried += 1;
+            if holds(&candidate)? {
+                far = mid;
+            } else {
+                near = mid;
+            }
+        }
+        if far != value {
+            let candidate = with(&current, &encode(far));
+            current = candidate;
+            kept += 1;
+        }
+    }
+    Ok(DecodedValueMinimization {
+        minimized: current,
+        tried,
+        kept,
     })
 }
 
@@ -816,6 +961,35 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
 
 #[cfg(test)]
 mod harness_tests {
+    /// #279: a decoded integer is reduced to the boundary its crash starts
+    /// at, each value at its own width, and the bytes outside the arguments
+    /// are left as they were.
+    #[test]
+    fn decoded_values_are_reduced_to_the_boundary_of_the_crash() {
+        use fuzz_engine_builtin::{TypedSpan, TypedValueKind};
+        let mut input = Vec::new();
+        input.extend_from_slice(&5000_i32.to_le_bytes()); // crashes from 101
+        input.push(200); // u8: crashes from 7
+        input.extend_from_slice(&(-9_i32).to_le_bytes()); // irrelevant: to 0
+        input.extend_from_slice(b"tail");
+        let spans = [
+            TypedSpan::new(0..4, TypedValueKind::SignedInteger),
+            TypedSpan::new(4..5, TypedValueKind::UnsignedInteger),
+            TypedSpan::new(5..9, TypedValueKind::SignedInteger),
+        ];
+        let result = super::minimize_decoded_values(&input, &spans, |candidate| {
+            let idx = i32::from_le_bytes(candidate[0..4].try_into().unwrap());
+            Ok(candidate.len() == input.len() && idx > 100 && candidate[4] >= 7)
+        })
+        .unwrap();
+        let minimized = result.minimized;
+        assert_eq!(i32::from_le_bytes(minimized[0..4].try_into().unwrap()), 101);
+        assert_eq!(minimized[4], 7);
+        assert_eq!(i32::from_le_bytes(minimized[5..9].try_into().unwrap()), 0);
+        assert_eq!(&minimized[9..], b"tail");
+        assert!(result.kept >= 3 && result.tried > result.kept);
+    }
+
     /// Without `--harness`, minimize resolves the finding's harness the way
     /// replay does, including a binary `bhf build` staged into
     /// `build/<id>/main`.
