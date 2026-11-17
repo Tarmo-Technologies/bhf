@@ -199,7 +199,12 @@ with input after input (the mutated input varies), while each input meets only
 the constants it is checked against, so at a keyword-table lookup a keyword
 counts once it has met more inputs than there are keywords, and before that
 neither side does. An operand `dictionary.txt` lists is kept too, and a record
-without a site only confirms such a token. Tokens are at most 64 bytes; a
+without a site only confirms such a token. The driver also records the constant
+of each integer comparison the compiler emitted against one (an `"int"`
+record), including a constant computed at build time that no source literal
+spells, such as a key folded from a hash of a literal; one record makes it a
+constant, written as its little-endian bytes and then big-endian. A constant
+of at most 0xff, or of all ones, is not recorded. Tokens are at most 64 bytes; a
 one-byte variant of a stronger token is left out. This run's constants come
 first, then those an earlier run learned, at most 256 tokens, under a header
 saying how they were chosen. A file an earlier release wrote held every operand, mutated

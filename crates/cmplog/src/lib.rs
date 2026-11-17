@@ -28,6 +28,10 @@ pub enum CmpKind {
     CStringEquality,
     /// Integer comparison via `cmp` instruction.
     IntegerCompare,
+    /// An integer comparison against a constant the compiler emitted: the
+    /// driver's `"int"` record, whose `operand_a` is the constant
+    /// (little-endian, at the comparison's width) and `operand_b` empty.
+    IntegerConstant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -103,6 +107,7 @@ impl CmpLog {
             CmpKind::BufferEquality => 0u8,
             CmpKind::CStringEquality => 1,
             CmpKind::IntegerCompare => 2,
+            CmpKind::IntegerConstant => 3,
         };
         // Per site, the distinct values each operand was compared with.
         type Partners<'a> = BTreeMap<&'a [u8], BTreeSet<&'a [u8]>>;
@@ -110,8 +115,15 @@ impl CmpLog {
         let mut first_seen: BTreeMap<&[u8], usize> = BTreeMap::new();
         // Operands of entries that cannot tell the input from the constant.
         let mut ambiguous: BTreeSet<&[u8]> = BTreeSet::new();
+        // The constants the driver named as such (`"int"` records).
+        let mut named: BTreeSet<&[u8]> = BTreeSet::new();
         for (index, entry) in self.entries.iter().enumerate() {
             let (a, b) = (entry.operand_a.as_slice(), entry.operand_b.as_slice());
+            if entry.kind == CmpKind::IntegerConstant {
+                first_seen.entry(a).or_insert(index);
+                named.insert(a);
+                continue;
+            }
             for operand in [a, b] {
                 first_seen.entry(operand).or_insert(index);
             }
@@ -146,6 +158,9 @@ impl CmpLog {
                     *count = (*count).max(met.len());
                 }
             }
+        }
+        for value in named {
+            evidence.entry(value).or_insert(1);
         }
         let known: BTreeSet<&[u8]> = known.iter().map(Vec::as_slice).collect();
         for value in first_seen.keys() {
@@ -185,6 +200,19 @@ impl CmpLog {
         self.splice_candidate_iter(input).collect()
     }
 
+    /// The constants of the driver's `"int"` records
+    /// ([`CmpKind::IntegerConstant`]), little-endian as recorded.
+    pub fn integer_constants(&self) -> Vec<&[u8]> {
+        let mut out: Vec<&[u8]> = Vec::new();
+        for entry in &self.entries {
+            if entry.kind == CmpKind::IntegerConstant && !out.contains(&entry.operand_a.as_slice())
+            {
+                out.push(&entry.operand_a);
+            }
+        }
+        out
+    }
+
     /// Drop the entries that yield no splice into `input`: neither operand
     /// occurs in it, or the occurrence already holds the other operand. A
     /// loop counter compared on every iteration fills the log with such
@@ -211,6 +239,7 @@ impl CmpLog {
         let stride = (input.len() / SPLICE_OFFSETS_PER_OPERAND).max(1);
         self.entries
             .iter()
+            .filter(|entry| entry.kind != CmpKind::IntegerConstant)
             .flat_map(|entry| {
                 [
                     (entry, &entry.operand_a, &entry.operand_b),
@@ -295,6 +324,7 @@ pub fn ingest_from_jsonl_log(path: &std::path::Path) -> Result<CmpLog, CmpLogErr
         }
         let kind = match value.get("k").and_then(|v| v.as_str()).unwrap_or("") {
             "strcmp" | "strncmp" => CmpKind::CStringEquality,
+            "int" => CmpKind::IntegerConstant,
             _ => CmpKind::BufferEquality,
         };
         let a_hex = value.get("a").and_then(|v| v.as_str()).unwrap_or("");
@@ -484,6 +514,40 @@ not-json-just-noise\n\
         assert_eq!(log.entries[1].operand_a, b"hello");
         assert_eq!(log.entries[1].operand_b, b"world");
         assert_eq!(log.entries[1].kind, CmpKind::CStringEquality);
+    }
+
+    /// The driver's `"int"` record names an integer comparison's constant
+    /// (#221): one record is enough to make it a constant, beside string
+    /// constants that need the evidence of the values they met, and it is
+    /// never spliced, having no compared value to find in an input.
+    #[test]
+    fn an_int_record_names_its_constant() {
+        let dir = tempfile::Builder::new().prefix("bhf-").tempdir().unwrap();
+        let log_path = dir.path().join("cmplog.jsonl");
+        std::fs::write(
+            &log_path,
+            "{\"e\":\"cmplog\",\"k\":\"int\",\"s\":\"00000010.00000020\",\"a\":\"5b3e0f69\",\"b\":\"\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000030.00000020\",\"a\":\"7878\",\"b\":\"4b455931\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000030.00000020\",\"a\":\"7979\",\"b\":\"4b455931\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000040.00000020\",\"a\":\"7a7a\",\"b\":\"4e4f5045\"}\n",
+        )
+        .unwrap();
+        let log = ingest_from_jsonl_log(&log_path).unwrap();
+        assert_eq!(log.entries[0].kind, CmpKind::IntegerConstant);
+        assert_eq!(log.entries[0].operand_a, [0x5b, 0x3e, 0x0f, 0x69]);
+        assert!(log.entries[0].operand_b.is_empty());
+        assert_eq!(log.integer_constants(), [&[0x5b, 0x3e, 0x0f, 0x69][..]]);
+        assert_eq!(
+            log.constant_operands(&[]),
+            [b"KEY1".to_vec(), vec![0x5b, 0x3e, 0x0f, 0x69]],
+            "the string met two values; the integer is named; NOPE met one"
+        );
+        let offsets: Vec<usize> = log
+            .splice_candidates(&[0x5b, 0x3e, 0x0f, 0x69, b'x', b'x'])
+            .iter()
+            .map(|candidate| candidate.offset)
+            .collect();
+        assert_eq!(offsets, [4], "only the string's operand is spliced");
     }
 
     #[test]

@@ -8193,8 +8193,10 @@ pub(crate) const LEARNED_CONSTANTS_MARKER: &str =
 /// The first lines of `learned_dictionary.txt`.
 pub(crate) const LEARNED_DICTIONARY_HEADER: &str = "\
 # Comparison operands observed at runtime while this harness was fuzzed
-# (the strcmp/memcmp-family operands recorded in cmplog.jsonl beside this
-# file), not mined from the source like dictionary.txt. A token is an operand
+# (the strcmp/memcmp-family operands and integer comparison constants
+# recorded in cmplog.jsonl beside this file), not mined from the source like
+# dictionary.txt. An integer constant is written little-endian, then
+# big-endian. Any other token is an operand
 # that met more distinct values at one comparison site than any of them met
 # there (the constant stays, the input compared with it varies), or one that
 # dictionary.txt also lists; a record that names no site only confirms a
@@ -8232,8 +8234,14 @@ pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<us
         }
     };
     let constants = log.constant_operands(&mined);
+    // An integer constant is also written big-endian, for a target that
+    // compares a field it read in network order.
+    let integers = log.integer_constants();
     for token in &constants {
         push(&mut tokens, token.clone());
+        if integers.contains(&token.as_slice()) {
+            push(&mut tokens, token.iter().rev().copied().collect());
+        }
     }
     if tokens.is_empty() {
         return Ok(0);
@@ -14154,6 +14162,25 @@ exit 0
         assert_eq!(
             fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
             before
+        );
+    }
+
+    /// An integer comparison's constant (#221) is learned from one record,
+    /// little-endian as compared and big-endian beside it.
+    #[test]
+    fn a_learned_integer_constant_is_written_in_both_byte_orders() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-INT");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(
+            harness.join("cmplog.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"int\",\"s\":\"00000010.00000000\",\"a\":\"5b3e0f69\",\"b\":\"\"}\n",
+        )
+        .unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 2);
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            vec![vec![0x5b, 0x3e, 0x0f, 0x69], vec![0x69, 0x0f, 0x3e, 0x5b]]
         );
     }
 

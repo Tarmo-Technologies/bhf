@@ -2689,6 +2689,14 @@
   when bhf panics.
 
 ### Added
+- The runtime comparison log records integer comparison constants (#221):
+  the C/C++ driver writes the constant of each comparison the compiler
+  emitted against one as an `"int"` record, with its own size budget, and
+  the learned dictionary takes it as a constant from one record, in
+  little- and then big-endian bytes. A constant computed at build time that
+  no source literal spells now carries to the next run and to the AFL++ and
+  WinAFL dictionaries; it was solved again by every run. Constants of at
+  most 0xff, and all ones, are not recorded.
 - Stack depth is a coverage channel of the C/C++ driver (#220): it records
   the deepest stack each execution reached, and the built-in engine keeps an
   input that recursed a quarter deeper again than every input before it,

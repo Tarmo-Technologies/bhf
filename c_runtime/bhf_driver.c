@@ -513,7 +513,8 @@ BHF_NOCOV static void bhf_cmplog_open(void) {
 }
 BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t site,
                                       const unsigned char *a, unsigned la,
-                                      const unsigned char *b, unsigned lb) {
+                                      const unsigned char *b, unsigned lb,
+                                      uint32_t *written, uint32_t budget) {
     static const char hex[] = "0123456789abcdef";
     char line[96 + 4 * BHF_CMPLOG_OPMAX];
     unsigned len = 0, need, i, k;
@@ -531,7 +532,7 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t
     need = (unsigned)sizeof("{\"e\":\"cmplog\",\"k\":\"\",\"s\":\"\",\"a\":\"\",\"b\":\"\"}\n") - 1u
            + 17u + 2u * (la + lb);
     for (p = kind; *p; p++) need++;
-    if (bhf_cmplog_written + need > BHF_CMPLOG_MAX_BYTES) return;
+    if (*written + need > budget) return;
     for (p = kind; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ull; }
     for (i = 0; i < la; i++) { h ^= a[i]; h *= 1099511628211ull; }
     h ^= 0xffu; h *= 1099511628211ull;
@@ -555,8 +556,8 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t
     for (k = 0; k < lb; k++) { line[len++] = hex[b[k] >> 4]; line[len++] = hex[b[k] & 15]; }
     BHF_CL_PUT("\"}\n");
 #undef BHF_CL_PUT
-    if (bhf_cmplog_written + len > BHF_CMPLOG_MAX_BYTES) return;
-    bhf_cmplog_written += len;
+    if (*written + len > budget) return;
+    *written += len;
 #ifdef _WIN32
     {
         DWORD wrote = 0;
@@ -577,7 +578,31 @@ BHF_NOCOV static void bhf_cmplog_buf(const char *kind, const void *pc, const voi
     if (!bhf_ev_site(pc, &site) || BHF_IN_SHIM()) return;
     cap = n > BHF_CMPLOG_OPMAX ? BHF_CMPLOG_OPMAX : (unsigned)n;
     bhf_cmplog_line(kind, pc, site, a, bhf_ev_len(a, cap, stop_at_nul), b,
-                    bhf_ev_len(b, cap, stop_at_nul));
+                    bhf_ev_len(b, cap, stop_at_nul), &bhf_cmplog_written, BHF_CMPLOG_MAX_BYTES);
+}
+/* An integer comparison against a constant the compiler emitted
+ * (`__sanitizer_cov_trace_const_cmp*`, whose first argument is the constant)
+ * is an `"int"` record of the constant alone, little-endian at the
+ * comparison's width (#221). A constant solved during one run, such as a
+ * computed key folded to an immediate, then reaches the learned dictionary
+ * the next run and the AFL++ and WinAFL lanes load. A constant of at most
+ * 0xff, or of all ones, is left out: loop bounds, flags and -1 say nothing
+ * about the input. Each constant is written once per process, against its
+ * own BHF_CMPLOG_INT_MAX_BYTES, so integers cannot crowd out strings. */
+#define BHF_CMPLOG_INT_MAX_BYTES (1u << 16)
+static uint32_t bhf_cmplog_int_written = 0;
+BHF_NOCOV static void bhf_cmplog_int(const void *pc, uint64_t constant, unsigned width) {
+    unsigned char a[8];
+    uint64_t ones = width >= 8 ? ~(uint64_t)0 : (((uint64_t)1 << (8 * width)) - 1);
+    uint32_t site;
+    unsigned i;
+    if (bhf_cmplog_fd == -1) return;
+    constant &= ones;
+    if (constant <= 0xffu || constant == ones) return;
+    if (!bhf_ev_site(pc, &site) || BHF_IN_SHIM()) return;
+    for (i = 0; i < width; i++) a[i] = (unsigned char)(constant >> (8 * i));
+    bhf_cmplog_line("int", pc, site, a, width, a, 0, &bhf_cmplog_int_written,
+                    BHF_CMPLOG_INT_MAX_BYTES);
 }
 
 /* One-byte, cumulative proof that generated harness code crossed the boundary
@@ -898,9 +923,9 @@ BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; B
 BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; BHF_MEMCPY(&ua, &a, 8); BHF_MEMCPY(&ub, &b, 8); bhf_ev_int(BHF_EV_DOUBLE, ua, ub, 8, 0, BHF_RA); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, BHF_RA); }
 /* In a const_cmp callback the FIRST argument is the compile-time constant. */
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_ev_int(BHF_EV_INT, a, b, 1, BHF_EV_CONST_A, BHF_RA); bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_ev_int(BHF_EV_INT, a, b, 4, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 4); bhf_vp_add((unsigned char *)&b, 4); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_ev_int(BHF_EV_INT, a, b, 8, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 8); bhf_vp_add((unsigned char *)&b, 8); bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, BHF_RA); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); bhf_cmplog_int(BHF_RA, a, 2); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_ev_int(BHF_EV_INT, a, b, 4, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 4); bhf_vp_add((unsigned char *)&b, 4); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, BHF_RA); bhf_cmplog_int(BHF_RA, a, 4); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_ev_int(BHF_EV_INT, a, b, 8, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 8); bhf_vp_add((unsigned char *)&b, 8); bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, BHF_RA); bhf_cmplog_int(BHF_RA, a, 8); }
 BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
     uint64_t n = cases[0], bits = cases[1];
     unsigned len = (unsigned)(bits / 8);
