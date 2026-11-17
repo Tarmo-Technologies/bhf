@@ -961,7 +961,20 @@ C/C++ findings come from sanitizer reports and runtime-audit evidence. The
 built-in BHF engine invokes libFuzzer-style `main` binaries one input at a
 time and parses sanitizer stderr. AFL++ mode runs `afl-fuzz` against the staged
 `main_afl` sanitizer binary, then replays crash artifacts through that binary to
-emit normalized findings.
+emit normalized findings. An input afl-fuzz saved as a hang (past its 1 s
+`-t`) is re-run through `main_afl` with twice that; one that hangs again is a
+BHF-230 finding with the stack it was looping in, and the run summary's
+`hangs` counts them as a builtin pass's does.
+
+The AFL++ session is kept in `afl_out/<harness>/out` between runs, and
+afl-fuzz resumes it (`AFL_AUTORESUME`): its queue, coverage map and stats.
+Seeds the session was not given before (a builtin pass's corpus, new
+`--seed-file`s) are added to its queue, and the crashes and hangs of the
+session a resume moved aside are harvested with this run's. After each run
+the queue is taken into the bhf corpus (`corpus/<harness>/queue`, counted in
+`corpus_persisted`), so the builtin engine and `bhf corpus` start from what
+AFL++ found. A session afl-fuzz cannot resume is started over, once, and bhf
+says so. `bhf clean` removes `afl_out`.
 
 ### Uncaught C++ exceptions
 

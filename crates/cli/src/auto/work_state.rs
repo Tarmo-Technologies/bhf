@@ -31,7 +31,8 @@ const REGENERABLE_DIRECTORIES: &[&str] = &[
     "src_instrumented",
     "fuzz_runs",
     "fuzz_scratch",
-    "afl_out",
+    // Not `afl_out`: an AFL++ session is campaign state, as the corpus is,
+    // and the next run resumes it (#275).
     "afl_qemu_out",
     "cxx_dialects",
     // Run-level force-fuzz Ada state: the reconstructed external-library stub

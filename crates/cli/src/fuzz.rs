@@ -6345,6 +6345,258 @@ mod oracle_dedupe_tests {
     }
 }
 
+/// afl-fuzz's per-execution limit (`-t 1000+`), past which it saves the
+/// input as a hang.
+const AFL_EXEC_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// The instance directory a single afl-fuzz writes in its `-o` directory.
+const AFL_INSTANCE: &str = "default";
+
+/// Whether `instance` holds a session afl-fuzz can resume: a queue.
+fn afl_session_exists(instance: &Path) -> bool {
+    !afl_entries(&instance.join("queue")).is_empty()
+}
+
+/// The `id:` entries AFL++ wrote in `dir` (a queue, a `crashes` or a `hangs`
+/// directory), sorted; its other files (`README.txt`, `.state/`) are not
+/// inputs.
+fn afl_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("id:") || name.starts_with("id_"))
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The afl-fuzz instance directories in `out_dir`: `default`, or one per
+/// `-M`/`-S` instance; each holds what afl-fuzz writes there (a queue, saved
+/// crashes or hangs, its stats).
+fn afl_instance_dirs(out_dir: &Path) -> Vec<PathBuf> {
+    let mut instances: Vec<PathBuf> = fs::read_dir(out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            ["queue", "crashes", "hangs", "fuzzer_stats"]
+                .iter()
+                .any(|name| path.join(name).exists())
+        })
+        .collect();
+    instances.sort();
+    instances
+}
+
+/// The inputs afl-fuzz saved as `kind` (`crashes` or `hangs`) in every
+/// instance: its `<kind>/` and the `<kind>.<date>/` a resumed session moved
+/// the last one's to (#275).
+fn afl_saved_inputs(out_dir: &Path, kind: &str) -> Vec<PathBuf> {
+    let backup = format!("{kind}.");
+    afl_instance_dirs(out_dir)
+        .iter()
+        .flat_map(|instance| {
+            let mut dirs: Vec<PathBuf> = fs::read_dir(instance)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name == kind || name.starts_with(&backup))
+                })
+                .map(|entry| entry.path())
+                .collect();
+            dirs.sort();
+            dirs
+        })
+        .flat_map(|dir| afl_entries(&dir))
+        .collect()
+}
+
+/// Remove the `crashes.<date>/` and `hangs.<date>/` a resumed session moved
+/// the last one's saved inputs to, once they are harvested.
+fn remove_afl_backups(out_dir: &Path) {
+    for instance in afl_instance_dirs(out_dir) {
+        for entry in fs::read_dir(&instance).into_iter().flatten().flatten() {
+            let backup = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("crashes.") || name.starts_with("hangs."));
+            if backup && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+/// The seeds an AFL++ session was given, by [`afl_seed_hash`], beside its
+/// output directory: a seed AFL++ trimmed is no longer in its queue as it
+/// was given, and is not given again.
+const AFL_OFFERED_SEEDS: &str = "offered-seeds.txt";
+
+/// A seed's name in [`AFL_OFFERED_SEEDS`] and in `orig:bhf-seed-<hash>`: the
+/// first 8 bytes of its SHA-256, in hex.
+fn afl_seed_hash(seed: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(seed)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn read_offered_seeds(path: &Path) -> HashSet<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn write_offered_seeds(path: &Path, offered: &HashSet<String>) {
+    let mut lines: Vec<&str> = offered.iter().map(String::as_str).collect();
+    lines.sort_unstable();
+    let mut text = lines.join("\n");
+    text.push('\n');
+    if let Err(error) = fs::write(path, text) {
+        bhfeprintln!(
+            "bhf: warning: could not record the seeds given to afl-fuzz in '{}': {error}",
+            path.display()
+        );
+    }
+}
+
+/// Add the seeds a resumed session was not given and its queue does not
+/// hold to that queue (#275): afl-fuzz reads a resumed session's inputs from
+/// its queue, not from `-i`. Each is named as a queue entry
+/// (`id:999999,orig:bhf-seed-<hash>`), which AFL++ renumbers on resume and
+/// cleans up after, and joins `offered`. The number added.
+fn add_resume_seeds(
+    queue: &Path,
+    seeds: &[Vec<u8>],
+    offered: &mut HashSet<String>,
+) -> Result<usize, String> {
+    let mut held: HashSet<String> = afl_entries(queue)
+        .iter()
+        .filter_map(|path| fs::read(path).ok())
+        .map(|bytes| afl_seed_hash(&bytes))
+        .collect();
+    let mut added = 0;
+    for seed in seeds.iter().filter(|seed| !seed.is_empty()) {
+        let digest = afl_seed_hash(seed);
+        if !held.insert(digest.clone()) || !offered.insert(digest.clone()) {
+            continue;
+        }
+        let path = queue.join(format!("id:999999,orig:bhf-seed-{digest}"));
+        fs::write(&path, seed)
+            .map_err(|error| format!("add seed '{}': {error}", path.display()))?;
+        added += 1;
+    }
+    Ok(added)
+}
+
+/// Take the inputs afl-fuzz keeps in its instances' queues into the
+/// harness's bhf corpus (`corpus/<id>/queue`, #275), by content hash and
+/// within the corpus limits, so the builtin engine, `bhf corpus` and a later
+/// AFL++ session start from them. The number newly kept.
+fn import_afl_queues(work_dir: &Path, harness_id: &str, out_dir: &Path, max_len: usize) -> usize {
+    let limits = corpus_limits(max_len);
+    let mut corpus = CorpusManager::new(work_dir.to_path_buf())
+        .with_retention_limits(limits.entries, limits.bytes);
+    let inputs = afl_instance_dirs(out_dir)
+        .into_iter()
+        .flat_map(|instance| afl_entries(&instance.join("queue")))
+        .filter_map(|path| fs::read(path).ok());
+    match corpus.persist_coverage_corpus(harness_id, inputs) {
+        Ok(count) => count,
+        Err(error) => {
+            bhfeprintln!("bhf: warning: could not import the AFL++ queue into the corpus: {error}");
+            0
+        }
+    }
+}
+
+/// Re-run an input afl-fuzz saved as a hang (#275) through `main_afl`, which
+/// reads it on stdin, with twice afl-fuzz's per-execution limit, and ask it
+/// for the stack it is in if it hangs again ([`signal_for_stack`]). Not re-run
+/// when `deadline` leaves less time than that.
+fn confirm_afl_hang(
+    main_afl: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    deadline: Instant,
+) -> Result<HangConfirmation, String> {
+    let confirm = AFL_EXEC_TIMEOUT.saturating_mul(2);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left < confirm {
+        return Ok(HangConfirmation::NotRerun);
+    }
+    let grace = HANG_STACK_GRACE.min(left - confirm);
+    let mut command = std::process::Command::new(main_afl);
+    command
+        .current_dir(ensure_harness_scratch(work_dir)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in hang_stack_env(extra_env, confirm) {
+        command.env(key, value);
+    }
+    apply_runaway_rlimits(&mut command);
+    replay_min::process::isolate_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn '{}': {error}", main_afl.display()))?;
+    let stderr_reader = drain_child_stderr(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let until = Instant::now() + confirm;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = collected_child_output(status, stderr_reader);
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Ok(match corpus::parse_sanitizer_report(&stderr) {
+                    Some(report) => HangConfirmation::Crashed(Box::new(report), stderr),
+                    None => HangConfirmation::Finished,
+                });
+            }
+            Ok(None) if Instant::now() >= until => {
+                signal_for_stack(&mut child, grace);
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                let stderr = stderr_reader
+                    .and_then(|reader| reader.join().ok())
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                let report = hang_report(&stderr, AFL_EXEC_TIMEOUT, confirm);
+                return Ok(HangConfirmation::Hung(Box::new(report), stderr));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(format!("wait for '{}': {error}", main_afl.display()));
+            }
+        }
+    }
+}
+
 /// Run a C harness under AFL++. Expects:
 ///
 /// - `<work_dir>/build/<harness_id>/main_afl` produced by
@@ -6391,17 +6643,19 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     // Seed corpus directory required by afl-fuzz.
     let afl_out = prepared.work_dir.join("afl_out").join(&prepared.harness_id);
     let seeds_dir = afl_out.join("seeds");
+    // This run's seeds only: an earlier run's are in AFL++'s queue.
+    let _ = fs::remove_dir_all(&seeds_dir);
     fs::create_dir_all(&seeds_dir)
         .map_err(|error| format!("create AFL seeds dir '{}': {error}", seeds_dir.display()))?;
+    // #275: AFL++'s output directory is kept between runs, and afl-fuzz
+    // resumes the session in it (`AFL_AUTORESUME`): its queue, its coverage
+    // map and its stats.
     let out_dir = afl_out.join("out");
-    let _ = fs::remove_dir_all(&out_dir);
     fs::create_dir_all(&out_dir)
         .map_err(|error| format!("create AFL out dir '{}': {error}", out_dir.display()))?;
     // afl-fuzz's console output goes here instead of an undrained pipe (see the
     // stdout/stderr redirect below — a piped, undrained child deadlocks).
     let afl_log = afl_out.join("afl-fuzz.log");
-    let afl_log_file = std::fs::File::create(&afl_log)
-        .map_err(|error| format!("create afl log '{}': {error}", afl_log.display()))?;
     let mut seed_count = 0_usize;
     for (idx, seed) in prepared.seeds.iter().enumerate() {
         if seed.is_empty() {
@@ -6417,6 +6671,25 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         let seed_path = seeds_dir.join("seed-default");
         fs::write(&seed_path, b"AAAA").map_err(|error| format!("write default seed: {error}"))?;
     }
+    // A resumed session reads its queue, not `-i`: the seeds it does not hold
+    // yet (a builtin pass's corpus, new operator seeds) join that queue.
+    let mut resuming = afl_session_exists(&out_dir.join(AFL_INSTANCE));
+    let offered_path = afl_out.join(AFL_OFFERED_SEEDS);
+    let mut offered = if resuming {
+        read_offered_seeds(&offered_path)
+    } else {
+        HashSet::new()
+    };
+    if resuming {
+        add_resume_seeds(
+            &out_dir.join(AFL_INSTANCE).join("queue"),
+            &prepared.seeds,
+            &mut offered,
+        )?;
+    } else {
+        offered.extend(prepared.seeds.iter().map(|seed| afl_seed_hash(seed)));
+    }
+    write_offered_seeds(&offered_path, &offered);
 
     let time_budget = prepared.time.unwrap_or_else(|| {
         // 100 ms per requested iteration, capped at 30s for safety.
@@ -6425,195 +6698,227 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     });
 
     let start = Instant::now();
-    // AFL stops at the first of -V or -E; pass only the time budget so the
-    // caller's `--time` (or our iterations-derived default) actually applies.
-    let mut afl_cmd = Command::new(&afl_fuzz);
-    afl_cmd
-        .current_dir(ensure_harness_scratch(&prepared.work_dir)?)
-        .arg("-i")
-        .arg(&seeds_dir)
-        .arg("-o")
-        .arg(&out_dir)
-        .arg("-V")
-        .arg(time_budget.as_secs().to_string())
-        // Per-exec timeout. WITHOUT this, a single fuzzed input that hangs the
-        // target (e.g. parson's recursive JSON parser on a deeply-nested array)
-        // wedges the whole run — afl-fuzz's internal `run_time` stays 0, its `-V`
-        // budget never fires, and the run deadlocks (observed: stuck at 20 execs
-        // forever; the hard-deadline kill above is only the backstop). A 1s cap is
-        // ~25000x a normal parser exec, so it catches hangs without flagging
-        // legitimately-fast inputs. The `+` suffix keeps initial seed calibration
-        // lenient (a slow seed is skipped, not treated as a fatal hang).
-        .arg("-t")
-        .arg("1000+");
-    // Issue #45: binary-only modes add `-Q` (QEMU) or `-O` (Frida) so a stripped,
-    // source-less dependency still gets coverage. `native` adds nothing.
-    if let Some(mode_flag) = prepared.afl_mode.flag() {
-        afl_cmd.arg(mode_flag);
-    }
-    // #274: AFL++'s input-to-state stage over the CmpLog build's comparison
-    // operands, with arithmetic and transform solving (`-l 2AT`), as AFL++
-    // recommends for a CmpLog binary.
-    if let Some(cmplog) = &cmplog_binary {
-        afl_cmd.arg("-c").arg(cmplog).arg("-l").arg("2AT");
-    }
-    if let Some(dictionary) = &generated_dictionary {
-        afl_cmd.arg("-x").arg(dictionary);
-    }
-    // AFL++ takes up to four `-x` dictionaries; the learned one goes second.
-    if let Some(learned) = find_learned_dictionary(&prepared.work_dir, &prepared.harness_id) {
-        afl_cmd.arg("-x").arg(learned);
-    }
-    if let Some(max_len) = prepared.afl_max_len {
-        if afl_fuzz_supports_max_len(&afl_fuzz) {
-            afl_cmd.arg("-G").arg(max_len.to_string());
-        } else {
-            bhfeprintln!(
-                "bhf: {} has no -G option (AFL++ 4.00c or newer), so its generated inputs \
-                 are not held to --max-len {max_len}; the seeds are still cut to {max_len} bytes",
-                afl_fuzz.display()
-            );
+    let build_afl_command = || -> Result<Command, String> {
+        let afl_log_file = std::fs::File::create(&afl_log)
+            .map_err(|error| format!("create afl log '{}': {error}", afl_log.display()))?;
+        // AFL stops at the first of -V or -E; pass only the time budget so the
+        // caller's `--time` (or our iterations-derived default) actually applies.
+        let mut afl_cmd = Command::new(&afl_fuzz);
+        afl_cmd
+            .current_dir(ensure_harness_scratch(&prepared.work_dir)?)
+            .arg("-i")
+            .arg(&seeds_dir)
+            .arg("-o")
+            .arg(&out_dir)
+            .arg("-V")
+            .arg(time_budget.as_secs().to_string())
+            // Per-exec timeout. WITHOUT this, a single fuzzed input that hangs the
+            // target (e.g. parson's recursive JSON parser on a deeply-nested array)
+            // wedges the whole run — afl-fuzz's internal `run_time` stays 0, its `-V`
+            // budget never fires, and the run deadlocks (observed: stuck at 20 execs
+            // forever; the hard-deadline kill above is only the backstop). A 1s cap is
+            // ~25000x a normal parser exec, so it catches hangs without flagging
+            // legitimately-fast inputs. The `+` suffix keeps initial seed calibration
+            // lenient (a slow seed is skipped, not treated as a fatal hang).
+            .arg("-t")
+            .arg(format!("{}+", AFL_EXEC_TIMEOUT.as_millis()));
+        // Issue #45: binary-only modes add `-Q` (QEMU) or `-O` (Frida) so a stripped,
+        // source-less dependency still gets coverage. `native` adds nothing.
+        if let Some(mode_flag) = prepared.afl_mode.flag() {
+            afl_cmd.arg(mode_flag);
         }
-    }
-    afl_cmd
-        .arg("--")
-        .arg(&main_afl)
-        .env("AFL_NO_UI", "1")
-        .env("AFL_SKIP_CPUFREQ", "1")
-        // AFL refuses to start on hosts where /proc/sys/kernel/core_pattern
-        // pipes to a userland handler (apport, systemd-coredump). Acknowledge
-        // we may miss the rare crash that gets intercepted by the handler;
-        // most C target crashes are SIGSEGV/SIGABRT seen via waitpid anyway.
-        .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
-        // Sanitizers default to "report and continue" which hides findings
-        // from AFL's exit-code-based crash detection. abort_on_error turns
-        // the first sanitizer report into a SIGABRT that AFL will save.
-        // symbolize=0 is required by AFL's pre-flight check so the sanitizer
-        // doesn't fork llvm-symbolizer in the hot loop; we re-symbolize
-        // ourselves when replaying each crash artifact against the
-        // libFuzzer binary later. The operator's inherited `<SAN>_OPTIONS`
-        // (suppressions / FP-killers, #435) are MERGED in first; bhf's
-        // required keys go last so they win.
-        .env(
-            "ASAN_OPTIONS",
-            multicore_fuzz::merge_sanitizer_options(
-                std::env::var("ASAN_OPTIONS").ok().as_deref(),
-                "abort_on_error=1:halt_on_error=1:symbolize=0",
-            ),
-        )
-        .env(
-            "UBSAN_OPTIONS",
-            multicore_fuzz::merge_sanitizer_options(
-                std::env::var("UBSAN_OPTIONS").ok().as_deref(),
-                "abort_on_error=1:halt_on_error=1:symbolize=0",
-            ),
-        )
-        .env(
-            "LSAN_OPTIONS",
-            multicore_fuzz::merge_sanitizer_options(
-                std::env::var("LSAN_OPTIONS").ok().as_deref(),
-                "abort_on_error=1:symbolize=0",
-            ),
-        )
-        // CRITICAL: redirect afl-fuzz's stdout+stderr to a FILE, not a pipe. A
-        // piped child blocks on write() once the ~64KB pipe buffer fills, and we
-        // only drain it after wait() — so afl-fuzz (which keeps printing status
-        // even under AFL_NO_UI) deadlocks after ~20 execs and `auto` hangs forever
-        // (the original 69-min wedge). A file never blocks; we read it afterward
-        // for the diagnostic hints below. stderr shares the stdout handle (a dup,
-        // so they share one file offset and interleave instead of clobbering).
-        .stdout(Stdio::from(
-            afl_log_file
-                .try_clone()
-                .map_err(|error| format!("dup afl log handle: {error}"))?,
-        ))
-        .stderr(Stdio::from(afl_log_file));
-    for (k, v) in &prepared.extra_env {
-        afl_cmd.env(k, v);
-    }
-    // #412: afl-fuzz stops at its first crash when AFL_BENCH_UNTIL_CRASH is
-    // set, whatever its value, so it never runs the rest of its budget.
-    afl_cmd.env_remove("AFL_BENCH_UNTIL_CRASH");
-    // `symbolize=0` must be re-asserted AFTER `extra_env`, because that map
-    // carries the builtin engine's sanitizer options — which deliberately keep
-    // symbolization so a crash's file:line can be joined to the static finding at
-    // the same line — and it would otherwise overwrite the value set above. AFL++
-    // v4 aborts in pre-flight on a custom `ASAN_OPTIONS` without it ("Custom
-    // ASAN_OPTIONS set without symbolize=0 - please fix!", afl-fuzz-init.c), so
-    // this is the one child that needs the opposite setting. Merging keeps every
-    // other key the operator or the builtin path supplied.
-    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
-        let inherited = prepared
-            .extra_env
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var(key).ok());
-        afl_cmd.env(
-            key,
-            multicore_fuzz::merge_sanitizer_options(inherited.as_deref(), "symbolize=0"),
-        );
-    }
-    // Issue #45: point `-Q`/`-O` at a non-PATH AFL++ build and scope binary-only
-    // instrumentation to the module/ranges of interest.
-    if let Some(dir) = &prepared.afl_path {
-        afl_cmd.env("AFL_PATH", dir);
-    }
-    if let Some((env_key, value)) = prepared
-        .afl_mode
-        .inst_ranges_env_value(&prepared.afl_inst_ranges)
-    {
-        afl_cmd.env(env_key, value);
-    }
-    apply_runaway_rlimits(&mut afl_cmd);
-    // Run afl-fuzz in its own process group so a hard-deadline kill can take down
-    // the WHOLE group — afl-fuzz plus the persistent harness it forked — instead
-    // of orphaning the harness (`child.kill()` alone leaves `main_afl` running).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        afl_cmd.process_group(0);
-    }
-    let mut child = afl_cmd
-        .spawn()
-        .map_err(|error| format!("spawn afl-fuzz '{}': {error}", afl_fuzz.display()))?;
-    // afl-fuzz is supposed to self-terminate at its `-V` budget, but a
-    // fork-server / persistent-mode handshake wedge can leave its internal
-    // `run_time` stuck at 0 so the `-V` check never fires and afl-fuzz hangs
-    // forever (observed: 20 execs, 69 min wall). A bare `child.wait()` would then
-    // block `auto` indefinitely, blowing past `--per-target-time`. Bound the wait
-    // with a hard wall-clock deadline (generous margin over the budget) and kill
-    // the process group if exceeded; any crashes found before the wedge are still
-    // harvested from `out/default/crashes` below.
-    let hard_deadline = Instant::now() + time_budget.saturating_mul(2) + Duration::from_secs(30);
-    let mut timed_out = false;
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| format!("wait afl-fuzz: {error}"))?
-        {
-            Some(status) => break status,
-            None => {
-                if Instant::now() >= hard_deadline {
-                    timed_out = true;
-                    kill_process_group(&mut child);
-                    break child
-                        .wait()
-                        .map_err(|error| format!("reap timed-out afl-fuzz: {error}"))?;
-                }
-                std::thread::sleep(Duration::from_millis(200));
+        // #274: AFL++'s input-to-state stage over the CmpLog build's comparison
+        // operands, with arithmetic and transform solving (`-l 2AT`), as AFL++
+        // recommends for a CmpLog binary.
+        if let Some(cmplog) = &cmplog_binary {
+            afl_cmd.arg("-c").arg(cmplog).arg("-l").arg("2AT");
+        }
+        if let Some(dictionary) = &generated_dictionary {
+            afl_cmd.arg("-x").arg(dictionary);
+        }
+        // AFL++ takes up to four `-x` dictionaries; the learned one goes second.
+        if let Some(learned) = find_learned_dictionary(&prepared.work_dir, &prepared.harness_id) {
+            afl_cmd.arg("-x").arg(learned);
+        }
+        if let Some(max_len) = prepared.afl_max_len {
+            if afl_fuzz_supports_max_len(&afl_fuzz) {
+                afl_cmd.arg("-G").arg(max_len.to_string());
+            } else {
+                bhfeprintln!(
+                    "bhf: {} has no -G option (AFL++ 4.00c or newer), so its generated inputs \
+                 are not held to --max-len {max_len}; the seeds are still cut to {max_len} bytes",
+                    afl_fuzz.display()
+                );
             }
         }
+        afl_cmd
+            .arg("--")
+            .arg(&main_afl)
+            .env("AFL_NO_UI", "1")
+            .env("AFL_SKIP_CPUFREQ", "1")
+            .env("AFL_AUTORESUME", "1")
+            // AFL refuses to start on hosts where /proc/sys/kernel/core_pattern
+            // pipes to a userland handler (apport, systemd-coredump). Acknowledge
+            // we may miss the rare crash that gets intercepted by the handler;
+            // most C target crashes are SIGSEGV/SIGABRT seen via waitpid anyway.
+            .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
+            // Sanitizers default to "report and continue" which hides findings
+            // from AFL's exit-code-based crash detection. abort_on_error turns
+            // the first sanitizer report into a SIGABRT that AFL will save.
+            // symbolize=0 is required by AFL's pre-flight check so the sanitizer
+            // doesn't fork llvm-symbolizer in the hot loop; we re-symbolize
+            // ourselves when replaying each crash artifact against the
+            // libFuzzer binary later. The operator's inherited `<SAN>_OPTIONS`
+            // (suppressions / FP-killers, #435) are MERGED in first; bhf's
+            // required keys go last so they win.
+            .env(
+                "ASAN_OPTIONS",
+                multicore_fuzz::merge_sanitizer_options(
+                    std::env::var("ASAN_OPTIONS").ok().as_deref(),
+                    "abort_on_error=1:halt_on_error=1:symbolize=0",
+                ),
+            )
+            .env(
+                "UBSAN_OPTIONS",
+                multicore_fuzz::merge_sanitizer_options(
+                    std::env::var("UBSAN_OPTIONS").ok().as_deref(),
+                    "abort_on_error=1:halt_on_error=1:symbolize=0",
+                ),
+            )
+            .env(
+                "LSAN_OPTIONS",
+                multicore_fuzz::merge_sanitizer_options(
+                    std::env::var("LSAN_OPTIONS").ok().as_deref(),
+                    "abort_on_error=1:symbolize=0",
+                ),
+            )
+            // CRITICAL: redirect afl-fuzz's stdout+stderr to a FILE, not a pipe. A
+            // piped child blocks on write() once the ~64KB pipe buffer fills, and we
+            // only drain it after wait() — so afl-fuzz (which keeps printing status
+            // even under AFL_NO_UI) deadlocks after ~20 execs and `auto` hangs forever
+            // (the original 69-min wedge). A file never blocks; we read it afterward
+            // for the diagnostic hints below. stderr shares the stdout handle (a dup,
+            // so they share one file offset and interleave instead of clobbering).
+            .stdout(Stdio::from(
+                afl_log_file
+                    .try_clone()
+                    .map_err(|error| format!("dup afl log handle: {error}"))?,
+            ))
+            .stderr(Stdio::from(afl_log_file));
+        for (k, v) in &prepared.extra_env {
+            afl_cmd.env(k, v);
+        }
+        // #412: afl-fuzz stops at its first crash when AFL_BENCH_UNTIL_CRASH is
+        // set, whatever its value, so it never runs the rest of its budget.
+        afl_cmd.env_remove("AFL_BENCH_UNTIL_CRASH");
+        // `symbolize=0` must be re-asserted AFTER `extra_env`, because that map
+        // carries the builtin engine's sanitizer options — which deliberately keep
+        // symbolization so a crash's file:line can be joined to the static finding at
+        // the same line — and it would otherwise overwrite the value set above. AFL++
+        // v4 aborts in pre-flight on a custom `ASAN_OPTIONS` without it ("Custom
+        // ASAN_OPTIONS set without symbolize=0 - please fix!", afl-fuzz-init.c), so
+        // this is the one child that needs the opposite setting. Merging keeps every
+        // other key the operator or the builtin path supplied.
+        for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
+            let inherited = prepared
+                .extra_env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(key).ok());
+            afl_cmd.env(
+                key,
+                multicore_fuzz::merge_sanitizer_options(inherited.as_deref(), "symbolize=0"),
+            );
+        }
+        // Issue #45: point `-Q`/`-O` at a non-PATH AFL++ build and scope binary-only
+        // instrumentation to the module/ranges of interest.
+        if let Some(dir) = &prepared.afl_path {
+            afl_cmd.env("AFL_PATH", dir);
+        }
+        if let Some((env_key, value)) = prepared
+            .afl_mode
+            .inst_ranges_env_value(&prepared.afl_inst_ranges)
+        {
+            afl_cmd.env(env_key, value);
+        }
+        apply_runaway_rlimits(&mut afl_cmd);
+        // Run afl-fuzz in its own process group so a hard-deadline kill can take down
+        // the WHOLE group — afl-fuzz plus the persistent harness it forked — instead
+        // of orphaning the harness (`child.kill()` alone leaves `main_afl` running).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            afl_cmd.process_group(0);
+        }
+        Ok(afl_cmd)
     };
-    if timed_out {
-        // Reap any persistent-mode worker that setsid()'d out of the killed group.
-        kill_processes_by_exe(&main_afl);
-        bhfeprintln!(
-            "bhf: afl-fuzz exceeded its hard deadline ({:?}) and was killed — \
+    let (status, hard_deadline) = loop {
+        let mut afl_cmd = build_afl_command()?;
+        let mut child = afl_cmd
+            .spawn()
+            .map_err(|error| format!("spawn afl-fuzz '{}': {error}", afl_fuzz.display()))?;
+        // afl-fuzz is supposed to self-terminate at its `-V` budget, but a
+        // fork-server / persistent-mode handshake wedge can leave its internal
+        // `run_time` stuck at 0 so the `-V` check never fires and afl-fuzz hangs
+        // forever (observed: 20 execs, 69 min wall). A bare `child.wait()` would then
+        // block `auto` indefinitely, blowing past `--per-target-time`. Bound the wait
+        // with a hard wall-clock deadline (generous margin over the budget) and kill
+        // the process group if exceeded; any crashes found before the wedge are still
+        // harvested from `out/default/crashes` below.
+        let hard_deadline =
+            Instant::now() + time_budget.saturating_mul(2) + Duration::from_secs(30);
+        let mut timed_out = false;
+        let status = loop {
+            match child
+                .try_wait()
+                .map_err(|error| format!("wait afl-fuzz: {error}"))?
+            {
+                Some(status) => break status,
+                None => {
+                    if Instant::now() >= hard_deadline {
+                        timed_out = true;
+                        kill_process_group(&mut child);
+                        break child
+                            .wait()
+                            .map_err(|error| format!("reap timed-out afl-fuzz: {error}"))?;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
+        if timed_out {
+            // Reap any persistent-mode worker that setsid()'d out of the killed group.
+            kill_processes_by_exe(&main_afl);
+            bhfeprintln!(
+                "bhf: afl-fuzz exceeded its hard deadline ({:?}) and was killed — \
              likely a fork-server/persistent-mode hang; harvesting any crashes found so far",
-            time_budget.saturating_mul(2) + Duration::from_secs(30)
-        );
-    }
+                time_budget.saturating_mul(2) + Duration::from_secs(30)
+            );
+        }
+        // #275: a session afl-fuzz cannot resume is started over, once, after
+        // its queue is taken into bhf's corpus.
+        if resuming && !timed_out && status.code().is_some_and(|code| code != 0) {
+            import_afl_queues(
+                &prepared.work_dir,
+                &prepared.harness_id,
+                &out_dir,
+                prepared.max_len,
+            );
+            bhfeprintln!(
+                "bhf: afl-fuzz could not resume the session in {} (see {}); starting it over, \
+             with its queue kept in bhf's corpus",
+                out_dir.display(),
+                afl_log.display()
+            );
+            fs::remove_dir_all(&out_dir)
+                .and_then(|()| fs::create_dir_all(&out_dir))
+                .map_err(|error| format!("reset AFL out dir '{}': {error}", out_dir.display()))?;
+            resuming = false;
+            continue;
+        }
+        break (status, hard_deadline);
+    };
     // AFL terminates itself with a signal when the -V time budget expires (or when
     // we hard-kill a hung run above), surfacing as status.code() == None. Treat
     // that as success - it's the *intended* end of a time-bounded run. Real
@@ -6679,7 +6984,6 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
     let elapsed = start.elapsed();
 
-    let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
     let build_binary_identity = build_binary_record(&prepared.harness_path);
     let mut emitter = with_harness_format(
@@ -6708,16 +7012,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         &prepared.harness_id,
     ));
     let mut crash_count = 0_usize;
-    if crashes_dir.is_dir() {
-        for entry in fs::read_dir(&crashes_dir)
-            .map_err(|error| format!("read AFL crashes dir '{}': {error}", crashes_dir.display()))?
-        {
-            let entry = entry.map_err(|error| format!("read AFL crash entry: {error}"))?;
-            let path = entry.path();
+    {
+        for path in afl_saved_inputs(&out_dir, "crashes") {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("id:") {
-                continue;
-            }
             crash_count += 1;
             let input = fs::read(&path)
                 .map_err(|error| format!("read crash artifact '{}': {error}", path.display()))?;
@@ -6797,6 +7094,75 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             finding_ids.push(id.0);
         }
     }
+    // #275: the inputs afl-fuzz saved as hangs. Each is re-run through
+    // main_afl with twice afl-fuzz's limit, and one that hangs again is a
+    // BHF-230 finding, as a builtin pass's confirmed hang is.
+    let mut hangs = HangRunSummary {
+        timeout_ms: u64::try_from(AFL_EXEC_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        ..HangRunSummary::default()
+    };
+    for path in afl_saved_inputs(&out_dir, "hangs") {
+        hangs.observed += 1;
+        if hangs.confirmed + hangs.cleared >= MAX_HANG_CONFIRMATIONS {
+            hangs.not_rerun += 1;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let input = fs::read(&path)
+            .map_err(|error| format!("read hang artifact '{}': {error}", path.display()))?;
+        let (report, log) = match confirm_afl_hang(
+            &prepared.harness_path,
+            &prepared.work_dir,
+            &input,
+            &prepared.extra_env,
+            hard_deadline,
+        )? {
+            HangConfirmation::Hung(report, log) => {
+                hangs.confirmed += 1;
+                (report, log)
+            }
+            // Given the time, it crashed: that crash is the finding.
+            HangConfirmation::Crashed(report, log) => {
+                hangs.cleared += 1;
+                (report, log)
+            }
+            HangConfirmation::Finished => {
+                hangs.cleared += 1;
+                continue;
+            }
+            HangConfirmation::NotRerun => {
+                hangs.not_rerun += 1;
+                continue;
+            }
+        };
+        if !afl_crash_is_new(&mut afl_dedup, &report) {
+            continue;
+        }
+        let id = emitter
+            .emit_sanitizer_crash_with_log(&input, &report, Some(log.as_bytes()))
+            .map_err(|error| format!("emit AFL hang finding: {error}"))?;
+        crate::fuzz_lineage::record(
+            &prepared.work_dir,
+            &id.0,
+            &corpus::lineage::FindingLineage::unknown(format!(
+                "found by AFL++, which schedules its own queue; bhf does not see which \
+                 input this one was mutated from (AFL++ hang file {name})"
+            )),
+        );
+        finding_ids.push(id.0);
+    }
+    // What a resumed session moved aside has been harvested with the rest.
+    remove_afl_backups(&out_dir);
+    let corpus_persisted = import_afl_queues(
+        &prepared.work_dir,
+        &prepared.harness_id,
+        &out_dir,
+        prepared.max_len,
+    );
 
     let elapsed_secs = elapsed.as_secs_f64();
     // Surface AFL's REAL throughput from its own stats file rather than reporting
@@ -6817,9 +7183,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         target_entry_observed: target_entry_from_env(&prepared.extra_env),
         corpus_new: crash_count,
         corpus_duplicates: 0,
-        // AFL++ owns its own on-disk queue/ corpus; the built-in persistence
-        // path (#401) does not apply to the external-engine run.
-        corpus_persisted: 0,
+        // AFL++'s queue, taken into the bhf corpus (#275).
+        corpus_persisted,
         execution: afl_execution_summary(),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
@@ -6846,7 +7211,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
         unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
         fresh_reruns: None,
-        hangs: None,
+        hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
@@ -12028,6 +12393,77 @@ mod engine_list_tests {
             Some(empty.join("afl-fuzz"))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #275: the crashes and hangs of every instance are harvested with the
+    /// `<kind>.<date>/` a resumed session moved the last one's to, and those
+    /// backups are removed after; AFL++'s README is not an input.
+    #[cfg(unix)]
+    #[test]
+    fn saved_afl_inputs_include_a_resumed_sessions_backups() {
+        use super::{afl_saved_inputs, remove_afl_backups};
+        let dir = crate::test_support::TestDir::new("afl-saved");
+        let out = dir.join("out");
+        let write = |relative: &str| {
+            let path = out.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        };
+        write("default/queue/id:000000,orig:seed");
+        write("default/crashes/id:000000,sig:06");
+        write("default/crashes/README.txt");
+        write("default/crashes.2026-01-01-00:00:00/id:000000,sig:11");
+        write("default/hangs/id:000000,src:000000");
+        write("_resume/id:000000");
+        let names = |paths: Vec<std::path::PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&out)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(afl_saved_inputs(&out, "crashes")),
+            [
+                "default/crashes/id:000000,sig:06",
+                "default/crashes.2026-01-01-00:00:00/id:000000,sig:11"
+            ]
+        );
+        assert_eq!(
+            names(afl_saved_inputs(&out, "hangs")),
+            ["default/hangs/id:000000,src:000000"]
+        );
+        remove_afl_backups(&out);
+        assert!(!out.join("default/crashes.2026-01-01-00:00:00").exists());
+        assert!(out.join("default/crashes/id:000000,sig:06").is_file());
+    }
+
+    /// #275: a resumed session's queue gets a seed it does not hold, once:
+    /// one it holds, or was given before (and trimmed since), is not added.
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_queue_gets_each_new_seed_once() {
+        use super::{add_resume_seeds, afl_seed_hash};
+        let dir = crate::test_support::TestDir::new("afl-resume-seeds");
+        let queue = dir.join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("id:000000,orig:seed"), b"held").unwrap();
+        let mut offered = std::collections::HashSet::from([afl_seed_hash(b"trimmed-away")]);
+        let seeds = [
+            b"held".to_vec(),
+            b"new".to_vec(),
+            b"new".to_vec(),
+            Vec::new(),
+            b"trimmed-away".to_vec(),
+        ];
+        assert_eq!(add_resume_seeds(&queue, &seeds, &mut offered).unwrap(), 1);
+        let added = queue.join(format!("id:999999,orig:bhf-seed-{}", afl_seed_hash(b"new")));
+        assert_eq!(std::fs::read(&added).unwrap(), b"new");
+        assert_eq!(add_resume_seeds(&queue, &seeds, &mut offered).unwrap(), 0);
     }
 
     /// #274: afl-fuzz runs `-c` on the CmpLog build beside `main_afl` in a

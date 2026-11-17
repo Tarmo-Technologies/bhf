@@ -2786,6 +2786,17 @@
   when bhf panics.
 
 ### Added
+- The AFL++ lane keeps its session (#275). `afl_out/<harness>/out` is kept
+  between runs, `bhf auto` runs included, and afl-fuzz resumes it
+  (`AFL_AUTORESUME`). Seeds the session was not given before join its queue
+  (`offered-seeds.txt` records the ones it was given). After each run its
+  queue is taken into the bhf corpus (`corpus_persisted`). Inputs afl-fuzz
+  saved as hangs are re-run through `main_afl` with twice its 1 s limit, and
+  one that hangs again is a BHF-230 finding (`hangs` in the summary). The
+  crashes and hangs of a session a resume moved aside are harvested too. A
+  session afl-fuzz cannot resume is started over, once. The out directory
+  was deleted at the start of every run, the queue was never imported, and
+  `hangs/` was never read.
 - The AFL++ lane runs CmpLog (#274). The harness Makefile has an
   `afl_cmplog` target that builds `main_afl_cmplog` under
   `AFL_LLVM_CMPLOG=1`. `bhf auto --engine afl++` and `bhf build --c-engine
