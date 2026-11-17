@@ -1279,6 +1279,8 @@ struct PreparedFuzzRun {
     _local_vp_map: Option<shared_map::SharedMapFile>,
     /// Keeps the stack-depth (#220) word alive for the run.
     _local_stack_map: Option<shared_map::SharedMapFile>,
+    /// Keeps the per-exec edge hit-count map (#420, #401) alive for the run.
+    _local_count_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
@@ -3350,6 +3352,17 @@ fn prepare_with_runner(
             None
         };
 
+    // #401: the per-exec edge hit-count map, so a loop or recursion run more
+    // times on known edges is new coverage here as in `bhf auto` (#420).
+    let local_count_map =
+        if builtin_framed && !extra_env.iter().any(|(key, _)| key == "BHF_COV_CNT_SHM") {
+            let (path, value) = arm_shared_map(&work_dir, BHF_COV_BITS)?;
+            extra_env.push(("BHF_COV_CNT_SHM".to_owned(), value));
+            Some(path)
+        } else {
+            None
+        };
+
     // #220 stack depth: the driver records each exec's deepest stack, and a
     // deeper one is novelty, so recursion depth compounds toward exhaustion.
     // `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
@@ -3433,6 +3446,7 @@ fn prepare_with_runner(
         _local_cmp_map: local_cmp_map,
         _local_vp_map: local_vp_map,
         _local_stack_map: local_stack_map,
+        _local_count_map: local_count_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
         dict_file: args.dict_file,

@@ -52,6 +52,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf fuzz` arms the C/C++ driver's per-exec hit-count map, as `bhf auto`
+  does (#401), so its built-in engine gets hit-count bucket feedback: an
+  input that runs a loop or a recursion more times on the same edges is new
+  coverage. Without the map the bucket channel did nothing under `bhf fuzz`,
+  though the libFuzzer parity page lists it as always on.
 - The built-in mutator's typed mutation reaches a harness's decoded
   arguments (#299). The fuzz loop and the transport loop take each decoded
   scalar argument's span from the harness's `arg-layout.json` and pass it to
