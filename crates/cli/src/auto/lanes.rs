@@ -237,10 +237,7 @@ mod tests {
         );
         let lanes = read(dir.path());
         let recorded = lanes[COVERAGE].recorded_at.clone().unwrap();
-        assert!(
-            recorded.parse::<jiff::Timestamp>().is_ok(),
-            "{recorded}"
-        );
+        assert!(recorded.parse::<jiff::Timestamp>().is_ok(), "{recorded}");
         let this_run = unavailable(&lanes, RUN_START);
         assert_eq!(
             this_run,

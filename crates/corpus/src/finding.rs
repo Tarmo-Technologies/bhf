@@ -2380,10 +2380,7 @@ mod tests {
         assert_eq!(raw["schema_version"], "bhf.finding.v1");
         assert_eq!(raw["finding_kind"], "fuzz");
         let created = raw["created_at"].as_str().unwrap();
-        assert!(
-            created.parse::<jiff::Timestamp>().is_ok(),
-            "{created}"
-        );
+        assert!(created.parse::<jiff::Timestamp>().is_ok(), "{created}");
     }
 
     #[test]
