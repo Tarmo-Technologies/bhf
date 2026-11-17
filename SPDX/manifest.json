@@ -2179,6 +2179,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_collector.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_command_taint_confirm.rs",
       "license": "Apache-2.0"
     },

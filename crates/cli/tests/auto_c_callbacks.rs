@@ -39,6 +39,7 @@ fn target_line(source: &str, name: &str) -> u32 {
 
 fn options(src_root: &std::path::Path) -> AttemptOptions {
     AttemptOptions {
+        collector: None,
         cross_sweep: None,
         ada_toolchain: Default::default(),
         winafl: Default::default(),

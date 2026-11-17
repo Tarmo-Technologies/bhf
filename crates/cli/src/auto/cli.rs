@@ -195,6 +195,22 @@ pub struct AutoArgs {
     #[arg(long = "deadline", value_parser = crate::fuzz::parse_duration)]
     pub deadline: Option<std::time::Duration>,
 
+    /// Runtime-event collector that observes each fuzzed target's process,
+    /// filesystem and module-load effects: after a target's passes, its
+    /// retained inputs (its findings, then its corpus, at most 16) are replayed
+    /// one by one under it, as `bhf fuzz --collector` does. `auto` selects the
+    /// platform's built-in provider (the native Windows ETW provider, or on
+    /// Linux the runtrace shim), a PATH runs an external sidecar, and `none`
+    /// (default) runs none. A violation becomes a `binary_semantic` finding
+    /// with its input, and run.json records each target's `collector`.
+    #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
+    pub collector: crate::collector_run::CollectorSpec,
+
+    /// How long, in milliseconds, the collector keeps observing a replayed
+    /// input's descendant processes after it exits.
+    #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
+    pub collector_window_ms: u64,
+
     /// A C++ exception type an API throws to tell its callers about bad input
     /// (`std::invalid_argument`, `json::parse_error`; `*` for any), so one
     /// that leaves the target is not an uncaught-exception finding (BHF-231).
@@ -2329,6 +2345,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
 
     let mut options = AttemptOptions {
+        collector: (!matches!(args.collector, crate::collector_run::CollectorSpec::Off))
+            .then(|| (args.collector.clone(), args.collector_window_ms)),
         per_target_time: std::time::Duration::from_secs(args.per_target_time),
         total_time: args.total_time.map(std::time::Duration::from_secs),
         per_target_finding_count: args.per_target_finding_count,

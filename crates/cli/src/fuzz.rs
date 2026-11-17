@@ -1838,6 +1838,41 @@ fn run_collector_for_fuzz(
     Ok(provenance)
 }
 
+/// `bhf auto --collector` (#278): observe `harness_id`'s retained inputs under
+/// the collector after its fuzz passes, as `bhf fuzz --collector` does, and
+/// return the run provenance. `wrapper` is the emulator a cross-built harness
+/// runs under; `runtrace_log` the last pass's shim log, read for the sinks no
+/// replay reaches.
+pub(crate) fn observe_with_collector(
+    work_dir: &Path,
+    harness_id: &str,
+    spec: &crate::collector_run::CollectorSpec,
+    window_ms: u64,
+    wrapper: Option<crate::runner::HarnessWrapper>,
+    env: &[(String, String)],
+    runtrace_log: Option<&Path>,
+) -> anyhow::Result<serde_json::Value> {
+    let harness = find_harness_executable(work_dir, harness_id, FuzzEngine::Builtin)
+        .map_err(anyhow::Error::msg)?;
+    let runner = crate::runner::harness_runner_with_wrapper(
+        harness,
+        wrapper,
+        crate::runner::SandboxModeArg::Auto,
+        None,
+        false,
+    );
+    let harness =
+        collector_replay::CollectorHarness::new(runner, work_dir, env, Duration::from_secs(10));
+    run_collector_for_fuzz(
+        spec,
+        window_ms,
+        work_dir,
+        harness_id,
+        runtrace_log,
+        Some(&harness),
+    )
+}
+
 /// The rules of the runtime-oracle findings already written for `harness_id`
 /// in `findings_dir`: the oracle lane's own findings, with their testcases, so
 /// the campaign-aggregate collector view does not repeat them.

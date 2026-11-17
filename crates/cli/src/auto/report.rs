@@ -320,6 +320,10 @@ struct TargetEntry<'a> {
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     stub_executed: Option<StubExecuted>,
+    /// The runtime-event collector's observation of the target's retained
+    /// inputs (`--collector`, #278); omitted when it ran none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collector: Option<serde_json::Value>,
 }
 
 /// The share of a target's first inputs that ended in a nil-value error, when
@@ -1625,6 +1629,9 @@ pub fn write_reports_with_output_limit(
             lanes: crate::auto::lanes::read(&r.harness_dir),
             behavioral_oracles: target_behavioral_oracles(r),
             stub_executed: target_stub_executed(&r.harness_dir),
+            collector: std::fs::read(r.harness_dir.join(crate::auto::attempt::COLLECTOR_FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
         })
         .collect();
 

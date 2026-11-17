@@ -2678,6 +2678,12 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --collector SPEC` (and `--collector-window-ms`) observes each
+  fuzzed target with the runtime-event collector: after its passes, the
+  target's retained inputs are replayed one by one under it, as
+  `bhf fuzz --collector` does, and run.json records each target's
+  `collector` observation with each replay's testcase, input SHA-256 and PID.
+  `bhf auto` had no collector: its fuzz runs left it off.
 - The FreeRTOS reference profile has an interrupt-driven entry point: its
   `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
   handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test

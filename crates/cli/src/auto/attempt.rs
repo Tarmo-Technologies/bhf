@@ -112,6 +112,10 @@ fn should_link_full_tu_set(
 /// `bhf auto` CLI flags `--per-target-time` and `--no-stubs`.
 #[derive(Debug, Clone)]
 pub struct AttemptOptions {
+    /// `--collector` and `--collector-window-ms` (#278): after a target's fuzz
+    /// passes, replay its retained inputs under this runtime-event collector.
+    /// `None` (the default) runs no collector.
+    pub collector: Option<(crate::collector_run::CollectorSpec, u64)>,
     /// TOTAL per-target fuzz wall-clock budget for the cascade against a freshly
     /// built harness, split evenly across the passes (`total / passes.len()`)
     /// under one shared deadline so the per-target wall ≈ this regardless of pass
@@ -268,6 +272,7 @@ pub struct CrossSweep {
 impl Default for AttemptOptions {
     fn default() -> Self {
         Self {
+            collector: None,
             per_target_time: Duration::from_secs(60),
             total_time: None,
             per_target_finding_count: None,
@@ -4241,6 +4246,31 @@ fn run_attempt(
                         findings,
                     );
                 }
+                // #278: replay the target's retained inputs under the collector,
+                // once, after its passes. The provenance goes beside the harness
+                // for run.json.
+                if let Some((spec, window_ms)) = &options.collector {
+                    let log = harness_dir.join("runtrace.jsonl");
+                    match crate::fuzz::observe_with_collector(
+                        work_dir,
+                        &candidate.harness_id,
+                        spec,
+                        *window_ms,
+                        cross_runner.clone(),
+                        &env_injected,
+                        Some(&log),
+                    ) {
+                        Ok(provenance) => {
+                            let _ = std::fs::write(
+                                harness_dir.join(COLLECTOR_FILE),
+                                serde_json::to_vec_pretty(&provenance).unwrap_or_default(),
+                            );
+                        }
+                        Err(error) => {
+                            bhfeprintln!("bhf auto: {}: collector: {error:#}", candidate.harness_id)
+                        }
+                    }
+                }
                 // #95: target entry is a fuzz-SUCCESS invariant. Every generated
                 // lane injects a checkpoint immediately before the selected project
                 // endpoint, so a genuine fuzz of the library hits it. If an
@@ -5181,6 +5211,9 @@ fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
 /// per candidate during a large sweep. First-failed-lookup prints
 /// a single stderr line; every subsequent call is silent.
 static SHIM_MISSING_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The collector's run provenance for a target, beside its harness (#278).
+pub(crate) const COLLECTOR_FILE: &str = "collector.json";
 
 /// Run one fuzz pass with the runtrace shim loaded. Returns the
 /// FuzzRunSummary plus the parsed event list (empty when the shim
