@@ -70,6 +70,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- `bhf auto`'s minimize pass minimizes Ada findings (#281), on their
+  event-log signature as `bhf minimize` does, within the group's 30 s, so
+  an Ada finding has a `min_testcase.bin`. The pass skipped them.
 - `bhf corpus minimize` minimizes on the harness's coverage map in every lane
   (#282). Each input is replayed in a fresh process with the map cleared,
   and kept when it reaches an edge no earlier input did or, for Ada, adds an

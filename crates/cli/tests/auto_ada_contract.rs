@@ -7,6 +7,10 @@
 //! postcondition (`Result <= Data'Length`) catches on every call — so any input,
 //! including the empty one, trips it. This drives the real `bhf auto` and asserts
 //! a BHF-557 finding is recorded. Gated on the Ada toolchain; skipped otherwise.
+//!
+//! `bhf auto`'s minimize pass minimizes the finding as it does a C one
+//! (#281): its `min_testcase.bin` holds an input that still trips it, no
+//! longer than the one the fuzzer found. The pass skipped Ada findings.
 
 use std::path::{Path, PathBuf};
 
@@ -37,19 +41,17 @@ fn copy_ada_sources(fixture: &Path, dest: &Path) {
     }
 }
 
-fn findings_contain_rule(work_dir: &Path, rule_id: &str) -> bool {
+/// The directory of a finding of `rule_id`, if there is one.
+fn finding_with_rule(work_dir: &Path, rule_id: &str) -> Option<PathBuf> {
     let findings = work_dir.join("results").join("findings");
-    let Ok(entries) = std::fs::read_dir(&findings) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if let Ok(json) = std::fs::read_to_string(entry.path().join("finding.json")) {
-            if json.contains(rule_id) {
-                return true;
-            }
-        }
-    }
-    false
+    std::fs::read_dir(&findings)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("finding.json"))
+                .is_ok_and(|json| json.contains(rule_id))
+        })
 }
 
 #[test]
@@ -80,11 +82,32 @@ fn ada_contract_violation_reports_bhf557() {
         .output()
         .expect("spawn bhf auto");
 
+    let finding = finding_with_rule(&work_dir, "BHF-557").unwrap_or_else(|| {
+        panic!(
+            "expected a BHF-557 Ada contract-violation finding under {}; bhf auto exit={:?}\nstderr=\n{}",
+            work_dir.join("results").join("findings").display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    });
+    let minimized = std::fs::read(finding.join("min_testcase.bin")).unwrap_or_else(|error| {
+        panic!(
+            "the minimize pass left no min_testcase.bin in {} ({error}); stderr=\n{}",
+            finding.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let original = std::fs::read(finding.join("testcase.bin")).unwrap();
     assert!(
-        findings_contain_rule(&work_dir, "BHF-557"),
-        "expected a BHF-557 Ada contract-violation finding under {}; bhf auto exit={:?}\nstderr=\n{}",
-        work_dir.join("results").join("findings").display(),
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr),
+        minimized.len() <= original.len(),
+        "{minimized:?} {original:?}"
     );
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(finding.join("finding.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        record["minimal_reproducer"], "min_testcase.bin",
+        "{record:#}"
+    );
+    assert_eq!(record["minimization"]["strategy"], "bytes", "{record:#}");
 }

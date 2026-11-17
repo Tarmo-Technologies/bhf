@@ -464,17 +464,27 @@ pub(crate) fn minimize_for_auto(
     harness: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<Option<MinimizeSummary>> {
-    let io = match engine_for_finding(harness, finding_dir) {
-        HarnessEngine::CAfl => CEngineIo::Stdin,
-        HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
-        HarnessEngine::AdaStdin => return Ok(None),
-    };
     // A cross-built harness runs under the emulator recorded beside it.
     let runner = match crate::runner::recorded_runner_for(harness) {
         Some(recorded) => {
             replay_min::HarnessRunner::qemu_user(recorded.program, recorded.args, harness)
         }
         None => replay_min::HarnessRunner::direct(harness),
+    };
+    let io = match engine_for_finding(harness, finding_dir) {
+        HarnessEngine::CAfl => CEngineIo::Stdin,
+        HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
+        // #281: an Ada finding is minimized as `bhf minimize` does it, on its
+        // event-log signature, within the group's deadline.
+        HarnessEngine::AdaStdin => {
+            let result = minimize(
+                finding_dir,
+                &runner,
+                MinimizeStrategy::Bytes,
+                Some(deadline),
+            )?;
+            return write_ada_minimization(finding_dir, &result).map(Some);
+        }
     };
     minimize_c_engine_until(
         finding_dir,
@@ -639,7 +649,7 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
         }
         HarnessEngine::AdaStdin => {}
     }
-    let result = minimize(&finding_dir, &runner, args.strategy).with_context(|| {
+    let result = minimize(&finding_dir, &runner, args.strategy, None).with_context(|| {
         let work = corpus::layout::work_dir_for_finding(&finding_dir);
         let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
         let detection = crate::protocol_detect::detect(runner.harness_path(), &work_dirs);
@@ -650,12 +660,19 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             detection.basis.describe()
         )
     })?;
-    let min_path = finding_dir.join("min_testcase.bin");
+    write_ada_minimization(&finding_dir, &result)
+}
 
+/// Write an Ada finding's minimized input to `min_testcase.bin` and record
+/// the minimization in its `finding.json`.
+fn write_ada_minimization(
+    finding_dir: &Path,
+    result: &MinimizeOutput,
+) -> anyhow::Result<MinimizeSummary> {
+    let min_path = finding_dir.join("min_testcase.bin");
     fs::write(&min_path, &result.minimized)
         .with_context(|| format!("write minimized testcase to {}", min_path.display()))?;
-    update_finding_record(&finding_dir, &result)?;
-
+    update_finding_record(finding_dir, result)?;
     Ok(MinimizeSummary {
         strategy: result.strategy,
         original_len: result.original_len,
@@ -690,10 +707,15 @@ fn minimize(
     finding_dir: &Path,
     runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeOutput> {
     match strategy {
         MinimizeStrategy::Bytes => {
-            let result = replay_min::minimize_finding_bytes_with_runner(finding_dir, runner)?;
+            let result = replay_min::minimize_finding_bytes_with_runner_until(
+                finding_dir,
+                runner,
+                deadline,
+            )?;
             let reduced = result.removed_bytes() > 0;
             let metadata = json!({
                 "strategy": strategy.as_str(),
