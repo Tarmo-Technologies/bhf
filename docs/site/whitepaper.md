@@ -18,7 +18,7 @@ fuzzable entry points, generates typed harnesses, recovers the build when there
 isn't one, and fuzzes across **sixteen lanes: Ada, C, C++, Rust, Java, Python,
 Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP**, with
 a built-in engine or by driving AFL++ directly on native C/C++, COBOL,
-Fortran and Rust targets.
+Fortran, Rust and Ada targets.
 
 In head-to-head measurements against the most popular fuzzer for each language,
 bhf finds the same bugs the specialists find while requiring **zero**
@@ -52,7 +52,8 @@ never happens. The bugs stay unfound not because the engines can't find them, bu
 because no one can afford the plumbing.
 
 And for **Ada**, the lingua franca of safety-critical avionics and defense, the
-plumbing tax is infinite: there is no AFL++ for Ada, no libFuzzer, no Jazzer.
+plumbing tax is infinite: AFL++ has no Ada mode, and there is no libFuzzer or
+Jazzer for it.
 
 ---
 

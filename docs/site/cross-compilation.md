@@ -294,7 +294,7 @@ edge coverage and the comparison log (with comparison evidence for each
 finding on qemu-user targets) surface. To catch those vulnerability classes,
 fuzz the target natively.
 
-The AFL++ secondary engine runs native C/C++, COBOL, Fortran and Rust targets only,
+The AFL++ secondary engine runs native C/C++, COBOL, Fortran, Rust and Ada targets only,
 so cross-compiled or emulated targets, and those of the other lanes, fall back
 to the built-in engine.
 

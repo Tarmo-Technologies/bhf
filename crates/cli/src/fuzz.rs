@@ -6876,6 +6876,9 @@ struct ExternalIngest<'a> {
     feed: TraceInput,
     emitter: FindingEmitter,
     dedup: SanitizerClusterDedup,
+    /// Event signatures (hex) reported already: the harness's earlier
+    /// findings, then each this ingest emits (#304).
+    event_signatures: HashSet<String>,
     finding_ids: Vec<String>,
 }
 
@@ -6887,22 +6890,26 @@ impl<'a> ExternalIngest<'a> {
         feed: TraceInput,
     ) -> Result<Self, String> {
         let sandbox_metadata = prepared.runner.sandbox_metadata();
+        // An Ada finding replays and minimizes through the harness's own
+        // build, as the builtin engine's do (#304).
+        let fixture =
+            ada_main_beside_afl(&prepared.harness_path).unwrap_or(prepared.harness_path.clone());
         let mut emitter = with_harness_format(
             FindingEmitter::with_metadata_and_sandbox(
                 prepared.work_dir.clone(),
                 prepared.harness_id.clone(),
                 "unknown".to_owned(),
-                prepared.harness_path.display().to_string(),
+                fixture.display().to_string(),
                 serde_json::to_value(&sandbox_metadata)
                     .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
             )
             .with_mode(prepared.mode)
             .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
-            &prepared.harness_path,
+            &fixture,
             &prepared.work_dir,
             &prepared.harness_id,
         );
-        if let Some(identity) = build_binary_record(&prepared.harness_path) {
+        if let Some(identity) = build_binary_record(&fixture) {
             emitter = emitter.with_build_binary(identity);
         }
         let dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
@@ -6910,6 +6917,10 @@ impl<'a> ExternalIngest<'a> {
             &prepared.work_dir,
             &prepared.harness_id,
         ));
+        let event_signatures = ExistingFindings::load(&prepared.work_dir, &prepared.harness_id)
+            .signatures
+            .into_keys()
+            .collect();
         Ok(Self {
             prepared,
             engine,
@@ -6917,8 +6928,59 @@ impl<'a> ExternalIngest<'a> {
             feed,
             emitter,
             dedup,
+            event_signatures,
             finding_ids: Vec::new(),
         })
+    }
+
+    /// The findings an Ada harness's crashing `input` shows when it runs
+    /// again with the event log (#304): an exception that escaped the target,
+    /// or a predefined check the target swallowed, as the builtin engine
+    /// reports them. Under AFL++ the harness aborted on it
+    /// (`BHF_CRASH_ON_FINDING`), with no report of its own. Whether any was
+    /// new.
+    fn ada_findings(&mut self, input: &[u8], artifact: &str) -> Result<bool, String> {
+        let prepared = self.prepared;
+        let run = run_harness(
+            &prepared.runner,
+            &prepared.work_dir,
+            input,
+            &prepared.extra_env,
+            prepared.per_input_timeout,
+            prepared.rss_limit_mb,
+            prepared.deadline,
+        )?;
+        let mut emitted = false;
+        for testcase in &run.testcases {
+            for (handler_index, classification) in classify(testcase) {
+                let Some(handler) = resolve_handler(testcase, handler_index) else {
+                    continue;
+                };
+                // As the builtin engine filters them: a target rejecting an
+                // input with its own exception, or a stub body it reached.
+                if finding_tier(classification, &handler.as_ref().exception_name)
+                    == FindingTier::IntendedRejection
+                    || handler
+                        .as_ref()
+                        .exception_message
+                        .contains(crate::auto::ada_body_stub::STUB_RAISE_MARKER)
+                {
+                    continue;
+                }
+                let signature = compute_signature(testcase, handler.as_ref());
+                if !self.event_signatures.insert(signature.hex()) {
+                    continue;
+                }
+                let id = self
+                    .emitter
+                    .emit(input, testcase, handler_index)
+                    .map_err(|error| format!("emit {} finding: {error}", self.engine))?;
+                self.record_lineage(&id.0, artifact);
+                self.finding_ids.push(id.0);
+                emitted = true;
+            }
+        }
+        Ok(emitted)
     }
 
     /// Record the crashing `input` the engine saved as `artifact` (`crash
@@ -6932,6 +6994,11 @@ impl<'a> ExternalIngest<'a> {
         replay: &ExternalReplay<'_>,
     ) -> Result<(), String> {
         let prepared = self.prepared;
+        // An Ada harness aborts on an exception's top-level catch, which its
+        // event log describes and a signal does not.
+        if is_instrumented_ada_harness(&prepared.runner) && self.ada_findings(input, artifact)? {
+            return Ok(());
+        }
         let replayed = replay(input, &prepared.extra_env, None)
             .map_err(|error| format!("replay {artifact}: {error}"))?;
         let stderr = String::from_utf8_lossy(&replayed.stderr);
@@ -7184,6 +7251,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                     afl_fuzz.display()
                 );
             }
+        }
+        // An Ada harness catches every exception at its top level, which
+        // AFL++ would see as a clean run: it aborts there instead (#304).
+        if is_instrumented_ada_harness(&prepared.runner) {
+            afl_cmd.env("BHF_CRASH_ON_FINDING", "1");
         }
         afl_cmd
             .arg("--")
@@ -7645,13 +7717,25 @@ fn libfuzzer_binary_note(
 /// `build/<id>/obj/main`, so the sentinel is two levels up. Keyed on the sentinel
 /// (not the C-driver markers) so it can never flip C/C++ harness behavior, and so
 /// a GNAT that lacks trace-pc (no sentinel) cleanly degrades to no coverage.
+/// The Ada harness's own build (`build/<id>/obj/main`) beside its AFL++ build
+/// (`build/<id>/main_afl`, #304), if `harness` is one.
+fn ada_main_beside_afl(harness: &Path) -> Option<PathBuf> {
+    let build_dir = harness.parent()?;
+    let main = build_dir.join("obj").join("main");
+    (harness.file_name().is_some_and(|name| name == "main_afl")
+        && build_dir.join(crate::build::ADA_COV_SENTINEL).is_file()
+        && main.is_file())
+    .then_some(main)
+}
+
 fn is_instrumented_ada_harness(runner: &replay_min::HarnessRunner) -> bool {
+    // `build/<id>/obj/main`, or the AFL++ build staged in `build/<id>/` (#304).
     runner
         .harness_path()
-        .parent()
-        .and_then(|obj_dir| obj_dir.parent())
-        .map(|build_dir| build_dir.join(crate::build::ADA_COV_SENTINEL).is_file())
-        .unwrap_or(false)
+        .ancestors()
+        .skip(1)
+        .take(2)
+        .any(|dir| dir.join(crate::build::ADA_COV_SENTINEL).is_file())
 }
 
 /// Hard cap on a single libFuzzer-binary invocation. A fuzz input that

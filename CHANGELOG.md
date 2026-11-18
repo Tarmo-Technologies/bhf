@@ -70,6 +70,9 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada harness given its input as a file on stdin reads it once (#304).
+  Each loop reopened `/dev/stdin`, which starts a regular file over, so the
+  harness read the same input until it was killed.
 - A COBOL finding is placed at the COBOL line libcob named (#424). Its
   location's file was the attributed message up to that line, as the
   report took the site from the message's prefix; the attribution now
@@ -2850,6 +2853,14 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --engine afl++` runs Ada targets under AFL++ (#304). The
+  harness's objects link again with AFL++'s runtime into
+  `build/<id>/main_afl`; the Ada coverage runtime forwards its trace-pc edges
+  into AFL++'s map, an exception that escapes the target aborts it
+  (`BHF_CRASH_ON_FINDING`), and each crash AFL++ saves is replayed with the
+  event log and reported, minimized and replayed as the builtin engine's
+  are. AFL++'s GCC plugin is not used: a distribution's plugin refuses a GCC
+  of another point release.
 - `bhf auto --engine afl++` runs Rust targets under AFL++ (#303). A Rust
   harness's `build-afl.sh` builds its crate again with bhf's trace-pc-guard
   instrumentation and links the staticlib with afl-clang-fast and a persistent

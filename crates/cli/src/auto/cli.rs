@@ -460,7 +460,7 @@ pub struct AutoArgs {
 
     /// Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin`
     /// (default) is the in-process coverage-guided engine. `afl++` drives AFL++
-    /// on the auto-recovered build (C/C++, COBOL, Fortran and Rust targets; needs
+    /// on the auto-recovered build (C/C++, COBOL, Fortran, Rust and Ada targets; needs
     /// `afl-fuzz` + `afl-clang-fast` on PATH, else it falls back to builtin with
     /// a warning). `--engine builtin,afl++` runs BOTH per target, splitting
     /// `--per-target-time` evenly across them. For a target of another lane an

@@ -695,6 +695,68 @@ fn ada_compiler_adapter(args: &BuildArgs) -> Result<CompilerAdapter, String> {
     ))
 }
 
+/// AFL++'s compiler runtime (`afl-compiler-rt.o`): its fork server, the
+/// shared map and the guard functions. In `AFL_PATH`, else beside the
+/// `afl-fuzz` on PATH (`<prefix>/lib/afl`), else a distribution's
+/// `/usr/lib/afl` or `/usr/local/lib/afl`.
+pub(crate) fn afl_compiler_runtime() -> Option<PathBuf> {
+    const RUNTIME: &str = "afl-compiler-rt.o";
+    let from_env = std::env::var_os("AFL_PATH").map(PathBuf::from);
+    let beside_afl_fuzz = which::which("afl-fuzz").ok().and_then(|afl_fuzz| {
+        let prefix = std::fs::canonicalize(afl_fuzz)
+            .ok()?
+            .parent()?
+            .parent()?
+            .to_path_buf();
+        Some(prefix.join("lib").join("afl"))
+    });
+    from_env
+        .into_iter()
+        .chain(beside_afl_fuzz)
+        .chain(["/usr/local/lib/afl", "/usr/lib/afl"].map(PathBuf::from))
+        .map(|dir| dir.join(RUNTIME))
+        .find(|runtime| runtime.is_file())
+}
+
+/// The AFL++ build of an Ada harness (#304): the objects its `main` build
+/// compiled, linked again with AFL++'s runtime into `build/<id>/main_afl`,
+/// where `bhf fuzz --engine afl++` takes it. AFL++'s fork server starts it,
+/// and the Ada coverage runtime forwards its trace-pc edges into AFL++'s map
+/// once the runtime is linked. AFL++'s GCC plugin is not used: a
+/// distribution's plugin is built for one GCC point release and refuses to
+/// load into another.
+pub(crate) fn try_ada_afl_build(args: &BuildArgs) -> Result<(), String> {
+    let runtime = afl_compiler_runtime().ok_or_else(|| {
+        "AFL++'s afl-compiler-rt.o was not found (set AFL_PATH to its directory)".to_owned()
+    })?;
+    let harness_id = args
+        .harness
+        .as_deref()
+        .ok_or_else(|| "no harness to build for AFL++".to_owned())?;
+    let build_dir = args.work_dir.join("build").join(harness_id);
+    let adapter = ada_compiler_adapter(args)?;
+    let extra = [
+        "-o".to_owned(),
+        "main_afl".to_owned(),
+        "-largs".to_owned(),
+        runtime.display().to_string(),
+        "-lpthread".to_owned(),
+        "-ldl".to_owned(),
+        "-lrt".to_owned(),
+    ];
+    let result = adapter
+        .build_with_args(&build_dir.join("bhf_build.gpr"), &extra)
+        .map_err(|error| format!("gprbuild for main_afl: {error}"))?;
+    if result.exit_code != 0 {
+        return Err(format!("{}\n{}", result.stderr, result.stdout));
+    }
+    std::fs::rename(
+        build_dir.join("obj").join("main_afl"),
+        build_dir.join("main_afl"),
+    )
+    .map_err(|error| format!("stage main_afl: {error}"))
+}
+
 /// Whether `dir` directly contains at least one C source file (`.c`). Used to
 /// decide whether the generated Ada project must also declare the C language so
 /// gprbuild compiles + links the C glue a real Ada library binds to. Non-recursive

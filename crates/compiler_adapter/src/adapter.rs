@@ -191,14 +191,29 @@ impl CompilerAdapter {
     }
 
     pub fn build(&self, project: &Path) -> Result<BuildResult, CompilerError> {
-        self.run(project, BuildMode::Full)
+        self.run(project, BuildMode::Full, &[])
+    }
+
+    /// [`Self::build`] with `extra` after the switches it passes: another
+    /// executable name (`-o`), or switches for one phase (`-largs ...`).
+    pub fn build_with_args(
+        &self,
+        project: &Path,
+        extra: &[String],
+    ) -> Result<BuildResult, CompilerError> {
+        self.run(project, BuildMode::Full, extra)
     }
 
     pub fn check(&self, project: &Path) -> Result<BuildResult, CompilerError> {
-        self.run(project, BuildMode::CheckOnly)
+        self.run(project, BuildMode::CheckOnly, &[])
     }
 
-    fn run(&self, project: &Path, mode: BuildMode) -> Result<BuildResult, CompilerError> {
+    fn run(
+        &self,
+        project: &Path,
+        mode: BuildMode,
+        extra: &[String],
+    ) -> Result<BuildResult, CompilerError> {
         let bin = self.project_build_binary()?;
         let start = Instant::now();
         let mut command = Command::new(bin);
@@ -249,6 +264,7 @@ impl CompilerAdapter {
             // records `-gnatc`) and still skips a unit nothing changed.
             command.arg("-s");
         }
+        command.args(extra);
 
         let output = run_bounded(&mut command)?;
         let duration_ms = millis_u64(start.elapsed().as_millis());

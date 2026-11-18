@@ -184,3 +184,72 @@ fn afl_fuzzes_a_rust_function_and_finds_its_out_of_bounds_index() {
         "located in the crate: {finding:#}"
     );
 }
+
+/// #304: an Ada harness's objects link again with AFL++'s runtime, and its
+/// trace-pc edges reach AFL++'s map. AFL++ finds the fixture's index check
+/// behind its enumeration, the finding is the Constraint_Error the builtin
+/// engine reports, and `bhf replay` reproduces it with the harness's own
+/// build.
+#[test]
+fn afl_fuzzes_an_ada_function_and_finds_its_constraint_error() {
+    if !afl_present() || !on_path("gnatmake") || !on_path("gprbuild") {
+        eprintln!("skipping: needs AFL++ and GNAT (gnatmake, gprbuild)");
+        return;
+    }
+    let root = TestDir::new("afl-ada");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ada_record_params");
+    for name in ["words.ads", "words.adb"] {
+        std::fs::copy(fixture.join(name), src.join(name)).unwrap();
+    }
+    let (target, findings, stderr) =
+        auto_afl(&root, &src, &["--languages", "ada", "--target", "weight"]);
+    let id = target["harness_id"].as_str().unwrap();
+    let build = root.join("work/build").join(id);
+    assert!(build.join("main_afl").is_file(), "{target:#}");
+    // Raw stdin is one input: a file there, as AFL++ hands it, is not read
+    // again and again.
+    let input = root.join("input.bin");
+    std::fs::write(&input, b"hello").unwrap();
+    let mut main = Command::new(build.join("obj/main"))
+        .stdin(std::fs::File::open(&input).unwrap())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while main.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the harness reads a file on stdin once"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let finding = findings
+        .iter()
+        .find(|finding| finding["rule_id"] == "BHF-101")
+        .unwrap_or_else(|| panic!("no BHF-101 finding: {findings:#?}\n{stderr}"));
+    assert!(found_by_afl(finding), "{finding:#}");
+    assert!(
+        finding.to_string().contains("index check failed"),
+        "{finding:#}"
+    );
+    assert!(
+        finding["fixture_path"]
+            .as_str()
+            .is_some_and(|fixture| fixture.ends_with("obj/main")),
+        "{finding:#}"
+    );
+    let dir = root
+        .join("work/results/findings")
+        .join(finding["id"].as_str().unwrap());
+    let replay = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["replay", "--finding"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let replayed = String::from_utf8_lossy(&replay.stdout);
+    assert!(replayed.starts_with("MATCH"), "{replayed}");
+}
