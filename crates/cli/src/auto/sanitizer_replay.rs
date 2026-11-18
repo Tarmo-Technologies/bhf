@@ -26,6 +26,9 @@ pub enum ReplayLane {
     /// `cfi`: `-fsanitize=cfi`, casts to the wrong class and calls through a
     /// function pointer or vtable of the wrong type.
     Cfi,
+    /// `realtime`: `-fsanitize=realtime` (clang 20+, #298), allocations, locks
+    /// and blocking calls in a target marked nonblocking.
+    Realtime,
 }
 
 impl ReplayLane {
@@ -33,6 +36,7 @@ impl ReplayLane {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "cfi" => Some(ReplayLane::Cfi),
+            "realtime" | "rtsan" => Some(ReplayLane::Realtime),
             _ => None,
         }
     }
@@ -40,6 +44,7 @@ impl ReplayLane {
     pub fn as_str(self) -> &'static str {
         match self {
             ReplayLane::Cfi => "cfi",
+            ReplayLane::Realtime => "realtime",
         }
     }
 }

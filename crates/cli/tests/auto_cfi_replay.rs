@@ -134,7 +134,11 @@ fn a_bad_cast_is_a_cfi_finding_and_the_unobservable_classes_are_listed() {
         .iter()
         .map(|class| class["class"].as_str().unwrap())
         .collect();
-    assert_eq!(classes, ["uninitialized-reads", "data-races"], "{run:#}");
+    assert_eq!(
+        classes,
+        ["uninitialized-reads", "data-races", "realtime-safety"],
+        "{run:#}"
+    );
     let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
     assert!(
         md.contains("## Bug classes this run could not observe"),

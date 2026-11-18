@@ -290,6 +290,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         extra_sources: Vec::new(),
         comparison_progress: false,
         sanitizers: Default::default(),
+        nonblocking: Vec::new(),
         sbom: false,
         static_scan: false,
         external_tools: false,

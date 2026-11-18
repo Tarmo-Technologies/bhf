@@ -2839,6 +2839,14 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --sanitizers ...,realtime` replays the corpus of each target that
+  must not block through a RealtimeSanitizer build (`make rtsan`, clang 20+
+  `-fsanitize=realtime`) after the fuzz passes (#298). The marked target runs
+  in a real-time context, and an allocation, lock, sleep or system call made
+  there is a BHF-232 (CWE-1322) finding that `bhf replay` reproduces with that
+  build. `--nonblocking <entry-points | all | NAME>` picks the targets; the
+  default marks interrupt handlers and RTOS task bodies. Without clang 20 the
+  lane is skipped and the run says so.
 - `bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
   control-flow integrity build (`make cfi`, clang `-fsanitize=cfi -flto
   -fvisibility=hidden`, reporting through the UBSan runtime) after the fuzz

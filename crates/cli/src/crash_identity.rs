@@ -368,7 +368,7 @@ fn kind_from_exception_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let kind = ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+    let kind = corpus::sanitizer::EXCEPTION_NAME_PREFIXES
         .iter()
         .find_map(|prefix| name.strip_prefix(prefix))
         .unwrap_or(name);

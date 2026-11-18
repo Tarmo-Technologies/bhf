@@ -192,7 +192,9 @@ jobs:
             llvm \
             libunwind-dev \
             binutils-dev \
-            libblocksruntime-dev
+            libblocksruntime-dev \
+            clang-20 \
+            libclang-rt-20-dev
           # Only the packages the mirror still serves are kept.
           sudo apt-get "${apt_opts[@]}" autoclean
           sudo rm -rf "$HOME/apt-archives/partial" "$HOME/apt-archives/lock"
@@ -260,7 +262,7 @@ jobs:
                       aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
                       arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
                       javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
-                      lldb llvm-symbolizer dotnet python2 honggfuzz hfuzz-clang; do
+                      lldb llvm-symbolizer dotnet python2 honggfuzz hfuzz-clang clang-20; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for

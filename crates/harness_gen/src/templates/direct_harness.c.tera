@@ -168,10 +168,27 @@ extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribut
 
 #if defined(BHF_EXTERNAL_DRIVER)
 extern void bhf_target_enter(void);
-#define BHF_TARGET_ENTER() bhf_target_enter()
+#define BHF_TARGET_ENTER_PROBE() bhf_target_enter()
 #else
-#define BHF_TARGET_ENTER() ((void)0)
+#define BHF_TARGET_ENTER_PROBE() ((void)0)
 #endif
+
+/* RealtimeSanitizer (#298): a target marked nonblocking (an interrupt handler or
+ * an RTOS task entry point, `bhf auto --nonblocking`) runs in a real-time
+ * context under the `rtsan` build, from its call to its return, so an
+ * allocation, a lock or a blocking call it makes is a report. The harness's
+ * own decoding and cleanup around the call are not. */
+#if defined(BHF_RTSAN) && defined(BHF_RTSAN_NONBLOCKING)
+extern void __rtsan_realtime_enter(void);
+extern void __rtsan_realtime_exit(void);
+#define BHF_RT_ENTER() __rtsan_realtime_enter()
+#define BHF_RT_EXIT() __rtsan_realtime_exit()
+#else
+#define BHF_RT_ENTER() ((void)0)
+#define BHF_RT_EXIT() ((void)0)
+#endif
+#define BHF_TARGET_EXIT() BHF_RT_EXIT()
+#define BHF_TARGET_ENTER() do { BHF_TARGET_ENTER_PROBE(); BHF_RT_ENTER(); } while (0)
 
 {%- if passthrough_libfuzzer_entrypoint %}
 extern int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
@@ -779,10 +796,12 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     for (size_t _bhf_i = 0; _bhf_i < Size; ++_bhf_i) {
         BHF_TARGET_ENTER();
         (void){{ qualified_target_name }}((Data[_bhf_i]){% for p in params %}, {{ p.arg }}{% endfor %});
+        BHF_TARGET_EXIT();
     }
 {%- else %}
     BHF_TARGET_ENTER();
     {% if return_type_present %}{{ return_type }} R = {% endif %}{{ qualified_target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+    BHF_TARGET_EXIT();
 {%- if return_type_present %}
     BHF_KEEP_RESULT(R);
 {%- if drive_steps and not byte_stream %}

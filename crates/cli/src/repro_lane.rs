@@ -2012,7 +2012,7 @@ fn failed_status() -> Option<ExitStatus> {
 /// The kind a recorded `exception.name` names (`ASAN_HEAP_BUFFER_OVERFLOW` is
 /// `heap-buffer-overflow`), as [`crate::crash_identity`] reads it.
 fn exception_kind(name: &str) -> String {
-    let kind = ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+    let kind = corpus::sanitizer::EXCEPTION_NAME_PREFIXES
         .iter()
         .find_map(|prefix| name.strip_prefix(prefix))
         .unwrap_or(name);

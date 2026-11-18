@@ -539,6 +539,31 @@ needs clang and an LTO linker (lld, or binutils with LLVM's gold plugin); a
 harness whose CFI build fails is named in the run's output, and its corpus is
 unmeasured for type confusion, not clean.
 
+## The RealtimeSanitizer replay
+
+`bhf auto --sanitizers ...,realtime` (or `rtsan`) checks the code that must
+not block: an interrupt handler, or the body of an RTOS task, that allocates,
+takes a lock, sleeps or makes a system call on its real-time path (CWE-1322).
+No other lane sees these: the call is correct C, and it only fails a deadline.
+
+The lane marks each nonblocking target's harness, so the target runs between
+`__rtsan_realtime_enter()` and `__rtsan_realtime_exit()`. `--nonblocking`
+names the targets: `entry-points` (the default) marks the functions that look
+like entry points (a name ending in `_IRQHandler`, `_Handler`, `_isr` or
+`_irq_handler`, or starting with `isr_`, and a `void` task or thread body
+taking one `void *` or `ULONG`), `all` marks every target, and any other value
+marks the target of that name. Repeat it to name several.
+
+After the fuzz passes, each marked C/C++ harness is built with
+`-fsanitize=realtime` (`make rtsan`, `main_rtsan`) and replays its corpus. A
+real-time unsafe call becomes a BHF-232 finding at the target's frame that made
+it, with the RTSan build as the fixture `bhf replay` runs. The lane needs clang
+20 or newer, which it finds as `clang-22`, `clang-21`, `clang-20` or `clang`.
+Without one, the run says so and skips the lane. A harness whose RTSan build
+fails is named in the run's output, and its corpus is unmeasured for real-time
+safety, not clean. `--nonblocking` without the `realtime` lane is an error, and
+`bhf fuzz` refuses `--sanitizers realtime`, as it does `cfi`.
+
 ## Bug classes a run could not observe
 
 `run.json`'s `summary.unobservable_classes` and the run report's "Bug classes
@@ -546,11 +571,12 @@ this run could not observe" list each class no lane of the run detects in the
 C/C++ targets it fuzzed, the languages it went unobserved in, and what would
 observe it: memory errors without ASan, undefined behavior without UBSan,
 leaks without LSan or ASan, uninitialized reads without the MSan replay (which
-has no C++ lane), data races without the TSan replay (C only), and type
-confusion without the CFI replay. A finding list without a class says nothing
+has no C++ lane), data races without the TSan replay (C only), type
+confusion without the CFI replay, and real-time unsafe calls without the
+RealtimeSanitizer replay. A finding list without a class says nothing
 about it.
 
-### Bounds of the MSan, TSan and CFI replays
+### Bounds of the MSan, TSan, CFI and RealtimeSanitizer replays
 
 Each replayed input runs for at most `--timeout`, or 30 s, whichever is less.
 A run past it is a hang under that sanitizer: it is not run again, and the
@@ -569,4 +595,6 @@ of `auto/sanitizer-replay.jsonl`: the sanitizer, harness, input, `elapsed_ms`,
   intra-pool overflows are caught.
 - **Leaks:** `--sanitizers asan,ubsan,lsan`. **Uninitialized reads / races:**
   `--sanitizers msan` or `tsan` as separate campaigns. **C++ type confusion and
-  bad indirect calls:** add `cfi` to `bhf auto --sanitizers`.
+  bad indirect calls:** add `cfi` to `bhf auto --sanitizers`. **Interrupt
+  handlers and RTOS tasks that must not block:** add `realtime`, and name the
+  targets with `--nonblocking` when the default entry-point match misses them.

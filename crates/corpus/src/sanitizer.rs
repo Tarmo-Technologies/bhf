@@ -208,12 +208,21 @@ pub struct StackFrame {
     pub line: Option<u32>,
 }
 
+/// The prefixes a sanitizer crash's recorded `exception.name` starts with
+/// (`ASAN_HEAP_BUFFER_OVERFLOW`, `RTSAN_UNSAFE_LIBRARY_CALL`): the rest is its
+/// kind.
+pub const EXCEPTION_NAME_PREFIXES: &[&str] =
+    &["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_", "RTSAN_"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sanitizer {
     AddressSanitizer,
     UndefinedBehaviorSanitizer,
     LeakSanitizer,
     MemorySanitizer,
+    /// RealtimeSanitizer (#298): a real-time unsafe call in a nonblocking
+    /// context.
+    RealtimeSanitizer,
 }
 
 impl Sanitizer {
@@ -223,6 +232,7 @@ impl Sanitizer {
             Sanitizer::UndefinedBehaviorSanitizer => "ubsan",
             Sanitizer::LeakSanitizer => "lsan",
             Sanitizer::MemorySanitizer => "msan",
+            Sanitizer::RealtimeSanitizer => "rtsan",
         }
     }
 }
@@ -232,6 +242,7 @@ pub fn parse_sanitizer_report(stderr: &str) -> Option<SanitizerReport> {
         .or_else(|| parse_ubsan(stderr))
         .or_else(|| parse_lsan(stderr))
         .or_else(|| parse_msan(stderr))
+        .or_else(|| parse_rtsan(stderr))
         // A Rust panic is the PRIMARY bug signal for the native Rust lane: a
         // bounds-check / unwrap / overflow / explicit panic aborts via SIGABRT,
         // which the C-oriented `is_input_rejection` would otherwise dismiss as an
@@ -1492,6 +1503,51 @@ fn parse_msan(stderr: &str) -> Option<SanitizerReport> {
         rule_id: "BHF-212",
         stack: parse_stack_frames(stderr),
         message: line.trim().to_owned(),
+        ..Default::default()
+    })
+}
+
+/// A RealtimeSanitizer report (#298): `==N==ERROR: RealtimeSanitizer: <kind>`
+/// (`unsafe-library-call`, `blocking-call`), the call it intercepted on the next
+/// line, and its stack. The report is located at the first frame with a source
+/// position: frame 0 is the intercepted library function.
+fn parse_rtsan(stderr: &str) -> Option<SanitizerReport> {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("ERROR: RealtimeSanitizer:"))?;
+    let kind = line
+        .split_once("ERROR: RealtimeSanitizer:")
+        .and_then(|(_, kind)| kind.split_whitespace().next())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("unsafe-library-call");
+    let after = stderr
+        .find(line)
+        .map(|pos| &stderr[pos + line.len()..])
+        .unwrap_or("");
+    let intercepted = after
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("");
+    let stack = parse_stack_frames(after);
+    let location = stack.iter().find_map(|frame| {
+        Some(SourceLocation {
+            file: frame.file.clone()?,
+            line: frame.line?,
+            column: None,
+        })
+    });
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::RealtimeSanitizer),
+        kind: kind.to_owned(),
+        rule_id: "BHF-232",
+        stack,
+        message: if intercepted.is_empty() {
+            line.trim().to_owned()
+        } else {
+            format!("{} {intercepted}", line.trim())
+        },
+        location,
         ..Default::default()
     })
 }

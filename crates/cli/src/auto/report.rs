@@ -208,6 +208,7 @@ fn unobservable_classes(
         SanitizerSelection::Set(set) => set.contains(&sanitizer),
     };
     let cfi = replay_lanes.contains(&ReplayLane::Cfi);
+    let realtime = replay_lanes.contains(&ReplayLane::Realtime);
     // (class, description, observed in C, observed in C++, what would)
     let classes = [
         (
@@ -251,6 +252,13 @@ fn unobservable_classes(
             cfi,
             cfi,
             "--sanitizers cfi",
+        ),
+        (
+            "realtime-safety",
+            "allocations, locks and blocking calls in an interrupt handler or task that must not block",
+            realtime,
+            realtime,
+            "--sanitizers realtime (clang 20+), with the nonblocking targets named by --nonblocking",
         ),
     ];
     classes
@@ -4247,12 +4255,13 @@ mod tests {
                 ("uninitialized-reads", vec!["c++"]),
                 ("data-races", vec!["c++"]),
                 ("type-confusion", vec!["c", "c++"]),
+                ("realtime-safety", vec!["c", "c++"]),
             ]
         );
         assert_eq!(
             names(unobservable_classes(
                 &SanitizerSelection::Set(vec![Sanitizer::Asan]),
-                &[ReplayLane::Cfi],
+                &[ReplayLane::Cfi, ReplayLane::Realtime],
                 true,
                 false,
             )),
@@ -4264,7 +4273,7 @@ mod tests {
         );
         assert!(unobservable_classes(&SanitizerSelection::None, &[], false, false).is_empty());
         let none = unobservable_classes(&SanitizerSelection::None, &[], true, false);
-        assert_eq!(none.len(), 6);
+        assert_eq!(none.len(), 7);
         assert!(none
             .iter()
             .any(|c| c.class == "type-confusion" && c.needs == "--sanitizers cfi"));

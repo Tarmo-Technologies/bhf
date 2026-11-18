@@ -3979,7 +3979,7 @@ mod tests {
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
         assert!(makefile
-            .contains(".PHONY: all afl afl_cmplog winafl libfuzzer cfi cov diff syntaxcheck clean"));
+            .contains(".PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan cov diff syntaxcheck clean"));
         assert!(makefile.contains("winafl: main_winafl"));
         assert!(makefile.contains("AFLPP_CXX ?= afl-clang-fast++"));
         assert!(makefile.contains("afl: main_afl"));

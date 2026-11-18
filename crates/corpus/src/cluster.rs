@@ -860,7 +860,7 @@ fn earlier_frameless_report(
     let name = exception.get("name").and_then(Value::as_str).unwrap_or("");
     let undiagnosed = undiagnosed_crash_kind(name);
     let sanitizer_crash = exception.get("sanitizer").and_then(Value::as_str).is_some()
-        || ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+        || crate::sanitizer::EXCEPTION_NAME_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix));
     if framed || !(sanitizer_crash || undiagnosed.is_some()) {

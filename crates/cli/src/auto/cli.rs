@@ -119,7 +119,7 @@ pub struct AutoArgs {
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, cxx-expected-exception, seed-file, seed-dir, sanitizers,
-    /// engine, languages, project, ada-deps, passes, force, rust-private, build-command,
+    /// nonblocking, engine, languages, project, ada-deps, passes, force, rust-private, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
     /// msbuild-evaluate, winafl-path, dynamorio-path (`seed-mining = false` is
     /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
@@ -750,6 +750,16 @@ pub struct AutoArgs {
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
+    /// The targets that must not block, for the RealtimeSanitizer replay
+    /// (`--sanitizers realtime`, #298): `entry-points` (the default: interrupt
+    /// handlers such as `USART1_IRQHandler` and RTOS task bodies, a function
+    /// with no result taking a `void *` with `task` or `thread` in its name),
+    /// `all`, or a target's name. Each runs in a real-time context under the
+    /// `rtsan` build, so an allocation, a lock or a blocking call it makes is a
+    /// finding. Repeatable.
+    #[arg(long = "nonblocking", value_name = "TARGET")]
+    pub nonblocking: Vec<String>,
+
     /// Emit an evidence-graded SBOM + VEX bundle at campaign end, into
     /// `<work-dir>/sbom/`. The bundle is generated where `FuzzReached` evidence is
     /// freshest: the scanned tree's components are enriched with the campaign's
@@ -1350,6 +1360,21 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         crate::auto::sanitizer_replay::split_replay_lanes(&args.sanitizers);
     if let Err(error) = crate::fuzz::parse_sanitizer_args(&build_sanitizers) {
         bhfeprintln!("error: {error}");
+        return Ok(2);
+    }
+    // #298: the targets the RealtimeSanitizer replay runs in a real-time
+    // context, marked as their harnesses are generated.
+    if replay_lanes.contains(&crate::auto::sanitizer_replay::ReplayLane::Realtime) {
+        crate::generate_harness::set_nonblocking_targets(if args.nonblocking.is_empty() {
+            vec!["entry-points".to_owned()]
+        } else {
+            args.nonblocking.clone()
+        });
+    } else if !args.nonblocking.is_empty() {
+        bhfeprintln!(
+            "error: --nonblocking marks targets for the RealtimeSanitizer replay; add \
+             `--sanitizers realtime`"
+        );
         return Ok(2);
     }
     if engines.contains(&crate::fuzz::FuzzEngine::Winafl) {
@@ -3278,6 +3303,43 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         bhfeprintln!(
             "bhf auto: memory profile — {memfindings} uncontrolled-consumption input(s) found by corpus replay"
         );
+    }
+
+    // RealtimeSanitizer corpus replay (C/C++, #298): only when asked for; it
+    // needs clang 20 or newer.
+    if options
+        .replay_lanes
+        .contains(&crate::auto::sanitizer_replay::ReplayLane::Realtime)
+    {
+        match crate::auto::rtsan::rtsan_compilers() {
+            Err(found) => bhfeprintln!(
+                "bhf auto: RealtimeSanitizer — skipped: it needs clang 20 or newer, and {found}"
+            ),
+            Ok(compilers) => {
+                let rtsan = crate::auto::rtsan::run_rtsan_replay(&work, &replay_bounds, &compilers);
+                bhfeprintln!(
+                    "bhf auto: RealtimeSanitizer — {} real-time unsafe call(s) found by corpus \
+                     replay of {} nonblocking target(s)",
+                    rtsan.findings,
+                    rtsan.nonblocking
+                );
+                if rtsan.nonblocking == 0 {
+                    bhfeprintln!(
+                        "bhf auto: RealtimeSanitizer — no target was marked nonblocking; name \
+                         them with --nonblocking (the default marks interrupt handlers and \
+                         RTOS task bodies)"
+                    );
+                }
+                if !rtsan.unbuilt.is_empty() {
+                    bhfeprintln!(
+                        "bhf auto: RealtimeSanitizer — {} harness(es) did not build with \
+                         -fsanitize=realtime: {}; their corpus is UNMEASURED",
+                        rtsan.unbuilt.len(),
+                        rtsan.unbuilt.join(", ")
+                    );
+                }
+            }
+        }
     }
 
     // Control-flow integrity corpus replay (C/C++, #297): only when asked for,
