@@ -70,6 +70,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A variadic C target is declared with its `...` in the generated harness
+  (#416). The declaration dropped it, so a build in which the harness also
+  saw the target's own prototype (a translation unit included whole) stopped
+  with `conflicting types`, and otherwise the call went through a fixed-arity
+  prototype to a variadic definition.
 - Continuous scheduler jobs are tenant-aware, and orphaned jobs are
   reconciled on start (#385). `submitJob` records the caller's tenant and
   workspace root on the job (`Scheduler::submit_as` with a `JobOwner`). That
