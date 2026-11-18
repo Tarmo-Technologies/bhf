@@ -422,6 +422,111 @@ pub fn parse_c_functions_with_knr(source: &str) -> Result<Vec<CFunction>, CParse
     Ok(functions)
 }
 
+/// The object-like macros `source` defines as nothing but storage-class or
+/// function specifiers (zlib's `#define local static`), each with the words it
+/// stands for (#415). A conditional definition counts: `#ifndef local` /
+/// `#define local static` is how zlib spells it.
+pub fn storage_class_macros(source: &str) -> std::collections::BTreeMap<String, String> {
+    const SPECIFIERS: &[&str] = &[
+        "static",
+        "extern",
+        "inline",
+        "__inline",
+        "__inline__",
+        "__forceinline",
+    ];
+    let mut macros = std::collections::BTreeMap::new();
+    for line in source.lines() {
+        let Some(rest) = line.trim_start().strip_prefix('#') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix("define") else {
+            continue;
+        };
+        if !rest.starts_with([' ', '\t']) {
+            continue;
+        }
+        let rest = rest.split("//").next().unwrap_or(rest);
+        let rest = rest.split("/*").next().unwrap_or(rest);
+        let mut words = rest.split_whitespace();
+        let Some(name) = words.next() else {
+            continue;
+        };
+        // A function-like macro (`name(`) is not a specifier.
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let body: Vec<&str> = words.collect();
+        if !body.is_empty() && body.iter().all(|word| SPECIFIERS.contains(word)) {
+            macros.insert(name.to_owned(), body.join(" "));
+        }
+    }
+    macros
+}
+
+/// Read each function's storage-class macros (`macros`, from
+/// [`storage_class_macros`]) as the specifiers they stand for (#415): under
+/// `#define local static`, `local unsigned read_buf(...)` is a `static`
+/// function returning `unsigned`. A macro is dropped from the return type,
+/// which a harness declares `extern`. The parse keeps some (`local`) in the
+/// return type and drops others, so the words before the name on the
+/// definition's line (and the line above, for a return type on its own line)
+/// in `source` are read too.
+pub fn apply_storage_class_macros(
+    functions: &mut [CFunction],
+    source: &str,
+    macros: &std::collections::BTreeMap<String, String>,
+) {
+    if macros.is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let is_static = |word: &str| {
+        macros
+            .get(word)
+            .is_some_and(|body| body.split_whitespace().any(|word| word == "static"))
+    };
+    for function in functions {
+        let mut words: Vec<&str> = function.return_type.split_whitespace().collect();
+        let mut expanded = false;
+        while let Some(word) = words
+            .first()
+            .copied()
+            .filter(|word| macros.contains_key(*word))
+        {
+            function.is_static |= is_static(word);
+            words.remove(0);
+            expanded = true;
+        }
+        if expanded && !words.is_empty() {
+            function.return_type = words.join(" ");
+        }
+        let Some(line) = (function.line as usize)
+            .checked_sub(1)
+            .and_then(|index| lines.get(index))
+        else {
+            continue;
+        };
+        let head = line.split(function.name.as_str()).next().unwrap_or("");
+        let above = if head.trim().is_empty() {
+            (function.line as usize)
+                .checked_sub(2)
+                .and_then(|index| lines.get(index))
+                .copied()
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        if above
+            .split_whitespace()
+            .chain(head.split_whitespace())
+            .any(is_static)
+        {
+            function.is_static = true;
+        }
+    }
+}
+
 /// A K&R parameter's type after the default argument promotions: `char`,
 /// `short` and `_Bool` arrive as `int`, `float` as `double`. `register` is
 /// dropped: it is storage, not type.
@@ -4909,6 +5014,41 @@ mod tests {
         let modern = fns.iter().find(|f| f.name == "modern").unwrap();
         assert_eq!(modern.params[0].c_type, "const char *");
         assert_eq!(fns.iter().filter(|f| f.name == "parse_rec").count(), 1);
+    }
+
+    /// #415: zlib's `local` is `static`, spelled through a conditional
+    /// macro; a function declared with it is static and returns the rest.
+    #[test]
+    fn a_storage_class_macro_is_read_as_the_specifier_it_stands_for() {
+        let header = "#ifndef local\n#  define local static\n#endif\n\
+                      #define ZINLINE static inline /* fast path */\n\
+                      #define ZEXPORT\n#define OF(args) args\n#define LIMIT 16\n";
+        let macros = storage_class_macros(header);
+        assert_eq!(
+            macros.into_iter().collect::<Vec<_>>(),
+            [
+                ("ZINLINE".to_owned(), "static inline".to_owned()),
+                ("local".to_owned(), "static".to_owned()),
+            ]
+        );
+        let src = "local unsigned read_buf(unsigned char *buf, unsigned size) { return size; }\n\
+                   ZINLINE int peek(const char *p) { return p[0]; }\n\
+                   int open_it(const char *path) { return path[0]; }\n";
+        let mut fns = parse_c_functions(src).unwrap();
+        apply_storage_class_macros(&mut fns, src, &storage_class_macros(header));
+        let by_name = |name: &str| fns.iter().find(|f| f.name == name).unwrap();
+        assert_eq!(by_name("read_buf").return_type, "unsigned");
+        assert!(by_name("read_buf").is_static);
+        assert_eq!(by_name("peek").return_type, "int");
+        assert!(by_name("peek").is_static);
+        assert_eq!(by_name("open_it").return_type, "int");
+        assert!(!by_name("open_it").is_static);
+
+        // A return type on its own line (GNU style).
+        let src = "local int\nscan(const char *p)\n{\n    return p[0];\n}\n";
+        let mut fns = parse_c_functions(src).unwrap();
+        apply_storage_class_macros(&mut fns, src, &storage_class_macros(header));
+        assert!(fns[0].is_static, "{fns:?}");
     }
 
     #[test]

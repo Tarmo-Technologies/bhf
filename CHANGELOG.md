@@ -70,6 +70,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A C function whose storage class is spelled through a macro builds (#415).
+  Under zlib's `#define local static`, `local unsigned read_buf(...)` was
+  declared `extern local unsigned` in the harness, which is `extern static`,
+  and the build stopped. An object-like macro that stands for storage-class or
+  function specifiers, in the source or a header it includes, is now read as
+  them: the function is `static` and returns `unsigned`. zlib's `read_buf` and
+  `gz_load` build and fuzz.
 - A variadic C target is declared with its `...` in the generated harness
   (#416). The declaration dropped it, so a build in which the harness also
   saw the target's own prototype (a translation unit included whole) stopped
