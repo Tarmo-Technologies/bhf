@@ -141,10 +141,29 @@ jobs:
       # emulator lanes, and the skip-line check after the tests fails the shard
       # if a test still skips (scripts/ci/allowed-skips.txt lists only tests
       # another workflow runs).
+      # The packages below come from the runner's Ubuntu mirror, which has
+      # been slow enough for this step alone to outlast the shard's timeout
+      # (#417): they are kept in a cache, restored here and saved right after
+      # the install, so a shard that fails later still leaves them for its
+      # rerun. A changed list restores the last set and downloads the rest.
+      - name: Restore the toolchain packages
+        id: apt-archives
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: nightly-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/integration-nightly.yml') }}
+          restore-keys: nightly-apt-${{ runner.os }}-
+
       - name: Install the interpreter and emulator toolchains
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          mkdir -p "$HOME/apt-archives/partial"
+          apt_opts=(
+            -o "Dir::Cache::Archives=$HOME/apt-archives"
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=60
+          )
+          sudo apt-get "${apt_opts[@]}" update
+          sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends \
             gnat \
             gprbuild \
             afl++ \
@@ -171,6 +190,17 @@ jobs:
             gdb \
             lldb \
             llvm
+          # Only the packages the mirror still serves are kept.
+          sudo apt-get "${apt_opts[@]}" autoclean
+          sudo rm -rf "$HOME/apt-archives/partial" "$HOME/apt-archives/lock"
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/apt-archives"
+
+      - name: Save the toolchain packages
+        if: steps.apt-archives.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-archives
+          key: ${{ steps.apt-archives.outputs.cache-primary-key }}
 
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
