@@ -255,12 +255,15 @@ pub fn build_python_harness(
          BHF_TARGET_PACKAGE=\"{pkg}\" \\\n\
          BHF_COVERED_LINES=\"{covered}\" \\\n\
          PYTHONDONTWRITEBYTECODE=1 \\\n\
-         PYTHONPATH=\"{pythonpath}:${{PYTHONPATH}}\" \\\n\
+         PYTHONPATH=\"{pythonpath}{separator}${{PYTHONPATH}}\" \\\n\
          exec \"{python}\" -B \"{driver}\" \"$@\"\n",
         trace = import_root.display(),
         pkg = module.split('.').next().unwrap_or(&module),
         covered = auto_dir.join("covered-lines.txt").display(),
         pythonpath = pythonpath,
+        // The host's separator: on Windows a `:` would join the inherited
+        // path onto the last entry, which then names no directory.
+        separator = if cfg!(windows) { ';' } else { ':' },
         python = python.display(),
         driver = driver.display(),
     );
