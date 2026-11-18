@@ -117,6 +117,12 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "entrypoint", value_name = "ADDR", value_parser = parse_address)]
     pub entrypoint: Option<u64>,
 
+    /// QEMU or Frida mode: run without CmpLog. By default afl-fuzz runs with
+    /// `-c 0`: it logs the target's comparisons and puts their operands into
+    /// the input, which solves a magic value the havoc stage rarely guesses.
+    #[arg(long = "no-cmplog")]
+    pub no_cmplog: bool,
+
     /// Wall-clock budget (e.g. 30s, 5m). For afl-qemu it defaults to ~100ms per
     /// `--iterations`, clamped to [1s,30s]; the builtin engine stops at it, or
     /// at `--iterations`, whichever comes first.
@@ -1164,12 +1170,14 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// File-input mode appends `@@` (AFL substitutes the testcase path); stdin
 /// mode omits it (AFL feeds the testcase on stdin). `-t` sets the per-exec
 /// timeout (ms) and `-m` the child memory limit so the campaign matches the
-/// replay oracle. Kept pure for testing.
+/// replay oracle. With `cmplog`, `-c 0` runs CmpLog through the same binary,
+/// as the binary-only modes do. Kept pure for testing.
 // A flat flag-bundle builder: the inputs are distinct afl-fuzz knobs, and a
 // struct would only scatter the same fields without clarifying the one argv.
 #[allow(clippy::too_many_arguments)]
 fn afl_binary_argv(
     afl_mode: AflBinaryMode,
+    cmplog: bool,
     binary: &Path,
     seeds_dir: &Path,
     out_dir: &Path,
@@ -1180,6 +1188,9 @@ fn afl_binary_argv(
     target_args: &[String],
 ) -> Vec<String> {
     let mut argv = vec![afl_mode.flag().to_owned()];
+    if cmplog {
+        argv.extend(["-c".to_owned(), "0".to_owned()]);
+    }
     argv.extend([
         "-i".to_owned(),
         seeds_dir.display().to_string(),
@@ -1321,8 +1332,10 @@ fn run_afl_binary(
 
     let secs = afl_qemu_budget_secs(args.time.as_deref(), args.iterations);
     let (mem_arg, mem_provenance) = afl_mem_arg(&args.mem_mb)?;
+    let cmplog = !args.no_cmplog;
     let mut argv = afl_binary_argv(
         afl.mode,
+        cmplog,
         &args.binary,
         &seeds_dir,
         &out_dir,
@@ -1503,6 +1516,7 @@ fn run_afl_binary(
         "fidelity": {
             "mutation": "AFL++ with coverage feedback",
             "coverage": afl.mode.coverage(),
+            "cmplog": cmplog,
             "persistent_addr": args.persistent_addr.map(|addr| format!("0x{addr:x}")),
             "entrypoint": args.entrypoint.map(|addr| format!("0x{addr:x}")),
             "edges_found": stats.get("edges_found"),
@@ -3211,6 +3225,7 @@ mod tests {
             adapter_report: None,
             persistent_addr: None,
             entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
 
@@ -3333,6 +3348,7 @@ mod afl_qemu_tests {
     fn argv_stdin_mode_has_no_at_at() {
         let argv = afl_binary_argv(
             AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3366,6 +3382,7 @@ mod afl_qemu_tests {
     fn argv_file_mode_appends_at_at() {
         let argv = afl_binary_argv(
             AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3385,6 +3402,7 @@ mod afl_qemu_tests {
         // as `-m`, so the mutation campaign and the replay oracle agree.
         let argv = afl_binary_argv(
             AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3488,6 +3506,7 @@ mod afl_qemu_tests {
     fn frida_mode_runs_afl_fuzz_with_o() {
         let argv = afl_binary_argv(
             AflBinaryMode::Frida,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3517,6 +3536,42 @@ mod afl_qemu_tests {
             ]
         );
         assert_eq!(AflBinaryMode::Frida.engine(), "afl-frida");
+    }
+
+    /// CmpLog runs through the same binary (`-c 0`) unless it is turned off
+    /// (#376).
+    #[test]
+    fn cmplog_is_c_0_unless_turned_off() {
+        for afl_mode in [AflBinaryMode::Qemu, AflBinaryMode::Frida] {
+            let argv = |cmplog| {
+                afl_binary_argv(
+                    afl_mode,
+                    cmplog,
+                    Path::new("/b/target"),
+                    Path::new("/s"),
+                    Path::new("/o"),
+                    7,
+                    1000,
+                    "none",
+                    BinaryInputMode::Stdin,
+                    &[],
+                )
+            };
+            let on = argv(true);
+            assert_eq!(on[..3], [afl_mode.flag(), "-c", "0"], "{on:?}");
+            assert!(!argv(false).iter().any(|arg| arg == "-c"));
+        }
+        #[derive(clap::Parser)]
+        struct Fuzz {
+            #[command(flatten)]
+            args: BinaryFuzzArgs,
+        }
+        let parsed = |extra: &[&str]| {
+            <Fuzz as clap::Parser>::try_parse_from(["fuzz", "bin"].iter().chain(extra).copied())
+                .map(|fuzz| fuzz.args.no_cmplog)
+        };
+        assert!(!parsed(&[]).unwrap(), "CmpLog is on by default");
+        assert!(parsed(&["--no-cmplog"]).unwrap());
     }
 
     /// `--persistent-addr` and `--entrypoint` set each mode's variables, and
@@ -3688,6 +3743,7 @@ mod afl_qemu_tests {
             adapter_report: None,
             persistent_addr: None,
             entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3779,6 +3835,7 @@ mod afl_qemu_tests {
             adapter_report: None,
             persistent_addr: None,
             entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -4095,6 +4152,7 @@ mod afl_qemu_tests {
             adapter_report: None,
             persistent_addr: None,
             entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");

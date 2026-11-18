@@ -480,7 +480,8 @@ sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
 Both effective limits are recorded in the run-provenance JSON, with `engine`,
 the trace program or library, `executions` and a `fidelity` object: the
-coverage source, `edges_found` and the persistent and entry addresses.
+coverage source, `cmplog`, `edges_found` and the persistent and entry
+addresses.
 
 The two AFL++ modes also take:
 
@@ -495,6 +496,9 @@ The two AFL++ modes also take:
 - `--entrypoint <ADDR>` — start the fork server at this address (hex)
   instead of the binary's entry point (`AFL_ENTRYPOINT`), so each run skips
   the start-up before it.
+- `--no-cmplog` — run without CmpLog. By default `afl-fuzz` runs `-c 0`: it
+  logs the target's comparisons and puts their operands into the input, which
+  solves a magic value the havoc stage rarely guesses.
 
 ```sh
 bhf binary fuzz ./parser --engine afl-qemu --input-mode file \

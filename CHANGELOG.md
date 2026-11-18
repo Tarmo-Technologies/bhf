@@ -2856,13 +2856,15 @@
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object
-  (coverage source, edges found) in the run JSON, and the container
+  (coverage source, CmpLog, edges found) in the run JSON, and the container
   acceptance runs both through bhf.
 - `bhf binary fuzz --persistent-addr <ADDR>` runs the target in AFL++'s
   persistent loop from that address under QEMU or Frida mode
   (`AFL_QEMU_PERSISTENT_ADDR` with `AFL_QEMU_PERSISTENT_GPR=1`, or
   `AFL_FRIDA_PERSISTENT_ADDR`), and `--entrypoint <ADDR>` starts the fork
   server later (`AFL_ENTRYPOINT`) (#375).
+- QEMU- and Frida-mode runs of `bhf binary fuzz` use CmpLog (`afl-fuzz -c 0`)
+  by default; `--no-cmplog` turns it off (#376).
 - The nightly builds AFL++'s QEMU and Frida modes with
   `scripts/ci/build-afl-binary-modes.sh`, which the container image's stage
   now runs too, and runs the binary-only tests against them.

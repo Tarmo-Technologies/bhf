@@ -785,6 +785,7 @@ fn plan_to_binary_fuzz_args(
         adapter_report: None,
         persistent_addr: None,
         entrypoint: None,
+        no_cmplog: false,
     })
 }
 

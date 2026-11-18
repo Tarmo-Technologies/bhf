@@ -4,7 +4,9 @@
 //! without instrumentation:
 //! - `--engine afl-frida` finds an abort (#322);
 //! - a QEMU-mode persistent loop (`--persistent-addr`) finds one, faster
-//!   than a QEMU run that starts the binary for every input (#375).
+//!   than a QEMU run that starts the binary for every input (#375);
+//! - CmpLog, on by default, solves a four-byte magic that a run with
+//!   `--no-cmplog` does not reach in the same budget (#376).
 //!
 //! These need `afl-fuzz` and AFL++'s QEMU and Frida modes, which Ubuntu's
 //! afl++ package leaves out: `scripts/ci/build-afl-binary-modes.sh` builds
@@ -188,5 +190,43 @@ fn a_qemu_persistent_loop_finds_the_abort_faster_than_a_restart_per_input() {
         "a persistent loop runs inputs without starting the binary again: {} vs {} executions",
         execs(&persistent),
         execs(&restarting)
+    );
+}
+
+/// Aborts only on a four-byte magic, compared as one integer: the havoc
+/// stage does not guess it, CmpLog reads it off the comparison.
+const MAGIC: &str = "#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\n\
+    #include <unistd.h>\n\
+    int main(void) {\n  unsigned char b[8] = {0};\n  ssize_t n = read(0, b, sizeof b);\n  \
+    uint32_t v;\n  if (n < 4) return 0;\n  memcpy(&v, b, 4);\n  \
+    if (v == 0x4b434148u) abort();\n  return 0;\n}\n";
+
+#[test]
+fn cmplog_solves_a_magic_the_same_run_without_it_does_not() {
+    let Some(modes) = have_afl_binary_modes() else {
+        eprintln!("skipping: no AFL++ QEMU mode");
+        return;
+    };
+    let dir = TestDir::new("afl-qemu-cmplog");
+    let elf = build(&dir, "magic", MAGIC);
+    let args = [
+        "--engine",
+        "afl-qemu",
+        "--seed-input",
+        "AAAAAAAA",
+        "--time",
+        "20s",
+    ];
+    let with = binary_fuzz(&modes, &dir.join("cmplog"), &elf, &args);
+    assert_eq!(with["fidelity"]["cmplog"], true, "{with:#}");
+    assert!(findings(&with) > 0, "CmpLog solves the magic: {with:#}");
+    let without_args: Vec<&str> = args.iter().copied().chain(["--no-cmplog"]).collect();
+    let without = binary_fuzz(&modes, &dir.join("plain"), &elf, &without_args);
+    assert_eq!(without["fidelity"]["cmplog"], false, "{without:#}");
+    assert_eq!(
+        findings(&without),
+        0,
+        "without CmpLog the havoc stage does not guess a 32-bit magic in the same budget: \
+         {without:#}"
     );
 }
