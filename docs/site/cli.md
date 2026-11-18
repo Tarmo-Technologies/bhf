@@ -2239,6 +2239,11 @@ bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work
 bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
   --mutate 42 --repair true
 
+# The same session against a real service: bhf starts it, waits for its port,
+# and sends each scenario message to it over TCP.
+bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
+  --session-transport tcp:127.0.0.1:7000 --session-server-cmd './toy-server 7000'
+
 # Fuzz with the extension's stages in the builtin loop (below), then drive the
 # just-retained corpus through its oracle; when the extension provides
 # codec.repair, a recognized frame is repaired before the oracle sees it (a raw
@@ -2274,10 +2279,41 @@ The run summary's `extension.stages` records what each stage did: `calls`,
 `mutated`, `encoded`, `codec_errors`, `lifecycle.resets` and `cut_off` (why a
 stage stopped, or `null`).
 
+**The session's target.** Without `--session-transport`, `bhf extension
+session` drives a built-in toy target that speaks the reference extension's
+OPEN/WRITE protocol. With `--session-transport SPEC` it drives a real one over
+the session lane's transport, the spec `bhf fuzz --session-transport` takes
+(`tcp:HOST:PORT`, `udp:HOST:PORT`, `serial:PATH[,baud=N]` or
+`transport:SPEC`). The extension frames every message, so bhf sends each one
+as `scenario.next` (and any mutate and repair) left it, and takes as its reply
+every byte the target sends until it goes quiet for 50 ms, which
+`scenario.observe-response` gets. bhf connects before `lifecycle.setup` runs,
+and a TCP target it cannot connect to is exit `2`. `--session-reply-timeout`
+bounds how long a reply may take to start (5 s over TCP, 1 s over UDP).
+
+`--session-server-cmd COMMAND` runs the service as the session lane's flag
+does: through the shell, in its own process group, with its stderr in
+`<work>/session_server/`. bhf waits until it serves the port (a service that
+does not start is exit `2`, with its stderr), drives the session, checks
+whether the service exited (waiting up to 2 s when the session lost the
+target), and stops it.
+
+A target that ends the session (closes or resets the connection, or does not
+answer in time) or a service that exits is the target's result, exit `3`:
+`extension.json` says `target_error: <why>` or `target_exited: <status>`, and
+the oracle does not judge a session that did not finish. A service that exits
+after answering the whole session is still exit `1` when the oracle fired on
+it, with the exit recorded. `session.target` records the transport, the
+exchanges, the error, and the service's command, starts and exit (its status,
+the sanitizer report's kind, rule and message when its stderr has one, and the
+log dir). Hunting crashes in a service over many sessions is `bhf fuzz
+--protocol-profile --session-server-cmd`'s job.
+
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
-semantic finding is emitted, `2` for a manifest/usage error, and `4` for a bounded
-extension-side infrastructure failure (so a fault is never confused with a clean
-run or a finding). `--json` emits a machine-readable report.
+semantic finding is emitted, `2` for a manifest/usage error, `3` (`session`
+over `--session-transport`) when the target ended the session, and `4` for a
+bounded extension-side infrastructure failure (so a fault is never confused
+with a clean run or a finding). `--json` emits a machine-readable report.
 
 **Capabilities.** The host drives the full `bhf.extension.v1` surface —
 `oracle.evaluate`, `codec.decode`/`encode`/`repair`, `mutator.mutate`,

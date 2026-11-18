@@ -285,7 +285,7 @@ impl SessionTransportPlan {
     }
 
     /// A short human label for the run summary / finding metadata.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
             Self::Udp { host, port } => format!("udp:{host}:{port}"),
@@ -300,7 +300,7 @@ impl SessionTransportPlan {
 
     /// The host, port and whether it is UDP, for a service bhf starts; a
     /// serial device has no port to wait for.
-    fn endpoint(&self) -> Result<(String, u16, bool), String> {
+    pub(crate) fn endpoint(&self) -> Result<(String, u16, bool), String> {
         match self {
             Self::Tcp { host, port } => Ok((host.clone(), *port, false)),
             Self::Udp { host, port } => Ok((host.clone(), *port, true)),
@@ -326,7 +326,7 @@ impl SessionTransportPlan {
     /// on the first [`SessionTransport::reset`], so this itself touches nothing.
     /// `reply_timeout` overrides the backend's deadline for a reply
     /// ([`SESSION_IO_TIMEOUT`] over TCP, [`UDP_REPLY_TIMEOUT`] over UDP).
-    fn into_transport(
+    pub(crate) fn into_transport(
         self,
         reset: SessionResetMode,
         framing: Framing,

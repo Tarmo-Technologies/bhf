@@ -16,9 +16,16 @@
 //! The same `oracle.evaluate` path is reused by `bhf fuzz --extension` via
 //! [`drive_fuzz_extension`], which evaluates a campaign's retained corpus after
 //! the run (never in the hot mutation loop).
+//!
+//! `session` drives the extension's scenario against a target: a built-in toy
+//! one, or with `--session-transport` a real one over the session lane's
+//! transport ([`LiveTarget`]), optionally a service bhf starts and watches
+//! (`--session-server-cmd`, the lane's [`SessionServer`]). A target that ends
+//! the session is the target's result (exit 3), never an extension fault.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -28,6 +35,10 @@ use extension_host::{
     CaseId, CodecOutcome, EvaluateOutcome, ExtensionClient, ExtensionManifest, FindingResult,
     InfraFailure, SessionDriver, SessionOptions, SessionTarget,
 };
+use protocol_session::{Framing, SessionTransport};
+
+use crate::session_fuzz::{LiveTransport, SessionResetMode, SessionTransportPlan};
+use crate::session_server::{ServerExit, SessionServer, SERVER_EXIT_GRACE};
 
 /// The session capability surface requested (as optional) by `bhf extension
 /// session` and `bhf fuzz --extension`, so an extension that provides them is
@@ -50,6 +61,10 @@ const EXIT_OK: i32 = 0;
 const EXIT_FINDING: i32 = 1;
 /// A manifest / usage / setup problem (mirrors clap's usage exit code).
 const EXIT_USAGE: i32 = 2;
+/// `session` over `--session-transport`: the target ended the session (closed
+/// or reset the connection, did not answer in time) or its service exited. A
+/// target result, so neither an extension fault nor a finding.
+const EXIT_TARGET: i32 = 3;
 /// A bounded extension-side infrastructure failure (crash/timeout/oversize/
 /// malformed/unsupported). Deliberately distinct from clean and from finding so a
 /// fault is never confused with a target result.
@@ -129,6 +144,32 @@ pub struct SessionCmdArgs {
     /// Emit a machine-readable JSON report instead of human-readable lines.
     #[arg(long)]
     json: bool,
+    /// Drive a real target instead of the built-in toy one, over the session
+    /// lane's transport: `tcp:HOST:PORT`, `udp:HOST:PORT`,
+    /// `serial:PATH[,baud=N]` or `transport:SPEC`, as `bhf fuzz
+    /// --session-transport` takes. Each message goes as the extension framed
+    /// it; its reply is what the target sends until it goes quiet.
+    #[arg(long = "session-transport", value_name = "SPEC")]
+    session_transport: Option<String>,
+    /// A command that runs the service `--session-transport` reaches, through
+    /// the shell: bhf starts it, waits until it serves the port, drives the
+    /// session, records whether the service exited (with the sanitizer report
+    /// in its stderr), and stops it.
+    #[arg(
+        long = "session-server-cmd",
+        value_name = "COMMAND",
+        requires = "session_transport"
+    )]
+    session_server_cmd: Option<String>,
+    /// How long the target may take to answer a message before it is taken
+    /// to have ended the session (default 5s over TCP, 1s over UDP).
+    #[arg(
+        long = "session-reply-timeout",
+        value_parser = crate::fuzz::parse_duration,
+        value_name = "DURATION",
+        requires = "session_transport"
+    )]
+    session_reply_timeout: Option<Duration>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -322,6 +363,19 @@ fn run_evaluate(a: &EvaluateArgs) -> i32 {
 }
 
 fn run_session(a: &SessionCmdArgs) -> i32 {
+    // A malformed spec is a usage error before anything is spawned.
+    let plan = match a
+        .session_transport
+        .as_deref()
+        .map(SessionTransportPlan::parse)
+        .transpose()
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            bhfeprintln!("error: --session-transport: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let seed = match std::fs::read(&a.input) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -375,22 +429,40 @@ fn run_session(a: &SessionCmdArgs) -> i32 {
         testcase_id(&a.input, &seed),
     );
 
-    let mut target = ToyFileTarget::new(&root);
+    let mut target = match plan {
+        Some(plan) => match LiveTarget::start(plan, a) {
+            Ok(live) => DrivenTarget::Live(Box::new(live)),
+            Err(error) => {
+                bhfeprintln!("error: {error}");
+                return EXIT_USAGE;
+            }
+        },
+        None => DrivenTarget::Toy(ToyFileTarget::new(&root)),
+    };
     let driver = SessionDriver::new(SessionOptions {
         mutate_seed: a.mutate,
         repair: a.repair,
         max_steps: 64,
     });
-    let outcome = match driver.run(&mut client, &mut target, &case, &root, &seed) {
+    let outcome = match driver.run(&mut client, target.as_session_target(), &case, &root, &seed) {
         Ok(outcome) => outcome,
         Err(error) => {
             bhfeprintln!("error: extension session failed: {error}");
             return EXIT_USAGE;
         }
     };
+    if let DrivenTarget::Live(live) = &mut target {
+        live.finish();
+    }
+    let ended = target.ended();
 
     let mut emitted = 0usize;
-    let (code, result_label) = if let Some(failure) = &outcome.infrastructure {
+    // A target that failed mid-session is the target's result (the driver
+    // records it as an infrastructure stop, but the extension did nothing
+    // wrong, and the oracle never judged the unfinished session).
+    let (code, result_label) = if let (Some(ended), true) = (&ended, target.failed()) {
+        (EXIT_TARGET, ended.clone())
+    } else if let Some(failure) = &outcome.infrastructure {
         (EXIT_INFRA, infra_failure_label(failure))
     } else if let Some(finding) = &outcome.finding {
         let emitter = FindingEmitter::new(a.work.clone());
@@ -410,6 +482,9 @@ fn run_session(a: &SessionCmdArgs) -> i32 {
                 return EXIT_USAGE;
             }
         }
+    } else if let Some(ended) = ended {
+        // A service that exited after a session it answered in full.
+        (EXIT_TARGET, ended)
     } else {
         (EXIT_OK, "ok".to_string())
     };
@@ -875,6 +950,178 @@ fn short_digest(bytes: &[u8]) -> String {
         .chars()
         .take(16)
         .collect()
+}
+
+/// The target a session drives: the built-in toy one, or a real one behind
+/// `--session-transport`.
+enum DrivenTarget {
+    Toy(ToyFileTarget),
+    Live(Box<LiveTarget>),
+}
+
+impl DrivenTarget {
+    fn as_session_target(&mut self) -> &mut dyn SessionTarget {
+        match self {
+            DrivenTarget::Toy(toy) => toy,
+            DrivenTarget::Live(live) => live.as_mut(),
+        }
+    }
+
+    fn summary(&self) -> Value {
+        match self {
+            DrivenTarget::Toy(toy) => toy.summary(),
+            DrivenTarget::Live(live) => live.summary(),
+        }
+    }
+
+    /// Why the target ended the session, if it did: `target_exited: <status>`
+    /// for a service that exited, `target_error: <why>` for a transport
+    /// failure.
+    fn ended(&self) -> Option<String> {
+        match self {
+            DrivenTarget::Toy(_) => None,
+            DrivenTarget::Live(live) => live.ended(),
+        }
+    }
+
+    /// Whether the transport to the target failed during the session.
+    fn failed(&self) -> bool {
+        matches!(self, DrivenTarget::Live(live) if live.error.is_some())
+    }
+}
+
+/// A real target behind `--session-transport`: each scenario message is one
+/// request over the session lane's transport, and its reply goes back to the
+/// extension. The extension frames every message (it owns the codec), so the
+/// transport adds nothing: a request is written as it is, and a reply is what
+/// arrives until the target goes quiet. With `--session-server-cmd` bhf also
+/// runs the service.
+struct LiveTarget {
+    transport: LiveTransport,
+    label: String,
+    exchanges: usize,
+    /// The transport failure that ended the session, if one did.
+    error: Option<String>,
+    server: Option<SessionServer>,
+    server_exit: Option<ServerExit>,
+    log_dir: PathBuf,
+}
+
+impl LiveTarget {
+    /// Start the service (when there is one), wait until it serves, and
+    /// connect, so a target that is not there is a setup error before the
+    /// extension's lifecycle runs (as a fuzzer opens its target before a
+    /// test case's callbacks).
+    fn start(plan: SessionTransportPlan, a: &SessionCmdArgs) -> Result<Self, String> {
+        let label = plan.label();
+        let log_dir = a.work.join("session_server");
+        let server = match &a.session_server_cmd {
+            Some(command) => {
+                let (host, port, udp) = plan.endpoint()?;
+                let mut server = SessionServer::new(command.clone(), host, port, udp, &log_dir);
+                server
+                    .start()
+                    .map_err(|error| format!("--session-server-cmd: {error}"))?;
+                Some(server)
+            }
+            None => None,
+        };
+        let mut transport = plan.into_transport(
+            SessionResetMode::Reconnect,
+            Framing::default(),
+            a.session_reply_timeout,
+        )?;
+        transport.reset().map_err(|error| {
+            format!(
+                "could not reach the session target {label}: {}",
+                error.message
+            )
+        })?;
+        Ok(Self {
+            transport,
+            label,
+            exchanges: 0,
+            error: None,
+            server,
+            server_exit: None,
+            log_dir,
+        })
+    }
+
+    /// After the session: whether the service exited (given the lane's grace
+    /// to finish its report when the session lost the target), then stop it.
+    fn finish(&mut self) {
+        let Some(server) = &mut self.server else {
+            return;
+        };
+        let grace = if self.error.is_some() {
+            SERVER_EXIT_GRACE
+        } else {
+            Duration::ZERO
+        };
+        self.server_exit = server.exited_within(grace);
+        server.stop();
+    }
+
+    fn ended(&self) -> Option<String> {
+        if let Some(exit) = &self.server_exit {
+            return Some(format!("target_exited: {}", exit.status));
+        }
+        self.error
+            .as_ref()
+            .map(|error| format!("target_error: {error}"))
+    }
+
+    fn summary(&self) -> Value {
+        let server = self.server.as_ref().map(|server| {
+            let exit = self.server_exit.as_ref().map(|exit| {
+                let sanitizer =
+                    corpus::sanitizer::parse_sanitizer_report(&exit.stderr).map(|report| {
+                        json!({
+                            "kind": report.kind,
+                            "rule_id": report.rule_id,
+                            "message": report.message,
+                        })
+                    });
+                json!({
+                    "status": exit.status,
+                    "sanitizer": sanitizer,
+                    "log_dir": self.log_dir.display().to_string(),
+                })
+            });
+            json!({
+                "command": server.command(),
+                "starts": server.starts(),
+                "exit": exit,
+            })
+        });
+        json!({
+            "transport": self.label,
+            "exchanges": self.exchanges,
+            "error": self.error,
+            "server": server,
+        })
+    }
+}
+
+impl SessionTarget for LiveTarget {
+    fn exchange(
+        &mut self,
+        _step: u32,
+        _label: Option<&str>,
+        message: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        match self.transport.send_request(message) {
+            Ok(reply) => {
+                self.exchanges += 1;
+                Ok(reply)
+            }
+            Err(error) => {
+                self.error = Some(error.message.clone());
+                Err(std::io::Error::other(error.message))
+            }
+        }
+    }
 }
 
 // ── The toy target: the issue's `[u16 BE len][payload][u32 BE CRC-32]` ───────

@@ -2885,6 +2885,15 @@
 - The extension's `lifecycle.setup`, `reset` and `teardown` run around the
   campaign and between its cases (#374). A setup or reset the extension
   answers as failed stops the campaign with its message.
+- `bhf extension session --session-transport SPEC` drives a real target
+  over the session lane's transport (#313), where it could drive only a
+  built-in toy target: each scenario message goes to the target as the
+  extension framed it, and the target's reply is what the extension observes
+  and binds. `--session-server-cmd` starts the service, waits for its port
+  and stops it after the session, and `--session-reply-timeout` bounds a
+  reply. A target that ends the session or a service that exits is exit `3`
+  with the reason in `extension.json` (a service's sanitizer report included),
+  never an extension fault or a finding.
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object
