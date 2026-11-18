@@ -206,7 +206,12 @@ fn replay_one(
         let run = crate::command_output::output_with_timeout_flagged(
             crate::auto::sanitizer_replay::replay_command(&bin)
                 .arg(&path)
-                .env("RTSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1"),
+                .env(
+                    "RTSAN_OPTIONS",
+                    crate::auto::sanitizer_replay::with_symbolizer(
+                        "halt_on_error=1:print_stacktrace=1",
+                    ),
+                ),
             bounds.run_timeout,
         );
         let elapsed = run_started.elapsed();

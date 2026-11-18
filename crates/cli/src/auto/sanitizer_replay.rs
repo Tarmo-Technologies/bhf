@@ -78,6 +78,36 @@ pub(crate) fn replay_command(bin: &Path) -> std::process::Command {
     command
 }
 
+/// The `llvm-symbolizer` a sanitizer runtime should run: the one on `PATH`,
+/// else a versioned one, else one in an LLVM install dir. A runtime built
+/// for another LLVM release looks for its own release's symbolizer, which a
+/// host with only that release's compiler does not have (Ubuntu's `clang-20`
+/// without `llvm-20`): its reports then name no frame. The symbolizer's
+/// protocol is the same across releases.
+pub(crate) fn llvm_symbolizer() -> Option<PathBuf> {
+    if let Ok(path) = which::which("llvm-symbolizer") {
+        return Some(path);
+    }
+    (14..=22).rev().find_map(|major| {
+        which::which(format!("llvm-symbolizer-{major}"))
+            .ok()
+            .or_else(|| {
+                let path = PathBuf::from(format!("/usr/lib/llvm-{major}/bin/llvm-symbolizer"));
+                path.is_file().then_some(path)
+            })
+    })
+}
+
+/// `options` for a sanitizer runtime with [`llvm_symbolizer`] named, when
+/// there is one: `options:external_symbolizer_path=<path>`.
+pub(crate) fn with_symbolizer(options: &str) -> String {
+    match llvm_symbolizer() {
+        Some(path) if options.is_empty() => format!("external_symbolizer_path={}", path.display()),
+        Some(path) => format!("{options}:external_symbolizer_path={}", path.display()),
+        None => options.to_owned(),
+    }
+}
+
 /// The file every replayed run is logged to, under the work dir.
 pub(crate) const REPLAY_LOG: &str = "auto/sanitizer-replay.jsonl";
 
@@ -202,6 +232,22 @@ fn digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sanitizer_is_told_which_symbolizer_to_run() {
+        let options = with_symbolizer("halt_on_error=1");
+        match llvm_symbolizer() {
+            Some(path) => assert_eq!(
+                options,
+                format!(
+                    "halt_on_error=1:external_symbolizer_path={}",
+                    path.display()
+                )
+            ),
+            None => assert_eq!(options, "halt_on_error=1"),
+        }
+        assert!(!with_symbolizer("").starts_with(':'));
+    }
 
     #[test]
     fn a_replay_does_not_ask_a_debuginfod_server() {
