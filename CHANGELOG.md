@@ -2853,6 +2853,12 @@
   when bhf panics.
 
 ### Added
+- A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
+  report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
+  write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's
+  security widget. The template fuzzes a merge request's changes, keeps the
+  corpus and stored findings in the cache, and sweeps the whole tree on a
+  schedule.
 - The bhf-pr action takes a `mode` (#319): `pr` (the diff-scoped gate, the
   default), `batch` (the whole tree), `prune` (rebuild the harnesses and keep
   each corpus's inputs that add coverage) and `coverage` (the run's line

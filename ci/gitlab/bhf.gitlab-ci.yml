@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+# bhf for GitLab CI: fuzz a merge request's changed code, gate on what it
+# finds, and show the findings in the merge request's security widget.
+#
+#   include:
+#     - remote: "https://raw.githubusercontent.com/Tarmo-Technologies/bhf/main/ci/gitlab/bhf.gitlab-ci.yml"
+#   variables:
+#     BHF_IMAGE: registry.example.com/tools/bhf:latest   # built from bhf's Dockerfile
+#
+# The job writes `gl-sast-report.json` (GitLab's SAST report format) for
+# `artifacts:reports:sast`, and keeps the corpus, the discovery cache and the
+# findings it stored in the cache, so the next pipeline continues the corpus
+# and replays the findings as regressions. Set BHF_MODE to `batch` (the whole
+# tree) in a scheduled pipeline to grow the corpus the merge requests use.
+
+variables:
+  BHF_IMAGE: bhf:local
+  BHF_MODE: pr
+  BHF_PATH: "."
+  BHF_LANGUAGES: ""
+  BHF_CAMPAIGN_TIME: "180"
+  BHF_PER_TARGET_TIME: "30"
+  BHF_PR_GATE: confirmed
+
+bhf:
+  stage: test
+  image: $BHF_IMAGE
+  variables:
+    # The merge base against the target branch needs the history.
+    GIT_DEPTH: "0"
+  cache:
+    key: bhf-corpus-$CI_COMMIT_REF_SLUG
+    fallback_keys:
+      - bhf-corpus-$CI_DEFAULT_BRANCH
+    when: always
+    paths:
+      - .bhf_work/corpus
+      - .bhf_work/discovery-cache.json
+      - .bhf_work/regressions
+      - .bhf_work/results/findings
+  script:
+    - |
+      set -u
+      scope=()
+      if [ "$BHF_MODE" = pr ]; then
+        target="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_DEFAULT_BRANCH}"
+        git fetch --quiet origin "$target"
+        scope=(--changed-since "origin/$target")
+      fi
+      lang=()
+      if [ -n "$BHF_LANGUAGES" ]; then lang=(--languages "$BHF_LANGUAGES"); fi
+      bhf ci "$BHF_PATH" "${scope[@]}" "${lang[@]}" \
+        --campaign-time "$BHF_CAMPAIGN_TIME" \
+        --per-target-time "$BHF_PER_TARGET_TIME" \
+        --pr-gate "$BHF_PR_GATE" \
+        --work-dir "$CI_PROJECT_DIR/.bhf_work" \
+        --gitlab-sast "$CI_PROJECT_DIR/gl-sast-report.json" \
+        --ci-json "$CI_PROJECT_DIR/bhf-ci.json"
+  artifacts:
+    when: always
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
+      - bhf-ci.json
+      - .bhf_work/results/INDEX.md
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      variables:
+        BHF_MODE: batch
+        BHF_PR_GATE: never

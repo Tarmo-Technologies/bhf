@@ -129,6 +129,9 @@ and `results/findings.csv` are always written. `--junit` (a switch, with no
 path) writes `<run>.junit.xml`, into `<work-dir>/results/report/` in work-dir
 mode, with the `bhf.report.v2` snapshot that `--baseline <PATH>` and
 `--model <PATH>` also write there (baseline comparisons need it).
+`--gitlab-sast` (a switch, work-dir mode) writes
+`results/gl-sast-report.json`, a GitLab SAST report of the findings (see
+[CI](ci.md#gitlab-ci)).
 
 `bhf model train --labels <FILE> --out <MODEL>` trains the confidence model
 `bhf report --model` applies. The labels file is a JSON list of records (or an

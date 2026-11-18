@@ -173,7 +173,39 @@ bhf ci . \
   [regression replay](#regression-replay)'s ids) for your own reporting.
 - `--regressions <DIR>` replays the stored findings in `<DIR>` as well as the
   work dir's own (repeatable).
+- `--gitlab-sast <path>` writes a [GitLab SAST report](#gitlab-ci) of the
+  run's findings.
 - Exit code is `0` unless the gate fails.
+
+## GitLab CI
+
+`ci/gitlab/bhf.gitlab-ci.yml` is a GitLab CI template with the action's
+behavior. Include it and name a bhf image (built from bhf's Dockerfile and
+pushed to your registry):
+
+```yaml
+include:
+  - remote: "https://raw.githubusercontent.com/Tarmo-Technologies/bhf/main/ci/gitlab/bhf.gitlab-ci.yml"
+variables:
+  BHF_IMAGE: registry.example.com/tools/bhf:latest
+```
+
+In a merge request pipeline its `bhf` job runs `bhf ci --changed-since` the
+target branch, gated by `BHF_PR_GATE`. It writes `gl-sast-report.json`, which
+`artifacts:reports:sast` hands to the merge request's security widget. The
+job caches the corpus, the discovery cache and the stored findings, keyed by
+branch with the default branch as the fallback, so each pipeline continues the
+corpus and replays the findings as [regressions](#regression-replay). A
+scheduled pipeline sweeps the whole tree (`BHF_MODE=batch`) without gating.
+`BHF_PATH`, `BHF_LANGUAGES`, `BHF_CAMPAIGN_TIME` and `BHF_PER_TARGET_TIME`
+are the action's inputs.
+
+The report is GitLab's SAST format 15.2.1. Each finding with a source location
+is one vulnerability: its bhf rule is the primary identifier and its CWEs
+follow, its location is the finding's file and line, its severity is the
+finding's, and its id is the finding's fingerprint, stable across pipelines.
+`bhf ci --gitlab-sast <PATH>` writes it for a run, and `bhf report
+--gitlab-sast` writes it to `results/gl-sast-report.json` from a work dir.
 
 ## LLM and agent use in CI
 

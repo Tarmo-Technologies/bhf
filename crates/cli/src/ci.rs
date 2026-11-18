@@ -112,6 +112,12 @@ pub struct CiArgs {
     #[arg(long, value_name = "PATH")]
     pub sarif: Option<PathBuf>,
 
+    /// Write a GitLab SAST security report (format 15.2.1) of the run's
+    /// findings to this path, for a GitLab job's `artifacts:reports:sast`
+    /// (`gl-sast-report.json`).
+    #[arg(long = "gitlab-sast", value_name = "PATH")]
+    pub gitlab_sast: Option<PathBuf>,
+
     /// Write a compact machine-readable CI result JSON to this path (finding
     /// counts by severity + verdict, confirmed count, scoped file count, exit
     /// code). Consumed by the GitHub Action to build the PR summary comment.
@@ -413,6 +419,20 @@ pub fn run(args: CiArgs) -> i32 {
     }
 
     let sarif_path = maybe_emit_sarif(&args, &work_dir);
+    if let Some(path) = args.gitlab_sast.as_deref() {
+        // From this run's findings: results/ is rebuilt when the command
+        // ends, after this.
+        let written = match results::rebuild(&work_dir, &results::RebuildOptions::default()) {
+            Ok(_) => crate::report::write_gitlab_sast(&work_dir, path),
+            Err(error) => Err(format!("rebuild results: {error}")),
+        };
+        if let Err(error) = written {
+            bhfeprintln!(
+                "warning: could not write --gitlab-sast {}: {error}",
+                path.display()
+            );
+        }
+    }
 
     let mut exit_code = match args.pr_gate {
         PrGate::Off => {

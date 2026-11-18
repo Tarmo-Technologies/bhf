@@ -271,3 +271,45 @@ fn copy_tree(from: &Path, to: &Path) {
         }
     }
 }
+
+/// #320: the GitLab SAST report of the golden findings document, which
+/// `scripts/ci/tests/test_gitlab_sast.py` validates against GitLab's schema.
+/// `BHF_UPDATE_GOLDEN=1` rewrites it.
+#[test]
+fn gitlab_sast_report_matches_its_golden() {
+    let doc: results::model::FindingsDocument = serde_json::from_slice(
+        &std::fs::read(repo().join("tests/fixtures/golden_results/results/findings.json")).unwrap(),
+    )
+    .unwrap();
+    let report = results::render::gitlab::render_gitlab_sast(
+        &doc,
+        "2026-10-01T11:58:00Z",
+        "2026-10-01T12:00:00Z",
+    );
+    let mut got = serde_json::to_string_pretty(&report).unwrap();
+    got.push('\n');
+    let golden = repo().join("tests/fixtures/gitlab/gl-sast-report.json");
+    if std::env::var_os("BHF_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|_| panic!("missing {}; run with BHF_UPDATE_GOLDEN=1", golden.display()));
+    assert_eq!(
+        got, want,
+        "gl-sast-report.json drifted; regenerate with BHF_UPDATE_GOLDEN=1"
+    );
+    let vulnerabilities = report["vulnerabilities"].as_array().unwrap();
+    let located = doc
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding
+                .location
+                .as_ref()
+                .is_some_and(|l| !l.file.is_empty())
+        })
+        .count();
+    assert_eq!(vulnerabilities.len(), located);
+    assert!(located > 0);
+}

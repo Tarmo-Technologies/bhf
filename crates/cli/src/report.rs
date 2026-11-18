@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[path = "report_comparison.rs"]
 mod comparison;
@@ -41,6 +41,12 @@ pub struct ReportArgs {
     /// Work-dir mode always writes `results/findings.csv`.
     #[arg(long)]
     pub csv: bool,
+
+    /// Work-dir mode: also write a GitLab SAST security report
+    /// (`results/gl-sast-report.json`, format 15.2.1), for a GitLab job's
+    /// `artifacts:reports:sast`. A switch: it takes no path.
+    #[arg(long = "gitlab-sast")]
+    pub gitlab_sast: bool,
 
     /// Collapse non-representative findings inside each cluster under
     /// their representative in the Markdown report.
@@ -85,6 +91,16 @@ pub fn run(args: ReportArgs) -> i32 {
 /// bhf.report.v2 snapshot (needed by --baseline workflows), JUnit, and the
 /// comparison, all under results/report/.
 fn run_work_dir(args: ReportArgs) -> i32 {
+    if args.gitlab_sast {
+        let dest = corpus::layout::results_dir(&args.work_dir).join(GITLAB_SAST_REPORT);
+        match write_gitlab_sast(&args.work_dir, &dest) {
+            Ok(()) => println!("GITLAB_SAST {}", dest.display()),
+            Err(error) => {
+                bhfeprintln!("error: {error}");
+                return 1;
+            }
+        }
+    }
     if !(args.junit || args.baseline.is_some() || args.model.is_some()) {
         return 0;
     }
@@ -94,6 +110,40 @@ fn run_work_dir(args: ReportArgs) -> i32 {
     // findings root; in work-dir mode an empty findings set is valid.
     let _ = std::fs::create_dir_all(&findings);
     run_explicit(args, findings, out)
+}
+
+/// The GitLab SAST report's file name, as GitLab's analyzers write it.
+pub(crate) const GITLAB_SAST_REPORT: &str = "gl-sast-report.json";
+
+/// Write the GitLab SAST report (#320) of `work_dir`'s rebuilt
+/// `results/findings.json` to `dest`. The scan's times are the run's, from
+/// `auto/run.json`, else the document's.
+pub(crate) fn write_gitlab_sast(work_dir: &Path, dest: &Path) -> Result<(), String> {
+    let path = corpus::layout::results_dir(work_dir).join("findings.json");
+    let doc: results::model::FindingsDocument = serde_json::from_slice(
+        &std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let run: Option<serde_json::Value> = std::fs::read(work_dir.join("auto").join("run.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let time = |key: &str| {
+        run.as_ref()
+            .and_then(|run| run.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| doc.generated_at.clone())
+    };
+    let report = results::render::gitlab::render_gitlab_sast(
+        &doc,
+        &time("started_at"),
+        &time("finished_at"),
+    );
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(dest, serde_json::to_vec_pretty(&report).unwrap_or_default())
+        .map_err(|error| format!("write {}: {error}", dest.display()))
 }
 
 fn run_explicit(args: ReportArgs, findings: PathBuf, out: PathBuf) -> i32 {

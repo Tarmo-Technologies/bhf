@@ -2,5 +2,6 @@
 //! Derived renderings of a `FindingsDocument`.
 
 pub mod csv;
+pub mod gitlab;
 pub mod index_md;
 pub mod sarif;

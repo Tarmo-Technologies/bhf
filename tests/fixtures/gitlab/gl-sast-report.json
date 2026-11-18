@@ -1,0 +1,111 @@
+{
+  "scan": {
+    "analyzer": {
+      "id": "bhf",
+      "name": "bhf",
+      "vendor": {
+        "name": "bhf"
+      },
+      "version": "0.3.0"
+    },
+    "end_time": "2026-10-01T12:00:00",
+    "scanner": {
+      "id": "bhf",
+      "name": "bhf",
+      "vendor": {
+        "name": "bhf"
+      },
+      "version": "0.3.0"
+    },
+    "start_time": "2026-10-01T11:58:00",
+    "status": "success",
+    "type": "sast"
+  },
+  "schema": "https://gitlab.com/gitlab-org/security-products/security-report-schemas/-/raw/v15.2.1/dist/sast-report-format.json",
+  "version": "15.2.1",
+  "vulnerabilities": [
+    {
+      "description": "This is a buffer overflow: while processing a crafted input, `parse_header` read or wrote past the end of a memory buffer. Out-of-bounds access can corrupt memory, leak data, crash the program, and in some cases be steered into running attacker code. Triggered by the attached test input (`testcase.bin`).",
+      "id": "c0ffee00c0ffee00",
+      "identifiers": [
+        {
+          "name": "BHF-201 Heap buffer overflow (AddressSanitizer)",
+          "type": "bhf_rule",
+          "value": "BHF-201"
+        },
+        {
+          "name": "CWE-122",
+          "type": "cwe",
+          "url": "https://cwe.mitre.org/data/definitions/122.html",
+          "value": "122"
+        },
+        {
+          "name": "CWE-125",
+          "type": "cwe",
+          "url": "https://cwe.mitre.org/data/definitions/125.html",
+          "value": "125"
+        }
+      ],
+      "location": {
+        "end_line": 42,
+        "file": "src/parse.c",
+        "method": "parse_header",
+        "start_line": 42
+      },
+      "name": "Heap-based Buffer Overflow in parse_header",
+      "severity": "Critical",
+      "solution": "Bounds-check the index/length before the access at `src/parse.c:42` (`parse_header`): validate it against the buffer size before reading or writing."
+    },
+    {
+      "description": "While processing a crafted input, the program hit a fault in `copy_name` and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed. Triggered by the attached test input (`testcase.bin`).",
+      "id": "BHF-401:lib/parse.c:6",
+      "identifiers": [
+        {
+          "name": "BHF-401 Unsafe string copy call in source",
+          "type": "bhf_rule",
+          "value": "BHF-401"
+        },
+        {
+          "name": "CWE-120",
+          "type": "cwe",
+          "url": "https://cwe.mitre.org/data/definitions/120.html",
+          "value": "120"
+        }
+      ],
+      "location": {
+        "end_line": 6,
+        "file": "lib/parse.c",
+        "method": "copy_name",
+        "start_line": 6
+      },
+      "name": "Unsafe string copy call in source (copy_name)",
+      "severity": "High"
+    },
+    {
+      "description": "strcpy into fixed buffer",
+      "id": "fp-weak-9",
+      "identifiers": [
+        {
+          "name": "BHF-401 Unsafe string copy call in source",
+          "type": "bhf_rule",
+          "value": "BHF-401"
+        },
+        {
+          "name": "CWE-120",
+          "type": "cwe",
+          "url": "https://cwe.mitre.org/data/definitions/120.html",
+          "value": "120"
+        }
+      ],
+      "location": {
+        "end_line": 9,
+        "file": "weak.c",
+        "method": "greet",
+        "start_line": 9
+      },
+      "name": "Unsafe string copy call in source (greet)",
+      "severity": "High",
+      "solution": "Use a bounded copy."
+    }
+  ]
+}
