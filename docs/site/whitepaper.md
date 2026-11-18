@@ -17,8 +17,8 @@ cost is prohibitive, and for Ada there is simply no off-the-shelf tool at all.
 fuzzable entry points, generates typed harnesses, recovers the build when there
 isn't one, and fuzzes across **sixteen lanes: Ada, C, C++, Rust, Java, Python,
 Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP**, with
-a built-in engine or by driving AFL++ directly on native C/C++, COBOL and
-Fortran targets.
+a built-in engine or by driving AFL++ directly on native C/C++, COBOL,
+Fortran and Rust targets.
 
 In head-to-head measurements against the most popular fuzzer for each language,
 bhf finds the same bugs the specialists find while requiring **zero**

@@ -2850,6 +2850,11 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --engine afl++` runs Rust targets under AFL++ (#303). A Rust
+  harness's `build-afl.sh` builds its crate again with bhf's trace-pc-guard
+  instrumentation and links the staticlib with afl-clang-fast and a persistent
+  driver, as cargo-afl links a crate; the same binary is the CmpLog build.
+  The build's target tree is removed after it.
 - `bhf auto --engine afl++` runs COBOL and Fortran targets under AFL++
   (#302). Their C glue builds with afl-clang-fast and links as the lane's
   `main` does (`lane-ldflags.txt`), the passthrough driver has an AFL++

@@ -142,3 +142,45 @@ fn afl_fuzzes_a_fortran_routine_and_finds_its_overflow() {
         "located in the Fortran source: {finding:#}"
     );
 }
+
+fn cargo_nightly() -> bool {
+    let present = Command::new("cargo")
+        .args(["+nightly", "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    support::require_tool(present, "cargo +nightly")
+}
+
+/// #303: the Rust lane's staticlib links with afl-clang-fast, as cargo-afl
+/// links a crate, and AFL++ finds the fixture's out-of-bounds index behind
+/// its `AB` magic.
+#[test]
+fn afl_fuzzes_a_rust_function_and_finds_its_out_of_bounds_index() {
+    if !afl_present() || !cargo_nightly() {
+        eprintln!("skipping: needs AFL++ and a nightly cargo");
+        return;
+    }
+    let root = TestDir::new("afl-rust");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/rust_fuzz");
+    let (target, findings, stderr) = auto_afl(
+        &root,
+        &fixture,
+        &["--run-untrusted", "--target", "parse_packet"],
+    );
+    let id = target["harness_id"].as_str().unwrap();
+    let harness = root.join("work/harnesses").join(id);
+    assert!(harness.join("main_afl_cmplog").is_file(), "{target:#}");
+    assert!(
+        !harness.join("rust_harness/target-afl").exists(),
+        "the AFL++ build's target tree is removed"
+    );
+    let finding = findings
+        .iter()
+        .find(|finding| finding["rule_id"] == "BHF-201")
+        .unwrap_or_else(|| panic!("no BHF-201 finding: {findings:#?}\n{stderr}"));
+    assert!(found_by_afl(finding), "{finding:#}");
+    assert!(
+        finding.to_string().contains("src/lib.rs"),
+        "located in the crate: {finding:#}"
+    );
+}

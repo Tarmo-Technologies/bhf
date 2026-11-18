@@ -1485,7 +1485,8 @@ pub(crate) fn applicable_engines(
     let is_c_family = matches!(lang, Lang::C | Lang::Cpp);
     // The COBOL and Fortran lanes build C glue on the same Makefile, so
     // afl-clang-fast builds them too (#302); WinAFL takes C/C++ only.
-    let builds_afl = is_c_family || matches!(lang, Lang::Cobol | Lang::Fortran);
+    // The Rust lane's staticlib links with afl-clang-fast too (#303).
+    let builds_afl = is_c_family || matches!(lang, Lang::Cobol | Lang::Fortran | Lang::Rust);
     let mut out: Vec<FuzzEngine> = requested
         .iter()
         .copied()
@@ -4015,12 +4016,19 @@ fn run_attempt(
                 // target or discards the builtin results.
                 if run_afl {
                     progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "afl++" }));
-                    let afl_build = crate::build::try_run_c_make_afl_build_with_extras(
-                        work_dir,
-                        &candidate.harness_id,
-                        &extra_sources,
-                        &extra_includes,
-                    );
+                    // A Rust harness has no Makefile: its `build-afl.sh` links
+                    // the staticlib with afl-clang-fast, CmpLog build included.
+                    let rust = matches!(candidate.lang, crate::auto::candidate::Lang::Rust);
+                    let afl_build = if rust {
+                        crate::auto::rust_build::build_rust_afl(&harness_dir)
+                    } else {
+                        crate::build::try_run_c_make_afl_build_with_extras(
+                            work_dir,
+                            &candidate.harness_id,
+                            &extra_sources,
+                            &extra_includes,
+                        )
+                    };
                     let afl_built = afl_build.status.success();
                     let afl_lane = if afl_built {
                         crate::auto::lanes::LaneStatus::built()
@@ -4048,13 +4056,17 @@ fn run_attempt(
                     if afl_built {
                         // The CmpLog build afl-fuzz runs with `-c` (#274); without
                         // it AFL++ still runs, without its input-to-state stage.
-                        let cmplog = crate::build::try_run_c_make_afl_cmplog_build_with_extras(
-                            work_dir,
-                            &candidate.harness_id,
-                            &extra_sources,
-                            &extra_includes,
-                        );
-                        if !cmplog.status.success() {
+                        // A Rust harness's build made it already.
+                        let cmplog_built = rust
+                            || crate::build::try_run_c_make_afl_cmplog_build_with_extras(
+                                work_dir,
+                                &candidate.harness_id,
+                                &extra_sources,
+                                &extra_includes,
+                            )
+                            .status
+                            .success();
+                        if !cmplog_built {
                             let _ = std::fs::remove_file(crate::auto::layout::harness_exe(
                                 &harness_dir,
                                 crate::build::AFL_CMPLOG_BINARY,
@@ -11918,9 +11930,10 @@ mod engine_selection_tests {
         // afl-only on a lane without an AFL++ build -> fall back to builtin
         // (never empty)
         assert_eq!(applicable_engines(Lang::Ada, &[AflPlusPlus]), vec![Builtin]);
+        // The Rust lane links its staticlib with afl-clang-fast (#303).
         assert_eq!(
             applicable_engines(Lang::Rust, &[AflPlusPlus]),
-            vec![Builtin]
+            vec![AflPlusPlus]
         );
         assert_eq!(
             applicable_engines(Lang::Java, &[AflPlusPlus]),

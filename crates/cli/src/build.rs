@@ -2684,7 +2684,7 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
 
 /// The result of a `make` that could not be started (not installed, or not
 /// on PATH): a failed build whose output says why, instead of a panic.
-fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
+pub(crate) fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
     #[cfg(unix)]
     let status = std::os::unix::process::ExitStatusExt::from_raw(127 << 8);
     #[cfg(windows)]

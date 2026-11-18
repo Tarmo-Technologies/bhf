@@ -92,7 +92,7 @@ sudo apt-get install -y lua5.4                          # Lua
 sudo apt-get install -y php-cli                         # PHP
 # C#: install a .NET 8 SDK, then stage the instrumentation CLI (and its NuGet package offline if needed)
 dotnet tool install --global SharpFuzz.CommandLine
-sudo apt-get install -y afl++                           # optional: AFL++ engine (C/C++, COBOL, Fortran)
+sudo apt-get install -y afl++                           # optional: AFL++ engine (C/C++, COBOL, Fortran, Rust)
 ```
 
 On RHEL 8, 9, or 10 and compatible distributions (AlmaLinux/Rocky Linux), the base
