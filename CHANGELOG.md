@@ -2892,6 +2892,15 @@
   byte mutation alone breaks. Seeds are repaired the same way and the
   message's own frame is a seed. Before, only the session lane used the frame
   fix-ups.
+- `bhf project import-ossfuzz` imports what OSS-Fuzz keeps beside each
+  fuzzer (#335): `<name>_seed_corpus.zip` is unpacked with the system
+  `unzip` (no zip library) into the manifest target's seeds, with any
+  symlink it restores removed; `<name>.dict` and the dictionary `.options`
+  names are merged into the harness's `dictionary.txt` and are the target's
+  dictionaries; and the `[libfuzzer]` `max_len`, `timeout` and
+  `rss_limit_mb` options set the target's `max-len`, `timeout` and
+  `rss-limit-mb`, with every other option reported as not applied. A seed
+  corpus without `unzip` on PATH stops the import with what to install.
 - The fuzzers `bhf project import-ossfuzz` builds are registered as
   harnesses of the work dir (#377): each is staged at
   `<work>/build/<name>/main`, where `bhf fuzz --harness <name>`, replay and

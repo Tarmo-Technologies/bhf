@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+[libfuzzer]
+max_len = 64
+timeout = 5
+rss_limit_mb = 1024
+dict = record.dict
+close_fd_mask = 3
+
+[asan]
+detect_leaks = 0

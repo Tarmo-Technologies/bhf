@@ -55,6 +55,14 @@ fn have_clang() -> bool {
     )
 }
 
+/// What an import of the fixture needs: clang, the `zip` its build.sh
+/// packs the seed corpus with, and the `unzip` bhf unpacks it with.
+fn have_fixture_tools() -> bool {
+    have_clang()
+        && support::require_tool(runs("zip", &["-v"]), "zip")
+        && support::require_tool(runs("unzip", &["-v"]), "unzip")
+}
+
 /// Whether a sandbox bhf can build in works here: bubblewrap with every
 /// namespace (the network one included), or firejail without network.
 fn working_sandbox() -> bool {
@@ -189,8 +197,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// fuzzer, the objects are in `$WORK`, and the operator's tree is untouched.
 #[test]
 fn the_fixture_build_sh_leaves_its_fuzzers_in_out() {
-    if !have_clang() {
-        eprintln!("skipping: clang not available");
+    if !have_fixture_tools() {
+        eprintln!("skipping: clang, zip or unzip not available");
         return;
     }
     let root = TestDir::new("ossfuzz-fixture");
@@ -253,8 +261,8 @@ fn the_fixture_build_sh_leaves_its_fuzzers_in_out() {
 /// and the import's manifest names both for `bhf project run`.
 #[test]
 fn the_imported_fuzzers_are_registered_and_bhf_fuzz_finds_the_planted_bug() {
-    if !have_clang() {
-        eprintln!("skipping: clang not available");
+    if !have_fixture_tools() {
+        eprintln!("skipping: clang, zip or unzip not available");
         return;
     }
     let root = TestDir::new("ossfuzz-register");
@@ -282,13 +290,21 @@ fn the_imported_fuzzers_are_registered_and_bhf_fuzz_finds_the_planted_bug() {
         assert_eq!(declared["input_mode"], "framed");
     }
     assert!(!work.join("build/record_tool").exists());
-    assert!(
-        listing.contains(&format!(
-            "bhf fuzz {} --harness checksum_fuzzer",
+    // The commands that fuzz one, the one that came with options included.
+    for command in [
+        format!(
+            "bhf project run --manifest {} --target parse_record_fuzzer --work-dir {}",
+            work.join("ossfuzz/bhf.project.toml").display(),
             work.display()
-        )),
-        "{listing}"
-    );
+        ),
+        format!(
+            "bhf fuzz {} --harness parse_record_fuzzer --time 60s --max-len 64 --timeout 5s \
+             --rss-limit-mb 1024",
+            work.display()
+        ),
+    ] {
+        assert!(listing.contains(&command), "{command} in {listing}");
+    }
 
     // The manifest bhf project run takes, checked by bhf itself.
     let manifest = work.join("ossfuzz/bhf.project.toml");
@@ -363,6 +379,245 @@ fn the_imported_fuzzers_are_registered_and_bhf_fuzz_finds_the_planted_bug() {
             && log.contains("record_parse")
     });
     assert!(found, "the planted overflow was not found: {findings:?}");
+}
+
+/// The fixture's seed corpus is unpacked with the system `unzip`, its
+/// `.dict` and the dictionary its `.options` names are merged into the
+/// harness's dictionary, and its `[libfuzzer]` options set the manifest
+/// target's; the options bhf has no equivalent for are reported. `bhf
+/// project run` on the import's manifest then runs the unpacked seeds
+/// (finding the overflow the corpus's regression input triggers, with that
+/// seed as its lineage root) and loads the merged dictionary.
+#[test]
+fn the_seed_corpus_dictionaries_and_options_are_imported_and_applied() {
+    if !have_fixture_tools() {
+        eprintln!("skipping: clang, zip or unzip not available");
+        return;
+    }
+    let root = TestDir::new("ossfuzz-extras");
+    let project = root.join("ossfuzz_project");
+    copy_tree(&fixture(), &project);
+    let work = root.join("work");
+    let out = import(
+        &project,
+        &work,
+        &[&sandbox_flags()[..], &["--json"]].concat(),
+    );
+    assert_ok(&out);
+    let work = work.canonicalize().unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let fuzzer = |name: &str| {
+        record["fuzzers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fuzzer| fuzzer["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+
+    // Seeds: exactly the corpus build.sh zipped, byte for byte.
+    let parse = fuzzer("parse_record_fuzzer");
+    let seeds = work.join("ossfuzz/seeds/parse_record_fuzzer");
+    assert_eq!(parse["seeds"]["dir"], seeds.to_str().unwrap());
+    let corpus = fixture().join("fuzz/corpus/parse_record");
+    assert_eq!(listing(&seeds), listing(&corpus));
+    assert_eq!(parse["seeds"]["files"], listing(&corpus).len());
+    for seed in listing(&corpus) {
+        assert_eq!(
+            fs::read(seeds.join(&seed)).unwrap(),
+            fs::read(corpus.join(&seed)).unwrap()
+        );
+    }
+
+    // Dictionaries: <name>.dict, then the options' record.dict, merged.
+    let out_dir = work.join("ossfuzz/out");
+    assert_eq!(
+        parse["dictionaries"],
+        serde_json::json!([
+            out_dir.join("parse_record_fuzzer.dict"),
+            out_dir.join("record.dict")
+        ])
+    );
+    let merged = "\"REC1\"\n\"\\x10\"\n\"\\xc5\\x9d\\x1c\\x81\"\n";
+    assert_eq!(
+        fs::read_to_string(work.join("build/parse_record_fuzzer/dictionary.txt")).unwrap(),
+        merged
+    );
+
+    // Options: the ones bhf applies, and a note for each of the others.
+    assert_eq!(
+        parse["options"],
+        serde_json::json!({ "max_len": 64, "timeout_secs": 5, "rss_limit_mb": 1024 })
+    );
+    let notes = parse["notes"].to_string();
+    for note in [
+        "[libfuzzer] close_fd_mask = 3 is not applied",
+        "[asan] detect_leaks = 0 is not applied",
+    ] {
+        assert!(notes.contains(note), "{note} in {notes}");
+        assert!(text(&out.stderr).contains(note), "{note} not reported");
+    }
+
+    // The fuzzer that came with nothing gets nothing.
+    let checksum = fuzzer("checksum_fuzzer");
+    assert!(checksum["seeds"].is_null());
+    assert_eq!(checksum["dictionary_tokens"], 0);
+    assert!(!work.join("build/checksum_fuzzer/dictionary.txt").exists());
+
+    // The manifest target carries them for `bhf project run`.
+    let manifest_path = work.join("ossfuzz/bhf.project.toml");
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let targets = manifest["target"].as_array().unwrap();
+    let target = |id: &str| {
+        targets
+            .iter()
+            .find(|target| target["id"].as_str() == Some(id))
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone()
+    };
+    let parse_target = target("parse_record_fuzzer");
+    assert_eq!(
+        parse_target["seeds"].as_array().unwrap(),
+        &[toml::Value::from("seeds/parse_record_fuzzer")]
+    );
+    assert_eq!(
+        parse_target["dictionaries"].as_array().unwrap(),
+        &[
+            toml::Value::from("out/parse_record_fuzzer.dict"),
+            toml::Value::from("out/record.dict")
+        ]
+    );
+    assert_eq!(parse_target["max-len"].as_str(), Some("64"));
+    assert_eq!(parse_target["timeout"].as_str(), Some("5s"));
+    assert_eq!(parse_target["rss-limit-mb"].as_integer(), Some(1024));
+    let checksum_target = target("checksum_fuzzer");
+    for key in [
+        "seeds",
+        "dictionaries",
+        "max-len",
+        "timeout",
+        "rss-limit-mb",
+    ] {
+        assert!(!checksum_target.contains_key(key), "{key}");
+    }
+
+    // `bhf project run` runs the unpacked seeds and loads the dictionaries.
+    let run_dir = root.join("run");
+    let _serial = support::fuzz_serial_guard();
+    let run = bhf()
+        .args([
+            "project",
+            "run",
+            "--target",
+            "parse_record_fuzzer",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .arg("--work-dir")
+        .arg(&run_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", text(&run.stderr));
+    assert_eq!(
+        fs::read_to_string(run_dir.join("build/parse_record_fuzzer/dictionary.txt")).unwrap(),
+        merged
+    );
+    let regression = seeds.join("regression_long_record");
+    let found = fs::read_dir(run_dir.join("results/findings"))
+        .expect("a finding")
+        .map(|entry| entry.unwrap().path())
+        .any(|dir| {
+            let finding: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+            finding["lineage"]["origin"] == "user_seed"
+                && finding["lineage"]["root_path"] == regression.to_str().unwrap()
+                && fs::read(dir.join("testcase.bin")).unwrap() == fs::read(&regression).unwrap()
+        });
+    assert!(found, "no finding from the unpacked regression seed");
+}
+
+/// A seed corpus is unpacked with the system `unzip`; without it the import
+/// stops with what is missing and how to get it, naming the corpus.
+#[test]
+fn a_missing_unzip_is_refused_with_a_clear_message() {
+    if !have_clang() {
+        eprintln!("skipping: clang not available");
+        return;
+    }
+    let root = TestDir::new("ossfuzz-nounzip");
+    // What bhf and this build.sh run, and no unzip.
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    for tool in ["bash", "clang", "clang++", "ar", "cp", "chmod"] {
+        let path = which::which(tool).unwrap_or_else(|_| panic!("{tool} on PATH"));
+        std::os::unix::fs::symlink(path, bin.join(tool)).unwrap();
+    }
+    // An empty zip archive: its end-of-central-directory record alone.
+    let mut empty_zip = b"PK\x05\x06".to_vec();
+    empty_zip.resize(22, 0);
+    let project = write_project(
+        &root,
+        "zipproj",
+        &format!(
+            "#!/bin/bash -eu\ncp seeds.zip \"$OUT/stub_fuzzer_seed_corpus.zip\"\n{STUB_FUZZER}"
+        ),
+    );
+    fs::write(project.join("seeds.zip"), &empty_zip).unwrap();
+    let out = bhf()
+        .args(["project", "import-ossfuzz"])
+        .arg(&project)
+        .arg("--work-dir")
+        .arg(root.join("work"))
+        .args(["--sandbox", "none"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    for needle in [
+        "`unzip` is not on PATH",
+        "stub_fuzzer_seed_corpus.zip",
+        "apt-get install unzip",
+    ] {
+        assert!(stderr.contains(needle), "{needle:?} in {stderr}");
+    }
+}
+
+/// A symlink in a seed corpus, which could name a host file, is not a seed.
+#[test]
+fn a_symlink_in_a_seed_corpus_is_not_a_seed() {
+    if !have_fixture_tools() {
+        eprintln!("skipping: clang, zip or unzip not available");
+        return;
+    }
+    let root = TestDir::new("ossfuzz-zipsymlink");
+    let project = write_project(
+        &root,
+        "linkproj",
+        &format!(
+            "#!/bin/bash -eu\n\
+             mkdir -p \"$WORK/corpus\"\n\
+             printf 'seed' > \"$WORK/corpus/plain\"\n\
+             ln -s /etc/hostname \"$WORK/corpus/host\"\n\
+             (cd \"$WORK/corpus\" && zip -q --symlinks \"$OUT/stub_fuzzer_seed_corpus.zip\" plain host)\n\
+             {STUB_FUZZER}"
+        ),
+    );
+    let work = root.join("work");
+    let out = import(
+        &project,
+        &work,
+        &[&sandbox_flags()[..], &["--json"]].concat(),
+    );
+    assert_ok(&out);
+    let seeds = work.join("ossfuzz/seeds/stub_fuzzer");
+    assert_eq!(listing(&seeds), [PathBuf::from("plain")]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["fuzzers"][0]["seeds"]["files"], 1);
 }
 
 /// build.sh runs from `$SRC/<name>` with the OSS-Fuzz variables, `$CC`/

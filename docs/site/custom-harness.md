@@ -339,8 +339,11 @@ neither works (`--sandbox none` runs it directly). Each fuzzer it builds is
 registered under its own name at `bhf_work/build/<name>/main`, so
 `bhf fuzz`, `bhf replay` and `bhf minimize` take it like a harness you built,
 and as a target of `bhf_work/ossfuzz/bhf.project.toml` for
-`bhf project run`; the import lists them. The variables `build.sh` gets and
-the sandbox are described in the
+`bhf project run`; the import lists them. Its `<name>_seed_corpus.zip`
+(unpacked with the system `unzip`), `<name>.dict` and the `[libfuzzer]`
+options of `<name>.options` come with it: `bhf project run` applies them
+all, and `bhf fuzz` loads the dictionary. The variables `build.sh` gets, the
+sandbox, and which options apply are described in the
 [CLI reference](cli.md#importing-an-oss-fuzz-build).
 
 ## Pitfalls

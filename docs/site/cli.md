@@ -2310,7 +2310,34 @@ The import also writes a `bhf.project.v1` manifest,
 drives through the framed protocol with coverage, and `engine = "binary"`
 with `input-mode = "file"` for a libFuzzer binary linked without it, which
 runs one input file per process. Importing again rewrites the manifest and
-the registered binaries.
+the registered binaries. A target has no `time`, so `bhf project run` runs
+`bhf fuzz`'s default budget; add `time = "10m"` to a target for a timed
+campaign.
+
+**Seeds, dictionaries and options.** What OSS-Fuzz takes from beside a
+fuzzer in `$OUT` comes with it:
+
+- `<name>_seed_corpus.zip` is unpacked with the system `unzip` (bhf links no
+  zip library) into `<work>/ossfuzz/seeds/<name>/`, the target's `seeds`.
+  `unzip` keeps every entry inside that directory, and a symlink it restores
+  is removed, since it could name a host file. When the build leaves a seed
+  corpus and `unzip` is not on PATH, the import stops and names the corpus
+  and the package to install.
+- `<name>.dict` and the dictionary the `.options` file's `dict` names
+  (relative to the fuzzer, inside `$OUT`) are merged, in that order and
+  without duplicate tokens, into `<work>/build/<name>/dictionary.txt`, which
+  `bhf fuzz` loads, and are the target's `dictionaries`. A dictionary that is
+  not UTF-8 or is over the size limit is left out with a note.
+- The `[libfuzzer]` options with a bhf equivalent set the target's
+  `max-len` (`max_len`), `timeout` (`timeout`, in seconds) and
+  `rss-limit-mb` (`rss_limit_mb`); the listing prints them as `bhf fuzz`
+  flags. Every other option (`close_fd_mask`, `only_ascii`, the `[asan]`
+  and `[afl]` sections, ...) is reported as not applied. A binary-lane
+  target takes the seeds and `timeout` (as `timeout-ms`) only.
+
+`bhf project run` on the manifest applies all three; `bhf fuzz` loads the
+dictionary, takes the options as the flags the listing prints, and takes
+each seed with `--seed-file`.
 
 ## Out-of-Process Extensions
 

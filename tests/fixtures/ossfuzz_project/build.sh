@@ -18,3 +18,8 @@ $CXX $CXXFLAGS "$WORK/checksum_fuzzer.o" "$WORK/record.o" \
 
 # Not a fuzz target: a tool built beside them.
 $CC $CFLAGS -Isrc tools/record_tool.c "$WORK/record.o" -o "$OUT/record_tool"
+
+# The seed corpus, dictionaries and options OSS-Fuzz takes from beside a fuzz
+# target in $OUT. The corpus keeps a regression input for the overflow.
+zip -q -j "$OUT/parse_record_fuzzer_seed_corpus.zip" fuzz/corpus/parse_record/*
+cp fuzz/parse_record_fuzzer.dict fuzz/parse_record_fuzzer.options fuzz/record.dict "$OUT/"

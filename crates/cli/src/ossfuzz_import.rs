@@ -44,6 +44,16 @@
 //! and `engine = "binary"` with `input-mode = "file"` for a libFuzzer binary
 //! the build linked without it (`-fsanitize=fuzzer` in place of
 //! `$LIB_FUZZING_ENGINE`), which runs one input file per process.
+//!
+//! What OSS-Fuzz keeps beside a fuzzer in `$OUT` comes with it:
+//! `<name>_seed_corpus.zip` is unpacked, with the system `unzip` (bhf takes
+//! no zip library for it), into `<work>/ossfuzz/seeds/<name>`, the target's
+//! seeds; `<name>.dict` and the dictionary its `.options` names are merged
+//! into the harness's `dictionary.txt`, which `bhf fuzz` loads, and are the
+//! target's dictionaries; and the `[libfuzzer]` options bhf has an
+//! equivalent for (`max_len`, `timeout`, `rss_limit_mb`) set the target's
+//! `max-len`, `timeout` and `rss-limit-mb`. Every other option is reported
+//! as not applied.
 
 use std::ffi::OsString;
 use std::fs;
@@ -133,6 +143,8 @@ struct Layout {
     work: PathBuf,
     out: PathBuf,
     engine: PathBuf,
+    /// The unpacked seed corpora, `<seeds>/<name>`.
+    seeds: PathBuf,
 }
 
 impl Layout {
@@ -143,14 +155,16 @@ impl Layout {
             work: root.join("work"),
             out: root.join("out"),
             engine: root.join("engine"),
+            seeds: root.join("seeds"),
             root,
         }
     }
 
-    /// Empty `$SRC`, `$WORK`, `$OUT` and the engine dir, as a fresh OSS-Fuzz
-    /// build container starts. Only these bhf-owned directories are removed.
+    /// Empty `$SRC`, `$WORK`, `$OUT`, the engine dir and the seeds, as a
+    /// fresh OSS-Fuzz build container starts. Only these bhf-owned
+    /// directories are removed.
     fn reset(&self) -> Result<()> {
-        for dir in [&self.src, &self.work, &self.out, &self.engine] {
+        for dir in [&self.src, &self.work, &self.out, &self.engine, &self.seeds] {
             if dir.exists() {
                 fs::remove_dir_all(dir).with_context(|| format!("empty '{}'", dir.display()))?;
             }
@@ -260,6 +274,51 @@ struct Registered<'a> {
     lane: Lane,
     /// `<work>/build/<name>/main`.
     harness: PathBuf,
+    extras: Extras,
+}
+
+/// What the import took from the seed corpus, dictionaries and `.options`
+/// OSS-Fuzz keeps beside a fuzzer.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Extras {
+    /// `<work>/ossfuzz/seeds/<name>`, unpacked from `<name>_seed_corpus.zip`,
+    /// and the number of seed files in it.
+    seeds: Option<(PathBuf, usize)>,
+    /// `<name>.dict` and the dictionary the `.options` file names, in that
+    /// order, merged into the harness's `dictionary.txt`.
+    dictionaries: Vec<PathBuf>,
+    /// The merged dictionary's token count.
+    tokens: usize,
+    options: FuzzerOptions,
+    /// What was not applied, and why.
+    notes: Vec<String>,
+}
+
+/// The `[libfuzzer]` options of a `.options` file that bhf applies.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FuzzerOptions {
+    max_len: Option<u64>,
+    timeout_secs: Option<u64>,
+    rss_limit_mb: Option<u64>,
+    /// The dictionary to use, relative to the fuzzer's directory.
+    dict: Option<String>,
+}
+
+impl FuzzerOptions {
+    /// The `bhf fuzz` flags these options are.
+    fn fuzz_flags(&self) -> String {
+        let mut flags = String::new();
+        if let Some(max_len) = self.max_len {
+            flags.push_str(&format!(" --max-len {max_len}"));
+        }
+        if let Some(timeout) = self.timeout_secs {
+            flags.push_str(&format!(" --timeout {timeout}s"));
+        }
+        if let Some(rss) = self.rss_limit_mb {
+            flags.push_str(&format!(" --rss-limit-mb {rss}"));
+        }
+        flags
+    }
 }
 
 /// Run `bhf project import-ossfuzz`.
@@ -346,10 +405,20 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
         );
     }
 
-    let registered = fuzzers
+    let mut registered = fuzzers
         .iter()
         .map(|fuzzer| register(&work_dir, fuzzer))
         .collect::<Result<Vec<_>>>()?;
+    unpack_seed_corpora(&layout, &mut registered)?;
+    for entry in &mut registered {
+        apply_dictionaries_and_options(&layout, &work_dir, entry)?;
+        for note in &entry.extras.notes {
+            bhfeprintln!(
+                "bhf project import-ossfuzz: note: {}: {note}",
+                entry.fuzzer.name
+            );
+        }
+    }
     let manifest = write_manifest(&layout, &name, &registered)?;
 
     let record = json!({
@@ -373,6 +442,18 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
                 Lane::Builtin => "builtin",
                 Lane::BinaryFile => "binary",
             },
+            "seeds": entry.extras.seeds.as_ref().map(|(dir, files)| json!({
+                "dir": dir,
+                "files": files,
+            })),
+            "dictionaries": entry.extras.dictionaries,
+            "dictionary_tokens": entry.extras.tokens,
+            "options": {
+                "max_len": entry.extras.options.max_len,
+                "timeout_secs": entry.extras.options.timeout_secs,
+                "rss_limit_mb": entry.extras.options.rss_limit_mb,
+            },
+            "notes": entry.extras.notes,
         })).collect::<Vec<_>>(),
     });
     let record_text = serde_json::to_string_pretty(&record)?;
@@ -386,7 +467,7 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
     Ok(())
 }
 
-/// The registered fuzzers, and how to run them.
+/// The registered fuzzers, what came with them, and how to run them.
 fn print_listing(name: &str, work_dir: &Path, manifest: &Path, registered: &[Registered]) {
     println!(
         "project '{name}': build.sh produced {} fuzzer(s), registered as harnesses of {}:",
@@ -405,21 +486,56 @@ fn print_listing(name: &str, work_dir: &Path, manifest: &Path, registered: &[Reg
             entry.harness.display(),
             entry.lane.label()
         );
+        let extras = &entry.extras;
+        let mut taken = Vec::new();
+        if let Some((dir, files)) = &extras.seeds {
+            taken.push(format!("{files} seed(s) in {}", dir.display()));
+        }
+        if extras.tokens > 0 {
+            taken.push(format!(
+                "{} dictionary token(s) from {}",
+                extras.tokens,
+                extras
+                    .dictionaries
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let flags = extras.options.fuzz_flags();
+        if !flags.is_empty() {
+            taken.push(format!("options{flags}"));
+        }
+        if !taken.is_empty() {
+            println!("  {:width$}  {}", "", taken.join("; "));
+        }
     }
-    let first = &registered[0].fuzzer.name;
-    println!("fuzz one with:");
-    if let Some(entry) = registered.iter().find(|entry| entry.lane == Lane::Builtin) {
-        println!(
-            "  bhf fuzz {} --harness {} --time 60s",
-            work_dir.display(),
-            entry.fuzzer.name
-        );
-    }
+    // The example: the first fuzzer that came with something, else the first.
+    let example = registered
+        .iter()
+        .find(|entry| entry.extras != Extras::default())
+        .unwrap_or(&registered[0]);
+    println!("fuzz one with its seeds, dictionary and options:");
     println!(
-        "  bhf project run --manifest {} --target {first} --work-dir {}",
+        "  bhf project run --manifest {} --target {} --work-dir {}",
         manifest.display(),
+        example.fuzzer.name,
         work_dir.display()
     );
+    let builtin = std::iter::once(example)
+        .chain(registered)
+        .find(|entry| entry.lane == Lane::Builtin);
+    if let Some(entry) = builtin {
+        println!("or with its dictionary and options (add each seed with --seed-file):");
+        println!(
+            "  bhf fuzz {} --harness {} --time 60s{}",
+            work_dir.display(),
+            entry.fuzzer.name,
+            entry.extras.options.fuzz_flags()
+        );
+    }
 }
 
 /// Stage `fuzzer` as the harness `<work>/build/<name>/main`, declaring the
@@ -458,7 +574,271 @@ fn register<'a>(work_dir: &Path, fuzzer: &'a Fuzzer) -> Result<Registered<'a>> {
         fuzzer,
         lane,
         harness,
+        extras: Extras::default(),
     })
+}
+
+/// Whether `path` is a regular file, not a symlink that could name a file
+/// outside `$OUT`.
+fn regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// Unpack each fuzzer's `<name>_seed_corpus.zip` into
+/// `<work>/ossfuzz/seeds/<name>` with the system `unzip`.
+fn unpack_seed_corpora(layout: &Layout, registered: &mut [Registered]) -> Result<()> {
+    let corpora: Vec<(usize, PathBuf)> = registered
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let zip = entry
+                .fuzzer
+                .path
+                .with_file_name(format!("{}_seed_corpus.zip", entry.fuzzer.name));
+            (index, zip)
+        })
+        .filter(|(_, zip)| regular_file(zip))
+        .collect();
+    if corpora.is_empty() {
+        return Ok(());
+    }
+    let unzip = program_on_path("unzip").ok_or_else(|| {
+        anyhow!(
+            "`unzip` is not on PATH: bhf unpacks OSS-Fuzz seed corpora with the system \
+             `unzip`, and the build left {}. Install it (e.g. `apt-get install unzip`) \
+             and import again",
+            corpora
+                .iter()
+                .filter_map(|(_, zip)| zip.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    for (index, zip) in corpora {
+        let entry = &mut registered[index];
+        let dir = layout.seeds.join(&entry.fuzzer.name);
+        let files = unpack_seeds(&unzip, &zip, &dir)?;
+        if files == 0 {
+            entry.extras.notes.push(format!(
+                "{} holds no seed file",
+                zip.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        } else {
+            entry.extras.seeds = Some((dir, files));
+        }
+    }
+    Ok(())
+}
+
+/// Unpack `zip` into `dir` with `unzip`, which keeps every entry inside `dir`
+/// (it drops `../` components and a leading `/`). A symlink or other special
+/// file it restores is removed: a seed is a regular file, and a symlink could
+/// name a host file. Returns the number of seed files.
+fn unpack_seeds(unzip: &Path, zip: &Path, dir: &Path) -> Result<usize> {
+    fs::create_dir_all(dir).with_context(|| format!("create '{}'", dir.display()))?;
+    let output = Command::new(unzip)
+        .args(["-qq", "-o"])
+        .arg(zip)
+        .arg("-d")
+        .arg(dir)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("start '{}'", unzip.display()))?;
+    // 1 is unzip's exit status for warnings, such as an empty archive.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        bail!(
+            "unzip could not unpack '{}' ({}): {}",
+            zip.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    fn prune(dir: &Path, files: &mut usize) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                prune(&entry.path(), files)?;
+            } else if kind.is_file() {
+                *files += 1;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    let mut files = 0;
+    prune(dir, &mut files).with_context(|| format!("read '{}'", dir.display()))?;
+    Ok(files)
+}
+
+/// Read an OSS-Fuzz `.options` file, an INI file as ClusterFuzz reads it:
+/// the `[libfuzzer]` options bhf has an equivalent for, and a note for every
+/// other line, so none is dropped without a word.
+fn parse_options(text: &str) -> (FuzzerOptions, Vec<String>) {
+    let mut options = FuzzerOptions::default();
+    let mut notes = Vec::new();
+    let mut section = String::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').or_else(|| line.split_once(':')) else {
+            notes.push(format!(
+                "`{line}` is not a `key = value` line, and is ignored"
+            ));
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        let number = value.parse::<u64>().ok();
+        let slot = match (section.as_str(), key) {
+            ("libfuzzer", "max_len") => &mut options.max_len,
+            ("libfuzzer", "timeout") => &mut options.timeout_secs,
+            ("libfuzzer", "rss_limit_mb") => &mut options.rss_limit_mb,
+            ("libfuzzer", "dict") => {
+                options.dict = Some(value.to_owned());
+                continue;
+            }
+            _ => {
+                notes.push(format!(
+                    "[{section}] {key} = {value} is not applied: bhf has no equivalent"
+                ));
+                continue;
+            }
+        };
+        match number {
+            Some(number) => *slot = Some(number),
+            None => notes.push(format!(
+                "[{section}] {key} = {value} is not applied: not a whole number"
+            )),
+        }
+    }
+    (options, notes)
+}
+
+/// The file a `.options` file's `dict` names, relative to the fuzzer's
+/// directory, or `None` when that would leave `$OUT`.
+fn option_dictionary(out: &Path, fuzzer_dir: &Path, dict: &str) -> Option<PathBuf> {
+    let relative = Path::new(dict);
+    let plain = relative.components().all(|part| {
+        matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    let path = fuzzer_dir.join(relative);
+    (plain && path.starts_with(out)).then_some(path)
+}
+
+/// Read the fuzzer's `.options`, merge `<name>.dict` and the dictionary the
+/// options name into the harness's `dictionary.txt`, and note what is not
+/// applied.
+fn apply_dictionaries_and_options(
+    layout: &Layout,
+    work_dir: &Path,
+    entry: &mut Registered,
+) -> Result<()> {
+    let name = &entry.fuzzer.name;
+    let fuzzer_dir = entry.fuzzer.path.parent().unwrap_or(&layout.out);
+    let extras = &mut entry.extras;
+    let options_path = fuzzer_dir.join(format!("{name}.options"));
+    if regular_file(&options_path) {
+        match fs::read_to_string(&options_path) {
+            Ok(text) => {
+                let (options, notes) = parse_options(&text);
+                extras.options = options;
+                extras.notes.extend(
+                    notes
+                        .into_iter()
+                        .map(|note| format!("{name}.options: {note}")),
+                );
+            }
+            Err(error) => extras.notes.push(format!(
+                "{name}.options could not be read ({error}); ignored"
+            )),
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let own = fuzzer_dir.join(format!("{name}.dict"));
+    if regular_file(&own) {
+        candidates.push(own);
+    }
+    if let Some(dict) = extras.options.dict.clone() {
+        match option_dictionary(&layout.out, fuzzer_dir, &dict) {
+            Some(path) if regular_file(&path) => {
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
+            Some(_) => extras.notes.push(format!(
+                "{name}.options: dict = {dict} names no file in $OUT"
+            )),
+            None => extras.notes.push(format!(
+                "{name}.options: dict = {dict} is outside $OUT, and is ignored"
+            )),
+        }
+    }
+    // A dictionary bhf cannot read (not UTF-8, or past the size limit) is
+    // left out with its reason, so `bhf project run` never trips on it.
+    for path in candidates {
+        match project_profile::merge_dictionaries(std::slice::from_ref(&path)) {
+            Ok(_) => extras.dictionaries.push(path),
+            Err(error) => extras
+                .notes
+                .push(format!("{error}; the dictionary is left out")),
+        }
+    }
+    let merged = project_profile::merge_dictionaries(&extras.dictionaries)?;
+    extras.tokens = merged.tokens.len();
+    let dictionary = work_dir.join("build").join(name).join("dictionary.txt");
+    if merged.tokens.is_empty() {
+        if dictionary.exists() {
+            fs::remove_file(&dictionary)
+                .with_context(|| format!("remove '{}'", dictionary.display()))?;
+        }
+    } else {
+        fs::write(&dictionary, merged.to_afl_format())
+            .with_context(|| format!("write '{}'", dictionary.display()))?;
+    }
+
+    if entry.lane == Lane::BinaryFile {
+        let options = &extras.options;
+        let mut unapplied = Vec::new();
+        if !extras.dictionaries.is_empty() {
+            unapplied.push("its dictionaries");
+        }
+        if options.max_len.is_some() {
+            unapplied.push("max_len");
+        }
+        if options.rss_limit_mb.is_some() {
+            unapplied.push("rss_limit_mb");
+        }
+        if !unapplied.is_empty() {
+            extras.notes.push(format!(
+                "{} do(es) not apply to a binary-lane target in the manifest",
+                unapplied.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `path`, under `<work>/ossfuzz/`, as the manifest names it.
+fn manifest_path(layout: &Layout, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(&layout.root)
+        .with_context(|| format!("'{}' is outside the import", path.display()))?;
+    Ok(relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 /// Write `<work>/ossfuzz/bhf.project.toml`, one target per fuzzer, and check
@@ -483,30 +863,59 @@ fn write_manifest(layout: &Layout, name: &str, registered: &[Registered]) -> Res
         binary: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_mode: Option<&'static str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        seeds: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dictionaries: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_len: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rss_limit_mb: Option<u64>,
     }
 
     let mut targets = Vec::with_capacity(registered.len());
     for entry in registered {
-        let relative = entry
-            .fuzzer
-            .path
-            .strip_prefix(&layout.root)
-            .with_context(|| format!("'{}' is outside $OUT", entry.fuzzer.path.display()))?;
-        let binary = relative
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        let (engine, input_mode) = match entry.lane {
-            Lane::Builtin => ("builtin", None),
-            Lane::BinaryFile => ("binary", Some("file")),
-        };
-        targets.push(TargetDoc {
+        let extras = &entry.extras;
+        let options = &extras.options;
+        let seeds = extras
+            .seeds
+            .iter()
+            .map(|(dir, _)| manifest_path(layout, dir))
+            .collect::<Result<Vec<_>>>()?;
+        let mut target = TargetDoc {
             id: entry.fuzzer.name.clone(),
-            engine,
-            binary,
-            input_mode,
-        });
+            engine: "builtin",
+            binary: manifest_path(layout, &entry.fuzzer.path)?,
+            input_mode: None,
+            seeds,
+            dictionaries: Vec::new(),
+            max_len: None,
+            timeout: None,
+            timeout_ms: None,
+            rss_limit_mb: None,
+        };
+        match entry.lane {
+            Lane::Builtin => {
+                target.dictionaries = extras
+                    .dictionaries
+                    .iter()
+                    .map(|path| manifest_path(layout, path))
+                    .collect::<Result<_>>()?;
+                target.max_len = options.max_len.map(|n| n.to_string());
+                target.timeout = options.timeout_secs.map(|n| format!("{n}s"));
+                target.rss_limit_mb = options.rss_limit_mb;
+            }
+            Lane::BinaryFile => {
+                target.engine = "binary";
+                target.input_mode = Some("file");
+                target.timeout_ms = options.timeout_secs.map(|n| n.saturating_mul(1000));
+            }
+        }
+        targets.push(target);
     }
     let doc = Doc {
         schema: project_profile::SCHEMA_V1,
@@ -1244,6 +1653,156 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The `[libfuzzer]` options bhf has an equivalent for are read; every
+    /// other line is noted as not applied, a bad number included.
+    #[test]
+    fn the_options_bhf_has_an_equivalent_for_are_read_and_the_rest_noted() {
+        let (options, notes) = parse_options(
+            "# a comment\n\
+             ; another\n\
+             [libfuzzer]\n\
+             max_len = 64\n\
+             timeout: 25\n\
+             rss_limit_mb=2560\n\
+             dict = shared.dict\n\
+             close_fd_mask = 3\n\
+             only_ascii = yes\n\
+             [LibFuzzer]\n\
+             runs = 10\n\
+             [asan]\n\
+             detect_leaks = 0\n\
+             [libfuzzer]\n\
+             max_len = big\n\
+             stray line\n",
+        );
+        assert_eq!(
+            options,
+            FuzzerOptions {
+                max_len: Some(64),
+                timeout_secs: Some(25),
+                rss_limit_mb: Some(2560),
+                dict: Some("shared.dict".to_owned()),
+            }
+        );
+        assert_eq!(
+            options.fuzz_flags(),
+            " --max-len 64 --timeout 25s --rss-limit-mb 2560"
+        );
+        assert_eq!(
+            notes,
+            [
+                "[libfuzzer] close_fd_mask = 3 is not applied: bhf has no equivalent",
+                "[libfuzzer] only_ascii = yes is not applied: bhf has no equivalent",
+                "[libfuzzer] runs = 10 is not applied: bhf has no equivalent",
+                "[asan] detect_leaks = 0 is not applied: bhf has no equivalent",
+                "[libfuzzer] max_len = big is not applied: not a whole number",
+                "`stray line` is not a `key = value` line, and is ignored",
+            ]
+        );
+    }
+
+    /// A `.options` file's `dict` is a file beside the fuzzer in `$OUT`, or
+    /// below it; an absolute path or a `..` that leaves `$OUT` is refused.
+    #[test]
+    fn an_options_dictionary_stays_in_out() {
+        let out = Path::new("/w/ossfuzz/out");
+        let sub = out.join("sub");
+        assert_eq!(
+            option_dictionary(out, out, "shared.dict"),
+            Some(out.join("shared.dict"))
+        );
+        assert_eq!(
+            option_dictionary(out, &sub, "./dicts/x.dict"),
+            Some(sub.join("./dicts/x.dict"))
+        );
+        for bad in ["/etc/passwd", "../secret.dict", "dicts/../../x.dict"] {
+            assert_eq!(option_dictionary(out, &sub, bad), None, "{bad}");
+        }
+    }
+
+    /// `<name>.dict` and the options' dictionary are merged into the
+    /// harness's `dictionary.txt`, de-duplicated; a dictionary that is not
+    /// UTF-8 is left out with a note; a binary-lane fuzzer notes what its
+    /// manifest target cannot take.
+    #[cfg(unix)]
+    #[test]
+    fn dictionaries_are_merged_into_the_harness_dictionary() {
+        let work = TestDir::new("ossfuzz-dicts");
+        let (layout, fuzzers) = out_with_two_fuzzers(&work);
+        fs::write(
+            layout.out.join("decode_fuzzer.dict"),
+            "# kw\nmagic=\"HDR1\"\n\"\\x00\\xff\"\n",
+        )
+        .unwrap();
+        fs::write(layout.out.join("shared.dict"), "\"HDR1\"\nend=\"END\"\n").unwrap();
+        fs::write(
+            layout.out.join("decode_fuzzer.options"),
+            "[libfuzzer]\ndict = shared.dict\nmax_len = 128\n",
+        )
+        .unwrap();
+        fs::write(layout.out.join("sub/legacy_fuzzer.dict"), b"\"\xff\xfe\"\n").unwrap();
+        fs::write(
+            layout.out.join("sub/legacy_fuzzer.options"),
+            "[libfuzzer]\nmax_len = 8\ntimeout = 3\n",
+        )
+        .unwrap();
+        let mut registered: Vec<Registered> = fuzzers
+            .iter()
+            .map(|fuzzer| register(&work, fuzzer).unwrap())
+            .collect();
+        for entry in &mut registered {
+            apply_dictionaries_and_options(&layout, &work, entry).unwrap();
+        }
+
+        let decode = &registered[0].extras;
+        assert_eq!(
+            decode.dictionaries,
+            [
+                layout.out.join("decode_fuzzer.dict"),
+                layout.out.join("shared.dict")
+            ]
+        );
+        assert_eq!(decode.tokens, 3);
+        assert_eq!(decode.options.max_len, Some(128));
+        assert!(decode.notes.is_empty(), "{:?}", decode.notes);
+        assert_eq!(
+            fs::read_to_string(work.join("build/decode_fuzzer/dictionary.txt")).unwrap(),
+            "\"HDR1\"\n\"\\x00\\xff\"\n\"END\"\n"
+        );
+
+        let legacy = &registered[1].extras;
+        assert!(legacy.dictionaries.is_empty());
+        assert!(!work.join("build/legacy_fuzzer/dictionary.txt").exists());
+        assert!(
+            legacy.notes[0].contains("not valid UTF-8"),
+            "{:?}",
+            legacy.notes
+        );
+        assert_eq!(
+            legacy.notes[1],
+            "max_len do(es) not apply to a binary-lane target in the manifest"
+        );
+
+        // The manifest takes what each lane runs with.
+        write_manifest(&layout, "libdemo", &registered).unwrap();
+        let manifest =
+            project_profile::load(&fs::read_to_string(layout.root.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        let decode = &manifest.targets[0];
+        assert_eq!(
+            decode.dictionaries,
+            [
+                PathBuf::from("out/decode_fuzzer.dict"),
+                PathBuf::from("out/shared.dict")
+            ]
+        );
+        assert_eq!(decode.max_len.as_deref(), Some("128"));
+        let legacy = &manifest.targets[1];
+        assert!(legacy.dictionaries.is_empty());
+        assert_eq!(legacy.max_len, None);
+        assert_eq!(legacy.timeout_ms, Some(3000));
     }
 
     #[test]
