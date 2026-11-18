@@ -726,7 +726,9 @@ pub struct AutoArgs {
     /// same arming `bhf fuzz --sanitizers` does, now for the auto pipeline.
     /// Default (empty) leaves the build and run env unchanged. Compatible set is
     /// `asan,ubsan,lsan`; `msan`/`tsan` are mutually exclusive with those and each
-    /// other. The special value `none` (standalone — not combinable with a
+    /// other. `cfi` is never armed in the fuzzed build: it adds a control-flow
+    /// integrity replay of each C/C++ harness's corpus (`make cfi`) after the
+    /// fuzz passes. The special value `none` (standalone — not combinable with a
     /// sanitizer) builds each native C/C++ harness with coverage but NO
     /// `-fsanitize=`, i.e. crash-only fuzzing with zero ASan/UBSan false positives
     /// — the escape hatch for shared-memory / custom-allocator / RTOS code that
@@ -1342,7 +1344,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
         return Ok(2);
     }
-    if let Err(error) = crate::fuzz::parse_sanitizer_args(&args.sanitizers) {
+    // `cfi` runs only as a corpus replay (#297); the rest is the fuzzed
+    // build's matrix.
+    let (build_sanitizers, replay_lanes) =
+        crate::auto::sanitizer_replay::split_replay_lanes(&args.sanitizers);
+    if let Err(error) = crate::fuzz::parse_sanitizer_args(&build_sanitizers) {
         bhfeprintln!("error: {error}");
         return Ok(2);
     }
@@ -1568,12 +1574,12 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // carry the exact same sanitizer/coverage contract as the harnesses that
     // will link them; parsing this only after the probe produced stale/default
     // artifacts for `--sanitizers none|msan|tsan|...`.
-    let sanitizers = crate::fuzz::parse_sanitizer_args(&args.sanitizers)
+    let sanitizers = crate::fuzz::parse_sanitizer_args(&build_sanitizers)
         .map_err(|error| anyhow::anyhow!(error))?;
     match &sanitizers {
         multicore_fuzz::SanitizerSelection::Set(_) => bhfeprintln!(
             "bhf auto: arming sanitizer matrix [{}] on each C/C++ harness build + run",
-            args.sanitizers.join(", ")
+            build_sanitizers.join(", ")
         ),
         multicore_fuzz::SanitizerSelection::None => bhfeprintln!(
             "bhf auto: --sanitizers none — building each C/C++ harness with coverage but \
@@ -2396,6 +2402,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         max_repair_rounds: args.max_repair_rounds,
         comparison_progress: args.comparison_progress,
         sanitizers,
+        replay_lanes: replay_lanes.clone(),
         dir_filter: dir_filter.clone(),
         engines,
         // Ada project-Main units (declared `for Main use (...)` in a .gpr under the
@@ -3273,6 +3280,28 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
     }
 
+    // Control-flow integrity corpus replay (C/C++, #297): only when asked for,
+    // since its build is a whole-program LTO link.
+    if options
+        .replay_lanes
+        .contains(&crate::auto::sanitizer_replay::ReplayLane::Cfi)
+    {
+        let cfi = crate::auto::cfi::run_cfi_replay(&work, &replay_bounds);
+        bhfeprintln!(
+            "bhf auto: control-flow integrity — {} violation(s) found by corpus replay",
+            cfi.findings
+        );
+        if !cfi.unbuilt.is_empty() {
+            bhfeprintln!(
+                "bhf auto: control-flow integrity — {} harness(es) did not build with \
+                 -fsanitize=cfi (it needs clang and an LTO link): {}; their corpus is \
+                 UNMEASURED for type confusion",
+                cfi.unbuilt.len(),
+                cfi.unbuilt.join(", ")
+            );
+        }
+    }
+
     // JVM sink-reachability oracle: the coverage agent records input-reachable
     // dangerous sinks (deserialization / exec / eval / SQL / LDAP) into each Java
     // harness's sink_report.txt; turn each reached sink into a behavioral finding.
@@ -3479,6 +3508,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         stopped_by_operator,
         output_budget.exhausted(),
         &options.sanitizers,
+        &options.replay_lanes,
     )?;
     crate::auto::discovery::bhfprof("auto:write_reports", _twr);
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The bounds the post-fuzz MemorySanitizer and ThreadSanitizer corpus replays
-//! share, and the log of what each replayed run did.
+//! The bounds the post-fuzz MemorySanitizer, ThreadSanitizer and
+//! control-flow-integrity corpus replays share, the log of what each replayed
+//! run did, and the sanitizers `bhf auto` runs only as a replay.
 //!
 //! Each replayed input runs at most `min(--timeout, 30 s)`, and a run that
 //! times out is not retried: the input is a hang under that sanitizer, and an
@@ -15,6 +16,47 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// A sanitizer `bhf auto --sanitizers` runs only as a corpus replay through a
+/// build of its own, never in the fuzzed build (#297): control-flow integrity
+/// needs whole-program LTO and hidden visibility, which the fuzzed build does
+/// not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayLane {
+    /// `cfi`: `-fsanitize=cfi`, casts to the wrong class and calls through a
+    /// function pointer or vtable of the wrong type.
+    Cfi,
+}
+
+impl ReplayLane {
+    /// The lane a `--sanitizers` value names.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cfi" => Some(ReplayLane::Cfi),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayLane::Cfi => "cfi",
+        }
+    }
+}
+
+/// `--sanitizers`' values without the replay lanes, and the lanes, each once.
+pub fn split_replay_lanes(values: &[String]) -> (Vec<String>, Vec<ReplayLane>) {
+    let mut rest = Vec::new();
+    let mut lanes = Vec::new();
+    for value in values {
+        match ReplayLane::parse(value) {
+            Some(lane) if !lanes.contains(&lane) => lanes.push(lane),
+            Some(_) => {}
+            None => rest.push(value.clone()),
+        }
+    }
+    (rest, lanes)
+}
 
 /// The longest one replayed input may run, whatever `--timeout` says.
 pub(crate) const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -143,6 +185,17 @@ fn digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #297: `cfi` leaves `--sanitizers` as a replay lane, once, and the rest
+    /// stays the fuzzed build's matrix in its order.
+    #[test]
+    fn the_replay_lanes_are_split_from_the_build_matrix() {
+        let values: Vec<String> = ["asan", "CFI", "ubsan", "cfi"].map(String::from).to_vec();
+        let (rest, lanes) = split_replay_lanes(&values);
+        assert_eq!(rest, ["asan", "ubsan"]);
+        assert_eq!(lanes, [ReplayLane::Cfi]);
+        assert_eq!(split_replay_lanes(&[]), (Vec::new(), Vec::new()));
+    }
 
     #[test]
     fn the_run_timeout_is_the_timeout_capped_at_30_seconds() {

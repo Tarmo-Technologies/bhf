@@ -8339,6 +8339,7 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false, false),
     ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true, false),
     ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true, false),
+    ("CFI", "$(CFI_CC)", "$(CFI_CFLAGS)", true, false),
     ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
     ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
     ("PROV", "$(CC)", "$(BHF_CFLAGS) $(CFLAGS)", true, true),
@@ -8348,6 +8349,7 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
 const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("MAIN", "$(CXX)", "$(BHF_CXXFLAGS) $(CXXFLAGS)", true, true),
     ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
+    ("CFI", "$(CFI_CXX)", "$(CFI_CXXFLAGS)", true, false),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
     ("WINAFL", "$(CXX)", "$(WINAFL_CXXFLAGS)", true, true),
@@ -20857,6 +20859,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("libfuzzer", "main_libfuzzer"),
             ("msan", "main_msan"),
             ("tsan", "main_tsan"),
+            ("cfi", "main_cfi"),
             ("cov", "main_cov"),
             ("diff", "main_diff"),
         ] {
@@ -20883,6 +20886,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("afl", "main_afl"),
             ("winafl", "main_winafl"),
             ("libfuzzer", "main_libfuzzer"),
+            ("cfi", "main_cfi"),
             ("cov", "main_cov"),
             ("diff", "main_diff"),
         ] {

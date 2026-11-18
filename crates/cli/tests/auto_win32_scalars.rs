@@ -45,6 +45,7 @@ fn options(src_root: &std::path::Path) -> AttemptOptions {
         comparison_progress: false,
         max_repair_rounds: 48,
         sanitizers: Default::default(),
+        replay_lanes: Vec::new(),
         per_target_time: Duration::from_secs(3),
         total_time: None,
         per_target_finding_count: None,

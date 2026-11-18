@@ -23,6 +23,9 @@ the C/C++ `--sanitizers` matrix.
 - `--sanitizers asan,ubsan,lsan` — arm exactly this set. `asan,ubsan,lsan` are
   mutually compatible; `msan` and `tsan` are exclusive with those and each other
   (run them as separate campaigns).
+- `--sanitizers asan,ubsan,cfi` (`bhf auto`) — fuzz with ASan and UBSan, then
+  replay the corpus through a control-flow integrity build. `cfi` is never part
+  of the fuzzed build: see [The control-flow integrity replay](#the-control-flow-integrity-replay).
 - `--sanitizers none` — build each native C/C++ harness with the engine's
   coverage instrumentation but **no `-fsanitize=`** at all. You get
   coverage-guided, **crash-only** fuzzing (SIGSEGV / SIGABRT still caught) with
@@ -516,7 +519,38 @@ The run summary says what the replay could not conclude:
   per-run timeout and timeout budget as every other replay run. If it does not
   finish, the input keeps the clean result of its first run.
 
-### Bounds of the MSan and TSan replays
+## The control-flow integrity replay
+
+`bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
+control-flow integrity build (`make cfi`, `main_cfi`: clang
+`-fsanitize=cfi -flto -fvisibility=hidden`). It finds what ASan and UBSan let
+pass: a cast to the wrong class (`static_cast<Circle *>` of a `Square`), a
+virtual call through an object of another type, and a call through a function
+pointer of the wrong type. The fuzzed build keeps UBSan's `function` and
+`vptr` checks off, so without this replay type confusion is not observed. CFI
+needs whole-program LTO, a link the fuzzed build does not do, so it is a
+replay of its own build, after the fuzz passes, and `bhf fuzz` refuses
+`--sanitizers cfi`.
+
+Its checks report through the UBSan runtime, and a report becomes a finding
+under the rule its check maps to: BHF-221, type confusion (CWE-843), at the
+cast or call, with the CFI build as the fixture `bhf replay` runs. The build
+needs clang and an LTO linker (lld, or binutils with LLVM's gold plugin); a
+harness whose CFI build fails is named in the run's output, and its corpus is
+unmeasured for type confusion, not clean.
+
+## Bug classes a run could not observe
+
+`run.json`'s `summary.unobservable_classes` and the run report's "Bug classes
+this run could not observe" list each class no lane of the run detects in the
+C/C++ targets it fuzzed, the languages it went unobserved in, and what would
+observe it: memory errors without ASan, undefined behavior without UBSan,
+leaks without LSan or ASan, uninitialized reads without the MSan replay (which
+has no C++ lane), data races without the TSan replay (C only), and type
+confusion without the CFI replay. A finding list without a class says nothing
+about it.
+
+### Bounds of the MSan, TSan and CFI replays
 
 Each replayed input runs for at most `--timeout`, or 30 s, whichever is less.
 A run past it is a hang under that sanitizer: it is not run again, and the
@@ -534,4 +568,5 @@ of `auto/sanitizer-replay.jsonl`: the sanitizer, harness, input, `elapsed_ms`,
 - **Custom static-pool allocator:** keep ASan and wire `bhf_asan.h` so
   intra-pool overflows are caught.
 - **Leaks:** `--sanitizers asan,ubsan,lsan`. **Uninitialized reads / races:**
-  `--sanitizers msan` or `tsan` as separate campaigns.
+  `--sanitizers msan` or `tsan` as separate campaigns. **C++ type confusion and
+  bad indirect calls:** add `cfi` to `bhf auto --sanitizers`.

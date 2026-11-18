@@ -8405,9 +8405,18 @@ pub(crate) fn parse_sanitizer_args(
     }
     let mut out = Vec::new();
     for value in values {
+        if let Some(lane) = crate::auto::sanitizer_replay::ReplayLane::parse(value) {
+            return Err(format!(
+                "--sanitizers {lane}: it runs as a corpus replay through a build of its own, \
+                 which `bhf auto --sanitizers {lane}` does after its fuzz passes; `bhf fuzz` \
+                 fuzzes one build",
+                lane = lane.as_str()
+            ));
+        }
         let Some(sanitizer) = multicore_fuzz::Sanitizer::parse(value) else {
             return Err(format!(
-                "unknown sanitizer '{value}' (expected asan, msan, ubsan, tsan, lsan, or none)"
+                "unknown sanitizer '{value}' (expected asan, msan, ubsan, tsan, lsan, or none; \
+                 `bhf auto` also takes cfi)"
             ));
         };
         if !out.contains(&sanitizer) {
@@ -13828,6 +13837,13 @@ mod parse_sanitizer_args_tests {
     fn none_is_standalone_none() {
         assert_eq!(parse(&["none"]).unwrap(), SanitizerSelection::None);
         assert_eq!(parse(&["NONE"]).unwrap(), SanitizerSelection::None);
+    }
+
+    /// #297: `cfi` is `bhf auto`'s corpus replay, and `bhf fuzz` says so.
+    #[test]
+    fn cfi_is_refused_with_the_auto_lane_named() {
+        let error = parse(&["asan", "cfi"]).unwrap_err();
+        assert!(error.contains("bhf auto --sanitizers cfi"), "{error}");
     }
 
     #[test]

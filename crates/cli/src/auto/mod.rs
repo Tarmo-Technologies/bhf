@@ -17,6 +17,7 @@ pub(crate) mod mmio_registers;
 pub mod build_probe;
 pub mod candidate;
 pub mod capability;
+pub mod cfi;
 pub mod cli;
 pub mod closure_memo;
 pub mod cobol;

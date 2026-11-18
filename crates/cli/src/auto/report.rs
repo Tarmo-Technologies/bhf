@@ -157,6 +157,120 @@ struct Summary {
     /// sweep that host-stubbed a VxWorks target is never read as target
     /// assurance, and a fully-native sweep carries no caveat.
     fidelity: FidelitySummary,
+    /// #297: the bug classes no sanitizer lane of the run could detect in the
+    /// C/C++ targets it fuzzed, and what would. Empty when it fuzzed none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unobservable_classes: Vec<UnobservableClass>,
+}
+
+/// A bug class the run's sanitizer lanes could not detect (#297).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UnobservableClass {
+    class: &'static str,
+    description: &'static str,
+    /// The fuzzed languages it went unobserved in (`c`, `c++`).
+    languages: Vec<&'static str>,
+    /// What would observe it.
+    needs: &'static str,
+}
+
+/// The bug classes the sanitizer lanes of a run with `selection` and
+/// `replay_lanes` could not detect in C and C++ targets, when it fuzzed them.
+/// The fuzzed build has ASan, UBSan and LeakSanitizer unless `--sanitizers`
+/// says otherwise; the MemorySanitizer and ThreadSanitizer replays run by
+/// default and are C-only; control-flow integrity runs only when asked for.
+/// UBSan's `function` and `vptr` checks are off in the fuzzed build, so type
+/// confusion needs the CFI replay.
+fn unobservable_classes(
+    selection: &SanitizerSelection,
+    replay_lanes: &[crate::auto::sanitizer_replay::ReplayLane],
+    fuzzed_c: bool,
+    fuzzed_cpp: bool,
+) -> Vec<UnobservableClass> {
+    use crate::auto::sanitizer_replay::ReplayLane;
+    let selected = |sanitizer: Sanitizer| match selection {
+        SanitizerSelection::Default => {
+            matches!(
+                sanitizer,
+                Sanitizer::Asan | Sanitizer::Ubsan | Sanitizer::Lsan
+            )
+        }
+        SanitizerSelection::None => false,
+        SanitizerSelection::Set(set) => {
+            set.contains(&sanitizer)
+                // ASan carries LeakSanitizer on the hosts bhf builds for.
+                || (sanitizer == Sanitizer::Lsan && set.contains(&Sanitizer::Asan))
+        }
+    };
+    let replayed = |sanitizer: Sanitizer| match selection {
+        SanitizerSelection::Default => true,
+        SanitizerSelection::None => false,
+        SanitizerSelection::Set(set) => set.contains(&sanitizer),
+    };
+    let cfi = replay_lanes.contains(&ReplayLane::Cfi);
+    // (class, description, observed in C, observed in C++, what would)
+    let classes = [
+        (
+            "memory-errors",
+            "out-of-bounds accesses and use after free",
+            selected(Sanitizer::Asan),
+            selected(Sanitizer::Asan),
+            "--sanitizers asan",
+        ),
+        (
+            "undefined-behavior",
+            "integer overflow, invalid shifts, misaligned and null accesses",
+            selected(Sanitizer::Ubsan),
+            selected(Sanitizer::Ubsan),
+            "--sanitizers ubsan",
+        ),
+        (
+            "memory-leaks",
+            "memory allocated and never freed",
+            selected(Sanitizer::Lsan),
+            selected(Sanitizer::Lsan),
+            "--sanitizers lsan (or asan)",
+        ),
+        (
+            "uninitialized-reads",
+            "reads of memory never written",
+            replayed(Sanitizer::Msan),
+            false,
+            "--sanitizers msan (C only: C++ MSan needs an instrumented libc++)",
+        ),
+        (
+            "data-races",
+            "unsynchronized access to memory shared between threads",
+            replayed(Sanitizer::Tsan),
+            false,
+            "--sanitizers tsan (C only)",
+        ),
+        (
+            "type-confusion",
+            "casts to the wrong class and calls through a function pointer or vtable of the wrong type",
+            cfi,
+            cfi,
+            "--sanitizers cfi",
+        ),
+    ];
+    classes
+        .into_iter()
+        .filter_map(|(class, description, in_c, in_cpp, needs)| {
+            let mut languages = Vec::new();
+            if fuzzed_c && !in_c {
+                languages.push("c");
+            }
+            if fuzzed_cpp && !in_cpp {
+                languages.push("c++");
+            }
+            (!languages.is_empty()).then_some(UnobservableClass {
+                class,
+                description,
+                languages,
+                needs,
+            })
+        })
+        .collect()
 }
 
 /// CC-1: campaign-level fidelity rollup for `run.json`'s summary. `dimensions`
@@ -1184,6 +1298,7 @@ pub fn write_reports(
         stopped_by_operator,
         false,
         &SanitizerSelection::Default,
+        &[],
     )
 }
 
@@ -1208,6 +1323,8 @@ pub fn write_reports_with_output_limit(
     // reports which sanitizers were actually armed and whether a TSan
     // (concurrency) pass ran.
     sanitizers: &SanitizerSelection,
+    // #297: the sanitizers run only as corpus replays (`cfi`).
+    replay_lanes: &[crate::auto::sanitizer_replay::ReplayLane],
 ) -> Result<()> {
     let auto_dir = work_dir.join("auto");
     std::fs::create_dir_all(&auto_dir)?;
@@ -1675,6 +1792,17 @@ pub fn write_reports_with_output_limit(
         .collect();
     crate::auto::build_fidelity::annotate_findings(work_dir, &fabricated_by_harness);
 
+    let fuzzed = |lang: Lang| {
+        results.iter().any(|r| {
+            r.candidate.lang == lang
+                && matches!(
+                    r.outcome,
+                    Outcome::BuiltAndFuzzed { .. } | Outcome::BuiltNotEntered { .. }
+                )
+        })
+    };
+    summary.unobservable_classes =
+        unobservable_classes(sanitizers, replay_lanes, fuzzed(Lang::C), fuzzed(Lang::Cpp));
     let run_json = RunJson {
         schema_version: 1,
         started_at: started_at.to_owned(),
@@ -3557,6 +3685,25 @@ fn render_md(r: &RunJson<'_>) -> String {
             "No findings were emitted. Review the target outcomes below before treating the run as clean."
         );
     }
+    if !r.summary.unobservable_classes.is_empty() {
+        let _ = writeln!(s);
+        let _ = writeln!(s, "## Bug classes this run could not observe");
+        let _ = writeln!(
+            s,
+            "No sanitizer lane of this run detects these in the C/C++ targets it fuzzed, \
+             so their absence from the findings says nothing about them."
+        );
+        for class in &r.summary.unobservable_classes {
+            let _ = writeln!(
+                s,
+                "- {} ({}): {}; needs {}",
+                class.class,
+                class.languages.join(", "),
+                class.description,
+                class.needs
+            );
+        }
+    }
     let _ = writeln!(s);
     let _ = writeln!(s, "## Campaign summary");
     let _ = writeln!(s, "Discovered: {}", r.summary.discovered);
@@ -4077,6 +4224,52 @@ fn md_section(s: &mut String, title: &str, bag: &[Aggregated]) {
 
 #[cfg(test)]
 mod tests {
+    /// #297: what a run's lanes leave unobserved, per fuzzed language.
+    #[test]
+    fn the_classes_no_lane_could_observe_are_listed() {
+        use crate::auto::sanitizer_replay::ReplayLane;
+        let names = |classes: Vec<UnobservableClass>| {
+            classes
+                .into_iter()
+                .map(|class| (class.class, class.languages))
+                .collect::<Vec<_>>()
+        };
+        // The default matrix: ASan, UBSan and LSan in the build, MSan and
+        // TSan replays for C; no CFI, and no MSan or TSan for C++.
+        assert_eq!(
+            names(unobservable_classes(
+                &SanitizerSelection::Default,
+                &[],
+                true,
+                true
+            )),
+            [
+                ("uninitialized-reads", vec!["c++"]),
+                ("data-races", vec!["c++"]),
+                ("type-confusion", vec!["c", "c++"]),
+            ]
+        );
+        assert_eq!(
+            names(unobservable_classes(
+                &SanitizerSelection::Set(vec![Sanitizer::Asan]),
+                &[ReplayLane::Cfi],
+                true,
+                false,
+            )),
+            [
+                ("undefined-behavior", vec!["c"]),
+                ("uninitialized-reads", vec!["c"]),
+                ("data-races", vec!["c"]),
+            ]
+        );
+        assert!(unobservable_classes(&SanitizerSelection::None, &[], false, false).is_empty());
+        let none = unobservable_classes(&SanitizerSelection::None, &[], true, false);
+        assert_eq!(none.len(), 6);
+        assert!(none
+            .iter()
+            .any(|c| c.class == "type-confusion" && c.needs == "--sanitizers cfi"));
+    }
+
     use super::*;
 
     #[test]
@@ -5859,6 +6052,7 @@ mod tests {
             false,
             true,
             &SanitizerSelection::Default,
+            &[],
         )
         .unwrap();
         let json: serde_json::Value =

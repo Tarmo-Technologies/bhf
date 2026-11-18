@@ -2839,6 +2839,14 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
+  control-flow integrity build (`make cfi`, clang `-fsanitize=cfi -flto
+  -fvisibility=hidden`, reporting through the UBSan runtime) after the fuzz
+  passes (#297). A cast to the wrong class or a call through a function
+  pointer or vtable of the wrong type is a BHF-221 finding that `bhf replay`
+  reproduces with that build; a harness whose CFI build fails is named.
+  `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
+  no lane of the run could observe in its C/C++ targets, and what would.
 - Ada harnesses get a coverage report too (#310): the replay records the PC
   of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
   runtime), takes the binary's calls to the callback as the instrumented

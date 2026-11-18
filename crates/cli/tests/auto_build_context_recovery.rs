@@ -68,6 +68,7 @@ fn options(source_root: &Path) -> AttemptOptions {
         max_repair_rounds: 48,
         comparison_progress: false,
         sanitizers: Default::default(),
+        replay_lanes: Vec::new(),
         dir_filter: Default::default(),
         engines: vec![FuzzEngine::Builtin],
         ada_main_sources: Default::default(),

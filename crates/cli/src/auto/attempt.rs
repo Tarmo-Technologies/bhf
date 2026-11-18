@@ -212,6 +212,8 @@ pub struct AttemptOptions {
     /// cross-compiled (qemu-user / wine) paths, where host sanitizer
     /// instrumentation doesn't apply.
     pub sanitizers: multicore_fuzz::SanitizerSelection,
+    /// #297: the sanitizers run only as corpus replays (`--sanitizers cfi`).
+    pub replay_lanes: Vec<crate::auto::sanitizer_replay::ReplayLane>,
     /// Directory-name filter (`auto --exclude-dir`/`--include-dir`) — the SAME
     /// filter discovery uses to drop non-library dirs (tests/testsuite/examples/
     /// benchmarks/fuzz). Threaded into the Ada src-instrumentation walk so the
@@ -291,6 +293,7 @@ impl Default for AttemptOptions {
             max_repair_rounds: DEFAULT_MAX_REPAIR_ROUNDS,
             comparison_progress: false,
             sanitizers: multicore_fuzz::SanitizerSelection::Default,
+            replay_lanes: Vec::new(),
             dir_filter: crate::auto::discovery::DirFilter::default(),
             engines: vec![FuzzEngine::Builtin],
             ada_main_sources: HashMap::new(),
