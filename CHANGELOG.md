@@ -2812,6 +2812,12 @@
   when bhf panics.
 
 ### Added
+- `bhf auto` fuzzes Python 2 sources under a `python2` interpreter (#285):
+  `python2`, `python2.7`, or a `python` that is 2.x. The Python runtime (driver,
+  coverage and decoder) runs on Python 2.7 as well as Python 3, and the target is
+  resolved with the Python 2 extractor. Without such an interpreter a Python 2
+  target is report-only, as before, with a reason that says to install one. The
+  nightly builds CPython 2.7.18 for the gated test.
 - `bhf auto` fuzzes Ada 83 units from an Ada 2012 harness (#284). Ada 83 has
   no child units, so an instrumented Ada 83 unit names the probe through the
   runtime's library-level `AdaFuzz_Probe83`, which renames the probe's

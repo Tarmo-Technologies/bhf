@@ -36,14 +36,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dialect {
-    // --- Ada (95/2005/2012/2022 fuzz today; 83 is M22 Phase 4) ---
+    // --- Ada (83 through 2022 fuzz; 83 from a modern harness, #284) ---
     Ada83,
     Ada95,
     Ada2005,
     Ada2012,
     Ada2022,
 
-    // --- C (C89..C23 build with modern clang; K&R needs Phase 3 normalization) ---
+    // --- C (C89..C23 build with modern clang; K&R through its declared parameters, #283) ---
     /// K&R / pre-ANSI C: old-style (untyped) parameter declarations.
     CKAndR,
     /// ANSI C / C90.
@@ -70,7 +70,8 @@ pub enum Dialect {
     Rust2024,
 
     // --- Python ---
-    /// Python 2.x (Phase 2). The 2/3 split is a hard dialect boundary.
+    /// Python 2.x, fuzzed under a `python2` interpreter (#285). The 2/3 split
+    /// is a hard dialect boundary.
     Python2,
     /// Python 3.x. The exact minor (3.0–3.5 f-string floor, 3.12+ `sys.monitoring`)
     /// is a [`HarnessProfile`] concern, not a separate dialect.
@@ -214,9 +215,9 @@ impl Dialect {
         match self {
             // Discovered + statically analyzed, not fuzzed end-to-end. K&R C
             // fuzzes through the prototype its declaration block gives (#283),
-            // Ada 83 from an Ada 2012 harness (#284).
-            Dialect::CppPre98 // Phase 5: no modern compiler accepts cfront/ARM
-            | Dialect::Python2 => FuzzSupport::ReportOnly, // Phase 2: needs python2
+            // Ada 83 from an Ada 2012 harness (#284), and Python 2 under a
+            // `python2` interpreter, report-only on a host without one (#285).
+            Dialect::CppPre98 => FuzzSupport::ReportOnly, // no modern compiler accepts cfront/ARM
             // Perl 4 fuzzes via the Perl 5 lane (Perl 5 is backward-compatible and
             // runs most Perl 4 — M22 Phase 5 design), so it is Fuzzable, not
             // report-only.
@@ -869,10 +870,9 @@ mod tests {
 
     #[test]
     fn legacy_dialects_are_report_only_modern_are_fuzzable() {
-        for d in [Dialect::CppPre98, Dialect::Python2] {
-            assert_eq!(d.fuzz_support(), FuzzSupport::ReportOnly, "{d:?}");
-        }
+        assert_eq!(Dialect::CppPre98.fuzz_support(), FuzzSupport::ReportOnly);
         for d in [
+            Dialect::Python2,
             Dialect::Ada83,
             Dialect::CKAndR,
             Dialect::Ada95,

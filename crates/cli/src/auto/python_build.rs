@@ -12,9 +12,13 @@
 //! repair loop is a pass-through (the launcher already exists). A missing `python3`
 //! or an un-harnessable target (currently: an instance method needing a constructed
 //! receiver) skips cleanly — the GNAT-less rule.
+//!
+//! A Python 2 source runs under a `python2` interpreter with the same runtime,
+//! which is written for both (#285); without one it is report-only.
 
 use crate::auto::candidate::Candidate;
 use python_parser::{parse_python_functions, PyFunction};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -29,10 +33,53 @@ pub enum PythonBuildResult {
     Failed { reason: String, skip: bool },
 }
 
-fn probe_python() -> Option<PathBuf> {
-    which::which("python3")
-        .or_else(|_| which::which("python"))
-        .ok()
+/// `name` on `path` (`PATH` when `None`).
+fn find_on(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    match path {
+        Some(path) => which::which_in(name, Some(path), "/").ok(),
+        None => which::which(name).ok(),
+    }
+}
+
+/// The interpreter a candidate of `dialect` runs under (#285), found on `path`
+/// (`PATH` when `None`): a Python 2 source under `python2`, `python2.7` or a
+/// `python` that is 2.x, any other under `python3` or a `python` that is 3.x.
+/// The error is the reason the target is skipped.
+pub(crate) fn select_interpreter(
+    dialect: Option<lang_profile::Dialect>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    if dialect == Some(lang_profile::Dialect::Python2) {
+        return ["python2", "python2.7", "python"]
+            .into_iter()
+            .filter_map(|name| find_on(name, path))
+            .find(|python| python_version(python).is_some_and(|(major, _)| major == 2))
+            .ok_or_else(|| {
+                "Python 2: no `python2` interpreter found; install Python 2.7 as `python2` \
+                 to fuzz this target"
+                    .to_owned()
+            });
+    }
+    let Some(python) = find_on("python3", path).or_else(|| find_on("python", path)) else {
+        return Err(
+            "no `python3` interpreter found; install Python 3 to fuzz Python \
+                    (the lane skips cleanly, like a GNAT-less Ada skip)"
+                .to_owned(),
+        );
+    };
+    // A Python 2 interpreter (the only `python` on some legacy hosts) cannot
+    // import a Python 3 source. Say so up front rather than letting the import
+    // smoke-test fail with an opaque SyntaxError.
+    if let Some((major, minor)) = python_version(&python) {
+        if major < 3 {
+            return Err(format!(
+                "interpreter at {} is Python {major}.{minor} and this is a Python 3 \
+                 source; install python3 to fuzz this target",
+                python.display()
+            ));
+        }
+    }
+    Ok(python)
 }
 
 /// M22: detected `(major, minor)` of a Python interpreter, or `None` if it could
@@ -69,31 +116,10 @@ pub fn build_python_harness(
     harness_id: &str,
     source_root: &Path,
 ) -> PythonBuildResult {
-    let Some(python) = probe_python() else {
-        return PythonBuildResult::Failed {
-            reason: "no `python3` interpreter found; install Python 3 to fuzz Python \
-                     (the lane skips cleanly, like a GNAT-less Ada skip)"
-                .to_owned(),
-            skip: true,
-        };
+    let python = match select_interpreter(candidate.dialect, None) {
+        Ok(python) => python,
+        Err(reason) => return PythonBuildResult::Failed { reason, skip: true },
     };
-    // M22: a Python 2 interpreter (the only `python` on some legacy hosts) cannot
-    // run the Python 3 driver. Detect it up front and skip with an actionable
-    // reason rather than letting the import smoke-test fail with an opaque
-    // SyntaxError. The Python 2 fuzzing lane is M22 Phase 2.
-    if let Some((major, minor)) = python_version(&python) {
-        if major < 3 {
-            return PythonBuildResult::Failed {
-                reason: format!(
-                    "interpreter at {} is Python {major}.{minor}; the Python-2 fuzzing \
-                     lane is not yet available (M22 Phase 2) — install python3 to fuzz \
-                     this target",
-                    python.display()
-                ),
-                skip: true,
-            };
-        }
-    }
     let Some(runtime) = locate_python_runtime() else {
         return PythonBuildResult::Failed {
             reason: "could not locate the bundled python_runtime/ (decode/cov/driver)".to_owned(),
@@ -269,8 +295,13 @@ struct ResolvedTarget {
 fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
     let source = crate::source_text::read_source_text(&candidate.source_path)
         .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
-    let functions =
-        parse_python_functions(&source).map_err(|_| "failed to parse Python source".to_owned())?;
+    // A Python 2 source fails the Python 3 grammar; discovery read it with the
+    // tolerant extractor, and so does this.
+    let functions = if candidate.dialect == Some(lang_profile::Dialect::Python2) {
+        python_parser::parse_python2_functions(&source)
+    } else {
+        parse_python_functions(&source).map_err(|_| "failed to parse Python source".to_owned())?
+    };
     let func = functions
         .iter()
         .find(|f| f.qualified() == candidate.name && f.line == candidate.line)
@@ -518,7 +549,7 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
          \x20       with open(path, \"wb\") as entry:\n\
          \x20           entry.write(b\"\\x01\")\n\
          \x20       _bhf_target_entered = True\n\
-         \x20   except OSError:\n\
+         \x20   except (IOError, OSError):\n\
          \x20       pass\n\
          \n\
          \n\
@@ -759,9 +790,66 @@ mod tests {
         }
     }
 
+    /// #285: a Python 2 source runs under a `python2`, `python2.7` or 2.x
+    /// `python` interpreter, and a Python 3 source never does. Stub
+    /// interpreters answer the version probe.
+    #[cfg(unix)]
+    #[test]
+    fn the_interpreter_follows_the_source_dialect() {
+        use lang_profile::Dialect;
+        use std::os::unix::fs::PermissionsExt;
+        let stub = |dir: &Path, name: &str, version: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let both = crate::test_support::TestDir::new("py-interp-both");
+        let python2 = stub(both.path(), "python2", "2.7");
+        let python3 = stub(both.path(), "python3", "3.12");
+        let path = Some(both.path().as_os_str());
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python2), path),
+            Ok(python2)
+        );
+        assert_eq!(select_interpreter(None, path), Ok(python3.clone()));
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python3), path),
+            Ok(python3)
+        );
+
+        // A legacy host's only `python` is 2.x: the Python 2 source takes it,
+        // a Python 3 source is told why it cannot.
+        let legacy = crate::test_support::TestDir::new("py-interp-legacy");
+        let python = stub(legacy.path(), "python", "2.7");
+        let path = Some(legacy.path().as_os_str());
+        assert_eq!(select_interpreter(Some(Dialect::Python2), path), Ok(python));
+        let error = select_interpreter(None, path).unwrap_err();
+        assert!(
+            error.contains("is Python 2.7 and this is a Python 3 source"),
+            "{error}"
+        );
+
+        // `python2.7` alone serves; a 3.x `python` does not.
+        let versioned = crate::test_support::TestDir::new("py-interp-27");
+        stub(versioned.path(), "python", "3.11");
+        let python27 = stub(versioned.path(), "python2.7", "2.7");
+        let path = Some(versioned.path().as_os_str());
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python2), path),
+            Ok(python27)
+        );
+
+        let none = crate::test_support::TestDir::new("py-interp-none");
+        stub(none.path(), "python3", "3.12");
+        let error =
+            select_interpreter(Some(Dialect::Python2), Some(none.path().as_os_str())).unwrap_err();
+        assert!(error.contains("no `python2` interpreter found"), "{error}");
+    }
+
     #[test]
     fn python_version_parses_installed_interpreter() {
-        let Some(py) = probe_python() else {
+        let Ok(py) = select_interpreter(None, None) else {
             return; // no interpreter installed -> skip, like a GNAT-less Ada skip
         };
         let v = python_version(&py).expect("python_version should parse a real interpreter");

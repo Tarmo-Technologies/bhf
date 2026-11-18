@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# -*- coding: utf-8 -*-
 """bhf Python fork-server driver — the Python analog of c_runtime/bhf_driver.c
 and java_runtime Driver.java. Speaks the SAME BHF_FRAMED protocol so the
 builtin engine drives a warm, long-lived interpreter one input at a time
@@ -17,6 +18,10 @@ the engine sees the death and re-isolates the input. An expected rejection
 
 Without BHF_FRAMED, argv[1] is a single input file to replay once (the engine's
 per-spawn crash-isolation path), else stdin is read.
+
+Runs on Python 2.7 as well as Python 3 (#285): no annotations or f-strings,
+and the exceptions Python 2 lacks or splits (StopAsyncIteration, IOError
+beside OSError) are named through what it has.
 """
 import importlib
 import os
@@ -48,9 +53,15 @@ FINDING_HALT_CODE = 86
 # this boundary. This lane has no behavioral sink oracles yet (the runtrace shim
 # is not loaded into the interpreter), so an injection that raises nothing is not
 # reported.
+try:
+    _STOP_ASYNC = StopAsyncIteration
+except NameError:  # Python 2
+    _STOP_ASYNC = StopIteration
+# EnvironmentError is OSError on Python 3 and the base of Python 2's separate
+# IOError and OSError.
 REJECTION_EXC = (
     ValueError, TypeError, AttributeError, KeyError, UnicodeError, EOFError,
-    NotImplementedError, OSError, StopIteration, StopAsyncIteration,
+    NotImplementedError, EnvironmentError, StopIteration, _STOP_ASYNC,
 )
 # Never a finding: interpreter control-flow signals (a target calling sys.exit or
 # being interrupted is not a crash).
@@ -73,14 +84,14 @@ _EXPECTED = _expected_exceptions()
 _TARGET_PKG = os.environ.get("BHF_TARGET_PACKAGE", "")
 
 
-def _is_library_exception(exc: BaseException) -> bool:
+def _is_library_exception(exc):
     if not _TARGET_PKG:
         return False
     module = type(exc).__module__ or ""
     return module == _TARGET_PKG or module.split(".", 1)[0] == _TARGET_PKG
 
 
-def _is_finding(exc: BaseException) -> bool:
+def _is_finding(exc):
     if isinstance(exc, CONTROL_EXC):
         return False
     if type(exc).__name__ in _EXPECTED:
@@ -92,7 +103,7 @@ def _is_finding(exc: BaseException) -> bool:
     return True
 
 
-def _report_finding(exc: BaseException):
+def _report_finding(exc):
     # Marker mirrors the JVM driver's `== bhf JVM finding:`; the engine's
     # `parse_python_finding` maps the exception type -> BHF rule -> CWE.
     # M22: `.format()` not an f-string, so this driver imports on Python 3.0-3.5
@@ -139,7 +150,7 @@ if _SHIM_INPUT_FILE is not None:
     atexit.register(_remove_published_input)
 
 
-def _publish_input(data: bytes):
+def _publish_input(data):
     if _SHIM_INPUT_FILE is None:
         return
     try:
@@ -147,16 +158,15 @@ def _publish_input(data: bytes):
     except OSError:
         return
     try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view) :]
+        while data:
+            data = data[os.write(fd, data) :]
     except OSError:
         pass
     finally:
         os.close(fd)
 
 
-def _run_input(run_one, data: bytes):
+def _run_input(run_one, data):
     bhf_cov.reset_prev()
     _publish_input(data)
     try:
@@ -216,7 +226,7 @@ def _arm_hang_report(run_one):
     signal.setitimer(signal.ITIMER_REAL, seconds)
 
 
-def _read_u32(fd) -> int:
+def _read_u32(fd):
     buf = b""
     while len(buf) < 4:
         chunk = os.read(fd, 4 - len(buf))
@@ -226,7 +236,7 @@ def _read_u32(fd) -> int:
     return struct.unpack("<I", buf)[0]
 
 
-def _read_exact(fd, n: int) -> bytes:
+def _read_exact(fd, n):
     buf = b""
     while len(buf) < n:
         chunk = os.read(fd, n - len(buf))
@@ -276,7 +286,7 @@ def main():
         with open(sys.argv[1], "rb") as f:
             data = f.read()
     else:
-        data = sys.stdin.buffer.read()
+        data = getattr(sys.stdin, "buffer", sys.stdin).read()
     _run_input(run_one, data)
     bhf_cov.dump_covered_lines()
 
