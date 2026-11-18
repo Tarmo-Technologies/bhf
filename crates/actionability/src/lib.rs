@@ -453,6 +453,9 @@ pub fn select_fix_location(raw: &Value, finding_json_path: Option<&str>) -> Opti
     if let Some(location) = sanitizer_stack_location(raw) {
         return Some(location);
     }
+    if let Some(location) = exception_source_location(raw) {
+        return Some(location);
+    }
     if let Some(location) = exception_message_location(raw) {
         return Some(location);
     }
@@ -2600,7 +2603,9 @@ fn sink_from(raw: &Value) -> Option<Sink> {
         // Some UBSan/runtime emitters put the only source location at the start
         // of the diagnostic message (`file:line:col: runtime error: ...`). Use it
         // when no structured stack or oracle sink was recorded.
-        return oracle_sink(raw).or_else(|| exception_message_sink(raw));
+        return oracle_sink(raw)
+            .or_else(|| exception_source_sink(raw))
+            .or_else(|| exception_message_sink(raw));
     };
     let mut fallback: Option<Sink> = None;
     for frame in frames {
@@ -2632,6 +2637,7 @@ fn sink_from(raw: &Value) -> Option<Sink> {
     }
     fallback
         .or_else(|| oracle_sink(raw))
+        .or_else(|| exception_source_sink(raw))
         .or_else(|| exception_message_sink(raw))
 }
 
@@ -2665,6 +2671,34 @@ fn message_source_location(raw: &Value) -> Option<MessageSourceLocation> {
         .filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|part| part.parse::<u64>().ok());
     Some(MessageSourceLocation { file, line, col })
+}
+
+/// The source site an emitter recorded beside the message
+/// (`exception.source_file`/`source_line`), as the COBOL attribution records
+/// the line libcob named. It goes before the message's own prefix, which
+/// names a file only when the message starts with one (#424).
+fn exception_source(raw: &Value) -> Option<(String, Option<u64>)> {
+    let file =
+        string_at(raw, &["exception", "source_file"]).filter(|file| !file.trim().is_empty())?;
+    let line = raw.pointer("/exception/source_line").and_then(|line| {
+        line.as_u64()
+            .or_else(|| line.as_str().and_then(|line| line.trim().parse().ok()))
+            .filter(|line| *line > 0)
+    });
+    Some((file, line))
+}
+
+fn exception_source_sink(raw: &Value) -> Option<Sink> {
+    let (file, line) = exception_source(raw)?;
+    let function = string_at(raw, &["target", "subprogram"])
+        .or_else(|| string_at(raw, &["target", "function"]))
+        .or_else(|| string_at(raw, &["target", "name"]))
+        .unwrap_or_default();
+    Some(Sink {
+        file: Some(file),
+        line,
+        function,
+    })
 }
 
 fn exception_message_sink(raw: &Value) -> Option<Sink> {

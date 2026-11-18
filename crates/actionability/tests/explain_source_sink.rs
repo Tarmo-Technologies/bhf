@@ -33,6 +33,33 @@ fn runtime_message_source_prefix_backfills_sink_and_fix_location() {
     assert_eq!(fix.reason, "exception_message_source");
 }
 
+/// #424: a COBOL finding's message names its site after the bug class
+/// (`... subscript at /src/parseit.cob:11: ...`), so its prefix is no file.
+/// The site the attribution records beside it is the sink.
+#[test]
+fn a_recorded_exception_source_is_the_sink_before_the_message() {
+    let raw = json!({
+        "rule_id": "BHF-210",
+        "target": { "subprogram": "PARSEIT" },
+        "exception": {
+            "name": "COBOL_RUNTIME_ERROR",
+            "message": "COBOL out-of-bounds reference-modification / subscript at /src/parseit.cob:11: offset of 'BUF' out of bounds: 200, maximum: 8",
+            "source_file": "/src/parseit.cob",
+            "source_line": 11,
+            "stack": []
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("the recorded source is the sink");
+    assert_eq!(sink.file.as_deref(), Some("/src/parseit.cob"));
+    assert_eq!(sink.line, Some(11));
+    assert_eq!(sink.function, "PARSEIT");
+    let fix = record.fix_location.expect("fix location");
+    assert_eq!(fix.path, "/src/parseit.cob");
+    assert_eq!(fix.line, Some(11));
+    assert_eq!(fix.reason, "exception_source");
+}
+
 #[test]
 fn sink_skips_rust_stdlib_frame_and_resolves_in_project_frame() {
     // #32: a Rust-lane crash's top frame is the toolchain stdlib

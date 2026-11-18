@@ -70,6 +70,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A COBOL finding is placed at the COBOL line libcob named (#424). Its
+  location's file was the attributed message up to that line, as the
+  report took the site from the message's prefix; the attribution now
+  records it as the exception's source, which comes first.
 - An Ada record parameter whose components are not integers builds (#418).
   An `out` record is declared without an initializer, an `in` record's
   constrained String and enumeration components are decoded as their own
