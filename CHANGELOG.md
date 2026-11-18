@@ -2839,6 +2839,11 @@
   when bhf panics.
 
 ### Added
+- The coverage report lists the comparisons each corpus reached and never
+  passed (#309): `results/coverage/<id>/blockers.{txt,json}` give the file,
+  line and function of each compare whose branch ran one way only, with the
+  operand it wants and values it got instead, from the harness's comparison
+  log placed by `llvm-symbolizer`. The sweep prints how many there are.
 - `bhf auto` writes each C/C++ harness's coverage report to
   `results/coverage/<id>/` (#308): `lcov.info`, llvm-cov's HTML report under
   `html/`, and a per-function table (`functions.txt` from

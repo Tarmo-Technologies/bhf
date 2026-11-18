@@ -468,9 +468,18 @@ The same replay writes each harness's coverage report to
   covered), and `functions.json`, each function's file, line, calls over the
   corpus, and its instrumented and covered lines.
 
+- `blockers.txt` and `blockers.json` — the comparisons the corpus reached and
+  never passed: a line whose branch llvm-cov saw run one way and never the
+  other, where the harness recorded a comparison (an integer compare against a
+  constant, a `memcmp`, a `strcmp`). Each names the file, line and function,
+  the operand the branch wants (hex; little-endian for an integer) and some of
+  the values it got instead. These are the places a dictionary entry, a seed
+  or a harness change would take the campaign further; the sweep says how
+  many there are.
+
 A function the table shows with no calls is one the campaign never reached.
 The report needs `llvm-cov` and `llvm-profdata` (or their `-18` names), as the
-replay does; a part llvm-cov cannot render is left out, and
+replay does, and the blockers `llvm-symbolizer` to place each comparison; a part llvm-cov cannot render is left out, and
 `harnesses/<id>/coverage-replay-diagnostic.txt` says why.
 
 ## Running a harness under another fuzzer

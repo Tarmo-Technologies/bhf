@@ -3376,6 +3376,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // variant of each C/C++ harness and replay the corpus to learn which lines the
     // campaign executed (the interpreted lanes get this from their tracers directly).
     let coverage = crate::auto::coverage_replay::run_coverage_replay(&work, Some(&path));
+    if coverage.blockers > 0 {
+        bhfeprintln!(
+            "bhf auto: {} comparison(s) reached but never passed \
+             (results/coverage/<id>/blockers.txt)",
+            coverage.blockers
+        );
+    }
     if coverage.harnesses > 0 {
         // Report the fraction, not a bare popcount: "589 lines" is
         // uninterpretable without knowing whether the target has 2,000 or
