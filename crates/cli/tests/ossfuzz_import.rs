@@ -247,6 +247,124 @@ fn the_fixture_build_sh_leaves_its_fuzzers_in_out() {
     assert_eq!(saved, record);
 }
 
+/// Each fuzzer the fixture builds is registered as a harness of the work
+/// dir, and listed; `bhf fuzz --harness <name>` runs the registered
+/// `parse_record_fuzzer` with coverage and finds its planted heap overflow;
+/// and the import's manifest names both for `bhf project run`.
+#[test]
+fn the_imported_fuzzers_are_registered_and_bhf_fuzz_finds_the_planted_bug() {
+    if !have_clang() {
+        eprintln!("skipping: clang not available");
+        return;
+    }
+    let root = TestDir::new("ossfuzz-register");
+    let project = root.join("ossfuzz_project");
+    copy_tree(&fixture(), &project);
+    let work = root.join("work");
+    let out = import(&project, &work, &sandbox_flags());
+    assert_ok(&out);
+    let work = work.canonicalize().unwrap();
+    let listing = text(&out.stdout);
+    assert!(
+        listing.contains("build.sh produced 2 fuzzer(s), registered as harnesses of"),
+        "{listing}"
+    );
+    for name in ["checksum_fuzzer", "parse_record_fuzzer"] {
+        let harness = work.join("build").join(name).join("main");
+        assert!(
+            listing.contains(&format!("{}  [bhf driver]", harness.display())),
+            "{name} not listed:\n{listing}"
+        );
+        let declared: serde_json::Value = serde_json::from_slice(
+            &fs::read(work.join("build").join(name).join("harness-protocol.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(declared["input_mode"], "framed");
+    }
+    assert!(!work.join("build/record_tool").exists());
+    assert!(
+        listing.contains(&format!(
+            "bhf fuzz {} --harness checksum_fuzzer",
+            work.display()
+        )),
+        "{listing}"
+    );
+
+    // The manifest bhf project run takes, checked by bhf itself.
+    let manifest = work.join("ossfuzz/bhf.project.toml");
+    let list = bhf()
+        .args(["project", "list", "--json", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", text(&list.stderr));
+    let listed: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let targets: Vec<(&str, &str)> = listed["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| (t["id"].as_str().unwrap(), t["engine"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            ("checksum_fuzzer", "builtin"),
+            ("parse_record_fuzzer", "builtin")
+        ]
+    );
+    let validate = bhf()
+        .args(["project", "validate", "--manifest"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(validate.status.success(), "{}", text(&validate.stderr));
+
+    // A well-formed record, one length-byte change from the overflow.
+    let seed = root.join("record.bin");
+    let mut record = b"REC1\x10".to_vec();
+    record.extend_from_slice(&[b'A'; 20]);
+    fs::write(&seed, &record).unwrap();
+    let _serial = support::fuzz_serial_guard();
+    let fuzz = bhf()
+        .arg("fuzz")
+        .arg(&work)
+        .args([
+            "--harness",
+            "parse_record_fuzzer",
+            "--time",
+            "15s",
+            "--seed-file",
+        ])
+        .arg(&seed)
+        .output()
+        .unwrap();
+    assert!(fuzz.status.success(), "{}", text(&fuzz.stderr));
+    let summary: serde_json::Value = serde_json::from_slice(
+        &fs::read(work.join("fuzz_runs/parse_record_fuzzer-latest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["execution"]["harness_protocol"], "bhf_framed");
+    assert_eq!(summary["coverage"]["source"], "sancov-trace-pc-guard");
+    assert!(
+        summary["coverage"]["edges"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
+    let findings: Vec<PathBuf> = fs::read_dir(work.join("results/findings"))
+        .expect("a finding")
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(!findings.is_empty(), "no finding: {}", text(&fuzz.stderr));
+    let found = findings.iter().any(|dir| {
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        let log = fs::read_to_string(dir.join("sanitizer.log")).unwrap_or_default();
+        finding["harness_id"] == "parse_record_fuzzer"
+            && log.contains("heap-buffer-overflow")
+            && log.contains("record_parse")
+    });
+    assert!(found, "the planted overflow was not found: {findings:?}");
+}
+
 /// build.sh runs from `$SRC/<name>` with the OSS-Fuzz variables, `$CC`/
 /// `$CXX` being clang and `$LIB_FUZZING_ENGINE` bhf's driver archive, and
 /// with nothing else of bhf's environment.

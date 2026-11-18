@@ -34,6 +34,16 @@
 //! finds them: a regular, executable file named `[A-Za-z0-9_-]+` (with no
 //! extension or `.exe`), not `jazzer_driver*`, whose name ends in `_fuzzer`
 //! or whose bytes contain `LLVMFuzzerTestOneInput`.
+//!
+//! Each fuzzer is then registered as a harness of the work dir, under its
+//! name: staged at `<work>/build/<name>/main`, where `bhf fuzz <work>
+//! --harness <name>` finds it, with the framed input mode declared beside a
+//! fuzzer linked with bhf's driver. Every fuzzer is also a target of a
+//! `bhf.project.v1` manifest, `<work>/ossfuzz/bhf.project.toml`, for
+//! `bhf project run`: `engine = "builtin"` for one linked with bhf's driver,
+//! and `engine = "binary"` with `input-mode = "file"` for a libFuzzer binary
+//! the build linked without it (`-fsanitize=fuzzer` in place of
+//! `$LIB_FUZZING_ENGINE`), which runs one input file per process.
 
 use std::ffi::OsString;
 use std::fs;
@@ -49,6 +59,9 @@ use crate::runner::SandboxModeArg;
 
 /// The import record written to `<work>/ossfuzz/import.json`.
 const IMPORT_SCHEMA: &str = "bhf.ossfuzz-import.v1";
+
+/// The `bhf.project.v1` manifest the import writes in `<work>/ossfuzz/`.
+const MANIFEST_FILE: &str = "bhf.project.toml";
 
 /// What OSS-Fuzz's fuzzer search looks for in a binary.
 const FUZZ_TARGET_MARKER: &[u8] = b"LLVMFuzzerTestOneInput";
@@ -146,10 +159,11 @@ impl Layout {
         // A private temporary directory in `$WORK`: TMPDIR points here, so
         // the compilers' scratch files never need a writable /tmp.
         fs::create_dir_all(self.work.join("tmp")).context("create $WORK/tmp")?;
-        // The record of the import this one replaces.
-        let record = self.root.join("import.json");
-        if record.exists() {
-            fs::remove_file(&record).with_context(|| format!("remove '{}'", record.display()))?;
+        // The record and manifest of the import this one replaces.
+        for stale in [self.root.join("import.json"), self.root.join(MANIFEST_FILE)] {
+            if stale.exists() {
+                fs::remove_file(&stale).with_context(|| format!("remove '{}'", stale.display()))?;
+            }
         }
         Ok(())
     }
@@ -208,6 +222,44 @@ struct Fuzzer {
     name: String,
     path: PathBuf,
     protocol: HarnessProtocol,
+}
+
+/// How bhf runs an imported fuzzer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Linked with bhf's driver: the builtin engine drives it through the
+    /// framed protocol, with coverage.
+    Builtin,
+    /// Anything else, such as a libFuzzer binary without bhf's driver: the
+    /// binary lane runs it on one input file per process.
+    BinaryFile,
+}
+
+impl Lane {
+    fn of(fuzzer: &Fuzzer) -> Self {
+        if fuzzer.protocol == HarnessProtocol::BhfFramed
+            && !protocol_detect::libfuzzer_without_bhf_driver(&fuzzer.path)
+        {
+            Self::Builtin
+        } else {
+            Self::BinaryFile
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "bhf driver",
+            Self::BinaryFile => "no bhf driver: one input file per process",
+        }
+    }
+}
+
+/// A fuzzer registered as a harness of the work dir.
+struct Registered<'a> {
+    fuzzer: &'a Fuzzer,
+    lane: Lane,
+    /// `<work>/build/<name>/main`.
+    harness: PathBuf,
 }
 
 /// Run `bhf project import-ossfuzz`.
@@ -294,6 +346,12 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
         );
     }
 
+    let registered = fuzzers
+        .iter()
+        .map(|fuzzer| register(&work_dir, fuzzer))
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = write_manifest(&layout, &name, &registered)?;
+
     let record = json!({
         "schema": IMPORT_SCHEMA,
         "project": name,
@@ -305,10 +363,16 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
         "work": layout.work,
         "out": layout.out,
         "build_log": log,
-        "fuzzers": fuzzers.iter().map(|fuzzer| json!({
-            "name": fuzzer.name,
-            "binary": fuzzer.path,
-            "protocol": fuzzer.protocol.label(),
+        "manifest": manifest,
+        "fuzzers": registered.iter().map(|entry| json!({
+            "name": entry.fuzzer.name,
+            "binary": entry.fuzzer.path,
+            "protocol": entry.fuzzer.protocol.label(),
+            "harness": entry.harness,
+            "engine": match entry.lane {
+                Lane::Builtin => "builtin",
+                Lane::BinaryFile => "binary",
+            },
         })).collect::<Vec<_>>(),
     });
     let record_text = serde_json::to_string_pretty(&record)?;
@@ -317,15 +381,164 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
     if args.json {
         println!("{record_text}");
     } else {
+        print_listing(&name, &work_dir, &manifest, &registered);
+    }
+    Ok(())
+}
+
+/// The registered fuzzers, and how to run them.
+fn print_listing(name: &str, work_dir: &Path, manifest: &Path, registered: &[Registered]) {
+    println!(
+        "project '{name}': build.sh produced {} fuzzer(s), registered as harnesses of {}:",
+        registered.len(),
+        work_dir.display()
+    );
+    let width = registered
+        .iter()
+        .map(|entry| entry.fuzzer.name.len())
+        .max()
+        .unwrap_or(0);
+    for entry in registered {
         println!(
-            "project '{name}': build.sh produced {} fuzzer(s) in {}:",
-            fuzzers.len(),
-            layout.out.display()
+            "  {:width$}  {}  [{}]",
+            entry.fuzzer.name,
+            entry.harness.display(),
+            entry.lane.label()
         );
-        for fuzzer in &fuzzers {
-            println!("  {} [{}]", fuzzer.name, fuzzer.protocol.label());
+    }
+    let first = &registered[0].fuzzer.name;
+    println!("fuzz one with:");
+    if let Some(entry) = registered.iter().find(|entry| entry.lane == Lane::Builtin) {
+        println!(
+            "  bhf fuzz {} --harness {} --time 60s",
+            work_dir.display(),
+            entry.fuzzer.name
+        );
+    }
+    println!(
+        "  bhf project run --manifest {} --target {first} --work-dir {}",
+        manifest.display(),
+        work_dir.display()
+    );
+}
+
+/// Stage `fuzzer` as the harness `<work>/build/<name>/main`, declaring the
+/// framed input mode beside one linked with bhf's driver.
+fn register<'a>(work_dir: &Path, fuzzer: &'a Fuzzer) -> Result<Registered<'a>> {
+    let lane = Lane::of(fuzzer);
+    let dir = work_dir.join("build").join(&fuzzer.name);
+    fs::create_dir_all(&dir).with_context(|| format!("create '{}'", dir.display()))?;
+    let harness = dir.join("main");
+    fs::copy(&fuzzer.path, &harness).with_context(|| {
+        format!(
+            "register '{}' as '{}'",
+            fuzzer.path.display(),
+            harness.display()
+        )
+    })?;
+    make_executable(&harness)?;
+    let sidecar = dir.join(protocol_detect::PROTOCOL_SIDECAR);
+    match lane {
+        Lane::Builtin => protocol_detect::write_declared_input_mode(
+            &dir,
+            "framed",
+            "OSS-Fuzz build.sh linked with bhf's driver (bhf project import-ossfuzz)",
+        )
+        .context("record the fuzzer's input mode")?,
+        // A fuzzer that lost bhf's driver since an earlier import must not
+        // keep that import's declaration.
+        Lane::BinaryFile => {
+            if sidecar.exists() {
+                fs::remove_file(&sidecar)
+                    .with_context(|| format!("remove '{}'", sidecar.display()))?;
+            }
         }
     }
+    Ok(Registered {
+        fuzzer,
+        lane,
+        harness,
+    })
+}
+
+/// Write `<work>/ossfuzz/bhf.project.toml`, one target per fuzzer, and check
+/// that it loads and validates as `bhf project run` will load it.
+fn write_manifest(layout: &Layout, name: &str, registered: &[Registered]) -> Result<PathBuf> {
+    #[derive(serde::Serialize)]
+    struct Doc<'a> {
+        schema: &'a str,
+        project: ProjectDoc<'a>,
+        target: Vec<TargetDoc>,
+    }
+    #[derive(serde::Serialize)]
+    struct ProjectDoc<'a> {
+        id: &'a str,
+        version: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct TargetDoc {
+        id: String,
+        engine: &'static str,
+        binary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_mode: Option<&'static str>,
+    }
+
+    let mut targets = Vec::with_capacity(registered.len());
+    for entry in registered {
+        let relative = entry
+            .fuzzer
+            .path
+            .strip_prefix(&layout.root)
+            .with_context(|| format!("'{}' is outside $OUT", entry.fuzzer.path.display()))?;
+        let binary = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let (engine, input_mode) = match entry.lane {
+            Lane::Builtin => ("builtin", None),
+            Lane::BinaryFile => ("binary", Some("file")),
+        };
+        targets.push(TargetDoc {
+            id: entry.fuzzer.name.clone(),
+            engine,
+            binary,
+            input_mode,
+        });
+    }
+    let doc = Doc {
+        schema: project_profile::SCHEMA_V1,
+        project: ProjectDoc {
+            id: name,
+            version: "0",
+        },
+        target: targets,
+    };
+    let text = format!(
+        "# Written by `bhf project import-ossfuzz`: one target per fuzzer the\n\
+         # project's OSS-Fuzz build.sh left in out/. Importing again rewrites it.\n\
+         {}",
+        toml::to_string(&doc).context("serialize the import's manifest")?
+    );
+    let manifest = project_profile::load(&text).context("the import's manifest")?;
+    project_profile::validate(&manifest, env!("CARGO_PKG_VERSION"))
+        .context("the import's manifest")?;
+    let path = layout.root.join(MANIFEST_FILE);
+    fs::write(&path, text).with_context(|| format!("write '{}'", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("set +x on '{}'", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -912,6 +1125,125 @@ mod tests {
             .map(|fuzzer| fuzzer.name)
             .collect();
         assert_eq!(names, ["decode", "inner_fuzzer", "parse_fuzzer"]);
+    }
+
+    /// An `$OUT` with a fuzzer linked with bhf's driver and a libFuzzer one
+    /// linked without it.
+    #[cfg(unix)]
+    fn out_with_two_fuzzers(work: &Path) -> (Layout, Vec<Fuzzer>) {
+        let layout = Layout::new(work);
+        fs::create_dir_all(layout.out.join("sub")).unwrap();
+        let mut driver = b"\x7fELF\0BHF_FRAMED\0LLVMFuzzerTestOneInput\0".to_vec();
+        driver.resize(9000, 0);
+        write_executable(&layout.out.join("decode_fuzzer"), &driver);
+        let mut libfuzzer = b"\x7fELF\0LLVMFuzzerTestOneInput\0".to_vec();
+        libfuzzer.extend_from_slice(b"INFO: libFuzzer ignores flags that start with '--'\0");
+        libfuzzer.resize(9000, 0);
+        write_executable(&layout.out.join("sub/legacy_fuzzer"), &libfuzzer);
+        let fuzzers = collect_fuzzers(&layout.out).unwrap();
+        (layout, fuzzers)
+    }
+
+    /// A fuzzer linked with bhf's driver is staged where `bhf fuzz --harness
+    /// <name>` finds it, with the framed input mode declared; a libFuzzer
+    /// binary without the driver is staged with no declaration (and loses
+    /// one an earlier import left), so it runs one input file per process.
+    #[cfg(unix)]
+    #[test]
+    fn each_fuzzer_is_registered_where_bhf_fuzz_finds_it() {
+        let work = TestDir::new("ossfuzz-register");
+        let (_layout, fuzzers) = out_with_two_fuzzers(&work);
+        let stale = work.join("build/legacy_fuzzer");
+        fs::create_dir_all(&stale).unwrap();
+        protocol_detect::write_declared_input_mode(&stale, "framed", "earlier import").unwrap();
+
+        let registered: Vec<Registered> = fuzzers
+            .iter()
+            .map(|fuzzer| register(&work, fuzzer).unwrap())
+            .collect();
+        let lanes: Vec<(&str, Lane)> = registered
+            .iter()
+            .map(|entry| (entry.fuzzer.name.as_str(), entry.lane))
+            .collect();
+        assert_eq!(
+            lanes,
+            [
+                ("decode_fuzzer", Lane::Builtin),
+                ("legacy_fuzzer", Lane::BinaryFile)
+            ]
+        );
+        for entry in &registered {
+            let found = crate::fuzz::find_harness_executable(
+                &work,
+                &entry.fuzzer.name,
+                crate::fuzz::FuzzEngine::Builtin,
+            )
+            .unwrap();
+            assert_eq!(found, entry.harness);
+            assert_eq!(
+                fs::read(&found).unwrap(),
+                fs::read(&entry.fuzzer.path).unwrap()
+            );
+            assert!(is_executable(&found));
+        }
+        let decode = protocol_detect::detect(&registered[0].harness, &[&work]);
+        assert_eq!(decode.protocol, HarnessProtocol::BhfFramed);
+        assert!(matches!(
+            decode.basis,
+            protocol_detect::ProtocolBasis::Declared(ref mode) if mode == "framed"
+        ));
+        assert!(!stale.join(protocol_detect::PROTOCOL_SIDECAR).exists());
+        assert_eq!(
+            protocol_detect::detect(&registered[1].harness, &[&work]).protocol,
+            HarnessProtocol::LibFuzzerSingleInput
+        );
+    }
+
+    /// The manifest has a builtin target for the fuzzer with bhf's driver and
+    /// a binary, file-input one for the libFuzzer binary, each naming its
+    /// binary in `$OUT` relative to the manifest, and loads and validates.
+    #[cfg(unix)]
+    #[test]
+    fn the_manifest_has_one_target_per_fuzzer() {
+        let work = TestDir::new("ossfuzz-manifest");
+        let (layout, fuzzers) = out_with_two_fuzzers(&work);
+        let registered: Vec<Registered> = fuzzers
+            .iter()
+            .map(|fuzzer| register(&work, fuzzer).unwrap())
+            .collect();
+        let path = write_manifest(&layout, "libdemo", &registered).unwrap();
+        assert_eq!(path, layout.root.join(MANIFEST_FILE));
+        let manifest = project_profile::load(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(manifest.project.id, "libdemo");
+        let targets: Vec<(&str, &str, Option<&str>, PathBuf)> = manifest
+            .targets
+            .iter()
+            .map(|target| {
+                (
+                    target.id.as_str(),
+                    target.engine.as_str(),
+                    target.input_mode.as_deref(),
+                    layout.root.join(target.binary.as_ref().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                (
+                    "decode_fuzzer",
+                    "builtin",
+                    None,
+                    layout.out.join("decode_fuzzer")
+                ),
+                (
+                    "legacy_fuzzer",
+                    "binary",
+                    Some("file"),
+                    layout.out.join("sub/legacy_fuzzer")
+                ),
+            ]
+        );
     }
 
     #[test]

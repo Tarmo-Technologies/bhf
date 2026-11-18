@@ -330,11 +330,16 @@ set to bhf's driver, so every fuzz target it links is a bhf harness, with no
 
 ```sh
 bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+bhf fuzz bhf_work --harness parse_record_fuzzer --time 60s
 ```
 
 `build.sh` runs in bubblewrap or firejail, without network and with writes
 confined to `$SRC`, `$WORK` and `$OUT`, and the import refuses to run it when
-neither works (`--sandbox none` runs it directly). The variables it gets and
+neither works (`--sandbox none` runs it directly). Each fuzzer it builds is
+registered under its own name at `bhf_work/build/<name>/main`, so
+`bhf fuzz`, `bhf replay` and `bhf minimize` take it like a harness you built,
+and as a target of `bhf_work/ossfuzz/bhf.project.toml` for
+`bhf project run`; the import lists them. The variables `build.sh` gets and
 the sandbox are described in the
 [CLI reference](cli.md#importing-an-oss-fuzz-build).
 

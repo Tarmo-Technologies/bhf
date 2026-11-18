@@ -69,7 +69,7 @@ pub enum ProjectCommand {
     List(ListArgs),
     /// Materialize an isolated work directory from a target, resolve+hash its assets, write provenance, and run its campaign on the configured engine (builtin/afl++ or binary)
     Run(RunArgs),
-    /// Run a project's OSS-Fuzz build.sh in a sandbox (no network, writes only to $SRC, $WORK and $OUT) with the OSS-Fuzz build variables ($CC, $CXX, $CFLAGS, $CXXFLAGS, $LIB_FUZZING_ENGINE, $SRC, $WORK, $OUT), $LIB_FUZZING_ENGINE being bhf's own driver, and collect the fuzzers it leaves in $OUT
+    /// Run a project's OSS-Fuzz build.sh in a sandbox (no network, writes only to $SRC, $WORK and $OUT) with the OSS-Fuzz build variables ($CC, $CXX, $CFLAGS, $CXXFLAGS, $LIB_FUZZING_ENGINE, $SRC, $WORK, $OUT), $LIB_FUZZING_ENGINE being bhf's own driver, and register each fuzzer it leaves in $OUT as a harness of the work dir (`bhf fuzz <work> --harness <name>`) and a target of <work>/ossfuzz/bhf.project.toml (`bhf project run`)
     ImportOssfuzz(crate::ossfuzz_import::ImportArgs),
 }
 

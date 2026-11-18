@@ -2292,6 +2292,26 @@ output in `<work>/ossfuzz/build.log`. A failing `build.sh` fails the import
 with the end of that log. A target linked with `-fsanitize=fuzzer` instead
 of `$LIB_FUZZING_ENGINE` is listed as a `libFuzzer single input` binary.
 
+**Harnesses.** Each fuzzer is registered as a harness of the work dir under
+its own name: copied to `<work>/build/<name>/main`, where `bhf fuzz`,
+`bhf replay` and `bhf minimize` find it, with a `harness-protocol.json`
+declaring the framed input mode beside one linked with bhf's driver. The
+listing names each one and the commands that fuzz it:
+
+```sh
+bhf fuzz bhf_work --harness parse_record_fuzzer --time 60s
+bhf project run --manifest bhf_work/ossfuzz/bhf.project.toml \
+  --target parse_record_fuzzer --work-dir bhf_work
+```
+
+The import also writes a `bhf.project.v1` manifest,
+`<work>/ossfuzz/bhf.project.toml`, with one target per fuzzer: `engine =
+"builtin"` for a fuzzer linked with bhf's driver, which the builtin engine
+drives through the framed protocol with coverage, and `engine = "binary"`
+with `input-mode = "file"` for a libFuzzer binary linked without it, which
+runs one input file per process. Importing again rewrites the manifest and
+the registered binaries.
+
 ## Out-of-Process Extensions
 
 `bhf extension` drives an explicitly-trusted, **out-of-process** extension that

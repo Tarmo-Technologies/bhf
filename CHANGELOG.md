@@ -2892,6 +2892,15 @@
   byte mutation alone breaks. Seeds are repaired the same way and the
   message's own frame is a seed. Before, only the session lane used the frame
   fix-ups.
+- The fuzzers `bhf project import-ossfuzz` builds are registered as
+  harnesses of the work dir (#377): each is staged at
+  `<work>/build/<name>/main`, where `bhf fuzz --harness <name>`, replay and
+  minimize find it, with the framed input mode declared beside one linked
+  with bhf's driver, and is a target of the `bhf.project.v1` manifest the
+  import writes to `<work>/ossfuzz/bhf.project.toml` for `bhf project run`
+  (`engine = "builtin"`, or `engine = "binary"` with `input-mode = "file"`
+  for a libFuzzer binary linked without bhf's driver). The import lists them
+  with the commands that fuzz them.
 - `bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
   ClusterFuzzLite integration (#334). It runs the project's `build.sh` as
   OSS-Fuzz does, `bash -eux $SRC/build.sh` from `$SRC/<name>`, with the
