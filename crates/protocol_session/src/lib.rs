@@ -32,7 +32,7 @@ pub mod runner;
 pub mod testcase;
 
 pub use binding::{Bindings, BoundValue};
-pub use framing::{Framing, FramingError, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
+pub use framing::{Framing, FramingError, LengthWidth, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
 pub use model::{
     CaptureSpec, CompiledCapture, CompiledField, CompiledMessage, ComputedSpec, DataSpec,
     EncodeError, FieldRole, FieldValue, ModelError, ProtocolModel, RefEncoding,

@@ -11,14 +11,24 @@
 //!
 //! ```toml
 //! [framing]
-//! kind = "length_prefix"   # raw (the default) | length_prefix | delimiter | fixed
-//! width = 2                # length_prefix: 1, 2 or 4 bytes
-//! endian = "big"           # length_prefix: big or little
+//! kind = "length_prefix"   # raw (the default) | length_prefix | length_field
+//!                          # | delimiter | fixed
+//! width = 2                # length_prefix: 1, 2 or 4 bytes; length_field:
+//!                          # those or "varint"
+//! endian = "big"           # length_prefix, length_field: big or little
 //! includes_prefix = false  # length_prefix: whether the length counts itself
+//! # offset = 4             # length_field: where in the message its length is
 //! # delimiter = "\r\n"     # delimiter: what ends each message
 //! # size = 16              # fixed: every message's size
 //! # reply_idle_ms = 50     # raw: how long a reply may go quiet and be complete
 //! ```
+//!
+//! A `length_field` protocol carries each message's length in its own header,
+//! as Modbus/TCP's MBAP header (a big-endian u16 at byte 4) and MQTT's fixed
+//! header (a variable byte integer at byte 1) do: the profile computes the
+//! field like any other `length(..)`, the transport writes the request as it
+//! is, and a reply is the whole message, header included, so captures index
+//! it from its first byte.
 //!
 //! This module owns no socket: a transport feeds the bytes it has read to
 //! [`Framing::take_reply`] until a reply is complete.
@@ -44,6 +54,14 @@ pub enum Framing {
         /// Whether the length counts the prefix as well as the message.
         includes_prefix: bool,
     },
+    /// Each message carries its length in a field at byte `offset` of its
+    /// own header, counting the bytes after the field. A request is written
+    /// as it is, and a reply is the whole message.
+    LengthField {
+        offset: usize,
+        width: LengthWidth,
+        endian: ByteOrder,
+    },
     /// Each message ends with `delimiter`, which is not part of the message.
     Delimiter { delimiter: Vec<u8> },
     /// Every message is `size` bytes: a shorter request is padded with zeros
@@ -58,6 +76,20 @@ impl Default for Framing {
         }
     }
 }
+
+/// How a [`Framing::LengthField`] length is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthWidth {
+    /// An unsigned integer of 1, 2 or 4 bytes, in the framing's byte order.
+    Bytes(u8),
+    /// A variable byte integer, as MQTT's Remaining Length is: 7 bits a byte,
+    /// least significant first, the high bit set on every byte but the last,
+    /// at most 4 bytes.
+    Varint,
+}
+
+/// The most bytes a [`LengthWidth::Varint`] length takes.
+const VARINT_MAX_BYTES: usize = 4;
 
 /// Where reading a reply has got to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +114,8 @@ impl Framing {
     /// The request as it goes on the wire.
     pub fn encode(&self, message: &[u8]) -> Result<Vec<u8>, FramingError> {
         match self {
-            Framing::Raw { .. } => Ok(message.to_vec()),
+            // A length field is the message's own, which the profile computes.
+            Framing::Raw { .. } | Framing::LengthField { .. } => Ok(message.to_vec()),
             Framing::LengthPrefix {
                 width,
                 endian,
@@ -174,6 +207,31 @@ impl Framing {
                     None => ReplyProgress::NeedMore,
                 }
             }
+            Framing::LengthField {
+                offset,
+                width,
+                endian,
+            } => {
+                let (declared, field_len) =
+                    match read_length_field(buffered, *offset, *width, *endian) {
+                        Ok(Some(length)) => length,
+                        Ok(None) => return ReplyProgress::NeedMore,
+                        Err(reason) => return ReplyProgress::Invalid(reason),
+                    };
+                if declared > max as u64 {
+                    return ReplyProgress::Invalid(format!(
+                        "reply length {declared} exceeds the {max}-byte cap"
+                    ));
+                }
+                let end = (offset + field_len).saturating_add(declared as usize);
+                match buffered.get(..end) {
+                    Some(reply) => ReplyProgress::Complete {
+                        reply: reply.to_vec(),
+                        consumed: end,
+                    },
+                    None => ReplyProgress::NeedMore,
+                }
+            }
             Framing::Delimiter { delimiter } => {
                 match buffered
                     .windows(delimiter.len())
@@ -247,6 +305,23 @@ impl Framing {
                     ""
                 }
             ),
+            Framing::LengthField {
+                offset,
+                width: LengthWidth::Varint,
+                ..
+            } => format!("length_field(varint at {offset})"),
+            Framing::LengthField {
+                offset,
+                width: LengthWidth::Bytes(width),
+                endian,
+            } => format!(
+                "length_field(u{} {} at {offset})",
+                u32::from(*width) * 8,
+                match endian {
+                    ByteOrder::Big => "big",
+                    ByteOrder::Little => "little",
+                }
+            ),
             Framing::Delimiter { delimiter } => format!(
                 "delimiter({})",
                 delimiter
@@ -259,6 +334,53 @@ impl Framing {
     }
 }
 
+/// The length a [`Framing::LengthField`] declares at `offset`, and how many
+/// bytes the field takes: `Ok(None)` until the field is all there.
+fn read_length_field(
+    buffered: &[u8],
+    offset: usize,
+    width: LengthWidth,
+    endian: ByteOrder,
+) -> Result<Option<(u64, usize)>, String> {
+    match width {
+        LengthWidth::Bytes(width) => {
+            let width = usize::from(width);
+            let Some(field) = buffered.get(offset..offset + width) else {
+                return Ok(None);
+            };
+            let mut bytes = field.to_vec();
+            if endian == ByteOrder::Little {
+                bytes.reverse();
+            }
+            let length = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            Ok(Some((length, width)))
+        }
+        LengthWidth::Varint => {
+            let mut length = 0u64;
+            for i in 0..VARINT_MAX_BYTES {
+                let Some(&byte) = buffered.get(offset + i) else {
+                    return Ok(None);
+                };
+                length |= u64::from(byte & 0x7f) << (7 * i);
+                if byte & 0x80 == 0 {
+                    return Ok(Some((length, i + 1)));
+                }
+            }
+            Err(format!(
+                "the variable byte integer at byte {offset} runs past {VARINT_MAX_BYTES} bytes"
+            ))
+        }
+    }
+}
+
+/// A `width` as written: a byte count, or `"varint"`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum WidthDef {
+    Bytes(u8),
+    Named(String),
+}
+
 /// The `[framing]` table as written.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,7 +388,9 @@ pub(crate) struct FramingDef {
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
-    width: Option<u8>,
+    width: Option<WidthDef>,
+    #[serde(default)]
+    offset: Option<usize>,
     #[serde(default)]
     endian: Option<ByteOrder>,
     #[serde(default)]
@@ -293,6 +417,7 @@ impl FramingDef {
             ("width", self.width.is_some()),
             ("endian", self.endian.is_some()),
             ("includes_prefix", self.includes_prefix.is_some()),
+            ("offset", self.offset.is_some()),
         ];
         let framing = match kind {
             "raw" => {
@@ -309,17 +434,35 @@ impl FramingDef {
             }
             "length_prefix" => {
                 unused(&[
+                    ("offset", self.offset.is_some()),
                     ("delimiter", self.delimiter.is_some()),
                     ("size", self.size.is_some()),
                 ])?;
-                let width = self.width.unwrap_or(2);
-                if !matches!(width, 1 | 2 | 4) {
-                    return Err(format!("`width` is {width}; expected 1, 2 or 4"));
-                }
                 Framing::LengthPrefix {
-                    width,
+                    width: self.byte_width("1, 2 or 4")?,
                     endian: self.endian.unwrap_or(ByteOrder::Big),
                     includes_prefix: self.includes_prefix.unwrap_or(false),
+                }
+            }
+            "length_field" => {
+                unused(&[
+                    ("includes_prefix", self.includes_prefix.is_some()),
+                    ("delimiter", self.delimiter.is_some()),
+                    ("size", self.size.is_some()),
+                ])?;
+                let width = match &self.width {
+                    Some(WidthDef::Named(name)) if name == "varint" => {
+                        if self.endian.is_some() {
+                            return Err("`endian` does not apply to a varint length".to_owned());
+                        }
+                        LengthWidth::Varint
+                    }
+                    _ => LengthWidth::Bytes(self.byte_width("1, 2, 4 or \"varint\"")?),
+                };
+                Framing::LengthField {
+                    offset: self.offset.unwrap_or(0),
+                    width,
+                    endian: self.endian.unwrap_or(ByteOrder::Big),
                 }
             }
             "delimiter" => {
@@ -347,8 +490,8 @@ impl FramingDef {
             }
             other => {
                 return Err(format!(
-                    "unknown framing kind {other:?}; expected raw, length_prefix, delimiter \
-                     or fixed"
+                    "unknown framing kind {other:?}; expected raw, length_prefix, length_field, \
+                     delimiter or fixed"
                 ))
             }
         };
@@ -356,6 +499,17 @@ impl FramingDef {
             return Err(format!("`reply_idle_ms` does not apply to {kind} framing"));
         }
         Ok(framing)
+    }
+
+    /// The `width` as a byte count, 2 when the table gives none; `expected`
+    /// names the widths the framing takes.
+    fn byte_width(&self, expected: &str) -> Result<u8, String> {
+        match &self.width {
+            None => Ok(2),
+            Some(WidthDef::Bytes(width @ (1 | 2 | 4))) => Ok(*width),
+            Some(WidthDef::Bytes(width)) => Err(format!("`width` is {width}; expected {expected}")),
+            Some(WidthDef::Named(name)) => Err(format!("`width` is {name:?}; expected {expected}")),
+        }
     }
 }
 
@@ -440,6 +594,93 @@ mod tests {
     }
 
     #[test]
+    fn a_length_field_in_the_message_header_ends_the_reply_and_stays_in_it() {
+        // Modbus/TCP: the MBAP length, a big-endian u16 at byte 4, counts the
+        // unit id and the PDU after it.
+        let mbap = resolve("kind = \"length_field\"\noffset = 4").unwrap();
+        assert_eq!(mbap.label(), "length_field(u16 big at 4)");
+        let request = [0, 1, 0, 0, 0, 6, 1, 3, 0, 0, 0, 1];
+        assert_eq!(
+            mbap.encode(&request).unwrap(),
+            request,
+            "the request carries its own length"
+        );
+        let reply = [0, 1, 0, 0, 0, 5, 1, 3, 2, 0xbe, 0xef];
+        assert_eq!(mbap.take_reply(&reply[..5], 64), ReplyProgress::NeedMore);
+        assert_eq!(mbap.take_reply(&reply[..10], 64), ReplyProgress::NeedMore);
+        let mut two = reply.to_vec();
+        two.extend_from_slice(&reply);
+        assert_eq!(
+            mbap.take_reply(&two, 64),
+            ReplyProgress::Complete {
+                reply: reply.to_vec(),
+                consumed: 11
+            }
+        );
+        assert!(matches!(
+            mbap.take_reply(&[0, 1, 0, 0, 0xff, 0xff], 64),
+            ReplyProgress::Invalid(_)
+        ));
+
+        let u32_le =
+            resolve("kind = \"length_field\"\noffset = 1\nwidth = 4\nendian = \"little\"").unwrap();
+        assert_eq!(u32_le.label(), "length_field(u32 little at 1)");
+        assert_eq!(
+            u32_le.take_reply(b"\x07\x02\x00\x00\x00abX", 64),
+            ReplyProgress::Complete {
+                reply: b"\x07\x02\x00\x00\x00ab".to_vec(),
+                consumed: 7
+            }
+        );
+    }
+
+    #[test]
+    fn a_varint_length_field_reads_an_mqtt_remaining_length() {
+        let mqtt = resolve("kind = \"length_field\"\noffset = 1\nwidth = \"varint\"").unwrap();
+        assert_eq!(mqtt.label(), "length_field(varint at 1)");
+        // CONNACK: a one-byte remaining length, then the next packet.
+        assert_eq!(
+            mqtt.take_reply(&[0x20, 0x02, 0x00, 0x00, 0xd0], 64),
+            ReplyProgress::Complete {
+                reply: vec![0x20, 0x02, 0x00, 0x00],
+                consumed: 4
+            }
+        );
+        // 200 bytes take two: 0xc8 (0x48 and more to come), then 0x01.
+        let mut publish = vec![0x30, 0xc8, 0x01];
+        publish.extend_from_slice(&[7; 200]);
+        assert_eq!(mqtt.take_reply(&publish[..2], 512), ReplyProgress::NeedMore);
+        assert_eq!(
+            mqtt.take_reply(&publish[..202], 512),
+            ReplyProgress::NeedMore
+        );
+        assert_eq!(
+            mqtt.take_reply(&publish, 512),
+            ReplyProgress::Complete {
+                reply: publish.clone(),
+                consumed: 203
+            }
+        );
+        assert!(matches!(
+            mqtt.take_reply(&publish, 100),
+            ReplyProgress::Invalid(_)
+        ));
+        let ReplyProgress::Invalid(reason) =
+            mqtt.take_reply(&[0x30, 0xff, 0xff, 0xff, 0xff, 0x01], 1 << 30)
+        else {
+            panic!("a fifth length byte is not a variable byte integer");
+        };
+        assert!(reason.contains("runs past 4 bytes"), "{reason}");
+        assert_eq!(
+            mqtt.datagram_reply(&[0xd0, 0x00], 64),
+            ReplyProgress::Complete {
+                reply: vec![0xd0, 0x00],
+                consumed: 2
+            }
+        );
+    }
+
+    #[test]
     fn a_delimiter_ends_each_message_and_is_not_part_of_it() {
         let crlf = resolve("kind = \"delimiter\"\ndelimiter = \"\\r\\n\"").unwrap();
         assert_eq!(crlf.label(), "delimiter(0d0a)");
@@ -491,6 +732,31 @@ mod tests {
                 "kind = \"length_prefix\"\nreply_idle_ms = 5",
                 "`reply_idle_ms` does not apply",
             ),
+            (
+                "kind = \"length_field\"\nwidth = \"varint\"\nendian = \"big\"",
+                "`endian` does not apply to a varint length",
+            ),
+            (
+                "kind = \"length_field\"\nwidth = \"nibble\"",
+                "expected 1, 2, 4 or \"varint\"",
+            ),
+            (
+                "kind = \"length_field\"\nwidth = 3",
+                "expected 1, 2, 4 or \"varint\"",
+            ),
+            (
+                "kind = \"length_field\"\nincludes_prefix = true",
+                "`includes_prefix` does not apply",
+            ),
+            (
+                "kind = \"length_prefix\"\noffset = 4",
+                "`offset` does not apply",
+            ),
+            (
+                "kind = \"length_prefix\"\nwidth = \"varint\"",
+                "expected 1, 2 or 4",
+            ),
+            ("offset = 1", "`offset` does not apply"),
             ("kind = \"cobs\"", "unknown framing kind"),
             ("reply_idle_ms = 0", "at least 1"),
             ("knd = \"raw\"", "unknown field"),

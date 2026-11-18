@@ -3014,6 +3014,18 @@
   reproduces with that build; a harness whose CFI build fails is named.
   `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
   no lane of the run could observe in its C/C++ targets, and what would.
+- Reference protocol profiles for Modbus/TCP and MQTT 3.1.1 (#311), in
+  `profiles/protocols/modbus-tcp.toml` and `mqtt-3.1.1.toml`. The Modbus
+  session reads a holding register, writes back the value it read and writes
+  a block of registers; the MQTT session connects, subscribes, publishes at
+  QoS 2, releases the publication with the packet id the broker's PUBREC
+  named, and pings. A state is reached only on the reply that answers the
+  request: a Modbus exception response or a refused CONNECT does not advance
+  the session. A profile's `[framing]` can be `length_field`, for a protocol
+  whose header carries the message's length (Modbus's MBAP length at byte 4,
+  MQTT's Remaining Length, a variable byte integer, at byte 1): a request is
+  written as it is and a reply read by that length, header included. Each
+  profile is tested against a fixture server.
 - Ada harnesses get a coverage report too (#310): the replay records the PC
   of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
   runtime), takes the binary's calls to the callback as the instrumented

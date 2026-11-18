@@ -1482,7 +1482,7 @@ so a run whose crashes were all known does not read as clean.
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
-- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
+- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1.
 - `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. `serial:PATH[,baud=N]` drives a UART or a pty, opened raw as the agent's `serial:` transport is (no echo, line editing or newline translation; 8N1, no flow control), at baud `N` when given; requests and replies are framed as the profile says, and `--session-reset reconnect` reopens the device while `none` keeps it open. `transport:TARGET-TRANSPORT-SPEC` drives a session through a `--target-transport` backend (`transport:agent:tcp:HOST:PORT`, `transport:gdb:HOST:PORT` with `--transport-coverage-map`, …): each message is one execution on the target, a fault, a crash or a hang ends the session at that message, and the executions' edges feed the code channel. A reply is the backend's stdout, which the agent backends do not have, so a profile over them captures nothing from replies. `--session-reset reconnect` arms a fresh target session for each protocol session; `none` keeps one armed. See [On-target fuzzing](on-target-fuzzing.md#3d-protocol-sessions-on-the-target). Required with `--protocol-profile`.
 - `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
@@ -1602,6 +1602,7 @@ transport adds nothing of its own:
 |---|---|---|
 | `raw` (the default) | written as it is | when no byte arrives for `reply_idle_ms` (50) after the first, or the peer closes |
 | `length_prefix` | preceded by its length in `width` bytes (1, 2 or 4; 2 by default), `endian` `big` (the default) or `little`; `includes_prefix = true` when the length counts the prefix | after the length its prefix declares |
+| `length_field` | written as it is: its length is a field of its own header at byte `offset` (0 by default), which the profile computes with `length(..)`, `width` 1, 2 or 4 bytes in `endian` order, or `"varint"` (MQTT's variable byte integer), counting the bytes after the field | after the length its field declares; the reply is the whole message, header included |
 | `delimiter` | followed by `delimiter` (`"\r\n"`) | at the delimiter, which is not part of the reply |
 | `fixed` | `size` bytes: a shorter request is padded with zeros, a longer one cut | after `size` bytes |
 
@@ -1612,7 +1613,34 @@ width = 2
 endian = "big"
 ```
 
-The run summary's `framing` names it (`length_prefix(u16 big)`).
+The run summary's `framing` names it (`length_prefix(u16 big)`,
+`length_field(varint at 1)`).
+
+#### Reference profiles
+
+bhf ships profiles for real protocols under `profiles/protocols/`; each
+file's header says what it models and how to point it at a server. Every
+state they declare is reached only when the server answers with the reply
+the request expects (each captures the reply's type as an enum naming only
+that reply), so the summary's `states_covered` counts states the server took
+the session to.
+
+| Profile | Protocol | The session |
+|---|---|---|
+| `modbus-tcp.toml` | Modbus/TCP (`--session-transport tcp:HOST:502`) | Read Holding Registers, Write Single Register with the value the read returned, Write Multiple Registers; an exception response does not advance it |
+| `mqtt-3.1.1.toml` | MQTT 3.1.1 (`tcp:HOST:1883`) | CONNECT, SUBSCRIBE, PUBLISH at QoS 2, PUBREL with the packet id the PUBREC named, PINGREQ; a refused CONNECT does not advance it |
+
+```sh
+bhf fuzz bhf_work --harness H-MODBUS \
+  --protocol-profile profiles/protocols/modbus-tcp.toml \
+  --session-transport tcp:192.0.2.10:502 --iterations 5000
+```
+
+A server that closes the connection on a malformed request, as an MQTT
+broker must, has the session lane record each such session as dropped (a
+`session-disconnect` finding, see below). Run under `--session-server-cmd`,
+a server that crashes is a `session-server-crash` or `session-server-exit`
+finding instead, which a close is not.
 
 A response capture of `type = "tlv"` takes the value of a tag-length-value
 record in the reply: the records from `at` are walked until one has `tag`

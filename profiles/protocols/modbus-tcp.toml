@@ -1,0 +1,288 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Modbus/TCP reference protocol profile (bhf.protocol.v1).
+#
+# Models a Modbus/TCP client session with a server (a PLC, an RTU, a
+# gateway; TCP port 502), per the Modbus Application Protocol Specification
+# v1.1b3 and the Modbus Messaging on TCP/IP Implementation Guide v1.0b.
+# Every request and reply is an MBAP header (transaction id, protocol id 0,
+# length, unit id) and a PDU (function code, data). The MBAP length counts
+# the unit id and the PDU; the profile computes it, so it stays right after
+# every mutation, and the framing reads each reply by it.
+#
+# The session reads a holding register (function 0x03), writes the value it
+# read back to the register (0x06, a read-modify-write as a configuration
+# tool does), and writes a block of registers (0x10). A state is reached
+# only on the function's normal response: an exception response (the
+# function code with its high bit set) is not captured, so it does not
+# advance the session.
+#
+# The unit id is 1, which a gateway routes to the first device behind it; a
+# server addressed directly usually answers any unit id (the guide suggests
+# 0xFF). Set `value` on each `unit_id` to the device a gateway should reach.
+#
+#   bhf fuzz <work> --harness <ID> \
+#     --protocol-profile profiles/protocols/modbus-tcp.toml \
+#     --session-transport tcp:HOST:502
+
+schema = "bhf.protocol.v1"
+transport = "tcp"
+start = "start"
+
+# The MBAP length, a big-endian u16 at byte 4, ends each message.
+[framing]
+kind = "length_field"
+offset = 4
+width = 2
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# Read Holding Registers (0x03): `quantity` registers from `address`.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "READ_HOLDING_REGISTERS"
+max_len = 260
+
+[[message.field]]
+name = "transaction_id"
+type = "u16"
+endian = "big"
+value = 1
+
+[[message.field]]
+name = "protocol_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "length"
+type = "u16"
+endian = "big"
+computed = "length(unit_id,function,address,quantity)"
+
+[[message.field]]
+name = "unit_id"
+type = "u8"
+value = 1
+
+[[message.field]]
+name = "function"
+type = "u8"
+value = 3
+
+[[message.field]]
+name = "address"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "quantity"
+type = "u16"
+endian = "big"
+value = 1
+
+# MBAP (7 bytes), the function, a byte count, then the registers.
+[message.response]
+[[message.response.capture]]
+name = "transaction_id"
+type = "u16"
+at = 0
+endian = "big"
+
+[[message.response.capture]]
+name = "function"
+type = "enum"
+at = 7
+variants = { read_holding_registers = 3 }
+
+[[message.response.capture]]
+name = "byte_count"
+type = "u8"
+at = 8
+
+# The first register read.
+[[message.response.capture]]
+name = "value"
+type = "u16"
+at = 9
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# Write Single Register (0x06): write back the value the read returned.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "WRITE_SINGLE_REGISTER"
+max_len = 260
+
+[[message.field]]
+name = "transaction_id"
+type = "u16"
+endian = "big"
+value = 2
+
+[[message.field]]
+name = "protocol_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "length"
+type = "u16"
+endian = "big"
+computed = "length(unit_id,function,address,value)"
+
+[[message.field]]
+name = "unit_id"
+type = "u8"
+value = 1
+
+[[message.field]]
+name = "function"
+type = "u8"
+value = 6
+
+[[message.field]]
+name = "address"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "value"
+type = "u16"
+endian = "big"
+ref = "READ_HOLDING_REGISTERS.response.value"
+
+# The normal response echoes the request.
+[message.response]
+[[message.response.capture]]
+name = "function"
+type = "enum"
+at = 7
+variants = { write_single_register = 6 }
+
+[[message.response.capture]]
+name = "address"
+type = "u16"
+at = 8
+endian = "big"
+
+[[message.response.capture]]
+name = "value"
+type = "u16"
+at = 10
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# Write Multiple Registers (0x10): `quantity` registers from `address`, two
+# bytes each in `values`.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "WRITE_MULTIPLE_REGISTERS"
+max_len = 260
+
+[[message.field]]
+name = "transaction_id"
+type = "u16"
+endian = "big"
+value = 3
+
+[[message.field]]
+name = "protocol_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "length"
+type = "u16"
+endian = "big"
+computed = "length(unit_id,function,address,quantity,byte_count,values)"
+
+[[message.field]]
+name = "unit_id"
+type = "u8"
+value = 1
+
+[[message.field]]
+name = "function"
+type = "u8"
+value = 16
+
+[[message.field]]
+name = "address"
+type = "u16"
+endian = "big"
+value = 1
+
+[[message.field]]
+name = "quantity"
+type = "u16"
+endian = "big"
+value = 2
+
+[[message.field]]
+name = "byte_count"
+type = "u8"
+computed = "length(values)"
+
+# At most 123 registers.
+[[message.field]]
+name = "values"
+type = "bytes"
+max = 246
+value = [0x00, 0x2a, 0x01, 0x00]
+
+[message.response]
+[[message.response.capture]]
+name = "function"
+type = "enum"
+at = 7
+variants = { write_multiple_registers = 16 }
+
+[[message.response.capture]]
+name = "address"
+type = "u16"
+at = 8
+endian = "big"
+
+[[message.response.capture]]
+name = "quantity"
+type = "u16"
+at = 10
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# Legal message ordering: a register is read before it is written back.
+# ---------------------------------------------------------------------------
+[[transition]]
+from = "start"
+send = "READ_HOLDING_REGISTERS"
+to = "read"
+
+[[transition]]
+from = "read"
+send = "READ_HOLDING_REGISTERS"
+to = "read"
+
+[[transition]]
+from = "read"
+send = "WRITE_SINGLE_REGISTER"
+to = "written"
+
+[[transition]]
+from = "written"
+send = "WRITE_MULTIPLE_REGISTERS"
+to = "written"
+
+[[transition]]
+from = "written"
+send = "READ_HOLDING_REGISTERS"
+to = "read"
+
+# A new connection for every session.
+[session]
+reset = "reconnect"
