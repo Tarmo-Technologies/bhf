@@ -519,10 +519,14 @@ pub struct FuzzArgs {
     #[arg(long, value_name = "PATH")]
     pub cmplog_log: Option<PathBuf>,
 
-    /// Path to a JSON grammar describing the target's input format for structure-aware
-    /// generation (a Nautilus-style grammar mutator). Each rule maps a non-terminal to
-    /// a list of production strings where `{NAME}` references another rule; the start
-    /// symbol is `START` if present, else the first rule.
+    /// Path to a JSON grammar describing the target's input format, for structure-aware
+    /// generation plus tree mutation: the builtin engine generates inputs from the
+    /// grammar, keeps each one's derivation tree, and mutates a kept input on its tree
+    /// (a subtree derived afresh, a recursion repeated, or a subtree spliced in from
+    /// another input's tree of the same rule), so those mutants stay sentences of the
+    /// grammar. Each rule maps a non-terminal to a list of production strings where
+    /// `{NAME}` references another rule; the start symbol is `START` if present, else
+    /// the first rule.
     #[arg(long = "grammar", value_name = "PATH")]
     pub grammar_file: Option<PathBuf>,
 
@@ -4213,6 +4217,10 @@ struct PoolEntry {
     /// finding, so it is neither mutated from nor saved in the queue. Kept in
     /// place so every other entry keeps its pool index.
     retired: bool,
+    /// The `--grammar` derivation tree whose sentence `bytes` is (#329), for
+    /// an input a grammar derivation or tree mutation made: its children are
+    /// mostly tree mutations, which keep them sentences of the grammar.
+    tree: Option<fuzz_engine_builtin::grammar::Derivation>,
 }
 
 /// Quantitative marginal feedback from one execution. Keeping the channel
@@ -4395,6 +4403,7 @@ impl PoolEntry {
             colored: None,
             typed_spans: None,
             retired: false,
+            tree: None,
         }
     }
 
@@ -5332,6 +5341,8 @@ fn run_builtin_with_progress(
         }
 
         let mut parents = crate::fuzz_lineage::InputParents::Queued(iteration);
+        // The derivation tree of a grammar-made child (#329).
+        let mut input_tree = None;
         // A peer's entry runs as it is, once the seeds have run.
         let imported = match peer_sync.as_mut() {
             Some(sync) if iteration >= initial_seed_count => {
@@ -5410,7 +5421,7 @@ fn run_builtin_with_progress(
                 let mut made_from = None;
                 let (bytes, field_edit) =
                     frame_child(codec, &base, effective_max_len, &mut rng, |rng| {
-                        let (bytes, parents) = mutate_from_pool(
+                        let (bytes, parents, tree) = mutate_from_pool(
                             &pool,
                             base_index,
                             &dictionary,
@@ -5420,11 +5431,14 @@ fn run_builtin_with_progress(
                             sequence_geometry,
                             rng,
                         );
-                        made_from = Some(parents);
+                        made_from = Some((parents, tree));
                         bytes
                     });
                 parents = match made_from {
-                    Some(made_from) if !field_edit => made_from,
+                    Some((made_from, tree)) if !field_edit => {
+                        input_tree = tree;
+                        made_from
+                    }
                     _ => crate::fuzz_lineage::InputParents::Mutated {
                         base: base_index,
                         donor: None,
@@ -5432,7 +5446,7 @@ fn run_builtin_with_progress(
                 };
                 bytes
             } else {
-                let (bytes, made_from) = mutate_from_pool(
+                let (bytes, made_from, tree) = mutate_from_pool(
                     &pool,
                     base_index,
                     &dictionary,
@@ -5443,6 +5457,7 @@ fn run_builtin_with_progress(
                     &mut rng,
                 );
                 parents = made_from;
+                input_tree = tree;
                 bytes
             }
         };
@@ -5939,6 +5954,13 @@ fn run_builtin_with_progress(
                 write_live_corpus_entry(dir, &input);
             }
             pool_bytes = pool_bytes.saturating_add(input.len());
+            // The tree is kept while it still derives the input (a `--frame`
+            // repair may have changed it) and fits the pool's byte budget.
+            let tree = input_tree.take().filter(|tree| {
+                grammar.as_ref().is_some_and(|g| g.sentence(tree) == input)
+                    && pool_bytes.saturating_add(tree.footprint()) <= corpus_limits.bytes
+            });
+            pool_bytes = pool_bytes.saturating_add(tree.as_ref().map_or(0, |t| t.footprint()));
             pool.push(PoolEntry {
                 bytes: input,
                 energy: input_energy,
@@ -5947,6 +5969,7 @@ fn run_builtin_with_progress(
                 colored: None,
                 typed_spans: None,
                 retired: false,
+                tree,
             });
         }
 
@@ -9551,6 +9574,8 @@ pub(crate) fn expand_sequence_portfolio_seeds(harness_dir: &Path, seeds: &mut Ve
 /// per-input RedQueen cmplog (#400) so `CmpLogSplice` injects the operands it
 /// observed at the offsets they were compared; falls back to the global
 /// pre-mined log (`global_cmplog`) so non-driver paths keep their behavior.
+/// Returns the child, what it descends from and, for a `--grammar`
+/// derivation or tree mutation (#329), the child's derivation tree.
 #[allow(clippy::too_many_arguments)]
 fn mutate_from_pool(
     pool: &[PoolEntry],
@@ -9561,7 +9586,11 @@ fn mutate_from_pool(
     config: MutatorConfig,
     sequence: Option<SequenceGeometry>,
     rng: &mut MutationRng,
-) -> (Vec<u8>, crate::fuzz_lineage::InputParents) {
+) -> (
+    Vec<u8>,
+    crate::fuzz_lineage::InputParents,
+    Option<fuzz_engine_builtin::grammar::Derivation>,
+) {
     let suite = MutatorSuite::new(config);
     let full_base = pool
         .get(base_index)
@@ -9589,7 +9618,12 @@ fn mutate_from_pool(
         mutation_input = mutation_input.with_cmplog(log);
     }
     if let Some(g) = grammar {
-        mutation_input = mutation_input.with_grammar(g);
+        // #329: the base's and the peer's derivation trees, for the tree
+        // mutations.
+        mutation_input = mutation_input.with_grammar(g).with_grammar_trees(
+            pool.get(base_index).and_then(|entry| entry.tree.as_ref()),
+            pool.get(peer_index).and_then(|entry| entry.tree.as_ref()),
+        );
     }
     // A sequence harness's op program lives in a fixed-stride control block, so
     // it can be described to the mutator as ordered spans instead of being
@@ -9600,9 +9634,9 @@ fn mutate_from_pool(
         mutation_input = mutation_input.with_operation_sequence(layout);
     }
 
-    let (bytes, kind) = match suite.mutate(&mutation_input, rng) {
-        Some(result) => (result.bytes, Some(result.kind)),
-        None => (vec![rng.next_u8()], None),
+    let (bytes, kind, tree) = match suite.mutate(&mutation_input, rng) {
+        Some(result) => (result.bytes, Some(result.kind), result.tree),
+        None => (vec![rng.next_u8()], None, None),
     };
     // AdaFuzz.Input.Load_From_Stdin exits the harness loop on empty input,
     // which leaves no event log behind and breaks first-run dogfooding when
@@ -9611,11 +9645,12 @@ fn mutate_from_pool(
         (
             vec![rng.next_u8()],
             crate::fuzz_lineage::InputParents::Generated,
+            None,
         )
     } else {
         let parents =
             crate::fuzz_lineage::InputParents::from_mutation(base_index, peer_index, kind);
-        (bytes, parents)
+        (bytes, parents, tree)
     }
 }
 
@@ -13848,6 +13883,73 @@ mod entropic_tests {
         assert!(broad_lane.scheduling_energy() > narrow_lane.scheduling_energy() * 100);
         assert!(broad_lane.made_progress());
         assert!(!CoverageNovelty::default().made_progress());
+    }
+}
+
+#[cfg(test)]
+mod grammar_tree_tests {
+    use super::{mutate_from_pool, PoolEntry};
+    use fuzz_engine_builtin::{Dictionary, Grammar, MutationRng, MutatorConfig};
+
+    fn grammar() -> Grammar {
+        Grammar::from_rules(
+            &[(
+                "S".to_owned(),
+                ["({S})", "[{S}]", "{S}{S}", "x", "y"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            )],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #329: a pool entry that keeps its derivation tree is mutated mostly on
+    /// the tree, and each such child comes back with the tree that derives it;
+    /// an entry without one gets a tree only from a fresh derivation.
+    #[test]
+    fn a_grammar_entry_is_mutated_on_its_tree() {
+        let grammar = grammar();
+        let mut rng = MutationRng::new(3);
+        let tree = loop {
+            let tree = grammar.generate_tree(64, &mut rng).unwrap();
+            if tree.len() > 6 {
+                break tree;
+            }
+        };
+        let mut entry = PoolEntry::seed(grammar.sentence(&tree));
+        entry.tree = Some(tree);
+        let pool = vec![entry];
+        let plain = vec![PoolEntry::seed(pool[0].bytes.clone())];
+        let config = MutatorConfig {
+            max_len: 64,
+            ..MutatorConfig::default()
+        };
+        let dictionary = Dictionary::default();
+        let children_with_trees = |pool: &[PoolEntry], rng: &mut MutationRng| {
+            let mut count = 0;
+            for _ in 0..300 {
+                let (bytes, _, tree) = mutate_from_pool(
+                    pool,
+                    0,
+                    &dictionary,
+                    None,
+                    Some(&grammar),
+                    config,
+                    None,
+                    rng,
+                );
+                if let Some(tree) = tree {
+                    assert_eq!(grammar.sentence(&tree), bytes);
+                    count += 1;
+                }
+            }
+            count
+        };
+        let on_tree = children_with_trees(&pool, &mut rng);
+        let fresh = children_with_trees(&plain, &mut rng);
+        assert!(on_tree > 150, "{on_tree} of 300 children carry a tree");
+        assert!(fresh < on_tree / 2, "{fresh} fresh derivations");
     }
 }
 

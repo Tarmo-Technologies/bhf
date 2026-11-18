@@ -3111,6 +3111,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_grammar_help.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_hit_count_buckets.rs",
       "license": "Apache-2.0"
     },

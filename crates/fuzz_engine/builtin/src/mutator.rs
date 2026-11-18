@@ -41,8 +41,18 @@ pub enum MutationKind {
     /// A fresh derivation from a user-supplied context-free grammar (`--grammar`).
     /// Unlike the fixed structured mutators, this generates deeply-valid inputs for a
     /// bespoke format the operator describes, reaching parser code past surface checks
-    /// that reject random bytes.
+    /// that reject random bytes. The result carries its derivation tree.
     StructuredGrammar,
+    /// A tree mutation of the base's `--grammar` derivation tree: one subtree
+    /// derived afresh from its non-terminal, or a recursion in it repeated
+    /// (Nautilus' random, rules and random-recursive mutations). The output is
+    /// a sentence of the grammar, where a byte edit of one rarely is.
+    GrammarSubtree,
+    /// A subtree of the base's derivation tree replaced by a subtree of the
+    /// peer's that derives the same non-terminal (Nautilus' splicing
+    /// mutation): structure one input reached, moved into another, still a
+    /// sentence of the grammar.
+    GrammarSplice,
     TypedValue,
     OpSequence,
     /// Offset-aware splice driven by runtime cmplog evidence.
@@ -63,7 +73,7 @@ pub enum MutationKind {
 }
 
 impl MutationKind {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 26] = [
         Self::BitFlip,
         Self::ByteFlip,
         Self::Arithmetic,
@@ -84,6 +94,8 @@ impl MutationKind {
         Self::StructuredChunked,
         Self::StructuredRecursive,
         Self::StructuredGrammar,
+        Self::GrammarSubtree,
+        Self::GrammarSplice,
         Self::TypedValue,
         Self::OpSequence,
         Self::CmpLogSplice,
@@ -91,9 +103,9 @@ impl MutationKind {
     ];
 
     /// Whether an input of this kind is an edit of the base it was given. The
-    /// generators (the structured shapes and `--grammar` derivations) build
-    /// theirs from the dictionary or grammar alone, so it descends from no
-    /// queue entry.
+    /// generators (the structured shapes and fresh `--grammar` derivations)
+    /// build theirs from the dictionary or grammar alone, so it descends from
+    /// no queue entry; a grammar tree mutation edits the base's tree.
     pub fn derives_from_base(self) -> bool {
         match self {
             Self::BitFlip
@@ -105,7 +117,9 @@ impl MutationKind {
             | Self::TypedValue
             | Self::OpSequence
             | Self::CmpLogSplice
-            | Self::RepeatToken => true,
+            | Self::RepeatToken
+            | Self::GrammarSubtree
+            | Self::GrammarSplice => true,
             Self::StructuredRecord
             | Self::StructuredJson
             | Self::StructuredXml
@@ -123,10 +137,10 @@ impl MutationKind {
         }
     }
 
-    /// Whether an input of this kind also takes bytes from the peer (a second
-    /// parent): only a splice does.
+    /// Whether an input of this kind also takes from the peer (a second
+    /// parent): only a splice does, of its bytes or of its derivation tree.
     pub fn uses_peer(self) -> bool {
-        matches!(self, Self::Splice)
+        matches!(self, Self::Splice | Self::GrammarSplice)
     }
 }
 
@@ -137,10 +151,19 @@ impl MutationKind {
 /// gate in one mutation where blind mutation needs exponentially many tries.
 const CMPLOG_SPLICE_EXTRA_WEIGHT: usize = 8;
 
+/// How many extra times each grammar tree mutation is entered into the
+/// selection pool when the base has a derivation tree: a byte edit of a
+/// sentence is rarely a sentence, so, as in Nautilus, most of a grammar input's
+/// children are tree mutations.
+const GRAMMAR_TREE_EXTRA_WEIGHT: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationResult {
     pub bytes: Vec<u8>,
     pub kind: MutationKind,
+    /// The derivation tree of `bytes`, for a `--grammar` derivation or tree
+    /// mutation: the engine keeps it with the input to mutate it later.
+    pub tree: Option<crate::grammar::Derivation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +432,10 @@ pub struct MutationInput<'a> {
     pub operation_sequence: Option<&'a OperationSequenceLayout>,
     pub cmplog: Option<&'a cmplog::CmpLog>,
     pub grammar: Option<&'a crate::grammar::Grammar>,
+    /// The base's `--grammar` derivation tree, when it has one.
+    pub grammar_tree: Option<&'a crate::grammar::Derivation>,
+    /// The peer's `--grammar` derivation tree, when it has one.
+    pub peer_grammar_tree: Option<&'a crate::grammar::Derivation>,
 }
 
 impl<'a> MutationInput<'a> {
@@ -421,6 +448,8 @@ impl<'a> MutationInput<'a> {
             operation_sequence: None,
             cmplog: None,
             grammar: None,
+            grammar_tree: None,
+            peer_grammar_tree: None,
         }
     }
 
@@ -446,6 +475,18 @@ impl<'a> MutationInput<'a> {
 
     pub fn with_grammar(mut self, grammar: &'a crate::grammar::Grammar) -> Self {
         self.grammar = Some(grammar);
+        self
+    }
+
+    /// The base's and the peer's derivation trees of the `--grammar` given
+    /// with [`MutationInput::with_grammar`], for the tree mutations.
+    pub fn with_grammar_trees(
+        mut self,
+        base: Option<&'a crate::grammar::Derivation>,
+        peer: Option<&'a crate::grammar::Derivation>,
+    ) -> Self {
+        self.grammar_tree = base;
+        self.peer_grammar_tree = peer;
         self
     }
 }
@@ -549,6 +590,11 @@ impl MutatorSuite {
                 available.push(MutationKind::CmpLogSplice);
             }
         }
+        for kind in [MutationKind::GrammarSubtree, MutationKind::GrammarSplice] {
+            if available.contains(&kind) {
+                available.extend(std::iter::repeat_n(kind, GRAMMAR_TREE_EXTRA_WEIGHT));
+            }
+        }
 
         // The dictionary generators share the pick in proportion to the
         // dictionary's size (a `--grammar` derivation keeps its own slot).
@@ -606,6 +652,31 @@ impl MutatorSuite {
         kind: MutationKind,
         rng: &mut MutationRng,
     ) -> Option<MutationResult> {
+        let max_len = self.config.max_len;
+        let tree = match kind {
+            MutationKind::StructuredGrammar => Some(input.grammar?.generate_tree(max_len, rng)?),
+            MutationKind::GrammarSubtree => Some(input.grammar?.mutate_tree(
+                input.grammar_tree?,
+                max_len,
+                rng,
+            )?),
+            MutationKind::GrammarSplice => Some(input.grammar?.splice(
+                input.grammar_tree?,
+                input.peer_grammar_tree?,
+                max_len,
+                rng,
+            )?),
+            _ => None,
+        };
+        if let Some(tree) = tree {
+            // An empty sentence is no input; another kind is tried instead.
+            let bytes = input.grammar?.sentence(&tree);
+            return (!bytes.is_empty()).then_some(MutationResult {
+                bytes,
+                kind,
+                tree: Some(tree),
+            });
+        }
         let bytes = match kind {
             MutationKind::BitFlip => bit_flip(input.bytes, rng),
             MutationKind::ByteFlip => byte_flip(input.bytes, rng),
@@ -630,7 +701,10 @@ impl MutatorSuite {
             MutationKind::StructuredYaml => self.structured_yaml(input.dictionary, rng),
             MutationKind::StructuredChunked => self.structured_chunked(input.dictionary, rng),
             MutationKind::StructuredRecursive => self.structured_recursive(input.dictionary, rng),
-            MutationKind::StructuredGrammar => input.grammar?.generate(self.config.max_len, rng),
+            // Made above, with their trees.
+            MutationKind::StructuredGrammar
+            | MutationKind::GrammarSubtree
+            | MutationKind::GrammarSplice => None,
             MutationKind::TypedValue => {
                 self.typed_value(input.bytes, input.dictionary, input.typed_spans, rng)
             }
@@ -641,7 +715,11 @@ impl MutatorSuite {
             MutationKind::RepeatToken => self.repeat_token(input.bytes, input.dictionary, rng),
         }?;
 
-        Some(MutationResult { bytes, kind })
+        Some(MutationResult {
+            bytes,
+            kind,
+            tree: None,
+        })
     }
 
     fn kind_available(&self, input: &MutationInput<'_>, kind: MutationKind) -> bool {
@@ -727,6 +805,17 @@ impl MutatorSuite {
             // Available whenever a grammar is supplied; generation ignores the input
             // bytes (it synthesizes a fresh derivation), so no length/dictionary gate.
             MutationKind::StructuredGrammar => input.grammar.is_some() && self.config.max_len > 0,
+            // A tree mutation needs the base's tree, and a tree splice the
+            // peer's too.
+            MutationKind::GrammarSubtree => {
+                input.grammar.is_some() && input.grammar_tree.is_some() && self.config.max_len > 0
+            }
+            MutationKind::GrammarSplice => {
+                input.grammar.is_some()
+                    && input.grammar_tree.is_some()
+                    && input.peer_grammar_tree.is_some()
+                    && self.config.max_len > 0
+            }
             MutationKind::TypedValue => !self
                 .typed_span_candidates(input.bytes, input.dictionary, input.typed_spans)
                 .is_empty(),
@@ -2751,6 +2840,138 @@ mod tests {
 
         assert_eq!(result.kind, MutationKind::Interesting);
         assert_ne!(result.bytes, vec![0]);
+    }
+
+    /// `S := ( S ) | [ S ] | < S > | S S | x | y | z`, and a recognizer of it
+    /// written apart from the grammar: one or more items, each a letter or a
+    /// bracketed sentence.
+    fn bracket_grammar() -> crate::grammar::Grammar {
+        crate::grammar::Grammar::from_rules(
+            &[(
+                "S".to_owned(),
+                ["({S})", "[{S}]", "<{S}>", "{S}{S}", "x", "y", "z"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            )],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn is_bracketed_x(s: &[u8]) -> bool {
+        fn items(s: &[u8], i: &mut usize) -> bool {
+            let start = *i;
+            loop {
+                match s.get(*i) {
+                    Some(b'x' | b'y' | b'z') => *i += 1,
+                    Some(&open @ (b'(' | b'[' | b'<')) => {
+                        *i += 1;
+                        let close = match open {
+                            b'(' => b')',
+                            b'[' => b']',
+                            _ => b'>',
+                        };
+                        if !items(s, i) || s.get(*i) != Some(&close) {
+                            return false;
+                        }
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            *i > start
+        }
+        let mut i = 0;
+        items(s, &mut i) && i == s.len()
+    }
+
+    /// #329: a grammar input carries its tree, and the tree mutations, which
+    /// need the base's tree (and a splice the peer's), give back sentences of
+    /// the grammar with their own trees.
+    #[test]
+    fn grammar_tree_mutations_give_sentences_with_their_trees() {
+        let grammar = bracket_grammar();
+        let dictionary = Dictionary::default();
+        let mut rng = MutationRng::new(0x329);
+        let plain = MutationInput::new(b"", &dictionary).with_grammar(&grammar);
+        for kind in [MutationKind::GrammarSubtree, MutationKind::GrammarSplice] {
+            assert!(
+                !suite().kind_available(&plain, kind),
+                "{kind:?} without a tree"
+            );
+            assert_eq!(suite().try_mutate_with_kind(&plain, kind, &mut rng), None);
+        }
+        let mut trees = Vec::new();
+        while trees.len() < 8 {
+            let made = suite()
+                .try_mutate_with_kind(&plain, MutationKind::StructuredGrammar, &mut rng)
+                .expect("a derivation");
+            let tree = made.tree.expect("a derivation carries its tree");
+            assert_eq!(grammar.sentence(&tree), made.bytes);
+            trees.push((made.bytes, tree));
+        }
+        let mut changed = 0;
+        for round in 0..400 {
+            let (base, base_tree) = &trees[round % trees.len()];
+            let (peer, peer_tree) = &trees[(round * 7 + 3) % trees.len()];
+            let input = MutationInput::new(base, &dictionary)
+                .with_peer(peer)
+                .with_grammar(&grammar)
+                .with_grammar_trees(Some(base_tree), Some(peer_tree));
+            let kind = if round.is_multiple_of(2) {
+                MutationKind::GrammarSubtree
+            } else {
+                MutationKind::GrammarSplice
+            };
+            let Some(made) = suite().try_mutate_with_kind(&input, kind, &mut rng) else {
+                continue;
+            };
+            assert!(made.bytes.len() <= 64);
+            assert!(is_bracketed_x(&made.bytes), "{kind:?}: {:?}", made.bytes);
+            let tree = made.tree.expect("a tree mutation carries its tree");
+            assert_eq!(grammar.sentence(&tree), made.bytes);
+            if made.bytes != *base {
+                changed += 1;
+            }
+        }
+        assert!(changed > 300, "{changed} of 400 changed their base");
+    }
+
+    /// A base with a derivation tree gets mostly tree mutations, so most of a
+    /// grammar input's children stay sentences.
+    #[test]
+    fn a_base_with_a_tree_is_mostly_mutated_on_its_tree() {
+        let grammar = bracket_grammar();
+        let dictionary = Dictionary::default();
+        let mut rng = MutationRng::new(7);
+        let tree = loop {
+            let tree = grammar.generate_tree(64, &mut rng).unwrap();
+            if tree.len() > 5 {
+                break tree;
+            }
+        };
+        let base = grammar.sentence(&tree);
+        let input = MutationInput::new(&base, &dictionary)
+            .with_peer(&base)
+            .with_grammar(&grammar)
+            .with_grammar_trees(Some(&tree), Some(&tree));
+        let suite = suite();
+        let mut on_tree = 0;
+        let mut sentences = 0;
+        for _ in 0..400 {
+            let made = suite.mutate(&input, &mut rng).expect("a mutation");
+            if matches!(
+                made.kind,
+                MutationKind::GrammarSubtree | MutationKind::GrammarSplice
+            ) {
+                on_tree += 1;
+            }
+            if is_bracketed_x(&made.bytes) {
+                sentences += 1;
+            }
+        }
+        assert!(on_tree > 200, "{on_tree} of 400 tree mutations");
+        assert!(sentences >= on_tree, "{sentences} sentences");
     }
 
     /// What an input was made from decides what it descends from: the

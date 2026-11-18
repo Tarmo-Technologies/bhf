@@ -2853,6 +2853,16 @@
   when bhf panics.
 
 ### Added
+- `--grammar` mutates derivation trees (#329), as Nautilus does: the builtin
+  engine keeps the derivation tree of each input it derives from the grammar,
+  and most children of such an input are tree mutations, a subtree derived
+  afresh from its rule, a recursion repeated, or a subtree spliced in from
+  another input's tree of the same rule, so they stay sentences of the
+  grammar. A derivation ends within `--max-len` by taking each rule's
+  smallest production as it nears it, where it was cut off mid-sentence. The
+  `--grammar` help said "a Nautilus-style grammar mutator" when the engine
+  only generated fresh derivations; it now says what the engine does. A
+  grammar whose smallest derivation nests more than 512 rules deep is refused.
 - `bhf fuzz --frame <profile.toml>` fuzzes a single-input harness through a
   binary frame descriptor (#328): a `bhf.protocol.v1` profile of one message,
   whose typed fields, lengths, checksums, TLVs and offsets the session lane
