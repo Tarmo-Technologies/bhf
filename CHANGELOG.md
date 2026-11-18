@@ -2853,6 +2853,11 @@
   when bhf panics.
 
 ### Added
+- The bhf-pr action keeps its work between runs (#317): with
+  `corpus-cache` (default on), it restores the corpus, the discovery cache
+  and the stored findings of the newest cache of the PR's branch, else of
+  the base branch, into `corpus-dir` before the run, says what it restored,
+  and saves them after it. Its run step is `scripts/run-bhf.sh`.
 - `bhf ci` replays stored findings against the run's build before it judges
   the run (#318): a finding that still reproduces fails the gate, and one
   that no longer does is reported fixed. A work dir restored from a cache

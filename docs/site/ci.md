@@ -58,6 +58,15 @@ fuzz-confirmed finding.
    links `results/INDEX.md` for the full findings index.
 6. **Enforces the gate** — see below.
 
+With `corpus-cache` on (the default), the action restores the newest cache of
+the PR's branch, else of its base branch, into the work dir before the run: the
+corpus each harness grew (`corpus/`), the discovery cache, and the findings
+the last run stored, which `bhf ci` replays first as
+[regressions](#regression-replay). The log and the job summary say how many
+inputs and findings were restored. It saves them after the run, whatever the
+verdict, under a key of its own (a cache key cannot be overwritten), so each
+run continues the last one.
+
 ## Inputs
 
 | Input | Default | Meaning |
@@ -72,6 +81,8 @@ fuzz-confirmed finding.
 | `upload-sarif` | `true` | Upload SARIF to the code-scanning tab. |
 | `version` | `latest` | bhf release tag to install. |
 | `build-from-source` | `false` | Install from source (`cargo install --git`) instead. |
+| `corpus-cache` | `true` | Restore the work dir's corpus, discovery cache and stored findings from the Actions cache before the run, and save them after it. |
+| `corpus-dir` | `$RUNNER_TEMP/bhf_work` | The work dir bhf runs in and the cache keeps. |
 
 ## Gate policy
 
