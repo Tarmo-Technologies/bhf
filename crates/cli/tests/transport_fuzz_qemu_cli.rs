@@ -984,12 +984,14 @@ fn cli_freertos_hang_times_out_and_the_reset_clears_state() {
 /// #251: a run's target cycles come from a counter the guest keeps, read
 /// before and after the run. QEMU models no `DWT_CYCCNT`, so this reads the
 /// MPS2 FPGAIO `COUNTER` (a 25 MHz up-counter) under `-icount`, where it
-/// advances with the instructions run. Input `0xB0` busy-loops one unit,
-/// `0xB7` eight and `0xBF` sixteen. Each run also counts the delivery and
-/// completion around the loop, a cost that differs between QEMU builds and,
-/// by a few thousand ticks, between boots, so the check is on differences
-/// that span several units: the eight units from `0xB7` to `0xBF` cost about
-/// what the seven from `0xB0` to `0xB7` do, unit for unit.
+/// advances with the instructions run. `sleep=off` keeps host time out of it:
+/// with icount's default `sleep=on`, the clock follows the host while the
+/// guest idles waiting for an input, and a loaded runner added ticks to some
+/// runs (#422). Input `0xB0` busy-loops one unit, `0xB7` eight and `0xBF`
+/// sixteen. Each run also counts the delivery and completion around the
+/// loop, a cost that differs between QEMU builds, so the check is on
+/// differences that span several units: the eight units from `0xB7` to `0xBF`
+/// cost about what the seven from `0xB0` to `0xB7` do, unit for unit.
 #[test]
 fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
     let tmp = tempfile::tempdir().unwrap();
@@ -999,7 +1001,7 @@ fn cli_freertos_target_cycles_grow_with_a_busy_loop() {
     };
     let mut cycles = Vec::new();
     for (tag, byte) in [("one", 0xB0_u8), ("eight", 0xB7), ("sixteen", 0xBF)] {
-        let guest = RtosGuest::boot_with(&elf, dir, tag, None, &["-icount", "shift=0"]);
+        let guest = RtosGuest::boot_with(&elf, dir, tag, None, &["-icount", "shift=0,sleep=off"]);
         let summary = guest.fuzz_with_spec(
             &elf,
             &dir.join(format!("work-{tag}")),

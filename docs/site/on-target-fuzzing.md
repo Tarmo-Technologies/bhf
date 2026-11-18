@@ -462,9 +462,11 @@ run summary's `target_cycles` gives the fewest and most cycles any run took.
 
 QEMU's Cortex-M models do not count `DWT_CYCCNT`, so on an emulator use a
 counter the machine models: on `mps2-an385` the FPGAIO `COUNTER` at
-`0x40028018` counts at 25 MHz, and under `-icount` it advances with the
-instructions run. A counter that never advances is reported once, and the
-deadline falls back to host time.
+`0x40028018` counts at 25 MHz, and under `-icount shift=0,sleep=off` it
+advances with the instructions run, the same count on every run. With
+icount's default `sleep=on` the clock follows host time while the guest
+idles, so a loaded host adds cycles. A counter that never advances is
+reported once, and the deadline falls back to host time.
 
 ```sh
 --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,cycles=0x40028018,cpu_hz=25000000"
