@@ -96,9 +96,8 @@ winget install --id Rustlang.Rustup -e                  # build bhf from source
 ```
 
 Optional per-lane toolchains are needed only for a lane you actually run. See
-the limitations below before installing them: several managed/interpreted lanes
-currently emit POSIX launchers and should be run under WSL/Linux rather than
-native Windows.
+the limitations below before installing them: the Rust and Fortran lanes run
+under WSL/Linux rather than native Windows.
 
 ## Getting `bhf.exe`
 
@@ -760,11 +759,18 @@ cmplog, and ASan all work natively on Windows.
   names another place.
 - The JavaScript and TypeScript lanes run on native Windows with Node (and
   esbuild for TypeScript): their launch spec runs `node` on the driver.
-- Perl, Ruby, Lua, and PHP currently emit POSIX `main` launchers even though
-  discovery is portable. Run those lanes under WSL/Linux for now; installing
-  only the interpreter on native Windows is not sufficient.
-- On native Windows `bhf auto` refuses the lanes that run under WSL (those
-  above, Rust and Fortran) whatever is installed: its toolchain check marks
+- The Perl, Ruby, Lua and PHP lanes run on native Windows with their
+  interpreter on `PATH` (Strawberry Perl, RubyInstaller's Ruby, a Lua 5.3 or
+  later, PHP): each `main` launcher has a launch spec, `PERL5LIB` and the Ruby
+  load path take `;`. Lua cannot put its standard input in binary mode, and
+  on Windows it reads it in text mode (CR LF becomes LF, a Ctrl-Z ends it),
+  so there its driver asks bhf for hex frames: each input is sent as hex
+  digits, which text mode leaves alone. The packaged Windows Lua builds are 5.1:
+  `scripts\ci\install-lua-windows.ps1 -Dest C:\tools\lua54` builds Lua 5.4
+  from lua.org's source with clang. PHP's coverage comes from the `pcov`
+  extension, as on Linux; without it the lane fuzzes without coverage.
+- On native Windows `bhf auto` refuses the lanes that run under WSL (Rust and
+  Fortran) whatever is installed: its toolchain check marks
   each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are
   reported static-only with that reason, pointing at WSL.
 - The persistent fork-server + coverage-guided engine run on Windows the same as

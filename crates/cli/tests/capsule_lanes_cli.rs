@@ -350,10 +350,6 @@ fn typescript_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Ruby runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn ruby_finding_round_trips() {
     skip_unless!(runs("ruby", &["--version"]), "ruby not installed");
     let run = Run::new(&[(
@@ -368,10 +364,6 @@ fn ruby_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Perl runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn perl_finding_round_trips() {
     skip_unless!(runs("perl", &["-v"]), "perl not installed");
     let run = Run::new(&[(
@@ -387,10 +379,6 @@ fn perl_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn php_finding_round_trips() {
     skip_unless!(runs("php", &["--version"]), "php not installed");
     let run = Run::new(&[(
@@ -412,9 +400,9 @@ fn php_finding_round_trips() {
 #[test]
 fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
     let run = Run::new(&[(
-        "parser.php",
-        "<?php\nfunction parse_record(string $text): int {\n    \
-         return intdiv(1000, strlen($text));\n}\n",
+        "parse.f90",
+        "subroutine parse_record(data)\n  implicit none\n  character(len=*), intent(in) :: data\n  \
+         integer :: n\n  n = len(data)\nend subroutine parse_record\n",
     )]);
     let out = run
         .bhf()
@@ -422,15 +410,16 @@ fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
         .arg(&run.src)
         .arg("--work-dir")
         .arg(&run.work)
-        .args(["--languages", "php", "--max-targets", "1", "--jobs", "1"])
+        .args(["--languages", "fortran", "--max-targets", "1", "--jobs", "1"])
         .args(["--per-target-time", "2", "--no-discovery-cache"])
         .output()
         .expect("run bhf auto");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
-            "PHP    (1 targets): NOT ON NATIVE WINDOWS — its harness launcher is a POSIX shell \
-             script; the lane runs under WSL (see docs/site/windows.md)"
+            "(1 targets): NOT ON NATIVE WINDOWS — its crash oracle is gfortran's \
+             AddressSanitizer, and MinGW-w64's GCC ships no sanitizer runtime; the lane runs \
+             under WSL (see docs/site/windows.md)"
         ),
         "{stderr}"
     );
@@ -440,9 +429,9 @@ fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
     assert_eq!(outcome["outcome"], "report_only", "{outcome}");
     assert_eq!(
         outcome["reason"],
-        "the PHP lane does not run on native Windows (its harness launcher is a POSIX shell \
-         script); run it under WSL (see docs/site/windows.md) — discovered and statically \
-         analyzed, not fuzzed",
+        "the Fortran lane does not run on native Windows (its crash oracle is gfortran's \
+         AddressSanitizer, and MinGW-w64's GCC ships no sanitizer runtime); run it under WSL \
+         (see docs/site/windows.md) — discovered and statically analyzed, not fuzzed",
         "{outcome}"
     );
 }

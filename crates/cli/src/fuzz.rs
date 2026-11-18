@@ -9657,6 +9657,28 @@ fn write_input_frame(stdin: &mut impl std::io::Write, input: &[u8]) -> std::io::
     stdin.write_all(&input[..capped])
 }
 
+/// The ready byte of a harness whose standard input stays in text mode
+/// (Lua's on Windows, which no Lua code can switch to binary): the C runtime
+/// turns CR LF into LF and ends the stream at a Ctrl-Z, so every frame it is
+/// sent is hex ([`write_hex_frame`]). Other harnesses send `\x01`.
+const TEXT_FRAMES_READY: u8 = b'H';
+
+/// Write one input as a hex frame, for a harness that asked for them
+/// ([`TEXT_FRAMES_READY`]): the length clamped as [`write_input_frame`]
+/// clamps it, in eight lowercase hex digits, then two per byte. No byte of
+/// it is one a text-mode reader translates.
+fn write_hex_frame(stdin: &mut impl std::io::Write, input: &[u8]) -> std::io::Result<()> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let capped = input.len().min(FRAMED_INPUT_CAP);
+    let mut frame = Vec::with_capacity(8 + 2 * capped);
+    frame.extend(format!("{capped:08x}").into_bytes());
+    for byte in &input[..capped] {
+        frame.push(DIGITS[usize::from(byte >> 4)]);
+        frame.push(DIGITS[usize::from(byte & 0xf)]);
+    }
+    stdin.write_all(&frame)
+}
+
 /// The variable naming the image the runtrace shim records comparisons in.
 const TARGET_EXE_ENV: &str = "BHF_TARGET_EXE";
 
@@ -10938,6 +10960,8 @@ struct ForkServer {
     /// Keeping this on the server prevents its persistent fast path from using a
     /// looser timeout than the per-spawn fallback or the enclosing pass budget.
     run_timeout_ms: i32,
+    /// The harness asked for hex frames ([`TEXT_FRAMES_READY`]).
+    text_frames: bool,
 }
 
 enum ForkOutcome {
@@ -11271,18 +11295,30 @@ fn fork_server_wait_inherits_short_pass_budget() {
 /// overlapped read on Windows), so a reply wakes it at once even on a loaded
 /// machine.
 fn read_sync_byte(stdout: &mut std::process::ChildStdout, timeout: Duration) -> SyncByte {
+    match read_harness_byte(stdout, timeout) {
+        Ok(_) => SyncByte::Received,
+        Err(outcome) => outcome,
+    }
+}
+
+/// [`read_sync_byte`], keeping the byte: the ready byte says how the harness
+/// reads its frames ([`TEXT_FRAMES_READY`]). `Err` is never `Received`.
+fn read_harness_byte(
+    stdout: &mut std::process::ChildStdout,
+    timeout: Duration,
+) -> Result<u8, SyncByte> {
     use std::io::Read;
     #[cfg(windows)]
     if let Some(outcome) = win_pipe::read_byte_within(stdout, timeout) {
         return outcome;
     }
     if !stdout_readable_within(stdout, fork_run_timeout_ms(timeout)) {
-        return SyncByte::TimedOut;
+        return Err(SyncByte::TimedOut);
     }
     let mut byte = [0u8; 1];
     match stdout.read_exact(&mut byte) {
-        Ok(()) => SyncByte::Received,
-        Err(_) => SyncByte::Closed,
+        Ok(()) => Ok(byte[0]),
+        Err(_) => Err(SyncByte::Closed),
     }
 }
 
@@ -11383,7 +11419,7 @@ mod win_pipe {
     pub(super) fn read_byte_within(
         stdout: &std::process::ChildStdout,
         timeout: Duration,
-    ) -> Option<SyncByte> {
+    ) -> Option<Result<u8, SyncByte>> {
         let handle = stdout.as_raw_handle();
         if !is_overlapped(handle) {
             return None;
@@ -11414,7 +11450,7 @@ mod win_pipe {
                 &mut overlapped,
             );
             if started == 0 && GetLastError() != ERROR_IO_PENDING {
-                SyncByte::Closed
+                Err(SyncByte::Closed)
             } else {
                 if started == 0 {
                     let millis = timeout.as_millis().clamp(1, u128::from(u32::MAX - 1)) as u32;
@@ -11424,14 +11460,14 @@ mod win_pipe {
                 }
                 if GetOverlappedResult(handle, &mut overlapped, &mut transferred, 1) != 0 {
                     if transferred == 1 {
-                        SyncByte::Received
+                        Ok(byte)
                     } else {
-                        SyncByte::Closed
+                        Err(SyncByte::Closed)
                     }
                 } else if GetLastError() == ERROR_OPERATION_ABORTED {
-                    SyncByte::TimedOut
+                    Err(SyncByte::TimedOut)
                 } else {
-                    SyncByte::Closed
+                    Err(SyncByte::Closed)
                 }
             }
         };
@@ -11980,19 +12016,21 @@ impl ForkServer {
         // No byte within the timeout means this harness does not speak the framed
         // protocol (a C/libFuzzer harness, a stale build, a test mock) -> bail so
         // the caller uses the per-spawn path.
-        let ready = read_sync_byte(&mut stdout, handshake_timeout);
-        if ready != SyncByte::Received {
-            kill_process_group(&mut child);
-            let _ = child.wait();
-            let _ = fs::remove_file(&events_path);
-            return Err(match ready {
-                SyncByte::TimedOut => {
-                    format!("fork-server: harness sent no ready byte within {handshake_timeout:?}")
-                }
-                _ => "fork-server: harness exited before completing the protocol handshake"
-                    .to_owned(),
-            });
-        }
+        let ready = match read_harness_byte(&mut stdout, handshake_timeout) {
+            Ok(byte) => byte,
+            Err(outcome) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                let _ = fs::remove_file(&events_path);
+                return Err(match outcome {
+                    SyncByte::TimedOut => format!(
+                        "fork-server: harness sent no ready byte within {handshake_timeout:?}"
+                    ),
+                    _ => "fork-server: harness exited before completing the protocol handshake"
+                        .to_owned(),
+                });
+            }
+        };
         Ok(Self {
             child,
             stdin,
@@ -12001,6 +12039,7 @@ impl ForkServer {
             events_offset: 0,
             rss_limit_mb,
             run_timeout_ms: fork_run_timeout_ms(run_timeout),
+            text_frames: ready == TEXT_FRAMES_READY,
         })
     }
 
@@ -12017,10 +12056,12 @@ impl ForkServer {
         // its next Load_From_Stdin once it has flushed this input's events). A
         // broken pipe / EOF means the process died; a timeout means this input
         // hung the persistent process — both isolate via the per-spawn path.
-        if write_input_frame(&mut self.stdin, input)
-            .and_then(|()| self.stdin.flush())
-            .is_err()
-        {
+        let framed = if self.text_frames {
+            write_hex_frame(&mut self.stdin, input)
+        } else {
+            write_input_frame(&mut self.stdin, input)
+        };
+        if framed.and_then(|()| self.stdin.flush()).is_err() {
             return ForkOutcome::Died;
         }
         match self.await_sync_within_rss_limit() {
@@ -12212,6 +12253,39 @@ mod exec_wait_tests {
         let waited = started.elapsed();
         assert!(waited >= Duration::from_secs(1), "{waited:?}");
         assert!(waited < Duration::from_secs(8), "{waited:?}");
+        drop(server);
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// A harness whose ready byte asks for hex frames is sent each input in
+    /// hex digits, so a text-mode reader gets the CR LF and Ctrl-Z intact.
+    #[test]
+    fn a_harness_that_asks_for_hex_frames_is_sent_them() {
+        let work = scratch_dir("hex-frames");
+        let frame = work.join("frame.txt");
+        let harness = script(
+            &work,
+            &format!(
+                "#!/bin/sh\n# BHF_FRAMED\nprintf H\n\
+                 hdr=$(dd bs=1 count=8 2>/dev/null)\n\
+                 dd bs=1 count=$((2 * 0x$hdr)) of='{}' 2>/dev/null\n\
+                 printf '\\001'\nexec sleep 30\n",
+                frame.display()
+            ),
+        );
+        let runner = replay_min::HarnessRunner::direct(harness);
+        let mut server = ForkServer::spawn(
+            &runner,
+            &work,
+            &[],
+            0,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .expect("the harness sends its ready byte");
+        assert!(server.text_frames);
+        assert!(matches!(server.run_one(b"\r\n\x1a"), ForkOutcome::Ran(_)));
+        assert_eq!(fs::read_to_string(&frame).unwrap(), "0d0a1a");
         drop(server);
         let _ = fs::remove_dir_all(&work);
     }
@@ -14131,7 +14205,25 @@ mod parse_sanitizer_args_tests {
 
 #[cfg(test)]
 mod framed_input_tests {
-    use super::{write_input_frame, FRAMED_INPUT_CAP};
+    use super::{write_hex_frame, write_input_frame, FRAMED_INPUT_CAP};
+
+    /// A hex frame carries the bytes a text-mode reader would translate (CR
+    /// LF, Ctrl-Z, NUL) as digits only, after the length in eight.
+    #[test]
+    fn a_hex_frame_spells_every_byte_in_digits() {
+        let mut out: Vec<u8> = Vec::new();
+        write_hex_frame(&mut out, b"\r\n\x1a\x00\xffA").unwrap();
+        assert_eq!(out, b"000000060d0a1a00ff41");
+        let big = vec![0x1au8; FRAMED_INPUT_CAP + 1];
+        out.clear();
+        write_hex_frame(&mut out, &big).unwrap();
+        assert_eq!(
+            &out[..8],
+            b"00100000",
+            "the length is clamped as a binary frame's is"
+        );
+        assert_eq!(out.len(), 8 + 2 * FRAMED_INPUT_CAP);
+    }
 
     #[test]
     fn frame_is_clamped_to_the_harness_buffer_so_the_protocol_stays_aligned() {

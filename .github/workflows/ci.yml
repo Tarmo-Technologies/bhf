@@ -741,7 +741,7 @@ jobs:
       # launch spec beside its POSIX launcher. The image's Python and .NET SDK
       # serve; a JDK, Node and SharpFuzz are installed here, before the
       # integration suites, whose capsule round trips build these lanes too
-      # (the image's default JDK is older than the lane needs).
+      # and should see the toolchains the lanes' own tests use.
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
@@ -760,6 +760,25 @@ jobs:
           # The C# harness restores only from NuGet's global packages folder.
           dotnet new classlib --output "$env:RUNNER_TEMP\sharpfuzz-stage" --force
           dotnet add "$env:RUNNER_TEMP\sharpfuzz-stage" package SharpFuzz --version 2.3.0
+
+      # Perl, Ruby, Lua and PHP on native Windows (#325): the runner's
+      # Strawberry Perl serves; Ruby and PHP come from Chocolatey when the image
+      # has none, and Lua 5.4 is built from lua.org's source (the packaged
+      # Windows builds are 5.1).
+      - name: Install Ruby, PHP and Lua
+        shell: pwsh
+        run: |
+          foreach ($tool in 'ruby', 'php') {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              choco install $tool --yes --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $dir = Get-ChildItem C:\tools -Directory -Filter "$tool*" | Sort-Object Name -Descending | Select-Object -First 1
+              $bin = if ($tool -eq 'ruby') { Join-Path $dir.FullName 'bin' } else { $dir.FullName }
+              Add-Content $env:GITHUB_PATH $bin
+            }
+          }
+          $lua = & scripts\ci\install-lua-windows.ps1 -Dest "$env:RUNNER_TEMP\lua54"
+          Add-Content $env:GITHUB_PATH $lua
 
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
@@ -788,7 +807,7 @@ jobs:
         env:
           BHF_REQUIRE_TOOLS: "1"
         run: |
-          cargo test --locked -p bhf --no-fail-fast --test auto_python_lane --test auto_java_fuzz --test auto_java_file_param --test auto_java_builder --test auto_js_browser_globals --test auto_csharp_source_lines
+          cargo test --locked -p bhf --no-fail-fast --test auto_python_lane --test auto_java_fuzz --test auto_java_file_param --test auto_java_builder --test auto_js_browser_globals --test auto_csharp_source_lines --test auto_perl_lane --test auto_ruby_lane --test auto_lua_lane --test auto_php_lane
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test portable scheduler runtime reliability

@@ -88,10 +88,9 @@ pub fn build_ruby_harness(
         Err(reason) => return RubyBuildResult::Failed { reason, skip: true },
     };
 
-    let target_abs = candidate
-        .source_path
-        .canonicalize()
-        .unwrap_or_else(|_| candidate.source_path.clone());
+    // Without Windows' verbatim `\\?\` prefix, which the interpreter cannot
+    // open there (#325).
+    let target_abs = crate::workdir::plain_canonical(&candidate.source_path);
     let target_dir = target_abs
         .parent()
         .map(Path::to_path_buf)
@@ -123,7 +122,8 @@ pub fn build_ruby_harness(
     // harness (see `generate_harness`) — after ruby startup, so the gem prelude
     // never scans them. Used here only for the build-time `require` smoke test.
     let roots = crate::auto::script_load_roots::module_load_roots(source_root, &target_dir);
-    let load_paths = crate::auto::script_load_roots::join_roots(&roots, ':');
+    let load_paths =
+        crate::auto::script_load_roots::join_roots(&roots, if cfg!(windows) { ';' } else { ':' });
     let harness_src = generate_harness_for_shape(&target_abs, &roots, &call, &[], materialize_file);
     let harness_path = auto_dir.join("bhfgen.rb");
     if let Err(e) = std::fs::write(&harness_path, &harness_src) {
@@ -368,6 +368,30 @@ pub fn build_ruby_harness(
     if let Err(e) = make_executable(&main_path) {
         return RubyBuildResult::Failed {
             reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    // Where `main` cannot run (native Windows, #325): ruby on the driver with
+    // the environment the script sets.
+    let launch = replay_min::Launch {
+        program: ruby.clone(),
+        args: vec!["--disable-gems".to_owned(), driver.display().to_string()],
+        env: vec![
+            ("BHF_HARNESS".to_owned(), harness_path.display().to_string()),
+            ("BHF_TARGET_MODULE".to_owned(), top_module.clone()),
+            (
+                "BHF_TRACE_PREFIX".to_owned(),
+                source_root.display().to_string(),
+            ),
+            (
+                "BHF_COVERED_LINES".to_owned(),
+                auto_dir.join("covered-lines.txt").display().to_string(),
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return RubyBuildResult::Failed {
+            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
             skip: false,
         };
     }

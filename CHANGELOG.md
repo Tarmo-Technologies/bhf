@@ -2853,6 +2853,14 @@
   when bhf panics.
 
 ### Added
+- The Perl, Ruby, Lua and PHP lanes run on native Windows (#325): each `main`
+  launcher has a launch spec, `PERL5LIB` and the Ruby load path take the
+  host's separator, and Perl's driver sends the target's output to the
+  platform's null device. Lua reads its standard input in text mode on
+  Windows, so there its driver asks for hex frames: a harness whose ready
+  byte is `H` is sent each input as hex digits.
+  `scripts/ci/install-lua-windows.ps1` builds Lua 5.4 from lua.org's source,
+  and the Windows CI job runs the four lanes' tests.
 - `bhf fuzz --extension` gives the builtin loop the extension's mutation
   stage (#314): one in four mutated children is the extension's
   `mutator.mutate` of the base the loop picked, within at most 1000 calls and

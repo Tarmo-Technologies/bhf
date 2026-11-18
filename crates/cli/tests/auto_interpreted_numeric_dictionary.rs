@@ -30,6 +30,16 @@ fn have(interpreter: &[&str], probe: &[&str]) -> bool {
 /// `bhf auto` over `file` = `source` fuzzing `tlv_ratio` for 20000 inputs at
 /// the default seed; whether results/findings.json reports a CWE-369 in it.
 fn finds_the_division(lang: &str, file: &str, source: &str) -> (bool, String) {
+    finds_the_division_with(lang, file, source, &[])
+}
+
+/// [`finds_the_division`] with `env` set for bhf and the harness.
+fn finds_the_division_with(
+    lang: &str,
+    file: &str,
+    source: &str,
+    env: &[(&str, &str)],
+) -> (bool, String) {
     let root = TestDir::new(&format!("numeric-dict-{lang}"));
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -41,6 +51,7 @@ fn finds_the_division(lang: &str, file: &str, source: &str) -> (bool, String) {
         .args(["--single-pass", "--iterations", "20000"])
         .args(["--per-target-time", "120"])
         .arg(&src)
+        .envs(env.iter().copied())
         .output()
         .expect("run bhf auto");
     let findings = std::fs::read_to_string(work.join("results/findings.json")).unwrap_or_default();
@@ -66,10 +77,6 @@ fn finds_the_division(lang: &str, file: &str, source: &str) -> (bool, String) {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Ruby runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn ruby_finds_a_division_behind_a_numeric_byte_check() {
     if !have(&["ruby"], &["-e", "1"]) {
         eprintln!("skipping: no ruby on PATH");
@@ -86,31 +93,36 @@ fn ruby_finds_a_division_behind_a_numeric_byte_check() {
     assert!(found, "{log}");
 }
 
+const LUA_TLV: &str = "local M = {}\nfunction M.tlv_ratio(data)\n  \
+                       if data:sub(1, 2) ~= \"RT\" or #data < 4 then return 0 end\n  \
+                       return 100 // (data:byte(4) - 48)\nend\nreturn M\n";
+
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Lua runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn lua_finds_a_division_behind_a_numeric_byte_check() {
     if !have(&["lua", "lua5.4"], &["-e", "assert(math.type)"]) {
         eprintln!("skipping: no lua 5.3+ on PATH");
         return;
     }
-    let (found, log) = finds_the_division(
-        "lua",
-        "tlv.lua",
-        "local M = {}\nfunction M.tlv_ratio(data)\n  \
-         if data:sub(1, 2) ~= \"RT\" or #data < 4 then return 0 end\n  \
-         return 100 // (data:byte(4) - 48)\nend\nreturn M\n",
-    );
+    let (found, log) = finds_the_division("lua", "tlv.lua", LUA_TLV);
     assert!(found, "{log}");
 }
 
+/// The hex frames Lua's driver asks for on Windows, where its stdin is in
+/// text mode, keep the fork-server's speed and coverage: the same 20000
+/// inputs find the division over them.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
-)]
+fn lua_finds_the_division_over_hex_frames() {
+    if !have(&["lua", "lua5.4"], &["-e", "assert(math.type)"]) {
+        eprintln!("skipping: no lua 5.3+ on PATH");
+        return;
+    }
+    let (found, log) =
+        finds_the_division_with("lua", "tlv.lua", LUA_TLV, &[("BHF_TEXT_FRAMES", "1")]);
+    assert!(found, "{log}");
+    assert!(!log.contains("ZERO coverage edges"), "{log}");
+}
+
+#[test]
 fn php_finds_a_division_behind_a_numeric_byte_check() {
     if !have(&["php"], &["-r", "echo 1;"]) {
         eprintln!("skipping: no php on PATH");

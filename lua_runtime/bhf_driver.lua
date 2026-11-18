@@ -20,7 +20,15 @@ local LINE_IDS = 1 << 24                         -- covered key: chunk id * LINE
 local cov = {}                                   -- sparse byte map: idx -> count
 local dirty = {}                                 -- indices changed since last flush
 local cov_prev = 0
-local cov_prefix = os.getenv("BHF_TRACE_PREFIX") or ""
+-- On Windows a chunk's path may spell the prefix with the other separator
+-- (the target loads from a `/` package path) or another case, so both are
+-- compared in one spelling there.
+local windows = package.config:sub(1, 1) == "\\"
+local function path_key(path)
+  if not windows then return path end
+  return (path:gsub("\\", "/"):lower())
+end
+local cov_prefix = path_key(os.getenv("BHF_TRACE_PREFIX") or "")
 local covered = {}                               -- covered key -> true
 local covered_dumped = 0
 local file_sized = false
@@ -44,7 +52,7 @@ local function chunk_of(source)
   id = false
   if source and source:sub(1, 1) == "@" and not own_sources[source] then
     local path = source:sub(2)
-    if cov_prefix == "" or path:sub(1, #cov_prefix) == cov_prefix then
+    if cov_prefix == "" or path_key(path):sub(1, #cov_prefix) == cov_prefix then
       id = #chunk_path + 1
       chunk_path[id] = path
       chunk_hash[id] = fnv_prefix(path)
@@ -363,26 +371,43 @@ hook_on()
 run_one = assert(dofile(harness), "harness did not return a run_one function")
 hook_off()
 
+-- Lua cannot switch its stdin to binary mode, and on Windows it reads in
+-- text mode (CR LF becomes LF, a Ctrl-Z ends the stream). There the launcher
+-- sets BHF_TEXT_FRAMES, and the ready byte "H" asks the engine for hex
+-- frames: the length in eight hex digits, then two per byte.
+local text_frames = os.getenv("BHF_TEXT_FRAMES") == "1"
+
+local function from_hex(digits)
+  return (digits:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
+end
+
 if os.getenv("BHF_FRAMED") then
-  -- Save the control pipe (fd 1) then redirect stdout/print to /dev/null so the
-  -- target's output can't corrupt the sync stream (#427).
+  -- Save the control pipe (fd 1) then redirect stdout/print to the null
+  -- device so the target's output can't corrupt the sync stream (#427).
   control = io.stdout
   control:setvbuf("no")
-  local devnull = io.open("/dev/null", "w")
+  local devnull = io.open("/dev/null", "w") or io.open("NUL", "w")
   if devnull then
     io.output(devnull)
     io.stdout = devnull
   end
   _G.print = function() end
   io.stdin:setvbuf("no")
-  control:write("\1") -- ready byte
+  control:write(text_frames and "H" or "\1") -- ready byte
   local count = 0
   while true do
-    local hdr = read_exact(4)
+    local hdr = read_exact(text_frames and 8 or 4)
     if not hdr then break end
-    local n = string.unpack("<I4", hdr)
-    local data = n > 0 and read_exact(n) or ""
+    local n
+    if text_frames then
+      n = tonumber(hdr, 16)
+      if not n then break end
+    else
+      n = string.unpack("<I4", hdr)
+    end
+    local data = n > 0 and read_exact(text_frames and 2 * n or n) or ""
     if not data then break end
+    if text_frames then data = from_hex(data) end
     run_input(data)
     flush_cov()
     control:write("\1") -- sync byte
