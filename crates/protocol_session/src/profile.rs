@@ -12,6 +12,11 @@
 //! response-condition / violation-state oracles that flag a security violation
 //! which exits cleanly (no crash).
 //!
+//! A profile's `kind` says what its messages are: `binary` (the default)
+//! lays each message out field by field, and `giop` makes each a GIOP 1.2
+//! Request whose fields are the operation's IDL-typed arguments (see
+//! [`crate::giop`]).
+//!
 //! Parsing is total and every rejection names the offender: an unknown schema,
 //! a duplicate message name, a dangling response reference, or malformed TOML
 //! each return a distinct [`ProfileError`] variant rather than a silent `None`.
@@ -28,21 +33,46 @@ pub const SCHEMA_V1: &str = "bhf.protocol.v1";
 pub const DEFAULT_MAX_MESSAGES: usize = 64;
 
 /// Declared type of a message field (or a response capture).
+///
+/// The IDL spellings of the types of the same size are accepted for them, so
+/// a `giop` profile can give its fields their IDL types: `octet`, `boolean`
+/// and `char` are `u8`, `short` and `unsigned short` are `u16`, `long` and
+/// `unsigned long` are `u32`, and `sequence<octet>` is `bytes`. A signed
+/// type's value is its two's complement at its width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
     /// Opaque, possibly variable-length bytes (bounded by `max`).
+    #[serde(alias = "sequence<octet>")]
     Bytes,
     /// Unsigned 8-bit integer.
+    #[serde(alias = "octet", alias = "boolean", alias = "char")]
     U8,
     /// Unsigned 16-bit integer.
+    #[serde(alias = "short", alias = "unsigned short")]
     U16,
     /// Unsigned 32-bit integer.
+    #[serde(alias = "long", alias = "unsigned long")]
     U32,
     /// A symbolic enumeration mapped to an integer code.
     Enum,
     /// A tag-length-value record (its length is computed).
     Tlv,
+    /// A CDR `string`, in a `giop` profile: bytes (bounded by `max`) that
+    /// marshal with their length and a NUL.
+    String,
+}
+
+/// What a profile's messages are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    /// Each message is laid out field by field, as its fields declare.
+    #[default]
+    Binary,
+    /// Each message is a GIOP 1.2 Request: its fields are the operation's
+    /// in parameters, marshalled in CDR (see [`crate::giop`]).
+    Giop,
 }
 
 /// Byte order for a multi-byte field.
@@ -91,14 +121,18 @@ pub struct FieldDef {
     pub value: Option<toml::Value>,
 }
 
-/// One response capture: a typed slice of the reply bytes at a fixed offset.
+/// One response capture: a typed slice of the reply bytes at a fixed offset,
+/// or, in a `giop` profile, a value of the GIOP Reply.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CaptureDef {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: FieldType,
-    /// Byte offset of the captured value within the reply.
-    pub at: usize,
+    /// Byte offset of the captured value within the reply. A binary
+    /// profile's captures need it; a `giop` profile's read the reply's
+    /// values in order and take none.
+    #[serde(default)]
+    pub at: Option<usize>,
     #[serde(default)]
     pub endian: Option<ByteOrder>,
     /// Byte length for a `bytes` capture.
@@ -140,6 +174,14 @@ pub struct MessageDef {
     /// Upper bound on the encoded frame size (bytes).
     #[serde(default)]
     pub max_len: Option<usize>,
+    /// In a `giop` profile, the operation the request invokes (the message's
+    /// name when absent).
+    #[serde(default)]
+    pub operation: Option<String>,
+    /// In a `giop` profile, the object key the request addresses, when it is
+    /// not the `[giop]` table's.
+    #[serde(default)]
+    pub object_key: Option<String>,
     #[serde(default, rename = "field")]
     pub fields: Vec<FieldDef>,
     #[serde(default)]
@@ -199,6 +241,10 @@ pub struct OracleDef {
 struct RawProfile {
     schema: String,
     #[serde(default)]
+    kind: ProfileKind,
+    #[serde(default)]
+    giop: Option<crate::giop::GiopDef>,
+    #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
     max_messages: Option<usize>,
@@ -220,6 +266,8 @@ struct RawProfile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     schema: String,
+    kind: ProfileKind,
+    giop: Option<crate::giop::GiopDef>,
     transport: Option<String>,
     max_messages: usize,
     start_state: String,
@@ -273,6 +321,13 @@ impl Profile {
             }
         }
 
+        // GIOP's keys belong to a giop profile, whose messages GIOP frames.
+        if raw.kind == ProfileKind::Binary {
+            if let Some(key) = giop_key(&raw) {
+                return Err(ProfileError::NotGiop { key });
+            }
+        }
+
         // Resolve the start state: explicit `start`, else the `from` of the
         // first transition, else a synthetic default.
         let start_state = raw
@@ -280,16 +335,27 @@ impl Profile {
             .or_else(|| raw.transition.first().map(|t| t.from.clone()))
             .unwrap_or_else(|| "start".to_owned());
 
+        let framing = match raw.kind {
+            ProfileKind::Binary => raw.framing.unwrap_or_default().resolve(),
+            ProfileKind::Giop => match raw.framing {
+                None => Ok(crate::framing::Framing::Giop),
+                Some(framing) => framing.resolve().and_then(|framing| match framing {
+                    crate::framing::Framing::Giop => Ok(framing),
+                    other => Err(format!(
+                        "a giop profile's messages are framed by their GIOP header, not {}",
+                        other.label()
+                    )),
+                }),
+            },
+        }
+        .map_err(|reason| ProfileError::BadFraming { reason })?;
         let max_messages = raw.max_messages.unwrap_or(DEFAULT_MAX_MESSAGES);
-        let framing = raw
-            .framing
-            .unwrap_or_default()
-            .resolve()
-            .map_err(|reason| ProfileError::BadFraming { reason })?;
         let source_sha256 = hex_sha256(source.as_bytes());
 
         Ok(Self {
             schema: raw.schema,
+            kind: raw.kind,
+            giop: raw.giop,
             transport: raw.transport,
             max_messages,
             start_state,
@@ -304,6 +370,16 @@ impl Profile {
 
     pub fn schema(&self) -> &str {
         &self.schema
+    }
+
+    /// What the profile's messages are.
+    pub fn kind(&self) -> ProfileKind {
+        self.kind
+    }
+
+    /// A `giop` profile's `[giop]` table.
+    pub fn giop(&self) -> Option<&crate::giop::GiopDef> {
+        self.giop.as_ref()
     }
 
     pub fn transport(&self) -> Option<&str> {
@@ -348,6 +424,21 @@ impl Profile {
     pub fn profile_sha256(&self) -> &str {
         &self.source_sha256
     }
+}
+
+/// The first GIOP key a binary profile gives, named for a diagnostic.
+fn giop_key(raw: &RawProfile) -> Option<String> {
+    if raw.giop.is_some() {
+        return Some("[giop]".to_owned());
+    }
+    raw.message.iter().find_map(|message| {
+        let key = match (&message.operation, &message.object_key) {
+            (Some(_), _) => "operation",
+            (None, Some(_)) => "object_key",
+            (None, None) => return None,
+        };
+        Some(format!("message {}'s `{key}`", message.name))
+    })
 }
 
 fn validate_reference(
@@ -400,6 +491,8 @@ pub enum ProfileError {
     BadReference { field: String, reference: String },
     #[error("bad [framing] in protocol profile: {reason}")]
     BadFraming { reason: String },
+    #[error("{key} applies to a giop profile only (kind = \"giop\")")]
+    NotGiop { key: String },
 }
 
 #[cfg(test)]
@@ -439,7 +532,7 @@ mod tests {
         let handle = &response.captures[0];
         assert_eq!(handle.name, "handle");
         assert_eq!(handle.ty, FieldType::U32);
-        assert_eq!(handle.at, 0);
+        assert_eq!(handle.at, Some(0));
 
         // WRITE.handle : u32 ref OPEN.response.handle
         let write = profile.message("WRITE").expect("WRITE present");

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The servant interface of the session lane's GIOP test server (#315), which
+// giop-warehouse.toml drives. open_bin returns a bin's handle; store and count
+// take it back.
+module Inventory {
+  interface Warehouse {
+    unsigned long open_bin(in string label);
+    long store(in unsigned long bin, in unsigned short slot, in long quantity);
+    long count(in unsigned long bin, in unsigned short slot);
+  };
+};

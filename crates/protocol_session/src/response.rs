@@ -8,12 +8,29 @@
 //! a reply too short for a capture yields [`ResponseError::Truncated`] with the
 //! byte counts, and an enum value with no matching symbol yields
 //! [`ResponseError::OutOfRange`] — never a panic and never a silent default.
+//! A `giop` message's reply is a GIOP Reply, whose values [`extract_reply`]
+//! reads in order (see [`crate::giop`]).
 
 use fuzz_engine_builtin::{Endian, IntWidth};
 
 use crate::binding::BoundValue;
 use crate::model::CaptureSpec;
-use crate::model::CompiledCapture;
+use crate::model::{CompiledCapture, CompiledMessage};
+
+/// Extract every response capture of `message` from `reply`: the values of
+/// its GIOP Reply for a `giop` message, and the slices at the captures'
+/// offsets otherwise.
+pub fn extract_reply(
+    message: &CompiledMessage,
+    reply: &[u8],
+) -> Result<Vec<(String, BoundValue)>, ResponseError> {
+    match &message.giop {
+        Some(request) => {
+            crate::giop::extract_reply(&message.name, request, &message.response, reply)
+        }
+        None => extract(&message.name, &message.response, reply),
+    }
+}
 
 /// Extract every response capture of `message` from `reply`, returning
 /// `(source_key, value)` pairs where `source_key` is `MSG.response.NAME` — the
@@ -25,14 +42,25 @@ pub fn extract(
 ) -> Result<Vec<(String, BoundValue)>, ResponseError> {
     let mut out = Vec::with_capacity(captures.len());
     for capture in captures {
-        let value = extract_one(capture, reply)?;
+        let value = extract_one(message, capture, reply)?;
         out.push((format!("{message}.response.{}", capture.name), value));
     }
     Ok(out)
 }
 
-fn extract_one(capture: &CompiledCapture, reply: &[u8]) -> Result<BoundValue, ResponseError> {
+fn extract_one(
+    message: &str,
+    capture: &CompiledCapture,
+    reply: &[u8],
+) -> Result<BoundValue, ResponseError> {
     match &capture.spec {
+        CaptureSpec::Giop { .. } => Err(ResponseError::Giop {
+            message: message.to_owned(),
+            reason: format!(
+                "capture {:?} reads a GIOP reply, which extract_reply reads",
+                capture.name
+            ),
+        }),
         CaptureSpec::Int { width, endian } => {
             let value = read_uint(reply, capture.at, *width, *endian, &capture.name)?;
             Ok(BoundValue::Int { value })
@@ -158,6 +186,9 @@ pub enum ResponseError {
     OutOfRange { field: String, value: u64 },
     #[error("tlv response capture {field:?} found no record{}", tag.map(|tag| format!(" with tag {tag}")).unwrap_or_default())]
     TlvNotFound { field: String, tag: Option<u64> },
+    /// A `giop` message's reply is not the GIOP Reply its captures read.
+    #[error("the reply to giop message {message}: {reason}")]
+    Giop { message: String, reason: String },
 }
 
 #[cfg(test)]

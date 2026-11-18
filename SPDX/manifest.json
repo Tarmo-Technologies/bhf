@@ -3351,6 +3351,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/session_giop_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/session_reference_profiles_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/session_runtime_oracles_cli.rs",
       "license": "Apache-2.0"
     },
@@ -4403,6 +4411,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/protocol_session/src/giop.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/protocol_session/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4435,7 +4447,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/protocol_session/tests/fixtures/giop-warehouse.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/protocol_session/tests/fixtures/toy-open-write.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/tests/reference_profiles.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5692,6 +5712,22 @@
     },
     {
       "path": "examples/swallowed_constraint_error/pkg.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/coap.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/modbus-tcp.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/mqtt-3.1.1.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/rtps.toml",
       "license": "Apache-2.0"
     },
     {

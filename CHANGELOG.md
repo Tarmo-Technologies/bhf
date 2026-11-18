@@ -3014,6 +3014,20 @@
   reproduces with that build; a harness whose CFI build fails is named.
   `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
   no lane of the run could observe in its C/C++ targets, and what would.
+- A protocol profile of `kind = "giop"` drives a CORBA servant (#315):
+  every message is a GIOP 1.2 Request, its fields the operation's `in`
+  parameters at their IDL types (`octet`, `boolean`, `short`, `long`, their
+  unsigned forms, `enum`, `string`, `sequence<octet>`), marshalled in CDR by
+  the `iiop` crate, which no command used before, and sent over the session
+  lane's TCP transport. A `[giop]` table gives the object key and byte
+  order; replies are framed by their GIOP header (`framing = "giop"`) and
+  must answer the request's id, and a capture reads the Reply's
+  `reply_status` or `request_id` or the next value of its body, so a
+  captured handle can be passed to a later operation. The `iiop` crate
+  gains a GIOP 1.2 Reply encoder and a CDR string from raw bytes. A test
+  fixture server built on `iiop` has a servant that crashes on a store into
+  a slot past a bin's, behind an `open_bin` handle; the campaign finds it as
+  a dropped session at that store, which `bhf replay` reproduces.
 - Reference protocol profiles for CoAP and RTPS/DDS over UDP (#372), in
   `profiles/protocols/coap.toml` and `rtps.toml`, for the session lane's
   `udp:` backend. The CoAP session discovers `/.well-known/core`, reads

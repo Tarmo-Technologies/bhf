@@ -14,6 +14,8 @@ path = "src/lib.rs"
 [dependencies]
 ada_state_machine = { path = "../ada_state_machine" }
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
+# GIOP framing and CDR marshalling for a `kind = "giop"` profile (#315).
+iiop = { path = "../iiop" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -22,3 +24,5 @@ toml = { workspace = true }
 
 [dev-dependencies]
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
+# The giop tests decode the requests a profile encodes against the IDL.
+idl_parser = { path = "../idl_parser" }

@@ -16,7 +16,8 @@
 //!   an [`idl_args::IdlOperationCatalog`].
 //! * [`encode`] (HDF-7) — the previously-missing inverse: [`encode::CdrWriter`]
 //!   and [`encode::encode_request_1_2`] turn structured values into a well-formed
-//!   GIOP 1.2 `Request` frame that decodes back byte-for-byte.
+//!   GIOP 1.2 `Request` frame that decodes back byte-for-byte, and
+//!   [`encode::encode_reply_1_2`] builds the `Reply` a servant answers with.
 //! * [`dispatch`] (HDF-7) — [`dispatch::Dispatcher`] wires decode → IDL-typed
 //!   args → a [`dispatch::Servant`] call ([`dispatch::Dispatcher::handle_frame`]),
 //!   so raw fuzz bytes that form a valid GIOP request reach a servant operation.
@@ -29,17 +30,20 @@
 //! encoder builds decodes through [`giop::read_request_1_2`] and dispatches to a
 //! fake servant with the expected IDL-typed arguments.
 //!
+//! # Where it is used
+//!
+//! The session lane's `giop` protocol profiles (`kind = "giop"` in the
+//! `protocol_session` crate, #315) marshal each message as a GIOP 1.2 Request
+//! with [`encode`], frame replies by their [`giop`] header, and read the
+//! values of each Reply with [`giop::read_reply_1_2`]; `bhf fuzz
+//! --protocol-profile` sends them over its TCP session transport.
+//!
 //! # What this is NOT (honest scope)
 //!
-//! * **Library capability only — not CLI-reachable.** No `bhf` subcommand
-//!   consumes this crate; it is not listed as a dependency of any other crate
-//!   (verified: only `crates/iiop/Cargo.toml` names it). A fuzz harness can call
-//!   [`dispatch::Dispatcher::handle_frame`] directly, but there is no wired
-//!   `bhf fuzz`/discovery path that feeds it corpus bytes yet. Wiring it to the
-//!   engine's binary-framed input model is the remaining HDF-7 follow-up.
-//! * **No live ORB and no network transport.** The "transport" is an in-memory
-//!   frame queue; there is no socket/IIOP-over-TCP driver here. Marshalling
-//!   fidelity is bounded to what [`cdr`]/[`giop`] implement, not a full ORB.
+//! * **No live ORB.** The crate owns no socket: [`dispatch::InMemoryTransport`]
+//!   is an in-memory frame queue, and the session lane's transport lives in
+//!   the `bhf` crate. Marshalling fidelity is bounded to what [`cdr`]/[`giop`]
+//!   implement, not a full ORB.
 
 pub mod cdr;
 pub mod dispatch;

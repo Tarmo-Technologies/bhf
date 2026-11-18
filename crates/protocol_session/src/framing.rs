@@ -12,7 +12,7 @@
 //! ```toml
 //! [framing]
 //! kind = "length_prefix"   # raw (the default) | length_prefix | length_field
-//!                          # | delimiter | fixed
+//!                          # | delimiter | fixed | giop
 //! width = 2                # length_prefix: 1, 2 or 4 bytes; length_field:
 //!                          # those or "varint"
 //! endian = "big"           # length_prefix, length_field: big or little
@@ -28,7 +28,8 @@
 //! header (a variable byte integer at byte 1) do: the profile computes the
 //! field like any other `length(..)`, the transport writes the request as it
 //! is, and a reply is the whole message, header included, so captures index
-//! it from its first byte.
+//! it from its first byte. A `giop` message's 12-byte GIOP header gives its
+//! size in the byte order its flags declare; it is a `giop` profile's framing.
 //!
 //! This module owns no socket: a transport feeds the bytes it has read to
 //! [`Framing::take_reply`] until a reply is complete.
@@ -67,6 +68,9 @@ pub enum Framing {
     /// Every message is `size` bytes: a shorter request is padded with zeros
     /// and a longer one cut to `size`.
     Fixed { size: usize },
+    /// Each message is a GIOP message, whose header gives its size. A
+    /// request is written as it is, and a reply is the whole message.
+    Giop,
 }
 
 impl Default for Framing {
@@ -115,7 +119,9 @@ impl Framing {
     pub fn encode(&self, message: &[u8]) -> Result<Vec<u8>, FramingError> {
         match self {
             // A length field is the message's own, which the profile computes.
-            Framing::Raw { .. } | Framing::LengthField { .. } => Ok(message.to_vec()),
+            Framing::Raw { .. } | Framing::LengthField { .. } | Framing::Giop => {
+                Ok(message.to_vec())
+            }
             Framing::LengthPrefix {
                 width,
                 endian,
@@ -254,6 +260,30 @@ impl Framing {
                 },
                 None => ReplyProgress::NeedMore,
             },
+            Framing::Giop => {
+                let Some(header) = buffered.get(..iiop::giop::HEADER_LEN) else {
+                    return ReplyProgress::NeedMore;
+                };
+                let body = match iiop::giop::parse_header(header) {
+                    Ok(header) => header.body_len as usize,
+                    Err(error) => {
+                        return ReplyProgress::Invalid(format!("not a GIOP message: {error}"))
+                    }
+                };
+                if body > max {
+                    return ReplyProgress::Invalid(format!(
+                        "reply length {body} exceeds the {max}-byte cap"
+                    ));
+                }
+                let end = iiop::giop::HEADER_LEN + body;
+                match buffered.get(..end) {
+                    Some(reply) => ReplyProgress::Complete {
+                        reply: reply.to_vec(),
+                        consumed: end,
+                    },
+                    None => ReplyProgress::NeedMore,
+                }
+            }
         }
     }
 
@@ -330,6 +360,7 @@ impl Framing {
                     .collect::<String>()
             ),
             Framing::Fixed { size } => format!("fixed({size})"),
+            Framing::Giop => "giop".to_owned(),
         }
     }
 }
@@ -479,6 +510,14 @@ impl FramingDef {
                     delimiter: delimiter.as_bytes().to_vec(),
                 }
             }
+            "giop" => {
+                unused(&prefix_keys)?;
+                unused(&[
+                    ("delimiter", self.delimiter.is_some()),
+                    ("size", self.size.is_some()),
+                ])?;
+                Framing::Giop
+            }
             "fixed" => {
                 unused(&prefix_keys)?;
                 unused(&[("delimiter", self.delimiter.is_some())])?;
@@ -491,7 +530,7 @@ impl FramingDef {
             other => {
                 return Err(format!(
                     "unknown framing kind {other:?}; expected raw, length_prefix, length_field, \
-                     delimiter or fixed"
+                     delimiter, fixed or giop"
                 ))
             }
         };
@@ -719,6 +758,55 @@ mod tests {
     }
 
     #[test]
+    fn a_giop_header_ends_the_message_in_either_byte_order() {
+        let giop = resolve("kind = \"giop\"").unwrap();
+        assert_eq!(giop.label(), "giop");
+        let big = iiop::encode::Reply12::new(1, iiop::giop::ReplyStatus::NoException)
+            .with_endian(iiop::cdr::Endianness::Big)
+            .with_body(vec![iiop::encode::CdrValue::ULong(7)])
+            .encode()
+            .unwrap();
+        assert_eq!(
+            giop.encode(&big).unwrap(),
+            big,
+            "a request is its own message"
+        );
+        let little = iiop::encode::Reply12::new(2, iiop::giop::ReplyStatus::NoException)
+            .encode()
+            .unwrap();
+        assert_eq!(giop.take_reply(&big[..11], 64), ReplyProgress::NeedMore);
+        assert_eq!(
+            giop.take_reply(&big[..big.len() - 1], 64),
+            ReplyProgress::NeedMore
+        );
+        let mut both = big.clone();
+        both.extend_from_slice(&little);
+        assert_eq!(
+            giop.take_reply(&both, 64),
+            ReplyProgress::Complete {
+                reply: big.clone(),
+                consumed: big.len()
+            }
+        );
+        assert_eq!(
+            giop.take_reply(&little, 64),
+            ReplyProgress::Complete {
+                reply: little.clone(),
+                consumed: little.len()
+            },
+            "a little-endian header's size"
+        );
+        let ReplyProgress::Invalid(reason) = giop.take_reply(b"HTTP/1.1 200", 64) else {
+            panic!("not a GIOP message");
+        };
+        assert!(reason.contains("bad GIOP magic"), "{reason}");
+        assert!(matches!(
+            giop.take_reply(&big, 4),
+            ReplyProgress::Invalid(_)
+        ));
+    }
+
+    #[test]
     fn a_framing_table_that_does_not_add_up_is_refused() {
         for (table, expected) in [
             ("kind = \"length_prefix\"\nwidth = 3", "expected 1, 2 or 4"),
@@ -757,6 +845,7 @@ mod tests {
                 "expected 1, 2 or 4",
             ),
             ("offset = 1", "`offset` does not apply"),
+            ("kind = \"giop\"\nwidth = 4", "`width` does not apply"),
             ("kind = \"cobs\"", "unknown framing kind"),
             ("reply_idle_ms = 0", "at least 1"),
             ("knd = \"raw\"", "unknown field"),

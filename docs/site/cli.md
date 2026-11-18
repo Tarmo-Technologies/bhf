@@ -1482,7 +1482,7 @@ so a run whose crashes were all known does not read as clean.
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
-- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1 over TCP and CoAP and RTPS/DDS over UDP.
+- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1 over TCP and CoAP and RTPS/DDS over UDP, and a `kind = "giop"` profile sends [GIOP requests](#giop-profiles) to an IIOP endpoint.
 - `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. `serial:PATH[,baud=N]` drives a UART or a pty, opened raw as the agent's `serial:` transport is (no echo, line editing or newline translation; 8N1, no flow control), at baud `N` when given; requests and replies are framed as the profile says, and `--session-reset reconnect` reopens the device while `none` keeps it open. `transport:TARGET-TRANSPORT-SPEC` drives a session through a `--target-transport` backend (`transport:agent:tcp:HOST:PORT`, `transport:gdb:HOST:PORT` with `--transport-coverage-map`, …): each message is one execution on the target, a fault, a crash or a hang ends the session at that message, and the executions' edges feed the code channel. A reply is the backend's stdout, which the agent backends do not have, so a profile over them captures nothing from replies. `--session-reset reconnect` arms a fresh target session for each protocol session; `none` keeps one armed. See [On-target fuzzing](on-target-fuzzing.md#3d-protocol-sessions-on-the-target). Required with `--protocol-profile`.
 - `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
@@ -1643,6 +1643,62 @@ broker must, has the session lane record each such session as dropped (a
 `session-disconnect` finding, see below). Run under `--session-server-cmd`,
 a server that crashes is a `session-server-crash` or `session-server-exit`
 finding instead, which a close is not.
+
+#### GIOP profiles
+
+A profile with `kind = "giop"` makes every message a GIOP 1.2 Request, for
+an IIOP endpoint over `--session-transport tcp:HOST:PORT`. The `[giop]`
+table gives the `object_key` the requests address (a message can give its
+own) and their `endian` (`big`, the default, or `little`). A message's
+`operation` is the operation it invokes (its name by default), and its
+fields are the operation's `in` parameters, in order, at their IDL types:
+`octet`, `boolean`, `char`, `short`, `unsigned short`, `long`, `unsigned
+long`, `enum` (marshalled as an unsigned long), `string` and
+`sequence<octet>`; a signed type's seed may be negative, and a field may be a
+`ref` to a captured value. bhf marshals them in CDR with its `iiop` crate,
+so a giop message has no computed or `tlv` fields: CDR carries its own
+lengths. Each reply is framed by its GIOP header (the summary's `framing` is
+`giop`) and must be the Reply to the request's id. A capture named
+`reply_status` or `request_id` reads that field of the Reply header, and
+every other capture reads the next value of the body (the result, then the
+out parameters), so a capture takes no `at`. A body capture needs a reply
+with no exception; a `reply_status` enum of `{ no_exception = 0 }` has only
+such a reply advance the session.
+
+```toml
+kind = "giop"
+
+[giop]
+object_key = "Warehouse"
+
+[[message]]
+name = "STORE"
+operation = "store"
+
+[[message.field]]
+name = "bin"
+type = "unsigned long"
+ref = "OPEN_BIN.response.bin"
+
+[[message.field]]
+name = "slot"
+type = "unsigned short"
+value = 1
+
+[message.response]
+[[message.response.capture]]
+name = "reply_status"
+type = "enum"
+variants = { no_exception = 0 }
+
+[[message.response.capture]]
+name = "stocked"
+type = "long"
+```
+
+A servant that crashes on a request takes its connection with it, which the
+session lane records as a dropped session (a `session-disconnect` finding at
+that message).
 
 A response capture of `type = "tlv"` takes the value of a tag-length-value
 record in the reply: the records from `at` are walked until one has `tag`
