@@ -2839,6 +2839,19 @@
   when bhf panics.
 
 ### Added
+- Board profiles (#293): `bhf fuzz --board-profile board.toml` takes
+  `--target-transport` and `--transport-coverage-map` from a TOML file of one
+  board's specs, its debug-probe lane (`gdb`, `coverage_map`) or, with
+  `--board-lane serial`, the agent on its UART (`serial`); each spec is
+  checked when the file is read. `docs/hil-boards/nucleo-f411re.toml` is the
+  template and `docs/hil-bringup.md` now lists each bring-up step with its
+  expected output. The `gdb:` transport takes the completion contract of
+  `qemu-system:` (`done=`, `fault=` and their widths and kinds) and
+  `reset=restart|monitor:CMD`, since QEMU's system gdbstub refuses the `R`
+  restart and a board resets by `monitor reset halt`. `tests/hil_board.rs`
+  reads a profile (`BHF_HIL_PROFILE`) and runs against a QEMU stand-in that
+  starts as a board does, and the reference agent's `--pty` mode serves a
+  pseudo-terminal for the serial lane; the hil-emu lane runs both (RV-6).
 - Semihosting coverage for the `gdb` and `qemu-system` transports (#292):
   with `coverage=semihosting` in `--transport-coverage-map` (and no ring
   keys), each run's coverage is the event stream the `semihosting` probe

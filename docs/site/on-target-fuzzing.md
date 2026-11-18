@@ -266,6 +266,30 @@ bhf fuzz bhf_work --harness H-C0001 \
   --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
 
+Each input starts from a reset. A board takes the same completion contract as
+`qemu-system:` (§3b) and says how it resets:
+
+- `done=<addr>[,done_kind=<n>]` and `fault=<addr>[,fault_width=4,fault_clear=0]`
+  — the completion breakpoint, planted once when the run starts, and the
+  firmware fault-status word, cleared before each input and read after it.
+- `reset=restart` (the default) sends the RSP `R` restart, as gdbserver and
+  OpenOCD serve it. `reset=monitor:<command>` runs a monitor command instead:
+  `monitor:reset halt` on OpenOCD or a J-Link, `monitor:system_reset` on QEMU,
+  whose system gdbstub refuses `R`.
+
+```sh
+bhf fuzz bhf_work --harness H-BOARD \
+  --target-transport "gdb:127.0.0.1:3333,done=0x08000200,fault=0x20000208,reset=monitor:reset halt" \
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000000,write=0x20000200,wrapped=0x20000204,cap=512
+```
+
+A **board profile** keeps a board's specs in one file:
+`bhf fuzz --board-profile board.toml` takes `--target-transport` and
+`--transport-coverage-map` from its `gdb` and `coverage_map`, and
+`--board-lane serial` takes `--target-transport` from its `serial` (the agent
+on the board's UART). `docs/hil-boards/nucleo-f411re.toml` is the template and
+`docs/hil-bringup.md` the bring-up, step by step.
+
 ### 3b. Full-system emulator (`qemu-system:qmp=…,gdb=…[,snapshot=TAG]`)
 
 The flagship path: boot a `qemu-system-*` guest, attach QMP + gdb, take a

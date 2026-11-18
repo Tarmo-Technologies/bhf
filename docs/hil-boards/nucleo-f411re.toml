@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A board profile (#293): one board's transport contract, as `bhf fuzz
+# --board-profile` and `tests/hil_board.rs` (BHF_HIL_PROFILE) read it. Each
+# value is the spec the matching `bhf fuzz` flag takes; see
+# docs/hil-bringup.md for the bring-up that fills it in.
+#
+# The addresses are your firmware's. Read them from the ELF you flashed:
+#   arm-none-eabi-nm -n harness.elf | grep -E \
+#     'bhf_input|harness_done|bhf_fault_flag|adafuzz_probe_memory_buffer'
+# The values below are placeholders; replace every one.
+
+name = "nucleo-f411re"
+
+# --target-transport of the debug-probe lane: OpenOCD's gdbstub, the
+# completion breakpoint (`harness_done`; a Thumb address may keep bit 0, bhf
+# clears it), the fault-status word the HardFault handler writes, and the
+# reset before each input.
+gdb = "gdb:127.0.0.1:3333,done=0x08000200,fault=0x20000208,reset=monitor:reset halt"
+
+# --transport-coverage-map of that lane: the input buffer (in a section the
+# startup code does not clear) and the memory_buffer coverage ring.
+coverage_map = "input=0x2000020c,input_cap=64,ring=0x20000000,write=0x20000200,wrapped=0x20000204,cap=512"
+
+# --target-transport of the agent lane: the reference agent on the board's
+# UART, which the ST-Link's virtual COM port shows on the host.
+serial = "agent:serial:/dev/ttyACM0,baud=115200"

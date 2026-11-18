@@ -40,6 +40,7 @@ mod benchmark;
 mod binary_adapter;
 mod binary_fuzz;
 mod binary_scan;
+pub mod board_profile;
 mod build;
 mod capsule;
 mod cartography;

@@ -58,7 +58,8 @@ use serde::Serialize;
 use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
     AgentTransport, CmpLogRegion, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
-    GuestFaultStatus, InputContract, RunOutcome, TargetSession, TargetTransport, TransportError,
+    GuestFaultStatus, InputContract, ResetMode, RunOutcome, TargetSession, TargetTransport,
+    TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -193,6 +194,14 @@ pub(crate) enum TransportPlan {
         /// Coverage from the semihosting channel (`coverage=semihosting`,
         /// #292), not the ring.
         semihosting: bool,
+        /// The completion breakpoint `(address, RSP kind)` (`done=`, #293).
+        harness_done: Option<(u64, u32)>,
+        /// The firmware fault-status word (`fault=`, #293).
+        fault_status: Option<GuestFaultStatus>,
+        /// How the target is reset before each input (`reset=`, #293).
+        reset: ResetMode,
+        /// What the parser corrected in the spec, for the run to print.
+        notes: Vec<String>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -363,29 +372,37 @@ impl TransportPlan {
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
             let (map, input, cmplog, semihosting) = require_coverage_map("gdb", coverage_map)?;
-            // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
+            // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`
+            // `[,done=ADDR[,done_kind=N]][,fault=ADDR[,fault_width=N][,fault_clear=N]]`
+            // `[,reset=restart|monitor:CMD]`.
             let mut parts = rest.split(',');
             let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
             let mut firmware = None;
             let mut task_id = None;
             let mut cycles = CycleKeys::default();
+            let mut contract = ContractKeys::default();
+            let mut reset = ResetMode::Restart;
             for part in parts.map(str::trim).filter(|part| !part.is_empty()) {
                 let unknown = || TransportSpecError::Malformed {
                     backend: "gdb",
                     spec: spec.to_owned(),
                     reason: format!(
                         "unknown option {part:?}; allowed: firmware=PATH, cycles=dwt|ADDR, \
-                         cpu_hz=N, task_id=ADDR"
+                         cpu_hz=N, task_id=ADDR, done=ADDR, done_kind=N, fault=ADDR, \
+                         fault_width=N, fault_clear=N, reset=restart|monitor:CMD"
                     ),
                 };
                 let (key, value) = part.split_once('=').ok_or_else(unknown)?;
                 match key.trim() {
                     "firmware" => firmware = Some(PathBuf::from(value.trim())),
                     "task_id" => task_id = Some(parse_int("task_id", value)?),
+                    "reset" => reset = parse_reset(spec, value)?,
                     key if cycles.take(key, value)? => {}
+                    key if contract.take(key, value)? => {}
                     _ => return Err(unknown()),
                 }
             }
+            let (harness_done, fault_status, notes) = contract.finish("gdb", spec)?;
             return Ok(Self::Gdb {
                 host,
                 port,
@@ -396,6 +413,10 @@ impl TransportPlan {
                 task_id,
                 cmplog,
                 semihosting,
+                harness_done,
+                fault_status,
+                reset,
+                notes,
             });
         }
 
@@ -439,18 +460,33 @@ impl TransportPlan {
                 task_id,
                 cmplog,
                 semihosting,
-            } => Ok(Box::new(
-                GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
-                    // The I/O bound doubles as the absolute per-input execution
-                    // deadline so a hung target is a bounded Timeout outcome, not
-                    // an unbounded wait behind the per-read socket timeout (#70).
-                    .with_exec_deadline(io_timeout)
-                    .with_input_contract(Some(input))
-                    .with_cycle_counter(cycles)
-                    .with_task_id(task_id)
-                    .with_cmplog(cmplog)
-                    .with_semihosting_coverage(semihosting),
-            )),
+                harness_done,
+                fault_status,
+                reset,
+                notes: _,
+            } => {
+                let mut transport = GdbRemoteTransport::new(
+                    move || connect_tcp_bounded(&host, port, io_timeout),
+                    map,
+                )
+                // The I/O bound doubles as the absolute per-input execution
+                // deadline so a hung target is a bounded Timeout outcome, not
+                // an unbounded wait behind the per-read socket timeout (#70).
+                .with_exec_deadline(io_timeout)
+                .with_input_contract(Some(input))
+                .with_cycle_counter(cycles)
+                .with_task_id(task_id)
+                .with_cmplog(cmplog)
+                .with_semihosting_coverage(semihosting)
+                .with_reset(reset);
+                if let Some((address, kind)) = harness_done {
+                    transport = transport.with_harness_breakpoint(address, kind);
+                }
+                if let Some(status) = fault_status {
+                    transport = transport.with_fault_status(status);
+                }
+                Ok(Box::new(transport))
+            }
             Self::QemuSystem {
                 qmp_host,
                 qmp_port,
@@ -535,7 +571,7 @@ impl TransportPlan {
     /// What the parser corrected in the spec (a Thumb `done=` address).
     pub(crate) fn notes(&self) -> &[String] {
         match self {
-            Self::QemuSystem { notes, .. } => notes,
+            Self::Gdb { notes, .. } | Self::QemuSystem { notes, .. } => notes,
             _ => &[],
         }
     }
@@ -586,11 +622,7 @@ fn parse_qemu_system(
     let mut gdb: Option<(String, u16)> = None;
     let mut snapshot_tag = DEFAULT_SNAPSHOT_TAG.to_owned();
     // Completion contract (#71) and firmware fault-status (#72), all optional.
-    let mut done: Option<u64> = None;
-    let mut done_kind: u64 = 2; // ARM Thumb breakpoint kind (instruction size).
-    let mut fault: Option<u64> = None;
-    let mut fault_width: u64 = 4;
-    let mut fault_clear: u64 = 0;
+    let mut contract = ContractKeys::default();
     let mut firmware: Option<PathBuf> = None;
     let mut cycles = CycleKeys::default();
     let mut task_id: Option<u64> = None;
@@ -614,14 +646,10 @@ fn parse_qemu_system(
             "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value)?),
             "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value)?),
             "snapshot" => snapshot_tag = value.to_owned(),
-            "done" => done = Some(parse_int("done", value)?),
-            "done_kind" => done_kind = parse_int("done_kind", value)?,
-            "fault" => fault = Some(parse_int("fault", value)?),
-            "fault_width" => fault_width = parse_int("fault_width", value)?,
-            "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
             "firmware" => firmware = Some(PathBuf::from(value)),
             "task_id" => task_id = Some(parse_int("task_id", value)?),
             key if cycles.take(key, value)? => {}
+            key if contract.take(key, value)? => {}
             other => {
                 return Err(malformed(format!(
                     "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
@@ -636,37 +664,7 @@ fn parse_qemu_system(
     let (gdb_host, gdb_port) =
         gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
 
-    let mut notes = Vec::new();
-    let harness_done = match done {
-        Some(address) => {
-            let kind = u32::try_from(done_kind)
-                .map_err(|_| malformed(format!("done_kind {done_kind} is out of range")))?;
-            // `nm` prints a Thumb function's address with bit 0 set (the
-            // interworking bit). A breakpoint there is unaligned and never
-            // hits, so the run would wait out every input.
-            let address = if kind == 2 && address & 1 == 1 {
-                notes.push(format!(
-                    "done={address:#x} has the Thumb bit set; planting the breakpoint at {:#x}",
-                    address & !1
-                ));
-                address & !1
-            } else {
-                address
-            };
-            Some((address, kind))
-        }
-        None => None,
-    };
-    let fault_status = match fault {
-        Some(address) => {
-            let width = usize::try_from(fault_width)
-                .map_err(|_| malformed(format!("fault_width {fault_width} is out of range")))?;
-            // GuestFaultStatus::new validates the width (1..=8); its error maps
-            // through TransportSpecError::Transport.
-            Some(GuestFaultStatus::new(address, width, fault_clear)?)
-        }
-        None => None,
-    };
+    let (harness_done, fault_status, notes) = contract.finish("qemu-system", spec)?;
 
     Ok(TransportPlan::QemuSystem {
         qmp_host,
@@ -685,6 +683,113 @@ fn parse_qemu_system(
         semihosting,
         notes,
     })
+}
+
+/// The completion contract keys of a memory-read spec: `done=` and
+/// `done_kind=` (#71), `fault=`, `fault_width=` and `fault_clear=` (#72).
+/// The `qemu-system` and, since #293, `gdb` backends take them.
+struct ContractKeys {
+    done: Option<u64>,
+    /// The RSP breakpoint kind: 2, ARM Thumb's instruction size, by default.
+    done_kind: u64,
+    fault: Option<u64>,
+    fault_width: u64,
+    fault_clear: u64,
+}
+
+impl Default for ContractKeys {
+    fn default() -> Self {
+        Self {
+            done: None,
+            done_kind: 2,
+            fault: None,
+            fault_width: 4,
+            fault_clear: 0,
+        }
+    }
+}
+
+impl ContractKeys {
+    /// Take `key=value` when it is one of these keys.
+    fn take(&mut self, key: &str, value: &str) -> Result<bool, TransportSpecError> {
+        match key {
+            "done" => self.done = Some(parse_int("done", value)?),
+            "done_kind" => self.done_kind = parse_int("done_kind", value)?,
+            "fault" => self.fault = Some(parse_int("fault", value)?),
+            "fault_width" => self.fault_width = parse_int("fault_width", value)?,
+            "fault_clear" => self.fault_clear = parse_int("fault_clear", value)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The completion breakpoint, the fault-status word, and what was
+    /// corrected in the spec.
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        self,
+        backend: &'static str,
+        spec: &str,
+    ) -> Result<(Option<(u64, u32)>, Option<GuestFaultStatus>, Vec<String>), TransportSpecError>
+    {
+        let malformed = |reason: String| TransportSpecError::Malformed {
+            backend,
+            spec: spec.to_owned(),
+            reason,
+        };
+        let mut notes = Vec::new();
+        let harness_done = match self.done {
+            Some(address) => {
+                let kind = u32::try_from(self.done_kind).map_err(|_| {
+                    malformed(format!("done_kind {} is out of range", self.done_kind))
+                })?;
+                // `nm` prints a Thumb function's address with bit 0 set (the
+                // interworking bit). A breakpoint there is unaligned and never
+                // hits, so the run would wait out every input.
+                let address = if kind == 2 && address & 1 == 1 {
+                    notes.push(format!(
+                        "done={address:#x} has the Thumb bit set; planting the breakpoint at {:#x}",
+                        address & !1
+                    ));
+                    address & !1
+                } else {
+                    address
+                };
+                Some((address, kind))
+            }
+            None => None,
+        };
+        let fault_status = match self.fault {
+            Some(address) => {
+                let width = usize::try_from(self.fault_width).map_err(|_| {
+                    malformed(format!("fault_width {} is out of range", self.fault_width))
+                })?;
+                // GuestFaultStatus::new validates the width (1..=8); its error
+                // maps through TransportSpecError::Transport.
+                Some(GuestFaultStatus::new(address, width, self.fault_clear)?)
+            }
+            None => None,
+        };
+        Ok((harness_done, fault_status, notes))
+    }
+}
+
+/// A `gdb:` spec's `reset=` (#293): `restart`, the RSP `R` packet, or
+/// `monitor:CMD`, a monitor command such as OpenOCD's `reset halt` or QEMU's
+/// `system_reset`.
+fn parse_reset(spec: &str, value: &str) -> Result<ResetMode, TransportSpecError> {
+    let value = value.trim();
+    if value == "restart" {
+        return Ok(ResetMode::Restart);
+    }
+    match value.strip_prefix("monitor:").map(str::trim) {
+        Some(command) if !command.is_empty() => Ok(ResetMode::Monitor(command.to_owned())),
+        _ => Err(TransportSpecError::Malformed {
+            backend: "gdb",
+            spec: spec.to_owned(),
+            reason: format!("reset={value:?}: expected restart or monitor:COMMAND"),
+        }),
+    }
 }
 
 /// The `cycles=` and `cpu_hz=` keys of a memory-read spec (#251).
@@ -2353,8 +2458,16 @@ mod tests {
                 task_id,
                 cmplog,
                 semihosting,
+                harness_done,
+                fault_status,
+                reset,
+                notes,
             } => {
                 assert!(!semihosting);
+                assert_eq!(harness_done, None);
+                assert!(fault_status.is_none());
+                assert_eq!(reset, ResetMode::Restart);
+                assert!(notes.is_empty());
                 assert_eq!(firmware, None);
                 assert_eq!(cycles, None);
                 assert_eq!(task_id, None);
@@ -2506,6 +2619,54 @@ mod tests {
                 assert_eq!(status.clear_value, 0xff);
             }
             other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    /// #293: a board over `gdb:` takes the qemu-system completion contract
+    /// (`done=`, a Thumb address corrected; `fault=` and its width and clear
+    /// value) and a reset by monitor command.
+    #[test]
+    fn the_gdb_spec_takes_the_completion_contract_and_a_monitor_reset() {
+        let map_spec = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=32";
+        let plan = TransportPlan::parse(
+            "gdb:127.0.0.1:3333,done=0xa9,fault=0x20000100,fault_width=2,fault_clear=0xff,\
+             reset=monitor:reset halt",
+            Some(map_spec),
+        )
+        .unwrap();
+        let TransportPlan::Gdb {
+            harness_done,
+            fault_status,
+            reset,
+            notes,
+            ..
+        } = &plan
+        else {
+            panic!("expected Gdb, got {plan:?}");
+        };
+        assert_eq!(*harness_done, Some((0xa8, 2)));
+        let status = fault_status.as_ref().unwrap();
+        assert_eq!(
+            (status.address, status.width, status.clear_value),
+            (0x2000_0100, 2, 0xff)
+        );
+        assert_eq!(*reset, ResetMode::Monitor("reset halt".to_owned()));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(plan.into_transport(None).is_ok());
+
+        for (spec, want) in [
+            (
+                "gdb:h:1,reset=monitor:",
+                "expected restart or monitor:COMMAND",
+            ),
+            ("gdb:h:1,reset=hard", "expected restart or monitor:COMMAND"),
+            ("gdb:h:1,fault=0x10,fault_width=9", "must be 1..=8 bytes"),
+            ("gdb:h:1,snapshot=x", "unknown option"),
+        ] {
+            let error = TransportPlan::parse(spec, Some(map_spec))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(want), "{spec}: {error}");
         }
     }
 

@@ -569,6 +569,23 @@ pub struct FuzzArgs {
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
 
+    /// Take `--target-transport` and `--transport-coverage-map` from a board
+    /// profile (#293): a TOML file of one board's transport contract, with
+    /// `gdb` and `coverage_map` for its debug probe and `serial` for the
+    /// reference agent on its UART. See docs/hil-bringup.md.
+    #[arg(long = "board-profile", value_name = "PATH")]
+    pub board_profile: Option<PathBuf>,
+
+    /// The board profile's lane to run: `gdb` (the debug probe) or `serial`
+    /// (the agent on the board's UART).
+    #[arg(
+        long = "board-lane",
+        value_enum,
+        default_value = "gdb",
+        requires = "board_profile"
+    )]
+    pub board_lane: crate::board_profile::BoardLane,
+
     /// Load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the
     /// target as a response-dependent, multi-message session (HDF-7) instead of
     /// single opaque inputs. Additive: when this is absent the default host /
@@ -1558,7 +1575,11 @@ pub(crate) fn fatal_signal_pc_offset(stderr: &str, signal: &str) -> Option<u64> 
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
-pub fn run(args: FuzzArgs) -> i32 {
+pub fn run(mut args: FuzzArgs) -> i32 {
+    if let Err(error) = crate::board_profile::apply(&mut args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
     // The transport and session lanes are the builtin engine's own loops: an
     // AFL++ or WinAFL run asked for with them would silently not happen.
     if let Some(error) = engine_lane_conflict(&args) {
@@ -2214,6 +2235,8 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         stop_after_findings,
         target_transport: None,
         transport_coverage_map: None,
+        board_profile: None,
+        board_lane: crate::board_profile::BoardLane::Gdb,
         protocol_profile: None,
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
@@ -2462,6 +2485,8 @@ fn afl_programmatic_args(
         stop_after_findings: None,
         target_transport: None,
         transport_coverage_map: None,
+        board_profile: None,
+        board_lane: crate::board_profile::BoardLane::Gdb,
         protocol_profile: None,
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
@@ -17939,6 +17964,8 @@ exit 0
             stop_after_findings: None,
             target_transport: None,
             transport_coverage_map: None,
+            board_profile: None,
+            board_lane: crate::board_profile::BoardLane::Gdb,
             protocol_profile: None,
             session_transport: None,
             session_reset: crate::session_fuzz::SessionResetMode::Reconnect,

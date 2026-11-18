@@ -302,6 +302,8 @@ pub struct MockGdbStub<C: Read + Write> {
     run_writes: Vec<(u64, Vec<u8>)>,
     /// File-I/O requests the target makes on each `c` (#292).
     file_io: Vec<FileIoRequest>,
+    /// Whether it takes monitor commands (`qRcmd`).
+    monitor: bool,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -316,7 +318,15 @@ impl<C: Read + Write> MockGdbStub<C> {
             console_output: Vec::new(),
             run_writes: Vec::new(),
             file_io: Vec::new(),
+            monitor: true,
         }
+    }
+
+    /// Refuse monitor commands with an empty reply, as QEMU's system gdbstub
+    /// refuses `R`.
+    pub fn without_monitor(mut self) -> Self {
+        self.monitor = false;
+        self
     }
 
     /// On each `c`, write `data` at `address` and make a File-I/O
@@ -491,6 +501,11 @@ impl<C: Read + Write> MockGdbStub<C> {
                     self.connection.send_packet(&reply)?;
                 }
                 b'R' => { /* restart: RSP defines no reply for `R`. */ }
+                // A monitor command: a line of output, then OK.
+                b'q' if self.monitor && packet.starts_with(b"qRcmd,") => {
+                    self.connection.send_packet(b"O6f6b0a")?;
+                    self.connection.send_packet(b"OK")?;
+                }
                 b'Z' | b'z' => self.connection.send_packet(b"OK")?, // (in|re)move breakpoint
                 _ => self.connection.send_packet(b"")?,             // unsupported
             }

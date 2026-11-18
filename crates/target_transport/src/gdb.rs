@@ -729,6 +729,45 @@ impl<C: Read + Write> GdbClient<C> {
         self.connection.send_packet(b"R00")
     }
 
+    /// Run a monitor command via `qRcmd` (#293): the probe's or emulator's own
+    /// command line, as `monitor CMD` in gdb is (`reset halt` on OpenOCD or a
+    /// J-Link, `system_reset` on QEMU). Returns the command's output, which
+    /// stubs send as `O` packets or hex before the closing `OK`.
+    pub fn monitor(&mut self, command: &str) -> Result<Vec<u8>> {
+        let mut response =
+            self.command(format!("qRcmd,{}", to_hex(command.as_bytes())).as_bytes())?;
+        let mut output = Vec::new();
+        for _ in 0..MAX_CONSOLE_PACKETS {
+            match response.as_slice() {
+                b"OK" => return Ok(output),
+                b"" => {
+                    return Err(TransportError::gdb(format!(
+                        "monitor {command:?}: the stub does not take monitor commands"
+                    )))
+                }
+                body if is_error_reply(body) => {
+                    return Err(TransportError::TargetError(format!(
+                        "monitor {command:?}: {}",
+                        String::from_utf8_lossy(body)
+                    )))
+                }
+                body => {
+                    let hex = body.strip_prefix(b"O").unwrap_or(body);
+                    output.extend(from_hex(hex)?);
+                    if output.len() > MAX_CONSOLE_BYTES {
+                        return Err(TransportError::gdb(format!(
+                            "monitor {command:?}: output exceeded {MAX_CONSOLE_BYTES} bytes"
+                        )));
+                    }
+                }
+            }
+            response = self.connection.recv_packet()?;
+        }
+        Err(TransportError::gdb(format!(
+            "monitor {command:?}: more than {MAX_CONSOLE_PACKETS} output packets"
+        )))
+    }
+
     /// Insert a software breakpoint at `address` via `Z0,addr,kind`.
     ///
     /// `kind` is the RSP breakpoint "kind" — for ARM Thumb it is the instruction
@@ -750,6 +789,18 @@ impl<C: Read + Write> GdbClient<C> {
         let response = self.command(format!("z0,{address:x},{kind:x}").as_bytes())?;
         self.expect_ok(&response, "remove software breakpoint")
     }
+}
+
+/// How [`GdbRemoteTransport`] resets the target before each input (#293).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ResetMode {
+    /// The extended-mode `R` restart, which has no reply: gdbserver's and
+    /// OpenOCD's.
+    #[default]
+    Restart,
+    /// A monitor command (`qRcmd`): `reset halt` on OpenOCD or a J-Link,
+    /// `system_reset` on QEMU, whose system gdbstub refuses `R`.
+    Monitor(String),
 }
 
 /// Target memory layout the [`GdbRemoteTransport`] uses to inject input and
@@ -843,6 +894,9 @@ pub struct GdbRemoteTransport<F> {
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
     semihosting_coverage: bool,
+    reset: ResetMode,
+    harness_breakpoint: Option<(u64, u32)>,
+    fault_status: Option<crate::fullsystem::GuestFaultStatus>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -857,7 +911,34 @@ impl<F> GdbRemoteTransport<F> {
             task_id_address: None,
             cmplog: None,
             semihosting_coverage: false,
+            reset: ResetMode::Restart,
+            harness_breakpoint: None,
+            fault_status: None,
         }
+    }
+
+    /// Reset the target before each input with `reset` (#293).
+    pub fn with_reset(mut self, reset: ResetMode) -> Self {
+        self.reset = reset;
+        self
+    }
+
+    /// Plant a software breakpoint at the firmware's completion symbol when
+    /// arming (#293), as [`crate::fullsystem::FullSystemTransport`] does, so
+    /// a firmware that ends in a loop at `done` stops back to the host there.
+    /// `kind` is the RSP breakpoint kind (`2` for Thumb, `4` for A32).
+    pub fn with_harness_breakpoint(mut self, address: u64, kind: u32) -> Self {
+        self.harness_breakpoint = Some((address, kind));
+        self
+    }
+
+    /// Clear the firmware's fault-status word before each input and let it
+    /// classify the run after it (#293), as on the full-system transport: a
+    /// fault handler that records the fault and returns through `done` is a
+    /// crash, not a clean stop.
+    pub fn with_fault_status(mut self, status: crate::fullsystem::GuestFaultStatus) -> Self {
+        self.fault_status = Some(status);
+        self
     }
 
     /// Stage each input under `contract`: cut to the region's capacity, with
@@ -916,6 +997,10 @@ where
     fn arm(&self) -> Result<Box<dyn TargetSession>> {
         let mut client = GdbClient::new((self.connect)()?);
         client.attach()?;
+        // Planted once: the stub keeps it across each input's reset.
+        if let Some((address, kind)) = self.harness_breakpoint {
+            client.insert_sw_breakpoint(address, kind)?;
+        }
         Ok(Box::new(GdbSession {
             client,
             map: self.map,
@@ -925,6 +1010,8 @@ where
             task_id_address: self.task_id_address,
             cmplog: self.cmplog,
             semihosting_coverage: self.semihosting_coverage,
+            reset: self.reset.clone(),
+            fault_status: self.fault_status.clone(),
         }))
     }
 }
@@ -995,6 +1082,8 @@ pub struct GdbSession<C> {
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
     semihosting_coverage: bool,
+    reset: ResetMode,
+    fault_status: Option<crate::fullsystem::GuestFaultStatus>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -1003,7 +1092,17 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         // timeout — is a control/infrastructure error, NOT a target-execution
         // hang, so it propagates (the caller halts without inventing a false
         // target-timing finding) rather than being classed as a target timeout.
-        self.client.reset()?;
+        match &self.reset {
+            ResetMode::Restart => self.client.reset()?,
+            ResetMode::Monitor(command) => {
+                self.client.monitor(command)?;
+            }
+        }
+        if let Some(status) = &self.fault_status {
+            let clear = status.clear_value.to_le_bytes();
+            self.client
+                .write_memory(status.address, &clear[..status.width])?;
+        }
         stage_input(
             &mut self.client,
             self.map.input_address,
@@ -1061,9 +1160,21 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         // A coverage-readback failure must not erase an already-known stop (#74):
         // keep the exit classification and record the read failure as a diagnostic
         // instead of propagating an error that loses the crash.
-        let exit = stop.to_exit_kind();
+        let mut exit = stop.to_exit_kind();
+        let mut fault = None;
+        let mut inconclusive = None;
         let mut target = crate::outcome::TargetObservation::default();
         let mut cycles_failed = None;
+        if let Some(status) = &self.fault_status {
+            crate::fullsystem::classify_fault_status(
+                &mut self.client,
+                status,
+                &mut exit,
+                &mut fault,
+                &mut cycles_failed,
+                &mut inconclusive,
+            );
+        }
         if let (Some(counter), Some(start)) = (&self.cycle_counter, cycles_start) {
             match counter.elapsed(&mut self.client, start) {
                 Ok(cycles) => target.cycles = Some(cycles),
@@ -1100,11 +1211,12 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
             target,
             exit,
             coverage_edges,
-            // Fault classification over the debug-probe path is HDF-2.
-            fault: None,
+            // The fault-status word's, when the spec names one; the stop
+            // reply alone is classified by `exit`.
+            fault,
             stdout,
             coverage_incomplete,
-            inconclusive: None,
+            inconclusive,
         })
     }
 }
@@ -1647,6 +1759,101 @@ mod tests {
             matches!((clear, run), (Some(clear), Some(run)) if clear < run),
             "the count is zeroed before the run: {log:?}"
         );
+    }
+
+    /// A board profile's contract over the gdb transport (#293): a monitor
+    /// command resets the target, the done breakpoint is planted once, and
+    /// the fault-status word is cleared before each run and makes a fault
+    /// that returned through `done` a crash.
+    #[test]
+    fn a_monitor_reset_done_breakpoint_and_fault_word_drive_each_run() {
+        let ring_capacity = 32_usize;
+        let (image, write, wrapped) = simulate_ring(
+            &encode_event_stream(&[Event::Crumb { id: 0x1FA }]),
+            ring_capacity,
+        );
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity,
+        };
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        // The firmware's fault handler records 0xDEADFA11 while it runs.
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log))
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, image)
+            .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)])
+            .with_region(0x6000, vec![0xFF; 4])
+            .with_run_write(0x6000, 0xDEAD_FA11_u32.to_le_bytes().to_vec());
+        let handle = thread::spawn(move || stub.serve());
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        )
+        .with_reset(ResetMode::Monitor("system_reset".to_owned()))
+        .with_harness_breakpoint(0xa8, 2)
+        .with_fault_status(crate::fullsystem::GuestFaultStatus::new(0x6000, 4, 0).unwrap());
+        let mut session = transport.arm().unwrap();
+        let first = session.run_input(&[0xF7]).unwrap();
+        let second = session.run_input(&[0xF7]).unwrap();
+        drop(session);
+        handle.join().unwrap().unwrap();
+
+        for outcome in [&first, &second] {
+            assert_eq!(outcome.exit, ExitKind::Crash);
+            let fault = outcome.fault.as_ref().expect("the fault word's fault");
+            assert!(fault.detail.contains("0xdeadfa11"), "{}", fault.detail);
+            assert_eq!(outcome.coverage_edges, vec![0x1FA]);
+        }
+        let log = log.lock().unwrap();
+        let reset = format!("qRcmd,{}", to_hex(b"system_reset"));
+        assert_eq!(log.iter().filter(|p| **p == reset).count(), 2, "{log:?}");
+        assert!(!log.iter().any(|p| p.starts_with('R')), "{log:?}");
+        assert_eq!(log.iter().filter(|p| *p == "Z0,a8,2").count(), 1, "{log:?}");
+        let clear = log.iter().position(|p| p == "M6000,4:00000000");
+        let run = log.iter().position(|p| p == "c");
+        assert!(
+            matches!((clear, run), (Some(clear), Some(run)) if clear < run),
+            "the fault word is cleared before the run: {log:?}"
+        );
+    }
+
+    /// A monitor command's output is returned, and a stub that refuses
+    /// monitor commands says so; the link stays in step either way.
+    #[test]
+    fn a_monitor_command_returns_its_output_or_its_refusal() {
+        for monitor in [true, false] {
+            let (client_end, stub_end) = duplex();
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let mut stub = MockGdbStub::new(stub_end, log).with_region(0x2000, vec![0x5A; 4]);
+            if !monitor {
+                stub = stub.without_monitor();
+            }
+            let handle = thread::spawn(move || stub.serve());
+            let mut client = GdbClient::new(client_end);
+            client.attach().unwrap();
+            let result = client.monitor("system_reset");
+            if monitor {
+                assert_eq!(result.unwrap(), b"ok\n");
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("does not take monitor commands"), "{error}");
+            }
+            assert_eq!(client.read_memory(0x2000, 4).unwrap(), vec![0x5A; 4]);
+            drop(client);
+            handle.join().unwrap().unwrap();
+        }
     }
 
     /// An input longer than the staging region is cut to its capacity, so the
