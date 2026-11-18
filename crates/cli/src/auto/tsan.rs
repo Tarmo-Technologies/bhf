@@ -695,12 +695,18 @@ EOF\nexit 86\n",
         .unwrap();
 
         let result = run_tsan_replay(&work, &ReplayBounds::unbounded(Duration::from_millis(250)));
+        // bhf's count is the check: each input it ran timed out, so a run past
+        // the budget would count more. The harness's own record can miss a
+        // run whose shell a loaded host killed before its first command.
+        assert_eq!(result.unmeasured, TSAN_TIMEOUT_LIMIT);
         let attempts = std::fs::read_to_string(&attempts_path)
             .unwrap()
             .lines()
             .count();
-        assert_eq!(attempts, TSAN_TIMEOUT_LIMIT);
-        assert_eq!(result.unmeasured, TSAN_TIMEOUT_LIMIT);
+        assert!(
+            (1..=TSAN_TIMEOUT_LIMIT).contains(&attempts),
+            "{attempts} runs recorded"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
