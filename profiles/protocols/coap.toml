@@ -1,0 +1,327 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CoAP reference protocol profile (bhf.protocol.v1).
+#
+# Models a CoAP client session with a constrained device (UDP port 5683),
+# per RFC 7252, over the session lane's UDP backend: each message is one
+# datagram. Every request is a Confirmable message (version 1, a 4-byte
+# token, a message id of its own) whose response comes piggybacked on the
+# ACK, echoing the message id and the token.
+#
+# The session discovers the server's resources (GET /.well-known/core),
+# reads /limit (GET), and updates it with a conditional PUT whose If-Match
+# carries the ETag the read returned (RFC 7252 §5.10.8.1), which a server
+# refuses with 4.12 Precondition Failed when it does not match. A state is
+# reached only on the success response: the ACK, then 2.05 Content or 2.04
+# Changed. A Reset, an error code or a separate response (an empty ACK, the
+# response later) is not captured, so it does not advance the session.
+#
+# The options are written as their one-byte headers (delta and length
+# nibbles) and their values: a mutation that changes a value's length makes
+# the option malformed, which is a case worth sending. The read's response
+# is expected to carry the ETag, of 4 bytes, as its first option, as a
+# server sorting its options by number does; set the capture's `len` and the
+# If-Match option header for a server whose ETag is longer.
+#
+# Each session sends from a socket of its own (--session-reset reconnect, the
+# default), so a server's duplicate detection, by endpoint and message id,
+# does not replay one session's responses into the next.
+#
+#   bhf fuzz <work> --harness <ID> \
+#     --protocol-profile profiles/protocols/coap.toml \
+#     --session-transport udp:HOST:5683
+
+schema = "bhf.protocol.v1"
+transport = "udp"
+start = "start"
+
+# Each message is its own datagram.
+[framing]
+kind = "raw"
+
+# ---------------------------------------------------------------------------
+# GET /.well-known/core: resource discovery (RFC 6690).
+# ---------------------------------------------------------------------------
+[[message]]
+name = "GET_CORE"
+max_len = 256
+
+# Version 1, Confirmable, a 4-byte token.
+[[message.field]]
+name = "header"
+type = "u8"
+value = 0x44
+
+# 0.01 GET
+[[message.field]]
+name = "code"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "message_id"
+type = "u16"
+endian = "big"
+value = 0x0101
+
+[[message.field]]
+name = "token"
+type = "u32"
+endian = "big"
+value = 1
+
+# Uri-Path (11): delta 11, length 11.
+[[message.field]]
+name = "uri_path_option"
+type = "u8"
+value = 0xbb
+
+[[message.field]]
+name = "uri_path"
+type = "bytes"
+max = 12
+value = ".well-known"
+
+# Uri-Path again: delta 0, length 4.
+[[message.field]]
+name = "uri_path_2_option"
+type = "u8"
+value = 0x04
+
+[[message.field]]
+name = "uri_path_2"
+type = "bytes"
+max = 12
+value = "core"
+
+# The ACK (version 1, a 4-byte token) with 2.05 Content.
+[message.response]
+[[message.response.capture]]
+name = "header"
+type = "enum"
+at = 0
+variants = { ack = 0x64 }
+
+[[message.response.capture]]
+name = "code"
+type = "enum"
+at = 1
+variants = { content = 0x45 }
+
+[[message.response.capture]]
+name = "message_id"
+type = "u16"
+at = 2
+endian = "big"
+
+[[message.response.capture]]
+name = "token"
+type = "u32"
+at = 4
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# GET /limit: read the resource and its ETag.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "GET_LIMIT"
+max_len = 256
+
+[[message.field]]
+name = "header"
+type = "u8"
+value = 0x44
+
+[[message.field]]
+name = "code"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "message_id"
+type = "u16"
+endian = "big"
+value = 0x0102
+
+[[message.field]]
+name = "token"
+type = "u32"
+endian = "big"
+value = 2
+
+# Uri-Path: delta 11, length 5.
+[[message.field]]
+name = "uri_path_option"
+type = "u8"
+value = 0xb5
+
+[[message.field]]
+name = "uri_path"
+type = "bytes"
+max = 12
+value = "limit"
+
+# The ACK with 2.05 Content, the ETag first: option 4, delta 4, length 4.
+[message.response]
+[[message.response.capture]]
+name = "header"
+type = "enum"
+at = 0
+variants = { ack = 0x64 }
+
+[[message.response.capture]]
+name = "code"
+type = "enum"
+at = 1
+variants = { content = 0x45 }
+
+[[message.response.capture]]
+name = "message_id"
+type = "u16"
+at = 2
+endian = "big"
+
+[[message.response.capture]]
+name = "token"
+type = "u32"
+at = 4
+endian = "big"
+
+[[message.response.capture]]
+name = "etag_option"
+type = "enum"
+at = 8
+variants = { etag_4_bytes = 0x44 }
+
+[[message.response.capture]]
+name = "etag"
+type = "bytes"
+at = 9
+len = 4
+
+# ---------------------------------------------------------------------------
+# PUT /limit, If-Match the ETag the read returned.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "PUT_LIMIT"
+max_len = 256
+
+[[message.field]]
+name = "header"
+type = "u8"
+value = 0x44
+
+# 0.03 PUT
+[[message.field]]
+name = "code"
+type = "u8"
+value = 0x03
+
+[[message.field]]
+name = "message_id"
+type = "u16"
+endian = "big"
+value = 0x0103
+
+[[message.field]]
+name = "token"
+type = "u32"
+endian = "big"
+value = 3
+
+# If-Match (1): delta 1, length 4.
+[[message.field]]
+name = "if_match_option"
+type = "u8"
+value = 0x14
+
+[[message.field]]
+name = "if_match"
+type = "bytes"
+ref = "GET_LIMIT.response.etag"
+
+# Uri-Path (11): delta 10, length 5.
+[[message.field]]
+name = "uri_path_option"
+type = "u8"
+value = 0xa5
+
+[[message.field]]
+name = "uri_path"
+type = "bytes"
+max = 12
+value = "limit"
+
+# Content-Format (12): delta 1, length 0, which is 0: text/plain.
+[[message.field]]
+name = "content_format_option"
+type = "u8"
+value = 0x10
+
+[[message.field]]
+name = "payload_marker"
+type = "u8"
+value = 0xff
+
+[[message.field]]
+name = "payload"
+type = "bytes"
+max = 64
+value = "80"
+
+# The ACK with 2.04 Changed.
+[message.response]
+[[message.response.capture]]
+name = "header"
+type = "enum"
+at = 0
+variants = { ack = 0x64 }
+
+[[message.response.capture]]
+name = "code"
+type = "enum"
+at = 1
+variants = { changed = 0x44 }
+
+[[message.response.capture]]
+name = "message_id"
+type = "u16"
+at = 2
+endian = "big"
+
+[[message.response.capture]]
+name = "token"
+type = "u32"
+at = 4
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# Legal message ordering: discover, read, then update what was read.
+# ---------------------------------------------------------------------------
+[[transition]]
+from = "start"
+send = "GET_CORE"
+to = "discovered"
+
+[[transition]]
+from = "discovered"
+send = "GET_LIMIT"
+to = "read"
+
+[[transition]]
+from = "read"
+send = "GET_LIMIT"
+to = "read"
+
+[[transition]]
+from = "read"
+send = "PUT_LIMIT"
+to = "updated"
+
+[[transition]]
+from = "updated"
+send = "GET_LIMIT"
+to = "read"
+
+[session]
+reset = "reconnect"

@@ -3014,6 +3014,16 @@
   reproduces with that build; a harness whose CFI build fails is named.
   `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
   no lane of the run could observe in its C/C++ targets, and what would.
+- Reference protocol profiles for CoAP and RTPS/DDS over UDP (#372), in
+  `profiles/protocols/coap.toml` and `rtps.toml`, for the session lane's
+  `udp:` backend. The CoAP session discovers `/.well-known/core`, reads
+  `/limit` and updates it with a conditional PUT whose If-Match carries the
+  ETag the read returned; only a piggybacked 2.05 or 2.04 advances it. The
+  RTPS 2.3 session announces a participant (SPDP), heartbeats its SEDP
+  publications writer to the participant that answered, addressed with the
+  GUID prefix that participant announced, and sends the publication at the
+  sequence number the reader's ACKNACK asked for. Each profile is tested
+  against a fixture server over UDP.
 - Reference protocol profiles for Modbus/TCP and MQTT 3.1.1 (#311), in
   `profiles/protocols/modbus-tcp.toml` and `mqtt-3.1.1.toml`. The Modbus
   session reads a holding register, writes back the value it read and writes

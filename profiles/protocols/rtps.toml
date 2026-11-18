@@ -1,0 +1,714 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RTPS/DDS reference protocol profile (bhf.protocol.v1).
+#
+# Models the discovery and reliable-delivery exchange between two DDS
+# participants, per the OMG DDS Interoperability Wire Protocol (DDSI-RTPS)
+# v2.3, over the session lane's UDP backend: each message is one datagram.
+# Every message is the RTPS header ("RTPS", version 2.3, a vendor id, the
+# sender's GUID prefix) and submessages, little-endian (the E flag), each
+# with its octetsToNextHeader computed.
+#
+# The session announces a participant (an SPDP DATA(p) to the builtin
+# participant reader) and captures the GUID prefix of the participant that
+# answers with its own announcement. It then heartbeats its SEDP
+# publications writer to that participant's publications reader, addressed
+# with an INFO_DST naming the captured prefix, and captures the sequence
+# number the reader's ACKNACK asks for. Last, it sends the publication
+# (a DATA(w) with its topic and type names) at that sequence number, with a
+# heartbeat, and the state is reached on the ACKNACK that has nothing
+# missing. A state is reached only on the reply that answers the request:
+# an announcement from the SPDP writer, then an ACKNACK from the
+# publications reader.
+#
+# The session lane takes the reply from the socket it sent from, so the
+# profile fits a participant that answers to a datagram's source address on
+# its unicast metatraffic port (7410 for domain 0, participant 0). A
+# participant that answers only to the locators in an announcement needs
+# them to name the fuzzer's address. The captures read the replies at the
+# offsets a little-endian participant writes them: the announcement's
+# writer id at byte 32 and its parameter list at byte 48, the ACKNACK at
+# byte 36 after an INFO_DST.
+#
+#   bhf fuzz <work> --harness <ID> \
+#     --protocol-profile profiles/protocols/rtps.toml \
+#     --session-transport udp:HOST:7410
+
+schema = "bhf.protocol.v1"
+transport = "udp"
+start = "start"
+
+# Each message is its own datagram.
+[framing]
+kind = "raw"
+
+# ---------------------------------------------------------------------------
+# SPDP_ANNOUNCE: the participant's DATA(p) to the builtin participant
+# reader, with a parameter list (PL_CDR_LE) naming its GUID.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "SPDP_ANNOUNCE"
+max_len = 1024
+
+[[message.field]]
+name = "protocol"
+type = "bytes"
+max = 4
+value = "RTPS"
+
+[[message.field]]
+name = "version_major"
+type = "u8"
+value = 2
+
+[[message.field]]
+name = "version_minor"
+type = "u8"
+value = 3
+
+# VENDORID_UNKNOWN
+[[message.field]]
+name = "vendor_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "guid_prefix"
+type = "bytes"
+max = 12
+value = "bhf-session1"
+
+# DATA, flags E (little-endian) and D (a serialized payload).
+[[message.field]]
+name = "data_id"
+type = "u8"
+value = 0x15
+
+[[message.field]]
+name = "data_flags"
+type = "u8"
+value = 0x05
+
+[[message.field]]
+name = "data_length"
+type = "u16"
+endian = "little"
+computed = "length(extra_flags,octets_to_inline_qos,reader_id,writer_id,writer_sn_high,writer_sn_low,encapsulation,encapsulation_options,protocol_version,vendor,participant_guid,builtin_endpoints,lease_duration,sentinel)"
+
+[[message.field]]
+name = "extra_flags"
+type = "u16"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "octets_to_inline_qos"
+type = "u16"
+endian = "little"
+value = 16
+
+# ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER
+[[message.field]]
+name = "reader_id"
+type = "u32"
+endian = "big"
+value = 0x000100c7
+
+# ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER
+[[message.field]]
+name = "writer_id"
+type = "u32"
+endian = "big"
+value = 0x000100c2
+
+[[message.field]]
+name = "writer_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "writer_sn_low"
+type = "u32"
+endian = "little"
+value = 1
+
+# PL_CDR_LE
+[[message.field]]
+name = "encapsulation"
+type = "u16"
+endian = "big"
+value = 3
+
+[[message.field]]
+name = "encapsulation_options"
+type = "u16"
+endian = "big"
+value = 0
+
+# PID_PROTOCOL_VERSION: 2.3
+[[message.field]]
+name = "protocol_version"
+type = "tlv"
+tag = 0x0015
+endian = "little"
+value = [2, 3, 0, 0]
+
+# PID_VENDORID
+[[message.field]]
+name = "vendor"
+type = "tlv"
+tag = 0x0016
+endian = "little"
+value = [0, 0, 0, 0]
+
+# PID_PARTICIPANT_GUID: the GUID prefix and ENTITYID_PARTICIPANT.
+[[message.field]]
+name = "participant_guid"
+type = "tlv"
+tag = 0x0050
+endian = "little"
+value = [0x62, 0x68, 0x66, 0x2d, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x31, 0x00, 0x00, 0x01, 0xc1]
+
+# PID_BUILTIN_ENDPOINT_SET: the participant and the publications and
+# subscriptions announcers and detectors.
+[[message.field]]
+name = "builtin_endpoints"
+type = "tlv"
+tag = 0x0058
+endian = "little"
+value = [0x3f, 0x00, 0x00, 0x00]
+
+# PID_PARTICIPANT_LEASE_DURATION: 100 s.
+[[message.field]]
+name = "lease_duration"
+type = "tlv"
+tag = 0x0002
+endian = "little"
+value = [100, 0, 0, 0, 0, 0, 0, 0]
+
+# PID_SENTINEL
+[[message.field]]
+name = "sentinel"
+type = "tlv"
+tag = 0x0001
+endian = "little"
+value = []
+
+# The answering participant's DATA(p) from the SPDP writer.
+[message.response]
+[[message.response.capture]]
+name = "protocol"
+type = "enum"
+at = 0
+width = "u32"
+endian = "big"
+variants = { rtps = 0x52545053 }
+
+[[message.response.capture]]
+name = "guid_prefix"
+type = "bytes"
+at = 8
+len = 12
+
+[[message.response.capture]]
+name = "submessage_id"
+type = "enum"
+at = 20
+variants = { data = 0x15 }
+
+[[message.response.capture]]
+name = "writer_id"
+type = "enum"
+at = 32
+width = "u32"
+endian = "big"
+variants = { spdp_participant_writer = 0x000100c2 }
+
+[[message.response.capture]]
+name = "participant_guid"
+type = "tlv"
+at = 48
+tag = 0x0050
+endian = "little"
+
+# ---------------------------------------------------------------------------
+# HEARTBEAT: the SEDP publications writer has sequence number 1, to the
+# discovered participant's publications reader.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "HEARTBEAT"
+max_len = 1024
+
+[[message.field]]
+name = "protocol"
+type = "bytes"
+max = 4
+value = "RTPS"
+
+[[message.field]]
+name = "version_major"
+type = "u8"
+value = 2
+
+[[message.field]]
+name = "version_minor"
+type = "u8"
+value = 3
+
+[[message.field]]
+name = "vendor_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "guid_prefix"
+type = "bytes"
+max = 12
+value = "bhf-session1"
+
+# INFO_DST: the participant that announced itself.
+[[message.field]]
+name = "dst_id"
+type = "u8"
+value = 0x0e
+
+[[message.field]]
+name = "dst_flags"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "dst_length"
+type = "u16"
+endian = "little"
+computed = "length(destination_prefix)"
+
+[[message.field]]
+name = "destination_prefix"
+type = "bytes"
+ref = "SPDP_ANNOUNCE.response.guid_prefix"
+
+# HEARTBEAT, flag E only: not final, so the reader must answer.
+[[message.field]]
+name = "hb_id"
+type = "u8"
+value = 0x07
+
+[[message.field]]
+name = "hb_flags"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "hb_length"
+type = "u16"
+endian = "little"
+computed = "length(hb_reader_id,hb_writer_id,first_sn_high,first_sn_low,last_sn_high,last_sn_low,hb_count)"
+
+# ENTITYID_SEDP_BUILTIN_PUBLICATIONS_DETECTOR
+[[message.field]]
+name = "hb_reader_id"
+type = "u32"
+endian = "big"
+value = 0x000003c7
+
+# ENTITYID_SEDP_BUILTIN_PUBLICATIONS_ANNOUNCER
+[[message.field]]
+name = "hb_writer_id"
+type = "u32"
+endian = "big"
+value = 0x000003c2
+
+[[message.field]]
+name = "first_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "first_sn_low"
+type = "u32"
+endian = "little"
+value = 1
+
+[[message.field]]
+name = "last_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "last_sn_low"
+type = "u32"
+endian = "little"
+value = 1
+
+[[message.field]]
+name = "hb_count"
+type = "u32"
+endian = "little"
+value = 1
+
+# The publications reader's ACKNACK, after an INFO_DST: its readerSNState's
+# bitmap base (high at 48, low at 52) is the first sequence number missing.
+[message.response]
+[[message.response.capture]]
+name = "protocol"
+type = "enum"
+at = 0
+width = "u32"
+endian = "big"
+variants = { rtps = 0x52545053 }
+
+[[message.response.capture]]
+name = "submessage_id"
+type = "enum"
+at = 36
+variants = { acknack = 0x06 }
+
+[[message.response.capture]]
+name = "reader_id"
+type = "enum"
+at = 40
+width = "u32"
+endian = "big"
+variants = { sedp_publications_reader = 0x000003c7 }
+
+[[message.response.capture]]
+name = "missing_sn_low"
+type = "u32"
+at = 52
+endian = "little"
+
+[[message.response.capture]]
+name = "num_bits"
+type = "u32"
+at = 56
+endian = "little"
+
+# ---------------------------------------------------------------------------
+# DATA_W: the publication (a DATA(w) with its endpoint GUID, topic and type
+# names) at the sequence number the ACKNACK asked for, and a heartbeat that
+# it is the last.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "DATA_W"
+max_len = 1024
+
+[[message.field]]
+name = "protocol"
+type = "bytes"
+max = 4
+value = "RTPS"
+
+[[message.field]]
+name = "version_major"
+type = "u8"
+value = 2
+
+[[message.field]]
+name = "version_minor"
+type = "u8"
+value = 3
+
+[[message.field]]
+name = "vendor_id"
+type = "u16"
+endian = "big"
+value = 0
+
+[[message.field]]
+name = "guid_prefix"
+type = "bytes"
+max = 12
+value = "bhf-session1"
+
+[[message.field]]
+name = "dst_id"
+type = "u8"
+value = 0x0e
+
+[[message.field]]
+name = "dst_flags"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "dst_length"
+type = "u16"
+endian = "little"
+computed = "length(destination_prefix)"
+
+[[message.field]]
+name = "destination_prefix"
+type = "bytes"
+ref = "SPDP_ANNOUNCE.response.guid_prefix"
+
+[[message.field]]
+name = "data_id"
+type = "u8"
+value = 0x15
+
+[[message.field]]
+name = "data_flags"
+type = "u8"
+value = 0x05
+
+[[message.field]]
+name = "data_length"
+type = "u16"
+endian = "little"
+computed = "length(extra_flags,octets_to_inline_qos,reader_id,writer_id,writer_sn_high,writer_sn_low,encapsulation,encapsulation_options,endpoint_guid,topic_pid,topic_param_length,topic_name_length,topic_name,type_pid,type_param_length,type_name_length,type_name,sentinel)"
+
+[[message.field]]
+name = "extra_flags"
+type = "u16"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "octets_to_inline_qos"
+type = "u16"
+endian = "little"
+value = 16
+
+[[message.field]]
+name = "reader_id"
+type = "u32"
+endian = "big"
+value = 0x000003c7
+
+[[message.field]]
+name = "writer_id"
+type = "u32"
+endian = "big"
+value = 0x000003c2
+
+[[message.field]]
+name = "writer_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "writer_sn_low"
+type = "u32"
+endian = "little"
+ref = "HEARTBEAT.response.missing_sn_low"
+
+[[message.field]]
+name = "encapsulation"
+type = "u16"
+endian = "big"
+value = 3
+
+[[message.field]]
+name = "encapsulation_options"
+type = "u16"
+endian = "big"
+value = 0
+
+# PID_ENDPOINT_GUID: the GUID prefix and a user writer with no key.
+[[message.field]]
+name = "endpoint_guid"
+type = "tlv"
+tag = 0x005a
+endian = "little"
+value = [0x62, 0x68, 0x66, 0x2d, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x31, 0x00, 0x00, 0x01, 0x03]
+
+# PID_TOPIC_NAME: a CDR string, its length counting the NUL.
+[[message.field]]
+name = "topic_pid"
+type = "u16"
+endian = "little"
+value = 0x0005
+
+[[message.field]]
+name = "topic_param_length"
+type = "u16"
+endian = "little"
+computed = "length(topic_name_length,topic_name)"
+
+[[message.field]]
+name = "topic_name_length"
+type = "u32"
+endian = "little"
+computed = "length(topic_name)"
+
+[[message.field]]
+name = "topic_name"
+type = "bytes"
+max = 64
+value = "bhf/session\u0000"
+
+# PID_TYPE_NAME
+[[message.field]]
+name = "type_pid"
+type = "u16"
+endian = "little"
+value = 0x0007
+
+[[message.field]]
+name = "type_param_length"
+type = "u16"
+endian = "little"
+computed = "length(type_name_length,type_name)"
+
+[[message.field]]
+name = "type_name_length"
+type = "u32"
+endian = "little"
+computed = "length(type_name)"
+
+[[message.field]]
+name = "type_name"
+type = "bytes"
+max = 64
+value = "bhf::Sample\u0000"
+
+[[message.field]]
+name = "sentinel"
+type = "tlv"
+tag = 0x0001
+endian = "little"
+value = []
+
+# HEARTBEAT: sequence numbers 1 to the one just sent.
+[[message.field]]
+name = "hb_id"
+type = "u8"
+value = 0x07
+
+[[message.field]]
+name = "hb_flags"
+type = "u8"
+value = 0x01
+
+[[message.field]]
+name = "hb_length"
+type = "u16"
+endian = "little"
+computed = "length(hb_reader_id,hb_writer_id,first_sn_high,first_sn_low,last_sn_high,last_sn_low,hb_count)"
+
+[[message.field]]
+name = "hb_reader_id"
+type = "u32"
+endian = "big"
+value = 0x000003c7
+
+[[message.field]]
+name = "hb_writer_id"
+type = "u32"
+endian = "big"
+value = 0x000003c2
+
+[[message.field]]
+name = "first_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "first_sn_low"
+type = "u32"
+endian = "little"
+value = 1
+
+[[message.field]]
+name = "last_sn_high"
+type = "u32"
+endian = "little"
+value = 0
+
+[[message.field]]
+name = "last_sn_low"
+type = "u32"
+endian = "little"
+ref = "HEARTBEAT.response.missing_sn_low"
+
+[[message.field]]
+name = "hb_count"
+type = "u32"
+endian = "little"
+value = 2
+
+# The ACKNACK with nothing missing: the reader has the publication.
+[message.response]
+[[message.response.capture]]
+name = "protocol"
+type = "enum"
+at = 0
+width = "u32"
+endian = "big"
+variants = { rtps = 0x52545053 }
+
+[[message.response.capture]]
+name = "submessage_id"
+type = "enum"
+at = 36
+variants = { acknack = 0x06 }
+
+[[message.response.capture]]
+name = "reader_id"
+type = "enum"
+at = 40
+width = "u32"
+endian = "big"
+variants = { sedp_publications_reader = 0x000003c7 }
+
+# The next sequence number the reader expects.
+[[message.response.capture]]
+name = "acked_sn_low"
+type = "u32"
+at = 52
+endian = "little"
+
+[[message.response.capture]]
+name = "num_bits"
+type = "enum"
+at = 56
+width = "u32"
+endian = "little"
+variants = { none_missing = 0 }
+
+# ---------------------------------------------------------------------------
+# Legal message ordering: discover, heartbeat, then publish what the reader
+# asked for.
+# ---------------------------------------------------------------------------
+[[transition]]
+from = "start"
+send = "SPDP_ANNOUNCE"
+to = "discovered"
+
+[[transition]]
+from = "discovered"
+send = "SPDP_ANNOUNCE"
+to = "discovered"
+
+[[transition]]
+from = "discovered"
+send = "HEARTBEAT"
+to = "nacked"
+
+[[transition]]
+from = "nacked"
+send = "HEARTBEAT"
+to = "nacked"
+
+[[transition]]
+from = "nacked"
+send = "DATA_W"
+to = "acknowledged"
+
+[[transition]]
+from = "acknowledged"
+send = "HEARTBEAT"
+to = "acknowledged"
+
+# A socket of its own for every session: the participant sees a new source
+# and keeps nothing of the last session.
+[session]
+reset = "reconnect"
