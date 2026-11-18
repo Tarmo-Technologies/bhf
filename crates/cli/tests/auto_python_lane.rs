@@ -117,6 +117,64 @@ fn auto_builds_fuzzes_and_finds_recursion_cwe674() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+/// #286: an instance method whose class takes constructor arguments is
+/// fuzzed: `Parser(limit)` is built from a decoded `int`, and the
+/// out-of-range index the limit reaches is found. Such a method was skipped
+/// ("only no-arg-constructible receivers").
+#[test]
+fn auto_builds_a_receiver_from_its_init_arguments_and_finds_the_bug() {
+    if !have_python() {
+        eprintln!("skipping: no python3 on PATH (GNAT-less rule)");
+        return;
+    }
+    let src = TestDir::new("pylane_ctor");
+    std::fs::write(
+        src.join("fieldparser.py"),
+        "class Parser:\n\
+         \x20   def __init__(self, limit: int):\n\
+         \x20       self.limit = limit\n\
+         \n\
+         \x20   def parse(self, data: bytes):\n\
+         \x20       fields = data.split(b\",\")\n\
+         \x20       if self.limit >= 16:\n\
+         \x20           return fields[0]\n\
+         \x20       return fields[self.limit]\n",
+    )
+    .unwrap();
+    let work_guard = TestDir::new("pylane_ctorwork");
+    let work = work_guard.join("work");
+    let out = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--target",
+            "Parser.parse",
+            "--per-target-time",
+            "10",
+        ])
+        .args(["--work-dir", work.to_str().unwrap(), src.to_str().unwrap()])
+        .output()
+        .expect("run bhf auto");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{log}");
+    assert!(log.contains("1 built+fuzzed"), "{log}");
+    let harness = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("bhfgen/harness.py"))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| panic!("no generated harness:\n{log}"));
+    let harness = std::fs::read_to_string(harness).unwrap();
+    assert!(harness.contains("_recv = _t.Parser(r0)"), "{harness}");
+    let doc = results_doc(&work);
+    assert!(
+        has_cwe(&doc, 125) && doc.to_string().contains("Parser.parse"),
+        "expected an out-of-bounds read in Parser.parse:\n{doc:#}\n{log}"
+    );
+}
+
 fn results_doc(work: &std::path::Path) -> serde_json::Value {
     let bytes = std::fs::read(work.join("results/findings.json")).unwrap_or_default();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)

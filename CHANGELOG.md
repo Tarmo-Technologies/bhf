@@ -2812,6 +2812,16 @@
   when bhf panics.
 
 ### Added
+- `bhf auto` fuzzes a Python instance method whose class's `__init__` takes
+  arguments (#286). The harness decodes each required `__init__` argument from
+  the input ahead of the method's own, as it decodes a method parameter of that
+  annotation or name, and builds the receiver from them. An `__init__`
+  parameter annotated with a type bhf cannot decode still skips the target,
+  and the reason names it. Only a receiver whose `__init__` took no required
+  argument was built. A union annotation (`str | Path`, `Optional[str]`) is
+  decoded as its first member bhf can build, a `Path` as a `pathlib.Path` of
+  decoded text, and the Python driver treats an `ImportError` the target
+  raises as the environment, not a finding.
 - `bhf auto` fuzzes Python 2 sources under a `python2` interpreter (#285):
   `python2`, `python2.7`, or a `python` that is 2.x. The Python runtime (driver,
   coverage and decoder) runs on Python 2.7 as well as Python 3, and the target is

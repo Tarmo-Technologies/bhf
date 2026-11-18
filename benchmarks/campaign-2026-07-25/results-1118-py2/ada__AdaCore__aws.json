@@ -1,0 +1,34 @@
+{
+ "repo": "AdaCore/aws",
+ "sha": "02cbd01c2f96c288440415a46bf865616c0ee0f8",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "aws.py",
+   "name": "Console_Process.on_input",
+   "outcome": "unsupported_params",
+   "reason": "target `aws` is not loadable (skipped cleanly): TabError: inconsistent use of tabs and spaces in indentation",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

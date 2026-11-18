@@ -47,6 +47,8 @@ FINDING_HALT_CODE = 86
 #     calling convention pre-seeds — our wrong shape. (Listed explicitly, NOT its
 #     base LookupError, so IndexError — a real OOB on the bytes we feed — stays.)
 #   - OSError: environmental. EOFError/StopIteration: normal stream end.
+#   - ImportError: a module the target imports late (inside a function or a
+#     constructor bhf now calls) is not installed: the environment, as OSError.
 # Genuine bugs still surface: IndexError (real OOB on the real bytes we feed →
 # BHF-201), RecursionError (BHF-207), MemoryError (BHF-209), ArithmeticError
 # (BHF-205), AssertionError + SystemError + custom errors (BHF-210). Campaigns tune
@@ -61,7 +63,7 @@ except NameError:  # Python 2
 # IOError and OSError.
 REJECTION_EXC = (
     ValueError, TypeError, AttributeError, KeyError, UnicodeError, EOFError,
-    NotImplementedError, EnvironmentError, StopIteration, _STOP_ASYNC,
+    NotImplementedError, EnvironmentError, StopIteration, _STOP_ASYNC, ImportError,
 )
 # Never a finding: interpreter control-flow signals (a target calling sys.exit or
 # being interrupted is not a crash).

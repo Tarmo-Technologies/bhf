@@ -364,9 +364,14 @@ SDK ceiling and central package management.
 The largest single class in the whole sweep. Correctly named in the manifest with
 the package; `--install-deps` fixes it where the network allows.
 
-### Py-2. Instance method needs constructor arguments — 25 — **GAP**
+### Py-2. Instance method needs constructor arguments — 25 — **[FIXED]**
 
-Only no-arg-constructible receivers are supported.
+The receiver is built from its `__init__` arguments, each decoded from the
+input as a method parameter of that annotation or name is (#286). Re-running
+the sweep's 21 Py-2 targets built and fuzzed 6 and left none on this reason.
+10 now stop at a dependency the project needs and is not installed, 3 at a
+constructor argument bhf cannot build, and 2 elsewhere. See
+[the re-run](validation/2026-11-18-py2-receivers.md).
 
 ### Py-3. `type X is not subscriptable` — 10 — **DEPENDENCY**
 
@@ -638,14 +643,14 @@ By fixable targets, highest first:
 6. **Java project-type parameters** (Java-1; 29 of the 57 that `results-0728`
    left) — a project or dependency type with no no-arg constructor, factory or
    constant to build it from. JDK collections are decoded since #236.
-7. **Python receiver-with-arguments** (Py-2; 25) and C# unforced receiver
-   (C#-1; 26).
+7. **C# unforced receiver** (C#-1; 26).
 
 Closed since the list was first ranked, and dropped from it: the C++
 non-self-contained header (C++-1), the Go receiver with a sibling
 constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1),
 the C++ compile-flag quoting (C++-6), private-module trait-impl methods
-(Rust-2) and the JS browser globals (JS-2).
+(Rust-2), the JS browser globals (JS-2) and the Python receiver with
+constructor arguments (Py-2).
 
 ## Method
 

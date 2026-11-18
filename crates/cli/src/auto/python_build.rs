@@ -161,7 +161,7 @@ pub fn build_python_harness(
     );
 
     // Generate the harness module.
-    let harness_src = generate_harness(&module, func, resolved.receiver.as_deref());
+    let harness_src = generate_harness(&module, func, resolved.receiver.as_ref());
     let harness_path = gen_pkg.join("harness.py");
     if let Err(e) = std::fs::write(&harness_path, &harness_src) {
         return PythonBuildResult::Failed {
@@ -283,15 +283,13 @@ pub fn build_python_harness(
 /// receiver-construction expression (`_t.Class()`).
 struct ResolvedTarget {
     func: PyFunction,
-    /// Construction expression for an instance method's receiver, or `None` for a
+    /// How an instance method's receiver is built, or `None` for a
     /// module-level function / `@staticmethod` / `@classmethod`.
-    receiver: Option<String>,
+    receiver: Option<Receiver>,
 }
 
 /// Re-parse the candidate source, find the function by (qualified name, line), and
-/// resolve the receiver for an instance method (no-arg constructor only — if the
-/// class's `__init__` needs arguments we skip cleanly, mirroring the Rust/Java
-/// no-arg-ctor first cut).
+/// resolve the receiver for an instance method ([`resolve_receiver`]).
 fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
     let source = crate::source_text::read_source_text(&candidate.source_path)
         .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
@@ -313,11 +311,21 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
     Ok(ResolvedTarget { func, receiver })
 }
 
+/// How an instance method's receiver is built: `_t.<class>(r0, r1, ...)`, one
+/// argument per required `__init__` parameter, decoded from the input ahead of
+/// the method's own arguments (#286).
+struct Receiver {
+    class: String,
+    params: Vec<python_parser::PyParam>,
+}
+
 /// Resolve an instance method's receiver. `None` for module fns / static / class
-/// methods. For an instance method, synthesize `_t.Class()` IFF the class's
-/// `__init__` (if defined in this file) takes no required arguments; otherwise
-/// return an `Err` so the target skips cleanly.
-fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<String>, String> {
+/// methods. An instance method's receiver is its class built from the required
+/// parameters of its `__init__` (none when this file defines no `__init__`),
+/// each decoded as a method parameter of its annotation or name is. An
+/// annotated parameter of a type the decoder cannot build (a class, a union)
+/// is an `Err`, so the target skips cleanly.
+fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<Receiver>, String> {
     if !func.is_method || func.is_staticmethod || func.is_classmethod {
         return Ok(None);
     }
@@ -326,26 +334,143 @@ fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<Stri
     };
     // The parser already drops the implicit `self`, so a non-default, non-varargs
     // param of `__init__` is a REQUIRED constructor argument.
-    if let Some(init) = all
+    let params: Vec<python_parser::PyParam> = all
         .iter()
         .find(|f| f.class_name.as_deref() == Some(class) && f.name == "__init__")
+        .map(|init| {
+            init.params
+                .iter()
+                .filter(|p| !p.is_varargs && !p.has_default)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(param) = params.iter().find(|p| {
+        p.annotation
+            .as_deref()
+            .is_some_and(|ann| !decodable_annotation(ann))
+    }) {
+        return Err(format!(
+            "instance method `{}` needs a receiver, but `{class}.__init__` parameter \
+             `{}: {}` is not a scalar, str, bytes, container or stream bhf can decode \
+             (skipped cleanly)",
+            func.qualified(),
+            param.name,
+            param.annotation.as_deref().unwrap_or_default()
+        ));
+    }
+    Ok(Some(Receiver {
+        class: class.to_owned(),
+        params,
+    }))
+}
+
+/// Whether [`decode_expr`] builds a value of annotation `ann` (rather than
+/// handing raw bytes to a parameter of some other type): a union counts when
+/// one of its members does ([`effective_annotation`]).
+fn decodable_annotation(ann: &str) -> bool {
+    single_decodable(&effective_annotation(ann))
+}
+
+/// Whether [`decode_expr`] builds a value of the one (non-union) annotation `ann`.
+fn single_decodable(ann: &str) -> bool {
+    let inner = ann.trim();
+    matches!(inner, "int" | "float" | "bool" | "boolean" | "IO")
+        || is_path_annotation(inner)
+        || [
+            "str",
+            "bytes",
+            "bytearray",
+            "memoryview",
+            "dict",
+            "Dict",
+            "Mapping",
+            "list",
+            "List",
+            "Sequence",
+            "Iterable",
+            "set",
+            "Set",
+            "frozenset",
+        ]
+        .iter()
+        .any(|family| {
+            inner == *family
+                || inner
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('['))
+        })
+        || [
+            "TextIO",
+            "StringIO",
+            "BinaryIO",
+            "BytesIO",
+            "IO[",
+            "BufferedReader",
+            "BufferedIOBase",
+        ]
+        .iter()
+        .any(|stream| inner.contains(stream))
+}
+
+/// A filesystem-path annotation: `Path`, `pathlib.Path`, `PurePath`,
+/// `os.PathLike[str]`.
+fn is_path_annotation(ann: &str) -> bool {
+    let base = ann.split('[').next().unwrap_or(ann).trim();
+    matches!(
+        base.rsplit('.').next().unwrap_or(base),
+        "Path" | "PurePath" | "PurePosixPath" | "PathLike"
+    )
+}
+
+/// The annotation [`decode_expr`] decodes `ann` as (#286): `ann` itself, or,
+/// for a union (`A | B`, `Union[A, B]`, `Optional[A]`), its first member that
+/// [`decode_expr`] can build (`str` of `str | os.PathLike[str]`). A union with
+/// no such member is returned as written.
+fn effective_annotation(ann: &str) -> String {
+    let ann = ann.trim();
+    let members: Vec<String> = if let Some(inner) = ann
+        .strip_prefix("Optional[")
+        .and_then(|rest| rest.strip_suffix(']'))
     {
-        let required = init
-            .params
-            .iter()
-            .filter(|p| !p.is_varargs && !p.has_default)
-            .count();
-        if required > 0 {
-            return Err(format!(
-                "instance method `{}` needs a receiver, but `{class}.__init__` takes \
-                 {required} required argument(s); only no-arg-constructible receivers \
-                 are supported (skipped cleanly)",
-                func.qualified()
-            ));
+        vec![inner.trim().to_owned()]
+    } else if let Some(inner) = ann
+        .strip_prefix("Union[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        split_top_level(inner, ',')
+    } else if split_top_level(ann, '|').len() > 1 {
+        split_top_level(ann, '|')
+    } else {
+        return ann.to_owned();
+    };
+    members
+        .into_iter()
+        .filter(|member| member != "None")
+        .find(|member| single_decodable(member))
+        .unwrap_or_else(|| ann.to_owned())
+}
+
+/// `text` split at each `separator` outside brackets, each part trimmed.
+fn split_top_level(text: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for c in text.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            _ => {}
+        }
+        if c == separator && depth == 0 {
+            parts.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(c);
         }
     }
-    // No __init__ in this file (inherited / default) or a no-arg __init__.
-    Ok(Some(format!("_t.{class}()")))
+    parts.push(current.trim().to_owned());
+    parts
 }
 
 /// Map a source file to `(import_root_dir, dotted_module)`. Walks up through
@@ -385,8 +510,18 @@ fn resolve_module(source_path: &Path, source_root: &Path) -> (PathBuf, String) {
 /// Decide how to decode one parameter from the fuzz cursor, by annotation then
 /// name heuristic. `last` controls whether a byte/str param drains the rest.
 fn decode_expr(p: &python_parser::PyParam, last: bool) -> String {
-    let ann = p.annotation.as_deref().unwrap_or("").trim();
+    let effective = effective_annotation(p.annotation.as_deref().unwrap_or(""));
+    let ann = effective.as_str();
     let name = p.name.to_ascii_lowercase();
+    // A path annotation gets a `pathlib.Path` of decoded text.
+    if is_path_annotation(ann) {
+        let text = if last {
+            "_c.rest().decode('utf-8', 'replace')"
+        } else {
+            "_c.text()"
+        };
+        return format!("__import__('pathlib').Path({text})");
+    }
     // A file-like param (`fp`/`file`/`stream` or an IO annotation) must NOT get raw
     // bytes — `bytes` has no `.read()`, which would manufacture an AttributeError
     // false positive (plistlib.load(fp)). Wrap the fuzz bytes in a real stream.
@@ -488,7 +623,7 @@ fn decode_expr(p: &python_parser::PyParam, last: bool) -> String {
 /// pass a keyword-only-with-default param positionally (e.g. `loads(s, *,
 /// parse_float=...)` -> `loads(a0)`). For an instance method, construct a fresh
 /// receiver per input so each input starts from clean state.
-fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> String {
+fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&Receiver>) -> String {
     let decodable: Vec<&python_parser::PyParam> = func
         .params
         .iter()
@@ -496,6 +631,18 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
         .collect();
     let n = decodable.len();
     let mut lines = String::new();
+    // The receiver's constructor arguments come first: the method's last
+    // argument takes the rest of the input.
+    let mut receiver_args = Vec::new();
+    for (i, p) in receiver
+        .map(|r| r.params.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!("    r{i} = {}\n", decode_expr(p, false)));
+        receiver_args.push(format!("r{i}"));
+    }
     let mut args = Vec::new();
     for (i, p) in decodable.iter().enumerate() {
         let last = i + 1 == n;
@@ -506,8 +653,9 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
     let call = match receiver {
         // Instance method: fresh receiver per input, then call the bare method name.
         Some(recv) => format!(
-            "    _recv = {recv}\n    _recv.{method}({arglist})\n",
-            recv = recv,
+            "    _recv = _t.{class}({ctor})\n    _recv.{method}({arglist})\n",
+            class = recv.class,
+            ctor = receiver_args.join(", "),
             method = func.name,
             arglist = arglist,
         ),
@@ -697,13 +845,111 @@ mod tests {
             is_varargs: false,
             has_default: true,
         });
-        let h = generate_harness("m", &m, Some("_t.C()"));
+        let recv = Receiver {
+            class: "C".to_owned(),
+            params: Vec::new(),
+        };
+        let h = generate_harness("m", &m, Some(&recv));
         assert!(h.contains("_recv = _t.C()"), "constructs receiver:\n{h}");
         assert!(
             h.contains("_recv.feed(a0)"),
             "calls bare method on receiver:\n{h}"
         );
         assert!(!h.contains("a1"), "defaulted param must be skipped:\n{h}");
+    }
+
+    /// #286: a receiver whose `__init__` takes arguments is built from them,
+    /// decoded ahead of the method's own, so the method's last parameter
+    /// still takes the rest of the input.
+    #[test]
+    fn a_receiver_is_built_from_its_init_arguments() {
+        let source = "class Parser:\n\
+                      \x20   def __init__(self, limit: int, name, strict=True):\n\
+                      \x20       self.limit = limit\n\
+                      \x20   def feed(self, data: bytes):\n\
+                      \x20       return data[: self.limit]\n";
+        let all = parse_python_functions(source).unwrap();
+        let feed = all.iter().find(|f| f.name == "feed").unwrap();
+        let recv = resolve_receiver(feed, &all).unwrap().unwrap();
+        assert_eq!(recv.class, "Parser");
+        let names: Vec<&str> = recv.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["limit", "name"],
+            "the defaulted `strict` is left out"
+        );
+        let h = generate_harness("m", feed, Some(&recv));
+        let r0 = h.find("    r0 = _c.i32()").expect(&h);
+        let r1 = h.find("    r1 = _c.take_bytes(").expect(&h);
+        let a0 = h.find("    a0 = _c.rest()").expect(&h);
+        assert!(r0 < r1 && r1 < a0, "constructor arguments first:\n{h}");
+        assert!(
+            h.contains("_recv = _t.Parser(r0, r1)\n    _recv.feed(a0)"),
+            "{h}"
+        );
+    }
+
+    /// An `__init__` parameter annotated with a type the decoder cannot build
+    /// still skips cleanly, and names the parameter.
+    #[test]
+    fn an_init_parameter_of_an_undecodable_type_skips_the_target() {
+        let source = "class Session:\n\
+                      \x20   def __init__(self, config: Config):\n\
+                      \x20       self.config = config\n\
+                      \x20   def handle(self, data: bytes):\n\
+                      \x20       return data\n";
+        let all = parse_python_functions(source).unwrap();
+        let handle = all.iter().find(|f| f.name == "handle").unwrap();
+        let error = resolve_receiver(handle, &all).err().unwrap();
+        assert!(error.contains("parameter `config: Config`"), "{error}");
+        for ann in [
+            "int",
+            "Optional[str]",
+            "bytes",
+            "Dict[str, int]",
+            "List[bytes]",
+            "BinaryIO",
+            "Union[int, str]",
+            "str | Path",
+            "Path",
+            "os.PathLike[str]",
+        ] {
+            assert!(decodable_annotation(ann), "{ann}");
+        }
+        for ann in [
+            "Config",
+            "Union[Config, Listener]",
+            "App | None",
+            "strategy",
+        ] {
+            assert!(!decodable_annotation(ann), "{ann}");
+        }
+    }
+
+    /// A union decodes as its first member the decoder builds, and a path
+    /// annotation as a `pathlib.Path` of decoded text.
+    #[test]
+    fn a_union_decodes_as_its_first_buildable_member_and_a_path_as_path() {
+        assert_eq!(effective_annotation("str | os.PathLike[str]"), "str");
+        assert_eq!(effective_annotation("Optional[bytes]"), "bytes");
+        assert_eq!(effective_annotation("Union[Config, int]"), "int");
+        assert_eq!(
+            effective_annotation("None | Dict[str, int]"),
+            "Dict[str, int]"
+        );
+        assert_eq!(effective_annotation("Config | None"), "Config | None");
+        assert_eq!(
+            decode_expr(&param("root", Some("str | os.PathLike[str]")), false),
+            "_c.text()"
+        );
+        assert_eq!(
+            decode_expr(&param("workspace", Some("Path")), false),
+            "__import__('pathlib').Path(_c.text())"
+        );
+        assert_eq!(
+            decode_expr(&param("limit", Some("Optional[int]")), false),
+            "_c.i32()"
+        );
     }
 
     fn param(name: &str, ann: Option<&str>) -> python_parser::PyParam {

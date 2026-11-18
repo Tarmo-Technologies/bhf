@@ -1,0 +1,45 @@
+{
+ "repo": "3b1b/manim",
+ "sha": "6199a00d4c1b1127ebe45cb629c3f22538b10e13",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "scene_file_writer.py",
+   "name": "SceneFileWriter.print_file_ready_message",
+   "outcome": "unsupported_params",
+   "reason": "instance method `SceneFileWriter.print_file_ready_message` needs a receiver, but `SceneFileWriter.__init__` parameter `scene: Scene` is not a scalar, str, bytes, container or stream bhf can decode (skipped cleanly)",
+   "class": "receiver argument of a type bhf cannot decode",
+   "before": 1,
+   "classes": [
+    "receiver argument of a type bhf cannot decode"
+   ]
+  },
+  {
+   "source": "string_mobject.py",
+   "name": "StringMobject.mobjects_from_svg_string",
+   "outcome": "unsupported_params",
+   "reason": "target `manimlib.mobject.svg.string_mobject` is not loadable (skipped cleanly): missing module `colour` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'colour'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}
