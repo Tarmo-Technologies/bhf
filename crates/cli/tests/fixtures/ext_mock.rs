@@ -60,10 +60,13 @@ fn main() {
         .to_string();
 
     // `no-cap` advertises only a capability the host does not require, so the
-    // required `oracle.evaluate` fails negotiation up front. Otherwise advertise
-    // the full surface (the host narrows it to what it asked for).
+    // required `oracle.evaluate` fails negotiation up front. The fuzz-stage
+    // modes advertise only the stage they drive (with the oracle). Otherwise
+    // advertise the full surface (the host narrows it to what it asked for).
     let provided: Vec<&str> = if mode == "no-cap" {
         vec!["codec.decode"]
+    } else if mode == "magic-mutator" || mode == "slow-mutator" {
+        vec!["oracle.evaluate", "mutator.mutate"]
     } else {
         vec![
             "oracle.evaluate",
@@ -129,6 +132,23 @@ fn main() {
             }
             "crash" => {
                 exit(101);
+            }
+            // `bhf fuzz` stage modes (#314).
+            "magic-mutator" if capability == "mutator.mutate" => {
+                // Whatever the base, the mutation is the input the target's
+                // gated bug needs.
+                let out = b"..BHFMAGIC..";
+                reply(
+                    &mut stdout,
+                    ok(
+                        &protocol,
+                        &case,
+                        Some(json!({ "output_b64": b64_encode(out) })),
+                    ),
+                );
+            }
+            "slow-mutator" if capability == "mutator.mutate" => {
+                std::thread::sleep(Duration::from_secs(30));
             }
             "crash-then-unhandshake" => {
                 // Record that this (first) child reached a request, then crash. A

@@ -2853,6 +2853,11 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --extension` gives the builtin loop the extension's mutation
+  stage (#314): one in four mutated children is the extension's
+  `mutator.mutate` of the base the loop picked, within at most 1000 calls and
+  a quarter of the pass's `--time`; a call that times out cuts the stage off
+  and the campaign goes on. The run summary's `extension.stages` records it.
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object

@@ -2153,13 +2153,25 @@ bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work
 bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
   --mutate 42 --repair true
 
-# Drive the just-retained corpus of a fuzz campaign through the extension oracle
-# after the run (not in the hot mutation loop); when the extension provides
+# Fuzz with the extension's stages in the builtin loop (below), then drive the
+# just-retained corpus through its oracle; when the extension provides
 # codec.repair, a recognized frame is repaired before the oracle sees it (a raw
 # corpus entry the extension rejects is evaluated verbatim). An extension fault
 # never aborts the campaign nor becomes a target finding.
 bhf fuzz bhf_work --harness H-0001 --extension path/to/extension.toml
 ```
+
+**Stages in the fuzz loop.** `bhf fuzz --extension` also gives the builtin
+loop the extension's `mutator.mutate`: one in four mutated children is the
+extension's mutation of the base the loop picked.
+
+The mutation stage makes at most 1000 calls per pass and spends at
+most a quarter of its `--time` (60 s without one). A call that times out, an
+extension that crashes or answers garbage, or a stage past its bound is cut off
+for the rest of the pass, and the campaign goes on with the builtin mutations.
+The run summary's `extension.stages` records what the stage did: `calls`,
+`mutated` and `cut_off` (why a
+stage stopped, or `null`).
 
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
 semantic finding is emitted, `2` for a manifest/usage error, and `4` for a bounded

@@ -3,13 +3,25 @@
 use std::io::{Read, Result};
 
 fn main() -> Result<()> {
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let mut raw = Vec::new();
+    std::io::stdin().read_to_end(&mut raw)?;
+    let input = String::from_utf8_lossy(&raw).into_owned();
     let event_path = std::env::var("BHF_EVENTS_PATH").map_err(std::io::Error::other)?;
     let mut bytes = Vec::new();
     push_begin(&mut bytes, 1);
     push_target(&mut bytes, 0x42);
     push_crumb(&mut bytes, 1);
+    // A bug behind a gate the builtin mutator does not pass by itself
+    // (`bhf fuzz --extension` stages, #314): an eight-byte magic.
+    if input.contains("BHFMAGIC") {
+        push_top_level(
+            &mut bytes,
+            "CONSTRAINT_ERROR",
+            "magic.adb:3 index check failed",
+        );
+        push_end(&mut bytes, 0);
+        return std::fs::write(event_path, bytes);
+    }
     // Exceptions that escape the target: an explicit raise with a message,
     // and a failed runtime check GNAT locates in its message.
     match input.as_str() {

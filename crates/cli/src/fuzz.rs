@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
+mod extension_stage;
 mod honggfuzz;
 mod libafl;
 mod libfuzzer;
@@ -5235,6 +5236,10 @@ fn run_builtin_with_progress(
     // The empty input always runs in a fresh process (an empty frame ends the
     // framed loop in some drivers). Run it once per pass and reuse the result.
     let mut empty_input_run: Option<HarnessRun> = None;
+    // #314: an extension's mutation stage.
+    let mut extension_stage = prepared.extension_manifest.as_deref().and_then(|manifest| {
+        extension_stage::ExtensionStage::open(manifest, &prepared.harness_id, prepared.time)
+    });
     for iteration in 0..prepared.iterations {
         if prepared
             .time
@@ -5312,18 +5317,32 @@ fn run_builtin_with_progress(
                     ));
                 }
             }
-            let (bytes, made_from) = mutate_from_pool(
-                &pool,
-                base_index,
-                &dictionary,
-                cmplog_log.as_ref(),
-                grammar.as_ref(),
-                mutator_config(prepared.structured_inputs, effective_max_len),
-                sequence_geometry,
-                &mut rng,
-            );
-            parents = made_from;
-            bytes
+            // One child in four is an extension stage's, when the extension
+            // has one (#314).
+            let from_extension = extension_stage.as_mut().and_then(|stage| {
+                let base = pool.get(base_index).map(PoolEntry::mutation_base)?;
+                stage.child(base, &mut rng)
+            });
+            if let Some(bytes) = from_extension {
+                parents = crate::fuzz_lineage::InputParents::Mutated {
+                    base: base_index,
+                    donor: None,
+                };
+                bytes
+            } else {
+                let (bytes, made_from) = mutate_from_pool(
+                    &pool,
+                    base_index,
+                    &dictionary,
+                    cmplog_log.as_ref(),
+                    grammar.as_ref(),
+                    mutator_config(prepared.structured_inputs, effective_max_len),
+                    sequence_geometry,
+                    &mut rng,
+                );
+                parents = made_from;
+                bytes
+            }
         };
         // RedQueen colorization can execute up to 65 probes before the main
         // input. Slow interpreted targets used to multiply a one-second pass
@@ -6072,12 +6091,13 @@ fn run_builtin_with_progress(
     // ── #57: extension oracle.evaluate post-run pass (fenced) ───────────────
     // When `--extension <manifest>` is set, drive the just-retained corpus
     // through the explicitly-trusted extension's out-of-process
-    // `oracle.evaluate`. Runs AFTER the campaign (never in the hot mutation
-    // loop); an extension fault is bounded infrastructure that never aborts the
-    // run nor becomes a target finding. Reuses the run's finding emitter so an
-    // extension finding carries the harness identity.
+    // `oracle.evaluate`. Runs AFTER the campaign; the loop's own extension
+    // stages (mutation) finish first and are reported beside it as `stages`. An extension fault is bounded infrastructure that
+    // never aborts the run nor becomes a target finding. Reuses the run's
+    // finding emitter so an extension finding carries the harness identity.
+    let stages = extension_stage.map(extension_stage::ExtensionStage::finish);
     let extension_block = prepared.extension_manifest.as_deref().map(|manifest| {
-        crate::extension::drive_fuzz_extension(
+        let mut block = crate::extension::drive_fuzz_extension(
             manifest,
             &emitter,
             &prepared.harness_id,
@@ -6085,7 +6105,11 @@ fn run_builtin_with_progress(
                 .enumerate()
                 .filter(|entry| queueable(entry))
                 .map(|(_, entry)| entry.bytes.as_slice()),
-        )
+        );
+        if let Some(stages) = stages {
+            block["stages"] = stages;
+        }
+        block
     });
 
     let elapsed_secs = start.elapsed().as_secs_f64();
