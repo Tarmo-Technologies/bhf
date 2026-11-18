@@ -304,6 +304,7 @@ impl ProbeInstrumentation {
             Sanitizer::Ubsan => "undefined",
             Sanitizer::Tsan => "thread",
             Sanitizer::Lsan => "leak",
+            Sanitizer::Hwasan => "hwaddress",
         };
         let selected = match selection {
             SanitizerSelection::Default => Some(vec![Sanitizer::Asan, Sanitizer::Ubsan]),

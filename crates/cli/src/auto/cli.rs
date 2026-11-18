@@ -726,7 +726,9 @@ pub struct AutoArgs {
     /// same arming `bhf fuzz --sanitizers` does, now for the auto pipeline.
     /// Default (empty) leaves the build and run env unchanged. Compatible set is
     /// `asan,ubsan,lsan`; `msan`/`tsan` are mutually exclusive with those and each
-    /// other. `cfi` is never armed in the fuzzed build: it adds a control-flow
+    /// other. On an AArch64 host, `hwasan` (HWAddressSanitizer) takes ASan's
+    /// place: it finds the same memory errors with pointer tags, and is refused
+    /// beside `asan` and on any other host. `cfi` is never armed in the fuzzed build: it adds a control-flow
     /// integrity replay of each C/C++ harness's corpus (`make cfi`) after the
     /// fuzz passes. The special value `none` (standalone — not combinable with a
     /// sanitizer) builds each native C/C++ harness with coverage but NO

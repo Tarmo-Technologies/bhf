@@ -198,8 +198,11 @@ fn unobservable_classes(
         SanitizerSelection::None => false,
         SanitizerSelection::Set(set) => {
             set.contains(&sanitizer)
-                // ASan carries LeakSanitizer on the hosts bhf builds for.
-                || (sanitizer == Sanitizer::Lsan && set.contains(&Sanitizer::Asan))
+                // ASan and HWASan carry LeakSanitizer on the hosts bhf builds
+                // them for, and HWASan finds ASan's memory errors.
+                || (sanitizer == Sanitizer::Lsan
+                    && (set.contains(&Sanitizer::Asan) || set.contains(&Sanitizer::Hwasan)))
+                || (sanitizer == Sanitizer::Asan && set.contains(&Sanitizer::Hwasan))
         }
     };
     let replayed = |sanitizer: Sanitizer| match selection {
@@ -551,6 +554,7 @@ fn effective_sanitizer_names(sel: &SanitizerSelection) -> Vec<String> {
             Sanitizer::Ubsan => "ubsan",
             Sanitizer::Tsan => "tsan",
             Sanitizer::Lsan => "lsan",
+            Sanitizer::Hwasan => "hwasan",
         }
     }
     match sel {

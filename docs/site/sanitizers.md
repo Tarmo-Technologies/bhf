@@ -23,6 +23,8 @@ the C/C++ `--sanitizers` matrix.
 - `--sanitizers asan,ubsan,lsan` — arm exactly this set. `asan,ubsan,lsan` are
   mutually compatible; `msan` and `tsan` are exclusive with those and each other
   (run them as separate campaigns).
+- `--sanitizers hwasan,ubsan` — on an AArch64 host, HWAddressSanitizer takes
+  ASan's place: see [HWASan on AArch64](#hwasan-on-aarch64).
 - `--sanitizers asan,ubsan,cfi` (`bhf auto`) — fuzz with ASan and UBSan, then
   replay the corpus through a control-flow integrity build. `cfi` is never part
   of the fuzzed build: see [The control-flow integrity replay](#the-control-flow-integrity-replay).
@@ -493,6 +495,30 @@ swapcontext(&co_uc, &main_uc);
 
 The calls are no-ops without ASan, so the same source still builds under
 `--sanitizers none`, on the cross path, and normally.
+
+## HWASan on AArch64
+
+On an AArch64 host, `--sanitizers hwasan` (or `hwaddress`) builds the fuzzed
+harness with `-fsanitize=hwaddress` in place of ASan. HWAddressSanitizer keeps
+a random tag in each pointer's top byte, which AArch64 ignores on every load
+and store, and the same tag for each 16 bytes of the memory it points to. An
+access through a pointer whose tag does not match its memory's is a report:
+heap and stack overflows, use after free and invalid frees, as ASan finds them,
+with far less memory (a tag per 16 bytes, no redzones or quarantine). It
+carries LeakSanitizer, as ASan does, and combines with `ubsan`.
+
+A report becomes a finding under the rule ASan gives the same bug (BHF-201 for
+a heap overflow, BHF-202 use after free, BHF-203 a stack overflow, BHF-204 an
+invalid free), its exception named `HWASAN_<KIND>`. HWASan's `ERROR:` line says
+only `tag-mismatch`, so the kind is the first specific `Cause:` its report
+gives. Its options are `HWASAN_OPTIONS`, which bhf merges as it does
+`ASAN_OPTIONS`.
+
+`hwasan` is refused beside `asan`, which finds the same bugs another way, and
+on any host other than AArch64. An x86-64 CPU does not ignore a pointer's top
+byte, so the build fails or the runtime does not start, and bhf says so before
+building. A HWASan build also needs a Linux kernel with the tagged-address
+ABI (5.4 or newer).
 
 ## The ThreadSanitizer corpus replay
 

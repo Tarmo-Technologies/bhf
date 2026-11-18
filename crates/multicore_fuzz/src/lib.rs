@@ -1063,6 +1063,7 @@ pub fn sanitizer_options_key(s: Sanitizer) -> &'static str {
         Sanitizer::Ubsan => "UBSAN_OPTIONS",
         Sanitizer::Tsan => "TSAN_OPTIONS",
         Sanitizer::Lsan => "LSAN_OPTIONS",
+        Sanitizer::Hwasan => "HWASAN_OPTIONS",
     }
 }
 
@@ -1120,6 +1121,8 @@ pub enum Sanitizer {
     Ubsan,
     Tsan,
     Lsan,
+    /// HWAddressSanitizer (#333): AArch64 hosts only, in place of ASan.
+    Hwasan,
 }
 
 impl Sanitizer {
@@ -1130,11 +1133,13 @@ impl Sanitizer {
             "ubsan" | "undefined" => Some(Sanitizer::Ubsan),
             "tsan" | "thread" => Some(Sanitizer::Tsan),
             "lsan" | "leak" => Some(Sanitizer::Lsan),
+            "hwasan" | "hwaddress" => Some(Sanitizer::Hwasan),
             _ => None,
         }
     }
 
-    /// The name `--sanitizers` takes: `asan`, `msan`, `ubsan`, `tsan`, `lsan`.
+    /// The name `--sanitizers` takes: `asan`, `msan`, `ubsan`, `tsan`, `lsan`,
+    /// `hwasan`.
     pub fn as_str(self) -> &'static str {
         match self {
             Sanitizer::Asan => "asan",
@@ -1142,6 +1147,7 @@ impl Sanitizer {
             Sanitizer::Ubsan => "ubsan",
             Sanitizer::Tsan => "tsan",
             Sanitizer::Lsan => "lsan",
+            Sanitizer::Hwasan => "hwasan",
         }
     }
 }
@@ -1671,6 +1677,9 @@ mod tests {
         assert_eq!(Sanitizer::parse("ubsan"), Some(Sanitizer::Ubsan));
         assert_eq!(Sanitizer::parse("tsan"), Some(Sanitizer::Tsan));
         assert_eq!(Sanitizer::parse("lsan"), Some(Sanitizer::Lsan));
+        assert_eq!(Sanitizer::parse("hwaddress"), Some(Sanitizer::Hwasan));
+        assert_eq!(Sanitizer::parse("HWASan"), Some(Sanitizer::Hwasan));
+        assert_eq!(sanitizer_options_key(Sanitizer::Hwasan), "HWASAN_OPTIONS");
         assert_eq!(Sanitizer::parse("garbage"), None);
     }
 

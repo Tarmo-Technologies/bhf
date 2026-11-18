@@ -8057,6 +8057,7 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
         multicore_fuzz::Sanitizer::Ubsan => "undefined",
         multicore_fuzz::Sanitizer::Tsan => "thread",
         multicore_fuzz::Sanitizer::Lsan => "leak",
+        multicore_fuzz::Sanitizer::Hwasan => "hwaddress",
     }
 }
 

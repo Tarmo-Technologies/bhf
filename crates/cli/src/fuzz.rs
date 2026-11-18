@@ -461,8 +461,9 @@ pub struct FuzzArgs {
     pub extension: Option<PathBuf>,
 
     /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
-    /// lsan), or the standalone value `none` (build coverage-only with no
-    /// `-fsanitize=` — crash-only fuzzing without ASan/UBSan false positives).
+    /// lsan, and on an AArch64 host hwasan in place of asan), or the standalone
+    /// value `none` (build coverage-only with no `-fsanitize=` — crash-only
+    /// fuzzing without ASan/UBSan false positives).
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
@@ -8415,13 +8416,25 @@ pub(crate) fn parse_sanitizer_args(
         }
         let Some(sanitizer) = multicore_fuzz::Sanitizer::parse(value) else {
             return Err(format!(
-                "unknown sanitizer '{value}' (expected asan, msan, ubsan, tsan, lsan, or none; \
-                 `bhf auto` also takes cfi)"
+                "unknown sanitizer '{value}' (expected asan, hwasan, msan, ubsan, tsan, lsan, or \
+                 none; `bhf auto` also takes cfi and realtime)"
             ));
         };
         if !out.contains(&sanitizer) {
             out.push(sanitizer);
         }
+    }
+    hwasan_host_check(&out, std::env::consts::ARCH)?;
+    // HWASan replaces ASan's shadow memory with pointer tags: clang refuses
+    // `-fsanitize=address,hwaddress`.
+    if out.contains(&multicore_fuzz::Sanitizer::Hwasan)
+        && out.contains(&multicore_fuzz::Sanitizer::Asan)
+    {
+        return Err(
+            "--sanitizers: hwasan cannot be combined with asan: it finds the same memory \
+             errors with pointer tags in place of ASan's shadow memory; pick one"
+                .to_owned(),
+        );
     }
     // MemorySanitizer and ThreadSanitizer each need a build of their own: no
     // other sanitizer links beside either (clang refuses
@@ -8446,6 +8459,21 @@ pub(crate) fn parse_sanitizer_args(
         }
     }
     Ok(SanitizerSelection::Set(out))
+}
+
+/// HWAddressSanitizer (#333) needs an AArch64 host: it keeps a tag in each
+/// pointer's top byte, which AArch64 ignores on every load and store (Top
+/// Byte Ignore) and other architectures do not, so its build fails or its
+/// runtime does not start anywhere else. `arch` is the host's.
+fn hwasan_host_check(sanitizers: &[multicore_fuzz::Sanitizer], arch: &str) -> Result<(), String> {
+    if !sanitizers.contains(&multicore_fuzz::Sanitizer::Hwasan) || arch == "aarch64" {
+        return Ok(());
+    }
+    Err(format!(
+        "--sanitizers hwasan needs an AArch64 host: HWAddressSanitizer keeps a tag in each \
+         pointer's top byte, which AArch64 ignores on every access and {arch} does not. Use \
+         --sanitizers asan on this host, or run on an AArch64 host"
+    ))
 }
 
 fn sanitizer_env_for(sanitizers: &[multicore_fuzz::Sanitizer]) -> Vec<(String, String)> {
@@ -8525,12 +8553,24 @@ pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
 /// of `abort_on_error=1`: the sanitizer exits non-zero after its report,
 /// which classifies it.
 pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
-    sanitizer_child_env_with(
+    let mut env = sanitizer_child_env_with(
         std::env::var("ASAN_OPTIONS").ok().as_deref(),
         std::env::var("UBSAN_OPTIONS").ok().as_deref(),
         leak,
         emulated,
-    )
+    );
+    // A HWASan build (#333) exists only on an AArch64 host, and runs natively
+    // there; it takes ASan's keys.
+    if cfg!(target_arch = "aarch64") && !emulated {
+        env.push((
+            "HWASAN_OPTIONS".to_owned(),
+            corpus::sanitizer_options::merge(
+                std::env::var("HWASAN_OPTIONS").ok().as_deref(),
+                &corpus::sanitizer_options::asan_required(leak, emulated),
+            ),
+        ));
+    }
+    env
 }
 
 /// [`sanitizer_child_env_for`] with the inherited `asan` and `ubsan` values:
@@ -8582,7 +8622,7 @@ fn in_loop_env(env: &[(String, String)], symbolize: bool) -> Vec<(String, String
     for (key, value) in env.iter_mut() {
         if matches!(
             key.as_str(),
-            "ASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
+            "ASAN_OPTIONS" | "HWASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
         ) {
             *value = corpus::sanitizer_options::merge(Some(value), "symbolize=0:abort_on_error=0");
         }
@@ -8705,6 +8745,7 @@ fn sanitizer_name(sanitizer: multicore_fuzz::Sanitizer) -> &'static str {
         multicore_fuzz::Sanitizer::Ubsan => "ubsan",
         multicore_fuzz::Sanitizer::Tsan => "tsan",
         multicore_fuzz::Sanitizer::Lsan => "lsan",
+        multicore_fuzz::Sanitizer::Hwasan => "hwasan",
     }
 }
 
@@ -10034,6 +10075,7 @@ fn hang_stack_env(extra_env: &[(String, String)], confirm: Duration) -> Vec<(Str
     env.push((HANG_REPORT_ENV.to_owned(), confirm.as_millis().to_string()));
     for key in [
         "ASAN_OPTIONS",
+        "HWASAN_OPTIONS",
         "UBSAN_OPTIONS",
         "MSAN_OPTIONS",
         "TSAN_OPTIONS",
@@ -13846,6 +13888,34 @@ mod parse_sanitizer_args_tests {
         assert!(error.contains("bhf auto --sanitizers cfi"), "{error}");
     }
 
+    /// #333: HWASan needs an AArch64 host; on any other the selection is
+    /// refused with the reason and what to use instead.
+    #[test]
+    fn hwasan_is_refused_off_aarch64_and_never_beside_asan() {
+        use super::hwasan_host_check;
+        let error =
+            hwasan_host_check(&[Sanitizer::Hwasan, Sanitizer::Ubsan], "x86_64").unwrap_err();
+        assert!(error.contains("needs an AArch64 host"), "{error}");
+        assert!(error.contains("x86_64 does not"), "{error}");
+        assert!(error.contains("--sanitizers asan"), "{error}");
+        assert_eq!(hwasan_host_check(&[Sanitizer::Hwasan], "aarch64"), Ok(()));
+        assert_eq!(hwasan_host_check(&[Sanitizer::Asan], "x86_64"), Ok(()));
+        if std::env::consts::ARCH == "aarch64" {
+            assert_eq!(
+                parse(&["hwaddress", "ubsan"]).unwrap(),
+                SanitizerSelection::Set(vec![Sanitizer::Hwasan, Sanitizer::Ubsan])
+            );
+            let error = parse(&["hwasan", "asan"]).unwrap_err();
+            assert!(
+                error.contains("hwasan cannot be combined with asan"),
+                "{error}"
+            );
+        } else {
+            let error = parse(&["hwaddress"]).unwrap_err();
+            assert!(error.contains("needs an AArch64 host"), "{error}");
+        }
+    }
+
     #[test]
     fn none_mixed_with_a_sanitizer_is_an_error() {
         // `none` is contradictory with a real sanitizer — reject, don't silently
@@ -15849,7 +15919,12 @@ exit 0
             Some("abort_on_error=1:symbolize=1:handle_abort=1")
         );
         assert_eq!(value("BHF_COV_SHM"), Some("/dev/shm/x"));
-        for key in ["UBSAN_OPTIONS", "MSAN_OPTIONS", "TSAN_OPTIONS"] {
+        for key in [
+            "HWASAN_OPTIONS",
+            "UBSAN_OPTIONS",
+            "MSAN_OPTIONS",
+            "TSAN_OPTIONS",
+        ] {
             assert!(
                 value(key).is_some_and(|options| options.ends_with("handle_abort=1")),
                 "{key}: {env:?}"

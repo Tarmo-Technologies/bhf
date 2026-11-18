@@ -2839,6 +2839,12 @@
   when bhf panics.
 
 ### Added
+- `--sanitizers hwasan` (`hwaddress`) builds the fuzzed C/C++ harness with
+  HWAddressSanitizer in place of ASan on an AArch64 host (#333). Its reports
+  are findings under the rule ASan gives the same bug, the kind taken from the
+  report's first specific `Cause:`, and `HWASAN_OPTIONS` is merged as
+  `ASAN_OPTIONS` is. It is refused beside `asan` and, with the reason, on any
+  other host.
 - `bhf auto --sanitizers ...,realtime` replays the corpus of each target that
   must not block through a RealtimeSanitizer build (`make rtsan`, clang 20+
   `-fsanitize=realtime`) after the fuzz passes (#298). The marked target runs
