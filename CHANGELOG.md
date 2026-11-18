@@ -2839,6 +2839,12 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --engine honggfuzz` runs honggfuzz in persistent mode (#295) on the
+  harness's `main_honggfuzz`, a new Makefile target built with honggfuzz's
+  `hfuzz-clang` (with ASan and UBSan) when absent. honggfuzz is found in
+  `BHF_HONGGFUZZ_PATH` or on PATH. The crash files it saves go through the
+  external-engine ingest into findings that replay through `main_honggfuzz`.
+  The nightly builds honggfuzz 2.6 for the gated test.
 - `bhf fuzz --engine libfuzzer` runs the harness's libFuzzer build (#294):
   `main_libfuzzer`, built with `make libfuzzer` when absent, for `--time`, with
   the per-input timeout, length and memory limits and the harness dictionary.

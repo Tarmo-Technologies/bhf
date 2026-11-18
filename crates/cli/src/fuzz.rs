@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
+mod honggfuzz;
 mod libfuzzer;
 mod peer_sync;
 pub(crate) mod shared_map;
@@ -243,7 +244,9 @@ pub struct FuzzArgs {
     /// Fuzz engine: the built-in coverage-guided engine (default), AFL++ via
     /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH),
     /// libFuzzer (`libfuzzer`, the harness's `main_libfuzzer`, built with
-    /// `make libfuzzer` when absent), or WinAFL (`winafl`, native Windows only;
+    /// `make libfuzzer` when absent), honggfuzz (`honggfuzz`, on the harness's
+    /// `main_honggfuzz`; needs honggfuzz on PATH or in `BHF_HONGGFUZZ_PATH`),
+    /// or WinAFL (`winafl`, native Windows only;
     /// needs WinAFL and DynamoRIO, see `--winafl-path` and `--dynamorio-path`).
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
@@ -835,6 +838,9 @@ pub enum FuzzEngine {
     /// libFuzzer, in process (#294): the harness's `main_libfuzzer`, built
     /// with `make libfuzzer` when there is none.
     Libfuzzer,
+    /// honggfuzz in persistent mode (#295): the harness's `main_honggfuzz`,
+    /// built with `make honggfuzz` (`hfuzz-clang`) when there is none.
+    Honggfuzz,
 }
 
 /// AFL++ execution mode for `--engine afl++` (issue #45). `native` uses
@@ -906,9 +912,11 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
             "afl++" | "aflplusplus" | "afl" => FuzzEngine::AflPlusPlus,
             "winafl" => FuzzEngine::Winafl,
             "libfuzzer" => FuzzEngine::Libfuzzer,
+            "honggfuzz" => FuzzEngine::Honggfuzz,
             other => {
                 return Err(format!(
-                    "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl, libfuzzer)"
+                    "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl, libfuzzer, \
+                     honggfuzz)"
                 ))
             }
         };
@@ -1594,10 +1602,13 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     }
-    if args.engine == FuzzEngine::Libfuzzer && multicore_requested(&args) {
+    if matches!(args.engine, FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz)
+        && multicore_requested(&args)
+    {
         bhfeprintln!(
-            "--engine libfuzzer runs one libFuzzer process; --workers and a sanitizer matrix \
-             (several --sanitizers) are not supported with it"
+            "--engine {} runs one fuzzer process; --workers and a sanitizer matrix (several \
+             --sanitizers) are not supported with it",
+            engine_arg_name(args.engine)
         );
         return 3;
     }
@@ -1654,6 +1665,7 @@ pub fn run(args: FuzzArgs) -> i32 {
         FuzzEngine::AflPlusPlus => run_afl_plus_plus(prepared),
         FuzzEngine::Winafl => winafl::run(prepared),
         FuzzEngine::Libfuzzer => libfuzzer::run(prepared),
+        FuzzEngine::Honggfuzz => honggfuzz::run(prepared),
     };
 
     match result {
@@ -3242,6 +3254,7 @@ fn engine_arg_name(engine: FuzzEngine) -> &'static str {
         FuzzEngine::AflPlusPlus => "afl++",
         FuzzEngine::Winafl => "winafl",
         FuzzEngine::Libfuzzer => "libfuzzer",
+        FuzzEngine::Honggfuzz => "honggfuzz",
     }
 }
 
@@ -12200,6 +12213,9 @@ pub(crate) fn find_harness_executable(
     if engine == FuzzEngine::Libfuzzer {
         return libfuzzer::ensure_binary(work_dir, harness_id);
     }
+    if engine == FuzzEngine::Honggfuzz {
+        return honggfuzz::ensure_binary(work_dir, harness_id);
+    }
     let build_dir = work_dir.join("build").join(harness_id);
     let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
     let legacy_auto_dir = crate::auto::layout::legacy_auto_harness_dir(work_dir, harness_id);
@@ -12241,7 +12257,10 @@ pub(crate) fn find_harness_executable(
         ),
         // WinAFL fuzzes `main_winafl` beside the sanitized `main`, which every
         // saved input is replayed through and which the findings name.
-        FuzzEngine::Builtin | FuzzEngine::Winafl | FuzzEngine::Libfuzzer => (
+        FuzzEngine::Builtin
+        | FuzzEngine::Winafl
+        | FuzzEngine::Libfuzzer
+        | FuzzEngine::Honggfuzz => (
             &["main"],
             vec![
                 build_dir.clone(),
@@ -12675,8 +12694,13 @@ mod engine_list_tests {
             parse_engine_list("afl").unwrap(),
             vec![FuzzEngine::AflPlusPlus]
         );
+        // The external engines parse, so `bhf auto` can say why it refuses them.
+        assert_eq!(
+            parse_engine_list("libfuzzer,honggfuzz").unwrap(),
+            vec![FuzzEngine::Libfuzzer, FuzzEngine::Honggfuzz]
+        );
         assert!(parse_engine_list("").is_err());
-        assert!(parse_engine_list("honggfuzz").is_err());
+        assert!(parse_engine_list("nyx").is_err());
     }
 
     #[test]

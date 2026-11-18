@@ -1323,10 +1323,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(2);
         }
     };
-    if engines.contains(&crate::fuzz::FuzzEngine::Libfuzzer) {
+    if let Some(engine) = engines.iter().find(|engine| {
+        matches!(
+            engine,
+            crate::fuzz::FuzzEngine::Libfuzzer | crate::fuzz::FuzzEngine::Honggfuzz
+        )
+    }) {
+        let name = if *engine == crate::fuzz::FuzzEngine::Libfuzzer {
+            "libfuzzer"
+        } else {
+            "honggfuzz"
+        };
         bhfeprintln!(
-            "error: --engine: libfuzzer is an engine of `bhf fuzz --engine libfuzzer`; \
-             `bhf auto` runs builtin, afl++ and winafl passes"
+            "error: --engine: {name} is an engine of `bhf fuzz --engine {name}`; `bhf auto` \
+             runs builtin, afl++ and winafl passes"
         );
         return Ok(2);
     }
