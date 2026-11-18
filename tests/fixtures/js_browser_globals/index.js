@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// A browser-oriented module: it reads `navigator.userAgent` as it loads, which
-// Node 20 does not define, and its header parser has a planted bug.
+// A browser-oriented module: it reads `location.hostname` as it loads, which
+// no Node defines (Node 21 and later define `navigator`, so a module that
+// reads only that loads there without a stand-in), and its header parser has
+// a planted bug.
 'use strict';
 
-const agent = navigator.userAgent.split(' ')[0];
+const host = location.hostname;
 
 function parseHeader(input) {
   const parts = String(input).split(':');
   if (parts[0].startsWith('U') && parts.length < 2) {
     // Planted: a `U...` header with no `:` is not handled.
-    throw new Error(`unparsed ${agent} header`);
+    throw new Error(`unparsed ${host} header`);
   }
   return parts.length;
 }

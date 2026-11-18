@@ -50,7 +50,7 @@ fn record_for(work: &Path, export: &str) -> Option<Option<String>> {
     windows,
     ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
 )]
-fn a_navigator_module_loads_with_stand_ins_and_its_bug_is_found() {
+fn a_module_reading_a_browser_global_as_it_loads_gets_stand_ins_and_its_bug_is_found() {
     if !have_node() {
         eprintln!("skipping: no node runtime on PATH");
         return;
@@ -75,7 +75,7 @@ fn a_navigator_module_loads_with_stand_ins_and_its_bug_is_found() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!log.contains("navigator is not defined"), "{log}");
+    assert!(!log.contains("location is not defined"), "{log}");
 
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(work.join("results/findings.json"))
@@ -95,13 +95,13 @@ fn a_navigator_module_loads_with_stand_ins_and_its_bug_is_found() {
     .unwrap();
     let caveat = record["fidelity_caveat"].as_str().unwrap_or_default();
     assert!(
-        caveat.contains("browser globals") && caveat.contains("navigator"),
+        caveat.contains("browser globals") && caveat.contains("location"),
         "{record:#}"
     );
     assert!(
         record["fidelity"]["environment_shim"]
             .as_str()
-            .is_some_and(|shim| shim.contains("navigator")),
+            .is_some_and(|shim| shim.contains("location")),
         "{record:#}"
     );
 
@@ -110,7 +110,7 @@ fn a_navigator_module_loads_with_stand_ins_and_its_bug_is_found() {
     assert!(
         loaded
             .as_deref()
-            .is_some_and(|names| names.contains("navigator")),
+            .is_some_and(|names| names.contains("location")),
         "{loaded:?}"
     );
     let called = record_for(&work, "widthFor").expect("a widthFor harness");
