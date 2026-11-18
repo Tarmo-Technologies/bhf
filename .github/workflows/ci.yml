@@ -737,6 +737,30 @@ jobs:
           cargo test --locked -p harness_gen --lib standalone
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The interpreted lanes on native Windows (#305-#307): each runs from the
+      # launch spec beside its POSIX launcher. The image's Python and .NET SDK
+      # serve; a JDK, Node and SharpFuzz are installed here, before the
+      # integration suites, whose capsule round trips build these lanes too
+      # (the image's default JDK is older than the lane needs).
+      - name: Install a JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install SharpFuzz
+        shell: pwsh
+        run: |
+          dotnet tool install --global --version 2.3.0 SharpFuzz.CommandLine
+          # The C# harness restores only from NuGet's global packages folder.
+          dotnet new classlib --output "$env:RUNNER_TEMP\sharpfuzz-stage" --force
+          dotnet add "$env:RUNNER_TEMP\sharpfuzz-stage" package SharpFuzz --version 2.3.0
+
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
       # paths, capsules, explain, cartography and provenance, plus every
@@ -757,30 +781,8 @@ jobs:
           cargo test --locked -p bhf --no-fail-fast --test auto_msbuild_import --test auto_force_win32 --test auto_makefile_injection --test auto_spaced_paths --test auto_force_params --test auto_peripheral_sequence --test capsule_cli --test capsule_lanes_cli --test cartography_cli --test explain_cli --test provenance_cli --test winafl_engine
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The interpreted lanes on native Windows (#305-#307): each runs from the
-      # launch spec beside its POSIX launcher. The image's Python and .NET SDK
-      # serve; a JDK, Node and SharpFuzz are installed here.
       # BHF_REQUIRE_TOOLS=1 fails a test whose toolchain is missing instead of
       # skipping it.
-      - name: Install a JDK
-        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
-        with:
-          distribution: temurin
-          java-version: 21
-
-      - name: Install Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-
-      - name: Install SharpFuzz
-        shell: pwsh
-        run: |
-          dotnet tool install --global --version 2.3.0 SharpFuzz.CommandLine
-          # The C# harness restores only from NuGet's global packages folder.
-          dotnet new classlib --output "$env:RUNNER_TEMP\sharpfuzz-stage" --force
-          dotnet add "$env:RUNNER_TEMP\sharpfuzz-stage" package SharpFuzz --version 2.3.0
-
       - name: Test the interpreted lanes
         shell: pwsh
         env:
