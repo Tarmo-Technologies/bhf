@@ -2853,6 +2853,15 @@
   when bhf panics.
 
 ### Added
+- `bhf minimize --strategy grammar --grammar <PATH>` minimizes a grammar
+  finding on its derivation tree (#369), so the minimized input is a smaller
+  sentence of the grammar that still reproduces; byte-wise minimization broke
+  its structure. The testcase is parsed with the grammar (an Earley parse),
+  and each subtree, outermost first, is replaced by its rule's smallest
+  derivation, a same-rule subtree inside it, or a smaller production of its
+  rule that keeps its children, while the finding reproduces, as Nautilus
+  and Perses do. `bhf auto --grammar` minimizes a finding whose testcase the
+  grammar derives the same way.
 - `--grammar` mutates derivation trees (#329), as Nautilus does: the builtin
   engine keeps the derivation tree of each input it derives from the grammar,
   and most children of such an input are tree mutations, a subtree derived

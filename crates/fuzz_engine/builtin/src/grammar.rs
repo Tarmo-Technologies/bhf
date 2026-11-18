@@ -36,9 +36,16 @@
 //! is built: a derivation falls back to it to end within its byte and node
 //! budget, so a generated or mutated tree is always complete and never cut off
 //! mid-sentence.
+//!
+//! [`Grammar::parse`] reads a tree back from a sentence (an Earley parse), and
+//! [`Grammar::minimize`] reduces a finding's tree while it still reproduces:
+//! each subtree replaced by its rule's smallest derivation, a same-rule
+//! subtree inside it, or a smaller production that keeps its children, so the
+//! minimized input stays a sentence.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fmt;
 
 use crate::rng::MutationRng;
 
@@ -60,6 +67,14 @@ const MAX_TREE_HEIGHT: usize = 1024;
 const MUTATION_TRIES: usize = 16;
 /// The most (ancestor, descendant) recursion pairs a pump picks from.
 const MAX_RECURSION_PAIRS: usize = 256;
+/// The longest input [`Grammar::parse`] parses.
+const MAX_PARSE_LEN: usize = 64 * 1024;
+/// The most Earley items, and tree-building steps, one parse may take: the
+/// bound on an ambiguous grammar's chart.
+const MAX_PARSE_WORK: usize = 1 << 22;
+/// How many same-rule subtrees inside a node a minimization tries to hoist
+/// into its place.
+const MAX_HOISTS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Symbol {
@@ -567,6 +582,516 @@ impl Grammar {
             },
             |smallest| smallest.cost,
         )
+    }
+
+    /// The smallest derivation of a productive `rule`: its smallest
+    /// production, with each non-terminal's smallest derivation in its place.
+    fn smallest_tree(&self, rule: usize) -> Derivation {
+        let smallest = self.smallest[rule].expect("only a productive rule has a tree");
+        let children = self.rules[rule][smallest.alt]
+            .iter()
+            .filter_map(|symbol| match symbol {
+                Symbol::NonTerminal(child) => Some(self.smallest_tree(*child)),
+                Symbol::Literal(_) => None,
+            })
+            .collect();
+        self.node(rule, smallest.alt, children)
+    }
+
+    /// A node taking production `alt` of `rule` over `children`, counted.
+    fn node(&self, rule: usize, alt: usize, children: Vec<Derivation>) -> Derivation {
+        let own = self.rules[rule][alt]
+            .iter()
+            .map(|symbol| match symbol {
+                Symbol::Literal(bytes) => bytes.len(),
+                Symbol::NonTerminal(_) => 0,
+            })
+            .sum();
+        let mut node = Derivation {
+            rule,
+            alt,
+            own,
+            len: 0,
+            nodes: 0,
+            height: 0,
+            children,
+        };
+        node.recount();
+        node
+    }
+
+    /// A derivation tree of `input` from the start symbol: an Earley parse
+    /// (with the Aycock-Horspool step for rules that derive the empty
+    /// sentence), from whose chart one derivation is read back. An input
+    /// that is no sentence of the grammar, or that the parse cannot settle
+    /// within its bounds, is an error that says which.
+    pub fn parse(&self, input: &[u8]) -> Result<Derivation, ParseError> {
+        if input.len() > MAX_PARSE_LEN {
+            return Err(ParseError::TooLong {
+                len: input.len(),
+                max: MAX_PARSE_LEN,
+            });
+        }
+        let flat = self.flat_productions();
+        let chart = Chart::fill(self, &flat, input)?;
+        let mut reader = TreeReader {
+            flat: &flat,
+            chart: &chart,
+            input,
+            decisions: HashMap::new(),
+            active: HashSet::new(),
+            steps: 0,
+        };
+        let whole = (self.start, 0, input.len());
+        if !reader.resolve(whole, 0) {
+            return Err(if reader.steps > MAX_PARSE_WORK {
+                ParseError::TooAmbiguous {
+                    work: MAX_PARSE_WORK,
+                }
+            } else {
+                ParseError::TooDeep {
+                    max: MAX_TREE_HEIGHT,
+                }
+            });
+        }
+        let tree = reader.tree(self, whole);
+        // The tree read back derives exactly the input.
+        debug_assert_eq!(self.sentence(&tree), input);
+        Ok(tree)
+    }
+
+    /// Each production as one symbol per byte of its literals.
+    fn flat_productions(&self) -> Vec<Vec<Vec<Flat>>> {
+        self.rules
+            .iter()
+            .map(|alts| {
+                alts.iter()
+                    .map(|symbols| {
+                        symbols
+                            .iter()
+                            .flat_map(|symbol| match symbol {
+                                Symbol::Literal(bytes) => {
+                                    bytes.iter().map(|&byte| Flat::Byte(byte)).collect()
+                                }
+                                Symbol::NonTerminal(rule) => vec![Flat::Rule(*rule)],
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Reduce `tree` while `holds` says its sentence still does what the
+    /// original did (a finding still reproduces), as Nautilus and Perses
+    /// minimize: for each node, outermost first, its rule's smallest
+    /// derivation, a same-rule subtree inside it hoisted into its place, or
+    /// another production of its rule that keeps the children it can, each
+    /// tried only where it is smaller. Every candidate is a derivation, so the
+    /// result is a sentence of the grammar. Stops after `max_runs` runs of
+    /// `holds`; a candidate whose sentence is the current one is taken
+    /// without a run.
+    pub fn minimize<E>(
+        &self,
+        tree: &Derivation,
+        max_runs: usize,
+        mut holds: impl FnMut(&[u8]) -> Result<bool, E>,
+    ) -> Result<GrammarMinimization, E> {
+        let mut current = tree.clone();
+        let mut sentence = self.sentence(&current);
+        let (mut tried, mut kept) = (0, 0);
+        'passes: loop {
+            let mut changed = false;
+            let mut k = 0;
+            while k < current.nodes {
+                let mut accepted = false;
+                for candidate in self.reductions(&current, k) {
+                    let candidate_sentence = self.sentence(&candidate);
+                    if candidate_sentence != sentence {
+                        if tried >= max_runs {
+                            break 'passes;
+                        }
+                        tried += 1;
+                        if !holds(&candidate_sentence)? {
+                            continue;
+                        }
+                        kept += 1;
+                    }
+                    current = candidate;
+                    sentence = candidate_sentence;
+                    accepted = true;
+                    changed = true;
+                    break;
+                }
+                // A node just reduced may reduce again; otherwise move on.
+                if !accepted {
+                    k += 1;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(GrammarMinimization {
+            tree: current,
+            tried,
+            kept,
+        })
+    }
+
+    /// The trees `tree` becomes with node `k` reduced, each smaller than it,
+    /// most reduced first.
+    fn reductions(&self, tree: &Derivation, k: usize) -> Vec<Derivation> {
+        let Some((node, _)) = tree.nth(k) else {
+            return Vec::new();
+        };
+        let mut replacements: Vec<Derivation> = Vec::new();
+        if self.smallest[node.rule].is_some() {
+            replacements.push(self.smallest_tree(node.rule));
+        }
+        let mut inside = Vec::new();
+        for child in &node.children {
+            collect_rule(child, node.rule, &mut inside);
+        }
+        inside.sort_by_key(|subtree| subtree.cost());
+        replacements.extend(inside.into_iter().take(MAX_HOISTS).cloned());
+        for alt in 0..self.rules[node.rule].len() {
+            if alt != node.alt && self.alt_cost[node.rule][alt].is_some() {
+                replacements.push(self.keeping_children(node, alt));
+            }
+        }
+        replacements.retain(|replacement| replacement.cost() < node.cost());
+        replacements.sort_by_key(|replacement| replacement.cost());
+        replacements.dedup();
+        replacements
+            .into_iter()
+            .filter_map(|replacement| {
+                let mut replacement = Some(replacement);
+                let mut out = tree.clone();
+                out.replace_nth(k, 0, &mut |_, _| replacement.take())
+                    .then_some(out)
+            })
+            .collect()
+    }
+
+    /// `node` with production `alt` of its rule instead, each of whose
+    /// non-terminals takes the next of `node`'s children of its rule, in
+    /// order, and its smallest derivation when none is left.
+    fn keeping_children(&self, node: &Derivation, alt: usize) -> Derivation {
+        let mut next = 0;
+        let children = self.rules[node.rule][alt]
+            .iter()
+            .filter_map(|symbol| match symbol {
+                Symbol::NonTerminal(rule) => Some(*rule),
+                Symbol::Literal(_) => None,
+            })
+            .map(|rule| {
+                match node.children[next.min(node.children.len())..]
+                    .iter()
+                    .position(|child| child.rule == rule)
+                {
+                    Some(offset) => {
+                        next += offset + 1;
+                        node.children[next - 1].clone()
+                    }
+                    None => self.smallest_tree(rule),
+                }
+            })
+            .collect();
+        self.node(node.rule, alt, children)
+    }
+}
+
+/// What [`Grammar::minimize`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrammarMinimization {
+    /// The smallest tree that still held.
+    pub tree: Derivation,
+    /// Candidates run.
+    pub tried: usize,
+    /// Candidates that held and were kept.
+    pub kept: usize,
+}
+
+/// Why [`Grammar::parse`] has no tree for an input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// The input is no sentence of the grammar: no parse reads past byte
+    /// `at`.
+    NotASentence {
+        at: usize,
+    },
+    TooLong {
+        len: usize,
+        max: usize,
+    },
+    /// The grammar is so ambiguous for the input that the parse took more
+    /// than `work` items or steps.
+    TooAmbiguous {
+        work: usize,
+    },
+    /// The input's derivation nests deeper than `max`.
+    TooDeep {
+        max: usize,
+    },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::NotASentence { at } => write!(
+                f,
+                "the input is not a sentence of the grammar: no derivation reads past byte {at}"
+            ),
+            ParseError::TooLong { len, max } => write!(
+                f,
+                "the input is {len} bytes, past the {max} bytes a grammar parse takes"
+            ),
+            ParseError::TooAmbiguous { work } => write!(
+                f,
+                "the grammar is too ambiguous for the input: its parse took more than {work} steps"
+            ),
+            ParseError::TooDeep { max } => write!(
+                f,
+                "the input's derivation nests deeper than the {max} levels a tree may"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// A production symbol as the parser reads it: one byte, or a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flat {
+    Byte(u8),
+    Rule(usize),
+}
+
+/// An Earley item: a production of a rule, how many of its symbols are read,
+/// and where it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Item {
+    rule: usize,
+    alt: usize,
+    dot: usize,
+    origin: usize,
+}
+
+/// An Earley chart: the items at each input position, and which rules were
+/// completed there from which start.
+struct Chart {
+    items: Vec<HashSet<Item>>,
+    completed: Vec<HashSet<(usize, usize)>>,
+}
+
+impl Chart {
+    fn fill(grammar: &Grammar, flat: &[Vec<Vec<Flat>>], input: &[u8]) -> Result<Self, ParseError> {
+        // A rule whose smallest sentence is empty derives the empty sentence.
+        let nullable: Vec<bool> = grammar
+            .smallest
+            .iter()
+            .map(|smallest| smallest.is_some_and(|s| s.cost.len == 0))
+            .collect();
+        let n = input.len();
+        let mut order: Vec<Vec<Item>> = vec![Vec::new(); n + 1];
+        let mut items: Vec<HashSet<Item>> = vec![HashSet::new(); n + 1];
+        let mut completed: Vec<HashSet<(usize, usize)>> = vec![HashSet::new(); n + 1];
+        // Per position, the items waiting on each rule there.
+        let mut waiting: Vec<HashMap<usize, Vec<Item>>> = vec![HashMap::new(); n + 1];
+        let mut total = 0usize;
+        let mut furthest = 0;
+        for alt in 0..flat[grammar.start].len() {
+            let item = Item {
+                rule: grammar.start,
+                alt,
+                dot: 0,
+                origin: 0,
+            };
+            if items[0].insert(item) {
+                order[0].push(item);
+            }
+        }
+        for at in 0..=n {
+            let mut next = 0;
+            while next < order[at].len() {
+                let item = order[at][next];
+                next += 1;
+                total += 1;
+                if total > MAX_PARSE_WORK {
+                    return Err(ParseError::TooAmbiguous {
+                        work: MAX_PARSE_WORK,
+                    });
+                }
+                if !order[at].is_empty() {
+                    furthest = at;
+                }
+                let mut add = |position: usize, new: Item, order: &mut Vec<Vec<Item>>| {
+                    if items[position].insert(new) {
+                        order[position].push(new);
+                    }
+                };
+                match flat[item.rule][item.alt].get(item.dot) {
+                    Some(Flat::Rule(rule)) => {
+                        waiting[at].entry(*rule).or_default().push(item);
+                        for alt in 0..flat[*rule].len() {
+                            let predicted = Item {
+                                rule: *rule,
+                                alt,
+                                dot: 0,
+                                origin: at,
+                            };
+                            add(at, predicted, &mut order);
+                        }
+                        if nullable[*rule] {
+                            let skipped = Item {
+                                dot: item.dot + 1,
+                                ..item
+                            };
+                            add(at, skipped, &mut order);
+                        }
+                    }
+                    Some(Flat::Byte(byte)) => {
+                        if input.get(at) == Some(byte) {
+                            let scanned = Item {
+                                dot: item.dot + 1,
+                                ..item
+                            };
+                            add(at + 1, scanned, &mut order);
+                        }
+                    }
+                    None => {
+                        completed[at].insert((item.rule, item.origin));
+                        let parents = waiting[item.origin]
+                            .get(&item.rule)
+                            .cloned()
+                            .unwrap_or_default();
+                        for parent in parents {
+                            let advanced = Item {
+                                dot: parent.dot + 1,
+                                ..parent
+                            };
+                            add(at, advanced, &mut order);
+                        }
+                    }
+                }
+            }
+        }
+        if !completed[n].contains(&(grammar.start, 0)) {
+            return Err(ParseError::NotASentence { at: furthest });
+        }
+        Ok(Self { items, completed })
+    }
+
+    fn has(&self, at: usize, item: Item) -> bool {
+        self.items[at].contains(&item)
+    }
+}
+
+/// A rule over an input span: `(rule, start, end)`.
+type Span = (usize, usize, usize);
+
+/// Reads one derivation back out of a filled [`Chart`]: for a rule over a
+/// span, a production completed there, and the split of the span between
+/// its symbols. Each resolved (rule, start, end) is kept, so it is read once.
+struct TreeReader<'a> {
+    flat: &'a [Vec<Vec<Flat>>],
+    chart: &'a Chart,
+    input: &'a [u8],
+    /// For each resolved (rule, start, end): its production and its
+    /// children's (rule, start, end), in order.
+    decisions: HashMap<Span, (usize, Vec<Span>)>,
+    /// The spans being resolved, so a cycle of rules over one span is cut.
+    active: HashSet<Span>,
+    steps: usize,
+}
+
+impl TreeReader<'_> {
+    fn resolve(&mut self, span: Span, depth: usize) -> bool {
+        if self.decisions.contains_key(&span) {
+            return true;
+        }
+        if depth > MAX_TREE_HEIGHT || self.steps > MAX_PARSE_WORK || !self.active.insert(span) {
+            return false;
+        }
+        let (rule, start, end) = span;
+        let mut found = None;
+        for alt in 0..self.flat[rule].len() {
+            let len = self.flat[rule][alt].len();
+            let item = Item {
+                rule,
+                alt,
+                dot: len,
+                origin: start,
+            };
+            if !self.chart.has(end, item) {
+                continue;
+            }
+            let mut children = Vec::new();
+            if self.split(item, end, depth, &mut children) {
+                children.reverse();
+                found = Some((alt, children));
+                break;
+            }
+        }
+        self.active.remove(&span);
+        match found {
+            Some(decision) => {
+                self.decisions.insert(span, decision);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `item`, in the chart at `at`, has a split of its span: its
+    /// read symbols matched, right to left, onto the input and onto resolved
+    /// children, which are pushed onto `children` last first.
+    fn split(&mut self, item: Item, at: usize, depth: usize, children: &mut Vec<Span>) -> bool {
+        self.steps += 1;
+        if self.steps > MAX_PARSE_WORK {
+            return false;
+        }
+        if item.dot == 0 {
+            return at == item.origin;
+        }
+        let before = Item {
+            dot: item.dot - 1,
+            ..item
+        };
+        match self.flat[item.rule][item.alt][item.dot - 1] {
+            Flat::Byte(byte) => {
+                at > item.origin
+                    && self.input[at - 1] == byte
+                    && self.chart.has(at - 1, before)
+                    && self.split(before, at - 1, depth, children)
+            }
+            Flat::Rule(rule) => {
+                for from in (item.origin..=at).rev() {
+                    if !self.chart.has(from, before)
+                        || !self.chart.completed[at].contains(&(rule, from))
+                        || !self.resolve((rule, from, at), depth + 1)
+                    {
+                        continue;
+                    }
+                    children.push((rule, from, at));
+                    if self.split(before, from, depth, children) {
+                        return true;
+                    }
+                    children.pop();
+                }
+                false
+            }
+        }
+    }
+
+    fn tree(&self, grammar: &Grammar, span: Span) -> Derivation {
+        let (alt, children) = &self.decisions[&span];
+        let children = children
+            .iter()
+            .map(|&child| self.tree(grammar, child))
+            .collect();
+        grammar.node(span.0, *alt, children)
     }
 }
 
@@ -1187,5 +1712,123 @@ mod tests {
             3,
             "every same-rule subtree of the donor: {seen:?}"
         );
+    }
+    /// `LIST := ITEM | ITEM,LIST`, `ITEM := [WORD] | (LIST)`.
+    fn list() -> Grammar {
+        Grammar::from_rules(
+            &rules(&[
+                ("START", &["{LIST}"]),
+                ("LIST", &["{ITEM}", "{ITEM},{LIST}"]),
+                ("ITEM", &["[{WORD}]", "({LIST})"]),
+                ("WORD", &["alpha", "beta", "BHFMAGIC", "gamma"]),
+            ]),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_parse_reads_back_a_tree_that_derives_the_input() {
+        for g in [arithmetic(), nested(), list()] {
+            let mut rng = MutationRng::new(0x369);
+            for _ in 0..300 {
+                let sentence = g.generate(256, &mut rng).unwrap_or_default();
+                let tree = g
+                    .parse(&sentence)
+                    .unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&sentence)));
+                assert_eq!(g.sentence(&tree), sentence);
+                assert_eq!(tree.len(), sentence.len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_parse_handles_empty_productions_and_rule_cycles() {
+        // `A` derives itself, and `B` the empty sentence among others.
+        let g = Grammar::from_rules(
+            &rules(&[("A", &["{A}", "{B}{A}", ""]), ("B", &["b", "", "{B}{B}"])]),
+            None,
+        )
+        .unwrap();
+        for input in [&b""[..], b"b", b"bbbb"] {
+            let tree = g.parse(input).unwrap();
+            assert_eq!(g.sentence(&tree), input);
+        }
+        assert_eq!(
+            g.parse(b"bab"),
+            Err(ParseError::NotASentence { at: 1 }),
+            "nothing reads the `a`"
+        );
+    }
+
+    #[test]
+    fn a_parse_refuses_what_is_no_sentence() {
+        let g = arithmetic();
+        for input in [&b"1+"[..], b"(1", b"12", b"", b"1+3"] {
+            let error = g.parse(input).unwrap_err();
+            assert!(
+                matches!(error, ParseError::NotASentence { .. }),
+                "{input:?}: {error}"
+            );
+        }
+        assert_eq!(g.parse(b"1+(2+x)"), Err(ParseError::NotASentence { at: 5 }));
+        let long = vec![b'1'; MAX_PARSE_LEN + 1];
+        assert!(matches!(g.parse(&long), Err(ParseError::TooLong { .. })));
+    }
+
+    /// #369: a finding minimized on its tree is a smaller sentence that still
+    /// does what it did; byte minimization of it would leave `BHFMAGIC`,
+    /// which is no sentence.
+    #[test]
+    fn minimize_reduces_a_sentence_to_the_smallest_that_still_holds() {
+        let g = list();
+        let input = b"[alpha],([beta],([gamma],[BHFMAGIC])),[gamma]";
+        let tree = g.parse(input).unwrap();
+        let holds = |s: &[u8]| -> Result<bool, ()> { Ok(s.windows(8).any(|w| w == b"BHFMAGIC")) };
+        let result = g.minimize(&tree, 10_000, holds).unwrap();
+        let minimized = g.sentence(&result.tree);
+        assert_eq!(minimized, b"[BHFMAGIC]");
+        assert!(g.parse(&minimized).is_ok());
+        assert!(result.kept > 0 && result.tried >= result.kept);
+        assert!(
+            g.parse(b"BHFMAGIC").is_err(),
+            "the byte-minimal input is no sentence"
+        );
+    }
+
+    #[test]
+    fn minimize_keeps_every_candidate_a_sentence_and_stops_at_its_run_bound() {
+        let g = nested();
+        let mut rng = MutationRng::new(0x3690);
+        for _ in 0..40 {
+            let tree = g.generate_tree(256, &mut rng).unwrap();
+            let original = g.sentence(&tree);
+            // Holds while the sentence keeps the original's count of `[`.
+            let brackets = |s: &[u8]| s.iter().filter(|&&b| b == b'[').count();
+            let want = brackets(&original);
+            let mut runs = 0;
+            let result = g
+                .minimize(&tree, 50, |candidate| -> Result<bool, ()> {
+                    runs += 1;
+                    assert!(earley_accepts(&g, candidate), "{candidate:?}");
+                    Ok(brackets(candidate) == want)
+                })
+                .unwrap();
+            let minimized = g.sentence(&result.tree);
+            assert!(runs <= 50 && result.tried == runs);
+            assert!(minimized.len() <= original.len());
+            assert_eq!(brackets(&minimized), want);
+            assert!(earley_accepts(&g, &minimized));
+        }
+    }
+
+    #[test]
+    fn minimize_returns_the_predicates_error() {
+        let g = list();
+        let tree = g.parse(b"[alpha],[beta]").unwrap();
+        let error = g
+            .minimize(&tree, 100, |_| Err::<bool, &str>("harness failed to start"))
+            .unwrap_err();
+        assert_eq!(error, "harness failed to start");
     }
 }

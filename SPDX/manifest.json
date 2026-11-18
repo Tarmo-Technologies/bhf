@@ -3271,6 +3271,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/minimize_grammar_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/minimize_typed_cli.rs",
       "license": "Apache-2.0"
     },

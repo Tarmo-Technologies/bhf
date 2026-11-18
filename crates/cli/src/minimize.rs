@@ -63,6 +63,15 @@ pub struct MinimizeArgs {
     #[arg(long, value_enum, default_value_t = MinimizeStrategy::Bytes)]
     pub strategy: MinimizeStrategy,
 
+    /// The JSON grammar (`bhf fuzz --grammar`'s format) a `--strategy grammar`
+    /// minimization parses the testcase with.
+    #[arg(
+        long = "grammar",
+        value_name = "PATH",
+        required_if_eq("strategy", "grammar")
+    )]
+    pub grammar: Option<PathBuf>,
+
     /// Minimize against the crash the harness reports even when it is not
     /// the one the finding records, as after an intentional rebuild whose
     /// inlining, line numbers or symbolizer moved the sink. bhf prints a
@@ -88,6 +97,13 @@ pub enum MinimizeStrategy {
     /// zero that still crashes. For Ada harnesses and generated C/C++
     /// harnesses, from their `arg-layout.json`.
     Typed,
+    /// Reduce a grammar finding on its derivation tree, parsed from the
+    /// testcase with `--grammar`: each subtree, outermost first, is replaced
+    /// by its rule's smallest derivation, by a same-rule subtree inside it,
+    /// or by a smaller production of its rule that keeps its children, while
+    /// the finding reproduces. The minimized input is a sentence of the
+    /// grammar, where a byte-wise reduction breaks its structure.
+    Grammar,
 }
 
 impl MinimizeStrategy {
@@ -95,8 +111,45 @@ impl MinimizeStrategy {
         match self {
             Self::Bytes => "bytes",
             Self::Typed => "typed",
+            Self::Grammar => "grammar",
         }
     }
+}
+
+/// The most candidates a grammar minimization runs.
+const MAX_GRAMMAR_RUNS: usize = 4096;
+
+/// The derivation tree of a `--strategy grammar` finding's testcase, or why
+/// it has none.
+fn grammar_tree(
+    grammar: &fuzz_engine_builtin::Grammar,
+    testcase: &[u8],
+    testcase_path: &Path,
+) -> anyhow::Result<fuzz_engine_builtin::grammar::Derivation> {
+    grammar.parse(testcase).map_err(|error| {
+        anyhow!(
+            "minimize --strategy grammar reduces a testcase the grammar derives, on its \
+             derivation tree; {} ({} bytes) has none: {error}, so minimize it with --strategy \
+             bytes",
+            testcase_path.display(),
+            testcase.len()
+        )
+    })
+}
+
+/// The grammar of the `bhf auto --grammar` campaign a finding came from
+/// (`grammar_path`, its `BHF_GRAMMAR`), when it derives the finding's
+/// testcase: the auto pass then minimizes the finding on its tree. A
+/// testcase the grammar does not derive (a seed, a byte mutation) is
+/// minimized byte-wise.
+fn auto_grammar(
+    grammar_path: Option<&std::ffi::OsStr>,
+    finding_dir: &Path,
+) -> Option<fuzz_engine_builtin::Grammar> {
+    let path = Path::new(grammar_path.filter(|path| !path.is_empty())?);
+    let grammar = crate::fuzz::load_grammar_for_run(Some(path)).ok()??;
+    let testcase = fs::read(finding_dir.join("testcase.bin")).ok()?;
+    grammar.parse(&testcase).is_ok().then_some(grammar)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,8 +193,17 @@ fn minimize_c_engine(
     strategy: MinimizeStrategy,
     io: CEngineIo,
     allow_other_crash: bool,
+    grammar: Option<&fuzz_engine_builtin::Grammar>,
 ) -> anyhow::Result<MinimizeSummary> {
-    minimize_c_engine_until(finding_dir, runner, strategy, io, None, allow_other_crash)
+    minimize_c_engine_until(
+        finding_dir,
+        runner,
+        strategy,
+        io,
+        None,
+        allow_other_crash,
+        grammar,
+    )
 }
 
 /// Like [`minimize_c_engine`], but stops accepting further reductions once
@@ -177,6 +239,7 @@ fn minimize_c_engine_until(
     io: CEngineIo,
     deadline: Option<std::time::Instant>,
     allow_other_crash: bool,
+    grammar: Option<&fuzz_engine_builtin::Grammar>,
 ) -> anyhow::Result<MinimizeSummary> {
     let harness = runner.harness_path();
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,7 +254,7 @@ fn minimize_c_engine_until(
     // #279: the typed strategy reduces the arguments the harness decodes,
     // which its `arg-layout.json` locates in the input.
     let typed_spans = match strategy {
-        MinimizeStrategy::Bytes => None,
+        MinimizeStrategy::Bytes | MinimizeStrategy::Grammar => None,
         MinimizeStrategy::Typed => {
             let work_dir = corpus::layout::work_dir_for_finding(finding_dir).unwrap_or_default();
             let harness_id = raw["harness_id"].as_str().unwrap_or_default();
@@ -218,6 +281,17 @@ fn minimize_c_engine_until(
             }
             Some(spans)
         }
+    };
+    // #369: the grammar strategy reduces the testcase's derivation tree.
+    let tree = match (strategy, grammar) {
+        (MinimizeStrategy::Grammar, Some(grammar)) => Some((
+            grammar,
+            grammar_tree(grammar, &original_input, &testcase_path)?,
+        )),
+        (MinimizeStrategy::Grammar, None) => {
+            return Err(anyhow!("minimize --strategy grammar needs --grammar"));
+        }
+        _ => None,
     };
 
     let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
@@ -368,9 +442,24 @@ fn minimize_c_engine_until(
         })
     };
     let mut typed_record = None;
-    let result = match &typed_spans {
-        None => replay_min::ddmin_bytes(&original_input, holds)?,
-        Some(spans) => {
+    let mut grammar_record = None;
+    let result = match (&typed_spans, tree) {
+        (None, Some((grammar, tree))) => {
+            let reduced = grammar.minimize(&tree, MAX_GRAMMAR_RUNS, holds)?;
+            grammar_record = Some(json!({
+                "nodes_before": tree.node_count(),
+                "nodes_after": reduced.tree.node_count(),
+                "candidates_tried": reduced.tried,
+                "candidates_kept": reduced.kept,
+            }));
+            replay_min::ByteMinimization {
+                original_len: original_input.len(),
+                minimized: grammar.sentence(&reduced.tree),
+                predicate_runs: reduced.tried,
+            }
+        }
+        (None, None) => replay_min::ddmin_bytes(&original_input, holds)?,
+        (Some(spans), _) => {
             let typed = minimize_decoded_values(&original_input, spans, holds)?;
             typed_record = Some(json!({
                 "spans": spans.len(),
@@ -411,6 +500,9 @@ fn minimize_c_engine_until(
     }
     if let Some(typed) = typed_record {
         metadata["typed"] = typed;
+    }
+    if let Some(record) = grammar_record {
+        metadata["grammar"] = record;
     }
     update_finding_record(
         finding_dir,
@@ -622,6 +714,13 @@ pub(crate) fn minimize_for_auto(
         }
         None => replay_min::HarnessRunner::direct(harness),
     };
+    // #369: a finding of a `--grammar` campaign whose testcase the grammar
+    // derives is minimized on its tree.
+    let grammar = auto_grammar(std::env::var_os("BHF_GRAMMAR").as_deref(), finding_dir);
+    let strategy = match grammar {
+        Some(_) => MinimizeStrategy::Grammar,
+        None => MinimizeStrategy::Bytes,
+    };
     let io = match engine_for_finding(harness, finding_dir) {
         HarnessEngine::CAfl => CEngineIo::Stdin,
         HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
@@ -631,8 +730,9 @@ pub(crate) fn minimize_for_auto(
             let result = minimize(
                 finding_dir,
                 &runner,
-                MinimizeStrategy::Bytes,
+                strategy,
                 Some(deadline),
+                grammar.as_ref(),
             )?;
             return write_minimization(finding_dir, &result).map(Some);
         }
@@ -640,10 +740,11 @@ pub(crate) fn minimize_for_auto(
     minimize_c_engine_until(
         finding_dir,
         &runner,
-        MinimizeStrategy::Bytes,
+        strategy,
         io,
         Some(deadline),
         false,
+        grammar.as_ref(),
     )
     .map(Some)
 }
@@ -706,6 +807,21 @@ impl std::error::Error for BaselineMismatch {}
 
 fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     let finding_dir = resolve_finding_arg(args.finding_dir, args.finding);
+    let grammar = match (&args.grammar, args.strategy) {
+        (Some(path), MinimizeStrategy::Grammar) => Some(
+            crate::fuzz::load_grammar_for_run(Some(path))
+                .map_err(|error| anyhow!(error))?
+                .ok_or_else(|| anyhow!("--grammar {} loaded no grammar", path.display()))?,
+        ),
+        (Some(_), strategy) => {
+            return Err(anyhow!(
+                "--grammar is the grammar a --strategy grammar minimization parses the \
+                 testcase with; --strategy {} does not use it",
+                strategy.as_str()
+            ));
+        }
+        (None, _) => None,
+    };
     // #60: a collector-sourced finding is reproduced from provider-captured
     // evidence that does not vary with the testcase bytes, so there is nothing to
     // delta-debug under deterministic replay. Re-confirm it reproduces and report
@@ -725,6 +841,13 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     // minimized through the transport it was found on, rebuilt from its
     // profile as `bhf replay` does, on the same fault rule and site.
     if crate::transport_replay::is_transport_finding(&finding_dir) {
+        if args.strategy == MinimizeStrategy::Grammar {
+            return Err(anyhow!(
+                "--strategy grammar minimizes a host harness's finding; an on-target transport \
+                 finding is minimized through its transport, so minimize it with --strategy \
+                 bytes"
+            ));
+        }
         if args.strategy == MinimizeStrategy::Typed {
             return Err(anyhow!(
                 "--strategy typed reduces a host harness's arguments by its \
@@ -774,6 +897,12 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
         bhfeprintln!("note: {note}");
     }
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
+        if args.strategy == MinimizeStrategy::Grammar {
+            return Err(anyhow!(
+                "--strategy grammar minimizes a harness's finding; a binary finding is \
+                 minimized with --strategy bytes"
+            ));
+        }
         let result =
             crate::binary_fuzz::minimize_binary_finding(&finding_dir, &harness, args.strategy)?;
         return Ok(MinimizeSummary {
@@ -810,6 +939,7 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
                 args.strategy,
                 CEngineIo::Stdin,
                 args.allow_other_crash,
+                grammar.as_ref(),
             );
         }
         HarnessEngine::CLibFuzzer => {
@@ -819,21 +949,23 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
                 args.strategy,
                 CEngineIo::ArgvFile,
                 args.allow_other_crash,
+                grammar.as_ref(),
             );
         }
         HarnessEngine::AdaStdin => {}
     }
-    let result = minimize(&finding_dir, &runner, args.strategy, None).with_context(|| {
-        let work = corpus::layout::work_dir_for_finding(&finding_dir);
-        let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
-        let detection = crate::protocol_detect::detect(runner.harness_path(), &work_dirs);
-        format!(
-            "minimizing {} as an Ada stdin harness ({}); if it is a C/C++ harness, pass the \
+    let result = minimize(&finding_dir, &runner, args.strategy, None, grammar.as_ref())
+        .with_context(|| {
+            let work = corpus::layout::work_dir_for_finding(&finding_dir);
+            let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
+            let detection = crate::protocol_detect::detect(runner.harness_path(), &work_dirs);
+            format!(
+                "minimizing {} as an Ada stdin harness ({}); if it is a C/C++ harness, pass the \
              binary next to its main.c/main.cpp with --harness, or rebuild it with this bhf",
-            runner.harness_path().display(),
-            detection.basis.describe()
-        )
-    })?;
+                runner.harness_path().display(),
+                detection.basis.describe()
+            )
+        })?;
     write_minimization(&finding_dir, &result)
 }
 
@@ -883,8 +1015,14 @@ fn minimize(
     runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
     deadline: Option<std::time::Instant>,
+    grammar: Option<&fuzz_engine_builtin::Grammar>,
 ) -> anyhow::Result<MinimizeOutput> {
     match strategy {
+        MinimizeStrategy::Grammar => {
+            let grammar =
+                grammar.ok_or_else(|| anyhow!("minimize --strategy grammar needs --grammar"))?;
+            minimize_event_log_on_grammar(finding_dir, runner, grammar, deadline)
+        }
         MinimizeStrategy::Bytes => {
             let result = replay_min::minimize_finding_bytes_with_runner_until(
                 finding_dir,
@@ -930,6 +1068,72 @@ fn minimize(
             })
         }
     }
+}
+
+/// #369: an event-log (Ada) finding minimized on its derivation tree. Each
+/// candidate is replayed as `bhf replay` replays the testcase, from a scratch
+/// copy of the finding, and holds when it raises the recorded signature.
+fn minimize_event_log_on_grammar(
+    finding_dir: &Path,
+    runner: &replay_min::HarnessRunner,
+    grammar: &fuzz_engine_builtin::Grammar,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<MinimizeOutput> {
+    let testcase_path = finding_dir.join("testcase.bin");
+    let original =
+        fs::read(&testcase_path).with_context(|| format!("read {}", testcase_path.display()))?;
+    let tree = grammar_tree(grammar, &original, &testcase_path)?;
+    let scratch = ScratchDir::create(finding_dir.join("minimize_tmp"))?;
+    let copy = scratch.path().join("finding.json");
+    fs::copy(finding_dir.join("finding.json"), &copy)
+        .with_context(|| format!("copy finding.json to {}", copy.display()))?;
+    let reproduces = |candidate: &[u8]| -> anyhow::Result<bool> {
+        let path = scratch.path().join("testcase.bin");
+        fs::write(&path, candidate).with_context(|| format!("write {}", path.display()))?;
+        match replay_min::replay_with_runner(scratch.path(), runner) {
+            Ok(result) => Ok(result == replay_min::ReplayResult::Match),
+            Err(error @ replay_min::ReplayError::HarnessFailedToStart { .. }) => Err(error.into()),
+            Err(_) => Ok(false),
+        }
+    };
+    // The testcase itself must reproduce, whatever the deadline.
+    if !reproduces(&original)? {
+        return Err(anyhow!(
+            "original testcase {} does not reproduce the finding's signature against {}",
+            testcase_path.display(),
+            runner.harness_path().display()
+        ));
+    }
+    let reduced = grammar.minimize(&tree, MAX_GRAMMAR_RUNS, |candidate| {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(false);
+        }
+        reproduces(candidate)
+    })?;
+    drop(scratch);
+    let minimized = grammar.sentence(&reduced.tree);
+    let removed = original.len().saturating_sub(minimized.len());
+    let reduced_any = removed > 0;
+    Ok(MinimizeOutput {
+        strategy: MinimizeStrategy::Grammar,
+        original_len: original.len(),
+        metadata: json!({
+            "strategy": "grammar",
+            "original_len": original.len(),
+            "minimized_len": minimized.len(),
+            "removed_bytes": removed,
+            "reduced": reduced_any,
+            "predicate_runs": reduced.tried,
+            "grammar": {
+                "nodes_before": tree.node_count(),
+                "nodes_after": reduced.tree.node_count(),
+                "candidates_tried": reduced.tried,
+                "candidates_kept": reduced.kept,
+            },
+        }),
+        minimized,
+        reduced: reduced_any,
+    })
 }
 
 fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow::Result<()> {
@@ -1042,6 +1246,136 @@ mod silent_abort_tests {
         harness
     }
 
+    /// A JSON grammar of `[word]` items and `(...)` groups, written to `dir`.
+    fn write_list_grammar(dir: &Path) -> PathBuf {
+        let path = dir.join("list.json");
+        fs::write(
+            &path,
+            r#"{"START": ["{LIST}"], "LIST": ["{ITEM}", "{ITEM},{LIST}"],
+                "ITEM": ["[{WORD}]", "({LIST})"],
+                "WORD": ["alpha", "beta", "BHFMAGIC", "gamma"]}"#,
+        )
+        .expect("grammar");
+        path
+    }
+
+    fn write_magic_abort_harness(dir: &Path) -> PathBuf {
+        let harness = dir.join("abort-on-magic.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *BHFMAGIC*) kill -ABRT $$;; esac\n",
+        )
+        .expect("harness");
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("chmod");
+        harness
+    }
+
+    fn magic_finding(root: &Path, testcase: &[u8]) -> PathBuf {
+        let finding = root.join("finding");
+        fs::create_dir_all(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), testcase).expect("testcase");
+        finding
+    }
+
+    /// #369: a grammar finding of a C/C++ harness minimizes to a smaller
+    /// sentence that still crashes, where the byte strategy leaves an input
+    /// that is no sentence.
+    #[test]
+    fn a_grammar_finding_minimizes_to_a_smaller_sentence_that_still_crashes() {
+        let root = tempdir().expect("tempdir");
+        let testcase = b"[alpha],([beta],[BHFMAGIC]),[gamma]";
+        let finding = magic_finding(root.path(), testcase);
+        let harness = write_magic_abort_harness(root.path());
+        let grammar = crate::fuzz::load_grammar_for_run(Some(&write_list_grammar(root.path())))
+            .unwrap()
+            .unwrap();
+        let runner = replay_min::HarnessRunner::direct(&harness);
+
+        let summary = minimize_c_engine_until(
+            &finding,
+            &runner,
+            MinimizeStrategy::Grammar,
+            CEngineIo::ArgvFile,
+            None,
+            false,
+            Some(&grammar),
+        )
+        .expect("minimize");
+        let minimized = fs::read(finding.join("min_testcase.bin")).unwrap();
+        assert_eq!(minimized, b"[BHFMAGIC]");
+        assert!(summary.reduced && summary.minimized_len < testcase.len());
+        assert!(grammar.parse(&minimized).is_ok(), "a sentence");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(record["minimization"]["strategy"], "grammar");
+        assert!(
+            record["minimization"]["grammar"]["candidates_kept"]
+                .as_u64()
+                .is_some_and(|kept| kept >= 1),
+            "{record:#}"
+        );
+        assert!(!finding.join("minimize_tmp").exists());
+
+        // Byte-wise, the same finding loses its structure.
+        minimize_c_engine(
+            &finding,
+            &runner,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+            false,
+            None,
+        )
+        .expect("minimize");
+        let bytes = fs::read(finding.join("min_testcase.bin")).unwrap();
+        assert_eq!(bytes, b"BHFMAGIC");
+        assert!(grammar.parse(&bytes).is_err(), "no sentence");
+    }
+
+    #[test]
+    fn a_testcase_the_grammar_does_not_derive_is_refused_by_name() {
+        let root = tempdir().expect("tempdir");
+        let finding = magic_finding(root.path(), b"[alpha]BHFMAGIC");
+        let harness = write_magic_abort_harness(root.path());
+        let grammar = crate::fuzz::load_grammar_for_run(Some(&write_list_grammar(root.path())))
+            .unwrap()
+            .unwrap();
+        let error = minimize_c_engine_until(
+            &finding,
+            &replay_min::HarnessRunner::direct(&harness),
+            MinimizeStrategy::Grammar,
+            CEngineIo::ArgvFile,
+            None,
+            false,
+            Some(&grammar),
+        )
+        .expect_err("not a sentence");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not a sentence") && message.contains("--strategy bytes"),
+            "{message}"
+        );
+        assert!(!finding.join("min_testcase.bin").exists());
+    }
+
+    /// The auto pass minimizes on the tree only a finding its campaign's
+    /// grammar derives.
+    #[test]
+    fn the_auto_pass_takes_the_campaign_grammar_for_a_testcase_it_derives() {
+        let root = tempdir().expect("tempdir");
+        let grammar = write_list_grammar(root.path());
+        let sentence = magic_finding(&root.path().join("a"), b"[BHFMAGIC],[beta]");
+        let bytes = magic_finding(&root.path().join("b"), b"BHFMAGIC");
+        assert!(super::auto_grammar(Some(grammar.as_os_str()), &sentence).is_some());
+        assert!(super::auto_grammar(Some(grammar.as_os_str()), &bytes).is_none());
+        assert!(super::auto_grammar(None, &sentence).is_none());
+        assert!(super::auto_grammar(Some(std::ffi::OsStr::new("")), &sentence).is_none());
+    }
+
     #[test]
     fn libfuzzer_minimizer_reduces_silent_abort_finding() {
         let root = tempdir().expect("tempdir");
@@ -1062,6 +1396,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect("minimize");
 
@@ -1096,6 +1431,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect_err("nothing to minimize");
         assert!(
@@ -1143,6 +1479,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect("a UBSan finding reproduces under the fuzz child's options");
         assert!(result.reduced);
@@ -1188,6 +1525,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect_err("another crash is not minimized");
         assert!(
@@ -1221,6 +1559,7 @@ mod silent_abort_tests {
             CEngineIo::ArgvFile,
             Some(past),
             false,
+            None,
         )
         .expect("minimize");
 
@@ -1261,6 +1600,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect("minimize");
 
@@ -1335,6 +1675,7 @@ mod silent_abort_tests {
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             false,
+            None,
         )
         .expect("minimize");
         assert_eq!(summary.unverified.as_deref(), Some("location"));

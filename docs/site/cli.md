@@ -85,6 +85,19 @@ harness and to a generated C/C++ harness, by the `arg-layout.json` beside it.
 Another lane, a binary finding and an on-target transport finding have no
 argument layout and are refused by name; minimize them with `--strategy
 bytes`, the default.
+`--strategy grammar --grammar <PATH>` minimizes a finding of a `--grammar`
+campaign on its derivation tree, so the minimized input is still a sentence of
+the grammar, where `--strategy bytes` cuts it down to bytes the target's
+parser may reject before the bug. The testcase is parsed with the grammar (an
+Earley parse), and each subtree, outermost first, is replaced while the
+finding reproduces: by its rule's smallest derivation, by a subtree of the
+same rule inside it, or by a smaller production of its rule that keeps its
+children. It runs at most 4096 candidates, and the finding's `minimization`
+block records `grammar.nodes_before`, `nodes_after`, `candidates_tried` and
+`candidates_kept`. A testcase the grammar does not derive is refused with the
+byte where its parse stops; a binary or on-target transport finding is
+refused by name. `bhf auto --grammar` minimizes a finding whose testcase the
+grammar derives the same way, and any other byte-wise.
 An on-target transport finding minimizes through the transport it was found
 on, rebuilt from its profile (`--transport-endpoint HOST:PORT` relocates it),
 on the same fault rule and site (see
