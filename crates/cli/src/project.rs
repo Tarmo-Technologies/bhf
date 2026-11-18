@@ -715,6 +715,8 @@ fn plan_to_fuzz_args(
         stop_after_findings: None,
         target_transport: None,
         transport_coverage_map: None,
+        board_profile: None,
+        board_lane: crate::board_profile::BoardLane::Gdb,
         protocol_profile: None,
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,

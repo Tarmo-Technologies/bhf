@@ -919,7 +919,27 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
         .filter(|project| crate::auto::gpr_scenario::gpr_is_extendable_base(project))
         .cloned();
     if extends_project.is_none() {
-        with_clauses.extend(discover_user_gpr_with_clauses(&user_root));
+        // #287: a library project builds standalone over the staged copy of
+        // its own units, beside the projects it `with`s, whose units staging
+        // left to them. Every project the tree's other project files `with`
+        // can include one that `with`s the library itself, a second owner of
+        // its staged units.
+        match args
+            .source_project
+            .as_deref()
+            .filter(|project| crate::auto::gpr_scenario::gpr_is_library_project(project))
+        {
+            Some(library) => with_clauses.extend(
+                crate::auto::gpr_scenario::project_with_clauses(library)
+                    .into_iter()
+                    .filter(|project| {
+                        !project
+                            .file_name()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("adafuzz.gpr"))
+                    }),
+            ),
+            None => with_clauses.extend(discover_user_gpr_with_clauses(&user_root)),
+        }
     }
     // The governing project's own `package Compiler` is extended, not
     // replaced: its switches stay, and bhf's follow them.
@@ -3062,7 +3082,7 @@ fn stage_afl_cmplog_build(harness_dir: &Path, build_dir: &Path, force_includes: 
 /// C++-stdlib `#include`s and the build-config macro `#define`s. Never
 /// `auto_types.h`, whose `void *` placeholders would clash with a real
 /// typedef in any target TU.
-fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
     let repairs = harness_dir.join("repairs");
     crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES
         .iter()
@@ -3071,7 +3091,7 @@ fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn apply_c_family_make_env(
+pub(crate) fn apply_c_family_make_env(
     cmd: &mut std::process::Command,
     extra_sources: &[PathBuf],
     extra_includes: &[PathBuf],

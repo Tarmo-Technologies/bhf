@@ -74,7 +74,7 @@
 //! are already in place, so the follow-up is additive.
 
 use crate::error::{Result, TransportError};
-use crate::gdb::{read_coverage_ring, ContStop, GdbClient, GdbMemoryMap};
+use crate::gdb::{ContStop, GdbClient, GdbMemoryMap};
 use crate::outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 use crate::transport::{TargetSession, TargetTransport};
 use serde_json::{json, Value};
@@ -377,6 +377,52 @@ fn read_fault_status<C: Read + Write>(
     Ok((word != status.clear_value).then_some(word))
 }
 
+/// Let the firmware fault-status word (#72) classify a run: a recorded fault
+/// upgrades a benign stop to a crash; a failed read after a crash stop is
+/// incomplete evidence, and after a benign stop makes the run inconclusive.
+/// Shared by [`FullSystemTransport`] and [`crate::gdb::GdbRemoteTransport`].
+pub(crate) fn classify_fault_status<C: Read + Write>(
+    gdb: &mut GdbClient<C>,
+    status: &GuestFaultStatus,
+    exit: &mut ExitKind,
+    fault: &mut Option<Fault>,
+    coverage_incomplete: &mut Option<String>,
+    inconclusive: &mut Option<String>,
+) {
+    match read_fault_status(gdb, status) {
+        Ok(Some(word)) if *exit != ExitKind::Crash => {
+            *exit = ExitKind::Crash;
+            *fault = Some(Fault {
+                kind: FaultKind::CpuException,
+                address: None,
+                detail: format!("firmware fault-status {word:#x} at {:#x}", status.address),
+            });
+        }
+        Ok(_) => {}
+        Err(err) if *exit == ExitKind::Crash => {
+            // The stop itself is already a crash; the fault-status word
+            // would only add detail, so a failed read does not erase the
+            // known crash — note it as incomplete evidence (#74) and keep
+            // the authoritative Crash classification.
+            *coverage_incomplete = Some(format!(
+                "fault-status read failed after a crash stop: {err}"
+            ));
+        }
+        Err(err) => {
+            // A benign completion stop whose fault-status word could NOT be
+            // read is INCONCLUSIVE (#72 re-review): that word is the only
+            // thing distinguishing a clean completion from a fault that
+            // returned through the `done` breakpoint, so we must not count
+            // this as a clean pass nor invent a crash — mark it inconclusive
+            // and retain the reason.
+            *inconclusive = Some(format!(
+                "firmware fault-status read failed on a benign completion stop: {err} \
+                     — cannot distinguish a clean completion from a returned-through-done fault"
+            ));
+        }
+    }
+}
+
 /// A full-system transport over a `qemu-system-*` guest driven by QMP + GDB.
 ///
 /// `connect_qmp` dials a fresh QMP socket and `connect_gdb` a fresh gdbstub
@@ -395,6 +441,7 @@ pub struct FullSystemTransport<FQ, FG> {
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
+    semihosting_coverage: bool,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -420,6 +467,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             cycle_counter: None,
             task_id_address: None,
             cmplog: None,
+            semihosting_coverage: false,
         })
     }
 
@@ -442,6 +490,14 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// (#386).
     pub fn with_cmplog(mut self, region: Option<crate::cmplog::CmpLogRegion>) -> Self {
         self.cmplog = region;
+        self
+    }
+
+    /// Decode each run's coverage from the event stream the target writes to
+    /// its semihosting channel ([`crate::gdb::SEMIHOSTING_COVERAGE_FD`]) in
+    /// place of the coverage ring (#292).
+    pub fn with_semihosting_coverage(mut self, semihosting: bool) -> Self {
+        self.semihosting_coverage = semihosting;
         self
     }
 
@@ -531,6 +587,7 @@ where
             cycle_counter: self.cycle_counter,
             task_id_address: self.task_id_address,
             cmplog: self.cmplog,
+            semihosting_coverage: self.semihosting_coverage,
         }))
     }
 }
@@ -548,6 +605,7 @@ pub struct FullSystemSession<CQ, CG> {
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
+    semihosting_coverage: bool,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -576,6 +634,7 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         if let Some(region) = &self.cmplog {
             crate::cmplog::clear(&mut self.gdb, region)?;
         }
+        self.gdb.take_semihosting_output();
         // The cycle counter starts last, so it measures the run, not the setup.
         let cycles_start = match &self.cycle_counter {
             Some(counter) => Some(counter.start(&mut self.gdb)?),
@@ -584,7 +643,11 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
         let (stop, stdout) = match self.gdb.cont_until(deadline)? {
             (ContStop::Stopped(stop), stdout) => (stop, stdout),
-            (ContStop::DeadlineExceeded, stdout) => {
+            (ContStop::DeadlineExceeded, mut stdout) => {
+                let written = self.gdb.take_semihosting_output();
+                if !self.semihosting_coverage {
+                    stdout.extend_from_slice(&written);
+                }
                 let detail = match self.exec_deadline {
                     Some(budget) => format!(
                         "no completion stop within the per-input execution deadline {}ms",
@@ -625,38 +688,14 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         // separate evidence channel from coverage: a coverage edge id is never
         // reinterpreted as a fault.
         if let Some(status) = &self.fault_status {
-            match read_fault_status(&mut self.gdb, status) {
-                Ok(Some(word)) if exit != ExitKind::Crash => {
-                    exit = ExitKind::Crash;
-                    fault = Some(Fault {
-                        kind: FaultKind::CpuException,
-                        address: None,
-                        detail: format!("firmware fault-status {word:#x} at {:#x}", status.address),
-                    });
-                }
-                Ok(_) => {}
-                Err(err) if exit == ExitKind::Crash => {
-                    // The stop itself is already a crash; the fault-status word
-                    // would only add detail, so a failed read does not erase the
-                    // known crash — note it as incomplete evidence (#74) and keep
-                    // the authoritative Crash classification.
-                    coverage_incomplete = Some(format!(
-                        "fault-status read failed after a crash stop: {err}"
-                    ));
-                }
-                Err(err) => {
-                    // A benign completion stop whose fault-status word could NOT be
-                    // read is INCONCLUSIVE (#72 re-review): that word is the only
-                    // thing distinguishing a clean completion from a fault that
-                    // returned through the `done` breakpoint, so we must not count
-                    // this as a clean pass nor invent a crash — mark it inconclusive
-                    // and retain the reason.
-                    inconclusive = Some(format!(
-                        "firmware fault-status read failed on a benign completion stop: {err} \
-                         — cannot distinguish a clean completion from a returned-through-done fault"
-                    ));
-                }
-            }
+            classify_fault_status(
+                &mut self.gdb,
+                status,
+                &mut exit,
+                &mut fault,
+                &mut coverage_incomplete,
+                &mut inconclusive,
+            );
         }
 
         // The cycles the run took (#251), best-effort like coverage: a failed
@@ -687,8 +726,15 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
             }
         }
 
-        // Harvest coverage from the in-guest ring, best-effort (#74).
-        let coverage_edges = match read_coverage_ring(&mut self.gdb, &self.map) {
+        // Harvest coverage from the in-guest ring or the semihosting
+        // channel, best-effort (#74).
+        let mut stdout = stdout;
+        let coverage_edges = match crate::gdb::collect_coverage(
+            &mut self.gdb,
+            &self.map,
+            self.semihosting_coverage,
+            &mut stdout,
+        ) {
             Ok(edges) => edges,
             Err(err) => {
                 coverage_incomplete.get_or_insert_with(|| err.to_string());

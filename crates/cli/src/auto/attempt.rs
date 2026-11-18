@@ -1486,6 +1486,8 @@ pub(crate) fn applicable_engines(
         .filter(|engine| match engine {
             FuzzEngine::Builtin => true,
             FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
+            // `bhf auto` refuses them before any target runs.
+            FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz | FuzzEngine::Libafl => false,
         })
         .collect();
     if out.is_empty() {
@@ -10171,6 +10173,19 @@ fn ensure_ada_src_instrumented(
         .map(Path::to_path_buf)
         .or_else(|| crate::auto::gpr_scenario::find_project_gpr(source_root));
 
+    // #287: a unit of a project the governing one depends on through `with`
+    // belongs to that project, and the build compiles it there: a staged copy
+    // would be its second owner (`unit "X" cannot belong to several projects`).
+    let owned_elsewhere = governing_gpr
+        .as_deref()
+        .map(crate::auto::gpr_scenario::withed_project_source_dirs)
+        .unwrap_or_default();
+    let mut left_to_their_projects = 0usize;
+    // The staging is shared by the work dir's targets and runs, and gprbuild
+    // reads every unit in it, not only this target's closure: drop a copy an
+    // earlier target staged of a unit these projects own.
+    remove_staged_copies_owned_elsewhere(&dst, &owned_elsewhere);
+
     // Directories the project's default GPR scenario excludes — don't instrument
     // sources gprbuild wouldn't compile under the default configuration.
     let source_excluded = governing_gpr
@@ -10272,6 +10287,11 @@ fn ensure_ada_src_instrumented(
         if is_excluded_ada_body(source_path, excluded_body_stems) {
             continue;
         }
+        if crate::auto::gpr_scenario::in_source_dirs(&owned_elsewhere, source_path) {
+            left_to_their_projects += 1;
+            remove_staged_copy(&dst, source_path, preserve_project_naming);
+            continue;
+        }
         let source_path = source_path.clone();
         let mut source = match crate::source_text::read_source_text(&source_path) {
             Ok(s) => s,
@@ -10284,6 +10304,16 @@ fn ensure_ada_src_instrumented(
             }
         };
         rewrite_legacy_gnat_calendar_c_time(&mut source);
+        // #356: a vendored copy of a GNAT predefined unit staged here would
+        // shadow the runtime's own (`predefined unit depends on itself`).
+        if let Some(unit) = vendored_predefined_unit(&source_path, &source) {
+            bhfeprintln!(
+                "bhf auto: not staging {}: it is the GNAT predefined unit {unit}, which the \
+                 runtime provides",
+                source_path.display()
+            );
+            continue;
+        }
         // A Pure/Preelaborate unit can't depend on the non-pure probe runtime;
         // copy it through uninstrumented so the build still sees it. The
         // categorization commonly lives in the spec, so for a body also consult
@@ -10384,6 +10414,11 @@ fn ensure_ada_src_instrumented(
             if !in_closure(dep_path) {
                 continue;
             }
+            if crate::auto::gpr_scenario::in_source_dirs(&owned_elsewhere, dep_path) {
+                left_to_their_projects += 1;
+                remove_staged_copy(&dst, dep_path, false);
+                continue;
+            }
             // Same rule as the source-tree walk above: a dependency's own
             // `main.adb` (e.g. SweetAda's `core/main.adb`, which does
             // `BSP.Setup; Application.Run;`) must NOT land in src_instrumented,
@@ -10391,6 +10426,17 @@ fn ensure_ada_src_instrumented(
             // the *project's* main instead of the harness — surfacing as
             // `"Setup" not declared in "bsp"` and never fuzzing.
             let mut dependency_source = crate::source_text::read_source_text(dep_path).ok();
+            if let Some(unit) = dependency_source
+                .as_deref()
+                .and_then(|source| vendored_predefined_unit(dep_path, source))
+            {
+                bhfeprintln!(
+                    "bhf auto: not staging {}: it is the GNAT predefined unit {unit}, which \
+                     the runtime provides",
+                    dep_path.display()
+                );
+                continue;
+            }
             let dest_name = dependency_source
                 .as_deref()
                 .and_then(|source| ada_source_dest_basename(dep_path, source))
@@ -10421,6 +10467,17 @@ fn ensure_ada_src_instrumented(
                 let _ = std::fs::write(&dest, bytes);
             }
         }
+    }
+
+    if left_to_their_projects > 0 {
+        bhfeprintln!(
+            "bhf auto: left {left_to_their_projects} unit(s) uninstrumented to the projects {} \
+             depends on, which build them",
+            governing_gpr
+                .as_deref()
+                .and_then(Path::file_name)
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        );
     }
 
     // Copy the C/C++ glue real Ada libraries bind to (gnatcoll's
@@ -10824,6 +10881,107 @@ fn ada_unit_key_from_filename(basename: &str) -> Option<String> {
         .strip_suffix(".ads")
         .or_else(|| canonical.strip_suffix(".adb"))?;
     Some(stem.replace('-', ".").to_ascii_lowercase())
+}
+
+/// Remove the copy of `source` an earlier target staged in `dst` (#287): the
+/// staging is shared by a run's targets, and a unit one target's project owns
+/// is another's to stage.
+fn remove_staged_copy(dst: &Path, source: &Path, preserve_project_naming: bool) {
+    let names = crate::source_text::read_source_text(source)
+        .ok()
+        .and_then(|text| ada_staged_source_basename(source, &text, preserve_project_naming))
+        .into_iter()
+        .chain(
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        );
+    for name in names {
+        let _ = std::fs::remove_file(dst.join(&name));
+        let _ = std::fs::remove_file(dst.join(format!("{name}.bhf-lines.json")));
+    }
+}
+
+/// [`remove_staged_copy`] for every Ada source in `dirs` (#287), under the
+/// name it is staged with either way a target stages it.
+fn remove_staged_copies_owned_elsewhere(dst: &Path, dirs: &[(PathBuf, bool)]) {
+    fn walk(dir: &Path, recursive: bool, dst: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    walk(&path, true, dst);
+                }
+                continue;
+            }
+            let is_ada = path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("ads") || ext.eq_ignore_ascii_case("adb")
+            });
+            if is_ada {
+                remove_staged_copy(dst, &path, true);
+                remove_staged_copy(dst, &path, false);
+            }
+        }
+    }
+    for (dir, recursive) in dirs {
+        walk(dir, *recursive, dst);
+    }
+}
+
+/// Whether the lowercased Ada unit `unit` is predefined by the GNAT runtime:
+/// `Ada`, `System`, `Interfaces` or `GNAT`, or a child of one (#356).
+fn is_gnat_predefined_unit(unit: &str) -> bool {
+    matches!(
+        unit.split('.').next().unwrap_or(unit),
+        "ada" | "system" | "interfaces" | "gnat"
+    )
+}
+
+/// The predefined unit a GNAT runtime file name names: a krunched one
+/// (`a-strfix.ads`, `s-stoele.adb`, `i-c.ads`, `g-os_lib.ads`, `interfac.ads`),
+/// at most eight characters with a one-letter root, or a full one
+/// (`ada-strings-fixed.ads`). A krunched name stands for its root's child; it
+/// does not spell the child's name.
+fn gnat_predefined_file_unit(basename: &str) -> Option<String> {
+    let lower = basename.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".ads")
+        .or_else(|| lower.strip_suffix(".adb"))?;
+    match stem {
+        "ada" | "system" | "gnat" | "interfaces" => return Some(stem.to_owned()),
+        "interfac" => return Some("interfaces".to_owned()),
+        _ => {}
+    }
+    let (prefix, rest) = stem.split_once('-')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let root = match prefix {
+        "a" if stem.len() <= 8 => "ada",
+        "s" if stem.len() <= 8 => "system",
+        "i" if stem.len() <= 8 => "interfaces",
+        "g" if stem.len() <= 8 => "gnat",
+        "ada" | "system" | "interfaces" | "gnat" => prefix,
+        _ => return None,
+    };
+    Some(format!("{root}.{}", rest.replace('-', ".")))
+}
+
+/// The GNAT predefined unit a tree's source at `path` is a vendored copy of
+/// (#356), by its declared name, or by a runtime file name when it does not
+/// parse (the compiler's own sources use GNAT-only syntax).
+fn vendored_predefined_unit(path: &Path, source: &str) -> Option<String> {
+    match ada_declared_unit_name(source, path) {
+        Some(unit) => is_gnat_predefined_unit(&unit).then_some(unit),
+        None => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(gnat_predefined_file_unit),
+    }
 }
 
 /// Declared Ada compilation-unit name, independent of GNAT's default filename
@@ -14206,6 +14364,66 @@ mod stamp_tests {
                 "{stem} must NOT be treated as a SIMD backend"
             );
         }
+    }
+
+    /// #356: a GNAT predefined unit, by full name, krunched runtime file
+    /// name or declaration, is not a tree unit to stage.
+    #[test]
+    fn a_vendored_gnat_predefined_unit_is_recognized() {
+        use super::{gnat_predefined_file_unit, is_gnat_predefined_unit, vendored_predefined_unit};
+        use std::path::Path;
+        for unit in [
+            "ada",
+            "ada.strings.fixed",
+            "system.storage_elements",
+            "interfaces.c",
+            "gnat.os_lib",
+        ] {
+            assert!(is_gnat_predefined_unit(unit), "{unit}");
+        }
+        for unit in [
+            "adapter",
+            "systems.io",
+            "interfaces_x",
+            "gnatcoll.json",
+            "my_ada.strings",
+        ] {
+            assert!(!is_gnat_predefined_unit(unit), "{unit}");
+        }
+        for (file, unit) in [
+            ("a-strfix.ads", "ada.strfix"),
+            ("s-stoele.adb", "system.stoele"),
+            ("i-c.ads", "interfaces.c"),
+            ("g-os_lib.ads", "gnat.os_lib"),
+            ("interfac.ads", "interfaces"),
+            ("system.ads", "system"),
+            ("ada-strings-fixed.ads", "ada.strings.fixed"),
+            ("GNAT-Lists.ADS", "gnat.lists"),
+        ] {
+            assert_eq!(
+                gnat_predefined_file_unit(file).as_deref(),
+                Some(unit),
+                "{file}"
+            );
+        }
+        for file in [
+            "a-longer_name.ads",
+            "parser.adb",
+            "s-.ads",
+            "x-thing.ads",
+            "gnatcoll-json.ads",
+        ] {
+            assert_eq!(gnat_predefined_file_unit(file), None, "{file}");
+        }
+        // The declaration decides: a user's unit `A.B` in `a-b.ads` is staged,
+        // a copy of `Ada.Text_IO` under any name is not.
+        let user = "package A.B is\n   X : Integer := 0;\nend A.B;\n";
+        assert_eq!(vendored_predefined_unit(Path::new("a-b.ads"), user), None);
+        let vendored = "package Ada.Text_IO is\n   X : Integer := 0;\nend Ada.Text_IO;\n";
+        assert_eq!(
+            vendored_predefined_unit(Path::new("my_textio.ads"), vendored).as_deref(),
+            Some("ada.text_io")
+        );
     }
 
     #[test]

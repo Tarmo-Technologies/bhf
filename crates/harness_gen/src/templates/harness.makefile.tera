@@ -181,6 +181,11 @@ AFLPP_CFLAGS ?= -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,
 # gcc has no libFuzzer — so this stays clang regardless of the project default.
 LIBFUZZER_CC ?= clang
 LIBFUZZER_CFLAGS ?= -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -fno-sanitize=function,vptr,alignment
+# honggfuzz build (`bhf fuzz --engine honggfuzz`): the same libFuzzer entry
+# point, compiled by honggfuzz's compiler wrapper, whose runtime (libhfuzz)
+# supplies `main`, the persistent loop and the coverage honggfuzz reads.
+HFUZZ_CC ?= hfuzz-clang
+HFUZZ_CFLAGS ?= -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment
 # MemorySanitizer build: finds reads of UNINITIALIZED memory (CWE-457/908) — a
 # whole bug class ASan/UBSan miss. MSan is mutually exclusive with ASan, so it is a
 # separate binary that `auto` replays the ASan pass's corpus through (no new fuzz
@@ -284,10 +289,10 @@ ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl afl_cmplog winafl libfuzzer msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
+.PHONY: all afl afl_cmplog winafl libfuzzer honggfuzz msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
 all: main$(EXEEXT)
 # The bare goal names, for the binaries named with $(EXEEXT).
-BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_msan main_tsan main_cov main_diff main_prov
+BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_honggfuzz main_msan main_tsan main_cov main_diff main_prov
 ifneq ($(EXEEXT),)
 .PHONY: $(BHF_BINARIES)
 $(BHF_BINARIES): %: %$(EXEEXT)
@@ -374,6 +379,11 @@ libfuzzer: main_libfuzzer$(EXEEXT)
 
 main_libfuzzer$(EXEEXT): $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CFLAGS)) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(LIBFUZZER_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+
+honggfuzz: main_honggfuzz$(EXEEXT)
+
+main_honggfuzz$(EXEEXT): $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+	$(HFUZZ_CC) $(HFUZZ_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(HFUZZ_CFLAGS)) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(HFUZZ_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- else %}
 # Compiled with -DBHF_EXTERNAL_DRIVER so main.c emits only `bhf_run_one` (no bhf
 # `main`, no bhf coverage runtime); bhf_libfuzzer.c adds `LLVMFuzzerTestOneInput`
@@ -383,6 +393,11 @@ libfuzzer: main_libfuzzer$(EXEEXT)
 
 main_libfuzzer$(EXEEXT): main.c bhf_libfuzzer.c $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c bhf_libfuzzer.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(LIBFUZZER_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+
+honggfuzz: main_honggfuzz$(EXEEXT)
+
+main_honggfuzz$(EXEEXT): main.c bhf_libfuzzer.c $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+	$(HFUZZ_CC) $(HFUZZ_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(HFUZZ_CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c bhf_libfuzzer.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(HFUZZ_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- endif %}
 
 msan: main_msan$(EXEEXT)

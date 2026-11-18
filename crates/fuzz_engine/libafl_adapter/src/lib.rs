@@ -284,6 +284,228 @@ pub mod libafl_engine {
             &mut objective,
         )
     }
+
+    pub use campaign::{run_campaign, CampaignConfig, CampaignResult};
+
+    /// A LibAFL campaign over a bhf harness (#296): LibAFL schedules and
+    /// mutates, each input runs in a fresh harness process, and the edge
+    /// bitmap the harness writes to its `BHF_COV_SHM` file is LibAFL's map.
+    mod campaign {
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        use libafl::{
+            corpus::{Corpus, InMemoryCorpus},
+            events::SimpleEventManager,
+            executors::{Executor, ExitKind, HasObservers},
+            feedbacks::{CrashFeedback, MaxMapFeedback},
+            fuzzer::{Evaluator, Fuzzer, StdFuzzer},
+            inputs::{BytesInput, HasTargetBytes},
+            monitors::NopMonitor,
+            mutators::{havoc_mutations, tokens_mutations, HavocScheduledMutator, Tokens},
+            observers::StdMapObserver,
+            schedulers::QueueScheduler,
+            stages::StdMutationalStage,
+            state::{HasCorpus, HasExecutions, HasSolutions, StdState},
+            Error, HasMetadata,
+        };
+        use libafl_bolts::{
+            rands::StdRand,
+            tuples::{tuple_list, Merge, RefIndexable},
+            ToSlice,
+        };
+
+        /// The edge bitmap's size, as the C driver's `BHF_COV_BITS`.
+        const COVERAGE_BYTES: usize = 1 << 16;
+
+        /// What a campaign runs and for how long.
+        pub struct CampaignConfig {
+            /// The harness: it runs the input in the file it is given.
+            pub harness: PathBuf,
+            /// Where the campaign writes each input and the coverage file.
+            pub scratch: PathBuf,
+            pub seeds: Vec<Vec<u8>>,
+            pub budget: Duration,
+            /// The per-input limit; an input that runs past it is killed.
+            pub timeout: Duration,
+            pub max_len: usize,
+            pub rng_seed: u64,
+            /// Dictionary tokens, which LibAFL inserts and splices in as
+            /// AFL++ does its `-x` dictionary.
+            pub tokens: Vec<Vec<u8>>,
+            /// The harness's environment.
+            pub env: Vec<(String, String)>,
+        }
+
+        /// What a campaign found: the inputs that crashed the harness, and
+        /// how many it ran.
+        pub struct CampaignResult {
+            pub executions: u64,
+            pub corpus: usize,
+            pub crashes: Vec<Vec<u8>>,
+        }
+
+        type Observer = StdMapObserver<'static, u8, false>;
+
+        /// Runs the harness on one input file per execution and reads the
+        /// edge bitmap it wrote into the map observer.
+        struct HarnessExecutor {
+            harness: PathBuf,
+            input: PathBuf,
+            coverage: PathBuf,
+            timeout: Duration,
+            env: Vec<(String, String)>,
+            observers: (Observer, ()),
+        }
+
+        impl HasObservers for HarnessExecutor {
+            type Observers = (Observer, ());
+
+            fn observers(&self) -> RefIndexable<&Self::Observers, Self::Observers> {
+                RefIndexable::from(&self.observers)
+            }
+
+            fn observers_mut(&mut self) -> RefIndexable<&mut Self::Observers, Self::Observers> {
+                RefIndexable::from(&mut self.observers)
+            }
+        }
+
+        impl<EM, I, S, Z> Executor<EM, I, S, Z> for HarnessExecutor
+        where
+            I: HasTargetBytes,
+            S: HasExecutions,
+        {
+            fn run_target(
+                &mut self,
+                _fuzzer: &mut Z,
+                state: &mut S,
+                _mgr: &mut EM,
+                input: &I,
+            ) -> Result<ExitKind, Error> {
+                *state.executions_mut() += 1;
+                std::fs::write(&self.input, input.target_bytes().to_slice())?;
+                std::fs::write(&self.coverage, vec![0_u8; COVERAGE_BYTES])?;
+                let mut child = Command::new(&self.harness)
+                    .arg(&self.input)
+                    .envs(self.env.iter().map(|(key, value)| (key, value)))
+                    .env("BHF_COV_SHM", &self.coverage)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                let deadline = Instant::now() + self.timeout;
+                let exit = loop {
+                    if let Some(status) = child.try_wait()? {
+                        break exit_kind(&status);
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break ExitKind::Timeout;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                };
+                let bitmap = std::fs::read(&self.coverage)?;
+                let map: &mut [u8] = &mut self.observers.0;
+                let n = map.len().min(bitmap.len());
+                map[..n].copy_from_slice(&bitmap[..n]);
+                Ok(exit)
+            }
+        }
+
+        /// A harness killed by a signal crashed: bhf's harnesses abort on a
+        /// sanitizer report (`abort_on_error=1`).
+        fn exit_kind(status: &std::process::ExitStatus) -> ExitKind {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if status.signal().is_some() {
+                    return ExitKind::Crash;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if !status.success() {
+                    return ExitKind::Crash;
+                }
+            }
+            ExitKind::Ok
+        }
+
+        /// Run a LibAFL campaign on `config`'s harness for its budget.
+        pub fn run_campaign(config: CampaignConfig) -> Result<CampaignResult, String> {
+            let error = |error: Error| format!("libafl: {error}");
+            std::fs::create_dir_all(&config.scratch)
+                .map_err(|e| format!("create '{}': {e}", config.scratch.display()))?;
+            let observer = StdMapObserver::owned("bhf-edges", vec![0_u8; COVERAGE_BYTES]);
+            let mut feedback = MaxMapFeedback::new(&observer);
+            let mut objective = CrashFeedback::new();
+            let mut state = StdState::new(
+                StdRand::with_seed(config.rng_seed),
+                InMemoryCorpus::<BytesInput>::new(),
+                InMemoryCorpus::<BytesInput>::new(),
+                &mut feedback,
+                &mut objective,
+            )
+            .map_err(error)?;
+            if !config.tokens.is_empty() {
+                state.add_metadata(Tokens::from(config.tokens.iter()));
+            }
+            let mut mgr = SimpleEventManager::new(NopMonitor::new());
+            let mut fuzzer = StdFuzzer::new(QueueScheduler::new(), feedback, objective);
+            let mut env = config.env.clone();
+            env.push((
+                "ASAN_OPTIONS".to_owned(),
+                "abort_on_error=1:halt_on_error=1:symbolize=0:detect_leaks=0".to_owned(),
+            ));
+            env.push((
+                "UBSAN_OPTIONS".to_owned(),
+                "abort_on_error=1:halt_on_error=1:symbolize=0".to_owned(),
+            ));
+            let mut executor = HarnessExecutor {
+                harness: config.harness.clone(),
+                input: config.scratch.join("libafl-input.bin"),
+                coverage: config.scratch.join("libafl-coverage.shm"),
+                timeout: config.timeout,
+                env,
+                observers: tuple_list!(observer),
+            };
+            let seeds = if config.seeds.is_empty() {
+                vec![b"AAAA".to_vec()]
+            } else {
+                config.seeds.clone()
+            };
+            for seed in seeds {
+                let mut seed = seed;
+                seed.truncate(config.max_len.max(1));
+                fuzzer
+                    .add_input(&mut state, &mut executor, &mut mgr, BytesInput::new(seed))
+                    .map_err(error)?;
+            }
+            let mutator = HavocScheduledMutator::new(havoc_mutations().merge(tokens_mutations()));
+            let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+            let start = Instant::now();
+            while start.elapsed() < config.budget {
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
+                    .map_err(error)?;
+            }
+            let solutions = state.solutions();
+            let mut crashes = Vec::new();
+            for id in solutions.ids() {
+                let testcase = solutions.get(id).map_err(error)?.borrow();
+                if let Some(input) = testcase.input() {
+                    crashes.push(input.target_bytes().to_slice().to_vec());
+                }
+            }
+            Ok(CampaignResult {
+                executions: *state.executions(),
+                corpus: state.corpus().count(),
+                crashes,
+            })
+        }
+    }
 }
 
 pub fn crate_name() -> &'static str {

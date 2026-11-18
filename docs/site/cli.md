@@ -1410,7 +1410,7 @@ so a run whose crashes were all known does not read as clean.
 
 `bhf fuzz` flags (libFuzzer-parity knobs and engine controls):
 
-- `--engine <builtin|afl++|winafl>` — engine to run. Default `builtin`. `winafl` (native Windows only; refused elsewhere) runs WinAFL on `main_winafl.exe` beside the sanitized `main.exe` and replays the crashes and hangs it saves through `main` for the report; see [WinAFL on Windows](windows.md#winafl-engine---engine-winafl). `afl++` and `winafl` cannot be combined with `--target-transport` or `--protocol-profile`, which run the builtin engine's own loops (exit `3`). A `winafl` run stopped by Ctrl-C ends without replaying what WinAFL saved and prints where it is; the next `winafl` run of that harness in the same work dir replays it. With `winafl`, a host other than native Windows also exits `3`; a missing or unusable WinAFL or DynamoRIO, a refused `--winafl-coverage-module` or an ARM64 harness exits `1`, as a missing `afl-fuzz` does.
+- `--engine <builtin|afl++|libfuzzer|honggfuzz|libafl|winafl>` — engine to run. Default `builtin`. `libfuzzer` runs the harness's `main_libfuzzer`, `honggfuzz` honggfuzz on its `main_honggfuzz`, and `libafl` a LibAFL campaign on its `main` in a bhf built with the `libafl-engine` feature (see below). `winafl` (native Windows only; refused elsewhere) runs WinAFL on `main_winafl.exe` beside the sanitized `main.exe` and replays the crashes and hangs it saves through `main` for the report; see [WinAFL on Windows](windows.md#winafl-engine---engine-winafl). No engine but `builtin` can be combined with `--target-transport` or `--protocol-profile`, which run the builtin engine's own loops (exit `3`). A `winafl` run stopped by Ctrl-C ends without replaying what WinAFL saved and prints where it is; the next `winafl` run of that harness in the same work dir replays it. With `winafl`, a host other than native Windows also exits `3`; a missing or unusable WinAFL or DynamoRIO, a refused `--winafl-coverage-module` or an ARM64 harness exits `1`, as a missing `afl-fuzz` does.
 - `--winafl-path <DIR>` — WinAFL directory for `--engine winafl`: the one holding `afl-fuzz.exe` and `winafl.dll`, or a WinAFL checkout with `build64\bin\Release`. Default: `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on `PATH`.
 - `--dynamorio-path <DIR>` — DynamoRIO install root, or its `bin64` directory, for `--engine winafl`. Default: `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on `PATH`.
 - `--winafl-instrumentation <dynamorio|intel-pt>` — WinAFL coverage: DynamoRIO (`afl-fuzz -D`, default) or Intel Processor Trace (`afl-fuzz -P`; an Intel CPU with PT and a WinAFL built with `-DINTELPT=1`, not inside most VMs).
@@ -1435,9 +1435,10 @@ so a run whose crashes were all known does not read as clean.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. The persistent engine calibrates each input it would add to the corpus, as AFL++ does: it re-runs the input four times, each from a zeroed edge bitmap, and an edge one run hit and another did not is variable. An input whose runs differ is added only if every run hit an edge no calibrated input hit every time before; one whose only new coverage was variable edges is left out, and the re-runs' edges count as seen, so a state-dependent edge is not new coverage later. `stability` in `fuzz_runs/<harness>-latest.json` gives `stability_pct` (the share of the edges calibration saw that no run varied on), `variable_edges`, `calibrated_entries` and `unstable_entries_dropped`. Below 90% bhf prints a note that the harness keeps state between executions, with this flag as one remedy. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
-- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
+- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
+- `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. `serial:PATH[,baud=N]` drives a UART or a pty, opened raw as the agent's `serial:` transport is (no echo, line editing or newline translation; 8N1, no flow control), at baud `N` when given; requests and replies are framed as the profile says, and `--session-reset reconnect` reopens the device while `none` keeps it open. `transport:TARGET-TRANSPORT-SPEC` drives a session through a `--target-transport` backend (`transport:agent:tcp:HOST:PORT`, `transport:gdb:HOST:PORT` with `--transport-coverage-map`, …): each message is one execution on the target, a fault, a crash or a hang ends the session at that message, and the executions' edges feed the code channel. A reply is the backend's stdout, which the agent backends do not have, so a profile over them captures nothing from replies. `--session-reset reconnect` arms a fresh target session for each protocol session; `none` keeps one armed. See [On-target fuzzing](on-target-fuzzing.md#3d-protocol-sessions-on-the-target). Required with `--protocol-profile`.
 - `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
 - `--dict <PATH>` — an AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose tokens the mutator splices into inputs, on top of the harness's own `dictionary.txt`. The host loop and the transport lane read it; a file that cannot be read stops the run. The transport lane also reads the harness's `dictionary.txt` and `--grammar`: with a grammar, a seed is a derivation of it when no `--seed-input` or `--seed-file` is given, and every other input is a fresh derivation, so a target that parses the grammar receives only its sentences.
@@ -1481,14 +1482,37 @@ limit fuzzed until then: when they recorded findings, the campaign keeps its
 usual exit code and stderr says they were stopped; when none recorded anything,
 it exits `1`.
 
-`bhf fuzz --engine` accepts only `builtin` (the default), `afl++` and (on
-native Windows) `winafl`;
-`libfuzzer`, `libafl`, and `nyx` are **not** valid `--engine` values and clap
-rejects them. C/C++ generated harnesses expose `LLVMFuzzerTestOneInput`, but
-their default `main` binary is bhf's own framed fork-server driver, not a
-libFuzzer binary, so BHF can normalize sanitizer findings; there is no separate
-`libfuzzer` runtime path through this flag (`make libfuzzer` builds a libFuzzer
-binary for other fuzzers). A binary you compiled yourself with
+`bhf fuzz --engine` accepts `builtin` (the default), `afl++`, `libfuzzer`,
+`honggfuzz`, `libafl` and (on native Windows) `winafl`; `nyx` is **not** a
+valid `--engine` value and clap rejects it. C/C++ generated harnesses expose
+`LLVMFuzzerTestOneInput`, and their default `main` binary is bhf's own framed
+fork-server driver. `--engine libfuzzer` (#294) runs the harness's libFuzzer
+build instead, `main_libfuzzer` in `build/<id>/` or the harness directory,
+which it builds with `make libfuzzer` (clang) when there is none. It runs for
+`--time` (or `--iterations` as `-runs=`), with `--timeout`, `--max-len`,
+`--rss-limit-mb`, `--rng-seed` and the harness dictionary, its corpus kept in
+`libfuzzer/<harness>/corpus/`. In process, libFuzzer stops at its first crash.
+Each `crash-`, `oom-` and `leak-` artifact it saves is replayed through
+`main_libfuzzer` and recorded as a finding, as AFL++'s crashes are, and a
+`timeout-` one that hangs again at twice the timeout is a hang finding. It runs
+one process: `--workers` and a sanitizer matrix are refused, and `bhf auto`
+refuses the engine. `--engine honggfuzz` (#295) runs honggfuzz in persistent
+mode on the harness's `main_honggfuzz`, which it builds with `make honggfuzz`
+(honggfuzz's `hfuzz-clang`, with ASan and UBSan) when there is none. honggfuzz
+is `BHF_HONGGFUZZ_PATH`'s (its build directory) or the one on `PATH`. It takes
+the same budget, limits and dictionary, keeps its corpus in
+`honggfuzz/<harness>/corpus/`, and the crash files it saves are replayed
+through `main_honggfuzz` into findings. It does not save hangs, so a run has
+no hang findings, and it too runs one process. `--engine libafl` (#296) runs
+a LibAFL campaign on the harness's `main`, in a bhf built with
+`cargo build --release -p bhf --features libafl-engine`; another bhf refuses it
+with that command. LibAFL schedules and mutates (havoc plus the harness
+dictionary's tokens), each input runs in a fresh `main` process, and the edge
+bitmap `main` writes to `BHF_COV_SHM` is its coverage map. It runs for `--time`
+(or 100 ms per `--iterations`), with `--timeout`, `--max-len` and `--rng-seed`;
+its corpus is in memory, and the inputs that crashed `main` are replayed
+through it into findings. It runs one process too, and `bhf auto` refuses it.
+A binary you compiled yourself with
 `-fsanitize=fuzzer` and placed at `build/<id>/main` is recognised by the
 libFuzzer runtime in it and run on one input file per process, so a crash it
 finds is recorded with the input that caused it. It gets no coverage guidance
@@ -1496,7 +1520,7 @@ without bhf's runtime, and `bhf fuzz` says so (once, also for a
 `--workers` campaign, whose workers' own stderr goes to their logs): wrap the
 fuzz target with
 `bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput`, build
-that harness and fuzz it instead. The standalone libFuzzer/LibAFL/Nyx adapters
+that harness and fuzz it instead. The standalone libFuzzer and Nyx adapters
 are not reachable through `bhf fuzz --engine`, and the Ada libFuzzer adapter
 remains deferred until users have a viable Ada/LLVM/libFuzzer toolchain.
 

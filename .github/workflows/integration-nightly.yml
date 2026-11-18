@@ -189,7 +189,10 @@ jobs:
             libnewlib-arm-none-eabi \
             gdb \
             lldb \
-            llvm
+            llvm \
+            libunwind-dev \
+            binutils-dev \
+            libblocksruntime-dev
           # Only the packages the mirror still serves are kept.
           sudo apt-get "${apt_opts[@]}" autoclean
           sudo rm -rf "$HOME/apt-archives/partial" "$HOME/apt-archives/lock"
@@ -212,6 +215,18 @@ jobs:
 
       - name: Install Python 2.7
         run: bash scripts/ci/install-python2.sh >> "$GITHUB_PATH"
+
+      # `bhf fuzz --engine honggfuzz` (#295): Ubuntu does not package
+      # honggfuzz; the script builds the pinned release once, and the cache
+      # keeps it.
+      - name: Cache the honggfuzz build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/honggfuzz
+          key: honggfuzz-${{ runner.os }}-${{ hashFiles('scripts/ci/install-honggfuzz.sh') }}
+
+      - name: Install honggfuzz
+        run: bash scripts/ci/install-honggfuzz.sh >> "$GITHUB_PATH"
 
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
@@ -245,7 +260,7 @@ jobs:
                       aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
                       arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
                       javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
-                      lldb llvm-symbolizer dotnet python2; do
+                      lldb llvm-symbolizer dotnet python2 honggfuzz hfuzz-clang; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for

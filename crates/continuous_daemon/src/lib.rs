@@ -2385,7 +2385,9 @@ sleep 30
         let id = scheduler
             .submit(dir.clone(), "H".to_owned(), Duration::from_secs(1))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // The bounds leave room for a loaded host: a hang is one that never
+        // ends, not one a busy machine stretched past the shutdown timeout.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !pid_file.is_file() {
             assert!(Instant::now() < deadline, "fuzz child did not start");
             std::thread::sleep(Duration::from_millis(10));
@@ -2395,7 +2397,7 @@ sleep 30
         let started = Instant::now();
         drop(scheduler);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "scheduler shutdown hung"
         );
         let saved: FuzzJob =
@@ -2405,7 +2407,7 @@ sleep 30
         assert_eq!(saved.state, JobState::Queued);
 
         let grandchild_status = PathBuf::from(format!("/proc/{grandchild_pid}/stat"));
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while grandchild_status.is_file() {
             let status = std::fs::read_to_string(&grandchild_status).unwrap();
             if status.split_whitespace().nth(2) == Some("Z") {

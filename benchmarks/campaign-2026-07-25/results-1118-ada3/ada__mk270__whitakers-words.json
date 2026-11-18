@@ -1,0 +1,367 @@
+{
+ "repo": "mk270/whitakers-words",
+ "sha": "9b11477e53f4adfb17d6f6aa563669dc71e0a680",
+ "rc": 0,
+ "targets": [
+  {
+   "source": "latin_utils-inflections_package.ads",
+   "name": "get",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 3,
+   "classes": [
+    "built and fuzzed",
+    "built and fuzzed",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "failed build",
+    "failed build",
+    "failed build",
+    "built and fuzzed",
+    "built and fuzzed",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "failed build",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "failed build",
+    "failed build",
+    "failed build",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params",
+    "unsupported_params"
+   ]
+  },
+  {
+   "source": "support_utils-addons_package.ads",
+   "name": "load_addons",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "words_engine-english_support_package.ads",
+   "name": "get",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"other\", \"tail\": \"main.adb:33:121: error: expected type \\\"Eword\\\" defined at words_engine-english_support_package.ads:28\\nmain.adb:33:121: error: found type universal integer\\nmain.adb:33:131: error: expected type \\\"Auxword\\\" defined at words_engine-english_support_package.ads:30\\nmain.adb",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build",
+    "failed build",
+    "unsupported_params"
+   ]
+  },
+  {
+   "source": "words_engine-roman_numerals_package.ads",
+   "name": "bad_roman_number",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "words_engine-trick_tables.ads",
+   "name": "common_prefix",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "words_engine-word_package.ads",
+   "name": "equ",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed",
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "words_engine-word_package.ads",
+   "name": "gtu",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed",
+    "built and fuzzed"
+   ]
+  },
+  {
+   "source": "words_engine-word_package.ads",
+   "name": "ltu",
+   "outcome": "built_and_fuzzed",
+   "reason": null,
+   "class": "built and fuzzed",
+   "before": 1,
+   "classes": [
+    "built and fuzzed",
+    "built and fuzzed"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 144,
+  "discovered_total": 144,
+  "built": 13,
+  "built_and_fuzzed": 13,
+  "fuzzed_stub_only": 0,
+  "failed_build": 72,
+  "unsupported_params": 59,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 9,
+  "fidelity": {
+   "reduced_fidelity_targets": 0,
+   "dimensions": {
+    "arch": {
+     "status": "exercised",
+     "reason": "fuzzed natively on the host x86_64 target"
+    },
+    "endianness": {
+     "status": "exercised",
+     "reason": "native host target ran in little-endian"
+    },
+    "rtos_runtime": {
+     "status": "not_applicable",
+     "reason": "host process target has no RTOS runtime"
+    },
+    "hardware_peripherals": {
+     "status": "not_applicable",
+     "reason": "host process target has no hardware peripherals"
+    },
+    "concurrency": {
+     "status": "not_exercised",
+     "reason": "no ThreadSanitizer pass ran; concurrent interleavings not explored"
+    },
+    "sanitizers": {
+     "status": "exercised",
+     "reason": "ran under asan+ubsan"
+    }
+   }
+  }
+ },
+ "findings_detail": [
+  {
+   "id": "F-0000-139ad01a",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A0041-5B241086",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "words_engine-word_package.adb:135 index check failed"
+  },
+  {
+   "id": "F-0001-cee79961",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A0041-5B241086",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "words_engine-word_package.adb:135 index check failed"
+  },
+  {
+   "id": "F-0002-7ba06b6d",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A003F-58A74F43",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "words_engine-word_package.adb:121 index check failed"
+  },
+  {
+   "id": "F-0003-bd02b7ea",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A003F-58A74F43",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "words_engine-word_package.adb:121 index check failed"
+  },
+  {
+   "id": "F-0004-155e0a08",
+   "rule": "BHF-102",
+   "cwe": [
+    "CWE-129"
+   ],
+   "cwe_name": "Swallowed Constraint_Error from range or index check",
+   "kind": null,
+   "severity": null,
+   "confidence": "low",
+   "tier": "swallowed_check",
+   "harness": "H-A0018-45651C0D",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "words_engine-roman_numerals_package.adb:381"
+   ],
+   "message": "words_engine-roman_numerals_package.adb:355 index check failed"
+  },
+  {
+   "id": "F-0005-c04403a2",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A0033-9ACFC128",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "main.adb:35 range check failed"
+  },
+  {
+   "id": "F-0006-a1fb4ad1",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A0073-FEF55D68",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "latin_utils-inflections_package-decn_record_io.adb:74 range check failed"
+  },
+  {
+   "id": "F-0007-a0dc08b7",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A0073-FEF55D68",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "latin_utils-inflections_package-decn_record_io.adb:77 range check failed"
+  },
+  {
+   "id": "F-0008-529dec02",
+   "rule": "BHF-101",
+   "cwe": [
+    "CWE-248"
+   ],
+   "cwe_name": "Unhandled exception propagates to top level",
+   "kind": null,
+   "severity": null,
+   "confidence": "medium",
+   "tier": "real_fault",
+   "harness": "H-A002F-A2DDC11C",
+   "frames": [
+    "CONSTRAINT_ERROR",
+    "<unhandled>:0"
+   ],
+   "message": "main.adb:33 range check failed"
+  }
+ ]
+}

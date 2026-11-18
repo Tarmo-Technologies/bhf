@@ -12,13 +12,19 @@
  *   clang -fsanitize-coverage=trace-pc-guard -c target.c
  *   cc -o agent agent_posix.o bhf_agent.o target.o
  *
+ * With `--pty` it serves a pseudo-terminal instead (#293), standing in for a
+ * board's UART: it prints the terminal's path, for `bhf fuzz
+ * --target-transport agent:serial:PATH`, and serves each time the host opens
+ * it.
+ *
  * On a board, the same loop runs over the UART with read/write callbacks of
  * its own and a fault vector that calls bhf_agent_fault().
  */
-#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 #include "bhf_agent.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -26,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef AGENT_INPUT_CAP
@@ -79,6 +86,37 @@ static void on_fault(int sig, siginfo_t *info, void *uctx) {
     _exit(70);
 }
 
+static void configure(bhf_agent_config *config, int *fd) {
+    config->read = sock_read;
+    config->write = sock_write;
+    config->io_ctx = fd;
+    config->entry = LLVMFuzzerTestOneInput;
+    config->input = input;
+    config->input_cap = sizeof input;
+    config->edges = edges;
+    config->edge_cap = AGENT_EDGE_CAP;
+}
+
+/* Serve a pseudo-terminal's master end. Until the host opens the terminal,
+ * and after it closes it, a read fails: wait and serve again. */
+static int serve_pty(void) {
+    static const struct timespec wait = {0, 10 * 1000 * 1000};
+    bhf_agent_config config;
+    int fd = posix_openpt(O_RDWR | O_NOCTTY);
+    if (fd < 0 || grantpt(fd) != 0 || unlockpt(fd) != 0) {
+        perror("agent_posix: pty");
+        return 1;
+    }
+    printf("%s\n", ptsname(fd));
+    fflush(stdout);
+    for (;;) {
+        configure(&config, &fd);
+        bhf_agent_init(&config);
+        bhf_agent_serve();
+        nanosleep(&wait, NULL);
+    }
+}
+
 int main(int argc, char **argv) {
     static const int sigs[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT};
     struct sockaddr_in addr;
@@ -95,6 +133,7 @@ int main(int argc, char **argv) {
     action.sa_flags = SA_SIGINFO | SA_NODEFER;
     for (i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &action, NULL);
     signal(SIGPIPE, SIG_IGN);
+    if (argc > 1 && strcmp(argv[1], "--pty") == 0) return serve_pty();
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -114,14 +153,7 @@ int main(int argc, char **argv) {
         int fd = accept(listener, NULL, NULL);
         if (fd < 0) continue;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        config.read = sock_read;
-        config.write = sock_write;
-        config.io_ctx = &fd;
-        config.entry = LLVMFuzzerTestOneInput;
-        config.input = input;
-        config.input_cap = sizeof input;
-        config.edges = edges;
-        config.edge_cap = AGENT_EDGE_CAP;
+        configure(&config, &fd);
         bhf_agent_init(&config);
         bhf_agent_serve();
         close(fd);

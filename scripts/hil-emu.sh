@@ -16,6 +16,9 @@
 #   RV-4  the pinned FreeRTOS task/queue profile and the FreeRTOS agent task
 #   RV-5  the reference agent's Zephyr sample (west + ZEPHYR_BASE, from
 #         scripts/ci/install-zephyr.sh)
+#   RV-6  the board lane from a board profile (#293): hil_board against a
+#         qemu-system-arm stand-in, and the reference agent on a pty over the
+#         profile's serial lane
 #
 # Unlike the default `cargo test` (which self-skips when the emulator/cross
 # toolchains are absent), this lane first HARD-FAILS if any required tool is
@@ -131,4 +134,9 @@ command -v west >/dev/null && [ -n "${ZEPHYR_BASE:-}" ] || {
 BHF_ZEPHYR_CLI=1 cargo test --locked -p bhf --test transport_zephyr_agent_cli -- --nocapture
 echo
 
-echo "== hil-emu: RV-1 through RV-5 executed the REAL live paths and passed =="
+echo "== RV-6: the board lane from a board profile: QEMU stand-in, agent on a pty =="
+BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test hil_board -- --nocapture
+BHF_REQUIRE_TOOLS=1 cargo test --locked -p bhf --test transport_agent_serial_cli -- --nocapture
+echo
+
+echo "== hil-emu: RV-1 through RV-6 executed the REAL live paths and passed =="

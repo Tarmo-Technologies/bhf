@@ -161,31 +161,35 @@ with one symbol unresolved.
 
 ### Ada-2. `missing Ada symbol` — 19 — **GAP**
 
-### Ada-3. `unit X cannot belong to several projects` — 9 — **GAP, mechanism known**
+### Ada-3. `unit X cannot belong to several projects` — 9 — **[FIXED]**
 
 BHF's own project synthesis, not the target's. Reproduced on
-mk270/whitakers-words (4 targets attempted, 3 die this way).
+mk270/whitakers-words, where each of `commands.gpr`, `words_engine.gpr`,
+`support_utils.gpr` and `latin_utils.gpr` owns its `src/<name>` directory and
+`with`s the next. bhf staged instrumented copies of the target's closure,
+units of the withed projects included, and built with a project extending the
+target's own, so `support_utils.uniques_package` had two owners: the copy and
+`support_utils`. (`extends all` does not fix it; that was tested.)
 
-The synthesized project is `project Bhf_Build extends "<tree>/commands.gpr"`
-with `Source_Dirs` pointing at `<work>/src_instrumented`. That work dir holds
-INSTRUMENTED COPIES of the tree's units. `commands.gpr` `with`s sibling library
-projects (`support_utils.gpr`, `latin_utils.gpr`, …) that own `src/<Name>`, so
-`support_utils.uniques_package` is owned by both `bhf_build` (the copy) and
-`support_utils` (the original), and gprbuild refuses.
+The units of the projects the governing one `with`s are now left to those
+projects, uninstrumented, and copies an earlier target staged of them are
+removed (#287). `"src/" & project'Name` is evaluated, so the project that owns
+the target's source governs its build, and a library project's build stands
+alone. Re-running the sweep's 10 Ada-3 targets (8 subprograms) built and
+fuzzed 7 and left none on this reason. The eighth now stops in its own
+harness, which gives a record's string and enumeration components integer
+literals (#418). See [the re-run](validation/2026-11-18-ada3-withed-projects.md).
 
-**`extends all` does NOT fix it — tested.** The obvious GPR answer for overriding
-units across a withed closure leaves the identical diagnostic on this project.
-Do not spend the experiment again.
+### Ada-4. `predefined unit depends on itself` — 9 — **[FIXED]**
 
-What is left to try: build purely from the staged sources without `extends`
-(losing the user project's compiler settings and link flags), or drop from
-`src_instrumented` any unit the extended closure already owns (losing coverage
-instrumentation on exactly those units). Both are trade-offs, so measure the
-built count before choosing.
-
-### Ada-4. `predefined unit depends on itself` — 9 — **GAP**
-
-Same family: a staged copy of a predefined unit shadows the real one.
+Same family: a staged copy of a predefined unit shadowed the real one. A tree
+that vendors its own GNAT runtime (`Ada`, `System`, `Interfaces`, `GNAT` and
+their children) had those units staged and compiled in place of the host
+compiler's, which they do not match. They are now left to the compiler's
+runtime (#356). Re-running the sweep's 9 Ada-4 targets (8 subprograms, all in
+one freestanding kernel) built all 8 and fuzzed 7; the eighth builds, but no
+input reached it. See
+[the re-run](validation/2026-11-18-ada4-vendored-runtime.md).
 
 ### Ada-5. `named type X is not declared in the parsed source set` — ~10 — **GAP**
 
@@ -633,8 +637,7 @@ By fixable targets, highest first:
    completed) — a definition in another non-included `.c` needs the
    tree-wide struct definitions plumbed to the decoder.
 2. **C++ unconstructible class** (C++-2; 30) + no-decoder (C++-3; 33).
-3. **Ada link/symbol residue** (Ada-1, Ada-2; 52) and **GPR structure**
-   (Ada-3; 18).
+3. **Ada link/symbol residue** (Ada-1, Ada-2; 52).
 4. **Go undrivable parameters** (Go-1; 58 before `context.Context` was
    fixed) — the rest are project and library types (`*zap.Logger`,
    `*pflag.FlagSet`).

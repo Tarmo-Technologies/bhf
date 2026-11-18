@@ -571,11 +571,12 @@ are documented as scaffolding naming the completing track:
 - **Memory-buffer emitter** — *wired.* `target_transport::coverage::MemoryBufferReader`
   consumes it, and the `gdb` and `qemu-system` transports read the ring each
   run (`crates/target_transport/src/coverage.rs`; the wrap case is tested).
-- **Semihosting emitter** — *not wired.* `SemihostingReader` decodes the
-  stream in tests, but no transport feeds it the emitter's output (the gdb
-  client keeps `O` packets as stdout only), so a semihosting harness fuzzes
-  without coverage. Reading it in the gdb and qemu-system transports is
-  [#292](https://github.com/Tarmo-Technologies/bhf/issues/292); the `.adb` header says so.
+- **Semihosting emitter** — *wired* (#292). The gdb client serves the File-I/O
+  writes a debugger-routed semihosting call makes, and with
+  `coverage=semihosting` the `gdb` and `qemu-system` transports decode what fd
+  2 got during each run through `SemihostingReader`
+  (`crates/target_transport/src/gdb.rs`; a live QEMU test checks the coverage
+  each path adds).
 - **Nyx `nyx-engine` stub** — *retired* in favor of `FullSystemTransport`
   (HDF-4): `nyx_adapter` crate docs mark it superseded scaffolding, and
   `NyxError::NotImplemented` names the replacement

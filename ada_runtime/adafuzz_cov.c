@@ -21,6 +21,10 @@
  * engine reader is unchanged: one byte per (hashed) edge, BHF_COV_BITS bytes
  * total. trace-pc has no guard pointer, so the return-address PC is hashed into
  * the bitmap instead.
+ *
+ * With BHF_COV_PCS=<file> (the coverage replay's, #310), each edge's PC is also
+ * appended to that file the first time this process reaches it, as a hex offset
+ * from the image's start, so the host can place it on an Ada line.
  */
 
 #include <stdint.h>
@@ -29,6 +33,10 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
 
 /* MUST match BHF_COV_BITS in crates/cli/src/fuzz.rs and
  * direct_harness.c.tera — the engine maps the same file at this size. */
@@ -45,11 +53,23 @@
 
 static unsigned char *adafuzz_cov_map = 0;
 
+/* The BHF_COV_PCS recorder: its file, and the PCs this process wrote. */
+#define ADAFUZZ_PCS_SLOTS (1u << 16)
+static int adafuzz_pcs_fd = -1;
+static uintptr_t adafuzz_pcs_seen[ADAFUZZ_PCS_SLOTS];
+#if defined(__ELF__)
+extern char __executable_start __attribute__((weak));
+#endif
+
 /* Map (or create+size) the BHF_COV_SHM edge bitmap once at process start.
  * MAP_SHARED so coverage accumulates across the persistent fork-server process
  * and any per-spawn children, and so the engine reading the same file sees it.
  * No-op when BHF_COV_SHM is unset (a plain run with no engine). */
 ADAFUZZ_NOCOV __attribute__((constructor)) static void adafuzz_cov_open(void) {
+    const char *pcs = getenv("BHF_COV_PCS");
+    if (pcs && *pcs) {
+        adafuzz_pcs_fd = open(pcs, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    }
     const char *p = getenv("BHF_COV_SHM");
     if (!p || !*p) {
         return;
@@ -72,11 +92,46 @@ ADAFUZZ_NOCOV __attribute__((constructor)) static void adafuzz_cov_open(void) {
  * return address identifies the edge. Fold it into the bitmap with the same
  * scramble libFuzzer/AFL use for PC-table-less coverage so adjacent edges spread
  * across buckets. No-op until the bitmap is mapped. */
+/* Append `pc`'s offset to the BHF_COV_PCS file once per process: an open-
+ * addressed set of the PCs written; a full set writes the rest every time,
+ * which the host's reader dedups. */
+ADAFUZZ_NOCOV static void adafuzz_pcs_record(uintptr_t pc) {
+    static const char hex[] = "0123456789abcdef";
+    uintptr_t base = 0;
+    uintptr_t offset;
+    unsigned slot, probe;
+    char line[2 * sizeof(uintptr_t) + 1];
+    int len = 0, shift;
+#if defined(__ELF__)
+    if (&__executable_start) base = (uintptr_t)&__executable_start;
+#endif
+    slot = (unsigned)((pc ^ (pc >> 7)) & (ADAFUZZ_PCS_SLOTS - 1));
+    for (probe = 0; probe < 64; probe++) {
+        unsigned at = (slot + probe) & (ADAFUZZ_PCS_SLOTS - 1);
+        if (adafuzz_pcs_seen[at] == pc) return;
+        if (adafuzz_pcs_seen[at] == 0) {
+            adafuzz_pcs_seen[at] = pc;
+            break;
+        }
+    }
+    offset = pc - base;
+    for (shift = (int)(sizeof(uintptr_t) * 8) - 4; shift >= 0; shift -= 4) {
+        unsigned digit = (unsigned)((offset >> shift) & 15u);
+        if (len == 0 && digit == 0 && shift > 0) continue;
+        line[len++] = hex[digit];
+    }
+    line[len++] = '\n';
+    (void)!write(adafuzz_pcs_fd, line, (size_t)len);
+}
+
 ADAFUZZ_NOCOV void __sanitizer_cov_trace_pc(void) {
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    if (adafuzz_pcs_fd >= 0) {
+        adafuzz_pcs_record(pc);
+    }
     if (!adafuzz_cov_map) {
         return;
     }
-    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
     adafuzz_cov_map[(pc ^ (pc >> 3)) & (BHF_COV_BITS - 1)] = 1;
 }
 

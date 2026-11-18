@@ -12,6 +12,18 @@
 //! `confirm::mark_fuzz_exercised_findings` marks a C/C++ static finding whose line
 //! the campaign PROVABLY executed (yet never crashed) as `fuzz_exercised`.
 //!
+//! The same replay writes the user's coverage report (#308) to
+//! `results/coverage/<harness>/`: `lcov.info`, an HTML report under `html/`, and a
+//! per-function table (`functions.txt`, `functions.json`), each cut to the files
+//! under the sweep's source root, without bhf's harness and runtime, and the
+//! comparisons the corpus reached but never passed (`blockers.json`,
+//! `blockers.txt`, #309). An Ada harness, which GNAT instruments with
+//! `-fsanitize-coverage=trace-pc` and no coverage mapping, gets the same
+//! `lcov.info` and per-subprogram table from its edges (#310): the replay records
+//! each edge's PC (`BHF_COV_PCS`), the binary's calls to the trace-pc callback
+//! are the instrumented ones, and `addr2line` places both on Ada lines, which the
+//! instrumented copies' line maps take back to the original source.
+//!
 //! Best-effort: a missing `llvm-cov`/`llvm-profdata`, a failed coverage build, or an
 //! empty corpus all skip cleanly. Never fatal.
 
@@ -228,6 +240,8 @@ pub struct CoverageTotals {
     pub harnesses: usize,
     pub covered_lines: usize,
     pub instrumented_lines: usize,
+    /// Comparisons the corpora reached and never passed (#309).
+    pub blockers: usize,
     pub expert_oracles: usize,
     pub expert_parity_or_better: usize,
     pub expert_marginal_gaps: usize,
@@ -246,8 +260,10 @@ impl CoverageTotals {
 
 /// Build + replay every C/C++ harness's corpus under source coverage, writing each
 /// harness's executed `(file:line)` set to `<harness>/covered-lines.txt` and its
-/// covered/instrumented counts to `coverage-summary.json`. Returns the totals.
-pub fn run_coverage_replay(work_dir: &Path) -> CoverageTotals {
+/// covered/instrumented counts to `coverage-summary.json`, and its report to
+/// `results/coverage/<harness>/` ([`write_coverage_report`]), cut to the files
+/// under `source_root`. Returns the totals.
+pub fn run_coverage_replay(work_dir: &Path, source_root: Option<&Path>) -> CoverageTotals {
     let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
         return CoverageTotals::default();
     };
@@ -266,9 +282,17 @@ pub fn run_coverage_replay(work_dir: &Path) -> CoverageTotals {
         else {
             continue;
         };
-        if let Some((covered, instrumented)) = llvm_tools
-            .as_ref()
-            .and_then(|(profdata, cov)| replay_one(work_dir, &hdir, &harness_id, profdata, cov))
+        if let Some((covered, instrumented, blockers)) =
+            llvm_tools.as_ref().and_then(|(profdata, cov)| {
+                replay_one(work_dir, &hdir, &harness_id, profdata, cov, source_root)
+            })
+        {
+            totals.harnesses += 1;
+            totals.covered_lines += covered;
+            totals.instrumented_lines += instrumented;
+            totals.blockers += blockers;
+        }
+        if let Some((covered, instrumented)) = replay_ada(work_dir, &hdir, &harness_id, source_root)
         {
             totals.harnesses += 1;
             totals.covered_lines += covered;
@@ -304,7 +328,8 @@ fn replay_one(
     harness_id: &str,
     profdata: &str,
     cov: &str,
-) -> Option<(usize, usize)> {
+    source_root: Option<&Path>,
+) -> Option<(usize, usize, usize)> {
     if !hdir.join("Makefile").is_file() {
         return None;
     }
@@ -477,6 +502,18 @@ fn replay_one(
     let covered = measurement.covered;
     let instrumented = measurement.instrumented;
     let _ = std::fs::remove_dir_all(&prof_dir);
+    let blockers = write_coverage_report(
+        &ReportInputs {
+            work_dir,
+            hdir,
+            harness_id,
+            source_root,
+            cov,
+            profile: &merged,
+            binary: &bin,
+        },
+        &export_text,
+    );
     if covered.is_empty() {
         return None;
     }
@@ -505,7 +542,7 @@ fn replay_one(
         profdata,
         cov,
     );
-    Some((covered.len(), instrumented))
+    Some((covered.len(), instrumented, blockers))
 }
 
 #[derive(Debug, Serialize)]
@@ -1422,6 +1459,796 @@ fn parse_lcov_kept(lcov: &str, keep: &dyn Fn(&str) -> bool) -> LcovMeasurement {
     }
 }
 
+/// What [`write_coverage_report`] reads besides the export.
+struct ReportInputs<'a> {
+    work_dir: &'a Path,
+    hdir: &'a Path,
+    harness_id: &'a str,
+    source_root: Option<&'a Path>,
+    cov: &'a str,
+    profile: &'a Path,
+    binary: &'a Path,
+}
+
+/// One function of the per-function table (#308).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FunctionCoverage {
+    function: String,
+    file: String,
+    line: u64,
+    /// How many times it was entered, over the replayed corpus; `None` for
+    /// an Ada harness, whose edges say only whether it was.
+    calls: Option<u64>,
+    /// Its instrumented lines the corpus executed, and all of them: the
+    /// lines from its first to the next function's in the file.
+    lines_covered: usize,
+    lines_instrumented: usize,
+}
+
+/// The files of `lcov` that the report keeps: the project's own, under
+/// `source_root` when there is one.
+fn report_files(lcov: &str, hdir: &Path, source_root: Option<&Path>) -> Vec<String> {
+    let harnesses = hdir.parent().unwrap_or(hdir);
+    let root = source_root.and_then(|root| root.canonicalize().ok());
+    let mut files: Vec<String> = lcov
+        .lines()
+        .filter_map(|line| line.strip_prefix("SF:"))
+        .map(|file| file.trim().to_owned())
+        .filter(|file| !is_bhf_scaffolding(file, harnesses))
+        .filter(|file| {
+            root.as_ref().is_none_or(|root| {
+                Path::new(file)
+                    .canonicalize()
+                    .is_ok_and(|path| path.starts_with(root))
+            })
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The records of `lcov` for `files`, each from its `SF:` to its
+/// `end_of_record`.
+fn lcov_for_files(lcov: &str, files: &[String]) -> String {
+    let mut out = String::new();
+    let mut keep = false;
+    for line in lcov.lines() {
+        if line == "TN:" || line.starts_with("TN:") {
+            continue;
+        }
+        if let Some(file) = line.strip_prefix("SF:") {
+            keep = files.iter().any(|kept| kept == file.trim());
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if line == "end_of_record" {
+            keep = false;
+        }
+    }
+    out
+}
+
+/// The per-function table of `lcov`'s `FN`, `FNDA` and `DA` records.
+fn function_table(lcov: &str) -> Vec<FunctionCoverage> {
+    let mut table = Vec::new();
+    let mut file = String::new();
+    let mut starts: Vec<(u64, String)> = Vec::new();
+    let mut calls: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut lines: Vec<(u64, u64)> = Vec::new();
+    let mut flush = |file: &str,
+                     starts: &mut Vec<(u64, String)>,
+                     calls: &mut std::collections::HashMap<String, u64>,
+                     lines: &mut Vec<(u64, u64)>| {
+        starts.sort();
+        for (index, (start, name)) in starts.iter().enumerate() {
+            let end = starts.get(index + 1).map_or(u64::MAX, |(next, _)| *next);
+            let span: Vec<&(u64, u64)> = lines
+                .iter()
+                .filter(|(line, _)| (*start..end).contains(line))
+                .collect();
+            table.push(FunctionCoverage {
+                function: name.clone(),
+                file: file.to_owned(),
+                line: *start,
+                calls: Some(calls.get(name).copied().unwrap_or(0)),
+                lines_covered: span.iter().filter(|(_, hits)| *hits > 0).count(),
+                lines_instrumented: span.len(),
+            });
+        }
+        starts.clear();
+        calls.clear();
+        lines.clear();
+    };
+    for line in lcov.lines() {
+        if let Some(rest) = line.strip_prefix("SF:") {
+            file = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("FN:") {
+            if let Some((start, name)) = rest.split_once(',') {
+                if let Ok(start) = start.trim().parse() {
+                    starts.push((start, name.trim().to_owned()));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("FNDA:") {
+            if let Some((count, name)) = rest.split_once(',') {
+                let count = count.trim().parse().unwrap_or(0);
+                *calls.entry(name.trim().to_owned()).or_default() += count;
+            }
+        } else if let Some(rest) = line.strip_prefix("DA:") {
+            let mut parts = rest.split(',');
+            if let (Some(Ok(number)), Some(hits)) =
+                (parts.next().map(|n| n.trim().parse()), parts.next())
+            {
+                lines.push((number, hits.trim().parse().unwrap_or(0)));
+            }
+        } else if line == "end_of_record" {
+            flush(&file, &mut starts, &mut calls, &mut lines);
+        }
+    }
+    table
+}
+
+/// Replay an Ada harness's corpus and write its coverage (#310): the
+/// project's executed lines to `covered-lines.txt` and `coverage-summary.json`,
+/// as the C/C++ replay does, and `results/coverage/<harness>/` with
+/// `lcov.info`, `functions.json` and `functions.txt`, per subprogram. Returns
+/// the covered and instrumented line counts.
+fn replay_ada(
+    work_dir: &Path,
+    hdir: &Path,
+    harness_id: &str,
+    source_root: Option<&Path>,
+) -> Option<(usize, usize)> {
+    if !hdir.join("main.adb").is_file() || hdir.join("covered-lines.txt").is_file() {
+        return None;
+    }
+    let bin = crate::fuzz::find_harness_executable(
+        work_dir,
+        harness_id,
+        crate::fuzz::FuzzEngine::Builtin,
+    )
+    .ok()?;
+    let inputs: Vec<PathBuf> =
+        std::fs::read_dir(work_dir.join("corpus").join(harness_id).join("queue"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .take(MAX_INPUTS)
+            .collect();
+    if inputs.is_empty() {
+        return None;
+    }
+    // Every instrumented edge: the return address of each call to the
+    // trace-pc callback, as offsets from the image's start.
+    let instrumented = trace_pc_sites(&bin);
+    if instrumented.is_empty() {
+        return None;
+    }
+    let pcs = hdir.join("cov_pcs.txt");
+    let _ = std::fs::remove_file(&pcs);
+    let deadline = Instant::now() + REPLAY_BUDGET;
+    for input in inputs {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(stdin) = std::fs::File::open(&input) else {
+            continue;
+        };
+        // One input per process, from stdin (the harness's raw mode). A
+        // crash or a timeout still leaves the edges it reached.
+        let _ = crate::command_output::bounded_replay_output(
+            Command::new(&bin)
+                .env("BHF_COV_PCS", &pcs)
+                .env_remove("BHF_FRAMED")
+                .env_remove("BHF_COV_SHM")
+                .stdin(stdin),
+            Duration::from_secs(15),
+        );
+    }
+    let hit: std::collections::BTreeSet<u64> = std::fs::read_to_string(&pcs)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .collect();
+    let _ = std::fs::remove_file(&pcs);
+
+    // Place each edge on an original line of a project file.
+    let maps = corpus::SourceLineMaps::load(&work_dir.join("src_instrumented"));
+    let root = source_root.and_then(|root| root.canonicalize().ok());
+    let in_root = |file: &str| {
+        root.as_ref().is_none_or(|root| {
+            Path::new(file)
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with(root))
+        })
+    };
+    let places = symbolize(&bin, &instrumented);
+    // (subprogram, file) -> (line -> reached)
+    let mut subprograms: std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeMap<u64, bool>,
+    > = std::collections::BTreeMap::new();
+    for pc in &instrumented {
+        let Some((function, file, line)) = places.get(pc) else {
+            continue;
+        };
+        let (file, line) = match u32::try_from(*line)
+            .ok()
+            .and_then(|line| maps.resolve(file, line))
+        {
+            Some(resolved) => (resolved.source_path, u64::from(resolved.original_line)),
+            None => (file.clone(), *line),
+        };
+        if !in_root(&file) {
+            continue;
+        }
+        let reached = hit.contains(pc);
+        let lines = subprograms
+            .entry((ada_subprogram_name(function), file))
+            .or_default();
+        let entry = lines.entry(line).or_insert(false);
+        *entry |= reached;
+    }
+    if subprograms.is_empty() {
+        return None;
+    }
+    let mut table: Vec<FunctionCoverage> = subprograms
+        .iter()
+        .map(|((function, file), lines)| FunctionCoverage {
+            function: function.clone(),
+            file: file.clone(),
+            line: lines.keys().next().copied().unwrap_or(0),
+            calls: None,
+            lines_covered: lines.values().filter(|reached| **reached).count(),
+            lines_instrumented: lines.len(),
+        })
+        .collect();
+    table.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+
+    // The lines, once each over the file's subprograms.
+    let mut files: std::collections::BTreeMap<&str, std::collections::BTreeMap<u64, bool>> =
+        std::collections::BTreeMap::new();
+    for ((_, file), lines) in &subprograms {
+        let merged = files.entry(file.as_str()).or_default();
+        for (line, reached) in lines {
+            *merged.entry(*line).or_insert(false) |= reached;
+        }
+    }
+    let mut lcov = String::new();
+    let mut covered = Vec::new();
+    let mut instrumented_lines = 0usize;
+    for (file, lines) in &files {
+        lcov.push_str(&format!("SF:{file}\n"));
+        for function in table.iter().filter(|f| f.file == *file) {
+            lcov.push_str(&format!("FN:{},{}\n", function.line, function.function));
+            lcov.push_str(&format!(
+                "FNDA:{},{}\n",
+                u64::from(function.lines_covered > 0),
+                function.function
+            ));
+        }
+        for (line, reached) in lines {
+            lcov.push_str(&format!("DA:{line},{}\n", u64::from(*reached)));
+            if *reached {
+                covered.push(format!("{file}:{line}"));
+            }
+        }
+        lcov.push_str(&format!(
+            "LF:{}\nLH:{}\nend_of_record\n",
+            lines.len(),
+            lines.values().filter(|reached| **reached).count()
+        ));
+        instrumented_lines += lines.len();
+    }
+    let dir = corpus::layout::results_dir(work_dir)
+        .join("coverage")
+        .join(harness_id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join("lcov.info"), &lcov);
+        if let Ok(json) = serde_json::to_string_pretty(&table) {
+            let _ = std::fs::write(dir.join("functions.json"), json + "\n");
+        }
+        let _ = std::fs::write(dir.join("functions.txt"), render_subprograms(&table));
+    }
+    let _ = std::fs::write(
+        hdir.join("coverage-summary.json"),
+        format!(
+            "{{\n  \"harness_id\": \"{harness_id}\",\n  \"covered_lines\": {},\n  \
+             \"instrumented_lines\": {instrumented_lines}\n}}\n",
+            covered.len()
+        ),
+    );
+    let _ = std::fs::write(hdir.join("covered-lines.txt"), covered.join("\n"));
+    Some((covered.len(), instrumented_lines))
+}
+
+/// The return address of each call to `__sanitizer_cov_trace_pc` in `binary`,
+/// as an offset from its image's start: every edge GNAT's trace-pc
+/// instrumentation planted (#310).
+fn trace_pc_sites(binary: &Path) -> Vec<u64> {
+    let Some(objdump) = llvm_tool("llvm-objdump")
+        .or_else(|| which::which("objdump").ok().map(|_| "objdump".to_owned()))
+    else {
+        return Vec::new();
+    };
+    let Ok(output) = crate::command_output::output_with_timeout(
+        Command::new(objdump)
+            .args(["-d", "--no-show-raw-insn"])
+            .arg(binary),
+        Duration::from_secs(300),
+    ) else {
+        return Vec::new();
+    };
+    trace_pc_sites_in(&String::from_utf8_lossy(&output.stdout), link_base(binary))
+}
+
+/// [`trace_pc_sites`] of an `objdump -d` listing, its addresses less `base`.
+fn trace_pc_sites_in(text: &str, base: u64) -> Vec<u64> {
+    let mut sites = Vec::new();
+    let mut after_call = false;
+    for line in text.lines() {
+        // `  4011d6:\tcall   401090 <__sanitizer_cov_trace_pc>`
+        let Some((address, rest)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        let Ok(address) = u64::from_str_radix(address.trim(), 16) else {
+            continue;
+        };
+        if std::mem::take(&mut after_call) {
+            sites.push(address.saturating_sub(base));
+        }
+        after_call = rest.contains("<__sanitizer_cov_trace_pc>");
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    sites
+}
+
+/// An Ada subprogram's name from its GNAT symbol: `checks__classify` is
+/// `checks.classify`; an overload's `__2` suffix stays.
+fn ada_subprogram_name(symbol: &str) -> String {
+    symbol.replace("__", ".")
+}
+
+/// `functions.txt` of an Ada harness: one row per subprogram.
+fn render_subprograms(table: &[FunctionCoverage]) -> String {
+    let width = table
+        .iter()
+        .map(|f| f.function.len())
+        .max()
+        .unwrap_or(0)
+        .max("Subprogram".len());
+    let mut out = format!(
+        "{:<width$}  {:>7}  {:>7}  {:>7}  File:Line\n",
+        "Subprogram", "Lines", "Covered", "Cover"
+    );
+    for function in table {
+        let cover = if function.lines_instrumented == 0 {
+            0.0
+        } else {
+            100.0 * function.lines_covered as f64 / function.lines_instrumented as f64
+        };
+        out.push_str(&format!(
+            "{:<width$}  {:>7}  {:>7}  {:>6.1}%  {}:{}\n",
+            function.function,
+            function.lines_instrumented,
+            function.lines_covered,
+            cover,
+            function.file,
+            function.line
+        ));
+    }
+    out
+}
+
+/// A comparison the corpus reached and never passed (#309): one direction
+/// of the branch at its line ran, another never did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ComparisonBlocker {
+    file: String,
+    line: u64,
+    function: String,
+    /// The comparisons recorded there (`int`, `memcmp`, `strcmp`, ...).
+    kinds: Vec<String>,
+    /// The operand the branch wants, hex: the constant side.
+    wants: String,
+    /// Some of the values it got instead, hex.
+    saw: Vec<String>,
+    /// How many distinct comparisons were recorded there.
+    records: usize,
+    /// The branch's directions taken and never taken, as llvm-cov counts
+    /// them.
+    branches_taken: usize,
+    branches_not_taken: usize,
+}
+
+/// One comparison record of `cmplog.jsonl`, its sites as offsets in the
+/// fuzzed binary: where the comparison ran and its caller.
+#[derive(Debug, Clone)]
+struct CmplogSite {
+    kind: String,
+    sites: [u64; 2],
+    a: String,
+    b: String,
+}
+
+/// The comparison records the harness's passes kept (`cmplog.jsonl`).
+fn read_cmplog_sites(hdir: &Path) -> Vec<CmplogSite> {
+    let Ok(text) = std::fs::read_to_string(hdir.join("cmplog.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["e"] == "cmplog")
+        .filter_map(|record| {
+            let (site, caller) = record["s"].as_str()?.split_once('.')?;
+            Some(CmplogSite {
+                kind: record["k"].as_str().unwrap_or_default().to_owned(),
+                sites: [
+                    u64::from_str_radix(site, 16).ok()?,
+                    u64::from_str_radix(caller, 16).ok()?,
+                ],
+                a: record["a"].as_str().unwrap_or_default().to_owned(),
+                b: record["b"].as_str().unwrap_or_default().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Where each address of `binary` is: `(function, file, line)`, by
+/// `llvm-symbolizer`. Addresses are offsets from the image's start, as the
+/// driver records them; each is looked up a byte back, inside the call or
+/// compare whose return address it is.
+fn symbolize(
+    binary: &Path,
+    addresses: &[u64],
+) -> std::collections::HashMap<u64, (String, String, u64)> {
+    use std::io::Write as _;
+    let mut out = std::collections::HashMap::new();
+    // llvm-symbolizer, else binutils' addr2line: both print a function line
+    // and a `FILE:LINE[:COLUMN]` line per address.
+    let mut command = if let Some(symbolizer) = llvm_tool("llvm-symbolizer") {
+        let mut command = Command::new(symbolizer);
+        command.arg(format!("--obj={}", binary.display())).args([
+            "--functions=linkage",
+            "--no-inlines",
+            "--output-style=GNU",
+        ]);
+        command
+    } else if which::which("addr2line").is_ok() {
+        let mut command = Command::new("addr2line");
+        command.arg("-f").arg("-e").arg(binary);
+        command
+    } else {
+        return out;
+    };
+    let base = link_base(binary);
+    let Ok(mut child) = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return out;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        for address in addresses {
+            let _ = writeln!(stdin, "{:#x}", (base + address).saturating_sub(1));
+        }
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return out;
+    };
+    // Two lines per address: the function, then `FILE:LINE`, with
+    // ` (discriminator N)` after it sometimes; `??:0` or `??:?` when unknown.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    for address in addresses {
+        let (Some(function), Some(location)) = (lines.next(), lines.next()) else {
+            break;
+        };
+        let location = location.split(" (").next().unwrap_or(location);
+        let Some((file, line)) = location.rsplit_once(':') else {
+            continue;
+        };
+        if let Ok(line) = line.parse::<u64>() {
+            if line > 0 && file != "??" {
+                out.insert(*address, (function.to_owned(), file.to_owned(), line));
+            }
+        }
+    }
+    out
+}
+
+/// The link-time address of `binary`'s image start (`__executable_start`):
+/// 0 for a position-independent executable.
+fn link_base(binary: &Path) -> u64 {
+    let Some(nm) =
+        llvm_tool("llvm-nm").or_else(|| which::which("nm").ok().map(|_| "nm".to_owned()))
+    else {
+        return 0;
+    };
+    Command::new(nm)
+        .arg(binary)
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find(|line| line.ends_with(" __executable_start"))
+                .and_then(|line| line.split_whitespace().next())
+                .and_then(|address| u64::from_str_radix(address, 16).ok())
+        })
+        .unwrap_or(0)
+}
+
+/// The comparisons of `cmplog` at a line of `files` whose branch `lcov`
+/// shows taken one way and never the other (#309).
+fn comparison_blockers(
+    lcov: &str,
+    cmplog: &[CmplogSite],
+    binary: &Path,
+    files: &[String],
+) -> Vec<ComparisonBlocker> {
+    use std::collections::BTreeMap;
+    // (file, line) -> (directions taken, directions never taken), for lines
+    // whose branch ran at all.
+    let mut branches: BTreeMap<(String, u64), (usize, usize)> = BTreeMap::new();
+    let mut file = String::new();
+    for line in lcov.lines() {
+        if let Some(rest) = line.strip_prefix("SF:") {
+            file = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("BRDA:") {
+            let fields: Vec<&str> = rest.split(',').collect();
+            if let [number, _, _, taken] = fields[..] {
+                let Ok(number) = number.parse::<u64>() else {
+                    continue;
+                };
+                let entry = branches.entry((file.clone(), number)).or_default();
+                match taken.trim().parse::<u64>() {
+                    Ok(0) => entry.1 += 1,
+                    Ok(_) => entry.0 += 1,
+                    // `-`: the branch's block never ran.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    let stuck = branches
+        .values()
+        .any(|(taken, missed)| *taken > 0 && *missed > 0);
+    if !stuck || cmplog.is_empty() {
+        return Vec::new();
+    }
+    let mut addresses: Vec<u64> = cmplog.iter().flat_map(|record| record.sites).collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    blockers_at(&branches, cmplog, &symbolize(binary, &addresses), files)
+}
+
+/// [`comparison_blockers`] with the branches parsed and the sites placed.
+fn blockers_at(
+    branches: &std::collections::BTreeMap<(String, u64), (usize, usize)>,
+    cmplog: &[CmplogSite],
+    places: &std::collections::HashMap<u64, (String, String, u64)>,
+    files: &[String],
+) -> Vec<ComparisonBlocker> {
+    use std::collections::BTreeMap;
+    let stuck: Vec<&(String, u64)> = branches
+        .iter()
+        .filter(|(_, (taken, missed))| *taken > 0 && *missed > 0)
+        .map(|(key, _)| key)
+        .collect();
+    let same_file = |a: &str, b: &str| {
+        a == b
+            || Path::new(a)
+                .canonicalize()
+                .ok()
+                .zip(Path::new(b).canonicalize().ok())
+                .is_some_and(|(a, b)| a == b)
+    };
+    // Each record at the first of its sites that is a project line: an
+    // intercepted memcmp's own site is the interceptor, its caller the call.
+    let mut at: BTreeMap<(String, u64), (String, Vec<&CmplogSite>)> = BTreeMap::new();
+    for record in cmplog {
+        let place = record.sites.iter().find_map(|site| {
+            places
+                .get(site)
+                .filter(|(_, file, _)| files.iter().any(|kept| same_file(kept, file)))
+        });
+        if let Some((function, file, line)) = place {
+            let key = files
+                .iter()
+                .find(|kept| same_file(kept, file))
+                .map(|kept| (kept.clone(), *line))
+                .unwrap_or_else(|| (file.clone(), *line));
+            at.entry(key)
+                .or_insert_with(|| (function.clone(), Vec::new()))
+                .1
+                .push(record);
+        }
+    }
+    let mut blockers = Vec::new();
+    for key in stuck {
+        let Some((function, records)) = at.get(key) else {
+            continue;
+        };
+        let (taken, missed) = branches[key];
+        let mut kinds: Vec<String> = records.iter().map(|r| r.kind.clone()).collect();
+        kinds.sort();
+        kinds.dedup();
+        // The constant side: an `int` record's `a`; otherwise the operand
+        // every record shares, else the commonest `b`.
+        let shared = |side: fn(&CmplogSite) -> &str| {
+            let first = side(records[0]);
+            records
+                .iter()
+                .all(|r| side(r) == first)
+                .then(|| first.to_owned())
+        };
+        let (wants, other): (String, fn(&CmplogSite) -> &str) =
+            if let Some(int) = records.iter().find(|r| r.kind == "int") {
+                (int.a.clone(), |r| r.b.as_str())
+            } else if let Some(b) = shared(|r| r.b.as_str()) {
+                (b, |r| r.a.as_str())
+            } else if let Some(a) = shared(|r| r.a.as_str()) {
+                (a, |r| r.b.as_str())
+            } else {
+                (records[0].b.clone(), |r| r.a.as_str())
+            };
+        let mut saw: Vec<String> = Vec::new();
+        for record in records {
+            let value = other(record);
+            if !value.is_empty() && value != wants && !saw.iter().any(|s| s == value) {
+                saw.push(value.to_owned());
+            }
+            if saw.len() == 4 {
+                break;
+            }
+        }
+        blockers.push(ComparisonBlocker {
+            file: key.0.clone(),
+            line: key.1,
+            function: function.clone(),
+            kinds,
+            wants,
+            saw,
+            records: records.len(),
+            branches_taken: taken,
+            branches_not_taken: missed,
+        });
+    }
+    blockers
+}
+
+/// Hex `bytes`, with their text when it is all printable.
+fn hex_and_text(hex: &str) -> String {
+    let bytes: Option<Vec<u8>> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+        .collect();
+    match bytes {
+        Some(bytes)
+            if !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') =>
+        {
+            format!("{hex} ({:?})", String::from_utf8_lossy(&bytes))
+        }
+        _ => hex.to_owned(),
+    }
+}
+
+/// `blockers.txt`: one line per blocked comparison, its place first.
+fn render_blockers(blockers: &[ComparisonBlocker]) -> String {
+    if blockers.is_empty() {
+        return "No comparison was reached and left unpassed.\n".to_owned();
+    }
+    let mut out = String::from(
+        "Comparisons the corpus reached but never passed: the branch ran one way only.\n\
+         Operands are hex, little-endian for integers.\n\n",
+    );
+    for blocker in blockers {
+        let saw: Vec<String> = blocker
+            .saw
+            .iter()
+            .map(|value| hex_and_text(value))
+            .collect();
+        out.push_str(&format!(
+            "{}:{}  {}  {}  wants {}{}  ({} record(s))\n",
+            blocker.file,
+            blocker.line,
+            blocker.function,
+            blocker.kinds.join(","),
+            hex_and_text(&blocker.wants),
+            if saw.is_empty() {
+                String::new()
+            } else {
+                format!(", saw {}", saw.join(", "))
+            },
+            blocker.records
+        ));
+    }
+    out
+}
+
+/// Write the harness's coverage report to `results/coverage/<harness>/`
+/// (#308): `lcov.info`, the export cut to the project's files under the
+/// source root; `html/`, llvm-cov's line-level report of them;
+/// `functions.txt`, llvm-cov's per-function table; and `functions.json`, each
+/// function's calls and lines; and `blockers.json` and `blockers.txt`, the
+/// comparisons the corpus reached and never passed. Best-effort: a report
+/// llvm-cov cannot render is left out and said in the harness's diagnostic.
+/// Returns how many blockers it listed.
+fn write_coverage_report(inputs: &ReportInputs, lcov: &str) -> usize {
+    let files = report_files(lcov, inputs.hdir, inputs.source_root);
+    if files.is_empty() {
+        return 0;
+    }
+    let dir = corpus::layout::results_dir(inputs.work_dir)
+        .join("coverage")
+        .join(inputs.harness_id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return 0;
+    }
+    let lcov = lcov_for_files(lcov, &files);
+    let _ = std::fs::write(dir.join("lcov.info"), &lcov);
+    let mut table = function_table(&lcov);
+    table.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    if let Ok(json) = serde_json::to_string_pretty(&table) {
+        let _ = std::fs::write(dir.join("functions.json"), json + "\n");
+    }
+    let blockers = comparison_blockers(
+        &lcov,
+        &read_cmplog_sites(inputs.hdir),
+        &crate::auto::layout::harness_exe(inputs.hdir, "main"),
+        &files,
+    );
+    if let Ok(json) = serde_json::to_string_pretty(&blockers) {
+        let _ = std::fs::write(dir.join("blockers.json"), json + "\n");
+    }
+    let _ = std::fs::write(dir.join("blockers.txt"), render_blockers(&blockers));
+    let llvm_cov = |subcommand: &str| {
+        let mut command = Command::new(inputs.cov);
+        command
+            .arg(subcommand)
+            .arg(format!("-instr-profile={}", inputs.profile.display()))
+            .arg(inputs.binary);
+        if let Some(demangler) = llvm_tool("llvm-cxxfilt") {
+            command.arg(format!("-Xdemangler={demangler}"));
+        }
+        command.args(&files);
+        command
+    };
+    let mut failures = Vec::new();
+    let mut show = llvm_cov("show");
+    show.args(["-format=html", "-show-line-counts-or-regions"])
+        .arg(format!("-output-dir={}", dir.join("html").display()));
+    match crate::command_output::output_with_timeout(&mut show, Duration::from_secs(300)) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => failures.push(format!("llvm-cov show: {}", diagnostic_tail(&out.stderr))),
+        Err(error) => failures.push(format!("llvm-cov show: {error}")),
+    }
+    let mut report = llvm_cov("report");
+    report.arg("-show-functions");
+    match crate::command_output::output_with_timeout(&mut report, Duration::from_secs(300)) {
+        Ok(out) if out.status.success() => {
+            let _ = std::fs::write(dir.join("functions.txt"), &out.stdout);
+        }
+        Ok(out) => failures.push(format!("llvm-cov report: {}", diagnostic_tail(&out.stderr))),
+        Err(error) => failures.push(format!("llvm-cov report: {error}")),
+    }
+    if !failures.is_empty() {
+        write_coverage_diagnostic(
+            inputs.hdir,
+            &format!("coverage report incomplete:\n{}\n", failures.join("\n")),
+        );
+    }
+    blockers.len()
+}
+
 fn lcov_line_file(line: &str) -> Option<&str> {
     line.rsplit_once(':').map(|(file, _)| file)
 }
@@ -1444,6 +2271,140 @@ fn llvm_tool(base: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each call to the trace-pc callback marks the next instruction as an
+    /// edge, and GNAT's symbol is the subprogram's dotted name.
+    #[test]
+    fn trace_pc_calls_are_the_ada_edges() {
+        let listing = "\
+0000000000401100 <checks__classify>:\n\
+  401100:\tpush   %rbp\n\
+  401101:\tcall   401090 <__sanitizer_cov_trace_pc>\n\
+  401106:\tmov    %edi,%eax\n\
+  40110a:\tcall   401090 <__sanitizer_cov_trace_pc>\n\
+  40110f:\tret\n\
+  401110:\tcall   401200 <checks__scale>\n\
+  401115:\tret\n";
+        assert_eq!(trace_pc_sites_in(listing, 0x400000), vec![0x1106, 0x110f]);
+        assert_eq!(ada_subprogram_name("checks__classify"), "checks.classify");
+        assert_eq!(ada_subprogram_name("pkg__child__put__2"), "pkg.child.put.2");
+        let table = render_subprograms(&[FunctionCoverage {
+            function: "checks.unused".to_owned(),
+            file: "/src/checks.adb".to_owned(),
+            line: 13,
+            calls: None,
+            lines_covered: 0,
+            lines_instrumented: 2,
+        }]);
+        assert!(table.contains("checks.unused"), "{table}");
+        assert!(table.contains("0.0%  /src/checks.adb:13"), "{table}");
+    }
+
+    /// A comparison is a blocker where its branch ran one way only: an
+    /// intercepted memcmp is placed at its caller, an integer compare at its
+    /// own site, and the constant side is what the branch wants.
+    #[test]
+    fn a_compare_whose_branch_ran_one_way_only_is_a_blocker() {
+        let file = "/src/magic.c".to_owned();
+        let mut branches = std::collections::BTreeMap::new();
+        branches.insert((file.clone(), 9), (1, 1));
+        branches.insert((file.clone(), 11), (1, 1));
+        branches.insert((file.clone(), 20), (2, 0));
+        let record = |kind: &str, sites: [u64; 2], a: &str, b: &str| CmplogSite {
+            kind: kind.to_owned(),
+            sites,
+            a: a.to_owned(),
+            b: b.to_owned(),
+        };
+        let cmplog = vec![
+            record("int", [0x900, 0x100], "dec0fe5a", ""),
+            record("memcmp", [0x50, 0xb00], "41414141", "515a2178"),
+            record("memcmp", [0x50, 0xb00], "41424141", "515a2178"),
+            record("int", [0x2000, 0x100], "07000000", ""),
+        ];
+        let mut places = std::collections::HashMap::new();
+        places.insert(0x900, ("parse".to_owned(), file.clone(), 9));
+        places.insert(0x50, ("__interceptor_bcmp".to_owned(), "??".to_owned(), 1));
+        places.insert(0xb00, ("parse".to_owned(), file.clone(), 11));
+        places.insert(
+            0x100,
+            ("bhf_run_one".to_owned(), "/w/main.c".to_owned(), 92),
+        );
+        places.insert(0x2000, ("parse".to_owned(), file.clone(), 20));
+        let blockers = blockers_at(&branches, &cmplog, &places, std::slice::from_ref(&file));
+        assert_eq!(blockers.len(), 2, "{blockers:#?}");
+        assert_eq!(
+            (blockers[0].line, blockers[0].wants.as_str()),
+            (9, "dec0fe5a")
+        );
+        assert_eq!(blockers[0].kinds, ["int"]);
+        assert_eq!(
+            (blockers[1].line, blockers[1].wants.as_str()),
+            (11, "515a2178")
+        );
+        assert_eq!(blockers[1].saw, ["41414141", "41424141"]);
+        assert_eq!(blockers[1].records, 2);
+        let text = render_blockers(&blockers);
+        assert!(
+            text.contains(
+                "/src/magic.c:11  parse  memcmp  wants 515a2178 (\"QZ!x\"), saw 41414141 (\"AAAA\")"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            render_blockers(&[]),
+            "No comparison was reached and left unpassed.\n"
+        );
+    }
+
+    /// The report's lcov keeps the source root's files, and its function
+    /// table counts each function's calls and the lines up to the next one.
+    #[test]
+    fn the_report_keeps_the_projects_files_and_tables_each_function() {
+        let root = crate::test_support::TestDir::new("coverage-report-unit");
+        let src = root.join("src");
+        let harness = root.join("work/harnesses/H-1");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&harness).unwrap();
+        let parse = src.join("parse.c");
+        std::fs::write(&parse, "").unwrap();
+        let elsewhere = root.join("vendor.c");
+        std::fs::write(&elsewhere, "").unwrap();
+        let lcov = format!(
+            "SF:{}\nFN:2,parse\nFN:9,unused\nFNDA:4,parse\nFNDA:0,unused\n\
+             DA:3,4\nDA:4,0\nDA:10,0\nend_of_record\n\
+             SF:{}\nFN:1,vendor\nDA:1,1\nend_of_record\n\
+             SF:{}\nFN:1,main\nDA:1,1\nend_of_record\n",
+            parse.display(),
+            elsewhere.display(),
+            harness.join("main.c").display()
+        );
+        let files = report_files(&lcov, &harness, Some(&src));
+        assert_eq!(files, vec![parse.display().to_string()]);
+        let kept = lcov_for_files(&lcov, &files);
+        assert_eq!(kept.matches("SF:").count(), 1, "{kept}");
+        assert_eq!(
+            function_table(&kept),
+            vec![
+                FunctionCoverage {
+                    function: "parse".to_owned(),
+                    file: parse.display().to_string(),
+                    line: 2,
+                    calls: Some(4),
+                    lines_covered: 1,
+                    lines_instrumented: 2,
+                },
+                FunctionCoverage {
+                    function: "unused".to_owned(),
+                    file: parse.display().to_string(),
+                    line: 9,
+                    calls: Some(0),
+                    lines_covered: 0,
+                    lines_instrumented: 1,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn lcov_export_yields_only_executed_lines() {

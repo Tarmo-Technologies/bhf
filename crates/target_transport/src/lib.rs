@@ -69,7 +69,7 @@ pub use fullsystem::{
 };
 pub use gdb::{
     read_coverage_ring, stage_input, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport,
-    GdbSession, InputContract, StopReply,
+    GdbSession, InputContract, ResetMode, StopReply,
 };
 pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome, TargetObservation};
 pub use transport::{TargetSession, TargetTransport};

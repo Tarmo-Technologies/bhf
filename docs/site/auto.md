@@ -458,6 +458,43 @@ C runtime's `bhf_*` headers are left out. The summary's `Coverage: N edges
 (the most any one target reached)` is the largest edge count of one target,
 not a total, since each target has its own edge map.
 
+The same replay writes each harness's coverage report to
+`results/coverage/<id>/`, about the files under the sweep's root only:
+
+- `lcov.info` — the line and function records, for `genhtml`, an IDE or a CI
+  coverage service;
+- `html/index.html` — llvm-cov's report, each file with its line counts;
+- `functions.txt` — llvm-cov's per-function table (regions, lines and branches
+  covered), and `functions.json`, each function's file, line, calls over the
+  corpus, and its instrumented and covered lines.
+
+- `blockers.txt` and `blockers.json` — the comparisons the corpus reached and
+  never passed: a line whose branch llvm-cov saw run one way and never the
+  other, where the harness recorded a comparison (an integer compare against a
+  constant, a `memcmp`, a `strcmp`). Each names the file, line and function,
+  the operand the branch wants (hex; little-endian for an integer) and some of
+  the values it got instead. These are the places a dictionary entry, a seed
+  or a harness change would take the campaign further; the sweep says how
+  many there are.
+
+An Ada harness gets the same report from its edges, without the HTML and the
+blockers. GNAT instruments with `-fsanitize-coverage=trace-pc` and no coverage
+mapping, so the replay records the PC of each edge an input reaches
+(`BHF_COV_PCS`), takes the binary's calls to the trace-pc callback as the
+instrumented edges, and places both on Ada lines with `addr2line` (or
+`llvm-symbolizer`) and the instrumented copies' line maps. `lcov.info` has the
+lines and subprograms; `functions.txt` and `functions.json` list each
+subprogram (`checks.classify` for GNAT's `checks__classify`) with its first
+line and its covered and instrumented lines; `calls` is `null`, since an edge
+says only whether it ran. The covered lines also go to the harness's
+`covered-lines.txt`, as for C/C++. It needs `objdump` from binutils, which
+GNAT installs with.
+
+A function the table shows with no calls is one the campaign never reached.
+The report needs `llvm-cov` and `llvm-profdata` (or their `-18` names), as the
+replay does, and the blockers `llvm-symbolizer` to place each comparison; a part llvm-cov cannot render is left out, and
+`harnesses/<id>/coverage-replay-diagnostic.txt` says why.
+
 ## Running a harness under another fuzzer
 
 The generated native harnesses (C, C++, Rust, Ada) are self-contained: the
@@ -710,6 +747,7 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
     ├── findings.sarif
     ├── manifest.json                           # what each file holds, with digests
     ├── attestation.json
+    ├── coverage/<harness-id>/                  # lcov.info, html/, functions.*, blockers.* (when the coverage replay ran)
     └── findings/<finding-id>/                  # finding.json, testcase.bin, replay.py, ...
 ```
 

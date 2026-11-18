@@ -6,14 +6,12 @@
 --  semihosting host channel (fd 2). This is a coverage *emitter* only; it does
 --  not itself decode or transport coverage.
 --
---  Consumer: none yet. target_transport::coverage::SemihostingReader
---  (crates/target_transport/src/coverage.rs) decodes this stream in tests, but
---  no transport reads it: `bhf fuzz --target-transport` over gdb or
---  qemu-system reads the memory_buffer ring, and the gdb client keeps
---  semihosting output only as stdout. A harness built with this backend
---  therefore fuzzes without coverage. Reading it in the gdb and qemu-system
---  transports is tracked as issue #292; use the memory_buffer backend with
---  those transports until then.
+--  Consumer: `bhf fuzz --target-transport` over gdb or qemu-system with
+--  `coverage=semihosting` in the coverage map (#292). The BSP's
+--  adafuzz_semihosting_write hands fd 2 to the semihosting stderr; a
+--  debugger-routed semihosting call reaches bhf's gdb client as a File-I/O
+--  write, and target_transport::coverage::SemihostingReader decodes what fd 2
+--  got during each run.
 pragma Ada_95;
 with Ada.Streams;
 with Interfaces; use Interfaces;

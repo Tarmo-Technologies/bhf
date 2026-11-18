@@ -70,6 +70,21 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada target whose project `with`s sibling library projects builds (#287).
+  Staging copied the siblings' units into src_instrumented beside the projects
+  that own them, and gprbuild refused the second owner (`unit "X" cannot belong
+  to several projects`). A unit of a project the governing one depends on
+  through `with` is now left to it (and an earlier target's copy removed), a
+  library governing project forwards its own `with`s rather than every
+  project the tree's files `with`, and `Source_Dirs` spelled
+  `"src/" & project'Name` is read as gprbuild reads it.
+- An Ada tree that vendors GNAT predefined units builds against the host
+  runtime (#356). A zero-footprint runtime ships its own `ada.ads`,
+  `system.ads` and `s-*`, `a-*`, `i-*`, `g-*` units, and a staged copy shadowed
+  the runtime's own: the build stopped with `predefined unit depends on itself`
+  or `"s-stalib.adb" must be compiled`. A source that declares a unit under
+  `Ada`, `System`, `Interfaces` or `GNAT`, or one with a runtime file name that
+  does not parse, is not staged, and the run's log names each one left out.
 - A C function whose storage class is spelled through a macro builds (#415).
   Under zlib's `#define local static`, `local unsigned read_buf(...)` was
   declared `extern local unsigned` in the harness, which is `extern static`,
@@ -2824,6 +2839,68 @@
   when bhf panics.
 
 ### Added
+- Ada harnesses get a coverage report too (#310): the replay records the PC
+  of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
+  runtime), takes the binary's calls to the callback as the instrumented
+  edges, places both on the original Ada lines (`addr2line` and the
+  instrumented copies' line maps) and writes `lcov.info`, `functions.txt` and
+  `functions.json` per subprogram to `results/coverage/<id>/`, and the covered
+  lines to `covered-lines.txt`.
+- The coverage report lists the comparisons each corpus reached and never
+  passed (#309): `results/coverage/<id>/blockers.{txt,json}` give the file,
+  line and function of each compare whose branch ran one way only, with the
+  operand it wants and values it got instead, from the harness's comparison
+  log placed by `llvm-symbolizer`. The sweep prints how many there are.
+- `bhf auto` writes each C/C++ harness's coverage report to
+  `results/coverage/<id>/` (#308): `lcov.info`, llvm-cov's HTML report under
+  `html/`, and a per-function table (`functions.txt` from
+  `llvm-cov report -show-functions`, `functions.json` with each function's
+  calls and lines), all cut to the files under the sweep's root.
+- Board profiles (#293): `bhf fuzz --board-profile board.toml` takes
+  `--target-transport` and `--transport-coverage-map` from a TOML file of one
+  board's specs, its debug-probe lane (`gdb`, `coverage_map`) or, with
+  `--board-lane serial`, the agent on its UART (`serial`); each spec is
+  checked when the file is read. `docs/hil-boards/nucleo-f411re.toml` is the
+  template and `docs/hil-bringup.md` now lists each bring-up step with its
+  expected output. The `gdb:` transport takes the completion contract of
+  `qemu-system:` (`done=`, `fault=` and their widths and kinds) and
+  `reset=restart|monitor:CMD`, since QEMU's system gdbstub refuses the `R`
+  restart and a board resets by `monitor reset halt`. `tests/hil_board.rs`
+  reads a profile (`BHF_HIL_PROFILE`) and runs against a QEMU stand-in that
+  starts as a board does, and the reference agent's `--pty` mode serves a
+  pseudo-terminal for the serial lane; the hil-emu lane runs both (RV-6).
+- Semihosting coverage for the `gdb` and `qemu-system` transports (#292):
+  with `coverage=semihosting` in `--transport-coverage-map` (and no ring
+  keys), each run's coverage is the event stream the `semihosting` probe
+  backend writes to fd 2. The gdb client now serves the File-I/O requests a
+  debugger-routed semihosting call makes (QEMU's
+  `-semihosting-config target=gdb`, OpenOCD's `semihosting_fileio`): it reads
+  each write's buffer, keeps fd 1 as console output and fd 2 as the
+  semihosting channel, and refuses other calls. A run that used semihosting
+  used to fail on the first such request. Each reply carries the Ctrl-C flag
+  and the client continues the target after it, because QEMU 8.2 sends no
+  stop reply for the rest of a run after a plain File-I/O reply.
+- `bhf fuzz --engine libafl` runs a LibAFL campaign (#296) on the harness's
+  `main`, in a bhf built with the `libafl-engine` feature (another bhf refuses
+  the engine and names the rebuild). LibAFL mutates with havoc and the harness
+  dictionary's tokens, each input runs in a fresh process, and the edge bitmap
+  the harness writes is its coverage map. The inputs that crashed the harness
+  go through the external-engine ingest into findings. CI runs the engine's
+  end-to-end test in its feature build.
+- `bhf fuzz --engine honggfuzz` runs honggfuzz in persistent mode (#295) on the
+  harness's `main_honggfuzz`, a new Makefile target built with honggfuzz's
+  `hfuzz-clang` (with ASan and UBSan) when absent. honggfuzz is found in
+  `BHF_HONGGFUZZ_PATH` or on PATH. The crash files it saves go through the
+  external-engine ingest into findings that replay through `main_honggfuzz`.
+  The nightly builds honggfuzz 2.6 for the gated test.
+- `bhf fuzz --engine libfuzzer` runs the harness's libFuzzer build (#294):
+  `main_libfuzzer`, built with `make libfuzzer` when absent, for `--time`, with
+  the per-input timeout, length and memory limits and the harness dictionary.
+  Its `crash-`, `oom-` and `leak-` artifacts are replayed through it and
+  recorded as findings, and a `timeout-` one that hangs again is a hang finding,
+  through the same external-engine ingest AFL++'s crashes and hangs now go
+  through. The findings replay through `main_libfuzzer`. `--engine` took only
+  builtin, afl++ and winafl.
 - The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
   serves the agent protocol on the UART the devicetree's chosen
   `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,

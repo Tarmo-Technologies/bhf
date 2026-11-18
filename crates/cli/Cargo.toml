@@ -58,6 +58,7 @@ extension_host = { path = "../extension_host" }
 fake_corba = { path = "../fake_corba" }
 finding_rules = { path = "../finding_rules" }
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
+fuzz_engine_libafl_adapter = { path = "../fuzz_engine/libafl_adapter", optional = true }
 governance = { path = "../governance" }
 harness_gen = { path = "../harness_gen" }
 idl_parser = { path = "../idl_parser" }
@@ -102,6 +103,8 @@ libc = "0.2"
 [features]
 default = []
 llm = ["dep:llm_harness_gen"]
+# `bhf fuzz --engine libafl` (#296): a LibAFL campaign over the harness.
+libafl-engine = ["dep:fuzz_engine_libafl_adapter", "fuzz_engine_libafl_adapter/libafl-engine"]
 
 [lib]
 name = "cli"

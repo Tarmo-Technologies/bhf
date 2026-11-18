@@ -69,12 +69,14 @@ jobs:
             libc6-dev-ppc64-cross \
             binutils \
             build-essential \
+            clang \
             device-tree-compiler \
             gperf \
             git
           # Sanity: the exact binaries scripts/hil-emu.sh requires.
           for tool in qemu-arm qemu-ppc64 qemu-system-arm qemu-img \
-                      arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc git; do
+                      arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc git \
+                      clang; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
 
