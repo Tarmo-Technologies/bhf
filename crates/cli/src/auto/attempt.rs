@@ -1483,12 +1483,16 @@ pub(crate) fn applicable_engines(
 ) -> Vec<FuzzEngine> {
     use crate::auto::candidate::Lang;
     let is_c_family = matches!(lang, Lang::C | Lang::Cpp);
+    // The COBOL and Fortran lanes build C glue on the same Makefile, so
+    // afl-clang-fast builds them too (#302); WinAFL takes C/C++ only.
+    let builds_afl = is_c_family || matches!(lang, Lang::Cobol | Lang::Fortran);
     let mut out: Vec<FuzzEngine> = requested
         .iter()
         .copied()
         .filter(|engine| match engine {
             FuzzEngine::Builtin => true,
-            FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
+            FuzzEngine::AflPlusPlus => builds_afl,
+            FuzzEngine::Winafl => is_c_family,
             // `bhf auto` refuses them before any target runs.
             FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz | FuzzEngine::Libafl => false,
         })
@@ -11900,7 +11904,19 @@ mod engine_selection_tests {
             applicable_engines(Lang::Cpp, &[AflPlusPlus]),
             vec![AflPlusPlus]
         );
-        // afl-only on a non-C/C++ target -> fall back to builtin (never empty)
+        // The COBOL and Fortran lanes' C glue builds with afl-clang-fast
+        // (#302); WinAFL stays C/C++.
+        assert_eq!(
+            applicable_engines(Lang::Cobol, &[Builtin, AflPlusPlus]),
+            vec![Builtin, AflPlusPlus]
+        );
+        assert_eq!(
+            applicable_engines(Lang::Fortran, &[AflPlusPlus]),
+            vec![AflPlusPlus]
+        );
+        assert_eq!(applicable_engines(Lang::Cobol, &[Winafl]), vec![Builtin]);
+        // afl-only on a lane without an AFL++ build -> fall back to builtin
+        // (never empty)
         assert_eq!(applicable_engines(Lang::Ada, &[AflPlusPlus]), vec![Builtin]);
         assert_eq!(
             applicable_engines(Lang::Rust, &[AflPlusPlus]),

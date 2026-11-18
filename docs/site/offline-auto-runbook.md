@@ -133,7 +133,7 @@ Add only the flags that describe content actually staged with the scan:
   normally prune.
 - `--seed-file`, `--seed-dir`, and `--grammar FILE` help structured parsers
   cross format gates and reach deeper code.
-- `--engine builtin,afl++` adds AFL++ for native C/C++ when its binaries are
+- `--engine builtin,afl++` adds AFL++ for native C/C++, COBOL and Fortran when its binaries are
   already installed offline. The per-target time is split between engines.
 
 Leave `--cxx-std` unset unless the required dialect is known; the automatic

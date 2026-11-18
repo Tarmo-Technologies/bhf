@@ -6935,7 +6935,16 @@ impl<'a> ExternalIngest<'a> {
         let replayed = replay(input, &prepared.extra_env, None)
             .map_err(|error| format!("replay {artifact}: {error}"))?;
         let stderr = String::from_utf8_lossy(&replayed.stderr);
-        let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
+        // As in the builtin engine, a crash signal with no sanitizer report
+        // that is not the target rejecting the input is a reachable crash: a
+        // COBOL program's libcob runtime reports its own errors and faults
+        // (#302).
+        let report = corpus::parse_sanitizer_report(&stderr).or_else(|| {
+            (crate::fatal_signal::classify(&replayed.status, &stderr).is_some()
+                && !is_input_rejection(&replayed.status, &stderr))
+            .then(|| fatal_signal_report(&replayed.status, &stderr))
+        });
+        let Some(report) = report else {
             return Ok(());
         };
         let key = self.dedup.key(&report);

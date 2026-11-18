@@ -460,11 +460,11 @@ pub struct AutoArgs {
 
     /// Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin`
     /// (default) is the in-process coverage-guided engine. `afl++` drives AFL++
-    /// on the auto-recovered build (C/C++ targets only; needs `afl-fuzz` +
-    /// `afl-clang-fast` on PATH, else it falls back to builtin with a warning).
-    /// `--engine builtin,afl++` runs BOTH per target, splitting `--per-target-time`
-    /// evenly across them. For a non-C/C++ target an `afl++` selection falls back
-    /// to builtin (logged, never silently skipped). `winafl` drives WinAFL on
+    /// on the auto-recovered build (C/C++, COBOL and Fortran targets; needs
+    /// `afl-fuzz` + `afl-clang-fast` on PATH, else it falls back to builtin with
+    /// a warning). `--engine builtin,afl++` runs BOTH per target, splitting
+    /// `--per-target-time` evenly across them. For a target of another lane an
+    /// `afl++` selection falls back to builtin. `winafl` drives WinAFL on
     /// native Windows (C/C++ targets; needs WinAFL and DynamoRIO, see
     /// `--winafl-path` / `--dynamorio-path`; refused on other hosts): it fuzzes
     /// a build without sanitizers and replays each saved crash and hang through

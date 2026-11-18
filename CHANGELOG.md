@@ -2850,6 +2850,13 @@
   when bhf panics.
 
 ### Added
+- `bhf auto --engine afl++` runs COBOL and Fortran targets under AFL++
+  (#302). Their C glue builds with afl-clang-fast and links as the lane's
+  `main` does (`lane-ldflags.txt`), the passthrough driver has an AFL++
+  persistent loop, and gfortran's trace-pc edges reach AFL++'s map through a
+  guard table of the driver's own. A crash AFL++ saves with no sanitizer
+  report, as a COBOL program's libcob error is, is a reachable-crash finding
+  as it is under the builtin engine.
 - `--sanitizers hwasan` (`hwaddress`) builds the fuzzed C/C++ harness with
   HWAddressSanitizer in place of ASan on an AArch64 host (#333). Its reports
   are findings under the rule ASan gives the same bug, the kind taken from the

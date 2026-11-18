@@ -2995,7 +2995,7 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
     extra_includes: &[PathBuf],
 ) -> std::process::Output {
     let (target, _staged) = afl_make_target_and_artifact();
-    try_run_c_make_build_with_target(
+    try_run_c_make_build_with_target_and_ldflags(
         work_dir,
         harness_id,
         extra_sources,
@@ -3003,7 +3003,26 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
         None,
         target,
         None,
+        lane_ldflags(work_dir, harness_id).as_deref(),
     )
+}
+
+/// The file a lane that links its harness with flags of its own (libcob for
+/// COBOL, the gfortran runtime and objects for Fortran) records them in, so
+/// its AFL++ builds link the same way (#302).
+pub(crate) const LANE_LDFLAGS_FILE: &str = "lane-ldflags.txt";
+
+/// Record the link flags a lane's `main` build used.
+pub(crate) fn record_lane_ldflags(harness_dir: &Path, ldflags: &str) {
+    let _ = std::fs::write(harness_dir.join(LANE_LDFLAGS_FILE), ldflags);
+}
+
+/// The link flags a lane recorded for this harness, if any.
+fn lane_ldflags(work_dir: &Path, harness_id: &str) -> Option<String> {
+    std::fs::read_to_string(
+        crate::auto::layout::harness_dir(work_dir, harness_id).join(LANE_LDFLAGS_FILE),
+    )
+    .ok()
 }
 
 /// The CmpLog build afl-fuzz runs beside `main_afl` (`-c`, #274): the
@@ -3019,7 +3038,7 @@ pub(crate) fn try_run_c_make_afl_cmplog_build_with_extras(
     extra_sources: &[PathBuf],
     extra_includes: &[PathBuf],
 ) -> std::process::Output {
-    try_run_c_make_build_with_target(
+    try_run_c_make_build_with_target_and_ldflags(
         work_dir,
         harness_id,
         extra_sources,
@@ -3027,6 +3046,7 @@ pub(crate) fn try_run_c_make_afl_cmplog_build_with_extras(
         None,
         Some("afl_cmplog"),
         None,
+        lane_ldflags(work_dir, harness_id).as_deref(),
     )
 }
 

@@ -705,6 +705,87 @@ static int bhf_read_n(int fd, void *buf, size_t n) {
     }
     return 1;
 }
+#if defined(BHF_AFL)
+/* AFL++ persistent-mode entrypoint for a passthrough libFuzzer entrypoint,
+ * compiled with afl-clang-fast: the C glue of the COBOL and Fortran lanes
+ * (#302). The glue marks where the target is entered, which only bhf's own
+ * driver records. */
+#include <errno.h>
+void bhf_target_enter(void) __attribute__((weak));
+void bhf_target_enter(void) {}
+
+/* gfortran's objects are built with trace-pc, which afl-compiler-rt does not
+ * provide: each call records the edge from the previous one, as AFL's classic
+ * instrumentation does, on one of a table of guards the runtime numbers like
+ * its own. (Naming AFL's map pointer here would clash with the declaration
+ * afl-clang-fast's pass adds to this file.) */
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard);
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop);
+#define BHF_AFL_PC_GUARDS 4096
+static uint32_t bhf_afl_pc_guards[BHF_AFL_PC_GUARDS];
+static __thread uintptr_t bhf_afl_prev_pc;
+__attribute__((constructor)) BHF_NOCOV static void bhf_afl_pc_guards_init(void) {
+    __sanitizer_cov_trace_pc_guard_init(bhf_afl_pc_guards, bhf_afl_pc_guards + BHF_AFL_PC_GUARDS);
+}
+BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    __sanitizer_cov_trace_pc_guard(&bhf_afl_pc_guards[(pc ^ bhf_afl_prev_pc) % BHF_AFL_PC_GUARDS]);
+    bhf_afl_prev_pc = pc >> 1;
+}
+
+#ifndef __AFL_FUZZ_INIT
+#define __AFL_FUZZ_INIT()
+#endif
+
+__AFL_FUZZ_INIT();
+
+#define BHF_AFL_BUF_CAP ((size_t)1024 * 1024)
+
+#ifndef __AFL_FUZZ_TESTCASE_BUF
+#define __AFL_FUZZ_TESTCASE_BUF bhf_afl_buf
+static uint8_t bhf_afl_buf[BHF_AFL_BUF_CAP];
+#endif
+
+#ifndef __AFL_FUZZ_TESTCASE_LEN
+static size_t bhf_afl_read_stdin(uint8_t *buf, size_t cap) {
+    size_t total = 0;
+    while (total < cap) {
+        ssize_t n = read(0, buf + total, cap - total);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        total += (size_t)n;
+    }
+    return total;
+}
+#define __AFL_FUZZ_TESTCASE_LEN bhf_afl_read_stdin(__AFL_FUZZ_TESTCASE_BUF, sizeof(bhf_afl_buf))
+#endif
+
+#ifndef __AFL_LOOP
+static int bhf_afl_loop_remaining = 1;
+#define __AFL_LOOP(_n) (bhf_afl_loop_remaining-- > 0)
+#endif
+
+int main(int argc, char **argv) {
+    if (LLVMFuzzerInitialize) LLVMFuzzerInitialize(&argc, &argv);
+#ifdef __AFL_HAVE_MANUAL_CONTROL
+    __AFL_INIT();
+#endif
+    uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(10000)) {
+        size_t len = (size_t)__AFL_FUZZ_TESTCASE_LEN;
+        /* An input of exactly its size, as the other lanes pass it. */
+        uint8_t *input = (uint8_t *)malloc(len ? len : 1);
+        if (!input) abort();
+        memcpy(input, buf, len);
+        bhf_run_one_bytes(input, len);
+        free(input);
+    }
+    return 0;
+}
+#else
 int main(int argc, char **argv) {
     if (LLVMFuzzerInitialize) LLVMFuzzerInitialize(&argc, &argv);
     bhf_vp_open();
@@ -773,6 +854,7 @@ int main(int argc, char **argv) {
     bhf_run_file(argv[1]);
     return 0;
 }
+#endif /* BHF_AFL */
 #endif /* !BHF_EXTERNAL_DRIVER */
 {% endraw %}
 {%- else %}
