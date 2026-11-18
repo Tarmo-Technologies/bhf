@@ -455,10 +455,10 @@ bhf binary fuzz ./stock_dll_harness.exe --runner wine \
 
 The runner, runner args, target args, and the full `@@`-marked argv are recorded
 in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
-`--runner` is builtin-engine only (afl-qemu provides its own `-Q` runner);
-`--target-arg` applies to both engines.
+`--runner` is builtin-engine only (afl-qemu and afl-frida run the binary
+under QEMU or Frida themselves); `--target-arg` applies to every engine.
 
-`--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
+`--engine builtin|afl-qemu|afl-frida|auto` selects the execution engine: `builtin`
 runs the seeds, then a blind havoc loop (each input a seed with 1, 2 or 4
 byte-level mutations stacked on it, from `--rng-seed`, with no coverage
 feedback) until `--iterations`, `--time` or the first crash; its run JSON says
@@ -466,13 +466,21 @@ so (`engine`, `fidelity` with `seeds_run` and `mutated_inputs`, `degraded:
 true` and `degraded_reason`, which names the missing afl-qemu tool when `auto`
 fell back). `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
-mode (`afl-fuzz -Q`); `auto` (the default) uses `afl-qemu` when its toolchain is
-present and otherwise falls back to `builtin`. Under `afl-qemu`, `--timeout-ms`
+mode (`afl-fuzz -Q`). `afl-frida` drives AFL++'s Frida mode (`afl-fuzz -O`),
+which instruments the binary as it runs on the host CPU: for a native binary
+QEMU mode emulates poorly or slowly. `auto` (the default) uses `afl-qemu` when
+its toolchain is present and otherwise falls back to `builtin`. bhf finds
+`afl-qemu-trace` through `BHF_AFL_QEMU_TRACE`, `PATH`, `AFL_PATH` and the
+AFL++ install dirs, and `afl-frida-trace.so` through `BHF_AFL_FRIDA_TRACE`,
+`AFL_PATH`, the `lib/afl` beside `afl-fuzz` and the install dirs; the container
+image ships both. Under `afl-qemu` and `afl-frida`, `--timeout-ms`
 is passed to `afl-fuzz` as the per-execution timeout (`-t`) so the mutation
 campaign and the crash-replay oracle share one policy, and `--mem-mb <MiB|none>`
 sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
-Both effective limits are recorded in the run-provenance JSON.
+Both effective limits are recorded in the run-provenance JSON, with `engine`,
+the trace program or library, `executions` and a `fidelity` object: the
+coverage source and `edges_found`.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic

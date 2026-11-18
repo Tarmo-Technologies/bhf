@@ -2853,6 +2853,14 @@
   when bhf panics.
 
 ### Added
+- `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
+  -O`) on a binary without source (#322). Both binary-only modes record their
+  engine, the trace program or library, `executions` and a `fidelity` object
+  (coverage source, edges found) in the run JSON, and the container
+  acceptance runs both through bhf.
+- The nightly builds AFL++'s QEMU and Frida modes with
+  `scripts/ci/build-afl-binary-modes.sh`, which the container image's stage
+  now runs too, and runs the binary-only tests against them.
 - The container image ships AFL++'s QEMU and Frida modes (#321):
   `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
   the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl

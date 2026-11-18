@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # AFL++'s QEMU and Frida modes in the image report coverage on an
-# uninstrumented binary: `bhf binary fuzz --engine afl-qemu` and `afl-fuzz -O`
-# each reach its edges, and QEMU mode finds its abort.
+# uninstrumented binary: `bhf binary fuzz --engine afl-qemu` and
+# `--engine afl-frida` each reach its edges and find its abort.
 set -euo pipefail
 image="${1:?usage: container-afl-binary-modes-acceptance.sh IMAGE EVIDENCE_DIR}"
 evidence="${2:?usage: container-afl-binary-modes-acceptance.sh IMAGE EVIDENCE_DIR}"
@@ -28,25 +28,20 @@ docker run --rm --network none --read-only \
   echo "== QEMU mode: bhf binary fuzz --engine afl-qemu"
   bhf binary fuzz /work/gate --engine afl-qemu --seed-input AAAA --time 30 \
     --work-dir /work/qemu > /work/qemu.json
-  echo "== Frida mode: afl-fuzz -O"
-  mkdir -p /work/frida-in && cp /work/seed /work/frida-in/seed
-  # afl-fuzz refuses the image'\''s ASAN_OPTIONS without symbolize=0.
-  ASAN_OPTIONS="$ASAN_OPTIONS:symbolize=0" UBSAN_OPTIONS="$UBSAN_OPTIONS:symbolize=0" \
-    afl-fuzz -O -i /work/frida-in -o /work/frida -V 20 -- /work/gate > /work/frida.log 2>&1 \
-    || { tail -30 /work/frida.log; exit 1; }
+  echo "== Frida mode: bhf binary fuzz --engine afl-frida"
+  bhf binary fuzz /work/gate --engine afl-frida --seed-input AAAA --time 30 \
+    --work-dir /work/frida > /work/frida.json
   python3 - <<'\''PY'\''
 import json, pathlib
 def stats(path):
     rows = (line.split(":", 1) for line in pathlib.Path(path).read_text().splitlines())
     return {key.strip(): value.strip() for key, value in rows}
-run = json.loads(pathlib.Path("/work/qemu.json").read_text())
-assert run["engine"] == "afl-qemu", run
-qemu = stats("/work/qemu/afl_qemu_out/out/default/fuzzer_stats")
-frida = stats("/work/frida/default/fuzzer_stats")
-print("QEMU mode:", qemu["edges_found"], "edges,", qemu["execs_done"], "executions, findings", run["findings"])
-print("Frida mode:", frida["edges_found"], "edges,", frida["execs_done"], "executions,", frida["saved_crashes"], "crashes")
-assert int(qemu["edges_found"]) > 0 and run["findings"], "QEMU mode found the abort with coverage"
-assert int(frida["edges_found"]) > 0 and int(frida["execs_done"]) > 0, "Frida mode reports coverage"
+for engine, name in (("afl-qemu", "qemu"), ("afl-frida", "frida")):
+    run = json.loads(pathlib.Path(f"/work/{name}.json").read_text())
+    stats_file = stats(f"/work/{name}/afl_{name}_out/out/default/fuzzer_stats")
+    print(engine, stats_file["edges_found"], "edges,", stats_file["execs_done"], "executions, findings", run["findings"])
+    assert run["engine"] == engine and run["fidelity"]["edges_found"] > 0, run
+    assert int(stats_file["edges_found"]) > 0 and run["findings"], f"{engine} found the abort with coverage"
 PY
   echo "AFL++ QEMU and Frida modes passed"
 ' > "$evidence/afl-binary-modes.log" 2>&1 || { tail -60 "$evidence/afl-binary-modes.log"; exit 1; }
