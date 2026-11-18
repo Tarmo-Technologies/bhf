@@ -87,6 +87,23 @@ The default is deliberately quiet: a static-only or lab-only signal annotates th
 PR but does not block it, so the gate flags introduced defects rather than
 pre-existing noise.
 
+## Regression replay
+
+Before a run is judged, `bhf ci` replays the findings an earlier run stored
+against this run's build of their harness: a finding that still reproduces
+fails the gate (unless `pr-gate` is `never`), and one that no longer does is
+reported fixed and passes. They are a work dir's `regressions/` directory and
+each `--regressions <DIR>` (a directory of finding directories, as
+`results/findings/` holds them).
+
+A work dir restored from a CI cache still holds its last run's findings in
+`results/findings/`. They move to `regressions/` before the run, one per root
+cause, so they are checked as regressions instead of being counted again as
+this run's findings. Their minimized inputs (`min_testcase.bin`, else
+`testcase.bin`) also seed the run, so the engines run them first. The summary
+gives the counts, and `--ci-json` has `regressions` with the ids that
+`reproduced`, were `fixed`, or could not be replayed (`unverified`).
+
 ## Requirements
 
 - **`fetch-depth: 0`** on `actions/checkout` — a shallow clone has no merge-base
@@ -126,8 +143,10 @@ bhf ci . \
   finding with no crash frame (a format-string, memory-limit or deadline
   oracle) points at the fuzzed function's line, or at the source root when
   that is unknown. `--ci-json <path>` writes a compact machine-readable result (counts by
-  severity/verdict, confirmed count, scoped file count) for your own
-  reporting.
+  severity/verdict, confirmed count, scoped file count, and the
+  [regression replay](#regression-replay)'s ids) for your own reporting.
+- `--regressions <DIR>` replays the stored findings in `<DIR>` as well as the
+  work dir's own (repeatable).
 - Exit code is `0` unless the gate fails.
 
 ## LLM and agent use in CI

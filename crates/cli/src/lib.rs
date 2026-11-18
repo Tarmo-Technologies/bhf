@@ -45,6 +45,7 @@ mod build;
 mod capsule;
 mod cartography;
 pub mod ci;
+pub(crate) mod ci_regression;
 mod clean;
 mod cmplog_cli;
 mod collector_run;

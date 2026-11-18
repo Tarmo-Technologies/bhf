@@ -2853,6 +2853,13 @@
   when bhf panics.
 
 ### Added
+- `bhf ci` replays stored findings against the run's build before it judges
+  the run (#318): a finding that still reproduces fails the gate, and one
+  that no longer does is reported fixed. A work dir restored from a cache
+  keeps its last findings in `regressions/`, one per root cause, and
+  `--regressions <DIR>` adds more; their minimized inputs seed the run, and
+  `--ci-json` lists the ids that reproduced, were fixed or were not
+  replayed.
 - `bhf auto --engine afl++` runs Ada targets under AFL++ (#304). The
   harness's objects link again with AFL++'s runtime into
   `build/<id>/main_afl`; the Ada coverage runtime forwards its trace-pc edges

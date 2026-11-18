@@ -27,6 +27,14 @@ pub struct CiArgs {
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
+    /// A directory of stored findings (finding directories, as
+    /// `results/findings/` holds them) to replay against this run's build
+    /// before it is judged: one that still reproduces fails the gate, one that
+    /// no longer does is fixed. The work dir's own `regressions/`, which keeps
+    /// a restored work dir's last findings, is always replayed. Repeatable.
+    #[arg(long = "regressions", value_name = "DIR")]
+    pub regressions: Vec<PathBuf>,
+
     /// Per-target TOTAL fuzz wall-clock budget in seconds (split across the
     /// passes). Forwarded to `bhf auto`.
     #[arg(long, default_value_t = 60)]
@@ -328,7 +336,23 @@ pub fn run(args: CiArgs) -> i32 {
         return report_nothing_to_do(&args);
     }
 
-    let auto_args = auto_args_from_ci(&args, &scoped_files);
+    // Stored findings (#318): a restored work dir's last ones move to
+    // `regressions/`, and every one's minimized input seeds the run, so the
+    // engines run them first; each is replayed once this run has built its
+    // harness again.
+    let regressions = crate::ci_regression::collect(&work_dir, &args.regressions);
+    if !regressions.is_empty() {
+        bhfeprintln!(
+            "bhf ci: {} stored finding(s) to replay as regressions",
+            regressions.len()
+        );
+    }
+    let mut auto_args = auto_args_from_ci(&args, &scoped_files);
+    auto_args.seed_files.extend(
+        regressions
+            .iter()
+            .map(|regression| regression.input.clone()),
+    );
     // auto::cli::run returns 0 for success, 2 when no candidates,
     // 1 for hard errors. We treat 1 here as failure regardless of
     // findings; 0/2 mean the auto loop completed normally.
@@ -336,6 +360,8 @@ pub fn run(args: CiArgs) -> i32 {
     if auto_exit != 0 && auto_exit != 2 {
         return auto_exit;
     }
+    let regression_outcome = crate::ci_regression::replay(&regressions);
+    crate::ci_regression::keep_unverified(&work_dir, &regressions, &regression_outcome);
 
     // Fail closed: if the findings directory cannot be enumerated, the
     // gate must error out (exit 1), never report zero findings and pass.
@@ -367,7 +393,17 @@ pub fn run(args: CiArgs) -> i32 {
 
     let summary_target = summary_path_resolution(args.summary_file.as_deref());
     if let Some(path) = summary_target {
-        let markdown = render_summary(&work_dir, total, &findings);
+        let mut markdown = render_summary(&work_dir, total, &findings);
+        if regression_outcome.replayed() > 0 {
+            markdown.push_str(&format!(
+                "\n**Regressions:** {} stored finding(s) replayed: {} still reproduce, {} fixed, \
+                 {} not replayed.\n",
+                regression_outcome.replayed(),
+                regression_outcome.reproduced.len(),
+                regression_outcome.fixed.len(),
+                regression_outcome.unverified.len()
+            ));
+        }
         if let Err(error) = append_summary(&path, &markdown) {
             bhfeprintln!(
                 "warning: could not write CI summary to {}: {error}",
@@ -394,6 +430,11 @@ pub fn run(args: CiArgs) -> i32 {
         PrGate::All => i32::from(total > 0),
         PrGate::Confirmed => i32::from(confirmed_count(&actionability) > 0),
     };
+    // A stored finding that still reproduces is a regression: it fails any
+    // gate that can fail.
+    if !regression_outcome.reproduced.is_empty() && args.pr_gate != PrGate::Never {
+        exit_code = 1;
+    }
     if let Some(policy) = args.policy.as_ref() {
         match governance::ci_policy_gate_with_runner_plan(
             &work_dir,
@@ -418,7 +459,7 @@ pub fn run(args: CiArgs) -> i32 {
         }
     }
     if let Some(path) = args.ci_json.as_ref() {
-        let ci = build_ci_json(
+        let mut ci = build_ci_json(
             total,
             &findings,
             &actionability,
@@ -426,6 +467,7 @@ pub fn run(args: CiArgs) -> i32 {
             sarif_path.as_deref(),
             exit_code,
         );
+        ci["regressions"] = regression_outcome.to_json();
         if let Err(error) = fs::write(path, serde_json::to_vec_pretty(&ci).unwrap_or_default()) {
             bhfeprintln!(
                 "warning: could not write --ci-json {}: {error}",
