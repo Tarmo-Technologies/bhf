@@ -121,10 +121,10 @@ pub fn build_js_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str
         Err(reason) => return JsBuildResult::Skip(reason),
     };
 
-    let module_abs = match candidate.source_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => candidate.source_path.clone(),
-    };
+    // Without Windows' verbatim `\\?\` prefix: a capsule relocates the
+    // launcher's paths onto its copy, and `\\?\` with the `/` that brings
+    // names no file.
+    let module_abs = crate::workdir::plain_canonical(&candidate.source_path);
     let load_cwd = crate::auto::layout::harness_dir(work_dir, harness_id);
     if let Err(error) = std::fs::create_dir_all(&load_cwd) {
         return JsBuildResult::Failed(format!("create {}: {error}", load_cwd.display()));
@@ -253,6 +253,31 @@ fn emit_js_harness(
     if let Err(e) = make_executable(&main_path) {
         return JsBuildResult::Failed(format!("chmod +x {}: {e}", main_path.display()));
     }
+    // The same launch where the shell script cannot run (#307).
+    let mut args = Vec::new();
+    if source_maps {
+        args.push("--enable-source-maps".to_owned());
+    }
+    args.push(driver.display().to_string());
+    let launch = replay_min::Launch {
+        program: "node".into(),
+        args,
+        env: vec![
+            ("BHF_JS_MODULE".to_owned(), module_abs.display().to_string()),
+            ("BHF_JS_EXPORT".to_owned(), func.export_path.clone()),
+            ("BHF_JS_ARG".to_owned(), func.arg_kind.as_env().to_owned()),
+            (
+                "BHF_JS_SHIM_RECORD".to_owned(),
+                hdir.join(BROWSER_GLOBALS_RECORD).display().to_string(),
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return JsBuildResult::Failed(format!(
+            "write the launch spec of {}: {e}",
+            main_path.display()
+        ));
+    }
     // Build gate 3: the driver must be able to PREPARE the target — resolve the
     // export, and construct a receiver for a `Class#method` — before the engine
     // spends a budget on it. A class whose constructor needs an environment that
@@ -289,8 +314,17 @@ fn js_export_load_error(main_path: &Path, export_path: &str) -> Option<String> {
     let mut attempts = 0;
     let out = loop {
         let before = read_record();
+        // The launcher, or its launch spec where it cannot run (#307).
+        let mut command = match crate::launch_spec::launch_for(main_path) {
+            Some(launch) => {
+                let mut command = Command::new(&launch.program);
+                command.args(&launch.args).envs(launch.env.iter().cloned());
+                command
+            }
+            None => Command::new(main_path),
+        };
         let out = crate::command_output::output_with_timeout(
-            Command::new(main_path)
+            command
                 .env("BHF_JS_LOAD_ONLY", "1")
                 .current_dir(dir)
                 .stdin(std::process::Stdio::null()),

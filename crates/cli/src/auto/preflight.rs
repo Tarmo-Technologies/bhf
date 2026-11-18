@@ -223,7 +223,7 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
 /// [`native_windows_refusal`] applies it on Windows.
 pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
     match lang {
-        Lang::Java | Lang::Perl | Lang::Js | Lang::Ts | Lang::Ruby | Lang::Lua | Lang::Php => {
+        Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php => {
             Some("its harness launcher is a POSIX shell script")
         }
         Lang::Rust => Some("its harness is a Unix static archive linked with libpthread and libdl"),
@@ -231,11 +231,18 @@ pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
             "its crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC ships no \
              sanitizer runtime",
         ),
-        // Python and C# run from their launch specs where their shell
-        // launchers cannot (#305, #306).
-        Lang::Ada | Lang::C | Lang::Cpp | Lang::Go | Lang::Cobol | Lang::Python | Lang::CSharp => {
-            None
-        }
+        // Python, C#, Java and JavaScript/TypeScript run from their launch
+        // specs where their shell launchers cannot (#305, #306, #307).
+        Lang::Ada
+        | Lang::C
+        | Lang::Cpp
+        | Lang::Go
+        | Lang::Cobol
+        | Lang::Python
+        | Lang::CSharp
+        | Lang::Java
+        | Lang::Js
+        | Lang::Ts => None,
     }
 }
 
@@ -518,10 +525,7 @@ mod tests {
     #[test]
     fn the_lanes_that_run_under_wsl_on_windows_are_refused_with_the_reason() {
         let wsl = [
-            Lang::Java,
             Lang::Perl,
-            Lang::Js,
-            Lang::Ts,
             Lang::Ruby,
             Lang::Lua,
             Lang::Php,
@@ -545,8 +549,8 @@ mod tests {
             }
         }
         assert_eq!(
-            wsl_refusal(Lang::Ts).unwrap(),
-            "the TypeScript lane does not run on native Windows (its harness launcher is a \
+            wsl_refusal(Lang::Lua).unwrap(),
+            "the Lua lane does not run on native Windows (its harness launcher is a \
              POSIX shell script); run it under WSL (see docs/site/windows.md) — discovered and \
              statically analyzed, not fuzzed"
         );

@@ -752,10 +752,17 @@ cmplog, and ASan all work natively on Windows.
   `main_symbols` launchers have launch specs (`dotnet` on the harness
   assembly), and its driver maps the coverage file and speaks the framed
   protocol through .NET's own file mapping and console streams there.
-- Java, Perl, JavaScript/TypeScript, Ruby, Lua, and PHP currently emit
-  POSIX `main` launchers even though discovery is portable. Run those lanes
-  under WSL/Linux for now; installing only the interpreter/JDK on native Windows
-  is not sufficient.
+- The Java lane runs on native Windows with a JDK (`java`, `javac`, `jar`) on
+  `PATH`: its launch spec runs `java` with the agent and a `;`-separated
+  classpath, and the agent jar is built by `java_runtime\build-agent.ps1`
+  (ASM 9.7 from Maven Central, checked against its pinned SHA-256, or from
+  `ASM_JAR_DIR`), cached in `%LOCALAPPDATA%\bhf\jvm` unless `BHF_JVM_CACHE`
+  names another place.
+- The JavaScript and TypeScript lanes run on native Windows with Node (and
+  esbuild for TypeScript): their launch spec runs `node` on the driver.
+- Perl, Ruby, Lua, and PHP currently emit POSIX `main` launchers even though
+  discovery is portable. Run those lanes under WSL/Linux for now; installing
+  only the interpreter on native Windows is not sufficient.
 - On native Windows `bhf auto` refuses the lanes that run under WSL (those
   above, Rust and Fortran) whatever is installed: its toolchain check marks
   each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are

@@ -318,10 +318,6 @@ fn python_finding_round_trips_and_names_a_missing_interpreter() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn javascript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     let run = Run::new(&[(
@@ -337,10 +333,6 @@ fn javascript_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "TypeScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn typescript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     // The TypeScript lane transpiles with esbuild, which Node.js does not ship.
@@ -862,10 +854,6 @@ fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn java_finding_round_trips() {
     skip_unless!(
         runs("javac", &["-version"]) && runs("java", &["-version"]),

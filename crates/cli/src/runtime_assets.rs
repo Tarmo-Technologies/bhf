@@ -117,6 +117,10 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         include_bytes!("../../../java_runtime/build-agent.sh"),
     ),
     (
+        "java_runtime/build-agent.ps1",
+        include_bytes!("../../../java_runtime/build-agent.ps1"),
+    ),
+    (
         "java_runtime/src/com/bhf/Cmplog.java",
         include_bytes!("../../../java_runtime/src/com/bhf/Cmplog.java"),
     ),
@@ -348,6 +352,7 @@ mod tests {
             "c_runtime/bhf_trace.h",
             "csharp_runtime/Driver.cs",
             "java_runtime/build-agent.sh",
+            "java_runtime/build-agent.ps1",
             "java_runtime/src/com/bhf/CoverageAgent.java",
             "js_runtime/bhf_driver.js",
             "lua_runtime/bhf_driver.lua",

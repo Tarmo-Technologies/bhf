@@ -38,10 +38,6 @@ fn has_jdk() -> bool {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn java_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
     let bin = bhf_bin();
     if !bin.exists() {

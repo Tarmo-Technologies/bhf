@@ -46,10 +46,6 @@ fn record_for(work: &Path, export: &str) -> Option<Option<String>> {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_module_reading_a_browser_global_as_it_loads_gets_stand_ins_and_its_bug_is_found() {
     if !have_node() {
         eprintln!("skipping: no node runtime on PATH");

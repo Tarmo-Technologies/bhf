@@ -2853,6 +2853,11 @@
   when bhf panics.
 
 ### Added
+- The Java, JavaScript and TypeScript lanes run on native Windows (#307):
+  their launchers have launch specs (`java` with the agent, `node` on the
+  driver), Java's classpaths take the host's separator, the JVM agent jar is
+  built by `build-agent.ps1` there (cached in `%LOCALAPPDATA%\bhf\jvm`), and
+  the JS lane's load check runs the launch spec.
 - The C# lane runs on native Windows (#306): its `main` and `main_symbols`
   launchers have launch specs (`dotnet` on the harness assembly), and the
   driver maps the coverage file and runs the framed protocol through .NET's

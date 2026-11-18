@@ -63,10 +63,6 @@ fn javac_major() -> Option<u32> {
 /// nothing to prove — it still must PASS there, just without exercising the
 /// retry, so assert the outcome rather than the flag.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_preview_language_feature_is_compiled_and_run_with_the_flag_it_asks_for() {
     let bin = bhf_bin();
     if !bin.exists() {
