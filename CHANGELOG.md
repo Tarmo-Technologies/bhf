@@ -2853,6 +2853,12 @@
   when bhf panics.
 
 ### Added
+- The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
+  no AddressSanitizer, so there the Fortran objects are compiled with
+  gfortran's bounds and pointer checks, a failed check is a crash instead of
+  an `exit(2)`, MinGW's gcc builds the driver and glue, and each finding's
+  `fidelity.sanitizers` says `none (toolchain limit)` with the reason. With
+  it no lane is refused on native Windows any more.
 - The Rust lane runs on native Windows (#326): the harness crate builds as
   an MSVC staticlib with SanitizerCoverage, AddressSanitizer and the static
   CRT, and clang links it with the driver and the system libraries rustc's

@@ -392,50 +392,6 @@ fn php_finding_round_trips() {
     run.round_trip(&id, "php");
 }
 
-/// On native Windows a lane that runs under WSL there is refused up front,
-/// whether or not its interpreter is installed: the toolchain check says so
-/// and the target is reported static-only with the reason, instead of
-/// failing in its launcher in words that read like a missing module.
-#[cfg(windows)]
-#[test]
-fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
-    let run = Run::new(&[(
-        "parse.f90",
-        "subroutine parse_record(data)\n  implicit none\n  character(len=*), intent(in) :: data\n  \
-         integer :: n\n  n = len(data)\nend subroutine parse_record\n",
-    )]);
-    let out = run
-        .bhf()
-        .arg("auto")
-        .arg(&run.src)
-        .arg("--work-dir")
-        .arg(&run.work)
-        .args(["--languages", "fortran", "--max-targets", "1", "--jobs", "1"])
-        .args(["--per-target-time", "2", "--no-discovery-cache"])
-        .output()
-        .expect("run bhf auto");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(
-            "(1 targets): NOT ON NATIVE WINDOWS — its crash oracle is gfortran's \
-             AddressSanitizer, and MinGW-w64's GCC ships no sanitizer runtime; the lane runs \
-             under WSL (see docs/site/windows.md)"
-        ),
-        "{stderr}"
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(run.work.join("auto/run.json")).unwrap()).unwrap();
-    let outcome = &report["targets"][0]["outcome"];
-    assert_eq!(outcome["outcome"], "report_only", "{outcome}");
-    assert_eq!(
-        outcome["reason"],
-        "the Fortran lane does not run on native Windows (its crash oracle is gfortran's \
-         AddressSanitizer, and MinGW-w64's GCC ships no sanitizer runtime); run it under WSL \
-         (see docs/site/windows.md) — discovered and statically analyzed, not fuzzed",
-        "{outcome}"
-    );
-}
-
 // Builds a PATH of symlinks into /usr/bin.
 #[cfg(unix)]
 #[test]
@@ -1025,8 +981,8 @@ fn cobol_finding_round_trips() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "Fortran runs under WSL on Windows (MinGW-w64's GCC has no AddressSanitizer \
-              runtime); see docs/site/windows.md"
+    ignore = "a capsule does not yet rebuild a Fortran harness built with MinGW-w64's \
+              gfortran, the Windows one (#430)"
 )]
 fn fortran_finding_round_trips_from_source() {
     skip_unless!(

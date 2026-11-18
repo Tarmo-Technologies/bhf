@@ -516,7 +516,6 @@ mod tests {
                 targets: 2,
                 missing: vec!["esbuild"],
                 install_hint: "install Node.js + esbuild (`npm i -g esbuild`)",
-                unsupported: None,
             }],
         };
         // The check named another lane's tool but not this lane's (its tool
@@ -528,7 +527,6 @@ mod tests {
                 targets: 1,
                 missing: vec!["gnat"],
                 install_hint: "install GNAT and GPRbuild",
-                unsupported: None,
             }],
         };
         let healthy = healthy();

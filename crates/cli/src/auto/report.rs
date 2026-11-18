@@ -635,7 +635,24 @@ fn target_fidelity(
         facts.sanitizers = binary_sanitizers(&harness);
         facts.tsan_ran = facts.tsan_ran && facts.sanitizers.iter().any(|n| n == "tsan");
     }
-    Some(actionability::Fidelity::from_facts(&facts))
+    // #327: a harness whose toolchain has no sanitizer here (Fortran on
+    // native Windows) ran without one, and records why.
+    let limit = std::fs::read_to_string(
+        r.harness_dir
+            .join(crate::auto::fortran_build::SANITIZER_LIMIT_RECORD),
+    )
+    .ok()
+    .map(|limit| limit.trim().to_owned())
+    .filter(|limit| !limit.is_empty());
+    if limit.is_some() {
+        facts.sanitizers.clear();
+        facts.tsan_ran = false;
+    }
+    let mut fidelity = actionability::Fidelity::from_facts(&facts);
+    if let Some(limit) = limit {
+        fidelity.sanitizers = actionability::FidelityDimension::not_exercised(limit);
+    }
+    Some(fidelity)
 }
 
 /// Whether a C/C++ harness was built with `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`:
@@ -5295,6 +5312,52 @@ mod tests {
             .find(|issue| issue["summary"].as_str().unwrap_or("").contains("va_list"))
             .expect("unsupported type reported");
         assert_eq!(unsupported["category"], "unsupported-type", "{unsupported}");
+    }
+
+    /// #327: a harness that records the sanitizer limit of its toolchain (a
+    /// Fortran harness on native Windows) claims none of the sanitizers the
+    /// run selected, and its findings say why.
+    #[test]
+    fn a_harness_built_without_sanitizers_says_why_in_its_fidelity() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+
+        let work = crate::test_support::TestDir::new("report-sanitizer-limit");
+        let built = |harness: &str| AttemptResult {
+            candidate: cand(harness),
+            outcome: Outcome::BuiltAndFuzzed {
+                repairs: vec![],
+                retries: 0,
+                per_pass_budget_secs: 60,
+                total_wall_budget_secs: 60,
+                executions_per_sec: 9.0,
+                passes: vec![],
+                runtrace_events: vec![],
+            },
+            harness_dir: work.join(harness),
+        };
+        let limited = built("H-LIMITED");
+        std::fs::create_dir_all(&limited.harness_dir).unwrap();
+        std::fs::write(
+            limited
+                .harness_dir
+                .join(crate::auto::fortran_build::SANITIZER_LIMIT_RECORD),
+            crate::auto::fortran_build::WINDOWS_SANITIZER_LIMIT,
+        )
+        .unwrap();
+        let fidelity = target_fidelity(&limited, &SanitizerSelection::Default).unwrap();
+        assert_eq!(
+            fidelity.sanitizers.status,
+            actionability::FidelityStatus::NotExercised
+        );
+        let reason = fidelity.sanitizers.reason.as_deref().unwrap();
+        assert!(reason.starts_with("none (toolchain limit): "), "{reason}");
+        assert!(reason.contains("-fcheck=bounds,pointer"), "{reason}");
+
+        let sanitized = target_fidelity(&built("H-ASAN"), &SanitizerSelection::Default).unwrap();
+        assert_eq!(
+            sanitized.sanitizers.status,
+            actionability::FidelityStatus::Exercised
+        );
     }
 
     /// CC-1: a fuzzed target's structured fidelity must land on both `run.json`
