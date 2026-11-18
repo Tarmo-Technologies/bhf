@@ -2839,6 +2839,14 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --engine libfuzzer` runs the harness's libFuzzer build (#294):
+  `main_libfuzzer`, built with `make libfuzzer` when absent, for `--time`, with
+  the per-input timeout, length and memory limits and the harness dictionary.
+  Its `crash-`, `oom-` and `leak-` artifacts are replayed through it and
+  recorded as findings, and a `timeout-` one that hangs again is a hang finding,
+  through the same external-engine ingest AFL++'s crashes and hangs now go
+  through. The findings replay through `main_libfuzzer`. `--engine` took only
+  builtin, afl++ and winafl.
 - The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
   serves the agent protocol on the UART the devicetree's chosen
   `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,

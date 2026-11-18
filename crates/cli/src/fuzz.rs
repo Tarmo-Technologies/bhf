@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
+mod libfuzzer;
 mod peer_sync;
 pub(crate) mod shared_map;
 pub(crate) mod typed_spans;
@@ -240,9 +241,10 @@ pub struct FuzzArgs {
     pub harness: String,
 
     /// Fuzz engine: the built-in coverage-guided engine (default), AFL++ via
-    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH), or
-    /// WinAFL (`winafl`, native Windows only; needs WinAFL and DynamoRIO, see
-    /// `--winafl-path` and `--dynamorio-path`).
+    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH),
+    /// libFuzzer (`libfuzzer`, the harness's `main_libfuzzer`, built with
+    /// `make libfuzzer` when absent), or WinAFL (`winafl`, native Windows only;
+    /// needs WinAFL and DynamoRIO, see `--winafl-path` and `--dynamorio-path`).
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
 
@@ -830,6 +832,9 @@ pub enum FuzzEngine {
     AflPlusPlus,
     /// WinAFL on native Windows (DynamoRIO or Intel PT instrumentation).
     Winafl,
+    /// libFuzzer, in process (#294): the harness's `main_libfuzzer`, built
+    /// with `make libfuzzer` when there is none.
+    Libfuzzer,
 }
 
 /// AFL++ execution mode for `--engine afl++` (issue #45). `native` uses
@@ -900,9 +905,10 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
             "builtin" => FuzzEngine::Builtin,
             "afl++" | "aflplusplus" | "afl" => FuzzEngine::AflPlusPlus,
             "winafl" => FuzzEngine::Winafl,
+            "libfuzzer" => FuzzEngine::Libfuzzer,
             other => {
                 return Err(format!(
-                    "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl)"
+                    "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl, libfuzzer)"
                 ))
             }
         };
@@ -1588,6 +1594,13 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     }
+    if args.engine == FuzzEngine::Libfuzzer && multicore_requested(&args) {
+        bhfeprintln!(
+            "--engine libfuzzer runs one libFuzzer process; --workers and a sanitizer matrix \
+             (several --sanitizers) are not supported with it"
+        );
+        return 3;
+    }
     // #276: AFL++ runs `--workers` as its own -M/-S instances, which sync
     // as they run; a sanitizer matrix still runs one worker per sanitizer.
     let afl_instances = args.engine == FuzzEngine::AflPlusPlus && args.sanitizers.len() <= 1;
@@ -1640,6 +1653,7 @@ pub fn run(args: FuzzArgs) -> i32 {
         FuzzEngine::Builtin => run_builtin_with_progress(prepared, Some(&print_progress)),
         FuzzEngine::AflPlusPlus => run_afl_plus_plus(prepared),
         FuzzEngine::Winafl => winafl::run(prepared),
+        FuzzEngine::Libfuzzer => libfuzzer::run(prepared),
     };
 
     match result {
@@ -3227,6 +3241,7 @@ fn engine_arg_name(engine: FuzzEngine) -> &'static str {
         FuzzEngine::Builtin => "builtin",
         FuzzEngine::AflPlusPlus => "afl++",
         FuzzEngine::Winafl => "winafl",
+        FuzzEngine::Libfuzzer => "libfuzzer",
     }
 }
 
@@ -6695,27 +6710,41 @@ fn import_afl_queues(work_dir: &Path, harness_id: &str, out_dir: &Path, max_len:
     }
 }
 
-/// Re-run an input afl-fuzz saved as a hang (#275) through `main_afl`, which
-/// reads it on stdin, with twice afl-fuzz's per-execution limit, and ask it
-/// for the stack it is in if it hangs again ([`signal_for_stack`]). Not re-run
-/// when `deadline` leaves less time than that.
-fn confirm_afl_hang(
+/// Re-run an input an external engine saved as a hang (#275, #294) through
+/// `main_afl` (the input on stdin, or as a file argument, as `feed` says) with
+/// twice the engine's per-execution `limit`, and ask it for the stack it is in
+/// if it hangs again ([`signal_for_stack`]). Not re-run when `deadline`
+/// leaves less time than that.
+fn confirm_external_hang(
     main_afl: &Path,
     work_dir: &Path,
     input: &[u8],
     extra_env: &[(String, String)],
     deadline: Instant,
+    limit: Duration,
+    feed: TraceInput,
 ) -> Result<HangConfirmation, String> {
-    let confirm = AFL_EXEC_TIMEOUT.saturating_mul(2);
+    let confirm = limit.saturating_mul(2);
     let left = deadline.saturating_duration_since(Instant::now());
     if left < confirm {
         return Ok(HangConfirmation::NotRerun);
     }
     let grace = HANG_STACK_GRACE.min(left - confirm);
+    let scratch = ensure_harness_scratch(work_dir)?;
+    let input_file = scratch.join(format!("hang-{}.bin", std::process::id()));
     let mut command = std::process::Command::new(main_afl);
+    if feed == TraceInput::ArgvFile {
+        fs::write(&input_file, input)
+            .map_err(|error| format!("write '{}': {error}", input_file.display()))?;
+        command.arg(&input_file);
+    }
     command
-        .current_dir(ensure_harness_scratch(work_dir)?)
-        .stdin(Stdio::piped())
+        .current_dir(&scratch)
+        .stdin(if feed == TraceInput::Stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     for (key, value) in hang_stack_env(extra_env, confirm) {
@@ -6736,6 +6765,7 @@ fn confirm_afl_hang(
             Ok(Some(status)) => {
                 let output = collected_child_output(status, stderr_reader);
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let _ = fs::remove_file(&input_file);
                 return Ok(match corpus::parse_sanitizer_report(&stderr) {
                     Some(report) => HangConfirmation::Crashed(Box::new(report), stderr),
                     None => HangConfirmation::Finished,
@@ -6749,7 +6779,8 @@ fn confirm_afl_hang(
                     .and_then(|reader| reader.join().ok())
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                     .unwrap_or_default();
-                let report = hang_report(&stderr, AFL_EXEC_TIMEOUT, confirm);
+                let report = hang_report(&stderr, limit, confirm);
+                let _ = fs::remove_file(&input_file);
                 return Ok(HangConfirmation::Hung(Box::new(report), stderr));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -6776,6 +6807,176 @@ fn confirm_afl_hang(
 /// `out/default/crashes/` directory to collect crash artifacts, replay
 /// each against the libFuzzer binary, parse the resulting stderr, and
 /// emit one finding per unique rule_signature.
+/// How an external engine's saved input is re-run: the input, the
+/// environment and an optional time limit, to the child's output.
+type ExternalReplay<'r> = dyn Fn(&[u8], &[(String, String)], Option<Duration>) -> Result<std::process::Output, String>
+    + 'r;
+
+/// The crashes and hangs an external engine (AFL++, libFuzzer) saved, re-run
+/// on bhf's side and recorded as the run's findings (#294): each is
+/// deduplicated on the run's crash clusters, a crash is given the builtin
+/// engine's object-size second opinion and its decoded arguments, and each
+/// finding's lineage says the engine scheduled it.
+struct ExternalIngest<'a> {
+    prepared: &'a PreparedFuzzRun,
+    /// The engine, as the lineage names it: `AFL++`, `libFuzzer`.
+    engine: &'static str,
+    /// What the engine schedules: `its own queue`.
+    schedule: &'static str,
+    /// How the harness takes an input for the argument trace.
+    feed: TraceInput,
+    emitter: FindingEmitter,
+    dedup: SanitizerClusterDedup,
+    finding_ids: Vec<String>,
+}
+
+impl<'a> ExternalIngest<'a> {
+    fn new(
+        prepared: &'a PreparedFuzzRun,
+        engine: &'static str,
+        schedule: &'static str,
+        feed: TraceInput,
+    ) -> Result<Self, String> {
+        let sandbox_metadata = prepared.runner.sandbox_metadata();
+        let mut emitter = with_harness_format(
+            FindingEmitter::with_metadata_and_sandbox(
+                prepared.work_dir.clone(),
+                prepared.harness_id.clone(),
+                "unknown".to_owned(),
+                prepared.harness_path.display().to_string(),
+                serde_json::to_value(&sandbox_metadata)
+                    .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
+            )
+            .with_mode(prepared.mode)
+            .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
+            &prepared.harness_path,
+            &prepared.work_dir,
+            &prepared.harness_id,
+        );
+        if let Some(identity) = build_binary_record(&prepared.harness_path) {
+            emitter = emitter.with_build_binary(identity);
+        }
+        let dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
+            &prepared.harness_path,
+            &prepared.work_dir,
+            &prepared.harness_id,
+        ));
+        Ok(Self {
+            prepared,
+            engine,
+            schedule,
+            feed,
+            emitter,
+            dedup,
+            finding_ids: Vec::new(),
+        })
+    }
+
+    /// Record the crashing `input` the engine saved as `artifact` (`crash
+    /// file id:000001,...`), re-run through `replay`, unless its sanitizer
+    /// report is not new or it does not crash again.
+    fn crash(
+        &mut self,
+        input: &[u8],
+        artifact: &str,
+        hard_deadline: Instant,
+        replay: &ExternalReplay<'_>,
+    ) -> Result<(), String> {
+        let prepared = self.prepared;
+        let replayed = replay(input, &prepared.extra_env, None)
+            .map_err(|error| format!("replay {artifact}: {error}"))?;
+        let stderr = String::from_utf8_lossy(&replayed.stderr);
+        let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
+            return Ok(());
+        };
+        let key = self.dedup.key(&report);
+        if !afl_crash_is_new(&mut self.dedup, &report) {
+            return Ok(());
+        }
+        // A clang build's UBSan object-size check reports a member access
+        // through an undersized heap block before ASan does: the builtin
+        // engine's second opinion, once per root cause (afl_crash_is_new
+        // consumed its key), within the per-input timeout and the pass's hard
+        // deadline.
+        let opinion = object_size_second_opinion(
+            &prepared.work_dir,
+            &report,
+            &prepared.extra_env,
+            prepared.per_input_timeout,
+            Some(hard_deadline),
+            |env, timeout| {
+                let rerun = replay(input, env, Some(timeout))?;
+                let stderr = String::from_utf8_lossy(&rerun.stderr).into_owned();
+                Ok((corpus::parse_sanitizer_report(&stderr), Some(stderr)))
+            },
+        );
+        let (report, log) = match opinion.as_ref().and_then(|o| o.asan.as_ref()) {
+            Some((view, log)) => (view, log.as_deref().unwrap_or_default()),
+            None => (&report, stderr.as_ref()),
+        };
+        if opinion.as_ref().is_some_and(|o| o.asan.is_some())
+            && !afl_crash_is_new(&mut self.dedup, report)
+        {
+            // That ASan report is a finding already.
+            return Ok(());
+        }
+        let id = self
+            .emitter
+            .emit_sanitizer_crash_with_log(input, report, Some(log.as_bytes()))
+            .map_err(|error| format!("emit {} finding: {error}", self.engine))?;
+        if let Some(opinion) = &opinion {
+            opinion.record(&prepared.work_dir, &id.0, &key);
+        }
+        self.record_lineage(&id.0, artifact);
+        record_finding_arguments(
+            &prepared.work_dir,
+            &id.0,
+            &prepared.harness_path,
+            input,
+            self.feed,
+            &prepared.extra_env,
+            AFL_REPLAY_TRACE_TIMEOUT,
+            None,
+        );
+        self.finding_ids.push(id.0);
+        Ok(())
+    }
+
+    /// Record a hang the engine saved as `artifact` that hung again
+    /// ([`confirm_external_hang`]), unless its report is not new.
+    fn hang(
+        &mut self,
+        input: &[u8],
+        report: &corpus::SanitizerReport,
+        log: &str,
+        artifact: &str,
+    ) -> Result<(), String> {
+        if !afl_crash_is_new(&mut self.dedup, report) {
+            return Ok(());
+        }
+        let id = self
+            .emitter
+            .emit_sanitizer_crash_with_log(input, report, Some(log.as_bytes()))
+            .map_err(|error| format!("emit {} hang finding: {error}", self.engine))?;
+        self.record_lineage(&id.0, artifact);
+        self.finding_ids.push(id.0);
+        Ok(())
+    }
+
+    fn record_lineage(&self, id: &str, artifact: &str) {
+        crate::fuzz_lineage::record(
+            &self.prepared.work_dir,
+            id,
+            &corpus::lineage::FindingLineage::unknown(format!(
+                "found by {engine}, which schedules {schedule}; bhf does not see which \
+                 input this one was mutated from ({engine} {artifact})",
+                engine = self.engine,
+                schedule = self.schedule,
+            )),
+        );
+    }
+}
+
 fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
     use std::process::Command;
     use std::time::Instant;
@@ -7178,114 +7379,27 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     let elapsed = start.elapsed();
 
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let build_binary_identity = build_binary_record(&prepared.harness_path);
-    let mut emitter = with_harness_format(
-        FindingEmitter::with_metadata_and_sandbox(
-            prepared.work_dir.clone(),
-            prepared.harness_id.clone(),
-            "unknown".to_owned(),
-            prepared.harness_path.display().to_string(),
-            serde_json::to_value(&sandbox_metadata)
-                .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
-        )
-        .with_mode(prepared.mode)
-        .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
-        &prepared.harness_path,
-        &prepared.work_dir,
-        &prepared.harness_id,
-    );
-    if let Some(identity) = build_binary_identity {
-        emitter = emitter.with_build_binary(identity);
-    }
-
-    let mut finding_ids = Vec::new();
-    let mut afl_dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
-        &prepared.harness_path,
-        &prepared.work_dir,
-        &prepared.harness_id,
-    ));
+    let mut ingest = ExternalIngest::new(&prepared, "AFL++", "its own queue", TraceInput::Stdin)?;
     let mut crash_count = 0_usize;
-    {
-        for path in afl_saved_inputs(&out_dir, "crashes") {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            crash_count += 1;
-            let input = fs::read(&path)
-                .map_err(|error| format!("read crash artifact '{}': {error}", path.display()))?;
-            let replay = replay_afl_input(
-                &prepared.harness_path,
-                &prepared.work_dir,
-                &input,
-                &prepared.extra_env,
-                None,
-            )
-            .map_err(|error| format!("replay '{}': {error}", path.display()))?;
-            let stderr = String::from_utf8_lossy(&replay.stderr);
-            let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
-                continue;
-            };
-            let key = afl_dedup.key(&report);
-            if !afl_crash_is_new(&mut afl_dedup, &report) {
-                continue;
-            }
-            // main_afl is a clang build (afl-clang-fast), whose UBSan
-            // object-size check reports a member access through an undersized
-            // heap block before ASan does: the builtin engine's second opinion,
-            // once per root cause (afl_crash_is_new consumed its key), within
-            // the per-input timeout and the pass's hard deadline.
-            let opinion = object_size_second_opinion(
-                &prepared.work_dir,
-                &report,
-                &prepared.extra_env,
-                prepared.per_input_timeout,
-                Some(hard_deadline),
-                |env, timeout| {
-                    let rerun = replay_afl_input(
-                        &prepared.harness_path,
-                        &prepared.work_dir,
-                        &input,
-                        env,
-                        Some(timeout),
-                    )?;
-                    let stderr = String::from_utf8_lossy(&rerun.stderr).into_owned();
-                    Ok((corpus::parse_sanitizer_report(&stderr), Some(stderr)))
-                },
-            );
-            let (report, log) = match opinion.as_ref().and_then(|o| o.asan.as_ref()) {
-                Some((view, log)) => (view, log.as_deref().unwrap_or_default()),
-                None => (&report, stderr.as_ref()),
-            };
-            if opinion.as_ref().is_some_and(|o| o.asan.is_some())
-                && !afl_crash_is_new(&mut afl_dedup, report)
-            {
-                // That ASan report is a finding already.
-                continue;
-            }
-            let id = emitter
-                .emit_sanitizer_crash_with_log(&input, report, Some(log.as_bytes()))
-                .map_err(|error| format!("emit AFL finding: {error}"))?;
-            if let Some(opinion) = &opinion {
-                opinion.record(&prepared.work_dir, &id.0, &key);
-            }
-            crate::fuzz_lineage::record(
-                &prepared.work_dir,
-                &id.0,
-                &corpus::lineage::FindingLineage::unknown(format!(
-                    "found by AFL++, which schedules its own queue; bhf does not see which \
-                     input this one was mutated from (AFL++ crash file {name})"
-                )),
-            );
-            record_finding_arguments(
-                &prepared.work_dir,
-                &id.0,
-                &prepared.harness_path,
-                &input,
-                TraceInput::Stdin,
-                &prepared.extra_env,
-                AFL_REPLAY_TRACE_TIMEOUT,
-                None,
-            );
-            finding_ids.push(id.0);
-        }
+    for path in afl_saved_inputs(&out_dir, "crashes") {
+        crash_count += 1;
+        let input = fs::read(&path)
+            .map_err(|error| format!("read crash artifact '{}': {error}", path.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        ingest.crash(
+            &input,
+            &format!("crash file {name}"),
+            hard_deadline,
+            &|input, env, timeout| {
+                replay_afl_input(
+                    &prepared.harness_path,
+                    &prepared.work_dir,
+                    input,
+                    env,
+                    timeout,
+                )
+            },
+        )?;
     }
     // #275: the inputs afl-fuzz saved as hangs. Each is re-run through
     // main_afl with twice afl-fuzz's limit, and one that hangs again is a
@@ -7307,12 +7421,14 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             .to_owned();
         let input = fs::read(&path)
             .map_err(|error| format!("read hang artifact '{}': {error}", path.display()))?;
-        let (report, log) = match confirm_afl_hang(
+        let (report, log) = match confirm_external_hang(
             &prepared.harness_path,
             &prepared.work_dir,
             &input,
             &prepared.extra_env,
             hard_deadline,
+            AFL_EXEC_TIMEOUT,
+            TraceInput::Stdin,
         )? {
             HangConfirmation::Hung(report, log) => {
                 hangs.confirmed += 1;
@@ -7332,21 +7448,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                 continue;
             }
         };
-        if !afl_crash_is_new(&mut afl_dedup, &report) {
-            continue;
-        }
-        let id = emitter
-            .emit_sanitizer_crash_with_log(&input, &report, Some(log.as_bytes()))
-            .map_err(|error| format!("emit AFL hang finding: {error}"))?;
-        crate::fuzz_lineage::record(
-            &prepared.work_dir,
-            &id.0,
-            &corpus::lineage::FindingLineage::unknown(format!(
-                "found by AFL++, which schedules its own queue; bhf does not see which \
-                 input this one was mutated from (AFL++ hang file {name})"
-            )),
-        );
-        finding_ids.push(id.0);
+        ingest.hang(&input, &report, &log, &format!("hang file {name}"))?;
     }
     // What a resumed session moved aside has been harvested with the rest.
     remove_afl_backups(&out_dir);
@@ -7369,7 +7471,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         harness_id: prepared.harness_id.clone(),
         engine: "afl++".to_owned(),
         mode: prepared.mode,
-        harness_path: prepared.harness_path,
+        harness_path: prepared.harness_path.clone(),
         sandbox: sandbox_metadata,
         iterations_requested: prepared.iterations,
         executions: afl_execs_done.map(|n| n as usize).unwrap_or(crash_count),
@@ -7382,7 +7484,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
         coverage,
-        findings: finding_ids,
+        findings: ingest.finding_ids.clone(),
         duplicates_of_existing: Vec::new(),
         duplicate_crashes_of_existing: 0,
         elapsed_secs,
@@ -7409,8 +7511,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         // (it iterates the builtin pool's retained corpus); AFL++ owns its own
         // on-disk queue, so `--extension` is not driven here.
         extension: None,
-        duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
-        unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
+        duplicate_sanitizer_hits: ingest.dedup.duplicate_hits(),
+        unreproduced_sanitizer_hits: ingest.dedup.unreproduced_hits(),
         fresh_reruns: None,
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
@@ -12095,6 +12197,9 @@ pub(crate) fn find_harness_executable(
     harness_id: &str,
     engine: FuzzEngine,
 ) -> Result<PathBuf, String> {
+    if engine == FuzzEngine::Libfuzzer {
+        return libfuzzer::ensure_binary(work_dir, harness_id);
+    }
     let build_dir = work_dir.join("build").join(harness_id);
     let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
     let legacy_auto_dir = crate::auto::layout::legacy_auto_harness_dir(work_dir, harness_id);
@@ -12136,7 +12241,7 @@ pub(crate) fn find_harness_executable(
         ),
         // WinAFL fuzzes `main_winafl` beside the sanitized `main`, which every
         // saved input is replayed through and which the findings name.
-        FuzzEngine::Builtin | FuzzEngine::Winafl => (
+        FuzzEngine::Builtin | FuzzEngine::Winafl | FuzzEngine::Libfuzzer => (
             &["main"],
             vec![
                 build_dir.clone(),

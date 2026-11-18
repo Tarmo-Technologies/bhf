@@ -3082,7 +3082,7 @@ fn stage_afl_cmplog_build(harness_dir: &Path, build_dir: &Path, force_includes: 
 /// C++-stdlib `#include`s and the build-config macro `#define`s. Never
 /// `auto_types.h`, whose `void *` placeholders would clash with a real
 /// typedef in any target TU.
-fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
     let repairs = harness_dir.join("repairs");
     crate::auto::repair::FORCE_INCLUDED_REPAIR_FILES
         .iter()
@@ -3091,7 +3091,7 @@ fn repair_force_includes(harness_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn apply_c_family_make_env(
+pub(crate) fn apply_c_family_make_env(
     cmd: &mut std::process::Command,
     extra_sources: &[PathBuf],
     extra_includes: &[PathBuf],

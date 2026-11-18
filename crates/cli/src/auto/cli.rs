@@ -1323,6 +1323,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(2);
         }
     };
+    if engines.contains(&crate::fuzz::FuzzEngine::Libfuzzer) {
+        bhfeprintln!(
+            "error: --engine: libfuzzer is an engine of `bhf fuzz --engine libfuzzer`; \
+             `bhf auto` runs builtin, afl++ and winafl passes"
+        );
+        return Ok(2);
+    }
     if let Err(error) = crate::fuzz::parse_sanitizer_args(&args.sanitizers) {
         bhfeprintln!("error: {error}");
         return Ok(2);
