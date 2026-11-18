@@ -477,6 +477,19 @@ The same replay writes each harness's coverage report to
   or a harness change would take the campaign further; the sweep says how
   many there are.
 
+An Ada harness gets the same report from its edges, without the HTML and the
+blockers. GNAT instruments with `-fsanitize-coverage=trace-pc` and no coverage
+mapping, so the replay records the PC of each edge an input reaches
+(`BHF_COV_PCS`), takes the binary's calls to the trace-pc callback as the
+instrumented edges, and places both on Ada lines with `addr2line` (or
+`llvm-symbolizer`) and the instrumented copies' line maps. `lcov.info` has the
+lines and subprograms; `functions.txt` and `functions.json` list each
+subprogram (`checks.classify` for GNAT's `checks__classify`) with its first
+line and its covered and instrumented lines; `calls` is `null`, since an edge
+says only whether it ran. The covered lines also go to the harness's
+`covered-lines.txt`, as for C/C++. It needs `objdump` from binutils, which
+GNAT installs with.
+
 A function the table shows with no calls is one the campaign never reached.
 The report needs `llvm-cov` and `llvm-profdata` (or their `-18` names), as the
 replay does, and the blockers `llvm-symbolizer` to place each comparison; a part llvm-cov cannot render is left out, and

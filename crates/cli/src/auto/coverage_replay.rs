@@ -17,7 +17,12 @@
 //! per-function table (`functions.txt`, `functions.json`), each cut to the files
 //! under the sweep's source root, without bhf's harness and runtime, and the
 //! comparisons the corpus reached but never passed (`blockers.json`,
-//! `blockers.txt`, #309).
+//! `blockers.txt`, #309). An Ada harness, which GNAT instruments with
+//! `-fsanitize-coverage=trace-pc` and no coverage mapping, gets the same
+//! `lcov.info` and per-subprogram table from its edges (#310): the replay records
+//! each edge's PC (`BHF_COV_PCS`), the binary's calls to the trace-pc callback
+//! are the instrumented ones, and `addr2line` places both on Ada lines, which the
+//! instrumented copies' line maps take back to the original source.
 //!
 //! Best-effort: a missing `llvm-cov`/`llvm-profdata`, a failed coverage build, or an
 //! empty corpus all skip cleanly. Never fatal.
@@ -277,13 +282,21 @@ pub fn run_coverage_replay(work_dir: &Path, source_root: Option<&Path>) -> Cover
         else {
             continue;
         };
-        if let Some((covered, instrumented, blockers)) = llvm_tools.as_ref().and_then(|(profdata, cov)| {
-            replay_one(work_dir, &hdir, &harness_id, profdata, cov, source_root)
-        }) {
+        if let Some((covered, instrumented, blockers)) =
+            llvm_tools.as_ref().and_then(|(profdata, cov)| {
+                replay_one(work_dir, &hdir, &harness_id, profdata, cov, source_root)
+            })
+        {
             totals.harnesses += 1;
             totals.covered_lines += covered;
             totals.instrumented_lines += instrumented;
             totals.blockers += blockers;
+        }
+        if let Some((covered, instrumented)) = replay_ada(work_dir, &hdir, &harness_id, source_root)
+        {
+            totals.harnesses += 1;
+            totals.covered_lines += covered;
+            totals.instrumented_lines += instrumented;
         }
         if let Some(expert_coverage) = explicit_expert_coverage(&harness_id) {
             run_external_expert_coverage_oracle(&hdir, &harness_id, &expert_coverage);
@@ -1463,8 +1476,9 @@ struct FunctionCoverage {
     function: String,
     file: String,
     line: u64,
-    /// How many times it was entered, over the replayed corpus.
-    calls: u64,
+    /// How many times it was entered, over the replayed corpus; `None` for
+    /// an Ada harness, whose edges say only whether it was.
+    calls: Option<u64>,
     /// Its instrumented lines the corpus executed, and all of them: the
     /// lines from its first to the next function's in the file.
     lines_covered: usize,
@@ -1539,7 +1553,7 @@ fn function_table(lcov: &str) -> Vec<FunctionCoverage> {
                 function: name.clone(),
                 file: file.to_owned(),
                 line: *start,
-                calls: calls.get(name).copied().unwrap_or(0),
+                calls: Some(calls.get(name).copied().unwrap_or(0)),
                 lines_covered: span.iter().filter(|(_, hits)| *hits > 0).count(),
                 lines_instrumented: span.len(),
             });
@@ -1574,6 +1588,261 @@ fn function_table(lcov: &str) -> Vec<FunctionCoverage> {
         }
     }
     table
+}
+
+/// Replay an Ada harness's corpus and write its coverage (#310): the
+/// project's executed lines to `covered-lines.txt` and `coverage-summary.json`,
+/// as the C/C++ replay does, and `results/coverage/<harness>/` with
+/// `lcov.info`, `functions.json` and `functions.txt`, per subprogram. Returns
+/// the covered and instrumented line counts.
+fn replay_ada(
+    work_dir: &Path,
+    hdir: &Path,
+    harness_id: &str,
+    source_root: Option<&Path>,
+) -> Option<(usize, usize)> {
+    if !hdir.join("main.adb").is_file() || hdir.join("covered-lines.txt").is_file() {
+        return None;
+    }
+    let bin = crate::fuzz::find_harness_executable(
+        work_dir,
+        harness_id,
+        crate::fuzz::FuzzEngine::Builtin,
+    )
+    .ok()?;
+    let inputs: Vec<PathBuf> =
+        std::fs::read_dir(work_dir.join("corpus").join(harness_id).join("queue"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .take(MAX_INPUTS)
+            .collect();
+    if inputs.is_empty() {
+        return None;
+    }
+    // Every instrumented edge: the return address of each call to the
+    // trace-pc callback, as offsets from the image's start.
+    let instrumented = trace_pc_sites(&bin);
+    if instrumented.is_empty() {
+        return None;
+    }
+    let pcs = hdir.join("cov_pcs.txt");
+    let _ = std::fs::remove_file(&pcs);
+    let deadline = Instant::now() + REPLAY_BUDGET;
+    for input in inputs {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(stdin) = std::fs::File::open(&input) else {
+            continue;
+        };
+        // One input per process, from stdin (the harness's raw mode). A
+        // crash or a timeout still leaves the edges it reached.
+        let _ = crate::command_output::bounded_replay_output(
+            Command::new(&bin)
+                .env("BHF_COV_PCS", &pcs)
+                .env_remove("BHF_FRAMED")
+                .env_remove("BHF_COV_SHM")
+                .stdin(stdin),
+            Duration::from_secs(15),
+        );
+    }
+    let hit: std::collections::BTreeSet<u64> = std::fs::read_to_string(&pcs)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .collect();
+    let _ = std::fs::remove_file(&pcs);
+
+    // Place each edge on an original line of a project file.
+    let maps = corpus::SourceLineMaps::load(&work_dir.join("src_instrumented"));
+    let root = source_root.and_then(|root| root.canonicalize().ok());
+    let in_root = |file: &str| {
+        root.as_ref().is_none_or(|root| {
+            Path::new(file)
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with(root))
+        })
+    };
+    let places = symbolize(&bin, &instrumented);
+    // (subprogram, file) -> (line -> reached)
+    let mut subprograms: std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeMap<u64, bool>,
+    > = std::collections::BTreeMap::new();
+    for pc in &instrumented {
+        let Some((function, file, line)) = places.get(pc) else {
+            continue;
+        };
+        let (file, line) = match u32::try_from(*line)
+            .ok()
+            .and_then(|line| maps.resolve(file, line))
+        {
+            Some(resolved) => (resolved.source_path, u64::from(resolved.original_line)),
+            None => (file.clone(), *line),
+        };
+        if !in_root(&file) {
+            continue;
+        }
+        let reached = hit.contains(pc);
+        let lines = subprograms
+            .entry((ada_subprogram_name(function), file))
+            .or_default();
+        let entry = lines.entry(line).or_insert(false);
+        *entry |= reached;
+    }
+    if subprograms.is_empty() {
+        return None;
+    }
+    let mut table: Vec<FunctionCoverage> = subprograms
+        .iter()
+        .map(|((function, file), lines)| FunctionCoverage {
+            function: function.clone(),
+            file: file.clone(),
+            line: lines.keys().next().copied().unwrap_or(0),
+            calls: None,
+            lines_covered: lines.values().filter(|reached| **reached).count(),
+            lines_instrumented: lines.len(),
+        })
+        .collect();
+    table.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+
+    // The lines, once each over the file's subprograms.
+    let mut files: std::collections::BTreeMap<&str, std::collections::BTreeMap<u64, bool>> =
+        std::collections::BTreeMap::new();
+    for ((_, file), lines) in &subprograms {
+        let merged = files.entry(file.as_str()).or_default();
+        for (line, reached) in lines {
+            *merged.entry(*line).or_insert(false) |= reached;
+        }
+    }
+    let mut lcov = String::new();
+    let mut covered = Vec::new();
+    let mut instrumented_lines = 0usize;
+    for (file, lines) in &files {
+        lcov.push_str(&format!("SF:{file}\n"));
+        for function in table.iter().filter(|f| f.file == *file) {
+            lcov.push_str(&format!("FN:{},{}\n", function.line, function.function));
+            lcov.push_str(&format!(
+                "FNDA:{},{}\n",
+                u64::from(function.lines_covered > 0),
+                function.function
+            ));
+        }
+        for (line, reached) in lines {
+            lcov.push_str(&format!("DA:{line},{}\n", u64::from(*reached)));
+            if *reached {
+                covered.push(format!("{file}:{line}"));
+            }
+        }
+        lcov.push_str(&format!(
+            "LF:{}\nLH:{}\nend_of_record\n",
+            lines.len(),
+            lines.values().filter(|reached| **reached).count()
+        ));
+        instrumented_lines += lines.len();
+    }
+    let dir = corpus::layout::results_dir(work_dir)
+        .join("coverage")
+        .join(harness_id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join("lcov.info"), &lcov);
+        if let Ok(json) = serde_json::to_string_pretty(&table) {
+            let _ = std::fs::write(dir.join("functions.json"), json + "\n");
+        }
+        let _ = std::fs::write(dir.join("functions.txt"), render_subprograms(&table));
+    }
+    let _ = std::fs::write(
+        hdir.join("coverage-summary.json"),
+        format!(
+            "{{\n  \"harness_id\": \"{harness_id}\",\n  \"covered_lines\": {},\n  \
+             \"instrumented_lines\": {instrumented_lines}\n}}\n",
+            covered.len()
+        ),
+    );
+    let _ = std::fs::write(hdir.join("covered-lines.txt"), covered.join("\n"));
+    Some((covered.len(), instrumented_lines))
+}
+
+/// The return address of each call to `__sanitizer_cov_trace_pc` in `binary`,
+/// as an offset from its image's start: every edge GNAT's trace-pc
+/// instrumentation planted (#310).
+fn trace_pc_sites(binary: &Path) -> Vec<u64> {
+    let Some(objdump) = llvm_tool("llvm-objdump")
+        .or_else(|| which::which("objdump").ok().map(|_| "objdump".to_owned()))
+    else {
+        return Vec::new();
+    };
+    let Ok(output) = crate::command_output::output_with_timeout(
+        Command::new(objdump)
+            .args(["-d", "--no-show-raw-insn"])
+            .arg(binary),
+        Duration::from_secs(300),
+    ) else {
+        return Vec::new();
+    };
+    trace_pc_sites_in(&String::from_utf8_lossy(&output.stdout), link_base(binary))
+}
+
+/// [`trace_pc_sites`] of an `objdump -d` listing, its addresses less `base`.
+fn trace_pc_sites_in(text: &str, base: u64) -> Vec<u64> {
+    let mut sites = Vec::new();
+    let mut after_call = false;
+    for line in text.lines() {
+        // `  4011d6:\tcall   401090 <__sanitizer_cov_trace_pc>`
+        let Some((address, rest)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        let Ok(address) = u64::from_str_radix(address.trim(), 16) else {
+            continue;
+        };
+        if std::mem::take(&mut after_call) {
+            sites.push(address.saturating_sub(base));
+        }
+        after_call = rest.contains("<__sanitizer_cov_trace_pc>");
+    }
+    sites.sort_unstable();
+    sites.dedup();
+    sites
+}
+
+/// An Ada subprogram's name from its GNAT symbol: `checks__classify` is
+/// `checks.classify`; an overload's `__2` suffix stays.
+fn ada_subprogram_name(symbol: &str) -> String {
+    symbol.replace("__", ".")
+}
+
+/// `functions.txt` of an Ada harness: one row per subprogram.
+fn render_subprograms(table: &[FunctionCoverage]) -> String {
+    let width = table
+        .iter()
+        .map(|f| f.function.len())
+        .max()
+        .unwrap_or(0)
+        .max("Subprogram".len());
+    let mut out = format!(
+        "{:<width$}  {:>7}  {:>7}  {:>7}  File:Line\n",
+        "Subprogram", "Lines", "Covered", "Cover"
+    );
+    for function in table {
+        let cover = if function.lines_instrumented == 0 {
+            0.0
+        } else {
+            100.0 * function.lines_covered as f64 / function.lines_instrumented as f64
+        };
+        out.push_str(&format!(
+            "{:<width$}  {:>7}  {:>7}  {:>6.1}%  {}:{}\n",
+            function.function,
+            function.lines_instrumented,
+            function.lines_covered,
+            cover,
+            function.file,
+            function.line
+        ));
+    }
+    out
 }
 
 /// A comparison the corpus reached and never passed (#309): one direction
@@ -1640,13 +1909,25 @@ fn symbolize(
 ) -> std::collections::HashMap<u64, (String, String, u64)> {
     use std::io::Write as _;
     let mut out = std::collections::HashMap::new();
-    let Some(symbolizer) = llvm_tool("llvm-symbolizer") else {
+    // llvm-symbolizer, else binutils' addr2line: both print a function line
+    // and a `FILE:LINE[:COLUMN]` line per address.
+    let mut command = if let Some(symbolizer) = llvm_tool("llvm-symbolizer") {
+        let mut command = Command::new(symbolizer);
+        command.arg(format!("--obj={}", binary.display())).args([
+            "--functions=linkage",
+            "--no-inlines",
+            "--output-style=GNU",
+        ]);
+        command
+    } else if which::which("addr2line").is_ok() {
+        let mut command = Command::new("addr2line");
+        command.arg("-f").arg("-e").arg(binary);
+        command
+    } else {
         return out;
     };
     let base = link_base(binary);
-    let Ok(mut child) = Command::new(symbolizer)
-        .arg(format!("--obj={}", binary.display()))
-        .args(["--functions=linkage", "--no-inlines"])
+    let Ok(mut child) = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1662,19 +1943,20 @@ fn symbolize(
     let Ok(output) = child.wait_with_output() else {
         return out;
     };
+    // Two lines per address: the function, then `FILE:LINE`, with
+    // ` (discriminator N)` after it sometimes; `??:0` or `??:?` when unknown.
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut blocks = text.split("\n\n");
+    let mut lines = text.lines();
     for address in addresses {
-        let Some(block) = blocks.next() else { break };
-        let mut lines = block.lines();
         let (Some(function), Some(location)) = (lines.next(), lines.next()) else {
+            break;
+        };
+        let location = location.split(" (").next().unwrap_or(location);
+        let Some((file, line)) = location.rsplit_once(':') else {
             continue;
         };
-        // `FILE:LINE:COLUMN`; `??:0:0` when unknown.
-        let mut parts = location.rsplitn(3, ':');
-        let (_, line, file) = (parts.next(), parts.next(), parts.next());
-        if let (Some(file), Some(Ok(line))) = (file, line.map(str::parse::<u64>)) {
-            if line > 0 {
+        if let Ok(line) = line.parse::<u64>() {
+            if line > 0 && file != "??" {
                 out.insert(*address, (function.to_owned(), file.to_owned(), line));
             }
         }
@@ -1990,6 +2272,34 @@ fn llvm_tool(base: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Each call to the trace-pc callback marks the next instruction as an
+    /// edge, and GNAT's symbol is the subprogram's dotted name.
+    #[test]
+    fn trace_pc_calls_are_the_ada_edges() {
+        let listing = "\
+0000000000401100 <checks__classify>:\n\
+  401100:\tpush   %rbp\n\
+  401101:\tcall   401090 <__sanitizer_cov_trace_pc>\n\
+  401106:\tmov    %edi,%eax\n\
+  40110a:\tcall   401090 <__sanitizer_cov_trace_pc>\n\
+  40110f:\tret\n\
+  401110:\tcall   401200 <checks__scale>\n\
+  401115:\tret\n";
+        assert_eq!(trace_pc_sites_in(listing, 0x400000), vec![0x1106, 0x110f]);
+        assert_eq!(ada_subprogram_name("checks__classify"), "checks.classify");
+        assert_eq!(ada_subprogram_name("pkg__child__put__2"), "pkg.child.put.2");
+        let table = render_subprograms(&[FunctionCoverage {
+            function: "checks.unused".to_owned(),
+            file: "/src/checks.adb".to_owned(),
+            line: 13,
+            calls: None,
+            lines_covered: 0,
+            lines_instrumented: 2,
+        }]);
+        assert!(table.contains("checks.unused"), "{table}");
+        assert!(table.contains("0.0%  /src/checks.adb:13"), "{table}");
+    }
+
     /// A comparison is a blocker where its branch ran one way only: an
     /// intercepted memcmp is placed at its caller, an integer compare at its
     /// own site, and the constant side is what the branch wants.
@@ -2080,7 +2390,7 @@ mod tests {
                     function: "parse".to_owned(),
                     file: parse.display().to_string(),
                     line: 2,
-                    calls: 4,
+                    calls: Some(4),
                     lines_covered: 1,
                     lines_instrumented: 2,
                 },
@@ -2088,7 +2398,7 @@ mod tests {
                     function: "unused".to_owned(),
                     file: parse.display().to_string(),
                     line: 9,
-                    calls: 0,
+                    calls: Some(0),
                     lines_covered: 0,
                     lines_instrumented: 1,
                 },

@@ -48,7 +48,11 @@ feeding the same edge bitmap and a bounded persisted corpus, and the source is
 rewritten with breadcrumb probes at exception handlers and `raise` statements
 that feed an exception-signature signal alongside edge presence. Ada coverage is
 **presence-only** — the hit-count-bucket and comparison-progress channels are
-C/C++-only.
+C/C++-only. After the sweep, `bhf auto` replays an Ada harness's corpus and
+reports the lines and subprograms its edges reached, in the format of the
+C/C++ report (`results/coverage/<id>/`, see [Auto](auto.md)): a trace-pc edge
+is placed on its Ada line with `addr2line`, and on the original source's line
+through the instrumented copy's line map.
 
 ## Rust and Java coverage
 

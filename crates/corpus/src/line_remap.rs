@@ -81,6 +81,17 @@ impl SourceLineMaps {
         }
     }
 
+    /// The original source and line of `line` of the instrumented copy
+    /// `file` (a path or a basename), when there is a map for it.
+    pub fn resolve(&self, file: &str, line: u32) -> Option<ResolvedLocation> {
+        let basename = Path::new(file).file_name()?.to_str()?.to_ascii_lowercase();
+        let (source_path, anchors) = self.maps.get(&basename)?;
+        Some(ResolvedLocation {
+            source_path: source_path.clone(),
+            original_line: Self::to_original(anchors, line),
+        })
+    }
+
     /// Rewrite every `<file>.adb:<line>` / `.ads:<line>` reference whose unit we
     /// have a map for, returning the rewritten message plus the first resolved
     /// location (for structured `source_file`/`source_line` fields).
@@ -175,6 +186,30 @@ fn is_stem_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_maps_an_instrumented_line_to_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("checks.adb.bhf-lines.json"),
+            r#"{"source_path":"/src/checks.adb","anchors":[[2,1],[6,4],[13,10]]}"#,
+        )
+        .unwrap();
+        let maps = SourceLineMaps::load(dir.path());
+        let at = |file: &str, line| {
+            maps.resolve(file, line)
+                .map(|resolved| (resolved.source_path, resolved.original_line))
+        };
+        assert_eq!(
+            at("/work/src_instrumented/checks.adb", 6),
+            Some(("/src/checks.adb".to_owned(), 4))
+        );
+        assert_eq!(
+            at("CHECKS.ADB", 15),
+            Some(("/src/checks.adb".to_owned(), 12))
+        );
+        assert_eq!(at("main.adb", 3), None);
+    }
     use std::fs;
 
     fn maps_with(basename: &str, source_path: &str, anchors: &[(u32, u32)]) -> SourceLineMaps {

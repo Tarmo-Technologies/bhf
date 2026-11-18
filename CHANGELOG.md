@@ -2839,6 +2839,13 @@
   when bhf panics.
 
 ### Added
+- Ada harnesses get a coverage report too (#310): the replay records the PC
+  of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
+  runtime), takes the binary's calls to the callback as the instrumented
+  edges, places both on the original Ada lines (`addr2line` and the
+  instrumented copies' line maps) and writes `lcov.info`, `functions.txt` and
+  `functions.json` per subprogram to `results/coverage/<id>/`, and the covered
+  lines to `covered-lines.txt`.
 - The coverage report lists the comparisons each corpus reached and never
   passed (#309): `results/coverage/<id>/blockers.{txt,json}` give the file,
   line and function of each compare whose branch ran one way only, with the
