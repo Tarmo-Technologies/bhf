@@ -70,6 +70,14 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada target whose project `with`s sibling library projects builds (#287).
+  Staging copied the siblings' units into src_instrumented beside the projects
+  that own them, and gprbuild refused the second owner (`unit "X" cannot belong
+  to several projects`). A unit of a project the governing one depends on
+  through `with` is now left to it (and an earlier target's copy removed), a
+  library governing project forwards its own `with`s rather than every
+  project the tree's files `with`, and `Source_Dirs` spelled
+  `"src/" & project'Name` is read as gprbuild reads it.
 - An Ada tree that vendors GNAT predefined units builds against the host
   runtime (#356). A zero-footprint runtime ships its own `ada.ads`,
   `system.ads` and `s-*`, `a-*`, `i-*`, `g-*` units, and a staged copy shadowed

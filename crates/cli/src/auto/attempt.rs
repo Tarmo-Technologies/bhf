@@ -10171,6 +10171,19 @@ fn ensure_ada_src_instrumented(
         .map(Path::to_path_buf)
         .or_else(|| crate::auto::gpr_scenario::find_project_gpr(source_root));
 
+    // #287: a unit of a project the governing one depends on through `with`
+    // belongs to that project, and the build compiles it there: a staged copy
+    // would be its second owner (`unit "X" cannot belong to several projects`).
+    let owned_elsewhere = governing_gpr
+        .as_deref()
+        .map(crate::auto::gpr_scenario::withed_project_source_dirs)
+        .unwrap_or_default();
+    let mut left_to_their_projects = 0usize;
+    // The staging is shared by the work dir's targets and runs, and gprbuild
+    // reads every unit in it, not only this target's closure: drop a copy an
+    // earlier target staged of a unit these projects own.
+    remove_staged_copies_owned_elsewhere(&dst, &owned_elsewhere);
+
     // Directories the project's default GPR scenario excludes — don't instrument
     // sources gprbuild wouldn't compile under the default configuration.
     let source_excluded = governing_gpr
@@ -10270,6 +10283,11 @@ fn ensure_ada_src_instrumented(
         // Force-fuzz body stub-out: don't stage the real body of a unit whose body
         // is offline-unbuildable — the harness stub dir supplies a trivial body.
         if is_excluded_ada_body(source_path, excluded_body_stems) {
+            continue;
+        }
+        if crate::auto::gpr_scenario::in_source_dirs(&owned_elsewhere, source_path) {
+            left_to_their_projects += 1;
+            remove_staged_copy(&dst, source_path, preserve_project_naming);
             continue;
         }
         let source_path = source_path.clone();
@@ -10394,6 +10412,11 @@ fn ensure_ada_src_instrumented(
             if !in_closure(dep_path) {
                 continue;
             }
+            if crate::auto::gpr_scenario::in_source_dirs(&owned_elsewhere, dep_path) {
+                left_to_their_projects += 1;
+                remove_staged_copy(&dst, dep_path, false);
+                continue;
+            }
             // Same rule as the source-tree walk above: a dependency's own
             // `main.adb` (e.g. SweetAda's `core/main.adb`, which does
             // `BSP.Setup; Application.Run;`) must NOT land in src_instrumented,
@@ -10442,6 +10465,17 @@ fn ensure_ada_src_instrumented(
                 let _ = std::fs::write(&dest, bytes);
             }
         }
+    }
+
+    if left_to_their_projects > 0 {
+        bhfeprintln!(
+            "bhf auto: left {left_to_their_projects} unit(s) uninstrumented to the projects {} \
+             depends on, which build them",
+            governing_gpr
+                .as_deref()
+                .and_then(Path::file_name)
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        );
     }
 
     // Copy the C/C++ glue real Ada libraries bind to (gnatcoll's
@@ -10845,6 +10879,55 @@ fn ada_unit_key_from_filename(basename: &str) -> Option<String> {
         .strip_suffix(".ads")
         .or_else(|| canonical.strip_suffix(".adb"))?;
     Some(stem.replace('-', ".").to_ascii_lowercase())
+}
+
+/// Remove the copy of `source` an earlier target staged in `dst` (#287): the
+/// staging is shared by a run's targets, and a unit one target's project owns
+/// is another's to stage.
+fn remove_staged_copy(dst: &Path, source: &Path, preserve_project_naming: bool) {
+    let names = crate::source_text::read_source_text(source)
+        .ok()
+        .and_then(|text| ada_staged_source_basename(source, &text, preserve_project_naming))
+        .into_iter()
+        .chain(
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        );
+    for name in names {
+        let _ = std::fs::remove_file(dst.join(&name));
+        let _ = std::fs::remove_file(dst.join(format!("{name}.bhf-lines.json")));
+    }
+}
+
+/// [`remove_staged_copy`] for every Ada source in `dirs` (#287), under the
+/// name it is staged with either way a target stages it.
+fn remove_staged_copies_owned_elsewhere(dst: &Path, dirs: &[(PathBuf, bool)]) {
+    fn walk(dir: &Path, recursive: bool, dst: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    walk(&path, true, dst);
+                }
+                continue;
+            }
+            let is_ada = path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("ads") || ext.eq_ignore_ascii_case("adb")
+            });
+            if is_ada {
+                remove_staged_copy(dst, &path, true);
+                remove_staged_copy(dst, &path, false);
+            }
+        }
+    }
+    for (dir, recursive) in dirs {
+        walk(dir, *recursive, dst);
+    }
 }
 
 /// Whether the lowercased Ada unit `unit` is predefined by the GNAT runtime:

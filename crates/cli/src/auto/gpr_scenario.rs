@@ -84,10 +84,15 @@ pub fn select_governing_gpr(candidate_source: &Path, search_root: &Path) -> Opti
             // base — never own the candidate through it.
             continue;
         }
+        // #287: `Source_Dirs` spelled `"src/" & project'Name` names no
+        // literal directory; read it as gprbuild does too.
         let owns = match &canon_src {
-            Some(src) => active_source_dirs(&gpr)
-                .iter()
-                .any(|dir| src.starts_with(dir)),
+            Some(src) => {
+                active_source_dirs(&gpr)
+                    .iter()
+                    .any(|dir| src.starts_with(dir))
+                    || in_source_dirs(&project_source_dirs(&gpr), src)
+            }
             None => false,
         };
         if !owns {
@@ -176,6 +181,11 @@ fn gpr_declares_library(text: &str) -> bool {
     // attributes are the ones GNAT's diagnostic keys on, so honor them as a
     // fallback for oddly-formatted headers.
     n.contains("library project") || n.contains("for library_dir") || n.contains("for library_name")
+}
+
+/// Whether `gpr_path` declares a library project (#287).
+pub(crate) fn gpr_is_library_project(gpr_path: &Path) -> bool {
+    std::fs::read_to_string(gpr_path).is_ok_and(|text| gpr_declares_library(&text))
 }
 
 /// Offline-legacy audit #1/#7: whether `gpr_path` can be safely EXTENDED to build
@@ -271,6 +281,162 @@ pub fn active_source_dirs(gpr_path: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// The projects `gpr_path` names in its `with` clauses (`limited with` too),
+/// resolved beside it; ones that are not files there (a `GPR_PROJECT_PATH`
+/// lookup) are left out.
+pub fn project_with_clauses(gpr_path: &Path) -> Vec<PathBuf> {
+    project_path_clauses(gpr_path, r#"(?i)\bwith\s+((?:"[^"]+"\s*,\s*)*"[^"]+")\s*;"#)
+}
+
+/// The projects `gpr_path` `extends` (`extends "base.gpr"`, `extends all`).
+fn project_extends_clauses(gpr_path: &Path) -> Vec<PathBuf> {
+    project_path_clauses(gpr_path, r#"(?i)\bextends\s+(?:all\s+)?("[^"]+")"#)
+}
+
+fn project_path_clauses(gpr_path: &Path, pattern: &str) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(gpr_path) else {
+        return Vec::new();
+    };
+    let base = gpr_path.parent().unwrap_or_else(|| Path::new("."));
+    let clause = regex::Regex::new(pattern).expect("regex");
+    let quoted = regex::Regex::new(r#""([^"]+)""#).expect("regex");
+    let mut out = Vec::new();
+    for caps in clause.captures_iter(&strip_comments(&text)) {
+        for name in quoted.captures_iter(&caps[1]) {
+            let mut name = name[1].to_owned();
+            if !name.to_ascii_lowercase().ends_with(".gpr") {
+                name.push_str(".gpr");
+            }
+            if let Ok(path) = base.join(&name).canonicalize() {
+                if path.is_file() && !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every project `gpr_path` depends on through `with` (#287): the projects it
+/// `with`s, the ones those `with` or `extend`, and so on. Not `gpr_path`, and
+/// not a project it `extends`, whose units an extension may override.
+pub fn withed_project_closure(gpr_path: &Path) -> Vec<PathBuf> {
+    const MAX_PROJECTS: usize = 64;
+    let own = gpr_path
+        .canonicalize()
+        .unwrap_or_else(|_| gpr_path.to_path_buf());
+    let mut excluded = project_extends_clauses(gpr_path);
+    excluded.push(own);
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut queue = project_with_clauses(gpr_path);
+    while let Some(project) = queue.pop() {
+        if out.len() >= MAX_PROJECTS || excluded.contains(&project) || out.contains(&project) {
+            continue;
+        }
+        queue.extend(project_with_clauses(&project));
+        queue.extend(project_extends_clauses(&project));
+        out.push(project);
+    }
+    out.sort();
+    out
+}
+
+/// The directories `gpr_path`'s sources are in, as gprbuild reads its
+/// `Source_Dirs` (#287), each with whether it takes the directories below it
+/// (`"src/**"`): an element of string literals and `project'Name`, joined by
+/// `&` (whitakers-words' `"src/" & project'Name`), relative to the project's
+/// directory. A project that declares no `Source_Dirs` has its own directory
+/// (an abstract one, none); `()` none. An element of another form (a variable, `external`) is left out,
+/// and every `Source_Dirs` of every scenario counts.
+pub fn project_source_dirs(gpr_path: &Path) -> Vec<(PathBuf, bool)> {
+    let Ok(text) = std::fs::read_to_string(gpr_path) else {
+        return Vec::new();
+    };
+    let base = gpr_path.parent().unwrap_or_else(|| Path::new("."));
+    let text = strip_comments(&text);
+    let name = regex::Regex::new(
+        r"(?i)\bproject\s+([A-Za-z][A-Za-z0-9_.]*)\s+(?:extends\b[^;]*?\s+)?is\b",
+    )
+    .expect("regex")
+    .captures(&text)
+    .map(|caps| caps[1].to_ascii_lowercase());
+    let attribute =
+        regex::Regex::new(r"(?is)\bfor\s+source_dirs\s+use\s*\((.*?)\)\s*;").expect("regex");
+    let mut lists = attribute.captures_iter(&text).peekable();
+    if lists.peek().is_none() {
+        // An abstract project has no sources unless it names some.
+        if gpr_declares_abstract(&text) {
+            return Vec::new();
+        }
+        return base
+            .canonicalize()
+            .map(|dir| vec![(dir, false)])
+            .unwrap_or_default();
+    }
+    let literal = regex::Regex::new(r#"^"([^"]*)"$"#).expect("regex");
+    let mut out = Vec::new();
+    for list in lists {
+        for element in list[1].split(',') {
+            let element = element.trim();
+            if element.is_empty() {
+                continue;
+            }
+            let mut value = String::new();
+            let evaluated = element.split('&').all(|part| {
+                let part = part.trim();
+                if let Some(caps) = literal.captures(part) {
+                    value.push_str(&caps[1]);
+                    true
+                } else if part.eq_ignore_ascii_case("project'name") {
+                    name.as_deref().map(|name| value.push_str(name)).is_some()
+                } else {
+                    false
+                }
+            });
+            if !evaluated {
+                continue;
+            }
+            let (dir, recursive) = match value.strip_suffix("**") {
+                Some(prefix) => (prefix.trim_end_matches('/').to_owned(), true),
+                None => (value, false),
+            };
+            let dir = if dir.is_empty() { ".".to_owned() } else { dir };
+            if let Ok(dir) = base.join(dir).canonicalize() {
+                if !out.iter().any(|(existing, _)| existing == &dir) {
+                    out.push((dir, recursive));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The source directories of the projects `gpr_path` depends on through
+/// `with` ([`withed_project_closure`]), less its own: a unit there is that
+/// project's, and the build compiles it there (#287).
+pub fn withed_project_source_dirs(gpr_path: &Path) -> Vec<(PathBuf, bool)> {
+    let own = project_source_dirs(gpr_path);
+    let mut out: Vec<(PathBuf, bool)> = Vec::new();
+    for project in withed_project_closure(gpr_path) {
+        for (dir, recursive) in project_source_dirs(&project) {
+            let is_own = own.iter().any(|(own_dir, _)| own_dir == &dir);
+            if !is_own && !out.iter().any(|(existing, _)| existing == &dir) {
+                out.push((dir, recursive));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `path` is in one of `dirs` ([`project_source_dirs`]).
+pub fn in_source_dirs(dirs: &[(PathBuf, bool)], path: &Path) -> bool {
+    let Some(parent) = path.parent().and_then(|dir| dir.canonicalize().ok()) else {
+        return false;
+    };
+    dirs.iter()
+        .any(|(dir, recursive)| &parent == dir || (*recursive && parent.starts_with(dir)))
 }
 
 /// Whether `dir` directly contains an Ada source file (`.ads`/`.adb`).
@@ -554,6 +720,109 @@ mod tests {
 
     fn tmp(name: &str) -> crate::test_support::TestDir {
         crate::test_support::TestDir::new(&format!("gpr-{name}"))
+    }
+
+    /// #287: whitakers-words' layout. `Source_Dirs` is `"src/" &
+    /// project'Name`; `commands.gpr` `with`s `words_engine.gpr`, which `with`s
+    /// `support_utils.gpr`; `shared.gpr` is abstract.
+    #[test]
+    fn a_withed_project_closure_and_its_source_dirs_are_read_as_gprbuild_reads_them() {
+        let root = tmp("withed-closure");
+        let project = |name: &str, kind: &str, withs: &[&str]| {
+            let clauses: String = withs
+                .iter()
+                .map(|w| format!("with \"{w}.gpr\";\n"))
+                .collect();
+            std::fs::write(
+                root.join(format!("{name}.gpr")),
+                format!(
+                    "{clauses}{kind}project {name} is\n   for Source_Dirs use (\"src/\" & \
+                     project'Name);  -- one directory per project\nend {name};\n"
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("src").join(name.to_ascii_lowercase())).unwrap();
+        };
+        project("Commands", "", &["shared", "words_engine"]);
+        project("Words_Engine", "library ", &["shared", "support_utils"]);
+        project("Support_Utils", "library ", &["shared"]);
+        std::fs::write(
+            root.join("shared.gpr"),
+            "abstract project Shared is\nend Shared;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tools.gpr"), "project Tools is\nend Tools;\n").unwrap();
+        let canon = |rel: &str| root.join(rel).canonicalize().unwrap();
+        // `with` clauses name `commands`'s file as `Commands.gpr`; on a
+        // case-sensitive file system they resolve as written.
+        std::fs::rename(root.join("Commands.gpr"), root.join("commands.gpr")).unwrap();
+        std::fs::rename(root.join("Words_Engine.gpr"), root.join("words_engine.gpr")).unwrap();
+        std::fs::rename(
+            root.join("Support_Utils.gpr"),
+            root.join("support_utils.gpr"),
+        )
+        .unwrap();
+
+        let commands = root.join("commands.gpr");
+        assert_eq!(
+            withed_project_closure(&commands),
+            [
+                canon("shared.gpr"),
+                canon("support_utils.gpr"),
+                canon("words_engine.gpr")
+            ]
+        );
+        assert_eq!(
+            project_source_dirs(&commands),
+            [(canon("src/commands"), false)]
+        );
+        assert!(project_source_dirs(&root.join("shared.gpr")).is_empty());
+        assert_eq!(
+            project_source_dirs(&root.join("tools.gpr")),
+            [(canon("."), false)]
+        );
+        let elsewhere = withed_project_source_dirs(&commands);
+        assert_eq!(
+            elsewhere,
+            [
+                (canon("src/support_utils"), false),
+                (canon("src/words_engine"), false)
+            ]
+        );
+        std::fs::write(root.join("src/support_utils/x.adb"), "").unwrap();
+        std::fs::write(root.join("src/commands/y.adb"), "").unwrap();
+        assert!(in_source_dirs(
+            &elsewhere,
+            &root.join("src/support_utils/x.adb")
+        ));
+        assert!(!in_source_dirs(
+            &elsewhere,
+            &root.join("src/commands/y.adb")
+        ));
+        // The governing project of a `src/support_utils` source is the one whose
+        // `Source_Dirs` name it.
+        assert_eq!(
+            select_governing_gpr(&root.join("src/support_utils/x.adb"), &root),
+            Some(root.join("support_utils.gpr"))
+        );
+    }
+
+    #[test]
+    fn recursive_and_multi_project_clauses_are_read() {
+        let root = tmp("recursive-dirs");
+        std::fs::create_dir_all(root.join("src/a/deep")).unwrap();
+        std::fs::write(
+            root.join("p.gpr"),
+            "with \"q\", \"r.gpr\";\nproject P is\n   for Source_Dirs use (\"src/**\", \"gen\", Extra);\nend P;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("q.gpr"), "project Q is\nend Q;\n").unwrap();
+        std::fs::write(root.join("r.gpr"), "project R is\nend R;\n").unwrap();
+        let dirs = project_source_dirs(&root.join("p.gpr"));
+        assert_eq!(dirs, [(root.join("src").canonicalize().unwrap(), true)]);
+        std::fs::write(root.join("src/a/deep/z.adb"), "").unwrap();
+        assert!(in_source_dirs(&dirs, &root.join("src/a/deep/z.adb")));
+        assert_eq!(project_with_clauses(&root.join("p.gpr")).len(), 2);
     }
 
     #[test]
