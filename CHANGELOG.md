@@ -2853,6 +2853,12 @@
   when bhf panics.
 
 ### Added
+- The MSan corpus replay covers C++ (#323): a C++ harness's `make msan` builds
+  against the MSan-instrumented libc++ `BHF_MSAN_LIBCXX` names, which the full
+  image builds into `/opt/msan-libcxx`. A run whose MSan runtime stops before
+  it runs the input (a refused re-run with address-space randomization off,
+  as in a container on a kernel with 32 bits of mmap randomization) is run
+  again.
 - `bhf export regression [--lang c|ada]` writes a work dir's harnesses,
   corpora and findings' minimized inputs as a standalone regression suite
   (#339): `run.sh` builds each harness against the scanned tree and fails

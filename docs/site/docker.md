@@ -60,6 +60,9 @@ The builder compiles only the release binaries and Linux shims against Ubuntu
 languages, including .NET 8 SDK, a headless JDK, and Maven.
 Gradle is omitted from the full image; add it to that stage for Gradle-project
 build recovery. The validation helpers use the explicit `validation` target.
+With C++ selected, the image also carries libc++ and libc++abi built with
+MemorySanitizer in `/opt/msan-libcxx` (`BHF_MSAN_LIBCXX`), which the C++ MSan
+replay builds against: see [Sanitizers](../sanitizers/#c-under-the-msan-replay).
 
 | Profile | Included build tools | Executed acceptance |
 |---|---|---|
@@ -365,6 +368,11 @@ and receive their own signatures.
   raise the cap. bhf records an analysis gap when it hits the RSS ceiling.
 - **A language target is skipped** — that toolchain is not installed in your
   scoped image, or the project has no fuzzable entry point in that language.
+- **`MemorySanitizer: CHECK failed: msan_linux.cpp ... ADDR_NO_RANDOMIZE`** —
+  the host's kernel randomizes mmap with 32 bits and the default seccomp
+  profile refuses MSan's re-run with randomization off. bhf retries such a run
+  up to 8 times; to stop it at the source, set `sysctl vm.mmap_rnd_bits=28` on
+  the host.
 - **`bhf cartography` warns that address-space randomization cannot be turned
   off** — the default seccomp profile refuses `personality(2)`, so the bytes
   that set a SEGV's faulting address show as `unknown`. Add

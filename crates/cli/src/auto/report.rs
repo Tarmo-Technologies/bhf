@@ -186,6 +186,7 @@ fn unobservable_classes(
     replay_lanes: &[crate::auto::sanitizer_replay::ReplayLane],
     fuzzed_c: bool,
     fuzzed_cpp: bool,
+    msan_libcxx: bool,
 ) -> Vec<UnobservableClass> {
     use crate::auto::sanitizer_replay::ReplayLane;
     let selected = |sanitizer: Sanitizer| match selection {
@@ -239,8 +240,8 @@ fn unobservable_classes(
             "uninitialized-reads",
             "reads of memory never written",
             replayed(Sanitizer::Msan),
-            false,
-            "--sanitizers msan (C only: C++ MSan needs an instrumented libc++)",
+            replayed(Sanitizer::Msan) && msan_libcxx,
+            "--sanitizers msan (C++ also needs BHF_MSAN_LIBCXX, an MSan-instrumented libc++)",
         ),
         (
             "data-races",
@@ -1813,8 +1814,13 @@ pub fn write_reports_with_output_limit(
                 )
         })
     };
-    summary.unobservable_classes =
-        unobservable_classes(sanitizers, replay_lanes, fuzzed(Lang::C), fuzzed(Lang::Cpp));
+    summary.unobservable_classes = unobservable_classes(
+        sanitizers,
+        replay_lanes,
+        fuzzed(Lang::C),
+        fuzzed(Lang::Cpp),
+        crate::auto::msan::msan_libcxx_available(),
+    );
     let run_json = RunJson {
         schema_version: 1,
         started_at: started_at.to_owned(),
@@ -4247,16 +4253,34 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // The default matrix: ASan, UBSan and LSan in the build, MSan and
-        // TSan replays for C; no CFI, and no MSan or TSan for C++.
+        // TSan replays for C; no CFI, and (without an MSan libc++) no MSan
+        // or TSan for C++.
         assert_eq!(
             names(unobservable_classes(
                 &SanitizerSelection::Default,
                 &[],
                 true,
-                true
+                true,
+                false,
             )),
             [
                 ("uninitialized-reads", vec!["c++"]),
+                ("data-races", vec!["c++"]),
+                ("type-confusion", vec!["c", "c++"]),
+                ("realtime-safety", vec!["c", "c++"]),
+            ]
+        );
+        // With an MSan-instrumented libc++ the C++ harnesses replay under
+        // MSan too (#323).
+        assert_eq!(
+            names(unobservable_classes(
+                &SanitizerSelection::Default,
+                &[],
+                true,
+                true,
+                true,
+            )),
+            [
                 ("data-races", vec!["c++"]),
                 ("type-confusion", vec!["c", "c++"]),
                 ("realtime-safety", vec!["c", "c++"]),
@@ -4268,6 +4292,7 @@ mod tests {
                 &[ReplayLane::Cfi, ReplayLane::Realtime],
                 true,
                 false,
+                false,
             )),
             [
                 ("undefined-behavior", vec!["c"]),
@@ -4275,8 +4300,10 @@ mod tests {
                 ("data-races", vec!["c"]),
             ]
         );
-        assert!(unobservable_classes(&SanitizerSelection::None, &[], false, false).is_empty());
-        let none = unobservable_classes(&SanitizerSelection::None, &[], true, false);
+        assert!(
+            unobservable_classes(&SanitizerSelection::None, &[], false, false, false).is_empty()
+        );
+        let none = unobservable_classes(&SanitizerSelection::None, &[], true, false, false);
         assert_eq!(none.len(), 7);
         assert!(none
             .iter()

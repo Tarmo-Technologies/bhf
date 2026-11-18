@@ -8446,6 +8446,13 @@ const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
     ("CFI", "$(CFI_CXX)", "$(CFI_CXXFLAGS)", true, false),
     ("RTSAN", "$(RTSAN_CXX)", "$(RTSAN_CXXFLAGS)", true, false),
+    (
+        "MSAN",
+        "$(MSAN_CXX)",
+        "$(MSAN_CXXFLAGS) $(MSAN_LIBCXX_FLAGS)",
+        true,
+        false,
+    ),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
     ("WINAFL", "$(CXX)", "$(WINAFL_CXXFLAGS)", true, true),

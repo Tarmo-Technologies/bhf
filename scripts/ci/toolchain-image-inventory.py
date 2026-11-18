@@ -33,6 +33,16 @@ def component(name, version, purl, files, **details):
                            *[{"name": "bhf:" + k, "value": str(v)} for k, v in details.items()]]}
 
 
+def msan_libcxx(root=pathlib.Path("/opt/msan-libcxx")):
+    """The MSan-instrumented libc++, with the LLVM release it was built from."""
+    version = (root / "LLVM_VERSION").read_text().strip()
+    files = {str(path): digest(path) for path in sorted((root / "lib").iterdir())
+             if path.is_file() and not path.is_symlink()}
+    if not files:
+        raise ValueError("the MSan libc++ has no libraries")
+    return component("msan-libcxx", version, f"pkg:generic/llvm-libcxx-msan@{quote(version, safe='')}", files)
+
+
 def rust_component_name(installed_name, rustc_details):
     host = next(line.removeprefix("host: ") for line in rustc_details.splitlines()
                 if line.startswith("host: "))
@@ -61,6 +71,8 @@ def inventory(flavor):
         commands.append(("dotnet-sdk", "dotnet", sdks[0]))
     if languages is None or "rust" in languages:
         commands.append(("rustup", "rustup", output("rustup", "--version").split()[1]))
+    if languages is None or "cpp" in languages:
+        result["components"].append(msan_libcxx())
     for name, command, version in commands:
         path = pathlib.Path(shutil.which(command)).resolve(strict=True)
         ecosystem = "npm" if name == "esbuild" else "generic"

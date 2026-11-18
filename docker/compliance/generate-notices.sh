@@ -30,6 +30,8 @@ COPYLEFT="$OUT/COPYLEFT-SOURCES.txt"
     echo
     echo "Non-dpkg components, all permissive: Rust toolchain (Apache-2.0 OR MIT),"
     echo "esbuild (MIT), SharpFuzz + dnlib (MIT), ASM/asm-tree (BSD-3-Clause),"
+    echo "LLVM libc++ + libc++abi built with MemorySanitizer in /opt/msan-libcxx"
+    echo "(Apache-2.0 WITH LLVM-exception; LICENSE.TXT in /usr/share/bhf/licenses/cpp),"
     echo ".NET SDK from Microsoft's release archive (MIT; LICENSE.txt and"
     echo "ThirdPartyNotices.txt in /usr/share/bhf/licenses/csharp), bhf (Apache-2.0)."
     echo

@@ -4,8 +4,7 @@
 //! that ASan/UBSan do not detect.
 //!
 //! MSan cannot be combined with ASan, so instead of a second fuzz loop bhf
-//! builds a SEPARATE MSan-instrumented binary (`make msan`, C only — the C++ Makefile
-//! has no `msan` target, and C++ MSan needs an instrumented libc++) and replays the
+//! builds a SEPARATE MSan-instrumented binary (`make msan`) and replays the
 //! ASan pass's saved corpus through it. An input that drove a read of uninitialized
 //! memory becomes a BHF-212 runtime finding — so it flows through the same
 //! confirmation/attestation path as any fuzz crash.
@@ -13,7 +12,10 @@
 //! Best-effort and FP-gated: only a report whose FAULTING frame lands in a target
 //! source (not the bhf driver, the C runtime, or a system library) is emitted,
 //! so noise from uninstrumented libc paths is dropped. Missing `make`/corpus, a
-//! failed MSan build, or a C++ harness all skip cleanly.
+//! failed MSan build all skip cleanly. A C++ harness builds only with an
+//! MSan-instrumented libc++ (`BHF_MSAN_LIBCXX`, its install prefix, which the
+//! full image sets, #323): without one its `make msan` fails and it is
+//! skipped.
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -28,7 +30,29 @@ use crate::auto::sanitizer_replay::{ReplayBounds, RunOutcome};
 /// stall the run; the coverage-diverse queue front is what matters for MSan.
 const MAX_INPUTS: usize = 2000;
 
-/// Replay every C harness's corpus through its MSan build, writing a BHF-212 finding
+/// How many times a run whose MSan runtime could not start is retried.
+pub(crate) const MSAN_START_ATTEMPTS: usize = 8;
+
+/// Whether `stderr` is an MSan runtime that stopped before the program ran:
+/// its address-space layout clashed with the shadow (a kernel with 32 bits of
+/// mmap randomization), and the re-exec with randomization off was refused
+/// (a container's seccomp profile refuses `personality(2)`). The layout is
+/// random, so another run usually starts.
+pub(crate) fn msan_could_not_start(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("MemorySanitizer: CHECK failed: msan_linux.cpp")
+        && stderr.contains("ADDR_NO_RANDOMIZE")
+}
+
+/// Whether C++ harnesses have an MSan build here: `BHF_MSAN_LIBCXX` names
+/// the prefix of an MSan-instrumented libc++.
+pub(crate) fn msan_libcxx_available() -> bool {
+    std::env::var_os("BHF_MSAN_LIBCXX")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|prefix| prefix.join("include/c++/v1").is_dir() && prefix.join("lib").is_dir())
+}
+
+/// Replay every C and C++ harness's corpus through its MSan build, writing a BHF-212 finding
 /// per distinct uninitialized-read site, within `bounds`. Returns the number of
 /// findings written.
 pub fn run_msan_replay(work_dir: &Path, bounds: &ReplayBounds) -> usize {
@@ -61,8 +85,9 @@ fn replay_one(
     if !hdir.join("Makefile").is_file() {
         return 0;
     }
-    // Build the MSan variant. C++ harnesses have no `msan` target -> make fails ->
-    // skip. A genuine MSan build error (missing instrumented dep) also skips.
+    // Build the MSan variant. A C++ harness needs BHF_MSAN_LIBCXX, which make
+    // takes from the environment: without it, or on a genuine MSan build error
+    // (a missing instrumented dependency), the harness is skipped.
     let built = crate::command_output::output_with_timeout(
         Command::new("make").arg("msan").current_dir(hdir),
         Duration::from_secs(600),
@@ -108,12 +133,18 @@ fn replay_one(
         // an input past the run timeout hangs under MSan, and a hang is no
         // uninitialized read.
         let run_started = Instant::now();
-        let run = crate::command_output::output_with_timeout_flagged(
-            crate::auto::sanitizer_replay::replay_command(&bin)
-                .arg(&path)
-                .env("MSAN_OPTIONS", "halt_on_error=1:exitcode=86:print_stats=0"),
-            bounds.run_timeout,
-        );
+        let mut run = Err(std::io::Error::other("not run"));
+        for _ in 0..MSAN_START_ATTEMPTS {
+            run = crate::command_output::output_with_timeout_flagged(
+                crate::auto::sanitizer_replay::replay_command(&bin)
+                    .arg(&path)
+                    .env("MSAN_OPTIONS", "halt_on_error=1:exitcode=86:print_stats=0"),
+                bounds.run_timeout,
+            );
+            if !matches!(&run, Ok((out, false)) if msan_could_not_start(&out.stderr)) {
+                break;
+            }
+        }
         let elapsed = run_started.elapsed();
         let out = match run {
             Ok((out, false)) => {
@@ -328,6 +359,17 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_msan_runtime_refused_its_aslr_reexec_could_not_start() {
+        let refused = b"MemorySanitizer: CHECK failed: msan_linux.cpp:192 \"((personality(old_personality | ADDR_NO_RANDOMIZE))) != ((-1))\" (0xffffffffffffffff, 0xffffffffffffffff) (tid=301)\n    <empty stack>\n";
+        assert!(msan_could_not_start(refused));
+        // A report of the program's own read is a result, not a failed start.
+        assert!(!msan_could_not_start(
+            b"==7==WARNING: MemorySanitizer: use-of-uninitialized-value\n    #0 0x5 in main m.c:1\n"
+        ));
+        assert!(!msan_could_not_start(b""));
+    }
 
     #[test]
     fn parses_first_target_frame_skipping_scaffolding() {

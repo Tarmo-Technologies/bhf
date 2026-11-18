@@ -8061,9 +8061,45 @@ fn signal_for_stack(_child: &mut std::process::Child, _grace: Duration) {}
 
 /// Run `harness_path <input_path>` with a wall-clock timeout. On
 /// timeout, kill the process and return a synthetic exit status plus
-/// a marker on stderr so the caller can distinguish hang-vs-crash.
+/// a marker on stderr so the caller can distinguish hang-vs-crash. A run
+/// whose MSan runtime could not start (see
+/// [`crate::auto::msan::msan_could_not_start`]) never ran the input, and is
+/// run again.
 #[allow(clippy::too_many_arguments)]
 fn run_with_timeout(
+    harness_path: &Path,
+    input_path: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+    scratch: &Path,
+    rss_limit_mb: usize,
+    qemu_prefix: Option<(&Path, &[String])>,
+    tweaks: SpawnTweaks<'_>,
+) -> Result<std::process::Output, String> {
+    let mut attempt = 1;
+    loop {
+        let output = run_with_timeout_once(
+            harness_path,
+            input_path,
+            timeout,
+            extra_env,
+            scratch,
+            rss_limit_mb,
+            qemu_prefix,
+            tweaks,
+        )?;
+        if attempt == crate::auto::msan::MSAN_START_ATTEMPTS
+            || !crate::auto::msan::msan_could_not_start(&output.stderr)
+        {
+            return Ok(output);
+        }
+        attempt += 1;
+    }
+}
+
+/// One run of [`run_with_timeout`].
+#[allow(clippy::too_many_arguments)]
+fn run_with_timeout_once(
     harness_path: &Path,
     input_path: &Path,
     timeout: Duration,

@@ -86,7 +86,7 @@ def main():
 
 
 def reconcile_tools(sbom, tools, flavor, languages=None):
-    expected = {"node", "esbuild", "go", "dotnet-sdk", "rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"} if flavor == "runtime" else set()
+    expected = {"node", "esbuild", "go", "dotnet-sdk", "msan-libcxx", "rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"} if flavor == "runtime" else set()
     if languages is not None:
         if tools.get("languages") != languages or not languages:
             raise ValueError("mismatched selected language inventory")
@@ -95,6 +95,7 @@ def reconcile_tools(sbom, tools, flavor, languages=None):
         if "typescript" in languages: expected.add("esbuild")
         if "go" in languages: expected.add("go")
         if "csharp" in languages: expected.add("dotnet-sdk")
+        if "cpp" in languages: expected.add("msan-libcxx")
         if "rust" in languages: expected.update({"rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"})
     components = tools["components"]
     if tools["flavor"] != flavor or {c["name"] for c in components} != expected:
