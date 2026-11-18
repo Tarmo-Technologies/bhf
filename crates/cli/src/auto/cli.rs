@@ -3375,7 +3375,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // Compiled-lane line coverage for negative confirmation: build a source-coverage
     // variant of each C/C++ harness and replay the corpus to learn which lines the
     // campaign executed (the interpreted lanes get this from their tracers directly).
-    let coverage = crate::auto::coverage_replay::run_coverage_replay(&work);
+    let coverage = crate::auto::coverage_replay::run_coverage_replay(&work, Some(&path));
     if coverage.harnesses > 0 {
         // Report the fraction, not a bare popcount: "589 lines" is
         // uninterpretable without knowing whether the target has 2,000 or
@@ -3383,7 +3383,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         match coverage.fraction() {
             Some(fraction) => bhfeprintln!(
                 "bhf auto: line coverage {}/{} ({:.1}%) across {} harness(es) \
-                 (covered-lines.txt + coverage-summary.json per harness)",
+                 (covered-lines.txt + coverage-summary.json per harness; reports in \
+                 results/coverage/)",
                 coverage.covered_lines,
                 coverage.instrumented_lines,
                 fraction * 100.0,

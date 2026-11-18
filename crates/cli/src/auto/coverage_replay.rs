@@ -12,6 +12,11 @@
 //! `confirm::mark_fuzz_exercised_findings` marks a C/C++ static finding whose line
 //! the campaign PROVABLY executed (yet never crashed) as `fuzz_exercised`.
 //!
+//! The same replay writes the user's coverage report (#308) to
+//! `results/coverage/<harness>/`: `lcov.info`, an HTML report under `html/`, and a
+//! per-function table (`functions.txt`, `functions.json`), each cut to the files
+//! under the sweep's source root, without bhf's harness and runtime.
+//!
 //! Best-effort: a missing `llvm-cov`/`llvm-profdata`, a failed coverage build, or an
 //! empty corpus all skip cleanly. Never fatal.
 
@@ -246,8 +251,10 @@ impl CoverageTotals {
 
 /// Build + replay every C/C++ harness's corpus under source coverage, writing each
 /// harness's executed `(file:line)` set to `<harness>/covered-lines.txt` and its
-/// covered/instrumented counts to `coverage-summary.json`. Returns the totals.
-pub fn run_coverage_replay(work_dir: &Path) -> CoverageTotals {
+/// covered/instrumented counts to `coverage-summary.json`, and its report to
+/// `results/coverage/<harness>/` ([`write_coverage_report`]), cut to the files
+/// under `source_root`. Returns the totals.
+pub fn run_coverage_replay(work_dir: &Path, source_root: Option<&Path>) -> CoverageTotals {
     let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
         return CoverageTotals::default();
     };
@@ -266,10 +273,9 @@ pub fn run_coverage_replay(work_dir: &Path) -> CoverageTotals {
         else {
             continue;
         };
-        if let Some((covered, instrumented)) = llvm_tools
-            .as_ref()
-            .and_then(|(profdata, cov)| replay_one(work_dir, &hdir, &harness_id, profdata, cov))
-        {
+        if let Some((covered, instrumented)) = llvm_tools.as_ref().and_then(|(profdata, cov)| {
+            replay_one(work_dir, &hdir, &harness_id, profdata, cov, source_root)
+        }) {
             totals.harnesses += 1;
             totals.covered_lines += covered;
             totals.instrumented_lines += instrumented;
@@ -304,6 +310,7 @@ fn replay_one(
     harness_id: &str,
     profdata: &str,
     cov: &str,
+    source_root: Option<&Path>,
 ) -> Option<(usize, usize)> {
     if !hdir.join("Makefile").is_file() {
         return None;
@@ -477,6 +484,18 @@ fn replay_one(
     let covered = measurement.covered;
     let instrumented = measurement.instrumented;
     let _ = std::fs::remove_dir_all(&prof_dir);
+    write_coverage_report(
+        &ReportInputs {
+            work_dir,
+            hdir,
+            harness_id,
+            source_root,
+            cov,
+            profile: &merged,
+            binary: &bin,
+        },
+        &export_text,
+    );
     if covered.is_empty() {
         return None;
     }
@@ -1422,6 +1441,199 @@ fn parse_lcov_kept(lcov: &str, keep: &dyn Fn(&str) -> bool) -> LcovMeasurement {
     }
 }
 
+/// What [`write_coverage_report`] reads besides the export.
+struct ReportInputs<'a> {
+    work_dir: &'a Path,
+    hdir: &'a Path,
+    harness_id: &'a str,
+    source_root: Option<&'a Path>,
+    cov: &'a str,
+    profile: &'a Path,
+    binary: &'a Path,
+}
+
+/// One function of the per-function table (#308).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FunctionCoverage {
+    function: String,
+    file: String,
+    line: u64,
+    /// How many times it was entered, over the replayed corpus.
+    calls: u64,
+    /// Its instrumented lines the corpus executed, and all of them: the
+    /// lines from its first to the next function's in the file.
+    lines_covered: usize,
+    lines_instrumented: usize,
+}
+
+/// The files of `lcov` that the report keeps: the project's own, under
+/// `source_root` when there is one.
+fn report_files(lcov: &str, hdir: &Path, source_root: Option<&Path>) -> Vec<String> {
+    let harnesses = hdir.parent().unwrap_or(hdir);
+    let root = source_root.and_then(|root| root.canonicalize().ok());
+    let mut files: Vec<String> = lcov
+        .lines()
+        .filter_map(|line| line.strip_prefix("SF:"))
+        .map(|file| file.trim().to_owned())
+        .filter(|file| !is_bhf_scaffolding(file, harnesses))
+        .filter(|file| {
+            root.as_ref().is_none_or(|root| {
+                Path::new(file)
+                    .canonicalize()
+                    .is_ok_and(|path| path.starts_with(root))
+            })
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The records of `lcov` for `files`, each from its `SF:` to its
+/// `end_of_record`.
+fn lcov_for_files(lcov: &str, files: &[String]) -> String {
+    let mut out = String::new();
+    let mut keep = false;
+    for line in lcov.lines() {
+        if line == "TN:" || line.starts_with("TN:") {
+            continue;
+        }
+        if let Some(file) = line.strip_prefix("SF:") {
+            keep = files.iter().any(|kept| kept == file.trim());
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if line == "end_of_record" {
+            keep = false;
+        }
+    }
+    out
+}
+
+/// The per-function table of `lcov`'s `FN`, `FNDA` and `DA` records.
+fn function_table(lcov: &str) -> Vec<FunctionCoverage> {
+    let mut table = Vec::new();
+    let mut file = String::new();
+    let mut starts: Vec<(u64, String)> = Vec::new();
+    let mut calls: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut lines: Vec<(u64, u64)> = Vec::new();
+    let mut flush = |file: &str,
+                     starts: &mut Vec<(u64, String)>,
+                     calls: &mut std::collections::HashMap<String, u64>,
+                     lines: &mut Vec<(u64, u64)>| {
+        starts.sort();
+        for (index, (start, name)) in starts.iter().enumerate() {
+            let end = starts.get(index + 1).map_or(u64::MAX, |(next, _)| *next);
+            let span: Vec<&(u64, u64)> = lines
+                .iter()
+                .filter(|(line, _)| (*start..end).contains(line))
+                .collect();
+            table.push(FunctionCoverage {
+                function: name.clone(),
+                file: file.to_owned(),
+                line: *start,
+                calls: calls.get(name).copied().unwrap_or(0),
+                lines_covered: span.iter().filter(|(_, hits)| *hits > 0).count(),
+                lines_instrumented: span.len(),
+            });
+        }
+        starts.clear();
+        calls.clear();
+        lines.clear();
+    };
+    for line in lcov.lines() {
+        if let Some(rest) = line.strip_prefix("SF:") {
+            file = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("FN:") {
+            if let Some((start, name)) = rest.split_once(',') {
+                if let Ok(start) = start.trim().parse() {
+                    starts.push((start, name.trim().to_owned()));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("FNDA:") {
+            if let Some((count, name)) = rest.split_once(',') {
+                let count = count.trim().parse().unwrap_or(0);
+                *calls.entry(name.trim().to_owned()).or_default() += count;
+            }
+        } else if let Some(rest) = line.strip_prefix("DA:") {
+            let mut parts = rest.split(',');
+            if let (Some(Ok(number)), Some(hits)) =
+                (parts.next().map(|n| n.trim().parse()), parts.next())
+            {
+                lines.push((number, hits.trim().parse().unwrap_or(0)));
+            }
+        } else if line == "end_of_record" {
+            flush(&file, &mut starts, &mut calls, &mut lines);
+        }
+    }
+    table
+}
+
+/// Write the harness's coverage report to `results/coverage/<harness>/`
+/// (#308): `lcov.info`, the export cut to the project's files under the
+/// source root; `html/`, llvm-cov's line-level report of them;
+/// `functions.txt`, llvm-cov's per-function table; and `functions.json`, each
+/// function's calls and lines. Best-effort: a report llvm-cov cannot render is
+/// left out and said in the harness's diagnostic.
+fn write_coverage_report(inputs: &ReportInputs, lcov: &str) {
+    let files = report_files(lcov, inputs.hdir, inputs.source_root);
+    if files.is_empty() {
+        return;
+    }
+    let dir = corpus::layout::results_dir(inputs.work_dir)
+        .join("coverage")
+        .join(inputs.harness_id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let lcov = lcov_for_files(lcov, &files);
+    let _ = std::fs::write(dir.join("lcov.info"), &lcov);
+    let mut table = function_table(&lcov);
+    table.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    if let Ok(json) = serde_json::to_string_pretty(&table) {
+        let _ = std::fs::write(dir.join("functions.json"), json + "\n");
+    }
+    let llvm_cov = |subcommand: &str| {
+        let mut command = Command::new(inputs.cov);
+        command
+            .arg(subcommand)
+            .arg(format!("-instr-profile={}", inputs.profile.display()))
+            .arg(inputs.binary);
+        if let Some(demangler) = llvm_tool("llvm-cxxfilt") {
+            command.arg(format!("-Xdemangler={demangler}"));
+        }
+        command.args(&files);
+        command
+    };
+    let mut failures = Vec::new();
+    let mut show = llvm_cov("show");
+    show.args(["-format=html", "-show-line-counts-or-regions"])
+        .arg(format!("-output-dir={}", dir.join("html").display()));
+    match crate::command_output::output_with_timeout(&mut show, Duration::from_secs(300)) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => failures.push(format!("llvm-cov show: {}", diagnostic_tail(&out.stderr))),
+        Err(error) => failures.push(format!("llvm-cov show: {error}")),
+    }
+    let mut report = llvm_cov("report");
+    report.arg("-show-functions");
+    match crate::command_output::output_with_timeout(&mut report, Duration::from_secs(300)) {
+        Ok(out) if out.status.success() => {
+            let _ = std::fs::write(dir.join("functions.txt"), &out.stdout);
+        }
+        Ok(out) => failures.push(format!("llvm-cov report: {}", diagnostic_tail(&out.stderr))),
+        Err(error) => failures.push(format!("llvm-cov report: {error}")),
+    }
+    if !failures.is_empty() {
+        write_coverage_diagnostic(
+            inputs.hdir,
+            &format!("coverage report incomplete:\n{}\n", failures.join("\n")),
+        );
+    }
+}
+
 fn lcov_line_file(line: &str) -> Option<&str> {
     line.rsplit_once(':').map(|(file, _)| file)
 }
@@ -1444,6 +1656,55 @@ fn llvm_tool(base: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report's lcov keeps the source root's files, and its function
+    /// table counts each function's calls and the lines up to the next one.
+    #[test]
+    fn the_report_keeps_the_projects_files_and_tables_each_function() {
+        let root = crate::test_support::TestDir::new("coverage-report-unit");
+        let src = root.join("src");
+        let harness = root.join("work/harnesses/H-1");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&harness).unwrap();
+        let parse = src.join("parse.c");
+        std::fs::write(&parse, "").unwrap();
+        let elsewhere = root.join("vendor.c");
+        std::fs::write(&elsewhere, "").unwrap();
+        let lcov = format!(
+            "SF:{}\nFN:2,parse\nFN:9,unused\nFNDA:4,parse\nFNDA:0,unused\n\
+             DA:3,4\nDA:4,0\nDA:10,0\nend_of_record\n\
+             SF:{}\nFN:1,vendor\nDA:1,1\nend_of_record\n\
+             SF:{}\nFN:1,main\nDA:1,1\nend_of_record\n",
+            parse.display(),
+            elsewhere.display(),
+            harness.join("main.c").display()
+        );
+        let files = report_files(&lcov, &harness, Some(&src));
+        assert_eq!(files, vec![parse.display().to_string()]);
+        let kept = lcov_for_files(&lcov, &files);
+        assert_eq!(kept.matches("SF:").count(), 1, "{kept}");
+        assert_eq!(
+            function_table(&kept),
+            vec![
+                FunctionCoverage {
+                    function: "parse".to_owned(),
+                    file: parse.display().to_string(),
+                    line: 2,
+                    calls: 4,
+                    lines_covered: 1,
+                    lines_instrumented: 2,
+                },
+                FunctionCoverage {
+                    function: "unused".to_owned(),
+                    file: parse.display().to_string(),
+                    line: 9,
+                    calls: 0,
+                    lines_covered: 0,
+                    lines_instrumented: 1,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn lcov_export_yields_only_executed_lines() {

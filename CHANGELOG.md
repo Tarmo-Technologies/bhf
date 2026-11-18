@@ -2839,6 +2839,11 @@
   when bhf panics.
 
 ### Added
+- `bhf auto` writes each C/C++ harness's coverage report to
+  `results/coverage/<id>/` (#308): `lcov.info`, llvm-cov's HTML report under
+  `html/`, and a per-function table (`functions.txt` from
+  `llvm-cov report -show-functions`, `functions.json` with each function's
+  calls and lines), all cut to the files under the sweep's root.
 - Board profiles (#293): `bhf fuzz --board-profile board.toml` takes
   `--target-transport` and `--transport-coverage-map` from a TOML file of one
   board's specs, its debug-probe lane (`gdb`, `coverage_map`) or, with

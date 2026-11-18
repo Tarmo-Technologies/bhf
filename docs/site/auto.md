@@ -458,6 +458,21 @@ C runtime's `bhf_*` headers are left out. The summary's `Coverage: N edges
 (the most any one target reached)` is the largest edge count of one target,
 not a total, since each target has its own edge map.
 
+The same replay writes each harness's coverage report to
+`results/coverage/<id>/`, about the files under the sweep's root only:
+
+- `lcov.info` — the line and function records, for `genhtml`, an IDE or a CI
+  coverage service;
+- `html/index.html` — llvm-cov's report, each file with its line counts;
+- `functions.txt` — llvm-cov's per-function table (regions, lines and branches
+  covered), and `functions.json`, each function's file, line, calls over the
+  corpus, and its instrumented and covered lines.
+
+A function the table shows with no calls is one the campaign never reached.
+The report needs `llvm-cov` and `llvm-profdata` (or their `-18` names), as the
+replay does; a part llvm-cov cannot render is left out, and
+`harnesses/<id>/coverage-replay-diagnostic.txt` says why.
+
 ## Running a harness under another fuzzer
 
 The generated native harnesses (C, C++, Rust, Ada) are self-contained: the
@@ -710,6 +725,7 @@ JavaScript/TypeScript drivers' own sink checks) or `off`, with the reason.
     ├── findings.sarif
     ├── manifest.json                           # what each file holds, with digests
     ├── attestation.json
+    ├── coverage/<harness-id>/                  # lcov.info, html/, functions.*, blockers.* (when the coverage replay ran)
     └── findings/<finding-id>/                  # finding.json, testcase.bin, replay.py, ...
 ```
 
