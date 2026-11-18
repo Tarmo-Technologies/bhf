@@ -15,6 +15,8 @@ current bhf drives.
       --all-lanes --run-untrusted
   BHF_BIN=... go1_rerun.py results-0728 results-1118-c3 --lang c --class C-3 --all-lanes
   BHF_BIN=... go1_rerun.py results-0728 results-1118-py2 --lang python --class Py-2 --all-lanes
+  BHF_BIN=... go1_rerun.py results-0728 results-1118-ada3 --lang ada --class Ada-3
+  BHF_BIN=... go1_rerun.py results-0728 results-1118-ada4 --lang ada --class Ada-4
   BHF_BIN=... go1_rerun.py results-0728 results-1118-js2 --lang javascript --class JS-2 \\
       --all-lanes
 
@@ -125,8 +127,24 @@ def python_class(target):
     return outcome or "other"
 
 
+def ada_class(target):
+    """The expected-gaps.md class of an Ada target's outcome."""
+    outcome = target.get("outcome") or ""
+    reason = target.get("reason") or ""
+    if outcome == "built_and_fuzzed":
+        return "built and fuzzed"
+    if "cannot belong to several projects" in reason:
+        return "Ada-3 unit of several projects"
+    if "predefined unit depends on itself" in reason or "s-stalib.adb\" must be compiled" in reason:
+        return "Ada-4 predefined unit shadowed"
+    if outcome == "failed_build":
+        return "failed build"
+    return outcome or "other"
+
+
 # Per language: its source suffixes and its classifier.
 LANGS = {
+    "ada": ((".ads", ".adb"), ada_class),
     "python": (".py", python_class),
     "c": ((".c", ".h"), c_class),
     "go": (".go", go_class),
@@ -149,7 +167,16 @@ def wanted_targets(
     for path in sorted(before.glob("*.json" if all_lanes else f"{lang}__*.json")):
         row = json.loads(path.read_text())
         auto = (row.get("surfaces") or {}).get("auto") or {}
+        # A failed build without a reason (the July rows' Ada targets) is given
+        # the cause most of the row's failed builds have in its blocker
+        # histogram.
+        failed = sorted(
+            (b for b in auto.get("blockers") or [] if b.get("category") == "failed_build"),
+            key=lambda b: -(b.get("count") or 0),
+        )
         for t in auto.get("targets") or []:
+            if t.get("outcome") == "failed_build" and not t.get("reason") and failed:
+                t = {**t, "reason": failed[0].get("detail") or ""}
             if str(t.get("source", "")).endswith(suffix) and classify(t).startswith(klass):
                 key = (t["source"], t["name"])
                 wanted.setdefault(path.name, (row, collections.Counter()))[1][key] += 1

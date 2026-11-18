@@ -183,9 +183,16 @@ What is left to try: build purely from the staged sources without `extends`
 instrumentation on exactly those units). Both are trade-offs, so measure the
 built count before choosing.
 
-### Ada-4. `predefined unit depends on itself` — 9 — **GAP**
+### Ada-4. `predefined unit depends on itself` — 9 — **[FIXED]**
 
-Same family: a staged copy of a predefined unit shadows the real one.
+Same family: a staged copy of a predefined unit shadowed the real one. A tree
+that vendors its own GNAT runtime (`Ada`, `System`, `Interfaces`, `GNAT` and
+their children) had those units staged and compiled in place of the host
+compiler's, which they do not match. They are now left to the compiler's
+runtime (#356). Re-running the sweep's 9 Ada-4 targets (8 subprograms, all in
+one freestanding kernel) built all 8 and fuzzed 7; the eighth builds, but no
+input reached it. See
+[the re-run](validation/2026-11-18-ada4-vendored-runtime.md).
 
 ### Ada-5. `named type X is not declared in the parsed source set` — ~10 — **GAP**
 

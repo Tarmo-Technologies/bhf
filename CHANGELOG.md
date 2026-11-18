@@ -70,6 +70,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada tree that vendors GNAT predefined units builds against the host
+  runtime (#356). A zero-footprint runtime ships its own `ada.ads`,
+  `system.ads` and `s-*`, `a-*`, `i-*`, `g-*` units, and a staged copy shadowed
+  the runtime's own: the build stopped with `predefined unit depends on itself`
+  or `"s-stalib.adb" must be compiled`. A source that declares a unit under
+  `Ada`, `System`, `Interfaces` or `GNAT`, or one with a runtime file name that
+  does not parse, is not staged, and the run's log names each one left out.
 - A C function whose storage class is spelled through a macro builds (#415).
   Under zlib's `#define local static`, `local unsigned read_buf(...)` was
   declared `extern local unsigned` in the harness, which is `extern static`,
