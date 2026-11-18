@@ -66,6 +66,18 @@ pub fn split_replay_lanes(values: &[String]) -> (Vec<String>, Vec<ReplayLane>) {
 /// The longest one replayed input may run, whatever `--timeout` says.
 pub(crate) const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The command that replays one input on the sanitizer build `bin`, its
+/// symbolizer kept off the network. On stock Ubuntu `DEBUGINFOD_URLS` names a
+/// server, and the symbolizer then fetches debug info for every report: that
+/// took seconds here and, on a CI runner, longer than the run's timeout, so
+/// the report counted as a hang and was no finding. Local symbolization still
+/// names the target's frames.
+pub(crate) fn replay_command(bin: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    command.env("DEBUGINFOD_URLS", "");
+    command
+}
+
 /// The file every replayed run is logged to, under the work dir.
 pub(crate) const REPLAY_LOG: &str = "auto/sanitizer-replay.jsonl";
 
@@ -190,6 +202,19 @@ fn digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replay_does_not_ask_a_debuginfod_server() {
+        let command = replay_command(Path::new("/w/main_rtsan"));
+        let set: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            set,
+            [(
+                std::ffi::OsStr::new("DEBUGINFOD_URLS"),
+                Some(std::ffi::OsStr::new(""))
+            )]
+        );
+    }
 
     /// #297: `cfi` leaves `--sanitizers` as a replay lane, once, and the rest
     /// stays the fuzzed build's matrix in its order.

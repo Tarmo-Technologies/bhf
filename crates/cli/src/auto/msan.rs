@@ -109,7 +109,7 @@ fn replay_one(
         // uninitialized read.
         let run_started = Instant::now();
         let run = crate::command_output::output_with_timeout_flagged(
-            Command::new(&bin)
+            crate::auto::sanitizer_replay::replay_command(&bin)
                 .arg(&path)
                 .env("MSAN_OPTIONS", "halt_on_error=1:exitcode=86:print_stats=0"),
             bounds.run_timeout,
