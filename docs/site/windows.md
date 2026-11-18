@@ -742,8 +742,13 @@ cmplog, and ASan all work natively on Windows.
   build on native Windows yet; run it under WSL/Linux. The Fortran lane's
   crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC, the
   Windows gfortran, ships no sanitizer runtime; run it under WSL/Linux.
-- Java, Python, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently
-  emit POSIX `main` launchers even though discovery is portable. Run those lanes
+- The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
+  or `python3`). Its `main` is a POSIX launcher, so it also writes
+  `main.launch.json` beside it: the interpreter, the driver and the environment
+  the launcher sets, which the engine, `bhf replay` and `bhf minimize` run on
+  Windows in its place.
+- Java, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently emit
+  POSIX `main` launchers even though discovery is portable. Run those lanes
   under WSL/Linux for now; installing only the interpreter/JDK on native Windows
   is not sufficient.
 - On native Windows `bhf auto` refuses the lanes that run under WSL (those

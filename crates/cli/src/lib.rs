@@ -46,6 +46,7 @@ mod capsule;
 mod cartography;
 pub mod ci;
 pub(crate) mod ci_regression;
+pub(crate) mod launch_spec;
 mod clean;
 mod cmplog_cli;
 mod collector_run;

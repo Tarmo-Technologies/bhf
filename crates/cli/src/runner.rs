@@ -37,6 +37,14 @@ pub(crate) fn harness_runner_for(
     sandbox_tool: Option<PathBuf>,
     sandbox_strict: bool,
 ) -> Result<HarnessRunner, String> {
+    // An interpreted lane's harness on a host that cannot run its launcher
+    // (#305): its interpreter, from the launch spec beside it.
+    if qemu_user.is_none() {
+        if let Some(launch) = crate::launch_spec::launch_for(&harness) {
+            let sandbox = sandbox_config(sandbox, sandbox_tool, sandbox_strict);
+            return Ok(HarnessRunner::launched(harness, launch).with_sandbox(sandbox));
+        }
+    }
     let wrapper = match qemu_user {
         Some(exe) => Some(HarnessWrapper::QemuUser {
             exe,

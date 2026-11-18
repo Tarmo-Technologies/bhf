@@ -285,10 +285,6 @@ def _walk(data, depth):
 /// A Python capsule round-trips; verify-poc names the interpreter it needs
 /// when that is missing.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Python runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn python_finding_round_trips_and_names_a_missing_interpreter() {
     skip_unless!(runs("python3", &["--version"]), "python3 not installed");
     let run = Run::new(&[("record_parser.py", PYTHON_TARGET)]);

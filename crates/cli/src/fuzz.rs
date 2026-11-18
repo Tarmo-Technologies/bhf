@@ -8084,7 +8084,16 @@ fn run_with_timeout(
             replay_min::process::disable_core_dumps(&mut cmd);
             cmd
         }
-        None => std::process::Command::new(harness_path),
+        // An interpreted lane's harness where its launcher cannot run (#305).
+        None => match crate::launch_spec::launch_for(harness_path) {
+            Some(launch) => {
+                let mut cmd = std::process::Command::new(&launch.program);
+                cmd.args(&launch.args);
+                cmd.envs(launch.env.iter().map(|(key, value)| (key, value)));
+                cmd
+            }
+            None => std::process::Command::new(harness_path),
+        },
     };
     timeout_cmd
         .current_dir(scratch)

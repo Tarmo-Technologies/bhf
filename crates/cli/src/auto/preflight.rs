@@ -224,7 +224,6 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
 pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
     match lang {
         Lang::Java
-        | Lang::Python
         | Lang::Perl
         | Lang::CSharp
         | Lang::Js
@@ -237,7 +236,9 @@ pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
             "its crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC ships no \
              sanitizer runtime",
         ),
-        Lang::Ada | Lang::C | Lang::Cpp | Lang::Go | Lang::Cobol => None,
+        // Python runs from its launch spec where its shell launcher cannot
+        // (#305).
+        Lang::Ada | Lang::C | Lang::Cpp | Lang::Go | Lang::Cobol | Lang::Python => None,
     }
 }
 
@@ -521,7 +522,6 @@ mod tests {
     fn the_lanes_that_run_under_wsl_on_windows_are_refused_with_the_reason() {
         let wsl = [
             Lang::Java,
-            Lang::Python,
             Lang::Perl,
             Lang::CSharp,
             Lang::Js,
@@ -557,11 +557,10 @@ mod tests {
         assert!(wsl_refusal(Lang::Fortran)
             .unwrap()
             .contains("MinGW-w64's GCC ships no sanitizer runtime"));
-        // Only native Windows refuses them.
-        assert_eq!(
-            native_windows_refusal(Lang::Python).is_some(),
-            cfg!(windows)
-        );
+        // Only native Windows refuses them; Python runs there from its
+        // launch spec (#305).
+        assert_eq!(native_windows_refusal(Lang::Perl).is_some(), cfg!(windows));
+        assert_eq!(native_windows_refusal(Lang::Python), None);
         assert_eq!(native_windows_refusal(Lang::Go), None);
     }
 

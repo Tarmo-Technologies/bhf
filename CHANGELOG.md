@@ -2853,6 +2853,12 @@
   when bhf panics.
 
 ### Added
+- The Python lane runs on native Windows (#305). Beside its POSIX `main`
+  launcher it writes `main.launch.json` (the interpreter, the driver and the
+  environment), which the harness runner execs directly where the launcher
+  cannot run; `PYTHONPATH` takes the host's separator and the coverage map is
+  mapped without `MAP_SHARED` there. `BHF_LAUNCH_SPEC=1` runs a harness from
+  its launch spec on any host.
 - A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
   report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
   write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's
