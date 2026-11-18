@@ -39,7 +39,11 @@ enum Distinct {
     Lacks(&'static str),
 }
 
-const PYTHON_TOOLS: &[Toolchain] = &[Toolchain::new("PYTHON", "python3", "runs the harness")];
+/// Python is `python3` on a POSIX host, and often only `python` on Windows.
+const PYTHON_TOOLS: &[Toolchain] = &[Toolchain {
+    fallbacks: &["python"],
+    ..Toolchain::new("PYTHON", "python3", "runs the harness")
+}];
 const NODE_TOOLS: &[Toolchain] = &[Toolchain::new("NODE", "node", "runs the harness")];
 const RUBY_TOOLS: &[Toolchain] = &[Toolchain::new("RUBY", "ruby", "runs the harness")];
 const PERL_TOOLS: &[Toolchain] = &[Toolchain::new("PERL", "perl", "runs the harness")];

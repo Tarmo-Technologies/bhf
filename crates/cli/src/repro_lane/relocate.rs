@@ -444,17 +444,22 @@ impl Relocator {
 /// host that runs it, or stopping with what is missing. The message is one
 /// single-quoted word, so a purpose that shows a command (`` `cargo
 /// +nightly` ``) or a `$` is printed, never run or expanded.
+///
+/// A name found only as one of Windows' app execution aliases (the
+/// `WindowsApps` stub that sends `python3` to the Microsoft Store when no
+/// such Python is installed) is not the program: the next name is tried.
 pub(crate) fn resolve_tool(var: &str, toolchain: &Toolchain) -> String {
     let env = toolchain.env_var;
-    let mut lookups = vec![format!(
-        "command -v \"${{{env}:-{}}}\"",
+    let found = |name: String| format!("command -v {name} | grep -iv '/WindowsApps/'");
+    let mut lookups = vec![found(format!(
+        "\"${{{env}:-{}}}\"",
         super::sh_double_quoted(toolchain.default)
-    )];
+    ))];
     lookups.extend(
         toolchain
             .fallbacks
             .iter()
-            .map(|name| format!("command -v {}", super::sh_word(name))),
+            .map(|name| found(super::sh_word(name))),
     );
     let message = format!(
         "build.sh: needs {} (or ${env}): it {}",
@@ -747,6 +752,49 @@ mod tests {
         }
     }
 
+    /// A name that resolves only to a Windows app execution alias (the
+    /// Microsoft Store's `python3` stub) gives way to the next name.
+    #[cfg(unix)]
+    #[test]
+    fn an_app_execution_alias_is_not_the_tool() {
+        const TOOL: Toolchain = Toolchain {
+            env_var: "BHF_WIDGET_TOOL",
+            default: "widget-tool3",
+            fallbacks: &["widget-tool"],
+            purpose: "runs the harness",
+            version_args: &["--version"],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("AppData/Local/Microsoft/WindowsApps");
+        let real = root.path().join("bin");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for program in [alias.join("widget-tool3"), real.join("widget-tool")] {
+            std::fs::write(&program, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let snippet = format!(
+            "{}printf '%s\\n' \"$TOOL_WIDGET\"",
+            resolve_tool("TOOL_WIDGET", &TOOL)
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env_remove("BHF_WIDGET_TOOL")
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", alias.display(), real.display()),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            real.join("widget-tool").display().to_string()
+        );
+    }
+
     #[cfg(unix)]
     fn relocator(work: &Path, tree: &Path) -> Relocator {
         Relocator {
@@ -803,7 +851,10 @@ mod tests {
             Some("sources/parser.js")
         );
         let stray = format!("{}/work/other.txt\n", resolved.display());
-        assert!(r.rewrite(&stray).is_err(), "the work dir by its resolved name");
+        assert!(
+            r.rewrite(&stray).is_err(),
+            "the work dir by its resolved name"
+        );
     }
 
     /// A path is rewritten only as a whole name: `/t/src` does not touch
