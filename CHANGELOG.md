@@ -2853,6 +2853,13 @@
   when bhf panics.
 
 ### Added
+- The Rust lane runs on native Windows (#326): the harness crate builds as
+  an MSVC staticlib with SanitizerCoverage, AddressSanitizer and the static
+  CRT, and clang links it with the driver and the system libraries rustc's
+  `native-static-libs` note names. The harness sets ASan's
+  `windows_hook_rtl_allocators=1` default, since Rust's allocator calls the
+  Windows heap directly. A Rust capsule's `build.sh` rebuilds the same way
+  on an MSVC host, and its vendored packages are found there.
 - The Perl, Ruby, Lua and PHP lanes run on native Windows (#325): each `main`
   launcher has a launch spec, `PERL5LIB` and the Ruby load path take the
   host's separator, and Perl's driver sends the target's output to the

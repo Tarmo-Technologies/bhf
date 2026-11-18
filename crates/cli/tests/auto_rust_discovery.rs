@@ -138,11 +138,6 @@ fn has_cargo_nightly() -> bool {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
     let bin = bhf_bin();
     if !bin.exists() {
@@ -275,7 +270,10 @@ fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
             .get("harness_id")
             .and_then(|h| h.as_str())
             .expect("parse_packet has a harness_id");
-        let main_bin = tmp.join("harnesses").join(harness_id).join("main");
+        let main_bin = tmp
+            .join("harnesses")
+            .join(harness_id)
+            .join(if cfg!(windows) { "main.exe" } else { "main" });
         assert!(
             main_bin.is_file(),
             "the native sancov+ASan harness binary exists at harnesses/<id>/main: {}",

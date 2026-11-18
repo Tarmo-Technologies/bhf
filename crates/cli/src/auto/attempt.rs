@@ -6811,7 +6811,10 @@ fn try_build(
         // is build-time (build_classifier::cargo) inside Step 0a, not the C/Ada
         // header/stub repair loop, so there is nothing to retry here.
         Lang::Rust => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
+            let main_bin = crate::auto::layout::harness_exe(
+                &crate::auto::layout::harness_dir(work_dir, harness_id),
+                "main",
+            );
             if main_bin.is_file() {
                 BuildOutcome::Success
             } else {

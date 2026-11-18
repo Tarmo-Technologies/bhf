@@ -96,8 +96,8 @@ winget install --id Rustlang.Rustup -e                  # build bhf from source
 ```
 
 Optional per-lane toolchains are needed only for a lane you actually run. See
-the limitations below before installing them: the Rust and Fortran lanes run
-under WSL/Linux rather than native Windows.
+the limitations below before installing them: the Fortran lane runs under
+WSL/Linux rather than native Windows.
 
 ## Getting `bhf.exe`
 
@@ -736,9 +736,14 @@ cmplog, and ASan all work natively on Windows.
   `bhf verify-poc` needs a POSIX `sh` on `PATH` (Git for Windows' will do).
   Ada and COBOL also produce native binaries but their Windows toolchain
   combinations are less exercised; validate them on a representative target
-  before relying on a campaign. The Rust lane builds its harness as a Unix
-  static archive (`lib*.a`, linked with `libpthread` and `libdl`) and does not
-  build on native Windows yet; run it under WSL/Linux. The Fortran lane's
+  before relying on a campaign. The Rust lane runs on native Windows with a
+  nightly Rust for `x86_64-pc-windows-msvc` and LLVM's clang: the harness
+  crate builds as an MSVC staticlib (`bhf_rust_harness.lib`) with
+  SanitizerCoverage, AddressSanitizer and the static CRT clang links an
+  ASan program with, and clang links it with the driver and the system
+  libraries rustc names for it. Rust's allocator calls the Windows heap directly, so the
+  harness sets ASan's `windows_hook_rtl_allocators=1` default; without it
+  ASan would see no Rust heap block's bounds. The Fortran lane's
   crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC, the
   Windows gfortran, ships no sanitizer runtime; run it under WSL/Linux.
 - The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
@@ -769,8 +774,8 @@ cmplog, and ASan all work natively on Windows.
   `scripts\ci\install-lua-windows.ps1 -Dest C:\tools\lua54` builds Lua 5.4
   from lua.org's source with clang. PHP's coverage comes from the `pcov`
   extension, as on Linux; without it the lane fuzzes without coverage.
-- On native Windows `bhf auto` refuses the lanes that run under WSL (Rust and
-  Fortran) whatever is installed: its toolchain check marks
+- On native Windows `bhf auto` refuses the lane that runs under WSL (Fortran)
+  whatever is installed: its toolchain check marks
   each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are
   reported static-only with that reason, pointing at WSL.
 - The persistent fork-server + coverage-guided engine run on Windows the same as

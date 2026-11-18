@@ -823,7 +823,9 @@ fn verify_capsule(
     oracle: Option<&Value>,
 ) -> Verification {
     let (mut build, script, poc) = build_command(cap);
-    let built = |cap: &Path| cap.join(poc).is_file();
+    // A build.sh on Windows writes `poc.exe` when it builds a native PoC
+    // (the Rust lane's), as build.ps1 does.
+    let built = |cap: &Path| cap.join(poc).is_file() || repro_lane::poc_path(cap).is_file();
     match crate::command_output::output_with_timeout(&mut build, BUILD_TIMEOUT) {
         Ok(out) if out.status.success() && built(cap) => {}
         Ok(out) => {

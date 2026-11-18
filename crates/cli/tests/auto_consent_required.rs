@@ -15,11 +15,6 @@ mod test_support;
 use test_support::TestDir;
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane runs under WSL on Windows, and is refused natively first; see \
-              docs/site/windows.md"
-)]
 fn a_rust_crate_without_run_untrusted_needs_the_consent_not_force() {
     let root = TestDir::new("consent-rust");
     let src = root.join("src");

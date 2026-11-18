@@ -156,7 +156,9 @@ impl Relocator {
 
 /// The spellings of `path` a file may name it by: as given and, when it
 /// differs, resolved (symlinks followed; on Windows, an 8.3 short name such
-/// as `ADMINI~1` long), longest first.
+/// as `ADMINI~1` long), longest first. A Windows path is also named with
+/// its backslashes doubled, as a TOML or JSON string spells it (a Rust
+/// harness's `Cargo.toml` path dependency), and with forward slashes.
 fn spellings(path: &Path) -> Vec<String> {
     let given = path.to_string_lossy().into_owned();
     let resolved = crate::workdir::plain_canonical(path)
@@ -165,6 +167,14 @@ fn spellings(path: &Path) -> Vec<String> {
     let mut spellings = vec![given];
     if resolved != spellings[0] {
         spellings.push(resolved);
+    }
+    if cfg!(windows) {
+        for spelling in spellings.clone() {
+            spellings.push(spelling.replace('\\', "\\\\"));
+            spellings.push(spelling.replace('\\', "/"));
+        }
+        spellings.sort();
+        spellings.dedup();
     }
     spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
     spellings
@@ -855,6 +865,35 @@ mod tests {
             r.rewrite(&stray).is_err(),
             "the work dir by its resolved name"
         );
+    }
+
+    /// A Windows path in a TOML or JSON string has its backslashes doubled
+    /// (a Rust harness's `Cargo.toml` path dependency), and a tool may write
+    /// it with forward slashes: each is rewritten, and each counts as naming
+    /// a protected dir.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_is_rewritten_however_a_string_spells_it() {
+        let tree = Path::new(r"C:\bhf-relocate-test\src");
+        let work = Path::new(r"C:\bhf-relocate-test\work");
+        let r = Relocator {
+            mounts: vec![Mount::in_place(tree, "sources", Contents::Nothing)],
+            tools: Vec::new(),
+            protected: vec![work.to_path_buf(), tree.to_path_buf()],
+            exclude: vec![work.to_path_buf()],
+        };
+        assert_eq!(
+            r.rewrite(r#"widget = { path = "C:\\bhf-relocate-test\\src" }"#)
+                .unwrap(),
+            format!(r#"widget = {{ path = "{CAPSULE_ROOT}/sources" }}"#)
+        );
+        assert_eq!(
+            r.rewrite("C:/bhf-relocate-test/src/lib.rs").unwrap(),
+            format!("{CAPSULE_ROOT}/sources/lib.rs")
+        );
+        assert!(r
+            .rewrite(r#"out = "C:\\bhf-relocate-test\\work\\x""#)
+            .is_err());
     }
 
     /// A path is rewritten only as a whole name: `/t/src` does not touch

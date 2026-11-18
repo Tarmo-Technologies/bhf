@@ -35,11 +35,6 @@ fn has_cargo_nightly() -> bool {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn static_methods_of_dependency_and_std_trait_impls_build_and_their_bugs_are_found() {
     if !has_cargo_nightly() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");

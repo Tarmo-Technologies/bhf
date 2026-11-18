@@ -94,11 +94,6 @@ fn attempt_findings(attempt: &serde_json::Value) -> Option<usize> {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn write_output_buffer_method_builds_fuzzes_without_empty_slice_panic_storm() {
     let bin = bhf_bin();
     if !bin.exists() {

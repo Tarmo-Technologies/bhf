@@ -810,6 +810,18 @@ jobs:
           cargo test --locked -p bhf --no-fail-fast --test auto_python_lane --test auto_java_fuzz --test auto_java_file_param --test auto_java_builder --test auto_js_browser_globals --test auto_csharp_source_lines --test auto_perl_lane --test auto_ruby_lane --test auto_lua_lane --test auto_php_lane
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The Rust lane on native Windows (#326): the harness builds with a
+      # nightly for x86_64-pc-windows-msvc.
+      - name: Test the Rust lane
+        shell: pwsh
+        env:
+          BHF_REQUIRE_TOOLS: "1"
+        run: |
+          rustup toolchain install nightly --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p bhf --no-fail-fast --test auto_rust_discovery
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test portable scheduler runtime reliability
         run: cargo test --locked -p continuous_daemon --lib health::tests
 

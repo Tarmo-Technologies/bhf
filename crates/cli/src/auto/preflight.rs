@@ -223,14 +223,15 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
 /// [`native_windows_refusal`] applies it on Windows.
 pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
     match lang {
-        Lang::Rust => Some("its harness is a Unix static archive linked with libpthread and libdl"),
         Lang::Fortran => Some(
             "its crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC ships no \
              sanitizer runtime",
         ),
         // The interpreted lanes run from their launch specs where their
-        // shell launchers cannot (#305, #306, #307, #325).
-        Lang::Ada
+        // shell launchers cannot (#305, #306, #307, #325), and the Rust
+        // harness links for MSVC (#326).
+        Lang::Rust
+        | Lang::Ada
         | Lang::C
         | Lang::Cpp
         | Lang::Go
@@ -526,7 +527,7 @@ mod tests {
     /// Windows with the reason and a pointer at WSL; the native lanes are not.
     #[test]
     fn the_lanes_that_run_under_wsl_on_windows_are_refused_with_the_reason() {
-        let wsl = [Lang::Rust, Lang::Fortran];
+        let wsl = [Lang::Fortran];
         for lang in LANES {
             let refusal = wsl_refusal(lang);
             if wsl.contains(&lang) {
@@ -544,19 +545,23 @@ mod tests {
             }
         }
         assert_eq!(
-            wsl_refusal(Lang::Rust).unwrap(),
-            "the Rust lane does not run on native Windows (its harness is a Unix static \
-             archive linked with libpthread and libdl); run it under WSL (see \
-             docs/site/windows.md) — discovered and statically analyzed, not fuzzed"
+            wsl_refusal(Lang::Fortran).unwrap(),
+            "the Fortran lane does not run on native Windows (its crash oracle is gfortran's \
+             AddressSanitizer, and MinGW-w64's GCC ships no sanitizer runtime); run it under \
+             WSL (see docs/site/windows.md) — discovered and statically analyzed, not fuzzed"
         );
         assert!(wsl_refusal(Lang::Fortran)
             .unwrap()
             .contains("MinGW-w64's GCC ships no sanitizer runtime"));
         // Only native Windows refuses them; the interpreted lanes run there
         // from their launch specs (#305, #325).
-        assert_eq!(native_windows_refusal(Lang::Fortran).is_some(), cfg!(windows));
+        assert_eq!(
+            native_windows_refusal(Lang::Fortran).is_some(),
+            cfg!(windows)
+        );
         assert_eq!(native_windows_refusal(Lang::Python), None);
         assert_eq!(native_windows_refusal(Lang::Perl), None);
+        assert_eq!(native_windows_refusal(Lang::Rust), None);
         assert_eq!(native_windows_refusal(Lang::Go), None);
     }
 
