@@ -6,10 +6,12 @@ use crate::InstrumenterError;
 use ada_parser::ast::{RaiseKind, RaiseSite, StructuralAst};
 use std::path::Path;
 
+/// `probe` is the package the calls name ([`crate::instrument::probe_package`]).
 pub fn collect_raise_insertions(
     ast: &StructuralAst,
     source: &str,
     source_path: &Path,
+    probe: &str,
     rewriter: &mut SourceRewriter<'_>,
 ) -> Result<usize, InstrumenterError> {
     let mut inserted = 0usize;
@@ -28,7 +30,7 @@ pub fn collect_raise_insertions(
 
         rewriter.add_insertion(Insertion {
             byte_offset: raise.span.start_byte,
-            text: raise_probe_text(source, source_path, raise)?,
+            text: raise_probe_text(source, source_path, probe, raise)?,
             kind: InsertionKind::RaiseProbe,
         });
         inserted = inserted.saturating_add(1);
@@ -60,6 +62,7 @@ fn valid_raise_span(source: &str, raise: &RaiseSite) -> bool {
 fn raise_probe_text(
     source: &str,
     source_path: &Path,
+    probe: &str,
     raise: &RaiseSite,
 ) -> Result<String, InstrumenterError> {
     let file_name = source_path
@@ -70,11 +73,11 @@ fn raise_probe_text(
     let exception_name = raise_exception_name(source, raise);
 
     Ok(format!(
-        "AdaFuzz.Probe.On_Explicit_Raise\n\
+        "{probe}.On_Explicit_Raise\n\
 {indent}  (Exception_Name => \"{}\",\n\
 {indent}   File           => \"{}\",\n\
 {indent}   Line           => {},\n\
-{indent}   Breadcrumb     => AdaFuzz.Probe.Last_Breadcrumb);\n\
+{indent}   Breadcrumb     => {probe}.Last_Breadcrumb);\n\
 {indent}",
         ada_string_literal_text(&exception_name),
         ada_string_literal_text(file_name),
@@ -143,7 +146,7 @@ mod tests {
         let path = Path::new("src.adb");
         let ast = ada_parser::reconcile::build_structural_ast(source, None, path).unwrap();
         let mut rewriter = SourceRewriter::new(source);
-        collect_raise_insertions(&ast, source, path, &mut rewriter).unwrap();
+        collect_raise_insertions(&ast, source, path, "AdaFuzz.Probe", &mut rewriter).unwrap();
         rewriter.apply().unwrap()
     }
 

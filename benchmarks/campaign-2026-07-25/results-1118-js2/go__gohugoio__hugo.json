@@ -1,0 +1,56 @@
+{
+ "repo": "gohugoio/hugo",
+ "sha": "a243a6154cc20484af491dc7ebc9ce6cf106d1ed",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "livereload.js",
+   "name": "check",
+   "outcome": "unsupported_params",
+   "reason": "target `check` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT 'check' is not a function in /home/ubuntu/bhf-corpus-500/go/gohugoio__hugo/livereload/livereload.js",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "livereload.js",
+   "name": "default",
+   "outcome": "unsupported_params",
+   "reason": "target `` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT '' is not a function in /home/ubuntu/bhf-corpus-500/go/gohugoio__hugo/livereload/livereload.js",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "livereload.js",
+   "name": "f",
+   "outcome": "unsupported_params",
+   "reason": "target `f` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT 'f' is not a function in /home/ubuntu/bhf-corpus-500/go/gohugoio__hugo/livereload/livereload.js",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 3,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

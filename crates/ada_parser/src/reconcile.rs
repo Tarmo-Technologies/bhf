@@ -240,8 +240,7 @@ fn detect_pragma_standard(tokens: &[Token]) -> Result<Option<AdaStandard>, ScanE
             if let TokenKind::Identifier(name) = &tokens[pragma_index].effective_kind {
                 match name.as_str() {
                     // M22: Ada 83 is accepted (best-effort), lexed with the
-                    // reduced 83 keyword set and built with -gnat83. Legacy 83
-                    // targets are discovered + reported on (report-only).
+                    // reduced 83 keyword set; `bhf auto` fuzzes it (#284).
                     "ada_83" | "ada83" => return Ok(Some(AdaStandard::Ada83)),
                     "ada_95" | "ada95" => return Ok(Some(AdaStandard::Ada95)),
                     "ada_05" | "ada05" | "ada_2005" | "ada2005" => {
@@ -476,7 +475,7 @@ mod tests {
     #[test]
     fn pragma_ada83_is_accepted_as_ada83_standard() {
         // M22: Ada 83 is no longer rejected — it parses (best-effort) and is
-        // tagged Ada83 so legacy targets are discovered and reported on.
+        // tagged Ada83.
         let ast = build_structural_ast(
             "pragma Ada_83;\nprocedure P is begin null; end P;\n",
             None,

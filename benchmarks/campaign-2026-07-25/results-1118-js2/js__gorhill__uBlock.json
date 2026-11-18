@@ -1,0 +1,78 @@
+{
+ "repo": "gorhill/uBlock",
+ "sha": "85c73e08e5eadc96b3b84272af2a6e8bcfe17235",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "dnr-editor.js",
+   "name": "DNREditor#createTooltipWidget",
+   "outcome": "unsupported_params",
+   "reason": "target `DNREditor#createTooltipWidget` is not loadable (skipped cleanly): TypeError: Cannot read properties of undefined (reading 'declarativeNetRequest')",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "dnr-editor.js",
+   "name": "DNREditor#exportToFile",
+   "outcome": "unsupported_params",
+   "reason": "target `DNREditor#exportToFile` is not loadable (skipped cleanly): TypeError: Cannot read properties of undefined (reading 'declarativeNetRequest')",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "dnr-editor.js",
+   "name": "DNREditor#foldService",
+   "outcome": "unsupported_params",
+   "reason": "target `DNREditor#foldService` is not loadable (skipped cleanly): TypeError: Cannot read properties of undefined (reading 'declarativeNetRequest')",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "dnr-editor.js",
+   "name": "DNREditor#updateView",
+   "outcome": "unsupported_params",
+   "reason": "target `DNREditor#updateView` is not loadable (skipped cleanly): TypeError: Cannot read properties of undefined (reading 'declarativeNetRequest')",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "dnr-editor.js",
+   "name": "DNREditor#validateRegexes",
+   "outcome": "unsupported_params",
+   "reason": "target `DNREditor#validateRegexes` is not loadable (skipped cleanly): TypeError: Cannot read properties of undefined (reading 'declarativeNetRequest')",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

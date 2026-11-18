@@ -1,0 +1,78 @@
+{
+ "repo": "hakimel/reveal.js",
+ "sha": "a3b940695648aa1c5b0680bc9a5b905cf43020e5",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "highlight.mjs",
+   "name": "$pattern",
+   "outcome": "unsupported_params",
+   "reason": "target `$pattern` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT '' is not a function in /home/ubuntu/bhf-corpus-500/js/hakimel__reveal.js/dist/plugin/highlight.mjs",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "highlight.mjs",
+   "name": "A",
+   "outcome": "unsupported_params",
+   "reason": "target `A` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT 'A' is not a function in /home/ubuntu/bhf-corpus-500/js/hakimel__reveal.js/dist/plugin/highlight.mjs",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "highlight.mjs",
+   "name": "N",
+   "outcome": "unsupported_params",
+   "reason": "target `N` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT 'N' is not a function in /home/ubuntu/bhf-corpus-500/js/hakimel__reveal.js/dist/plugin/highlight.mjs",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "highlight.mjs",
+   "name": "_",
+   "outcome": "unsupported_params",
+   "reason": "target `_` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT '_' is not a function in /home/ubuntu/bhf-corpus-500/js/hakimel__reveal.js/dist/plugin/highlight.mjs",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  },
+  {
+   "source": "highlight.mjs",
+   "name": "a",
+   "outcome": "unsupported_params",
+   "reason": "target `a` is not loadable (skipped cleanly): Error: BHF_JS_EXPORT 'a' is not a function in /home/ubuntu/bhf-corpus-500/js/hakimel__reveal.js/dist/plugin/highlight.mjs",
+   "class": "not loadable, another reason",
+   "before": 1,
+   "classes": [
+    "not loadable, another reason"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

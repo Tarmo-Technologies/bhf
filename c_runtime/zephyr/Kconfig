@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BHF_AGENT
+	bool "bhf reference target-side agent"
+	depends on SERIAL && MULTITHREADING
+	help
+	  Serve the bhf agent protocol (c_runtime/bhf_agent.h) on the UART
+	  the devicetree's chosen bhf,agent-uart names, for
+	  `bhf fuzz --target-transport agent:serial:PATH` or, through a
+	  serial-to-TCP bridge, agent:tcp:HOST:PORT.
+
+if BHF_AGENT
+
+config BHF_AGENT_INPUT_SIZE
+	int "The largest input the agent runs, in bytes"
+	default 4096
+
+config BHF_AGENT_EDGE_CAP
+	int "The edges the agent reports for one input"
+	default 1024
+
+config BHF_AGENT_STACK_SIZE
+	int "The agent thread's stack size"
+	default 4096
+
+config BHF_AGENT_PRIORITY
+	int "The agent thread's priority"
+	default 5
+
+endif # BHF_AGENT

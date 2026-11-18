@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! M22 Phase 3: K&R / pre-ANSI C is discovered via the tolerant extractor
-//! (the modern tree-sitter-c grammar cannot represent old-style untyped
-//! parameter lists), tagged with the K&R dialect, and — having no fuzzing lane
-//! that auto-builds it yet — reported on: discovered + statically analyzed with
-//! CWE-tagged findings, instead of silently dropped.
+//! K&R / pre-ANSI C is discovered via the tolerant extractor (the modern
+//! tree-sitter-c grammar cannot represent old-style untyped parameter lists)
+//! and tagged with the K&R dialect. `bhf auto` fuzzes it through the ANSI
+//! prototype synthesized from the declaration block (#283); the report-only
+//! path still emits CWE-tagged static findings for it.
 
 use cli::auto::candidate::Lang;
 use cli::auto::discovery::discover;
 use cli::auto::report_only::emit_report_only;
 use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 
 #[path = "../src/test_support.rs"]
 mod test_support;
@@ -85,4 +87,72 @@ fn knr_target_report_only_emits_cwe_finding() {
 
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&work);
+}
+
+/// #283: `bhf auto` builds a K&R definition's harness from the prototype its
+/// declaration block gives, and finds the overflow behind it. The dialect was
+/// report-only, and the modern parse called the function with no arguments.
+#[test]
+fn auto_fuzzes_a_knr_definition_and_finds_its_overflow() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_bhf"));
+    let src = tmp("knr-auto-src");
+    fs::write(
+        src.join("rec.c"),
+        "#include <string.h>\n\n\
+         int parse_rec(buf, len)\n\
+         \x20   unsigned char *buf;\n\
+         \x20   int len;\n\
+         {\n\
+         \x20   char tmp[8];\n\
+         \x20   if (len < 2 || buf[0] != 'R')\n\
+         \x20       return -1;\n\
+         \x20   memcpy(tmp, buf, len);\n\
+         \x20   return tmp[1];\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp("knr-auto-work");
+    let out = Command::new(&bin)
+        .args(["auto", src.to_str().unwrap(), "--target", "parse_rec"])
+        .args([
+            "--per-target-time",
+            "10",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+        ])
+        .args(["--work-dir", work.to_str().unwrap()])
+        .output()
+        .expect("run bhf auto");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(log.contains("1 built+fuzzed"), "{log}");
+    let main = fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("main.c"))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| panic!("no harness main.c: {log}"));
+    let main = fs::read_to_string(main).unwrap();
+    assert!(
+        main.contains("parse_rec(unsigned char *, int);"),
+        "the harness declares the synthesized prototype: {main}"
+    );
+    let findings: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    let overflow = findings["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["title"]
+                .as_str()
+                .unwrap_or("")
+                .contains("parse_rec")
+        });
+    let overflow = overflow.unwrap_or_else(|| panic!("no parse_rec finding: {findings:#}\n{log}"));
+    assert_eq!(overflow["cwe"], serde_json::json!([121]), "{overflow:#}");
 }

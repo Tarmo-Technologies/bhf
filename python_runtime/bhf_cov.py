@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# -*- coding: utf-8 -*-
 """bhf Python coverage agent — the Python analog of java_runtime Coverage.java.
 
 Joins bhf's file-backed edge map (path in BHF_COV_SHM, mmap MAP_SHARED,
@@ -10,10 +11,17 @@ Edge hash MUST match the C driver / Coverage.java:
     idx = (prev ^ block) & MASK ; map[idx]++ (saturating 0xff) ; prev = block >> 1
 prev is reset to 0 at the start of each input so identical inputs hash to
 identical edges (deterministic coverage).
+
+Runs on Python 2.7 as well as Python 3 (#285), where a map byte is a
+one-character `str` and settrace is the only backend.
 """
 import mmap
 import os
 import sys
+
+_PY2 = sys.version_info[0] < 3
+# os.replace is Python 3.3+; on POSIX os.rename replaces the same way.
+_replace = getattr(os, "replace", os.rename)
 
 COV_BITS = 1 << 16
 COV_MASK = COV_BITS - 1
@@ -46,7 +54,7 @@ def dump_covered_lines():
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             fh.write("\n".join(sorted(_covered)))
-        os.replace(tmp, path)
+        _replace(tmp, path)
         _covered_dumped = len(_covered)
     except Exception:
         pass
@@ -68,7 +76,7 @@ def _open():
         return None
 
 
-def enabled() -> bool:
+def enabled():
     return _map is not None
 
 
@@ -77,7 +85,7 @@ def reset_prev():
     _prev = 0
 
 
-def _record(block: int):
+def _record(block):
     global _prev
     m = _map
     if m is None:
@@ -89,12 +97,40 @@ def _record(block: int):
     _prev = (block >> 1) & COV_MASK
 
 
-def _block_id(filename: str, lineno: int) -> int:
+if _PY2:
+
+    def _record(block):  # noqa: F811 - a Python 2 map byte is a 1-char str
+        global _prev
+        m = _map
+        if m is None:
+            return
+        idx = (_prev ^ block) & COV_MASK
+        v = ord(m[idx])
+        if v != 0xFF:
+            m[idx] = chr(v + 1)
+        _prev = (block >> 1) & COV_MASK
+
+
+# The FNV-1a state after each file name's bytes, so a name is hashed once
+# rather than on every line event.
+_file_hash = {}
+
+
+def _name_hash(filename):
+    h = _file_hash.get(filename)
+    if h is None:
+        name = filename if isinstance(filename, bytes) else filename.encode("utf-8", "replace")
+        h = 0xCBF29CE484222325
+        for byte in bytearray(name):
+            h = ((h ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        _file_hash[filename] = h
+    return h
+
+
+def _block_id(filename, lineno):
     # Stable per (file,line). hash() is salted per-process for str, so use a
     # deterministic FNV-1a over the bytes instead — coverage must be reproducible.
-    h = 0xCBF29CE484222325
-    for byte in filename.encode("utf-8", "replace"):
-        h = ((h ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    h = _name_hash(filename)
     h = ((h ^ (lineno & 0xFF)) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     h = ((h ^ ((lineno >> 8) & 0xFF)) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h & COV_MASK

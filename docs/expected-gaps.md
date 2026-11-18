@@ -95,12 +95,15 @@ JNI, Win32. The manifest reports them. A minority are BHF's own and worth
 re-reading the exemplars for; that method has produced a fix every time it was
 run.
 
-### C-3. K&R C — 21 — **BY DESIGN**
+### C-3. K&R C — 21 — **[FIXED]**
 
-Discovered and statically analyzed, not fuzzed (M22). Fuzzing a K&R definition
-means synthesizing a prototype from the parameter declaration list; the
-discovery side already recovers the true signature, so this is closer than the
-count suggests.
+A K&R definition is now fuzzed through the prototype its parameter
+declarations give, each parameter at its promoted type (#283). Re-running the
+sweep's 20 C-3 targets left none report-only as K&R C. Only 6 were K&R
+definitions: 2 built and fuzzed, 1 built without an input reaching the target,
+2 stop at zlib's `#define local static` (#415) and 1 is compiled out. The other
+14 were ANSI C that the July extractor misread, and now stop where other C
+targets stop. See [the re-run](validation/2026-11-18-c3-knr.md).
 
 ### C-4. `build abandoned after N repair rounds: --campaign-time exhausted` — 10 — **ENVIRONMENT**
 
@@ -361,9 +364,14 @@ SDK ceiling and central package management.
 The largest single class in the whole sweep. Correctly named in the manifest with
 the package; `--install-deps` fixes it where the network allows.
 
-### Py-2. Instance method needs constructor arguments — 25 — **GAP**
+### Py-2. Instance method needs constructor arguments — 25 — **[FIXED]**
 
-Only no-arg-constructible receivers are supported.
+The receiver is built from its `__init__` arguments, each decoded from the
+input as a method parameter of that annotation or name is (#286). Re-running
+the sweep's 21 Py-2 targets built and fuzzed 6 and left none on this reason.
+10 now stop at a dependency the project needs and is not installed, 3 at a
+constructor argument bhf cannot build, and 2 elsewhere. See
+[the re-run](validation/2026-11-18-py2-receivers.md).
 
 ### Py-3. `type X is not subscriptable` — 10 — **DEPENDENCY**
 
@@ -381,11 +389,16 @@ as a loader gap; reading an exemplar corrected the classification.
 
 ### JS-1. Missing npm package — ~225 — **DEPENDENCY**
 
-### JS-2. Browser globals: `window is not defined` (23), `navigator is not defined` (5) — **GAP**
+### JS-2. Browser globals: `window is not defined` (23), `navigator is not defined` (5) — **[FIXED]**
 
-A DOM-targeting module loaded under bare Node. A minimal global shim would make
-these loadable; whether the resulting fuzz is meaningful needs judgement, and a
-shim that lies about the environment can manufacture findings.
+A DOM-targeting module loaded under bare Node. The driver now stands in for
+the browser globals Node lacks when a module needs them (#288), and each
+finding of such a target names them in its fidelity caveat, since a finding
+may depend on the stand-ins. Re-running the sweep's 37 JS-2 targets (29
+JavaScript, 8 TypeScript) built and fuzzed 23 and left none on a missing
+browser global; the other 14 stop at the next precondition (an extension API,
+exports that are not functions, a JSX sample without React). See
+[the re-run](validation/2026-11-18-js2-browser-globals.md).
 
 ### TS-1. `No loader is configured for ".png"/".svg"/".yaml"/".vue"` — 18 — **[FIXED]**
 
@@ -630,16 +643,14 @@ By fixable targets, highest first:
 6. **Java project-type parameters** (Java-1; 29 of the 57 that `results-0728`
    left) — a project or dependency type with no no-arg constructor, factory or
    constant to build it from. JDK collections are decoded since #236.
-7. **Python receiver-with-arguments** (Py-2; 25) and C# unforced receiver
-   (C#-1; 26).
-8. **JS browser globals** (JS-2; 28) — cheap, but risks manufacturing
-   findings.
+7. **C# unforced receiver** (C#-1; 26).
 
 Closed since the list was first ranked, and dropped from it: the C++
 non-self-contained header (C++-1), the Go receiver with a sibling
 constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1),
-the C++ compile-flag quoting (C++-6) and private-module trait-impl methods
-(Rust-2).
+the C++ compile-flag quoting (C++-6), private-module trait-impl methods
+(Rust-2), the JS browser globals (JS-2) and the Python receiver with
+constructor arguments (Py-2).
 
 ## Method
 

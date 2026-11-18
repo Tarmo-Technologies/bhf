@@ -583,6 +583,9 @@ struct CTemplateContext {
     /// file scope before it ([`tag_declarations`]).
     forward_tags: Vec<String>,
     params: Vec<CParamEmission>,
+    /// The target takes `...` after its parameters: the forward declaration
+    /// keeps it (#416), and the call passes the fixed arguments only.
+    variadic: bool,
     return_type: String,
     return_type_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3400,6 +3403,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         params_decode: trace.decode,
         params_after: trace.after,
         params,
+        variadic: args.target.variadic,
         return_type: if return_type_present {
             return_type
         } else {
@@ -9128,6 +9132,13 @@ mod tests {
         assert!(
             main.contains("char *message = bhf_c_format_string(&Cur, 4096)"),
             "the variadic format param must be %-neutralised: {main}"
+        );
+        // #416: the declaration keeps the `...`; a variadic definition called
+        // through a fixed-arity prototype is undefined behavior, and conflicts
+        // with the target's own prototype where the harness sees it.
+        assert!(
+            main.contains("extern void my_log(int, const char *, ...);"),
+            "the forward declaration keeps the ellipsis: {main}"
         );
     }
 

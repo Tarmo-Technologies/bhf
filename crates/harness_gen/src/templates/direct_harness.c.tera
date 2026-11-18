@@ -138,7 +138,7 @@ static uint32_t _bhf_env_next_u32(void) {
 {%- for tag in forward_tags %}
 {{ tag }};
 {%- endfor %}
-extern {{ return_type }} {{ qualified_target_name }}({% for p in params %}{{ p.c_type }}{% if not loop.last %}, {% endif %}{% endfor %});
+extern {{ return_type }} {{ qualified_target_name }}({% for p in params %}{{ p.c_type }}{% if not loop.last %}, {% endif %}{% endfor %}{% if variadic %}{% if params | length > 0 %}, {% endif %}...{% endif %});
 {%- endif %}
 
 {#- #93: forward-declare bhf's own generated entry points BEFORE their

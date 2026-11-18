@@ -1,0 +1,45 @@
+{
+ "repo": "BVLC/caffe",
+ "sha": "9b891540183ddc834a02b2bd81b31afae71b2153",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "io.py",
+   "name": "Transformer.deprocess",
+   "outcome": "unsupported_params",
+   "reason": "target `caffe.io` is not loadable (skipped cleanly): missing module `caffe._caffe` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'caffe._caffe'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  },
+  {
+   "source": "io.py",
+   "name": "Transformer.preprocess",
+   "outcome": "unsupported_params",
+   "reason": "target `caffe.io` is not loadable (skipped cleanly): missing module `caffe._caffe` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'caffe._caffe'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 2,
+  "discovered_total": 2,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 2,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

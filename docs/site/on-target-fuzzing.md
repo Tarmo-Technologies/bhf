@@ -54,7 +54,7 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
-| An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. Kernel is bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
+| An open RTOS (FreeRTOS, Zephyr) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. ✅ The reference agent as a Zephyr module (`c_runtime/zephyr/`): its `qemu_cortex_m3` sample runs clean → fault → clean and replays under `qemu-system-arm`. Kernels are bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
@@ -148,7 +148,7 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 (addresses are decimal or `0x`-hex, from your linker map / `nm`):
 
 ```
---transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>
+--transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>[,cmplog=<addr>,cmplog_cap=<n>]
 ```
 
 - `input`   — where BHF writes the fuzz input on the target
@@ -164,9 +164,55 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 - `write`   — the ring's write cursor
 - `wrapped` — the ring's wrapped flag
 - `cap`     — ring capacity in **bytes** (the length read back), not a record count
+- `cmplog`, `cmplog_cap` — optional, together: the address of the firmware's
+  comparison record and how many entries it holds (at most 43690, one
+  read's worth). See [CmpLog on the target](#cmplog-on-the-target).
 
 The `agent` transport carries coverage over its own protocol and rejects this
 option.
+
+### CmpLog on the target
+
+A 4-byte magic compare is out of reach of random mutation. Build the code
+under test with `-fsanitize-coverage=trace-cmp` (GCC or clang) and give the
+firmware callbacks that record each comparison in RAM:
+
+```c
+#define BHF_CMPLOG_CAP 32
+volatile struct {
+  uint32_t count;      /* bhf zeroes it before each run */
+  uint32_t reserved;
+  struct { uint64_t lhs, rhs; uint32_t width, site; } entries[BHF_CMPLOG_CAP];
+} bhf_cmplog;
+
+void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) {
+  uint32_t n = bhf_cmplog.count;
+  if (n < BHF_CMPLOG_CAP) {
+    bhf_cmplog.entries[n].lhs = a;
+    bhf_cmplog.entries[n].rhs = b;
+    bhf_cmplog.entries[n].width = 4;
+    bhf_cmplog.entries[n].site = (uint32_t)__builtin_return_address(0);
+  }
+  bhf_cmplog.count = n + 1;
+}
+/* ... and the same for __sanitizer_cov_trace_cmp{1,2,4,8} and
+ * __sanitizer_cov_trace_const_cmp{1,2,8}, at their widths. */
+```
+
+Keep the callbacks out of the instrumented files. Then name the record in
+the coverage map: `cmplog=<addr of bhf_cmplog>,cmplog_cap=32`. All fields
+are little-endian. A `count` past the capacity means the record filled; bhf
+reads the entries it holds.
+
+bhf zeroes `count` before each run on the `gdb` and `qemu-system`
+transports, and reads the record after the run. It keeps the comparisons of
+each corpus entry's run. A mutation of that entry then replaces an operand
+it finds in the input with the value it was compared against. The run
+summary's `comparisons` counts the comparisons read.
+
+The gated `transport_fuzz_qemu_cli` test solves a 4-byte magic on the
+mps2-an385 fixture within 300 executions with `cmplog=`, and not without it.
+A session-lane spec (`--session-transport transport:…`) rejects `cmplog=`.
 
 ### 3a. Debug probe / emulator gdbstub (`gdb:HOST:PORT`)
 
@@ -261,17 +307,56 @@ and no newline translation, so every frame byte crosses unchanged, at
 and macOS the device is a tty path; on Windows it is a COM port (`COM3`,
 `COM10`).
 
-BHF ships the host side of this lane only. No target-side agent ships yet: a
-reference agent in portable C ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), a FreeRTOS task running it
-([#290](https://github.com/Tarmo-Technologies/bhf/issues/290)) and Zephyr glue ([#291](https://github.com/Tarmo-Technologies/bhf/issues/291)) are tracked. Until then the
-agent is yours to write, to this frame format. Every integer is little-endian;
-one round trip per input:
+BHF ships a reference target-side agent in freestanding C99,
+`c_runtime/bhf_agent.{h,c}`: no heap, and no libc beyond `<stdint.h>`,
+`<stddef.h>` and `<setjmp.h>`. The board gives it:
+
+- read and write callbacks over its UART, socket or debug channel;
+- an input buffer (a longer input is refused, not run);
+- an edge buffer;
+- the function under test, which has `LLVMFuzzerTestOneInput`'s signature.
+
+Build the code under test with `-fsanitize-coverage=trace-pc-guard`. The
+agent provides the SanitizerCoverage callbacks and reports each guard an input
+reaches once. Build the agent itself without them. A fault vector or signal
+handler calls `bhf_agent_fault(kind, addr, detail)`: the agent reports the
+fault for the running input and goes on with the next, returning from the
+handler by `longjmp`. On a target where that is not safe, define
+`BHF_AGENT_NO_SETJMP`, reset, and report the fault the reset kept.
+`c_runtime/examples/agent_posix.c` runs it on a POSIX host for `agent:tcp`:
+
+```sh
+cc -c c_runtime/bhf_agent.c
+cc -I c_runtime -c c_runtime/examples/agent_posix.c
+clang -fsanitize-coverage=trace-pc-guard -c target.c   # defines LLVMFuzzerTestOneInput
+cc -o agent agent_posix.o bhf_agent.o target.o
+./agent 9000 &
+bhf fuzz bhf_work --harness H-agent --target-transport agent:tcp:127.0.0.1:9000 --max-len 4096
+```
+
+Set `--max-len` to the agent's input buffer. On a board the agent runs as a
+task over the UART. `crates/target_transport/tests/freertos/agent_task.c` is
+one, for FreeRTOS on `mps2-an385` under QEMU, and its `Makefile` builds it.
+Its HardFault handler returns from the exception into a function that reports
+the fault from the task. The run is recorded in
+[validation](../validation/2026-11-18-freertos-agent.md).
+
+`c_runtime/zephyr/` is the agent as a Zephyr module: set `CONFIG_BHF_AGENT=y`,
+name the UART with the devicetree's chosen `bhf,agent-uart`, and call
+`bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`. Zephyr ends a thread that
+faults, so the module's `k_sys_fatal_error_handler` records the fault, and the
+calling thread sends the reply and starts a new agent thread. Its
+`qemu_cortex_m3` sample is in `c_runtime/zephyr/samples/agent`, and its
+README has the commands; the run is recorded in
+[validation](../validation/2026-11-18-zephyr-agent.md). An agent that
+implements the protocol itself uses this frame format. Every integer is little-endian, one
+round trip per input:
 
 | Direction | Field | Size | Meaning |
 |---|---|---|---|
 | host → target | `len` | `u32` | input length in bytes |
 | host → target | `input` | `len` bytes | the input |
-| target → host | `status` | `u32` | `0` ran to completion, `1` crashed, `2` timed out; any other value is a protocol error |
+| target → host | `status` | `u32` | `0` ran to completion, `1` crashed, `2` timed out, `3` refused: the input is longer than the agent's buffer and was read and dropped, not run (the run is inconclusive); any other value is a protocol error |
 | target → host | `n_edges` | `u32` | number of coverage edges that follow |
 | target → host | `edges` | `n_edges` × `u32` | the edge ids this input hit |
 | target → host | `fault_present` | `u32` | `1` when a fault block follows, else `0` |
@@ -284,6 +369,24 @@ The `kind`, `addr`, `detail_len` and `detail` fields are sent only when
 `fault_present` is `1`. The host refuses an input over 16 MiB, more than 2^20
 edges or a detail over 64 KiB before it allocates. The agent has no stdout
 channel.
+
+### Several targets at once
+
+`--workers N` drives N targets, one per worker: name each worker's in the spec
+with `{worker}` (0 to N-1) or `{BASE+worker}`:
+
+```sh
+bhf fuzz bhf_work --harness H-C0001 --workers 4 \
+  --target-transport agent:tcp:127.0.0.1:{9000+worker}
+```
+
+The workers share one corpus, coverage map and schedule, so an input one
+worker keeps is mutated by all of them. They also share one finding set: a
+fault several workers reach is one finding. Its transport profile names the
+spec of the worker that found it, and `bhf replay` re-drives it there.
+`--iterations` and `--time` are the whole campaign's, and the summary's
+`workers` counts the workers. A run-control halt on one target (a hang, a
+lost link) stops the campaign, as it does for one worker.
 
 ### 3d. Protocol sessions on the target
 
@@ -359,9 +462,11 @@ run summary's `target_cycles` gives the fewest and most cycles any run took.
 
 QEMU's Cortex-M models do not count `DWT_CYCCNT`, so on an emulator use a
 counter the machine models: on `mps2-an385` the FPGAIO `COUNTER` at
-`0x40028018` counts at 25 MHz, and under `-icount` it advances with the
-instructions run. A counter that never advances is reported once, and the
-deadline falls back to host time.
+`0x40028018` counts at 25 MHz, and under `-icount shift=0,sleep=off` it
+advances with the instructions run, the same count on every run. With
+icount's default `sleep=on` the clock follows host time while the guest
+idles, so a loaded host adds cycles. A counter that never advances is
+reported once, and the deadline falls back to host time.
 
 ```sh
 --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,cycles=0x40028018,cpu_hz=25000000"
@@ -510,9 +615,9 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   each connection/read/write (`--timeout`), and dials the resource on the first
   execution (a dead endpoint fails with a connection error, not
   "unimplemented"). It takes the seed, length, time, iteration, timeout,
-  deadline and RNG-seed flags; a host-lane flag it does not wire (`--workers`,
-  `--grammar`, `--cmplog-log` and the others [cli.md](cli.md) lists) is
-  refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
+  deadline, RNG-seed, `--dict`, `--grammar` and `--workers` flags; a host-lane
+  flag it does not wire (`--cmplog-log`, `--len-control` and the others
+  [cli.md](cli.md) lists) is refused with exit 2 instead of silently dropped. A gated end-to-end test (`transport_fuzz_qemu_cli`, present
   when `qemu-system-arm` + `arm-none-eabi-gcc` are installed) drives the real
   mps2-an385 fixture through the shipped `bhf fuzz --target-transport
   qemu-system:…` binary and asserts it plants the breakpoint itself and persists

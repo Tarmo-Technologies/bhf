@@ -1,0 +1,34 @@
+{
+ "repo": "openssl/openssl",
+ "sha": "799252f3b67d0429e64736f922a3c2860135facb",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "conf_mod.c",
+   "name": "CONF_modules_load_file_ex",
+   "outcome": "unsupported_params",
+   "reason": "C parameter 'libctx' of type 'OSSL_LIB_CTX *' has no byte-buffer decoder after struct synthesis: opaque type 'struct ossl_lib_ctx_st' for pointer parameter 'libctx' needs lifecycle support (Phase C); sequence generation also failed first: C sequence handle 'OSSL_LIB_CTX' is incomplete in the harness's included headers (its full definition is visible only in a non-included source); cannot stack-allocate it \u2014 skipping",
+   "class": "unsupported_params",
+   "before": 1,
+   "classes": [
+    "unsupported_params"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 1,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

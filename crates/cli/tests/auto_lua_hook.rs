@@ -112,10 +112,19 @@ fn a_stack_overflow_is_located_in_the_target() {
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("walk.lua"), WALK).unwrap();
+    // The test is where the overflow is located, not whether mutation finds
+    // the `[`: a seed takes the path, so a loaded runner cannot miss it. The
+    // line hook makes the overflow take half a second here and seconds on a
+    // loaded runner, and a run is cut short where its pass ends: one pass
+    // with the whole budget, and a timeout past it, let the seed finish.
+    let seed = root.join("seed.bin");
+    std::fs::write(&seed, b"[x").unwrap();
     let work = root.join("work");
     let started = Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(["auto", "--work-dir", work.to_str().unwrap()])
+        .arg("--seed-file")
+        .arg(&seed)
         .args([
             "--languages",
             "lua",
@@ -123,6 +132,9 @@ fn a_stack_overflow_is_located_in_the_target() {
             "1",
             "--per-target-time",
             "10",
+            "--timeout",
+            "30s",
+            "--single-pass",
         ])
         .arg(&src)
         .output()

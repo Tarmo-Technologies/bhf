@@ -1,0 +1,78 @@
+{
+ "repo": "pallets/flask",
+ "sha": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "app.py",
+   "name": "App.handle_url_build_error",
+   "outcome": "unsupported_params",
+   "reason": "target `app` is not loadable (skipped cleanly): missing module `werkzeug` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'werkzeug'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  },
+  {
+   "source": "config.py",
+   "name": "Config.from_envvar",
+   "outcome": "unsupported_params",
+   "reason": "target `flask.config` is not loadable (skipped cleanly): missing module `werkzeug` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'werkzeug'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  },
+  {
+   "source": "config.py",
+   "name": "Config.from_prefixed_env",
+   "outcome": "unsupported_params",
+   "reason": "target `flask.config` is not loadable (skipped cleanly): missing module `werkzeug` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'werkzeug'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  },
+  {
+   "source": "config.py",
+   "name": "Config.from_pyfile",
+   "outcome": "unsupported_params",
+   "reason": "target `flask.config` is not loadable (skipped cleanly): missing module `werkzeug` (not in the project and not installed) \u2014 ModuleNotFoundError: No module named 'werkzeug'",
+   "class": "not loadable",
+   "before": 1,
+   "classes": [
+    "not loadable"
+   ]
+  },
+  {
+   "source": "provider.py",
+   "name": "JSONProvider.loads",
+   "outcome": "unsupported_params",
+   "reason": "instance method `JSONProvider.loads` needs a receiver, but `JSONProvider.__init__` parameter `app: App` is not a scalar, str, bytes, container or stream bhf can decode (skipped cleanly)",
+   "class": "receiver argument of a type bhf cannot decode",
+   "before": 1,
+   "classes": [
+    "receiver argument of a type bhf cannot decode"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 5,
+  "discovered_total": 5,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 5,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

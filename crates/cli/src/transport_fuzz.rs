@@ -57,7 +57,7 @@ use fuzz_engine_builtin::{
 use serde::Serialize;
 use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
-    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
+    AgentTransport, CmpLogRegion, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
     GuestFaultStatus, InputContract, RunOutcome, TargetSession, TargetTransport, TransportError,
 };
 
@@ -124,7 +124,6 @@ pub(crate) fn should_use_transport(args: &FuzzArgs) -> bool {
 /// The `bhf fuzz` flags this lane does not wire. Remove a flag here when the
 /// lane starts honouring it.
 const UNSUPPORTED_FLAGS: &[&str] = &[
-    "--workers",
     "--cmplog-log",
     "--len-control",
     "--rss-limit-mb",
@@ -189,6 +188,8 @@ pub(crate) enum TransportPlan {
         cycles: Option<CycleCounter>,
         /// The address of the firmware's task identity word (`task_id=`, #252).
         task_id: Option<u64>,
+        /// The firmware's comparison record (`cmplog=`, #386).
+        cmplog: Option<CmpLogRegion>,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -217,6 +218,8 @@ pub(crate) enum TransportPlan {
         cycles: Option<CycleCounter>,
         /// The address of the firmware's task identity word (`task_id=`, #252).
         task_id: Option<u64>,
+        /// The firmware's comparison record (`cmplog=`, #386).
+        cmplog: Option<CmpLogRegion>,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -273,9 +276,12 @@ pub(crate) enum TransportSpecError {
 
     #[error(
         "--transport-coverage-map has unknown key {key:?} (allowed: input, input_cap, \
-         input_len, ring, write, wrapped, cap)"
+         input_len, ring, write, wrapped, cap, cmplog, cmplog_cap)"
     )]
     UnknownMapKey { key: String },
+
+    #[error("--transport-coverage-map: {0}")]
+    CmpLog(String),
 
     #[error("coverage ring capacity {cap} is not representable as a host-sized length")]
     CapTooLarge { cap: u64 },
@@ -346,7 +352,7 @@ impl TransportPlan {
         }
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
-            let (map, input) = require_coverage_map("gdb", coverage_map)?;
+            let (map, input, cmplog) = require_coverage_map("gdb", coverage_map)?;
             // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
             let mut parts = rest.split(',');
             let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
@@ -378,12 +384,13 @@ impl TransportPlan {
                 firmware,
                 cycles: cycles.counter("gdb", spec)?,
                 task_id,
+                cmplog,
             });
         }
 
         if let Some(rest) = spec.strip_prefix("qemu-system:") {
-            let (map, input) = require_coverage_map("qemu-system", coverage_map)?;
-            return parse_qemu_system(spec, rest, map, input);
+            let (map, input, cmplog) = require_coverage_map("qemu-system", coverage_map)?;
+            return parse_qemu_system(spec, rest, map, input, cmplog);
         }
 
         Err(TransportSpecError::UnknownBackend {
@@ -418,6 +425,7 @@ impl TransportPlan {
                 firmware: _,
                 cycles,
                 task_id,
+                cmplog,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
@@ -426,7 +434,8 @@ impl TransportPlan {
                     .with_exec_deadline(io_timeout)
                     .with_input_contract(Some(input))
                     .with_cycle_counter(cycles)
-                    .with_task_id(task_id),
+                    .with_task_id(task_id)
+                    .with_cmplog(cmplog),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -441,6 +450,7 @@ impl TransportPlan {
                 firmware: _,
                 cycles,
                 task_id,
+                cmplog,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -451,7 +461,8 @@ impl TransportPlan {
                 )?
                 .with_input_contract(Some(input))
                 .with_cycle_counter(cycles)
-                .with_task_id(task_id);
+                .with_task_id(task_id)
+                .with_cmplog(cmplog);
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -497,6 +508,14 @@ impl TransportPlan {
         }
     }
 
+    /// The firmware's comparison record the coverage map names (`cmplog=`).
+    pub(crate) fn cmplog(&self) -> Option<CmpLogRegion> {
+        match self {
+            Self::Gdb { cmplog, .. } | Self::QemuSystem { cmplog, .. } => *cmplog,
+            _ => None,
+        }
+    }
+
     /// What the parser corrected in the spec (a Thumb `done=` address).
     pub(crate) fn notes(&self) -> &[String] {
         match self {
@@ -532,7 +551,7 @@ fn reject_coverage_map(coverage_map: Option<&str>) -> Result<(), TransportSpecEr
 fn require_coverage_map(
     backend: &'static str,
     coverage_map: Option<&str>,
-) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
     let map = coverage_map
         .filter(|m| !m.trim().is_empty())
         .ok_or(TransportSpecError::MissingCoverageMap { backend })?;
@@ -544,6 +563,7 @@ fn parse_qemu_system(
     rest: &str,
     map: GdbMemoryMap,
     input: InputContract,
+    cmplog: Option<CmpLogRegion>,
 ) -> Result<TransportPlan, TransportSpecError> {
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
@@ -644,6 +664,7 @@ fn parse_qemu_system(
         firmware,
         cycles: cycles.counter("qemu-system", spec)?,
         task_id,
+        cmplog,
         notes,
     })
 }
@@ -724,7 +745,12 @@ fn parse_host_port(
     Ok((host.to_owned(), port))
 }
 
-fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), TransportSpecError> {
+/// The most CmpLog entries one read takes: the gdb client's read cap.
+const MAX_CMPLOG_CAPACITY: u64 = 43_690;
+
+fn parse_coverage_map(
+    spec: &str,
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
     let mut input = None;
     let mut ring = None;
     let mut write = None;
@@ -732,6 +758,8 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
     let mut cap = None;
     let mut input_cap = None;
     let mut input_len = None;
+    let mut cmplog = None;
+    let mut cmplog_cap = None;
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -753,6 +781,8 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
             "cap" => cap = Some(parse_int(key, value)?),
             "input_cap" => input_cap = Some(parse_int(key, value)?),
             "input_len" => input_len = Some(parse_int(key, value)?),
+            "cmplog" => cmplog = Some(parse_int(key, value)?),
+            "cmplog_cap" => cmplog_cap = Some(parse_int(key, value)?),
             other => {
                 return Err(TransportSpecError::UnknownMapKey {
                     key: other.to_owned(),
@@ -779,7 +809,33 @@ fn parse_coverage_map(spec: &str) -> Result<(GdbMemoryMap, InputContract), Trans
     let capacity = usize::try_from(input_cap)
         .map_err(|_| TransportSpecError::CapTooLarge { cap: input_cap })?;
     let contract = InputContract::new(capacity, input_len)?;
-    Ok((map, contract))
+    // The comparison record (#386): its address and its entry capacity, which
+    // the firmware's declaration fixes, so neither is guessed.
+    let cmplog = match (cmplog, cmplog_cap) {
+        (None, None) => None,
+        (Some(address), Some(cap)) if (1..=MAX_CMPLOG_CAPACITY).contains(&cap) => {
+            Some(CmpLogRegion {
+                address,
+                capacity: cap as usize,
+            })
+        }
+        (Some(_), Some(cap)) => {
+            return Err(TransportSpecError::CmpLog(format!(
+                "cmplog_cap={cap} is outside 1..={MAX_CMPLOG_CAPACITY}"
+            )))
+        }
+        (Some(_), None) => {
+            return Err(TransportSpecError::CmpLog(
+                "cmplog= needs cmplog_cap=N, the record's entry capacity".to_owned(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(TransportSpecError::CmpLog(
+                "cmplog_cap= needs cmplog=ADDR, the record's address".to_owned(),
+            ))
+        }
+    };
+    Ok((map, contract, cmplog))
 }
 
 /// Parse a decimal or `0x`-hex unsigned integer.
@@ -829,6 +885,9 @@ pub(crate) struct TransportFuzzConfig {
     /// The raw `--target-transport` spec, persisted with each finding so it can
     /// be replayed against the same target/reset contract (#80).
     pub spec: String,
+    /// Each worker's spec, `spec` with its `{worker}` resolved (#316); one
+    /// worker's is `spec`.
+    pub worker_specs: Vec<String>,
     /// The raw `--transport-coverage-map` spec, if any (persisted for replay).
     pub coverage_map: Option<String>,
     /// Ceiling on a generated input's length.
@@ -899,6 +958,11 @@ pub(crate) struct TransportFuzzSummary {
     /// counter (#251).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_cycles: Option<CycleStats>,
+    /// The workers that drove the campaign, one transport each (#316).
+    pub workers: usize,
+    /// The comparisons the firmware's CmpLog record reported, over all runs
+    /// (`cmplog=`, #386).
+    pub comparisons: usize,
     pub elapsed_secs: f64,
 }
 
@@ -952,6 +1016,8 @@ pub(crate) fn run_time(
 pub(crate) enum TransportFuzzError {
     #[error("target transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("worker transport: {0}")]
+    Spec(#[from] TransportSpecError),
     #[error("writing finding: {0}")]
     Finding(#[from] CorpusError),
 }
@@ -1012,248 +1078,416 @@ pub(crate) fn run_transport_campaign(
     transport: &dyn TargetTransport,
     config: &TransportFuzzConfig,
 ) -> Result<TransportFuzzSummary, TransportFuzzError> {
-    let start = Instant::now();
-    let mut session = transport.arm()?;
+    let campaign = Campaign::new(config);
+    run_worker(0, transport, &campaign, config)?;
+    campaign.finish(config)
+}
 
-    let mut coverage = CoverageProxy::default();
-    let mut scheduler = PowerScheduler::default();
+/// [`run_transport_campaign`] over `workers` transports at once (#316): worker
+/// `w` drives the transport `make(w)` builds, in a thread of its own, and the
+/// workers share one corpus, coverage map, schedule and finding set, so what
+/// one finds the others mutate and a fault is one finding however many reach
+/// it. The iteration cap and the time budget are the campaign's.
+pub(crate) fn run_transport_campaign_workers(
+    make: &(dyn Fn(usize) -> Result<Box<dyn TargetTransport>, TransportFuzzError> + Sync),
+    workers: usize,
+    config: &TransportFuzzConfig,
+) -> Result<TransportFuzzSummary, TransportFuzzError> {
+    let campaign = Campaign::new(config);
+    let results: Vec<Result<(), TransportFuzzError>> = std::thread::scope(|scope| {
+        let campaign = &campaign;
+        let handles: Vec<_> = (0..workers.max(1))
+            .map(|worker| {
+                scope.spawn(move || {
+                    let transport = make(worker)?;
+                    let result = run_worker(worker, transport.as_ref(), campaign, config);
+                    if result.is_err() {
+                        // The others stop too: the campaign has failed.
+                        campaign
+                            .lock()
+                            .halted
+                            .get_or_insert_with(|| format!("worker {worker} failed"));
+                    }
+                    result
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("transport worker panicked"))
+            .collect()
+    });
+    for result in results {
+        result?;
+    }
+    campaign.finish(config)
+}
+
+/// What the workers of a transport campaign share.
+struct Campaign {
+    start: Instant,
+    state: std::sync::Mutex<CampaignState>,
+}
+
+struct CampaignState {
+    coverage: CoverageProxy,
+    scheduler: PowerScheduler,
+    emitter: FindingEmitter,
+    /// The next seed to run.
+    next_seed: usize,
+    /// Seeds taken and not yet folded in: until none is, an empty schedule is
+    /// not the end of the campaign.
+    seeds_in_flight: usize,
+    /// Executions a worker has begun: the iteration cap holds on them, so the
+    /// workers together never run past it.
+    started: usize,
+    executions: usize,
+    corpus_new: usize,
+    crashes: usize,
+    // Executions whose post-stop coverage/evidence collection was incomplete
+    // (#74): surfaced in the summary so partial coverage — on a clean run or a
+    // crash — is never silently presented as complete.
+    incomplete_observations: usize,
+    // Runs whose clean/crash classification is UNRELIABLE because a configured
+    // fault-determining observation failed (#72 re-review): recorded here, never
+    // counted as a clean pass and never turned into a fabricated finding.
+    inconclusive_observations: usize,
+    finding_ids: Vec<String>,
+    /// The worker whose transport found each finding, for its replay profile.
+    finding_workers: std::collections::HashMap<String, usize>,
+    // Dedup findings on the same key the on-disk finding signature is built from
+    // (rule_id | kind; the transport lane carries no stack frames), so one fault
+    // class yields one finding regardless of how many inputs reach it.
+    seen_findings: std::collections::HashSet<String>,
+    // Distinct crash-candidate count per (target | rule | kind) class, bounding
+    // how many distinct fault sites one class may retain (#75).
+    class_counts: std::collections::HashMap<String, usize>,
+    // Set when a run-control condition stops the campaign early (#70): a target
+    // hang or a lost transport — a distinct, non-clean outcome.
+    halted: Option<String>,
+    // The target cycles of each completed run, when the spec reads a counter.
+    target_cycles: Option<CycleStats>,
+    /// The comparisons each corpus member's run recorded (#386), keyed by the
+    /// member's bytes: the mutator splices their operands into it.
+    cmplogs: std::collections::HashMap<Vec<u8>, std::sync::Arc<cmplog::CmpLog>>,
+    comparisons: usize,
+}
+
+impl Campaign {
+    fn new(config: &TransportFuzzConfig) -> Self {
+        let emitter = FindingEmitter::with_metadata(
+            config.work_dir.clone(),
+            config.harness_id.clone(),
+            "transport".to_owned(),
+            config.transport_label.clone(),
+        )
+        .with_mode(config.mode);
+        Self {
+            start: Instant::now(),
+            state: std::sync::Mutex::new(CampaignState {
+                coverage: CoverageProxy::default(),
+                scheduler: PowerScheduler::default(),
+                emitter,
+                next_seed: 0,
+                seeds_in_flight: 0,
+                started: 0,
+                executions: 0,
+                corpus_new: 0,
+                crashes: 0,
+                incomplete_observations: 0,
+                inconclusive_observations: 0,
+                finding_ids: Vec::new(),
+                finding_workers: std::collections::HashMap::new(),
+                seen_findings: std::collections::HashSet::new(),
+                class_counts: std::collections::HashMap::new(),
+                halted: None,
+                target_cycles: None,
+                cmplogs: std::collections::HashMap::new(),
+                comparisons: 0,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CampaignState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn should_stop(&self, state: &CampaignState, config: &TransportFuzzConfig) -> bool {
+        state.halted.is_some()
+            || should_stop(
+                state.started,
+                config.iterations,
+                self.start,
+                config.time_budget,
+                state.finding_ids.len(),
+                config.stop_after_findings,
+            )
+    }
+
+    /// Fold one run in: count it, keep its coverage, keep a clean input that
+    /// reached new coverage (always, for a seed), and turn a fault into a
+    /// finding.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        worker: usize,
+        input: &[u8],
+        seed: bool,
+        outcome: &RunOutcome,
+        elapsed: Duration,
+        config: &TransportFuzzConfig,
+    ) -> Result<(), TransportFuzzError> {
+        let mut state = self.lock();
+        let state = &mut *state;
+        state.executions += 1;
+        CycleStats::record(&mut state.target_cycles, outcome.target.cycles);
+        if outcome.coverage_incomplete.is_some() {
+            state.incomplete_observations += 1;
+        }
+        if outcome.inconclusive.is_some() {
+            state.inconclusive_observations += 1;
+        }
+        state.comparisons += outcome.target.comparisons.len();
+        let feedback = fold_coverage(&mut state.coverage, &outcome.coverage_edges);
+        if seed {
+            // Seeds are always corpus members.
+            state
+                .scheduler
+                .insert_with_feedback(input, feedback.to_schedule_feedback());
+            state.seeds_in_flight -= 1;
+            keep_cmplog(state, input, outcome);
+        } else if outcome.exit == ExitKind::Ok
+            && outcome.inconclusive.is_none()
+            && (feedback.new_bitmap_bits() > 0 || feedback.new_exception_signatures > 0)
+        {
+            // Retain a clean input that reached new coverage as a new corpus
+            // seed, feeding its novelty back into the power schedule. A
+            // crashing input becomes a finding, not a seed; an INCONCLUSIVE
+            // run is not a proven clean pass, so it is not retained as a clean
+            // seed either (#72 re-review).
+            state
+                .scheduler
+                .insert_with_feedback(input, feedback.to_schedule_feedback());
+            state.corpus_new += 1;
+            keep_cmplog(state, input, outcome);
+        }
+        let before = state.finding_ids.len();
+        handle_outcome(
+            outcome,
+            input,
+            &config.transport_label,
+            &state.emitter,
+            &mut state.seen_findings,
+            &mut state.class_counts,
+            &mut state.finding_ids,
+            &mut state.crashes,
+        )?;
+        // The deadline oracle is for a COMPLETED-but-slow run only: a crash
+        // or execution timeout already yields its own finding, and an
+        // INCONCLUSIVE run is not a proven clean completion — firing it for
+        // either would fabricate a timing finding.
+        if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
+            maybe_emit_deadline(
+                run_time(config.cycle_counter, outcome, elapsed),
+                config.deadline,
+                input,
+                &state.emitter,
+                &mut state.seen_findings,
+                &mut state.finding_ids,
+                &mut state.crashes,
+            )?;
+        }
+        for id in &state.finding_ids[before..] {
+            state.finding_workers.insert(id.clone(), worker);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        config: &TransportFuzzConfig,
+    ) -> Result<TransportFuzzSummary, TransportFuzzError> {
+        let start = self.start;
+        let state = self
+            .state
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Persist a replayable target profile next to each finding (#80), with
+        // the spec of the worker whose transport found it.
+        persist_transport_profiles(config, &state.finding_ids, &state.finding_workers);
+        let snapshot = state.coverage.snapshot();
+        Ok(TransportFuzzSummary {
+            schema_version: 1,
+            harness_id: config.harness_id.clone(),
+            engine: "transport".to_owned(),
+            transport: config.transport_label.clone(),
+            seeds: config.seeds.len(),
+            executions: state.executions,
+            corpus_new: state.corpus_new,
+            coverage_edges: snapshot.edge_bits,
+            coverage_blocks: snapshot.breadcrumb_bits,
+            crashes: state.crashes,
+            incomplete_observations: state.incomplete_observations,
+            inconclusive_observations: state.inconclusive_observations,
+            findings: state.finding_ids,
+            halted: state.halted,
+            target_cycles: state.target_cycles,
+            workers: config.worker_specs.len().max(1),
+            comparisons: state.comparisons,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+/// Keep the comparisons a new corpus member's run recorded, as the CmpLog
+/// its mutations splice from: an operand found in the input is replaced with
+/// the value it was compared against (#386).
+fn keep_cmplog(state: &mut CampaignState, input: &[u8], outcome: &RunOutcome) {
+    let mut log = cmplog::CmpLog::new();
+    for comparison in &outcome.target.comparisons {
+        log.record(cmplog::CmpEntry {
+            site_id: u64::from(comparison.site),
+            operand_a: comparison.lhs_bytes(),
+            operand_b: comparison.rhs_bytes(),
+            kind: cmplog::CmpKind::IntegerCompare,
+        });
+    }
+    log.retain_spliceable(input);
+    if !log.entries.is_empty() {
+        state
+            .cmplogs
+            .insert(input.to_vec(), std::sync::Arc::new(log));
+    }
+}
+
+/// One worker of a campaign: run seeds while any are left, then mutate the
+/// shared corpus, each input through its own `transport`.
+fn run_worker(
+    worker: usize,
+    transport: &dyn TargetTransport,
+    campaign: &Campaign,
+    config: &TransportFuzzConfig,
+) -> Result<(), TransportFuzzError> {
+    let mut session = transport.arm()?;
     let mutator = MutatorSuite::new(MutatorConfig {
         max_len: config.max_len.max(1),
         ..MutatorConfig::default()
     });
-    let mut rng = MutationRng::new(config.rng_seed);
+    // Worker 0 mutates as a campaign of one does; the others on streams of
+    // their own.
+    let mut rng = MutationRng::new(
+        config
+            .rng_seed
+            .wrapping_add((worker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
     let dictionary = Dictionary::from_tokens(config.dictionary.iter().cloned());
-
-    let emitter = FindingEmitter::with_metadata(
-        config.work_dir.clone(),
-        config.harness_id.clone(),
-        "transport".to_owned(),
-        config.transport_label.clone(),
-    )
-    .with_mode(config.mode);
-
-    let mut executions = 0usize;
-    let mut corpus_new = 0usize;
-    let mut crashes = 0usize;
-    // Executions whose post-stop coverage/evidence collection was incomplete
-    // (#74): surfaced in the summary so partial coverage — on a clean run or a
-    // crash — is never silently presented as complete.
-    let mut incomplete_observations = 0usize;
-    // Runs whose clean/crash classification is UNRELIABLE because a configured
-    // fault-determining observation failed (#72 re-review): recorded here, never
-    // counted as a clean pass and never turned into a fabricated finding.
-    let mut inconclusive_observations = 0usize;
-    let mut finding_ids: Vec<String> = Vec::new();
-    // Dedup findings on the same key the on-disk finding signature is built from
-    // (rule_id | kind; the transport lane carries no stack frames), so one fault
-    // class yields one finding regardless of how many inputs reach it.
-    let mut seen_findings: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Distinct crash-candidate count per (target | rule | kind) class, bounding
-    // how many distinct fault sites one class may retain (#75).
-    let mut class_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    // Set when a run-control condition stops the campaign early (#70): a target
-    // hang or a lost transport — a distinct, non-clean outcome.
-    let mut halted: Option<String> = None;
-    // The target cycles of each completed run, when the spec reads a counter.
-    let mut target_cycles: Option<CycleStats> = None;
-
-    // --- seed phase: run every seed once; seeds are always corpus members. ---
-    let seed_count = config.seeds.len();
-    for seed in &config.seeds {
-        if should_stop(
-            executions,
-            config.iterations,
-            start,
-            config.time_budget,
-            finding_ids.len(),
-            config.stop_after_findings,
-        ) {
-            break;
+    let halt = |reason: String| {
+        let mut state = campaign.lock();
+        if state.halted.is_none() {
+            state.halted = Some(if config.worker_specs.len() > 1 {
+                format!("worker {worker}: {reason}")
+            } else {
+                reason
+            });
         }
-        match run_one_input(session.as_mut(), seed)? {
-            Step::Halt(reason) => {
-                halted = Some(reason);
+    };
+
+    // --- seed phase: every seed runs once, on whichever worker takes it. ---
+    loop {
+        let seed = {
+            let mut state = campaign.lock();
+            if campaign.should_stop(&state, config) || state.next_seed >= config.seeds.len() {
                 break;
             }
+            let seed = config.seeds[state.next_seed].clone();
+            state.next_seed += 1;
+            state.seeds_in_flight += 1;
+            state.started += 1;
+            seed
+        };
+        match run_one_input(session.as_mut(), &seed)? {
+            Step::Halt(reason) => {
+                campaign.lock().seeds_in_flight -= 1;
+                halt(reason);
+                return Ok(());
+            }
             Step::Ran(outcome, elapsed) => {
-                executions += 1;
-                CycleStats::record(&mut target_cycles, outcome.target.cycles);
-                if outcome.coverage_incomplete.is_some() {
-                    incomplete_observations += 1;
-                }
-                if outcome.inconclusive.is_some() {
-                    inconclusive_observations += 1;
-                }
-                let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
-                scheduler.insert_with_feedback(seed.clone(), feedback.to_schedule_feedback());
-                handle_outcome(
-                    &outcome,
-                    seed,
-                    &config.transport_label,
-                    &emitter,
-                    &mut seen_findings,
-                    &mut class_counts,
-                    &mut finding_ids,
-                    &mut crashes,
-                )?;
-                // The deadline oracle is for a COMPLETED-but-slow run only: a crash
-                // or execution timeout already yields its own finding, and an
-                // INCONCLUSIVE run is not a proven clean completion — firing it for
-                // either would fabricate a timing finding.
-                if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
-                    maybe_emit_deadline(
-                        run_time(config.cycle_counter, &outcome, elapsed),
-                        config.deadline,
-                        seed,
-                        &emitter,
-                        &mut seen_findings,
-                        &mut finding_ids,
-                        &mut crashes,
-                    )?;
-                }
+                campaign.record(worker, &seed, true, &outcome, elapsed, config)?;
             }
         }
     }
 
     // --- mutation phase: scheduler-driven, coverage-guided. ---
-    if halted.is_none() {
-        'outer: loop {
-            if should_stop(
-                executions,
-                config.iterations,
-                start,
-                config.time_budget,
-                finding_ids.len(),
-                config.stop_after_findings,
-            ) {
+    'outer: loop {
+        let scheduled = {
+            let mut state = campaign.lock();
+            if campaign.should_stop(&state, config) {
                 break;
             }
-            let Some(scheduled) = scheduler.select_next() else {
+            match state.scheduler.select_next() {
+                Some(scheduled) => {
+                    let cmplog = state.cmplogs.get(&scheduled.bytes).cloned();
+                    (scheduled, cmplog)
+                }
+                // Another worker's seed may yet arrive.
+                None if state.seeds_in_flight > 0 => {
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 // No corpus (no seeds and none retained) — nothing to mutate.
-                break;
-            };
-            // The scheduler's power schedule sets how many children this seed earns.
-            let children = scheduled.energy.max(1);
-            for _ in 0..children {
-                if should_stop(
-                    executions,
-                    config.iterations,
-                    start,
-                    config.time_budget,
-                    finding_ids.len(),
-                    config.stop_after_findings,
-                ) {
+                None => break,
+            }
+        };
+        let (scheduled, cmplog) = scheduled;
+        // The scheduler's power schedule sets how many children this seed earns.
+        let children = scheduled.energy.max(1);
+        for _ in 0..children {
+            {
+                let mut state = campaign.lock();
+                if campaign.should_stop(&state, config) {
                     break 'outer;
                 }
-                // With a grammar, a target that parses it gets only its
-                // sentences: a byte mutation of one would mostly not be.
-                let generated = match &config.grammar {
-                    Some(grammar) => grammar.generate(config.max_len.max(1), &mut rng),
-                    None => {
-                        let spans = config
-                            .arg_layout
-                            .as_ref()
-                            .map(|layout| {
-                                crate::fuzz::typed_spans::arg_layout_typed_spans(
-                                    layout,
-                                    &scheduled.bytes,
-                                )
-                            })
-                            .unwrap_or_default();
-                        mutator
-                            .mutate(
-                                &MutationInput::new(&scheduled.bytes, &dictionary)
-                                    .with_typed_spans(&spans),
-                                &mut rng,
+                state.started += 1;
+            }
+            // With a grammar, a target that parses it gets only its
+            // sentences: a byte mutation of one would mostly not be.
+            let generated = match &config.grammar {
+                Some(grammar) => grammar.generate(config.max_len.max(1), &mut rng),
+                None => {
+                    let spans = config
+                        .arg_layout
+                        .as_ref()
+                        .map(|layout| {
+                            crate::fuzz::typed_spans::arg_layout_typed_spans(
+                                layout,
+                                &scheduled.bytes,
                             )
-                            .map(|result| result.bytes)
+                        })
+                        .unwrap_or_default();
+                    let mut input =
+                        MutationInput::new(&scheduled.bytes, &dictionary).with_typed_spans(&spans);
+                    if let Some(log) = cmplog.as_deref() {
+                        input = input.with_cmplog(log);
                     }
-                };
-                let input = generated.unwrap_or_else(|| scheduled.bytes.clone());
-                match run_one_input(session.as_mut(), &input)? {
-                    Step::Halt(reason) => {
-                        halted = Some(reason);
-                        break 'outer;
-                    }
-                    Step::Ran(outcome, elapsed) => {
-                        executions += 1;
-                        CycleStats::record(&mut target_cycles, outcome.target.cycles);
-                        if outcome.coverage_incomplete.is_some() {
-                            incomplete_observations += 1;
-                        }
-                        if outcome.inconclusive.is_some() {
-                            inconclusive_observations += 1;
-                        }
-                        let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
-                        // Retain a clean input that reached new coverage as a new
-                        // corpus seed, feeding its novelty back into the power
-                        // schedule. A crashing input becomes a finding, not a seed;
-                        // an INCONCLUSIVE run is not a proven clean pass, so it is
-                        // not retained as a clean seed either (#72 re-review).
-                        if outcome.exit == ExitKind::Ok
-                            && outcome.inconclusive.is_none()
-                            && (feedback.new_bitmap_bits() > 0
-                                || feedback.new_exception_signatures > 0)
-                        {
-                            scheduler.insert_with_feedback(
-                                input.clone(),
-                                feedback.to_schedule_feedback(),
-                            );
-                            corpus_new += 1;
-                        }
-                        handle_outcome(
-                            &outcome,
-                            &input,
-                            &config.transport_label,
-                            &emitter,
-                            &mut seen_findings,
-                            &mut class_counts,
-                            &mut finding_ids,
-                            &mut crashes,
-                        )?;
-                        // Deadline oracle: completed-but-slow runs only (a crash,
-                        // an execution timeout, or an inconclusive run is not a
-                        // proven clean completion).
-                        if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
-                            maybe_emit_deadline(
-                                run_time(config.cycle_counter, &outcome, elapsed),
-                                config.deadline,
-                                &input,
-                                &emitter,
-                                &mut seen_findings,
-                                &mut finding_ids,
-                                &mut crashes,
-                            )?;
-                        }
-                    }
+                    mutator.mutate(&input, &mut rng).map(|result| result.bytes)
+                }
+            };
+            let input = generated.unwrap_or_else(|| scheduled.bytes.clone());
+            match run_one_input(session.as_mut(), &input)? {
+                Step::Halt(reason) => {
+                    halt(reason);
+                    break 'outer;
+                }
+                Step::Ran(outcome, elapsed) => {
+                    campaign.record(worker, &input, false, &outcome, elapsed, config)?;
                 }
             }
         }
     }
-
-    // Persist a replayable target profile next to each finding (#80).
-    persist_transport_profiles(config, &finding_ids);
-
-    let snapshot = coverage.snapshot();
-    Ok(TransportFuzzSummary {
-        schema_version: 1,
-        harness_id: config.harness_id.clone(),
-        engine: "transport".to_owned(),
-        transport: config.transport_label.clone(),
-        seeds: seed_count,
-        executions,
-        corpus_new,
-        coverage_edges: snapshot.edge_bits,
-        coverage_blocks: snapshot.breadcrumb_bits,
-        crashes,
-        incomplete_observations,
-        inconclusive_observations,
-        findings: finding_ids,
-        halted,
-        target_cycles,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-    })
+    Ok(())
 }
 
 /// Schema id and filename for the per-finding replay profile (#80).
@@ -1280,11 +1514,24 @@ fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
 /// fidelity limitations. Endpoints are recorded verbatim from the operator's
 /// spec; `bhf replay --transport-endpoint` relocates them, and a report that is
 /// published more widely should not embed sensitive endpoints indiscriminately.
-fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[String]) {
-    if finding_ids.is_empty() {
-        return;
+fn persist_transport_profiles(
+    config: &TransportFuzzConfig,
+    finding_ids: &[String],
+    finding_workers: &std::collections::HashMap<String, usize>,
+) {
+    for id in finding_ids {
+        // The spec of the worker whose transport found it (#316).
+        let spec = finding_workers
+            .get(id)
+            .filter(|_| config.worker_specs.len() > 1)
+            .and_then(|worker| config.worker_specs.get(*worker))
+            .unwrap_or(&config.spec);
+        persist_transport_profile(config, spec, id);
     }
-    let (backend, reset) = backend_and_reset(&config.spec);
+}
+
+fn persist_transport_profile(config: &TransportFuzzConfig, spec: &str, id: &str) {
+    let (backend, reset) = backend_and_reset(spec);
     // Persist the timing contract so `bhf replay` can reproduce a timing finding:
     // the per-input execution deadline (rebuild the transport with the SAME bound
     // so an execution-timeout re-times-out) and the response-time deadline (so a
@@ -1302,7 +1549,7 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
     });
     let profile = serde_json::json!({
         "schema_version": TRANSPORT_PROFILE_SCHEMA,
-        "spec": config.spec,
+        "spec": spec,
         "coverage_map": config.coverage_map,
         "transport_label": config.transport_label,
         "backend": backend,
@@ -1324,7 +1571,7 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
     let Ok(body) = serde_json::to_vec_pretty(&profile) else {
         return;
     };
-    for id in finding_ids {
+    {
         let dir = config.work_dir.join("results").join("findings").join(id);
         let _ = std::fs::write(dir.join(TRANSPORT_PROFILE_FILE), &body);
         // The finding names the firmware it was found on, too (#248).
@@ -1609,11 +1856,66 @@ pub(crate) fn run(args: FuzzArgs) -> i32 {
     }
 }
 
+/// Whether a `--target-transport` spec names each worker's target (#316).
+fn has_worker_template(spec: &str) -> bool {
+    resolve_worker_spec(spec, 0) != resolve_worker_spec(spec, 1)
+}
+
+/// `spec` for worker `worker`: `{worker}` is its number, and `{BASE+worker}`
+/// (decimal) is `BASE` plus it, for a port per worker.
+fn resolve_worker_spec(spec: &str, worker: usize) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let mut rest = spec;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let inner = &after[..close];
+        let value = if inner == "worker" {
+            Some(worker as u64)
+        } else {
+            inner
+                .strip_suffix("+worker")
+                .and_then(|base| base.trim().parse::<u64>().ok())
+                .map(|base| base + worker as u64)
+        };
+        match value {
+            Some(value) => out.push_str(&value.to_string()),
+            None => out.push_str(&rest[open..open + 1 + close + 1]),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
-    let spec = args
+    let template = args
         .target_transport
-        .as_deref()
+        .clone()
         .expect("run() is only reached when --target-transport is set");
+    // #316: `--workers N` is N transports, one spec each.
+    let worker_specs = match args.workers {
+        None | Some(crate::fuzz::FuzzWorkerCount::Fixed(0 | 1)) => {
+            vec![resolve_worker_spec(&template, 0)]
+        }
+        Some(crate::fuzz::FuzzWorkerCount::Fixed(n)) if has_worker_template(&template) => (0..n
+            as usize)
+            .map(|worker| resolve_worker_spec(&template, worker))
+            .collect(),
+        Some(_) => {
+            crate::bhfeprintln!(
+                "bhf fuzz --target-transport: --workers runs one transport per worker: give \
+                 a number of workers, and a spec naming each worker's target with {{worker}} \
+                 (0, 1, ...) or {{BASE+worker}} (agent:tcp:127.0.0.1:{{9000+worker}})"
+            );
+            return Err(2);
+        }
+    };
+    let spec = worker_specs[0].as_str();
 
     let plan =
         TransportPlan::parse(spec, args.transport_coverage_map.as_deref()).map_err(|error| {
@@ -1656,11 +1958,25 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         None => None,
     };
     let cycle_counter = plan.cycle_counter();
-    let transport_label = plan.label();
-    let transport = plan.into_transport(args.timeout).map_err(|error| {
-        crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
-        2
-    })?;
+    // One label for the campaign: a fault is one finding whichever worker's
+    // target it is on.
+    let transport_label = if worker_specs.len() > 1 {
+        template.clone()
+    } else {
+        plan.label()
+    };
+    // Every worker's spec parses before any worker starts.
+    let mut plans = vec![plan];
+    for worker_spec in &worker_specs[1..] {
+        plans.push(
+            TransportPlan::parse(worker_spec, args.transport_coverage_map.as_deref()).map_err(
+                |error| {
+                    crate::bhfeprintln!("bhf fuzz --target-transport {worker_spec}: {error}");
+                    2
+                },
+            )?,
+        );
+    }
 
     let fail = |error: String| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
@@ -1685,6 +2001,7 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         per_input_timeout: args.timeout,
         deadline: args.deadline,
         spec: spec.to_owned(),
+        worker_specs: worker_specs.clone(),
         coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
         input_contract,
@@ -1698,7 +2015,23 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         arg_layout: crate::fuzz::typed_spans::find_arg_layout(&args.work_dir, &args.harness, None),
     };
 
-    let summary = run_transport_campaign(transport.as_ref(), &config).map_err(|error| {
+    let timeout = args.timeout;
+    let summary = if plans.len() == 1 {
+        let transport = plans.remove(0).into_transport(timeout).map_err(|error| {
+            crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
+            2
+        })?;
+        run_transport_campaign(transport.as_ref(), &config)
+    } else {
+        let make = |worker: usize| {
+            plans[worker]
+                .clone()
+                .into_transport(timeout)
+                .map_err(TransportFuzzError::from)
+        };
+        run_transport_campaign_workers(&make, plans.len(), &config)
+    }
+    .map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
         1
     })?;
@@ -1961,10 +2294,12 @@ mod tests {
                 firmware,
                 cycles,
                 task_id,
+                cmplog,
             } => {
                 assert_eq!(firmware, None);
                 assert_eq!(cycles, None);
                 assert_eq!(task_id, None);
+                assert_eq!(cmplog, None);
                 assert_eq!(input, InputContract::new(64, None).unwrap());
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 1234);
@@ -2037,6 +2372,7 @@ mod tests {
                 firmware: _,
                 cycles: _,
                 task_id: _,
+                cmplog: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
@@ -2110,6 +2446,41 @@ mod tests {
                 assert_eq!(status.clear_value, 0xff);
             }
             other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    /// #386: `cmplog=` and `cmplog_cap=` name the firmware's comparison
+    /// record, both or neither, with a capacity one read can take.
+    #[test]
+    fn the_coverage_map_names_a_cmplog_record() {
+        let base = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2",
+            Some(&format!("{base},cmplog=0x20000258,cmplog_cap=32")),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.cmplog(),
+            Some(CmpLogRegion {
+                address: 0x2000_0258,
+                capacity: 32
+            })
+        );
+        let plan = TransportPlan::parse("gdb:h:2", Some(base)).unwrap();
+        assert_eq!(plan.cmplog(), None);
+        for (extra, says) in [
+            (",cmplog=0x2000", "cmplog= needs cmplog_cap=N"),
+            (",cmplog_cap=8", "cmplog_cap= needs cmplog=ADDR"),
+            (",cmplog=0x2000,cmplog_cap=0", "cmplog_cap=0 is outside"),
+            (
+                ",cmplog=0x2000,cmplog_cap=43691",
+                "cmplog_cap=43691 is outside",
+            ),
+        ] {
+            let error = TransportPlan::parse("gdb:h:2", Some(&format!("{base}{extra}")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(says), "{extra}: {error}");
         }
     }
 
@@ -2302,6 +2673,137 @@ mod tests {
         assert!(error.to_string().contains("snapshot tag"), "{error}");
     }
 
+    /// #316: a spec names each worker's target with `{worker}` or
+    /// `{BASE+worker}`; one without either is no per-worker spec.
+    #[test]
+    fn a_worker_spec_template_resolves_per_worker() {
+        assert_eq!(
+            resolve_worker_spec("agent:tcp:127.0.0.1:{9000+worker}", 2),
+            "agent:tcp:127.0.0.1:9002"
+        );
+        assert_eq!(
+            resolve_worker_spec("agent:serial:/dev/ttyUSB{worker},baud=115200", 1),
+            "agent:serial:/dev/ttyUSB1,baud=115200"
+        );
+        assert!(has_worker_template("gdb:127.0.0.1:{3333+worker}"));
+        assert!(!has_worker_template("agent:tcp:127.0.0.1:9000"));
+        assert_eq!(
+            resolve_worker_spec("x:{other}:{worker", 3),
+            "x:{other}:{worker"
+        );
+    }
+
+    /// A target whose edges are its input's first byte and which faults on an
+    /// input holding `!`; it logs which worker ran each input.
+    /// The inputs a target ran, with the worker that ran each.
+    type RunLog = Arc<Mutex<Vec<(usize, Vec<u8>)>>>;
+
+    #[derive(Clone)]
+    struct LoggingTarget {
+        worker: usize,
+        log: RunLog,
+    }
+
+    impl TargetTransport for LoggingTarget {
+        fn arm(&self) -> target_transport::Result<Box<dyn TargetSession>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl TargetSession for LoggingTarget {
+        fn run_input(&mut self, input: &[u8]) -> target_transport::Result<RunOutcome> {
+            self.log.lock().unwrap().push((self.worker, input.to_vec()));
+            let faulted = input.contains(&b'!');
+            Ok(RunOutcome {
+                exit: if faulted {
+                    ExitKind::Crash
+                } else {
+                    ExitKind::Ok
+                },
+                coverage_edges: vec![1, 100 + u32::from(input.first().copied().unwrap_or(0))],
+                fault: faulted.then(|| target_transport::Fault {
+                    kind: target_transport::FaultKind::MemoryProtection,
+                    address: Some(0x2000_0100),
+                    detail: "write past the frame".to_owned(),
+                }),
+                stdout: Vec::new(),
+                coverage_incomplete: None,
+                inconclusive: None,
+                target: Default::default(),
+            })
+        }
+    }
+
+    /// #316: N workers, one transport each, share one campaign: every one of
+    /// them runs inputs, together they run the campaign's iteration cap and
+    /// no more, and a fault more than one reaches is one finding, replayed on
+    /// the transport of the worker that found it.
+    #[test]
+    fn workers_share_one_campaign_over_their_own_transports() {
+        let work = tmp_work_dir("workers");
+        let mut cfg = config(work.to_path_buf(), vec![b"a".to_vec(), b"b".to_vec()], 600);
+        cfg.worker_specs = (0..3)
+            .map(|worker| format!("agent:tcp:127.0.0.1:{}", 9000 + worker))
+            .collect();
+        cfg.dictionary = vec![b"!".to_vec()];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let make = |worker: usize| -> Result<Box<dyn TargetTransport>, TransportFuzzError> {
+            Ok(Box::new(LoggingTarget {
+                worker,
+                log: Arc::clone(&log),
+            }))
+        };
+        let summary = run_transport_campaign_workers(&make, 3, &cfg).unwrap();
+        assert_eq!(summary.workers, 3);
+        assert_eq!(summary.executions, 600, "{summary:?}");
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 600, "no worker runs past the cap");
+        for worker in 0..3 {
+            assert!(
+                log.iter().any(|(who, _)| *who == worker),
+                "worker {worker} ran no input"
+            );
+        }
+        // The seeds ran once each, between them.
+        let seed_runs = log
+            .iter()
+            .filter(|(_, input)| input.as_slice() == b"a" || input.as_slice() == b"b")
+            .count();
+        assert!(seed_runs >= 2, "{seed_runs}");
+        let faulting = log
+            .iter()
+            .filter(|(_, input)| input.contains(&b'!'))
+            .count();
+        assert!(
+            faulting > 1,
+            "more than one input reached the fault: {faulting}"
+        );
+        assert_eq!(
+            summary.findings.len(),
+            1,
+            "one fault, one finding: {summary:?}"
+        );
+        let profile: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                work.join("results/findings")
+                    .join(&summary.findings[0])
+                    .join(TRANSPORT_PROFILE_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // On the transport of a worker that ran a faulting input.
+        let found_on: Vec<String> = log
+            .iter()
+            .filter(|(_, input)| input.contains(&b'!'))
+            .map(|(who, _)| format!("agent:tcp:127.0.0.1:{}", 9000 + who))
+            .collect();
+        assert!(
+            found_on.iter().any(|spec| profile["spec"] == spec.as_str()),
+            "replayed where it was found: {profile:#}"
+        );
+    }
+
     // --- end-to-end loop tests against the mock agent ------------------------
 
     /// Build an [`AgentTransport`] over an in-memory `duplex()` whose target end
@@ -2343,6 +2845,7 @@ mod tests {
             per_input_timeout: None,
             deadline: None,
             spec: "agent:tcp:127.0.0.1:65535".to_owned(),
+            worker_specs: vec!["agent:tcp:127.0.0.1:65535".to_owned()],
             coverage_map: None,
             max_len: 4096,
             input_contract: None,

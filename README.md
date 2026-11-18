@@ -31,8 +31,11 @@ toolchains. Missing dependencies and unsupported targets are reported.
   types, and symbols. Targets that cannot build can still receive static and taint analysis.
 - **Sixteen languages.** All use a shared coverage-guided engine. AFL++ is an optional
   adapter for native C/C++.
-- **Legacy code.** Discovers and statically analyzes Ada 83, K&R C, pre-C++98 and
-  Python 2 sources (report-only: they are not fuzzed), and reads Latin-1/Windows-1252 sources.
+- **Legacy code.** Fuzzes old-style (K&R) definitions in C through the prototype their
+  parameter declarations give, `pragma Ada_83` units from a modern Ada harness, and
+  sources written for `python2` when that interpreter is installed (report-only without it).
+  Discovers and statically analyzes pre-C++98 sources (report-only: they are not
+  fuzzed), and reads Latin-1/Windows-1252 sources.
 - **Offline operation.** No network access, telemetry, or automatic updates required.
 - **Permissive core.** Apache-2.0, MIT, and BSD dependencies.
 

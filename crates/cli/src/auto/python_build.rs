@@ -12,9 +12,13 @@
 //! repair loop is a pass-through (the launcher already exists). A missing `python3`
 //! or an un-harnessable target (currently: an instance method needing a constructed
 //! receiver) skips cleanly — the GNAT-less rule.
+//!
+//! A Python 2 source runs under a `python2` interpreter with the same runtime,
+//! which is written for both (#285); without one it is report-only.
 
 use crate::auto::candidate::Candidate;
 use python_parser::{parse_python_functions, PyFunction};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -29,10 +33,53 @@ pub enum PythonBuildResult {
     Failed { reason: String, skip: bool },
 }
 
-fn probe_python() -> Option<PathBuf> {
-    which::which("python3")
-        .or_else(|_| which::which("python"))
-        .ok()
+/// `name` on `path` (`PATH` when `None`).
+fn find_on(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    match path {
+        Some(path) => which::which_in(name, Some(path), "/").ok(),
+        None => which::which(name).ok(),
+    }
+}
+
+/// The interpreter a candidate of `dialect` runs under (#285), found on `path`
+/// (`PATH` when `None`): a Python 2 source under `python2`, `python2.7` or a
+/// `python` that is 2.x, any other under `python3` or a `python` that is 3.x.
+/// The error is the reason the target is skipped.
+pub(crate) fn select_interpreter(
+    dialect: Option<lang_profile::Dialect>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    if dialect == Some(lang_profile::Dialect::Python2) {
+        return ["python2", "python2.7", "python"]
+            .into_iter()
+            .filter_map(|name| find_on(name, path))
+            .find(|python| python_version(python).is_some_and(|(major, _)| major == 2))
+            .ok_or_else(|| {
+                "Python 2: no `python2` interpreter found; install Python 2.7 as `python2` \
+                 to fuzz this target"
+                    .to_owned()
+            });
+    }
+    let Some(python) = find_on("python3", path).or_else(|| find_on("python", path)) else {
+        return Err(
+            "no `python3` interpreter found; install Python 3 to fuzz Python \
+                    (the lane skips cleanly, like a GNAT-less Ada skip)"
+                .to_owned(),
+        );
+    };
+    // A Python 2 interpreter (the only `python` on some legacy hosts) cannot
+    // import a Python 3 source. Say so up front rather than letting the import
+    // smoke-test fail with an opaque SyntaxError.
+    if let Some((major, minor)) = python_version(&python) {
+        if major < 3 {
+            return Err(format!(
+                "interpreter at {} is Python {major}.{minor} and this is a Python 3 \
+                 source; install python3 to fuzz this target",
+                python.display()
+            ));
+        }
+    }
+    Ok(python)
 }
 
 /// M22: detected `(major, minor)` of a Python interpreter, or `None` if it could
@@ -69,31 +116,10 @@ pub fn build_python_harness(
     harness_id: &str,
     source_root: &Path,
 ) -> PythonBuildResult {
-    let Some(python) = probe_python() else {
-        return PythonBuildResult::Failed {
-            reason: "no `python3` interpreter found; install Python 3 to fuzz Python \
-                     (the lane skips cleanly, like a GNAT-less Ada skip)"
-                .to_owned(),
-            skip: true,
-        };
+    let python = match select_interpreter(candidate.dialect, None) {
+        Ok(python) => python,
+        Err(reason) => return PythonBuildResult::Failed { reason, skip: true },
     };
-    // M22: a Python 2 interpreter (the only `python` on some legacy hosts) cannot
-    // run the Python 3 driver. Detect it up front and skip with an actionable
-    // reason rather than letting the import smoke-test fail with an opaque
-    // SyntaxError. The Python 2 fuzzing lane is M22 Phase 2.
-    if let Some((major, minor)) = python_version(&python) {
-        if major < 3 {
-            return PythonBuildResult::Failed {
-                reason: format!(
-                    "interpreter at {} is Python {major}.{minor}; the Python-2 fuzzing \
-                     lane is not yet available (M22 Phase 2) — install python3 to fuzz \
-                     this target",
-                    python.display()
-                ),
-                skip: true,
-            };
-        }
-    }
     let Some(runtime) = locate_python_runtime() else {
         return PythonBuildResult::Failed {
             reason: "could not locate the bundled python_runtime/ (decode/cov/driver)".to_owned(),
@@ -135,7 +161,7 @@ pub fn build_python_harness(
     );
 
     // Generate the harness module.
-    let harness_src = generate_harness(&module, func, resolved.receiver.as_deref());
+    let harness_src = generate_harness(&module, func, resolved.receiver.as_ref());
     let harness_path = gen_pkg.join("harness.py");
     if let Err(e) = std::fs::write(&harness_path, &harness_src) {
         return PythonBuildResult::Failed {
@@ -257,20 +283,23 @@ pub fn build_python_harness(
 /// receiver-construction expression (`_t.Class()`).
 struct ResolvedTarget {
     func: PyFunction,
-    /// Construction expression for an instance method's receiver, or `None` for a
+    /// How an instance method's receiver is built, or `None` for a
     /// module-level function / `@staticmethod` / `@classmethod`.
-    receiver: Option<String>,
+    receiver: Option<Receiver>,
 }
 
 /// Re-parse the candidate source, find the function by (qualified name, line), and
-/// resolve the receiver for an instance method (no-arg constructor only — if the
-/// class's `__init__` needs arguments we skip cleanly, mirroring the Rust/Java
-/// no-arg-ctor first cut).
+/// resolve the receiver for an instance method ([`resolve_receiver`]).
 fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
     let source = crate::source_text::read_source_text(&candidate.source_path)
         .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
-    let functions =
-        parse_python_functions(&source).map_err(|_| "failed to parse Python source".to_owned())?;
+    // A Python 2 source fails the Python 3 grammar; discovery read it with the
+    // tolerant extractor, and so does this.
+    let functions = if candidate.dialect == Some(lang_profile::Dialect::Python2) {
+        python_parser::parse_python2_functions(&source)
+    } else {
+        parse_python_functions(&source).map_err(|_| "failed to parse Python source".to_owned())?
+    };
     let func = functions
         .iter()
         .find(|f| f.qualified() == candidate.name && f.line == candidate.line)
@@ -282,11 +311,21 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
     Ok(ResolvedTarget { func, receiver })
 }
 
+/// How an instance method's receiver is built: `_t.<class>(r0, r1, ...)`, one
+/// argument per required `__init__` parameter, decoded from the input ahead of
+/// the method's own arguments (#286).
+struct Receiver {
+    class: String,
+    params: Vec<python_parser::PyParam>,
+}
+
 /// Resolve an instance method's receiver. `None` for module fns / static / class
-/// methods. For an instance method, synthesize `_t.Class()` IFF the class's
-/// `__init__` (if defined in this file) takes no required arguments; otherwise
-/// return an `Err` so the target skips cleanly.
-fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<String>, String> {
+/// methods. An instance method's receiver is its class built from the required
+/// parameters of its `__init__` (none when this file defines no `__init__`),
+/// each decoded as a method parameter of its annotation or name is. An
+/// annotated parameter of a type the decoder cannot build (a class, a union)
+/// is an `Err`, so the target skips cleanly.
+fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<Receiver>, String> {
     if !func.is_method || func.is_staticmethod || func.is_classmethod {
         return Ok(None);
     }
@@ -295,26 +334,143 @@ fn resolve_receiver(func: &PyFunction, all: &[PyFunction]) -> Result<Option<Stri
     };
     // The parser already drops the implicit `self`, so a non-default, non-varargs
     // param of `__init__` is a REQUIRED constructor argument.
-    if let Some(init) = all
+    let params: Vec<python_parser::PyParam> = all
         .iter()
         .find(|f| f.class_name.as_deref() == Some(class) && f.name == "__init__")
+        .map(|init| {
+            init.params
+                .iter()
+                .filter(|p| !p.is_varargs && !p.has_default)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(param) = params.iter().find(|p| {
+        p.annotation
+            .as_deref()
+            .is_some_and(|ann| !decodable_annotation(ann))
+    }) {
+        return Err(format!(
+            "instance method `{}` needs a receiver, but `{class}.__init__` parameter \
+             `{}: {}` is not a scalar, str, bytes, container or stream bhf can decode \
+             (skipped cleanly)",
+            func.qualified(),
+            param.name,
+            param.annotation.as_deref().unwrap_or_default()
+        ));
+    }
+    Ok(Some(Receiver {
+        class: class.to_owned(),
+        params,
+    }))
+}
+
+/// Whether [`decode_expr`] builds a value of annotation `ann` (rather than
+/// handing raw bytes to a parameter of some other type): a union counts when
+/// one of its members does ([`effective_annotation`]).
+fn decodable_annotation(ann: &str) -> bool {
+    single_decodable(&effective_annotation(ann))
+}
+
+/// Whether [`decode_expr`] builds a value of the one (non-union) annotation `ann`.
+fn single_decodable(ann: &str) -> bool {
+    let inner = ann.trim();
+    matches!(inner, "int" | "float" | "bool" | "boolean" | "IO")
+        || is_path_annotation(inner)
+        || [
+            "str",
+            "bytes",
+            "bytearray",
+            "memoryview",
+            "dict",
+            "Dict",
+            "Mapping",
+            "list",
+            "List",
+            "Sequence",
+            "Iterable",
+            "set",
+            "Set",
+            "frozenset",
+        ]
+        .iter()
+        .any(|family| {
+            inner == *family
+                || inner
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('['))
+        })
+        || [
+            "TextIO",
+            "StringIO",
+            "BinaryIO",
+            "BytesIO",
+            "IO[",
+            "BufferedReader",
+            "BufferedIOBase",
+        ]
+        .iter()
+        .any(|stream| inner.contains(stream))
+}
+
+/// A filesystem-path annotation: `Path`, `pathlib.Path`, `PurePath`,
+/// `os.PathLike[str]`.
+fn is_path_annotation(ann: &str) -> bool {
+    let base = ann.split('[').next().unwrap_or(ann).trim();
+    matches!(
+        base.rsplit('.').next().unwrap_or(base),
+        "Path" | "PurePath" | "PurePosixPath" | "PathLike"
+    )
+}
+
+/// The annotation [`decode_expr`] decodes `ann` as (#286): `ann` itself, or,
+/// for a union (`A | B`, `Union[A, B]`, `Optional[A]`), its first member that
+/// [`decode_expr`] can build (`str` of `str | os.PathLike[str]`). A union with
+/// no such member is returned as written.
+fn effective_annotation(ann: &str) -> String {
+    let ann = ann.trim();
+    let members: Vec<String> = if let Some(inner) = ann
+        .strip_prefix("Optional[")
+        .and_then(|rest| rest.strip_suffix(']'))
     {
-        let required = init
-            .params
-            .iter()
-            .filter(|p| !p.is_varargs && !p.has_default)
-            .count();
-        if required > 0 {
-            return Err(format!(
-                "instance method `{}` needs a receiver, but `{class}.__init__` takes \
-                 {required} required argument(s); only no-arg-constructible receivers \
-                 are supported (skipped cleanly)",
-                func.qualified()
-            ));
+        vec![inner.trim().to_owned()]
+    } else if let Some(inner) = ann
+        .strip_prefix("Union[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        split_top_level(inner, ',')
+    } else if split_top_level(ann, '|').len() > 1 {
+        split_top_level(ann, '|')
+    } else {
+        return ann.to_owned();
+    };
+    members
+        .into_iter()
+        .filter(|member| member != "None")
+        .find(|member| single_decodable(member))
+        .unwrap_or_else(|| ann.to_owned())
+}
+
+/// `text` split at each `separator` outside brackets, each part trimmed.
+fn split_top_level(text: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for c in text.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            _ => {}
+        }
+        if c == separator && depth == 0 {
+            parts.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(c);
         }
     }
-    // No __init__ in this file (inherited / default) or a no-arg __init__.
-    Ok(Some(format!("_t.{class}()")))
+    parts.push(current.trim().to_owned());
+    parts
 }
 
 /// Map a source file to `(import_root_dir, dotted_module)`. Walks up through
@@ -354,8 +510,18 @@ fn resolve_module(source_path: &Path, source_root: &Path) -> (PathBuf, String) {
 /// Decide how to decode one parameter from the fuzz cursor, by annotation then
 /// name heuristic. `last` controls whether a byte/str param drains the rest.
 fn decode_expr(p: &python_parser::PyParam, last: bool) -> String {
-    let ann = p.annotation.as_deref().unwrap_or("").trim();
+    let effective = effective_annotation(p.annotation.as_deref().unwrap_or(""));
+    let ann = effective.as_str();
     let name = p.name.to_ascii_lowercase();
+    // A path annotation gets a `pathlib.Path` of decoded text.
+    if is_path_annotation(ann) {
+        let text = if last {
+            "_c.rest().decode('utf-8', 'replace')"
+        } else {
+            "_c.text()"
+        };
+        return format!("__import__('pathlib').Path({text})");
+    }
     // A file-like param (`fp`/`file`/`stream` or an IO annotation) must NOT get raw
     // bytes — `bytes` has no `.read()`, which would manufacture an AttributeError
     // false positive (plistlib.load(fp)). Wrap the fuzz bytes in a real stream.
@@ -457,7 +623,7 @@ fn decode_expr(p: &python_parser::PyParam, last: bool) -> String {
 /// pass a keyword-only-with-default param positionally (e.g. `loads(s, *,
 /// parse_float=...)` -> `loads(a0)`). For an instance method, construct a fresh
 /// receiver per input so each input starts from clean state.
-fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> String {
+fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&Receiver>) -> String {
     let decodable: Vec<&python_parser::PyParam> = func
         .params
         .iter()
@@ -465,6 +631,18 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
         .collect();
     let n = decodable.len();
     let mut lines = String::new();
+    // The receiver's constructor arguments come first: the method's last
+    // argument takes the rest of the input.
+    let mut receiver_args = Vec::new();
+    for (i, p) in receiver
+        .map(|r| r.params.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!("    r{i} = {}\n", decode_expr(p, false)));
+        receiver_args.push(format!("r{i}"));
+    }
     let mut args = Vec::new();
     for (i, p) in decodable.iter().enumerate() {
         let last = i + 1 == n;
@@ -475,8 +653,9 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
     let call = match receiver {
         // Instance method: fresh receiver per input, then call the bare method name.
         Some(recv) => format!(
-            "    _recv = {recv}\n    _recv.{method}({arglist})\n",
-            recv = recv,
+            "    _recv = _t.{class}({ctor})\n    _recv.{method}({arglist})\n",
+            class = recv.class,
+            ctor = receiver_args.join(", "),
             method = func.name,
             arglist = arglist,
         ),
@@ -518,7 +697,7 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&str>) -> 
          \x20       with open(path, \"wb\") as entry:\n\
          \x20           entry.write(b\"\\x01\")\n\
          \x20       _bhf_target_entered = True\n\
-         \x20   except OSError:\n\
+         \x20   except (IOError, OSError):\n\
          \x20       pass\n\
          \n\
          \n\
@@ -666,13 +845,111 @@ mod tests {
             is_varargs: false,
             has_default: true,
         });
-        let h = generate_harness("m", &m, Some("_t.C()"));
+        let recv = Receiver {
+            class: "C".to_owned(),
+            params: Vec::new(),
+        };
+        let h = generate_harness("m", &m, Some(&recv));
         assert!(h.contains("_recv = _t.C()"), "constructs receiver:\n{h}");
         assert!(
             h.contains("_recv.feed(a0)"),
             "calls bare method on receiver:\n{h}"
         );
         assert!(!h.contains("a1"), "defaulted param must be skipped:\n{h}");
+    }
+
+    /// #286: a receiver whose `__init__` takes arguments is built from them,
+    /// decoded ahead of the method's own, so the method's last parameter
+    /// still takes the rest of the input.
+    #[test]
+    fn a_receiver_is_built_from_its_init_arguments() {
+        let source = "class Parser:\n\
+                      \x20   def __init__(self, limit: int, name, strict=True):\n\
+                      \x20       self.limit = limit\n\
+                      \x20   def feed(self, data: bytes):\n\
+                      \x20       return data[: self.limit]\n";
+        let all = parse_python_functions(source).unwrap();
+        let feed = all.iter().find(|f| f.name == "feed").unwrap();
+        let recv = resolve_receiver(feed, &all).unwrap().unwrap();
+        assert_eq!(recv.class, "Parser");
+        let names: Vec<&str> = recv.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["limit", "name"],
+            "the defaulted `strict` is left out"
+        );
+        let h = generate_harness("m", feed, Some(&recv));
+        let r0 = h.find("    r0 = _c.i32()").expect(&h);
+        let r1 = h.find("    r1 = _c.take_bytes(").expect(&h);
+        let a0 = h.find("    a0 = _c.rest()").expect(&h);
+        assert!(r0 < r1 && r1 < a0, "constructor arguments first:\n{h}");
+        assert!(
+            h.contains("_recv = _t.Parser(r0, r1)\n    _recv.feed(a0)"),
+            "{h}"
+        );
+    }
+
+    /// An `__init__` parameter annotated with a type the decoder cannot build
+    /// still skips cleanly, and names the parameter.
+    #[test]
+    fn an_init_parameter_of_an_undecodable_type_skips_the_target() {
+        let source = "class Session:\n\
+                      \x20   def __init__(self, config: Config):\n\
+                      \x20       self.config = config\n\
+                      \x20   def handle(self, data: bytes):\n\
+                      \x20       return data\n";
+        let all = parse_python_functions(source).unwrap();
+        let handle = all.iter().find(|f| f.name == "handle").unwrap();
+        let error = resolve_receiver(handle, &all).err().unwrap();
+        assert!(error.contains("parameter `config: Config`"), "{error}");
+        for ann in [
+            "int",
+            "Optional[str]",
+            "bytes",
+            "Dict[str, int]",
+            "List[bytes]",
+            "BinaryIO",
+            "Union[int, str]",
+            "str | Path",
+            "Path",
+            "os.PathLike[str]",
+        ] {
+            assert!(decodable_annotation(ann), "{ann}");
+        }
+        for ann in [
+            "Config",
+            "Union[Config, Listener]",
+            "App | None",
+            "strategy",
+        ] {
+            assert!(!decodable_annotation(ann), "{ann}");
+        }
+    }
+
+    /// A union decodes as its first member the decoder builds, and a path
+    /// annotation as a `pathlib.Path` of decoded text.
+    #[test]
+    fn a_union_decodes_as_its_first_buildable_member_and_a_path_as_path() {
+        assert_eq!(effective_annotation("str | os.PathLike[str]"), "str");
+        assert_eq!(effective_annotation("Optional[bytes]"), "bytes");
+        assert_eq!(effective_annotation("Union[Config, int]"), "int");
+        assert_eq!(
+            effective_annotation("None | Dict[str, int]"),
+            "Dict[str, int]"
+        );
+        assert_eq!(effective_annotation("Config | None"), "Config | None");
+        assert_eq!(
+            decode_expr(&param("root", Some("str | os.PathLike[str]")), false),
+            "_c.text()"
+        );
+        assert_eq!(
+            decode_expr(&param("workspace", Some("Path")), false),
+            "__import__('pathlib').Path(_c.text())"
+        );
+        assert_eq!(
+            decode_expr(&param("limit", Some("Optional[int]")), false),
+            "_c.i32()"
+        );
     }
 
     fn param(name: &str, ann: Option<&str>) -> python_parser::PyParam {
@@ -759,9 +1036,66 @@ mod tests {
         }
     }
 
+    /// #285: a Python 2 source runs under a `python2`, `python2.7` or 2.x
+    /// `python` interpreter, and a Python 3 source never does. Stub
+    /// interpreters answer the version probe.
+    #[cfg(unix)]
+    #[test]
+    fn the_interpreter_follows_the_source_dialect() {
+        use lang_profile::Dialect;
+        use std::os::unix::fs::PermissionsExt;
+        let stub = |dir: &Path, name: &str, version: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let both = crate::test_support::TestDir::new("py-interp-both");
+        let python2 = stub(both.path(), "python2", "2.7");
+        let python3 = stub(both.path(), "python3", "3.12");
+        let path = Some(both.path().as_os_str());
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python2), path),
+            Ok(python2)
+        );
+        assert_eq!(select_interpreter(None, path), Ok(python3.clone()));
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python3), path),
+            Ok(python3)
+        );
+
+        // A legacy host's only `python` is 2.x: the Python 2 source takes it,
+        // a Python 3 source is told why it cannot.
+        let legacy = crate::test_support::TestDir::new("py-interp-legacy");
+        let python = stub(legacy.path(), "python", "2.7");
+        let path = Some(legacy.path().as_os_str());
+        assert_eq!(select_interpreter(Some(Dialect::Python2), path), Ok(python));
+        let error = select_interpreter(None, path).unwrap_err();
+        assert!(
+            error.contains("is Python 2.7 and this is a Python 3 source"),
+            "{error}"
+        );
+
+        // `python2.7` alone serves; a 3.x `python` does not.
+        let versioned = crate::test_support::TestDir::new("py-interp-27");
+        stub(versioned.path(), "python", "3.11");
+        let python27 = stub(versioned.path(), "python2.7", "2.7");
+        let path = Some(versioned.path().as_os_str());
+        assert_eq!(
+            select_interpreter(Some(Dialect::Python2), path),
+            Ok(python27)
+        );
+
+        let none = crate::test_support::TestDir::new("py-interp-none");
+        stub(none.path(), "python3", "3.12");
+        let error =
+            select_interpreter(Some(Dialect::Python2), Some(none.path().as_os_str())).unwrap_err();
+        assert!(error.contains("no `python2` interpreter found"), "{error}");
+    }
+
     #[test]
     fn python_version_parses_installed_interpreter() {
-        let Some(py) = probe_python() else {
+        let Ok(py) = select_interpreter(None, None) else {
             return; // no interpreter installed -> skip, like a GNAT-less Ada skip
         };
         let v = python_version(&py).expect("python_version should parse a real interpreter");

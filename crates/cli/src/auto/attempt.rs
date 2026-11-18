@@ -1619,13 +1619,23 @@ fn attempt_unclassified(
     // never fuzzed. This fires as soon as a lane's fallback discovery surfaces a
     // legacy-dialect candidate; modern dialects fall through to the normal path.
     if let Some(dialect) = candidate.dialect {
-        if dialect.fuzz_support() == lang_profile::FuzzSupport::ReportOnly {
+        // A Python 2 source fuzzes under a `python2` interpreter (#285); on a
+        // host without one it is reported on as before.
+        let no_python2 = dialect == lang_profile::Dialect::Python2
+            && crate::auto::python_build::select_interpreter(Some(dialect), None).is_err();
+        if dialect.fuzz_support() == lang_profile::FuzzSupport::ReportOnly || no_python2 {
             let harness_dir = crate::auto::layout::harness_dir(work_dir, &candidate.harness_id);
             std::fs::create_dir_all(&harness_dir)?;
-            let reason = format!(
-                "{}: legacy dialect — discovered and statically analyzed, not fuzzed (M22)",
-                dialect.label()
-            );
+            let reason = if no_python2 {
+                "Python 2: legacy dialect — discovered and statically analyzed, not fuzzed: \
+                 no `python2` interpreter (install Python 2.7 as `python2` to fuzz it)"
+                    .to_owned()
+            } else {
+                format!(
+                    "{}: legacy dialect — discovered and statically analyzed, not fuzzed (M22)",
+                    dialect.label()
+                )
+            };
             let outcome = crate::auto::report_only::emit_report_only(candidate, reason, work_dir);
             return Ok(AttemptResult {
                 candidate: candidate.clone(),
@@ -5223,7 +5233,10 @@ pub(crate) fn harness_launcher_lang(
 /// Their sinks (a file the target opens, a command it runs) are the shim's.
 pub(crate) fn shim_preloaded_into_launcher(lang: crate::auto::candidate::Lang) -> bool {
     use crate::auto::candidate::Lang;
-    matches!(lang, Lang::Python | Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php)
+    matches!(
+        lang,
+        Lang::Python | Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php
+    )
 }
 
 /// The warning for a failed `make afl`: the builtin engine's results stand

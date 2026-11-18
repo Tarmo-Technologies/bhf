@@ -1,0 +1,35 @@
+{
+ "repo": "ethereum/go-ethereum",
+ "sha": "454ca784c5aa2129ff5c9d168c4bf66fc4283d02",
+ "rc": 0,
+ "targets": [
+  {
+   "source": "main_impl.h",
+   "name": "secp256k1_ellswift_xdh",
+   "outcome": "report_only",
+   "reason": "blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:5: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:93:30: error: use of undeclared identifier 'SECP256K1_B' |    93 |     secp256k1_fe_add_int(&g, SECP256K1_B);                       /* g = u^3 + 7 */ |       |                              ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:237:34: error: use of undeclared identifier 'SECP256K1_B' |   237 |         secp256k1_fe_add_int(&g, SECP256K1_B);          /* g = u^3+7 */; sequence generation also failed first: blocked_by_non_self_contained_header: '/home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h' cannot be included by an independent C harness translation unit under its recovered build flags, and no compiling project umbrella was found; it likely depends on declarations or macro state established by an owning source file before inclusion. Compiler preflight: In file included from <stdin>:5: | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:93:30: error: use of undeclared identifier 'SECP256K1_B' |    93 |     secp256k1_fe_add_int(&g, SECP256K1_B);                       /* g = u^3 + 7 */ |       |                              ^ | /home/ubuntu/bhf-corpus-500/go/ethereum__go-ethereum/crypto/secp256k1/libsecp256k1/src/modules/ellswift/main_impl.h:237:34: error: use of undeclared identifier 'SECP256K1_B' |   237 |         secp256k1_fe_add_int(&g, SECP256K1_B);          /* g = u^3+7 */",
+   "class": "report_only",
+   "before": 1,
+   "classes": [
+    "report_only"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 1,
+  "discovered_total": 1,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "report_only": 1,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

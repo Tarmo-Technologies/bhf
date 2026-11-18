@@ -207,6 +207,221 @@ function reportFinding(err, rule) {
   if (err && err.stack) process.stderr.write(String(err.stack) + '\n');
 }
 
+// --- browser globals (#288) -------------------------------------------------
+// A module written for a browser references `window`, `document` or
+// `navigator`, and under Node it fails to load ("window is not defined") or
+// throws on its first input. When it does, the driver installs minimal stand-ins
+// for the browser globals Node lacks, and one for the name it hit (an
+// `HTMLFormElement`, a `MutationObserver`), loads or runs again, and records the
+// names (BHF_JS_SHIM_RECORD), which the target's fidelity record reports: a
+// finding may depend on them rather than on a real browser. A later start
+// installs the recorded names before it loads: an ES module that threw as it
+// loaded keeps its error in this process, so its next load is in the next one.
+// A module that only tests `typeof window` never gets them.
+const BROWSER_GLOBALS = [
+  'window', 'self', 'document', 'navigator', 'location', 'localStorage',
+  'sessionStorage', 'history', 'screen', 'customElements', 'HTMLElement', 'Element', 'Node',
+];
+const BROWSER_CLASS = /^(HTML\w*Element|SVG\w*Element|\w+Observer|DOMParser|XMLSerializer|DocumentFragment|Text|Comment|ShadowRoot|Range|Selection)$/;
+// The names stood in for, in the order they were.
+const standIns = [];
+let baseShim = false;
+
+// The browser global a ReferenceError says is missing, or null.
+function missingBrowserGlobal(err) {
+  if (!(err instanceof ReferenceError)) return null;
+  const m = /^(\w+) is not defined$/.exec(String(err.message || ''));
+  if (!m || m[1] in globalThis) return null;
+  return BROWSER_GLOBALS.includes(m[1]) || BROWSER_CLASS.test(m[1]) ? m[1] : null;
+}
+
+function inertElement(tag) {
+  const element = {
+    tagName: String(tag || 'div').toUpperCase(),
+    nodeName: String(tag || 'div').toUpperCase(),
+    style: {},
+    dataset: {},
+    attributes: {},
+    children: [],
+    childNodes: [],
+    textContent: '',
+    innerHTML: '',
+    innerText: '',
+    value: '',
+    classList: {
+      add() {}, remove() {}, toggle() { return false; }, contains() { return false; },
+    },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    removeAttribute(name) { delete this.attributes[name]; },
+    appendChild(child) { this.children.push(child); this.childNodes.push(child); return child; },
+    removeChild(child) { return child; },
+    insertBefore(child) { return child; },
+    addEventListener() {},
+    removeEventListener() {},
+    dispatchEvent() { return true; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getElementsByTagName() { return []; },
+    getBoundingClientRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; },
+    focus() {}, blur() {}, click() {},
+  };
+  return element;
+}
+
+function memoryStorage() {
+  const items = new Map();
+  return {
+    get length() { return items.size; },
+    key(index) { return Array.from(items.keys())[index] ?? null; },
+    getItem(key) { return items.has(String(key)) ? items.get(String(key)) : null; },
+    setItem(key, value) { items.set(String(key), String(value)); },
+    removeItem(key) { items.delete(String(key)); },
+    clear() { items.clear(); },
+  };
+}
+
+// A class a module extends or tests against (`class X extends HTMLElement`,
+// `x instanceof HTMLFormElement`); an observer's methods do nothing.
+function standInClass(name) {
+  const cls = function BrowserStandIn() {};
+  Object.defineProperty(cls, 'name', { value: name });
+  if (/Observer$/.test(name)) {
+    cls.prototype.observe = function () {};
+    cls.prototype.unobserve = function () {};
+    cls.prototype.disconnect = function () {};
+    cls.prototype.takeRecords = function () { return []; };
+  }
+  return cls;
+}
+
+function defineGlobal(name, value) {
+  if (name in globalThis) return false;
+  Object.defineProperty(globalThis, name, { value, writable: true, configurable: true, enumerable: false });
+  return true;
+}
+
+// The browser globals Node does not define, once; their names are recorded.
+function installBaseShim() {
+  if (baseShim) return;
+  baseShim = true;
+  const g = globalThis;
+  const define = (name, value) => {
+    if (defineGlobal(name, value) && BROWSER_GLOBALS.includes(name)) standIns.push(name);
+  };
+  const html = inertElement('html');
+  const body = inertElement('body');
+  const head = inertElement('head');
+  html.appendChild(head);
+  html.appendChild(body);
+  // `document.getElementsByTagName('head')[0]` and `querySelector('body')`
+  // find the page's own elements.
+  const byTag = (tag) => ({ html, head, body })[String(tag).toLowerCase()] || null;
+  const url = new URL('http://localhost/');
+  define('window', g);
+  define('self', g);
+  define('navigator', {
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) bhf-fuzz',
+    language: 'en-US',
+    languages: ['en-US'],
+    platform: 'Linux x86_64',
+    vendor: '',
+    onLine: true,
+    cookieEnabled: false,
+    hardwareConcurrency: 1,
+    maxTouchPoints: 0,
+  });
+  define('location', {
+    href: url.href, protocol: url.protocol, host: url.host, hostname: url.hostname,
+    port: url.port, pathname: url.pathname, search: '', hash: '', origin: url.origin,
+    assign() {}, replace() {}, reload() {}, toString() { return url.href; },
+  });
+  define('document', {
+    documentElement: html,
+    body,
+    head,
+    cookie: '',
+    title: '',
+    readyState: 'complete',
+    location: g.location,
+    createElement: (tag) => inertElement(tag),
+    createElementNS: (_ns, tag) => inertElement(tag),
+    createTextNode: (text) => ({ nodeValue: String(text), textContent: String(text) }),
+    createDocumentFragment: () => inertElement('fragment'),
+    getElementById: () => null,
+    getElementsByClassName: () => [],
+    getElementsByTagName: (tag) => (byTag(tag) ? [byTag(tag)] : []),
+    querySelector: (selector) => byTag(selector),
+    querySelectorAll: (selector) => (byTag(selector) ? [byTag(selector)] : []),
+    addEventListener() {},
+    removeEventListener() {},
+  });
+  define('localStorage', memoryStorage());
+  define('sessionStorage', memoryStorage());
+  define('history', { length: 1, state: null, pushState() {}, replaceState() {}, back() {}, forward() {}, go() {} });
+  define('screen', { width: 1280, height: 720, availWidth: 1280, availHeight: 720, colorDepth: 24 });
+  const defined = new Map();
+  define('customElements', {
+    define(name, cls) { defined.set(String(name), cls); },
+    get(name) { return defined.get(String(name)); },
+    whenDefined() { return Promise.resolve(); },
+    upgrade() {},
+  });
+  for (const name of ['HTMLElement', 'Element', 'Node']) {
+    define(name, standInClass(name));
+  }
+  // Helpers on `window`, which go with it unrecorded.
+  for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent', 'alert', 'scrollTo']) {
+    if (typeof g[name] !== 'function') defineGlobal(name, () => undefined);
+  }
+  if (typeof g.requestAnimationFrame !== 'function') {
+    defineGlobal('requestAnimationFrame', (cb) => setTimeout(() => cb(Date.now()), 0));
+    defineGlobal('cancelAnimationFrame', (id) => clearTimeout(id));
+  }
+  if (typeof g.matchMedia !== 'function') {
+    defineGlobal('matchMedia', (query) => ({
+      matches: false, media: String(query), addListener() {}, removeListener() {},
+      addEventListener() {}, removeEventListener() {},
+    }));
+  }
+}
+
+// Stand in for `name` (and the base globals), and record the names.
+function standIn(name) {
+  installBaseShim();
+  if (defineGlobal(name, standInClass(name))) standIns.push(name);
+  process.stderr.write(
+    `bhf: note: the target references browser globals; it runs with bhf's minimal ` +
+      `stand-ins for ${standIns.join(', ')}\n`,
+  );
+  const record = process.env.BHF_JS_SHIM_RECORD;
+  if (record) {
+    try {
+      fs.writeFileSync(record, standIns.join(',') + '\n');
+    } catch (_) {
+      /* the record is best effort; the note above says it too */
+    }
+  }
+}
+
+// The names an earlier start stood in for, installed before the target loads.
+function installRecordedStandIns() {
+  const record = process.env.BHF_JS_SHIM_RECORD;
+  let names = [];
+  try {
+    names = fs.readFileSync(record, 'utf8').trim().split(',').filter(Boolean);
+  } catch (_) {
+    return;
+  }
+  if (names.length === 0) return;
+  installBaseShim();
+  for (const name of names) {
+    if (defineGlobal(name, standInClass(name))) standIns.push(name);
+  }
+}
+
 let runOne = null;
 let targetEntered = false;
 // The bytes of the input currently being processed (latin1), for the sink taint
@@ -341,6 +556,13 @@ async function runInput(buf) {
     // targets, keeps the materialized resource alive until the read completes.
     await runOne(buf);
   } catch (err) {
+    // A browser module that touches `navigator` only when called: run the
+    // input again with the stand-ins (#288) rather than report Node's lack.
+    const name = missingBrowserGlobal(err);
+    if (name !== null) {
+      standIn(name);
+      return runInput(buf);
+    }
     const c = classify(err);
     if (c.finding) {
       reportFinding(err, c.rule);
@@ -367,35 +589,57 @@ function loadRunOne() {
   const modPath = process.env.BHF_JS_MODULE;
   const exportPath = process.env.BHF_JS_EXPORT || '';
   const argKind = process.env.BHF_JS_ARG || 'buffer';
-  const mod = require(modPath);
-  // A `ClassPath#method` export path means: resolve the class, `new` it (no-arg),
-  // then call the instance method. `#method` (empty class part) = the module itself
-  // is the class. Otherwise the export path is a plain dotted function path.
-  const hash = exportPath.indexOf('#');
+  // A browser module that touches `window` as it loads: load it again with
+  // the stand-ins (#288). A CommonJS module that threw is not cached; an ES
+  // module keeps its error, and loads in the next start.
+  installRecordedStandIns();
+  // Resolve the export, constructing a receiver for a `Class#method`.
+  const resolve = () => {
+    const mod = require(modPath);
+
+    // A `ClassPath#method` export path means: resolve the class, `new` it (no-arg),
+    // then call the instance method. `#method` (empty class part) = the module itself
+    // is the class. Otherwise the export path is a plain dotted function path.
+    const hash = exportPath.indexOf('#');
+    let fn;
+    let recv;
+    if (hash >= 0) {
+      const classPath = exportPath.slice(0, hash);
+      const methodName = exportPath.slice(hash + 1);
+      let cls = mod;
+      for (const part of classPath.split('.').filter(Boolean)) {
+        cls = cls[part];
+      }
+      if (typeof cls !== 'function') {
+        throw new Error(`BHF_JS_EXPORT class '${classPath}' not found in ${modPath}`);
+      }
+      recv = new cls();
+      fn = recv[methodName];
+    } else {
+      fn = mod;
+      recv = undefined;
+      for (const part of exportPath.split('.').filter(Boolean)) {
+        recv = fn;
+        fn = fn[part];
+      }
+    }
+    if (typeof fn !== 'function') {
+      throw new Error(`BHF_JS_EXPORT '${exportPath}' is not a function in ${modPath}`);
+    }
+    return { fn, recv };
+  };
   let fn;
   let recv;
-  if (hash >= 0) {
-    const classPath = exportPath.slice(0, hash);
-    const methodName = exportPath.slice(hash + 1);
-    let cls = mod;
-    for (const part of classPath.split('.').filter(Boolean)) {
-      cls = cls[part];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      ({ fn, recv } = resolve());
+      break;
+    } catch (err) {
+      // As it loads, or as its receiver is constructed.
+      const name = missingBrowserGlobal(err);
+      if (name === null || attempt >= 16) throw err;
+      standIn(name);
     }
-    if (typeof cls !== 'function') {
-      throw new Error(`BHF_JS_EXPORT class '${classPath}' not found in ${modPath}`);
-    }
-    recv = new cls();
-    fn = recv[methodName];
-  } else {
-    fn = mod;
-    recv = undefined;
-    for (const part of exportPath.split('.').filter(Boolean)) {
-      recv = fn;
-      fn = fn[part];
-    }
-  }
-  if (typeof fn !== 'function') {
-    throw new Error(`BHF_JS_EXPORT '${exportPath}' is not a function in ${modPath}`);
   }
   const bound = fn.bind(recv);
   if (argKind === 'string') {

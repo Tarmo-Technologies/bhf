@@ -20,6 +20,50 @@ use std::time::Duration;
 /// so a wedged or half-installed toolchain cannot hang the whole run.
 const TOOL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The browser globals the JS driver stands in for when a target needs them
+/// (#288); `js_runtime/bhf_driver.js` keeps the same list.
+const BROWSER_GLOBALS: &[&str] = &[
+    "window",
+    "self",
+    "document",
+    "navigator",
+    "location",
+    "localStorage",
+    "sessionStorage",
+    "history",
+    "screen",
+    "customElements",
+    "HTMLElement",
+    "Element",
+    "Node",
+];
+
+/// The browser global a Node error says is missing
+/// (`ReferenceError: window is not defined`), if `stderr` holds one.
+fn missing_browser_global(stderr: &str) -> Option<&'static str> {
+    stderr.lines().find_map(|line| {
+        let name = line
+            .trim()
+            .strip_prefix("ReferenceError: ")?
+            .strip_suffix(" is not defined")?;
+        let class = (name.starts_with("HTML") || name.starts_with("SVG"))
+            && name.ends_with("Element")
+            || name.ends_with("Observer");
+        (BROWSER_GLOBALS.contains(&name) || class).then(|| {
+            BROWSER_GLOBALS
+                .iter()
+                .copied()
+                .find(|known| *known == name)
+                .unwrap_or("a browser class")
+        })
+    })
+}
+
+/// The file beside a JS harness's launcher where its driver records the
+/// browser globals it stood in for (#288), comma-separated; absent when the
+/// target needed none.
+pub(crate) const BROWSER_GLOBALS_RECORD: &str = "browser-globals.txt";
+
 pub enum JsBuildResult {
     Built,
     /// Not fuzzable here (target no longer present, will not transpile or
@@ -133,6 +177,11 @@ fn js_module_load_error(module_abs: &Path, load_cwd: &Path) -> Option<String> {
         return None;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // #288: a browser module that needs `window` as it loads is the driver's
+    // to stand in for; its load-only gate (build gate 3) decides.
+    if missing_browser_global(&stderr).is_some() {
+        return None;
+    }
     // Shared wording so the uninstalled npm package is recorded as a named
     // requirement: the prose form said `npm install` but carried no marker, so
     // the run reported "no dependencies were missing" for a tree where every
@@ -177,10 +226,14 @@ fn emit_js_harness(
          # into the file-backed BHF_COV_SHM map and speaks the framed protocol.\n\
          # BHF_JS_MODULE = the target module; BHF_JS_EXPORT = the export path;\n\
          # BHF_JS_ARG = buffer|string|path (how fuzz bytes reach the first param).\n\
+         # BHF_JS_SHIM_RECORD = where the driver records the browser globals it\n\
+         # stood in for, when the target needed them (#288).\n\
          BHF_JS_MODULE=\"{module}\" \\\n\
          BHF_JS_EXPORT=\"{export_path}\" \\\n\
          BHF_JS_ARG=\"{arg}\" \\\n\
+         BHF_JS_SHIM_RECORD=\"{shim_record}\" \\\n\
          exec node {node_flags}\"{driver}\" \"$@\"\n",
+        shim_record = hdir.join(BROWSER_GLOBALS_RECORD).display(),
         module = module_abs.display(),
         export_path = func.export_path,
         arg = func.arg_kind.as_env(),
@@ -191,6 +244,9 @@ fn emit_js_harness(
         },
         driver = driver.display(),
     );
+    // An earlier build's record is not this one's: the driver writes it again
+    // when this target needs the browser stand-ins.
+    let _ = std::fs::remove_file(hdir.join(BROWSER_GLOBALS_RECORD));
     if let Err(e) = std::fs::write(&main_path, script) {
         return JsBuildResult::Failed(format!("write launcher {}: {e}", main_path.display()));
     }
@@ -224,14 +280,28 @@ fn emit_js_harness(
 /// server, a watch loop) is a different problem, and refusing it here would turn
 /// a hang into a false skip.
 fn js_export_load_error(main_path: &Path, export_path: &str) -> Option<String> {
-    let out = crate::command_output::output_with_timeout(
-        Command::new(main_path)
-            .env("BHF_JS_LOAD_ONLY", "1")
-            .current_dir(main_path.parent().unwrap_or_else(|| Path::new(".")))
-            .stdin(std::process::Stdio::null()),
-        Duration::from_secs(30),
-    )
-    .ok()?;
+    let dir = main_path.parent().unwrap_or_else(|| Path::new("."));
+    let record = dir.join(BROWSER_GLOBALS_RECORD);
+    let read_record = || std::fs::read_to_string(&record).unwrap_or_default();
+    // #288: a load that stood in for another browser global is tried again,
+    // with the recorded stand-ins from the start (an ES module that threw as
+    // it loaded loads again only in a new process).
+    let mut attempts = 0;
+    let out = loop {
+        let before = read_record();
+        let out = crate::command_output::output_with_timeout(
+            Command::new(main_path)
+                .env("BHF_JS_LOAD_ONLY", "1")
+                .current_dir(dir)
+                .stdin(std::process::Stdio::null()),
+            Duration::from_secs(30),
+        )
+        .ok()?;
+        attempts += 1;
+        if out.status.success() || read_record() == before || attempts >= 8 {
+            break out;
+        }
+    };
     if out.status.success() {
         return None;
     }
@@ -454,6 +524,29 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// #288: a missing browser global is told from another load error.
+    #[test]
+    fn a_missing_browser_global_is_named_and_other_errors_are_not() {
+        let window = "/x/index.js:3\n  const w = window.innerWidth;\n\nReferenceError: window is not defined\n    at Object.<anonymous>";
+        assert_eq!(super::missing_browser_global(window), Some("window"));
+        assert_eq!(
+            super::missing_browser_global("ReferenceError: navigator is not defined"),
+            Some("navigator")
+        );
+        assert_eq!(
+            super::missing_browser_global("ReferenceError: HTMLFormElement is not defined"),
+            Some("a browser class")
+        );
+        assert_eq!(
+            super::missing_browser_global("ReferenceError: foo is not defined"),
+            None
+        );
+        assert_eq!(
+            super::missing_browser_global("Error: Cannot find module 'side-channel'"),
+            None
+        );
+    }
+
     use super::*;
 
     /// esbuild is found on PATH, else in a `node_modules/.bin` between the

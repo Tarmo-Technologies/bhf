@@ -30,6 +30,25 @@ An **exported** function taking at least one argument is the fuzzable unit. bhf:
    bhf's cumulative `BHF_COV_SHM` edge bitmap, so the engine gets genuine
    branch feedback, not black-box guessing.
 
+### Browser globals
+
+A module written for a browser may reference `window`, `document` or
+`navigator`, which Node lacks: it fails to load (`ReferenceError: window is
+not defined`), or throws on its first input. When it does, the driver installs
+inert stand-ins for the browser globals Node does not define (`window` and
+`self` as the global object, `document` with elements that do nothing,
+`navigator`, `location` on `http://localhost/`, in-memory
+`localStorage`/`sessionStorage`, `history`, `screen`), then loads or runs
+again. A class it needs (`HTMLFormElement`, `customElements`, a
+`MutationObserver`) gets a stand-in too, as the module hits it, at load or as
+its receiver is constructed. A module that only tests `typeof window` gets
+none. The driver records the globals it stood in for in the harness's
+`browser-globals.txt` and installs them before the target loads, since an ES
+module that threw as it loaded keeps its error in that process. Each
+of the target's findings carries them in `fidelity.environment_shim` and its
+`fidelity_caveat`. A finding may depend on the stand-ins rather than on a real
+browser, so check it in one.
+
 ### Oracle
 
 An **uncaught exception** that is not input rejection is the finding signal (the

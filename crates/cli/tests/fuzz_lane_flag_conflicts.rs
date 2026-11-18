@@ -14,7 +14,6 @@ use test_support::TestDir;
 
 /// Host-lane flags neither lane wires, each with the arguments that set it.
 const HOST_ONLY: &[(&str, &[&str])] = &[
-    ("--workers", &["--workers", "2"]),
     ("--cmplog-log", &["--cmplog-log", "cmplog.txt"]),
     ("--len-control", &["--len-control", "5"]),
     ("--rss-limit-mb", &["--rss-limit-mb", "128"]),
@@ -46,6 +45,8 @@ const HOST_ONLY: &[(&str, &[&str])] = &[
 
 /// Flags only the session lane does not wire.
 const SESSION_ONLY: &[(&str, &[&str])] = &[
+    // The transport lane runs workers over a per-worker spec (#316).
+    ("--workers", &["--workers", "2"]),
     ("--grammar", &["--grammar", "/nonexistent/grammar.json"]),
     ("--dict", &["--dict", "/nonexistent/tokens.dict"]),
     ("--seed-input", &["--seed-input", "A"]),
@@ -115,20 +116,13 @@ fn several_ignored_flags_are_named_together() {
     let out = fuzz(
         &work,
         TRANSPORT,
-        &[
-            "--workers",
-            "4",
-            "--len-control",
-            "5",
-            "--cmplog-log",
-            "c.txt",
-        ],
+        &["--len-control", "5", "--cmplog-log", "c.txt"],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("--workers, --cmplog-log, --len-control")
-            || stderr.contains("--workers, --len-control, --cmplog-log"),
+        stderr.contains("--cmplog-log, --len-control")
+            || stderr.contains("--len-control, --cmplog-log"),
         "{stderr}"
     );
 }

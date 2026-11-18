@@ -202,6 +202,17 @@ jobs:
           path: ~/apt-archives
           key: ${{ steps.apt-archives.outputs.cache-primary-key }}
 
+      # The Python 2 lane's tests run under `python2` (#285), which Ubuntu no
+      # longer packages: the script builds CPython 2.7 once, and the cache keeps it.
+      - name: Cache the Python 2.7 build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/python2.7
+          key: python2.7-${{ runner.os }}-${{ hashFiles('scripts/ci/install-python2.sh') }}
+
+      - name: Install Python 2.7
+        run: bash scripts/ci/install-python2.sh >> "$GITHUB_PATH"
+
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
@@ -234,7 +245,7 @@ jobs:
                       aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
                       arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
                       javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
-                      lldb llvm-symbolizer dotnet; do
+                      lldb llvm-symbolizer dotnet python2; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for

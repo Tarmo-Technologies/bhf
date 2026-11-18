@@ -736,6 +736,7 @@ pub struct GdbRemoteTransport<F> {
     input_contract: Option<InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
+    cmplog: Option<crate::cmplog::CmpLogRegion>,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -748,6 +749,7 @@ impl<F> GdbRemoteTransport<F> {
             input_contract: None,
             cycle_counter: None,
             task_id_address: None,
+            cmplog: None,
         }
     }
 
@@ -769,6 +771,14 @@ impl<F> GdbRemoteTransport<F> {
     /// report it in [`RunOutcome::target`] (#252).
     pub fn with_task_id(mut self, address: Option<u64>) -> Self {
         self.task_id_address = address;
+        self
+    }
+
+    /// Clear the firmware's CmpLog record in `region` before each run and
+    /// report the comparisons it holds after it in [`RunOutcome::target`]
+    /// (#386).
+    pub fn with_cmplog(mut self, region: Option<crate::cmplog::CmpLogRegion>) -> Self {
+        self.cmplog = region;
         self
     }
 
@@ -798,6 +808,7 @@ where
             input_contract: self.input_contract,
             cycle_counter: self.cycle_counter,
             task_id_address: self.task_id_address,
+            cmplog: self.cmplog,
         }))
     }
 }
@@ -844,6 +855,7 @@ pub struct GdbSession<C> {
     input_contract: Option<InputContract>,
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
+    cmplog: Option<crate::cmplog::CmpLogRegion>,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -859,6 +871,9 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
             self.input_contract.as_ref(),
             input,
         )?;
+        if let Some(region) = &self.cmplog {
+            crate::cmplog::clear(&mut self.client, region)?;
+        }
         // The cycle counter starts last, so it measures the run (#251).
         let cycles_start = match &self.cycle_counter {
             Some(counter) => Some(counter.start(&mut self.client)?),
@@ -916,6 +931,14 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
                 Ok(id) => target.task_id = Some(u64::from(id)),
                 Err(err) => {
                     cycles_failed.get_or_insert_with(|| format!("task id: {err}"));
+                }
+            }
+        }
+        if let Some(region) = &self.cmplog {
+            match crate::cmplog::read(&mut self.client, region) {
+                Ok(comparisons) => target.comparisons = comparisons,
+                Err(err) => {
+                    cycles_failed.get_or_insert_with(|| format!("cmplog: {err}"));
                 }
             }
         }
@@ -1246,6 +1269,77 @@ mod tests {
         assert!(
             log.iter().any(|p| p.starts_with("M1000,")),
             "log missing input write: {log:?}"
+        );
+    }
+
+    /// With a CmpLog region (#386) the session zeroes the record's count
+    /// before the run and reports the comparisons the run recorded.
+    #[test]
+    fn a_cmplog_region_is_cleared_before_the_run_and_read_after_it() {
+        let ring_capacity = 32_usize;
+        let (image, write, wrapped) = simulate_ring(&encode_event_stream(&[]), ring_capacity);
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity,
+        };
+        let region = crate::cmplog::CmpLogRegion {
+            address: 0x6000,
+            capacity: 4,
+        };
+        // What the firmware's trace-cmp callbacks leave: one 4-byte compare.
+        let mut record = Vec::new();
+        record.extend_from_slice(&1u32.to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&0x4141_4141u64.to_le_bytes());
+        record.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+        record.extend_from_slice(&4u32.to_le_bytes());
+        record.extend_from_slice(&0x0800_0123u32.to_le_bytes());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log))
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, image)
+            .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)])
+            .with_region(region.address, vec![0xAA; 8 + 4 * 24])
+            .with_run_write(region.address, record);
+        let handle = thread::spawn(move || stub.serve());
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        )
+        .with_cmplog(Some(region));
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"AAAA").unwrap();
+        drop(session);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(outcome.coverage_incomplete, None);
+        assert_eq!(
+            outcome.target.comparisons,
+            vec![crate::cmplog::Comparison {
+                site: 0x0800_0123,
+                width: 4,
+                lhs: 0x4141_4141,
+                rhs: 0xDEAD_BEEF,
+            }]
+        );
+        let log = log.lock().unwrap();
+        let clear = log.iter().position(|p| p == "M6000,4:00000000");
+        let run = log.iter().position(|p| p == "c");
+        assert!(
+            matches!((clear, run), (Some(clear), Some(run)) if clear < run),
+            "the count is zeroed before the run: {log:?}"
         );
     }
 

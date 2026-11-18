@@ -157,6 +157,9 @@ pub struct TargetObservation {
     pub cycles: Option<u64>,
     /// The task identity word the firmware wrote (an RTOS task handle).
     pub task_id: Option<u64>,
+    /// The comparisons the input ran, from the firmware's CmpLog record
+    /// (#386); empty when the spec names none.
+    pub comparisons: Vec<crate::cmplog::Comparison>,
 }
 
 impl RunOutcome {

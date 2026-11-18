@@ -1,0 +1,45 @@
+{
+ "repo": "jart/cosmopolitan",
+ "sha": "3293fad0a9eac7865c019be98fb993eeb933405e",
+ "rc": 1,
+ "targets": [
+  {
+   "source": "ssh.c",
+   "name": "ParseOpensshKnownHost",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"malformed_function_decl\", \"file\": \"/home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan/libc/ctype.h\", \"line\": 8}, {\"kind\": \"malformed_function_decl\", \"file\": \"/home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan/libc/ctype.h\", \"line\": 9}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  },
+  {
+   "source": "turfwar.c",
+   "name": "Read",
+   "outcome": "failed_build",
+   "reason": "[{\"kind\": \"malformed_function_decl\", \"file\": \"/home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan/libc/assert.h\", \"line\": 17}, {\"kind\": \"malformed_function_decl\", \"file\": \"/home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan/libc/assert.h\", \"line\": 18}]",
+   "class": "failed build",
+   "before": 1,
+   "classes": [
+    "failed build"
+   ]
+  }
+ ],
+ "summary": {
+  "discovered": 3,
+  "discovered_total": 3,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 3,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

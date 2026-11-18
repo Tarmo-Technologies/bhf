@@ -1,0 +1,32 @@
+{
+ "repo": "Kong/kong",
+ "sha": "391ee48d3a68e8d0bbd0405ec1d02d75f768aa92",
+ "rc": 2,
+ "targets": [
+  {
+   "source": "py-hello.py",
+   "name": "Plugin.access",
+   "outcome": "not_discovered",
+   "reason": null,
+   "class": "not discovered",
+   "before": 1,
+   "classes": []
+  }
+ ],
+ "summary": {
+  "discovered": 0,
+  "discovered_total": 0,
+  "built": 0,
+  "built_and_fuzzed": 0,
+  "fuzzed_stub_only": 0,
+  "failed_build": 0,
+  "unsupported_params": 0,
+  "unrecoverable_link": 0,
+  "unrecoverable_runtime": 0,
+  "findings": 0,
+  "fidelity": {
+   "reduced_fidelity_targets": 0
+  }
+ },
+ "findings_detail": []
+}

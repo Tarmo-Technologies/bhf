@@ -26,10 +26,21 @@ fn a_format_string_bug_is_one_cwe_134_group_at_the_call() {
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("fmt.c"), TARGET).unwrap();
+    // What is grouped, not whether a short pass finds it: a format whose
+    // conversions read harmless garbage reaches the call and stays in the
+    // corpus, for the runtime oracle and the capability profile, and one
+    // whose `%s` conversions read garbage pointers crashes.
+    let reaches = root.join("reaches.bin");
+    std::fs::write(&reaches, b"%x%x%x%x").unwrap();
+    let crashes = root.join("crashes.bin");
+    std::fs::write(&crashes, b"%s%s%s%s%s%s%s%s").unwrap();
     let work = root.join("work");
     let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(["auto", "--work-dir", work.to_str().unwrap()])
-        .args(["--jobs", "1", "--per-target-time", "10"])
+        .args(["--jobs", "1", "--per-target-time", "10", "--seed-file"])
+        .arg(&reaches)
+        .arg("--seed-file")
+        .arg(&crashes)
         .arg(&src)
         .output()
         .expect("run bhf auto");

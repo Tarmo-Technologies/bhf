@@ -143,6 +143,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "ada_runtime/adafuzz_probe83.ads",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "benchmarks/cwe/harnesses/afl_persistent.c",
       "license": "Apache-2.0"
     },
@@ -431,6 +435,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "c_runtime/bhf_agent.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "c_runtime/bhf_decode_test.c",
       "license": "Apache-2.0"
     },
@@ -440,6 +448,26 @@
     },
     {
       "path": "c_runtime/bhf_service_cov.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "c_runtime/examples/agent_posix.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "c_runtime/zephyr/bhf_agent_zephyr.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "c_runtime/zephyr/samples/agent/src/main.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "c_runtime/zephyr/samples/agent/src/target.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "c_runtime/zephyr/zephyr/module.yml",
       "license": "Apache-2.0"
     },
     {
@@ -2191,6 +2219,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_c_declarations.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_c_decoded_args.rs",
       "license": "Apache-2.0"
     },
@@ -2516,6 +2548,10 @@
     },
     {
       "path": "crates/cli/tests/auto_java_sink_oracle.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_js_browser_globals.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3267,6 +3303,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/transport_freertos_agent_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/transport_fuzz_qemu_cli.rs",
       "license": "Apache-2.0"
     },
@@ -3276,6 +3316,18 @@
     },
     {
       "path": "crates/cli/tests/transport_minimize_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_reference_agent_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_workers_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_zephyr_agent_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4799,6 +4851,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/src/cmplog.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/src/coverage.rs",
       "license": "Apache-2.0"
     },
@@ -4843,7 +4899,27 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/tests/agent/target.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/agent/zephyr_host/zephyr_host.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/agent_loopback.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/tests/common/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/freertos/agent_target.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/freertos/agent_task.c",
       "license": "Apache-2.0"
     },
     {
@@ -5376,6 +5452,26 @@
     },
     {
       "path": "docs/validation/2026-11-17-zoxide-incrate-parity.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-c3-knr.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-freertos-agent.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-js2-browser-globals.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-py2-receivers.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-zephyr-agent.md",
       "license": "Apache-2.0"
     },
     {

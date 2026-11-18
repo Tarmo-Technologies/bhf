@@ -70,6 +70,18 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A C function whose storage class is spelled through a macro builds (#415).
+  Under zlib's `#define local static`, `local unsigned read_buf(...)` was
+  declared `extern local unsigned` in the harness, which is `extern static`,
+  and the build stopped. An object-like macro that stands for storage-class or
+  function specifiers, in the source or a header it includes, is now read as
+  them: the function is `static` and returns `unsigned`. zlib's `read_buf` and
+  `gz_load` build and fuzz.
+- A variadic C target is declared with its `...` in the generated harness
+  (#416). The declaration dropped it, so a build in which the harness also
+  saw the target's own prototype (a translation unit included whole) stopped
+  with `conflicting types`, and otherwise the call went through a fixed-arity
+  prototype to a variadic definition.
 - Continuous scheduler jobs are tenant-aware, and orphaned jobs are
   reconciled on start (#385). `submitJob` records the caller's tenant and
   workspace root on the job (`Scheduler::submit_as` with a `JobOwner`). That
@@ -2812,6 +2824,91 @@
   when bhf panics.
 
 ### Added
+- The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
+  serves the agent protocol on the UART the devicetree's chosen
+  `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,
+  `bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`). Zephyr ends a thread that
+  faults, so the module's `k_sys_fatal_error_handler` records the fault for
+  the running input, and the calling thread sends the reply
+  (`bhf_agent_report_fault`, new in `bhf_agent.h`) and starts a new agent
+  thread. Its `qemu_cortex_m3` sample runs clean, fault and clean inputs in one
+  boot and replays the fault (`transport_zephyr_agent_cli`, opt in with
+  `BHF_ZEPHYR_CLI=1`; hil-emu installs Zephyr and runs it). The glue also runs
+  on the host against a stand-in for the Zephyr API, in `agent_loopback`.
+- `bhf auto` fuzzes a Python instance method whose class's `__init__` takes
+  arguments (#286). The harness decodes each required `__init__` argument from
+  the input ahead of the method's own, as it decodes a method parameter of that
+  annotation or name, and builds the receiver from them. An `__init__`
+  parameter annotated with a type bhf cannot decode still skips the target,
+  and the reason names it. Only a receiver whose `__init__` took no required
+  argument was built. A union annotation (`str | Path`, `Optional[str]`) is
+  decoded as its first member bhf can build, a `Path` as a `pathlib.Path` of
+  decoded text, and the Python driver treats an `ImportError` the target
+  raises as the environment, not a finding.
+- `bhf auto` fuzzes Python 2 sources under a `python2` interpreter (#285):
+  `python2`, `python2.7`, or a `python` that is 2.x. The Python runtime (driver,
+  coverage and decoder) runs on Python 2.7 as well as Python 3, and the target is
+  resolved with the Python 2 extractor. Without such an interpreter a Python 2
+  target is report-only, as before, with a reason that says to install one. The
+  nightly builds CPython 2.7.18 for the gated test.
+- `bhf auto` fuzzes Ada 83 units from an Ada 2012 harness (#284). Ada 83 has
+  no child units, so an instrumented Ada 83 unit names the probe through the
+  runtime's library-level `AdaFuzz_Probe83`, which renames the probe's
+  subprograms, and its exception handlers are not rewritten: their probe binds
+  the occurrence, which Ada 83 cannot. The dialect was report-only, and the
+  instrumented unit's `with AdaFuzz.Probe;` did not compile under
+  `pragma Ada_83`.
+- `bhf auto` fuzzes K&R C definitions (#283). The harness declares the
+  prototype the definition's parameter declarations give, with the default
+  argument promotions (`char` and `short` as `int`, `float` as `double`), and
+  passes the arguments it decodes. The modern parse read an old-style
+  definition as taking no parameters, and the dialect was report-only.
+  Pre-C++98 C++ stays report-only.
+- On-target CmpLog for the `gdb` and `qemu-system` transports (#386).
+  `--transport-coverage-map ...,cmplog=ADDR,cmplog_cap=N` names a record the
+  firmware's `-fsanitize-coverage=trace-cmp` callbacks fill, `{u32 count,
+  u32 reserved}` then `{u64 lhs, u64 rhs, u32 width, u32 site}` entries. bhf
+  zeroes the count before each run and reads the entries after it. A mutation
+  of a corpus entry splices the operands its run compared. The summary's
+  `comparisons` counts them. On the mps2-an385 fixture a 4-byte magic is
+  solved within 300 executions with `cmplog=` and not without it. The
+  transport lane had no comparison feedback.
+- `bhf fuzz --target-transport ... --workers N` drives N targets at once
+  (#316). The spec names each worker's with `{worker}` or `{BASE+worker}`
+  (`agent:tcp:127.0.0.1:{9000+worker}`). The workers share one corpus,
+  coverage map, schedule and finding set, the iteration cap and time budget
+  are the campaign's, and a finding's transport profile names the spec of
+  the worker that found it. A spec without a template is refused with
+  `--workers`. The transport lane was single-worker.
+- The reference agent runs as a FreeRTOS task under `qemu-system-arm`
+  (#290). `crates/target_transport/tests/freertos/agent_task.c` serves the
+  agent protocol over UART0 of `mps2-an385`, which `-serial tcp:` makes a
+  socket. Its HardFault handler returns from the exception into a recovery
+  function that reports the fault from the task. `transport_freertos_agent_cli`
+  (opt in with `BHF_RTOS_CLI=1`) runs clean, fault and clean inputs in one
+  boot and replays the fault (`docs/validation/2026-11-18-freertos-agent.md`).
+  The agent lane had not been run against anything but mocks.
+- A reference target-side agent ships for `agent:tcp` and `agent:serial`
+  (#289): `c_runtime/bhf_agent.{h,c}`, freestanding C99 with no heap. It
+  serves the agent protocol over the board's read and write callbacks and
+  collects each input's SanitizerCoverage guards. It reports a fault from
+  the board's vector or signal handler (`bhf_agent_fault`) and goes on with
+  the next input. An input longer than its buffer is refused, a new
+  protocol status (`3`) the host takes as an inconclusive run.
+  `c_runtime/examples/agent_posix.c` runs it over TCP, and a loopback test
+  and a `bhf fuzz` run drive it to a fault that `bhf replay` reproduces.
+  Users had to implement the protocol from its description.
+- The JS lane runs browser-oriented modules (#288). A module that needs
+  `window`, `document` or `navigator`, at load or when called, gets inert
+  stand-ins for the browser globals Node lacks, and for any
+  `HTML…Element`, `SVG…Element` or `…Observer` class it hits. The harness's
+  `browser-globals.txt` records which, and later starts install them before
+  the target loads, as an ES module needs. The target's findings carry them
+  in `fidelity.environment_shim` and `fidelity_caveat`, since a finding may
+  depend on them. A module that tests `typeof window` gets none. These
+  modules were skipped as not loadable (JS-2). Re-running the sweep's 37 JS-2
+  targets built and fuzzed 23 of them
+  (`docs/validation/2026-11-18-js2-browser-globals.md`).
 - `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
   finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
   integer or flag to the first of 0, 1, -1 and its type's limits that still

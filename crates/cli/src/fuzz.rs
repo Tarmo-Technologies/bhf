@@ -555,7 +555,9 @@ pub struct FuzzArgs {
     /// memory-read transports (`gdb`, `qemu-system`) as
     /// `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>`,
     /// plus `input_len=<addr>` when the firmware reads the input's length from
-    /// a `u32` there (each value decimal or `0x`-hex). `input_cap` is the
+    /// a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` for the comparison
+    /// record the firmware fills for CmpLog (each value decimal or `0x`-hex).
+    /// `input_cap` is the
     /// staging buffer's size: no input is written past it. The `agent`
     /// transport carries coverage over its protocol and rejects this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
@@ -5064,6 +5066,10 @@ fn run_builtin_with_progress(
         .collect();
     // Re-run results waiting to be taken in at the end of an iteration.
     let mut arrived: Vec<crate::fresh_rerun::Checked<FreshRerunResult>> = Vec::new();
+    // The inputs this pass has sent for a re-run, by key. An input whose
+    // coverage varies from run to run can make progress twice: its second
+    // re-run would only repeat the first, and the pass would count it twice.
+    let mut sent_for_rerun: HashSet<u64> = HashSet::new();
     // Inputs this pass leaves unchecked: still running when it ended, cut
     // short by its end, or held back once the finding cap was reached.
     let mut unchecked_inputs: Vec<Vec<u8>> = Vec::new();
@@ -5153,7 +5159,9 @@ fn run_builtin_with_progress(
         let reruns =
             fresh_reruns.get_or_insert_with(|| start_fresh_reruns(&prepared, pass_deadline));
         for (_, input) in carried_over {
-            arrived.extend(reruns.submit(input));
+            if sent_for_rerun.insert(crash_input_key(&input)) {
+                arrived.extend(reruns.submit(input));
+            }
         }
         adopt_fresh_reruns!(std::mem::take(&mut arrived));
     }
@@ -5498,6 +5506,7 @@ fn run_builtin_with_progress(
             && driver_harness
             && run.sanitizer.is_none()
             && !input.is_empty()
+            && sent_for_rerun.insert(crash_input_key(&input))
         {
             let reruns =
                 fresh_reruns.get_or_insert_with(|| start_fresh_reruns(&prepared, pass_deadline));

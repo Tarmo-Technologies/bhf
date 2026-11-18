@@ -47,31 +47,56 @@ pub fn line_map_sidecar_json(
 
 pub type BreadcrumbSidecar = BTreeMap<String, Breadcrumb>;
 
+/// The probe package a unit of `dialect` names in its instrumented calls.
+/// Ada 83 has no child units, so an Ada 83 unit cannot `with`
+/// `AdaFuzz.Probe`; it names the runtime's library-level
+/// `AdaFuzz_Probe83`, which renames the probe's subprograms (#284).
+pub fn probe_package(dialect: AdaStandard) -> &'static str {
+    if dialect == AdaStandard::Ada83 {
+        "AdaFuzz_Probe83"
+    } else {
+        "AdaFuzz.Probe"
+    }
+}
+
 pub fn instrument_unit(args: InstrumentArgs<'_>) -> Result<InstrumentedFile, InstrumenterError> {
     let mut rewriter = SourceRewriter::new(args.source);
-    let breadcrumbs = breadcrumbs::collect_breadcrumb_insertions(
-        args.ast,
-        args.source,
-        args.source_path,
-        &mut rewriter,
-    )?;
-    let handler_insertions =
-        handlers::collect_handler_rewrites(args.ast, args.source, args.source_path, &mut rewriter)?;
-    let raise_insertions =
-        raises::collect_raise_insertions(args.ast, args.source, args.source_path, &mut rewriter)?;
-    let needs_probe = !breadcrumbs.is_empty() || handler_insertions > 0 || raise_insertions > 0;
-    let needs_ada_exceptions = handler_insertions > 0;
     let dialect = args
         .ast
         .units
         .first()
         .map(|unit| unit.ada_standard)
         .unwrap_or(AdaStandard::Ada2022);
+    let probe = probe_package(dialect);
+    let breadcrumbs = breadcrumbs::collect_breadcrumb_insertions(
+        args.ast,
+        args.source,
+        args.source_path,
+        probe,
+        &mut rewriter,
+    )?;
+    // A handler probe binds the exception occurrence (`when E : others`) and
+    // reads it through Ada.Exceptions, neither of which Ada 83 has.
+    let handler_insertions = if dialect == AdaStandard::Ada83 {
+        0
+    } else {
+        handlers::collect_handler_rewrites(args.ast, args.source, args.source_path, &mut rewriter)?
+    };
+    let raise_insertions = raises::collect_raise_insertions(
+        args.ast,
+        args.source,
+        args.source_path,
+        probe,
+        &mut rewriter,
+    )?;
+    let needs_probe = !breadcrumbs.is_empty() || handler_insertions > 0 || raise_insertions > 0;
+    let needs_ada_exceptions = handler_insertions > 0;
     let tokens = ada_parser::lexer::lex(args.source, dialect);
     context_clauses::collect_context_clause_insertions(
         args.source,
         args.ast,
         &tokens,
+        probe,
         needs_probe,
         needs_ada_exceptions,
         &mut rewriter,
@@ -120,6 +145,40 @@ mod tests {
             source_path: path,
         })
         .unwrap()
+    }
+
+    /// #284: an Ada 83 unit cannot `with` a child unit, so its calls name the
+    /// library-level bridge, and its handlers are left as written: their
+    /// probe binds the occurrence, which Ada 83 cannot.
+    #[test]
+    fn an_ada83_unit_names_the_library_level_probe_and_keeps_its_handlers() {
+        let source = "pragma Ada_83;\n\
+                      package body P is\n\
+                      \x20  Bad : exception;\n\
+                      \x20  procedure Q (N : Integer) is\n\
+                      \x20  begin\n\
+                      \x20     if N = 0 then\n\
+                      \x20        raise Bad;\n\
+                      \x20     end if;\n\
+                      \x20  exception\n\
+                      \x20     when Constraint_Error => null;\n\
+                      \x20  end Q;\n\
+                      end P;\n";
+        let result = instrument(source);
+        let out = &result.rewritten_source;
+        assert!(
+            out.contains("with AdaFuzz_Probe83;\npackage body P"),
+            "{out}"
+        );
+        assert!(out.contains("AdaFuzz_Probe83.Breadcrumb (1);"), "{out}");
+        assert!(out.contains("AdaFuzz_Probe83.On_Explicit_Raise"), "{out}");
+        assert!(
+            out.contains("Breadcrumb     => AdaFuzz_Probe83.Last_Breadcrumb"),
+            "{out}"
+        );
+        assert!(!out.contains("AdaFuzz.Probe"), "{out}");
+        assert!(!out.contains("Ada.Exceptions"), "{out}");
+        assert!(out.contains("when Constraint_Error => null;"), "{out}");
     }
 
     #[test]

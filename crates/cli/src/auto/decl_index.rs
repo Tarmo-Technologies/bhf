@@ -420,7 +420,7 @@ impl DeclarationIndex {
                     continue;
                 };
                 if is_c {
-                    let Ok(functions) = c_parser::parse_c_functions(&source) else {
+                    let Ok(functions) = c_parser::parse_c_functions_with_knr(&source) else {
                         continue;
                     };
                     if functions.iter().any(|f| f.name == "main") {
@@ -842,7 +842,7 @@ impl DeclarationIndex {
                         }
                     }
                     if ext == "c" {
-                        if let Ok(functions) = c_parser::parse_c_functions(&source) {
+                        if let Ok(functions) = c_parser::parse_c_functions_with_knr(&source) {
                             for f in functions {
                                 let name = f.name.clone();
                                 if !f.is_static {

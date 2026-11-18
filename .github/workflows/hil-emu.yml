@@ -4,7 +4,8 @@
 #
 # Runs the REAL (live-QEMU) transport validations — RV-1 (cross-endian fidelity),
 # RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M),
-# RV-4 (pinned FreeRTOS task/queue, CLI finding and replay) —
+# RV-4 (pinned FreeRTOS task/queue, CLI finding and replay), RV-5 (the
+# reference agent's Zephyr sample, CLI finding and replay) —
 # via scripts/hil-emu.sh. The script hard-fails if the qemu / cross toolchains are
 # missing and runs the gated tests with BHF_HIL_REQUIRE=1, so the emulator
 # validations CANNOT silently skip in CI. The physical-board lane
@@ -24,6 +25,11 @@ on:
       - "crates/cli/src/transport_*.rs"
       - "crates/cli/src/fuzz.rs"
       - "crates/cli/tests/transport_fuzz_qemu_cli.rs"
+      - "crates/cli/tests/transport_freertos_agent_cli.rs"
+      - "c_runtime/bhf_agent.*"
+      - "c_runtime/zephyr/**"
+      - "crates/cli/tests/transport_zephyr_agent_cli.rs"
+      - "scripts/ci/install-zephyr.sh"
       - "scripts/hil-emu.sh"
       - ".github/workflows/hil-emu.yml"
   schedule:
@@ -63,6 +69,8 @@ jobs:
             libc6-dev-ppc64-cross \
             binutils \
             build-essential \
+            device-tree-compiler \
+            gperf \
             git
           # Sanity: the exact binaries scripts/hil-emu.sh requires.
           for tool in qemu-arm qemu-ppc64 qemu-system-arm qemu-img \
@@ -70,10 +78,26 @@ jobs:
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
 
+      # The components rust-toolchain.toml lists, installed with the toolchain:
+      # a later `cargo` adding them hit a conflict with a runner image's own
+      # stable install (#423).
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.99.0
+          components: clippy, rustfmt
+
+      # The Zephyr agent sample (RV-5) builds against a Zephyr tree with west.
+      - name: Cache the Zephyr tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/zephyrproject
+          key: zephyr-${{ runner.os }}-${{ hashFiles('scripts/ci/install-zephyr.sh') }}
+
+      - name: Install Zephyr and west
+        run: |
+          bash scripts/ci/install-zephyr.sh >> "$GITHUB_ENV"
+          echo "$HOME/.local/opt/zephyrproject/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run the emulator-in-the-loop validations
         run: scripts/hil-emu.sh

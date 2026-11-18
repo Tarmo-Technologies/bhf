@@ -3613,6 +3613,7 @@ project AdaFuzz_Runtime is\n\
       \"adafuzz-input.adb\",\n\
       \"adafuzz-decode.ads\",\n\
       \"adafuzz-decode.adb\",\n\
+      \"adafuzz_probe83.ads\",\n\
       \"adafuzz_cov.c\");\n\
    for Object_Dir use \"adafuzz_obj\";\n\
    for Library_Name use \"adafuzz\";\n\

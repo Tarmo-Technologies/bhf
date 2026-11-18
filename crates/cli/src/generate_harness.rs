@@ -2912,8 +2912,13 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         .with_context(|| format!("resolve C source {}", args.source.display()))?;
     let source = crate::source_text::read_source_text(&source_path)
         .with_context(|| format!("read C source {}", source_path.display()))?;
-    let functions = c_parser::parse_c_functions(&source)
+    let mut functions = c_parser::parse_c_functions_with_knr(&source)
         .with_context(|| format!("parse C source {}", source_path.display()))?;
+    c_parser::apply_storage_class_macros(
+        &mut functions,
+        &source,
+        &c_storage_class_macros(&source_path, &source),
+    );
     let target_name = args
         .target
         .as_deref()
@@ -10397,6 +10402,48 @@ fn direct_project_includes(source: &str, include_dirs: &[PathBuf]) -> Vec<String
 /// without those in a foreign-OS-only `#if` branch and without textually
 /// included implementation fragments. Whether each one is a project header
 /// depends on the include dirs it is looked up in.
+/// The storage-class macros (#415) a C source's translation unit sees: its
+/// own, and those of the headers it reaches through `#include`s that resolve
+/// beside the source or beside the including header. zlib defines its
+/// `local` in zutil.h, which deflate.c reaches through deflate.h.
+fn c_storage_class_macros(
+    source_path: &Path,
+    source: &str,
+) -> std::collections::BTreeMap<String, String> {
+    const MAX_HEADERS: usize = 64;
+    let mut macros = c_parser::storage_class_macros(source);
+    let Some(dir) = source_path.parent() else {
+        return macros;
+    };
+    let mut queue: Vec<(PathBuf, String)> = include_spellings(source)
+        .into_iter()
+        .map(|header| (dir.to_path_buf(), header))
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some((base, header)) = queue.pop() {
+        if seen.len() >= MAX_HEADERS {
+            break;
+        }
+        let path = base.join(&header);
+        if !path.is_file() || !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(text) = crate::source_text::read_source_text(&path) else {
+            continue;
+        };
+        for (name, body) in c_parser::storage_class_macros(&text) {
+            macros.entry(name).or_insert(body);
+        }
+        let parent = path.parent().map_or_else(|| base.clone(), Path::to_path_buf);
+        queue.extend(
+            include_spellings(&text)
+                .into_iter()
+                .map(|nested| (parent.clone(), nested)),
+        );
+    }
+    macros
+}
+
 fn include_spellings(source: &str) -> Vec<String> {
     let mut includes = Vec::new();
     // (skip-current-branch, skip-else-branch) per open `#if`. An include inside a

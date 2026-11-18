@@ -16,8 +16,13 @@
 bhf::m19_full_ci_matrix::full_ci_fixture_pipelines_cover_active_matrix_cell  skipping: BHF_M19_FULL_CI is not set
 
 # The FreeRTOS CLI acceptance fetches a pinned kernel; hil-emu.yml runs every
-# cli_freertos_ test with BHF_RTOS_CLI=1.
+# cli_freertos_ test, and the FreeRTOS agent task's, with BHF_RTOS_CLI=1.
 bhf::transport_fuzz_qemu_cli::cli_freertos_*  skip cli_freertos_*: set BHF_RTOS_CLI=1
+bhf::transport_freertos_agent_cli::*  SKIP: set BHF_RTOS_CLI=1
+
+# The Zephyr agent sample needs a Zephyr tree and west; hil-emu.yml installs
+# them and runs it with BHF_ZEPHYR_CLI=1.
+bhf::transport_zephyr_agent_cli::*  SKIP: set BHF_ZEPHYR_CLI=1
 
 # The binary analyzers' tests need the pinned Rizin, Ghidra and angr; the
 # nightly's binary-analyzers job installs them and runs every one with
