@@ -2853,6 +2853,11 @@
   when bhf panics.
 
 ### Added
+- The bhf-pr action takes a `mode` (#319): `pr` (the diff-scoped gate, the
+  default), `batch` (the whole tree), `prune` (rebuild the harnesses and keep
+  each corpus's inputs that add coverage) and `coverage` (the run's line
+  coverage, with `results/coverage/` as an artifact). A scheduled example
+  workflow runs batch, prune and coverage in turn on the shared corpus cache.
 - The bhf-pr action keeps its work between runs (#317): with
   `corpus-cache` (default on), it restores the corpus, the discovery cache
   and the stored findings of the newest cache of the PR's branch, else of

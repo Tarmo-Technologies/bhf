@@ -71,6 +71,7 @@ run continues the last one.
 
 | Input | Default | Meaning |
 |---|---|---|
+| `mode` | `pr` | `pr` \| `batch` \| `prune` \| `coverage` — see [Modes](#modes). |
 | `path` | `.` | Source root to scan. |
 | `base-ref` | *(auto)* | Git ref to diff against. Default: PR base / default branch. |
 | `languages` | *(all)* | Comma list to restrict any of the sixteen lanes (`ada,c,cpp,rust,java,python,perl,go,cobol,fortran,csharp,javascript,typescript,ruby,lua,php`). |
@@ -83,6 +84,20 @@ run continues the last one.
 | `build-from-source` | `false` | Install from source (`cargo install --git`) instead. |
 | `corpus-cache` | `true` | Restore the work dir's corpus, discovery cache and stored findings from the Actions cache before the run, and save them after it. |
 | `corpus-dir` | `$RUNNER_TEMP/bhf_work` | The work dir bhf runs in and the cache keeps. |
+
+## Modes
+
+| Mode | What it runs |
+|---|---|
+| `pr` (default) | `bhf ci --changed-since <base>`: the changed code's targets, with the gate. |
+| `batch` | `bhf ci` over the whole tree, with the gate: every target's corpus grows. |
+| `prune` | A one-second `bhf auto` builds the harnesses again, then `bhf corpus minimize` keeps the inputs of each corpus that add coverage. The log and the job summary give the counts before and after. |
+| `coverage` | `bhf auto` for `per-target-time`, which replays each corpus through a source-coverage build: the run's line coverage in the job summary, and `results/coverage/` uploaded as an artifact. |
+
+`batch`, `prune` and `coverage` belong on a schedule. They share the corpus
+cache with the PR runs, so the corpus a PR check restores is the one the
+scheduled runs grew and pruned. `.github/workflows/bhf-scheduled.example.yml`
+runs the three in turn each week, and any one by hand.
 
 ## Gate policy
 

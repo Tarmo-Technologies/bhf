@@ -5,6 +5,10 @@ branding:
   icon: "target"
   color: "purple"
 inputs:
+  mode:
+    description: "pr | batch | prune | coverage. pr (default) fuzzes the PR's changed code and gates on it; batch fuzzes the whole tree; prune rebuilds the harnesses and shrinks each cached corpus to the inputs that add coverage; coverage fuzzes briefly from the corpus and uploads the line coverage it reaches. Run batch, prune and coverage on a schedule."
+    required: false
+    default: "pr"
   path:
     description: "Source root to scan."
     required: false
@@ -110,11 +114,12 @@ runs:
         INPUT_BUILD_FROM_SOURCE: ${{ inputs.build-from-source }}
         GH_TOKEN: ${{ github.token }}
 
-    - name: Run bhf (diff-scoped)
+    - name: Run bhf
       id: run
       shell: bash
       run: ${{ github.action_path }}/scripts/run-bhf.sh
       env:
+        INPUT_MODE: ${{ inputs.mode }}
         INPUT_PATH: ${{ inputs.path }}
         INPUT_LANGUAGES: ${{ inputs.languages }}
         INPUT_CAMPAIGN_TIME: ${{ inputs.campaign-time }}
@@ -122,6 +127,16 @@ runs:
         INPUT_PR_GATE: ${{ inputs.pr-gate }}
         BASE_REF: ${{ steps.base.outputs.ref }}
         BHF_WORK_DIR: ${{ steps.work.outputs.dir }}
+
+    - name: Upload the coverage report
+      if: ${{ always() && steps.run.outputs.coverage_dir != '' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: bhf-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.run.outputs.coverage_dir }}
+        if-no-files-found: ignore
+        retention-days: 30
 
     # Saved whatever the verdict: a finding the run stored is what the next
     # run replays as a regression.
