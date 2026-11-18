@@ -783,6 +783,8 @@ fn plan_to_binary_fuzz_args(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         rng_seed: 0,
         adapter_report: None,
+        persistent_addr: None,
+        entrypoint: None,
     })
 }
 

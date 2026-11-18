@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `bhf binary fuzz` under AFL++'s binary-only modes, on binaries built
-//! without instrumentation.
-//! `--engine afl-frida` finds an abort (#322).
+//! without instrumentation:
+//! - `--engine afl-frida` finds an abort (#322);
+//! - a QEMU-mode persistent loop (`--persistent-addr`) finds one, faster
+//!   than a QEMU run that starts the binary for every input (#375).
 //!
 //! These need `afl-fuzz` and AFL++'s QEMU and Frida modes, which Ubuntu's
 //! afl++ package leaves out: `scripts/ci/build-afl-binary-modes.sh` builds
@@ -126,4 +128,65 @@ fn frida_mode_finds_the_abort_and_records_its_engine() {
         .is_some_and(|coverage| coverage.contains("Frida")));
     assert!(run["fidelity"]["edges_found"].as_u64() > Some(0), "{run:#}");
     assert!(findings(&run) > 0, "Frida mode finds the abort: {run:#}");
+}
+
+/// Reads its input file in `process`, which `main` calls once: a persistent
+/// loop around `process` runs each input without starting the binary again.
+const PROCESS_FILE: &str = "#include <stdio.h>\n#include <stdlib.h>\n\
+    int process(const char *path) {\n  char b[8] = {0};\n  FILE *f = fopen(path, \"rb\");\n  \
+    if (!f) return 1;\n  size_t n = fread(b, 1, sizeof b, f);\n  fclose(f);\n  \
+    if (n > 1 && b[0] == 'F' && b[1] == 'U') abort();\n  return 0;\n}\n\
+    int main(int argc, char **argv) { return argc > 1 ? process(argv[1]) : 1; }\n";
+
+/// The address of the function `name` (from `nm`), as `0x` hex.
+fn symbol(elf: &Path, name: &str) -> String {
+    let out = Command::new("nm").arg(elf).output().expect("run nm");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let addr = u64::from_str_radix(fields.next()?, 16).ok()?;
+            (fields.next()? == "T" && fields.next()? == name).then(|| format!("0x{addr:x}"))
+        })
+        .unwrap_or_else(|| panic!("no {name} in {}", elf.display()))
+}
+
+#[test]
+fn a_qemu_persistent_loop_finds_the_abort_faster_than_a_restart_per_input() {
+    let Some(modes) = have_afl_binary_modes() else {
+        eprintln!("skipping: no AFL++ QEMU mode");
+        return;
+    };
+    let dir = TestDir::new("afl-qemu-persistent");
+    let elf = build(&dir, "process", PROCESS_FILE);
+    let addr = symbol(&elf, "process");
+    let common = [
+        "--engine",
+        "afl-qemu",
+        "--input-mode",
+        "file",
+        "--seed-input",
+        "AAAA",
+        "--time",
+        "15s",
+    ];
+    let persistent_args: Vec<&str> = common
+        .iter()
+        .copied()
+        .chain(["--persistent-addr", addr.as_str()])
+        .collect();
+    let persistent = binary_fuzz(&modes, &dir.join("persistent"), &elf, &persistent_args);
+    assert_eq!(persistent["fidelity"]["persistent_addr"], addr.as_str());
+    assert!(
+        findings(&persistent) > 0,
+        "the persistent loop finds the abort: {persistent:#}"
+    );
+    let restarting = binary_fuzz(&modes, &dir.join("restarting"), &elf, &common);
+    let execs = |run: &serde_json::Value| run["executions"].as_u64().unwrap_or(0);
+    assert!(
+        execs(&persistent) > 2 * execs(&restarting),
+        "a persistent loop runs inputs without starting the binary again: {} vs {} executions",
+        execs(&persistent),
+        execs(&restarting)
+    );
 }

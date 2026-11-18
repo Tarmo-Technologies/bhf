@@ -480,7 +480,26 @@ sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
 Both effective limits are recorded in the run-provenance JSON, with `engine`,
 the trace program or library, `executions` and a `fidelity` object: the
-coverage source and `edges_found`.
+coverage source, `edges_found` and the persistent and entry addresses.
+
+The two AFL++ modes also take:
+
+- `--persistent-addr <ADDR>` — run the target in a persistent loop from this
+  address (hex), restoring its registers on each pass, so the binary is not
+  started again for every input: `AFL_QEMU_PERSISTENT_ADDR` with
+  `AFL_QEMU_PERSISTENT_GPR=1`, or `AFL_FRIDA_PERSISTENT_ADDR`. Point it at a
+  function that reads one input and returns, such as the one `main` calls
+  with the input file's path; the loop ends where that function returns. A
+  position-independent binary's addresses are where the emulator loads it,
+  not what `nm` prints, so a non-PIE build is the simple case.
+- `--entrypoint <ADDR>` — start the fork server at this address (hex)
+  instead of the binary's entry point (`AFL_ENTRYPOINT`), so each run skips
+  the start-up before it.
+
+```sh
+bhf binary fuzz ./parser --engine afl-qemu --input-mode file \
+  --seed-file samples/record.bin --persistent-addr 0x4011b6 --time 10m
+```
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic

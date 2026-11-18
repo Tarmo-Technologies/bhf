@@ -101,6 +101,22 @@ pub struct BinaryFuzzArgs {
     #[arg(long, value_enum, default_value_t = BinaryFuzzEngine::Auto)]
     pub engine: BinaryFuzzEngine,
 
+    /// QEMU or Frida mode: run the target in a persistent loop from this
+    /// address (hex), restoring its registers on each pass, so the binary is
+    /// not started again for every input. The loop ends where the function at
+    /// the address returns. Sets `AFL_QEMU_PERSISTENT_ADDR` (with
+    /// `AFL_QEMU_PERSISTENT_GPR=1`) or `AFL_FRIDA_PERSISTENT_ADDR`. A
+    /// position-independent binary's addresses are where the emulator loads
+    /// it, not what `nm` prints.
+    #[arg(long = "persistent-addr", value_name = "ADDR", value_parser = parse_address)]
+    pub persistent_addr: Option<u64>,
+
+    /// QEMU or Frida mode: start the fork server at this address (hex)
+    /// instead of the binary's entry point (`AFL_ENTRYPOINT`), so each run
+    /// skips the start-up before it.
+    #[arg(long = "entrypoint", value_name = "ADDR", value_parser = parse_address)]
+    pub entrypoint: Option<u64>,
+
     /// Wall-clock budget (e.g. 30s, 5m). For afl-qemu it defaults to ~100ms per
     /// `--iterations`, clamped to [1s,30s]; the builtin engine stops at it, or
     /// at `--iterations`, whichever comes first.
@@ -181,6 +197,17 @@ pub enum BinaryFuzzEngine {
     #[value(name = "afl-frida")]
     AflFrida,
     Auto,
+}
+
+/// A `--persistent-addr` or `--entrypoint` address: hex, with or without
+/// `0x`.
+fn parse_address(value: &str) -> Result<u64, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u64::from_str_radix(digits, 16)
+        .map_err(|_| format!("{value:?} is not a hex address (e.g. 0x401136)"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -365,6 +392,12 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         }
         ResolvedEngine::Builtin { degraded } => degraded,
     };
+    if args.persistent_addr.is_some() || args.entrypoint.is_some() {
+        return Err(anyhow!(
+            "--persistent-addr and --entrypoint need --engine afl-qemu or afl-frida (the \
+             builtin engine starts the binary for every input)"
+        ));
+    }
     let time_budget = match args.time.as_deref() {
         Some(time) => Some(Duration::from_secs(parse_duration_secs(time).ok_or_else(
             || anyhow!("--time {time:?} is not a duration (e.g. 30s, 5m)"),
@@ -968,6 +1001,14 @@ impl AflBinaryMode {
             Self::Frida => "edges, instrumented by Frida as the binary runs",
         }
     }
+
+    /// The variable that sets the persistent loop's address.
+    fn persistent_var(self) -> &'static str {
+        match self {
+            Self::Qemu => "AFL_QEMU_PERSISTENT_ADDR",
+            Self::Frida => "AFL_FRIDA_PERSISTENT_ADDR",
+        }
+    }
 }
 
 /// AFL++'s toolchain for a binary-only mode: `afl-fuzz`, plus the program
@@ -1194,6 +1235,27 @@ fn parse_duration_secs(value: &str) -> Option<u64> {
     Some(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
 }
 
+/// The variables that set up a persistent loop or a later fork-server start
+/// for `afl_mode`: `--persistent-addr` (with the registers restored on each
+/// QEMU pass) and `--entrypoint`. Pure, for testing.
+fn afl_binary_env(
+    afl_mode: AflBinaryMode,
+    persistent_addr: Option<u64>,
+    entrypoint: Option<u64>,
+) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if let Some(addr) = persistent_addr {
+        env.push((afl_mode.persistent_var(), format!("0x{addr:x}")));
+        if afl_mode == AflBinaryMode::Qemu {
+            env.push(("AFL_QEMU_PERSISTENT_GPR", "1".to_owned()));
+        }
+    }
+    if let Some(addr) = entrypoint {
+        env.push(("AFL_ENTRYPOINT", format!("0x{addr:x}")));
+    }
+    env
+}
+
 /// The lineage of a crash AFL++ found in a binary-only mode: unknown, since
 /// AFL++ schedules its own queue and bhf does not see what the input was
 /// mutated from. Nothing is guessed; the reason names the crash file.
@@ -1301,6 +1363,9 @@ fn run_afl_binary(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in env {
+        cmd.env(key, value);
+    }
+    for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
         cmd.env(key, value);
     }
     // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
@@ -1438,6 +1503,8 @@ fn run_afl_binary(
         "fidelity": {
             "mutation": "AFL++ with coverage feedback",
             "coverage": afl.mode.coverage(),
+            "persistent_addr": args.persistent_addr.map(|addr| format!("0x{addr:x}")),
+            "entrypoint": args.entrypoint.map(|addr| format!("0x{addr:x}")),
             "edges_found": stats.get("edges_found"),
         },
         "degraded": false,
@@ -3142,6 +3209,8 @@ mod tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
             rng_seed: 0,
         };
 
@@ -3450,6 +3519,28 @@ mod afl_qemu_tests {
         assert_eq!(AflBinaryMode::Frida.engine(), "afl-frida");
     }
 
+    /// `--persistent-addr` and `--entrypoint` set each mode's variables, and
+    /// QEMU mode's loop restores the registers (#375).
+    #[test]
+    fn persistent_and_entrypoint_set_the_mode_variables() {
+        assert_eq!(
+            afl_binary_env(AflBinaryMode::Qemu, Some(0x401136), Some(0x401000)),
+            [
+                ("AFL_QEMU_PERSISTENT_ADDR", "0x401136".to_owned()),
+                ("AFL_QEMU_PERSISTENT_GPR", "1".to_owned()),
+                ("AFL_ENTRYPOINT", "0x401000".to_owned()),
+            ]
+        );
+        assert_eq!(
+            afl_binary_env(AflBinaryMode::Frida, Some(0x401136), None),
+            [("AFL_FRIDA_PERSISTENT_ADDR", "0x401136".to_owned())]
+        );
+        assert!(afl_binary_env(AflBinaryMode::Qemu, None, None).is_empty());
+        assert_eq!(parse_address("0x401136"), Ok(0x401136));
+        assert_eq!(parse_address("401136"), Ok(0x401136));
+        assert!(parse_address("main").is_err());
+    }
+
     #[test]
     fn frida_trace_is_looked_for_beside_afl_fuzz() {
         let candidates = afl_frida_trace_candidates(
@@ -3595,6 +3686,8 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3684,6 +3777,8 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Auto,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3998,6 +4093,8 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
