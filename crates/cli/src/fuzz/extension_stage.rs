@@ -7,43 +7,56 @@
 //!
 //! - `mutator.mutate` (#314): one in [`EXTENSION_EVERY`] mutated children is
 //!   the extension's mutation of the base the loop picked.
+//! - `codec.decode` + `codec.encode` (#373): a child is the base decoded to
+//!   the extension's structured value, one value of it mutated, and encoded
+//!   back, so a framed format keeps its length and checksum fields right.
+//!   Decode and encode errors are counted; they are never findings.
 //!
-//! The mutation stage is bounded: at most [`MAX_CALLS`] calls and a quarter
-//! of the pass's time budget ([`DEFAULT_BUDGET`] without one). A call that
-//! times out, or an extension that stops answering, cuts the stage off for
-//! the rest of the pass, and the campaign goes on with the builtin
-//! mutations.
+//! The mutation and codec stages are bounded: at most [`MAX_CALLS`] calls
+//! and a quarter of the pass's time budget ([`DEFAULT_BUDGET`] without one).
+//! A call that times out, or an extension that stops answering, cuts the
+//! stage off for the rest of the pass, and the campaign goes on with the
+//! builtin mutations.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use extension_host::{capability, CaseId, ExtensionClient, ExtensionManifest, MutateOutcome};
+use extension_host::{
+    capability, CaseId, CodecOutcome, ExtensionClient, ExtensionManifest, MutateOutcome,
+};
 use fuzz_engine_builtin::MutationRng;
 use serde_json::{json, Value};
 
 /// One in this many mutated children comes from an extension stage.
 pub(super) const EXTENSION_EVERY: u64 = 4;
 
-/// The most mutate calls one pass makes.
+/// The most mutate and codec calls one pass makes.
 pub(super) const MAX_CALLS: usize = 1000;
 
-/// The stage's time budget for a pass without `--time`.
+/// The stages' time budget for a pass without `--time`.
 pub(super) const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 
 /// The capabilities the stages use, offered as optional.
-const STAGE_CAPS: &[&str] = &[capability::MUTATOR_MUTATE];
+const STAGE_CAPS: &[&str] = &[
+    capability::MUTATOR_MUTATE,
+    capability::CODEC_DECODE,
+    capability::CODEC_ENCODE,
+];
 
 /// The stages of one pass.
 pub(super) struct ExtensionStage {
     client: ExtensionClient,
     campaign: String,
     mutate: bool,
+    codec: bool,
     budget: Duration,
     spent: Duration,
     calls: usize,
     children: u64,
     mutated: usize,
     mutate_declined: usize,
+    encoded: usize,
+    codec_errors: usize,
     cut_off: Option<String>,
 }
 
@@ -59,28 +72,34 @@ impl ExtensionStage {
         let client =
             ExtensionClient::from_manifest_with_optional(&loaded, manifest, STAGE_CAPS).ok()?;
         let mutate = client.supports(capability::MUTATOR_MUTATE);
-        if !mutate {
+        let codec =
+            client.supports(capability::CODEC_DECODE) && client.supports(capability::CODEC_ENCODE);
+        if !(mutate || codec) {
             return None;
         }
         Some(Self {
             client,
             campaign: campaign.to_owned(),
             mutate,
+            codec,
             budget: pass_budget.map_or(DEFAULT_BUDGET, |budget| budget / 4),
             spent: Duration::ZERO,
             calls: 0,
             children: 0,
             mutated: 0,
             mutate_declined: 0,
+            encoded: 0,
+            codec_errors: 0,
             cut_off: None,
         })
     }
 
-    /// The next mutated child from the extension's mutation stage, made from
-    /// `base`, or `None`: the loop makes this child itself. One in
-    /// [`EXTENSION_EVERY`] children is the stage's, within its bounds.
+    /// The next mutated child from an extension stage, made from `base`, or
+    /// `None`: the loop makes this child itself. One in [`EXTENSION_EVERY`]
+    /// children is the stages', alternating mutation and codec when the
+    /// extension provides both, within the stages' bounds.
     pub(super) fn child(&mut self, base: &[u8], rng: &mut MutationRng) -> Option<Vec<u8>> {
-        if !self.mutate || self.cut_off.is_some() {
+        if !(self.mutate || self.codec) || self.cut_off.is_some() {
             return None;
         }
         self.children += 1;
@@ -98,8 +117,14 @@ impl ExtensionStage {
             ));
             return None;
         }
+        let turn = self.children / EXTENSION_EVERY;
+        let use_codec = self.codec && (!self.mutate || turn.is_multiple_of(2));
         let started = Instant::now();
-        let child = self.mutate_child(base, rng);
+        let child = if use_codec {
+            self.codec_child(base, rng)
+        } else {
+            self.mutate_child(base, rng)
+        };
         self.spent += started.elapsed();
         child
     }
@@ -135,16 +160,223 @@ impl ExtensionStage {
         }
     }
 
+    fn codec_child(&mut self, base: &[u8], rng: &mut MutationRng) -> Option<Vec<u8>> {
+        self.calls += 1;
+        let case = self.case("codec");
+        let decoded = match self.client.decode(&case, base) {
+            Ok(CodecOutcome::Decoded(value)) => value,
+            Ok(CodecOutcome::Infrastructure(failure)) => {
+                self.codec_errors += 1;
+                self.cut_off = Some(format!("codec.decode failed: {failure:?}"));
+                return None;
+            }
+            Ok(_) => {
+                self.codec_errors += 1;
+                return None;
+            }
+            Err(error) => {
+                self.codec_errors += 1;
+                self.cut_off = Some(format!("codec.decode failed: {error}"));
+                return None;
+            }
+        };
+        let mut value = decoded;
+        mutate_value(&mut value, rng);
+        match self.client.encode(&case, value) {
+            Ok(CodecOutcome::Bytes(bytes)) => {
+                self.encoded += 1;
+                Some(bytes)
+            }
+            Ok(CodecOutcome::Infrastructure(failure)) => {
+                self.codec_errors += 1;
+                self.cut_off = Some(format!("codec.encode failed: {failure:?}"));
+                None
+            }
+            Ok(_) => {
+                self.codec_errors += 1;
+                None
+            }
+            Err(error) => {
+                self.codec_errors += 1;
+                self.cut_off = Some(format!("codec.encode failed: {error}"));
+                None
+            }
+        }
+    }
+
     /// What the stages did, for the run summary's `extension.stages`.
     pub(super) fn finish(self) -> Value {
         json!({
             "mutator": self.mutate,
+            "codec": self.codec,
             "calls": self.calls,
             "spent_ms": u64::try_from(self.spent.as_millis()).unwrap_or(u64::MAX),
             "budget_ms": u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
             "mutated": self.mutated,
             "mutate_declined": self.mutate_declined,
+            "encoded": self.encoded,
+            "codec_errors": self.codec_errors,
             "cut_off": self.cut_off,
         })
+    }
+}
+
+/// Mutate one value of a decoded structure in place: a number nudged or
+/// replaced by a boundary, a string edited (a byte inserted, removed or
+/// replaced, or the string doubled), a boolean flipped, or an array element
+/// duplicated or removed.
+pub(super) fn mutate_value(value: &mut Value, rng: &mut MutationRng) {
+    let mut leaves = Vec::new();
+    collect_leaves(value, &mut Vec::new(), &mut leaves);
+    let Some(pick) = rng.choose_index(leaves.len()) else {
+        return;
+    };
+    let Some(target) = value.pointer_mut(&leaves[pick]) else {
+        return;
+    };
+    match target {
+        Value::Bool(flag) => *flag = !*flag,
+        Value::Number(number) => *target = mutate_number(number, rng),
+        Value::String(text) => mutate_string(text, rng),
+        Value::Array(items) => {
+            if let Some(at) = rng.choose_index(items.len()) {
+                if rng.coin() {
+                    let copy = items[at].clone();
+                    items.insert(at, copy);
+                } else {
+                    items.remove(at);
+                }
+            }
+        }
+        Value::Null | Value::Object(_) => {}
+    }
+}
+
+/// JSON pointers to each mutable value: every scalar, and every non-empty
+/// array.
+fn collect_leaves(value: &Value, path: &mut Vec<String>, out: &mut Vec<String>) {
+    let pointer = |path: &[String]| {
+        path.iter()
+            .map(|part| format!("/{}", part.replace('~', "~0").replace('/', "~1")))
+            .collect::<String>()
+    };
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                path.push(key.clone());
+                collect_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            if !items.is_empty() {
+                out.push(pointer(path));
+            }
+            for (index, child) in items.iter().enumerate() {
+                path.push(index.to_string());
+                collect_leaves(child, path, out);
+                path.pop();
+            }
+        }
+        Value::Null => {}
+        _ => out.push(pointer(path)),
+    }
+}
+
+fn mutate_number(number: &serde_json::Number, rng: &mut MutationRng) -> Value {
+    const BOUNDARIES: [i64; 8] = [0, 1, -1, 127, 255, 65535, i32::MAX as i64, i64::MIN];
+    if let Some(n) = number.as_i64() {
+        let next = match rng.next_u8() % 4 {
+            0 => n.wrapping_add(1),
+            1 => n.wrapping_sub(1),
+            2 => n.wrapping_mul(2),
+            _ => BOUNDARIES[usize::from(rng.next_u8()) % BOUNDARIES.len()],
+        };
+        json!(next)
+    } else if let Some(n) = number.as_u64() {
+        json!(n.wrapping_add(1))
+    } else {
+        json!(number.as_f64().unwrap_or(0.0) * -1.5)
+    }
+}
+
+fn mutate_string(text: &mut String, rng: &mut MutationRng) {
+    let mut bytes = std::mem::take(text).into_bytes();
+    match rng.next_u8() % 4 {
+        0 => {
+            let at = rng.choose_index(bytes.len() + 1).unwrap_or(0);
+            bytes.insert(at, printable(rng));
+        }
+        1 => {
+            if let Some(at) = rng.choose_index(bytes.len()) {
+                bytes.remove(at);
+            }
+        }
+        2 => {
+            if let Some(at) = rng.choose_index(bytes.len()) {
+                bytes[at] = printable(rng);
+            }
+        }
+        _ => {
+            let copy = bytes.clone();
+            bytes.extend(copy);
+        }
+    }
+    *text = String::from_utf8_lossy(&bytes).into_owned();
+}
+
+/// A printable ASCII byte, so an edited string stays valid UTF-8.
+fn printable(rng: &mut MutationRng) -> u8 {
+    b' ' + rng.next_u8() % 95
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decoded_value_is_mutated_in_one_place_and_stays_its_shape() {
+        let mut rng = MutationRng::new(7);
+        let original = json!({ "op": "OPEN", "path": "track", "length": 10, "crc_valid": true });
+        let mut changed = 0;
+        for _ in 0..64 {
+            let mut value = original.clone();
+            mutate_value(&mut value, &mut rng);
+            let fields = value.as_object().unwrap();
+            assert_eq!(
+                fields.keys().collect::<Vec<_>>(),
+                original.as_object().unwrap().keys().collect::<Vec<_>>()
+            );
+            let differing = fields
+                .iter()
+                .filter(|(key, field)| original[key.as_str()] != **field)
+                .count();
+            assert!(differing <= 1, "{value}");
+            changed += differing;
+        }
+        assert!(changed > 32, "most mutations change a value");
+    }
+
+    #[test]
+    fn strings_stay_valid_text_and_arrays_change_length() {
+        let mut rng = MutationRng::new(3);
+        let mut text = "track".to_owned();
+        for _ in 0..200 {
+            mutate_string(&mut text, &mut rng);
+            text.truncate(64);
+        }
+        assert!(String::from_utf8(text.into_bytes()).is_ok());
+        let mut value = json!({ "items": [1] });
+        let mut lengths = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let mut copy = value.clone();
+            // Only the array (and its one number) can change.
+            mutate_value(&mut copy, &mut rng);
+            lengths.insert(copy["items"].as_array().unwrap().len());
+        }
+        assert!(lengths.contains(&0) && lengths.contains(&2), "{lengths:?}");
+        value["items"] = json!([]);
+        mutate_value(&mut value, &mut rng);
+        assert_eq!(value, json!({ "items": [] }), "nothing to mutate");
     }
 }

@@ -2162,15 +2162,24 @@ bhf fuzz bhf_work --harness H-0001 --extension path/to/extension.toml
 ```
 
 **Stages in the fuzz loop.** `bhf fuzz --extension` also gives the builtin
-loop the extension's `mutator.mutate`: one in four mutated children is the
-extension's mutation of the base the loop picked.
+loop the stages the extension provides:
 
-The mutation stage makes at most 1000 calls per pass and spends at
+- `mutator.mutate`: one in four mutated children is the extension's mutation
+  of the base the loop picked.
+- `codec.decode` with `codec.encode`: a child is the base decoded to the
+  extension's structured value, one value of it mutated (a number nudged or
+  set to a boundary, a string edited or doubled, a boolean flipped, an array
+  element duplicated or dropped), and encoded back, so a framed format keeps
+  its length and checksum fields right. With both stages the two take turns.
+  A decode or encode the extension rejects is counted (`codec_errors`), never
+  a finding.
+
+The mutation and codec stages make at most 1000 calls per pass and spend at
 most a quarter of its `--time` (60 s without one). A call that times out, an
 extension that crashes or answers garbage, or a stage past its bound is cut off
 for the rest of the pass, and the campaign goes on with the builtin mutations.
-The run summary's `extension.stages` records what the stage did: `calls`,
-`mutated` and `cut_off` (why a
+The run summary's `extension.stages` records what each stage did: `calls`,
+`mutated`, `encoded`, `codec_errors` and `cut_off` (why a
 stage stopped, or `null`).
 
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a

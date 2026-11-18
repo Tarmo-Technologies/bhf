@@ -2858,6 +2858,9 @@
   `mutator.mutate` of the base the loop picked, within at most 1000 calls and
   a quarter of the pass's `--time`; a call that times out cuts the stage off
   and the campaign goes on. The run summary's `extension.stages` records it.
+- With `codec.decode` and `codec.encode`, a child is the base decoded, one
+  value of it mutated and encoded back, so a framed format keeps its length
+  and checksum right (#373). Codec errors are counted, never findings.
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object

@@ -5236,7 +5236,7 @@ fn run_builtin_with_progress(
     // The empty input always runs in a fresh process (an empty frame ends the
     // framed loop in some drivers). Run it once per pass and reuse the result.
     let mut empty_input_run: Option<HarnessRun> = None;
-    // #314: an extension's mutation stage.
+    // #314, #373: an extension's mutation and codec stages.
     let mut extension_stage = prepared.extension_manifest.as_deref().and_then(|manifest| {
         extension_stage::ExtensionStage::open(manifest, &prepared.harness_id, prepared.time)
     });
@@ -5318,7 +5318,7 @@ fn run_builtin_with_progress(
                 }
             }
             // One child in four is an extension stage's, when the extension
-            // has one (#314).
+            // has one (#314, #373).
             let from_extension = extension_stage.as_mut().and_then(|stage| {
                 let base = pool.get(base_index).map(PoolEntry::mutation_base)?;
                 stage.child(base, &mut rng)
@@ -6092,7 +6092,7 @@ fn run_builtin_with_progress(
     // When `--extension <manifest>` is set, drive the just-retained corpus
     // through the explicitly-trusted extension's out-of-process
     // `oracle.evaluate`. Runs AFTER the campaign; the loop's own extension
-    // stages (mutation) finish first and are reported beside it as `stages`. An extension fault is bounded infrastructure that
+    // stages (mutation, codec) finish first and are reported beside it as `stages`. An extension fault is bounded infrastructure that
     // never aborts the run nor becomes a target finding. Reuses the run's
     // finding emitter so an extension finding carries the harness identity.
     let stages = extension_stage.map(extension_stage::ExtensionStage::finish);

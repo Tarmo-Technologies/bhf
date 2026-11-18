@@ -67,6 +67,8 @@ fn main() {
         vec!["codec.decode"]
     } else if mode == "magic-mutator" || mode == "slow-mutator" {
         vec!["oracle.evaluate", "mutator.mutate"]
+    } else if mode == "codec-only" {
+        vec!["oracle.evaluate", "codec.decode", "codec.encode"]
     } else {
         vec![
             "oracle.evaluate",
