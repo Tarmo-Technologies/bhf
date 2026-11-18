@@ -78,10 +78,14 @@ jobs:
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
 
+      # The components rust-toolchain.toml lists, installed with the toolchain:
+      # a later `cargo` adding them hit a conflict with a runner image's own
+      # stable install (#423).
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.99.0
+          components: clippy, rustfmt
 
       # The Zephyr agent sample (RV-5) builds against a Zephyr tree with west.
       - name: Cache the Zephyr tree
