@@ -194,7 +194,9 @@ jobs:
             binutils-dev \
             libblocksruntime-dev \
             clang-20 \
-            libclang-rt-20-dev
+            libclang-rt-20-dev \
+            cmake \
+            ninja-build
           # Only the packages the mirror still serves are kept.
           sudo apt-get "${apt_opts[@]}" autoclean
           sudo rm -rf "$HOME/apt-archives/partial" "$HOME/apt-archives/lock"
@@ -229,6 +231,24 @@ jobs:
 
       - name: Install honggfuzz
         run: bash scripts/ci/install-honggfuzz.sh >> "$GITHUB_PATH"
+
+      # libc++ and libc++abi built with MemorySanitizer, which the C++ MSan
+      # replay links (#323): the script the container image builds them with
+      # builds them once, from the LLVM release of the runner's clang, and the
+      # cache keeps them.
+      - name: Cache the MSan-instrumented libc++
+        id: msan-libcxx
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/msan-libcxx
+          key: msan-libcxx-${{ runner.os }}-${{ hashFiles('scripts/ci/build-msan-libcxx.sh') }}
+
+      - name: Build the MSan-instrumented libc++
+        if: steps.msan-libcxx.outputs.cache-hit != 'true'
+        run: bash scripts/ci/build-msan-libcxx.sh "$HOME/.local/opt/msan-libcxx"
+
+      - name: Point the C++ MSan replay at the instrumented libc++
+        run: echo "BHF_MSAN_LIBCXX=$HOME/.local/opt/msan-libcxx" >> "$GITHUB_ENV"
 
       - name: Install a JDK
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0

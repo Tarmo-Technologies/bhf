@@ -81,36 +81,19 @@ RUN source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$
 # function that touched the memory is instrumented, the C++ standard library
 # included. Build libc++ and libc++abi with -fsanitize=memory from the LLVM
 # release of the image's clang, for the C++ MSan replay (BHF_MSAN_LIBCXX).
-# Without C++ in the selection the stage is empty.
+# scripts/ci/build-msan-libcxx.sh holds the pin and builds them, here and in
+# the nightly. Without C++ in the selection the stage is empty.
 FROM ubuntu-pinned AS msan-libcxx
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG BHF_LANGUAGES=all
-ARG LLVM_VERSION=18.1.3
-ARG LLVM_SOURCE_SHA256=2929f62d69dec0379e529eb632c40e15191e36f3bd58c2cb2df0413a0dc48651
 COPY scripts/language-selection.sh /selection.sh
+COPY scripts/ci/build-msan-libcxx.sh /build-msan-libcxx.sh
 RUN source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
     mkdir -p /out; \
     if bhf_has_language "$languages" cpp; then \
-      src="llvm-project-${LLVM_VERSION}.src"; \
       apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils clang libclang-rt-18-dev cmake ninja-build python3 \
-      && [[ "$(clang -dumpversion)" == "$LLVM_VERSION" ]] \
-      && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/llvm.tar.xz \
-        "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${src}.tar.xz" \
-      && echo "${LLVM_SOURCE_SHA256}  /tmp/llvm.tar.xz" | sha256sum -c - \
-      && tar -C /tmp -xJf /tmp/llvm.tar.xz "$src/runtimes" "$src/libcxx" "$src/libcxxabi" \
-        "$src/libunwind" "$src/cmake" "$src/llvm/cmake" "$src/llvm/utils/llvm-lit" "$src/third-party" \
-      && cmake -G Ninja -S "/tmp/$src/runtimes" -B /tmp/msan-build -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' \
-        -DLLVM_USE_SANITIZER=MemoryWithOrigins -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
-        -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
-        -DLIBCXX_ENABLE_STATIC=OFF -DLIBCXXABI_ENABLE_STATIC=OFF -DCMAKE_INSTALL_PREFIX=/opt/msan-libcxx \
-      && DESTDIR=/out ninja -C /tmp/msan-build install-cxx install-cxxabi \
-      && echo "$LLVM_VERSION" > /out/opt/msan-libcxx/LLVM_VERSION \
-      && mkdir -p /out/usr/share/bhf/licenses/cpp \
-      && cp "/tmp/$src/libcxx/LICENSE.TXT" /out/usr/share/bhf/licenses/cpp/libcxx-LICENSE.TXT \
-      && cp "/tmp/$src/libcxxabi/LICENSE.TXT" /out/usr/share/bhf/licenses/cpp/libcxxabi-LICENSE.TXT \
-      && test -f /out/opt/msan-libcxx/lib/libc++.so.1 || exit; \
+      && DESTDIR=/out bash /build-msan-libcxx.sh /opt/msan-libcxx /out/usr/share/bhf/licenses/cpp || exit; \
     fi
 
 # AFL++'s QEMU and Frida modes for uninstrumented binaries, which Ubuntu's
