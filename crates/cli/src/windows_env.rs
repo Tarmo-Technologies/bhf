@@ -725,9 +725,31 @@ fn capture(dev_cmd: &Path, arch: &str, host: &str) -> Result<Vec<(String, String
     Ok(vars)
 }
 
+/// Windows PowerShell (`powershell.exe`, 5.1) to run one of bhf's scripts,
+/// without the `PSModulePath` it would inherit. PowerShell 7 (`pwsh`) sets
+/// that to its own module directories, which Windows PowerShell cannot load,
+/// so a script started from a pwsh session found no `Get-FileHash` or other
+/// built-in cmdlet. Without it Windows PowerShell computes its own.
+pub(crate) fn windows_powershell() -> std::process::Command {
+    let mut command = std::process::Command::new("powershell.exe");
+    command.env_remove("PSModulePath");
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A script bhf runs under Windows PowerShell does not inherit
+    /// PowerShell 7's module path, whose modules it cannot load.
+    #[test]
+    fn windows_powershell_drops_the_inherited_module_path() {
+        let command = windows_powershell();
+        assert_eq!(command.get_program(), "powershell.exe");
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "PSModulePath" && value.is_none()));
+    }
 
     #[test]
     fn windows_vswhere_json_lists_instances() {

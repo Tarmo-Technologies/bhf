@@ -1155,7 +1155,7 @@ fn ensure_agent_jar() -> Result<PathBuf, String> {
     }
     // A Windows host builds it with the script's PowerShell twin (#307).
     let mut build = if cfg!(windows) {
-        let mut command = Command::new("powershell");
+        let mut command = crate::windows_env::windows_powershell();
         command
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(script.with_file_name("build-agent.ps1"));
