@@ -1487,7 +1487,7 @@ pub(crate) fn applicable_engines(
             FuzzEngine::Builtin => true,
             FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
             // `bhf auto` refuses them before any target runs.
-            FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz => false,
+            FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz | FuzzEngine::Libafl => false,
         })
         .collect();
     if out.is_empty() {

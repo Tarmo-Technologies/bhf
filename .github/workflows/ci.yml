@@ -212,6 +212,7 @@ jobs:
         run: |
           cargo build --locked -p fuzz_engine_libafl_adapter --features libafl-engine
           cargo test --locked -p fuzz_engine_libafl_adapter --features libafl-engine
+          cargo test --locked -p bhf --features libafl-engine --test fuzz_libafl_engine
           cargo test --locked -p probe_gnat_actions --features enabled
           cargo check --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
           cargo test --locked -p bhf-daemon --features llm --lib

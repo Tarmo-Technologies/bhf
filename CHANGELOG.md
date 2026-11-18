@@ -2839,6 +2839,13 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --engine libafl` runs a LibAFL campaign (#296) on the harness's
+  `main`, in a bhf built with the `libafl-engine` feature (another bhf refuses
+  the engine and names the rebuild). LibAFL mutates with havoc and the harness
+  dictionary's tokens, each input runs in a fresh process, and the edge bitmap
+  the harness writes is its coverage map. The inputs that crashed the harness
+  go through the external-engine ingest into findings. CI runs the engine's
+  end-to-end test in its feature build.
 - `bhf fuzz --engine honggfuzz` runs honggfuzz in persistent mode (#295) on the
   harness's `main_honggfuzz`, a new Makefile target built with honggfuzz's
   `hfuzz-clang` (with ASan and UBSan) when absent. honggfuzz is found in

@@ -1326,13 +1326,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     if let Some(engine) = engines.iter().find(|engine| {
         matches!(
             engine,
-            crate::fuzz::FuzzEngine::Libfuzzer | crate::fuzz::FuzzEngine::Honggfuzz
+            crate::fuzz::FuzzEngine::Libfuzzer
+                | crate::fuzz::FuzzEngine::Honggfuzz
+                | crate::fuzz::FuzzEngine::Libafl
         )
     }) {
-        let name = if *engine == crate::fuzz::FuzzEngine::Libfuzzer {
-            "libfuzzer"
-        } else {
-            "honggfuzz"
+        let name = match engine {
+            crate::fuzz::FuzzEngine::Libfuzzer => "libfuzzer",
+            crate::fuzz::FuzzEngine::Honggfuzz => "honggfuzz",
+            _ => "libafl",
         };
         bhfeprintln!(
             "error: --engine: {name} is an engine of `bhf fuzz --engine {name}`; `bhf auto` \

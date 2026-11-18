@@ -24,6 +24,7 @@ use crate::fresh_rerun::{FreshReruns, Placement, RerunContext};
 
 mod collector_replay;
 mod honggfuzz;
+mod libafl;
 mod libfuzzer;
 mod peer_sync;
 pub(crate) mod shared_map;
@@ -841,6 +842,9 @@ pub enum FuzzEngine {
     /// honggfuzz in persistent mode (#295): the harness's `main_honggfuzz`,
     /// built with `make honggfuzz` (`hfuzz-clang`) when there is none.
     Honggfuzz,
+    /// A LibAFL campaign over the harness (#296), in a bhf built with the
+    /// `libafl-engine` feature.
+    Libafl,
 }
 
 /// AFL++ execution mode for `--engine afl++` (issue #45). `native` uses
@@ -898,7 +902,8 @@ impl AflMode {
 /// ordered, de-duplicated `Vec<FuzzEngine>`. Order is preserved as written; the
 /// first occurrence of each engine wins. Whitespace around names is tolerated.
 /// Empty input or an unknown name is an error. Accepted names mirror the
-/// `FuzzEngine` value-enum (`builtin`, `afl++`, `winafl`), plus
+/// `FuzzEngine` value-enum (`builtin`, `afl++`, `winafl`, `libfuzzer`,
+/// `honggfuzz`, `libafl`), plus
 /// `afl`/`aflplusplus` synonyms for `afl++`.
 pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
     let mut out: Vec<FuzzEngine> = Vec::new();
@@ -913,10 +918,11 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
             "winafl" => FuzzEngine::Winafl,
             "libfuzzer" => FuzzEngine::Libfuzzer,
             "honggfuzz" => FuzzEngine::Honggfuzz,
+            "libafl" => FuzzEngine::Libafl,
             other => {
                 return Err(format!(
                     "unknown fuzz engine '{other}' (expected: builtin, afl++, winafl, libfuzzer, \
-                     honggfuzz)"
+                     honggfuzz, libafl)"
                 ))
             }
         };
@@ -925,7 +931,7 @@ pub(crate) fn parse_engine_list(raw: &str) -> Result<Vec<FuzzEngine>, String> {
         }
     }
     if out.is_empty() {
-        return Err("no fuzz engine specified (expected: builtin, afl++, winafl)".to_owned());
+        return Err("no fuzz engine specified (expected: builtin, afl++, winafl, libfuzzer, honggfuzz, libafl)".to_owned());
     }
     Ok(out)
 }
@@ -1602,8 +1608,10 @@ pub fn run(args: FuzzArgs) -> i32 {
             return 3;
         }
     }
-    if matches!(args.engine, FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz)
-        && multicore_requested(&args)
+    if matches!(
+        args.engine,
+        FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz | FuzzEngine::Libafl
+    ) && multicore_requested(&args)
     {
         bhfeprintln!(
             "--engine {} runs one fuzzer process; --workers and a sanitizer matrix (several \
@@ -1666,6 +1674,7 @@ pub fn run(args: FuzzArgs) -> i32 {
         FuzzEngine::Winafl => winafl::run(prepared),
         FuzzEngine::Libfuzzer => libfuzzer::run(prepared),
         FuzzEngine::Honggfuzz => honggfuzz::run(prepared),
+        FuzzEngine::Libafl => libafl::run(prepared),
     };
 
     match result {
@@ -3255,6 +3264,7 @@ fn engine_arg_name(engine: FuzzEngine) -> &'static str {
         FuzzEngine::Winafl => "winafl",
         FuzzEngine::Libfuzzer => "libfuzzer",
         FuzzEngine::Honggfuzz => "honggfuzz",
+        FuzzEngine::Libafl => "libafl",
     }
 }
 
@@ -12260,7 +12270,8 @@ pub(crate) fn find_harness_executable(
         FuzzEngine::Builtin
         | FuzzEngine::Winafl
         | FuzzEngine::Libfuzzer
-        | FuzzEngine::Honggfuzz => (
+        | FuzzEngine::Honggfuzz
+        | FuzzEngine::Libafl => (
             &["main"],
             vec![
                 build_dir.clone(),
@@ -12696,8 +12707,12 @@ mod engine_list_tests {
         );
         // The external engines parse, so `bhf auto` can say why it refuses them.
         assert_eq!(
-            parse_engine_list("libfuzzer,honggfuzz").unwrap(),
-            vec![FuzzEngine::Libfuzzer, FuzzEngine::Honggfuzz]
+            parse_engine_list("libfuzzer,honggfuzz,libafl").unwrap(),
+            vec![
+                FuzzEngine::Libfuzzer,
+                FuzzEngine::Honggfuzz,
+                FuzzEngine::Libafl
+            ]
         );
         assert!(parse_engine_list("").is_err());
         assert!(parse_engine_list("nyx").is_err());

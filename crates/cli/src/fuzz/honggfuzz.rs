@@ -149,8 +149,8 @@ fn is_crash_file(name: &str) -> bool {
 }
 
 /// Run `main_honggfuzz` on `input`, as a file argument, once: libhfuzz runs
-/// a single input outside honggfuzz.
-fn replay(
+/// a single input outside honggfuzz (as bhf's own driver does, for LibAFL).
+pub(super) fn replay(
     harness: &Path,
     work_dir: &Path,
     input: &[u8],

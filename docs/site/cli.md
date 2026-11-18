@@ -1410,7 +1410,7 @@ so a run whose crashes were all known does not read as clean.
 
 `bhf fuzz` flags (libFuzzer-parity knobs and engine controls):
 
-- `--engine <builtin|afl++|libfuzzer|honggfuzz|winafl>` — engine to run. Default `builtin`. `libfuzzer` runs the harness's `main_libfuzzer` and `honggfuzz` honggfuzz on its `main_honggfuzz` (see below). `winafl` (native Windows only; refused elsewhere) runs WinAFL on `main_winafl.exe` beside the sanitized `main.exe` and replays the crashes and hangs it saves through `main` for the report; see [WinAFL on Windows](windows.md#winafl-engine---engine-winafl). `afl++`, `libfuzzer` and `winafl` cannot be combined with `--target-transport` or `--protocol-profile`, which run the builtin engine's own loops (exit `3`). A `winafl` run stopped by Ctrl-C ends without replaying what WinAFL saved and prints where it is; the next `winafl` run of that harness in the same work dir replays it. With `winafl`, a host other than native Windows also exits `3`; a missing or unusable WinAFL or DynamoRIO, a refused `--winafl-coverage-module` or an ARM64 harness exits `1`, as a missing `afl-fuzz` does.
+- `--engine <builtin|afl++|libfuzzer|honggfuzz|libafl|winafl>` — engine to run. Default `builtin`. `libfuzzer` runs the harness's `main_libfuzzer`, `honggfuzz` honggfuzz on its `main_honggfuzz`, and `libafl` a LibAFL campaign on its `main` in a bhf built with the `libafl-engine` feature (see below). `winafl` (native Windows only; refused elsewhere) runs WinAFL on `main_winafl.exe` beside the sanitized `main.exe` and replays the crashes and hangs it saves through `main` for the report; see [WinAFL on Windows](windows.md#winafl-engine---engine-winafl). No engine but `builtin` can be combined with `--target-transport` or `--protocol-profile`, which run the builtin engine's own loops (exit `3`). A `winafl` run stopped by Ctrl-C ends without replaying what WinAFL saved and prints where it is; the next `winafl` run of that harness in the same work dir replays it. With `winafl`, a host other than native Windows also exits `3`; a missing or unusable WinAFL or DynamoRIO, a refused `--winafl-coverage-module` or an ARM64 harness exits `1`, as a missing `afl-fuzz` does.
 - `--winafl-path <DIR>` — WinAFL directory for `--engine winafl`: the one holding `afl-fuzz.exe` and `winafl.dll`, or a WinAFL checkout with `build64\bin\Release`. Default: `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on `PATH`.
 - `--dynamorio-path <DIR>` — DynamoRIO install root, or its `bin64` directory, for `--engine winafl`. Default: `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on `PATH`.
 - `--winafl-instrumentation <dynamorio|intel-pt>` — WinAFL coverage: DynamoRIO (`afl-fuzz -D`, default) or Intel Processor Trace (`afl-fuzz -P`; an Intel CPU with PT and a WinAFL built with `-DINTELPT=1`, not inside most VMs).
@@ -1482,8 +1482,8 @@ usual exit code and stderr says they were stopped; when none recorded anything,
 it exits `1`.
 
 `bhf fuzz --engine` accepts `builtin` (the default), `afl++`, `libfuzzer`,
-`honggfuzz` and (on native Windows) `winafl`; `libafl` and `nyx` are **not**
-valid `--engine` values and clap rejects them. C/C++ generated harnesses expose
+`honggfuzz`, `libafl` and (on native Windows) `winafl`; `nyx` is **not** a
+valid `--engine` value and clap rejects it. C/C++ generated harnesses expose
 `LLVMFuzzerTestOneInput`, and their default `main` binary is bhf's own framed
 fork-server driver. `--engine libfuzzer` (#294) runs the harness's libFuzzer
 build instead, `main_libfuzzer` in `build/<id>/` or the harness directory,
@@ -1502,7 +1502,16 @@ is `BHF_HONGGFUZZ_PATH`'s (its build directory) or the one on `PATH`. It takes
 the same budget, limits and dictionary, keeps its corpus in
 `honggfuzz/<harness>/corpus/`, and the crash files it saves are replayed
 through `main_honggfuzz` into findings. It does not save hangs, so a run has
-no hang findings, and it too runs one process. A binary you compiled yourself with
+no hang findings, and it too runs one process. `--engine libafl` (#296) runs
+a LibAFL campaign on the harness's `main`, in a bhf built with
+`cargo build --release -p bhf --features libafl-engine`; another bhf refuses it
+with that command. LibAFL schedules and mutates (havoc plus the harness
+dictionary's tokens), each input runs in a fresh `main` process, and the edge
+bitmap `main` writes to `BHF_COV_SHM` is its coverage map. It runs for `--time`
+(or 100 ms per `--iterations`), with `--timeout`, `--max-len` and `--rng-seed`;
+its corpus is in memory, and the inputs that crashed `main` are replayed
+through it into findings. It runs one process too, and `bhf auto` refuses it.
+A binary you compiled yourself with
 `-fsanitize=fuzzer` and placed at `build/<id>/main` is recognised by the
 libFuzzer runtime in it and run on one input file per process, so a crash it
 finds is recorded with the input that caused it. It gets no coverage guidance
@@ -1510,7 +1519,7 @@ without bhf's runtime, and `bhf fuzz` says so (once, also for a
 `--workers` campaign, whose workers' own stderr goes to their logs): wrap the
 fuzz target with
 `bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput`, build
-that harness and fuzz it instead. The standalone libFuzzer/LibAFL/Nyx adapters
+that harness and fuzz it instead. The standalone libFuzzer and Nyx adapters
 are not reachable through `bhf fuzz --engine`, and the Ada libFuzzer adapter
 remains deferred until users have a viable Ada/LLVM/libFuzzer toolchain.
 
