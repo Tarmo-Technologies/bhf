@@ -109,7 +109,7 @@ fn replay_one(
         // uninitialized read.
         let run_started = Instant::now();
         let run = crate::command_output::output_with_timeout_flagged(
-            Command::new(&bin)
+            crate::auto::sanitizer_replay::replay_command(&bin)
                 .arg(&path)
                 .env("MSAN_OPTIONS", "halt_on_error=1:exitcode=86:print_stats=0"),
             bounds.run_timeout,
@@ -196,7 +196,7 @@ fn first_target_frame(stderr: &str, hdir: &Path) -> Option<(String, u64)> {
 
 /// Whether a frame's file is bhf scaffolding, the C runtime, or a system
 /// library rather than the analysed target.
-fn is_noise_frame(file: &str, hdir: &str) -> bool {
+pub(crate) fn is_noise_frame(file: &str, hdir: &str) -> bool {
     file.starts_with(hdir)
         || file.contains("/c_runtime/")
         || file.contains("bhf_decode")

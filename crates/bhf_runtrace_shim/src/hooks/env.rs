@@ -38,6 +38,7 @@ const SUPPRESSED_VARS: &[&[u8]] = &[
     // Anything starting with AFL_ or ASAN_ is fuzz-runtime noise.
     b"AFL_",
     b"ASAN_",
+    b"HWASAN_",
     b"UBSAN_",
     b"LSAN_",
     b"MSAN_",

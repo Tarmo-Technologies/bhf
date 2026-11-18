@@ -23,6 +23,11 @@ the C/C++ `--sanitizers` matrix.
 - `--sanitizers asan,ubsan,lsan` — arm exactly this set. `asan,ubsan,lsan` are
   mutually compatible; `msan` and `tsan` are exclusive with those and each other
   (run them as separate campaigns).
+- `--sanitizers hwasan,ubsan` — on an AArch64 host, HWAddressSanitizer takes
+  ASan's place: see [HWASan on AArch64](#hwasan-on-aarch64).
+- `--sanitizers asan,ubsan,cfi` (`bhf auto`) — fuzz with ASan and UBSan, then
+  replay the corpus through a control-flow integrity build. `cfi` is never part
+  of the fuzzed build: see [The control-flow integrity replay](#the-control-flow-integrity-replay).
 - `--sanitizers none` — build each native C/C++ harness with the engine's
   coverage instrumentation but **no `-fsanitize=`** at all. You get
   coverage-guided, **crash-only** fuzzing (SIGSEGV / SIGABRT still caught) with
@@ -491,6 +496,30 @@ swapcontext(&co_uc, &main_uc);
 The calls are no-ops without ASan, so the same source still builds under
 `--sanitizers none`, on the cross path, and normally.
 
+## HWASan on AArch64
+
+On an AArch64 host, `--sanitizers hwasan` (or `hwaddress`) builds the fuzzed
+harness with `-fsanitize=hwaddress` in place of ASan. HWAddressSanitizer keeps
+a random tag in each pointer's top byte, which AArch64 ignores on every load
+and store, and the same tag for each 16 bytes of the memory it points to. An
+access through a pointer whose tag does not match its memory's is a report:
+heap and stack overflows, use after free and invalid frees, as ASan finds them,
+with far less memory (a tag per 16 bytes, no redzones or quarantine). It
+carries LeakSanitizer, as ASan does, and combines with `ubsan`.
+
+A report becomes a finding under the rule ASan gives the same bug (BHF-201 for
+a heap overflow, BHF-202 use after free, BHF-203 a stack overflow, BHF-204 an
+invalid free), its exception named `HWASAN_<KIND>`. HWASan's `ERROR:` line says
+only `tag-mismatch`, so the kind is the first specific `Cause:` its report
+gives. Its options are `HWASAN_OPTIONS`, which bhf merges as it does
+`ASAN_OPTIONS`.
+
+`hwasan` is refused beside `asan`, which finds the same bugs another way, and
+on any host other than AArch64. An x86-64 CPU does not ignore a pointer's top
+byte, so the build fails or the runtime does not start, and bhf says so before
+building. A HWASan build also needs a Linux kernel with the tagged-address
+ABI (5.4 or newer).
+
 ## The ThreadSanitizer corpus replay
 
 Unless `--sanitizers` leaves `tsan` out, `bhf auto` builds each C harness's
@@ -516,7 +545,64 @@ The run summary says what the replay could not conclude:
   per-run timeout and timeout budget as every other replay run. If it does not
   finish, the input keeps the clean result of its first run.
 
-### Bounds of the MSan and TSan replays
+## The control-flow integrity replay
+
+`bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
+control-flow integrity build (`make cfi`, `main_cfi`: clang
+`-fsanitize=cfi -flto -fvisibility=hidden`). It finds what ASan and UBSan let
+pass: a cast to the wrong class (`static_cast<Circle *>` of a `Square`), a
+virtual call through an object of another type, and a call through a function
+pointer of the wrong type. The fuzzed build keeps UBSan's `function` and
+`vptr` checks off, so without this replay type confusion is not observed. CFI
+needs whole-program LTO, a link the fuzzed build does not do, so it is a
+replay of its own build, after the fuzz passes, and `bhf fuzz` refuses
+`--sanitizers cfi`.
+
+Its checks report through the UBSan runtime, and a report becomes a finding
+under the rule its check maps to: BHF-221, type confusion (CWE-843), at the
+cast or call, with the CFI build as the fixture `bhf replay` runs. The build
+needs clang and an LTO linker (lld, or binutils with LLVM's gold plugin); a
+harness whose CFI build fails is named in the run's output, and its corpus is
+unmeasured for type confusion, not clean.
+
+## The RealtimeSanitizer replay
+
+`bhf auto --sanitizers ...,realtime` (or `rtsan`) checks the code that must
+not block: an interrupt handler, or the body of an RTOS task, that allocates,
+takes a lock, sleeps or makes a system call on its real-time path (CWE-1322).
+No other lane sees these: the call is correct C, and it only fails a deadline.
+
+The lane marks each nonblocking target's harness, so the target runs between
+`__rtsan_realtime_enter()` and `__rtsan_realtime_exit()`. `--nonblocking`
+names the targets: `entry-points` (the default) marks the functions that look
+like entry points (a name ending in `_IRQHandler`, `_Handler`, `_isr` or
+`_irq_handler`, or starting with `isr_`, and a `void` task or thread body
+taking one `void *` or `ULONG`), `all` marks every target, and any other value
+marks the target of that name. Repeat it to name several.
+
+After the fuzz passes, each marked C/C++ harness is built with
+`-fsanitize=realtime` (`make rtsan`, `main_rtsan`) and replays its corpus. A
+real-time unsafe call becomes a BHF-232 finding at the target's frame that made
+it, with the RTSan build as the fixture `bhf replay` runs. The lane needs clang
+20 or newer, which it finds as `clang-22`, `clang-21`, `clang-20` or `clang`.
+Without one, the run says so and skips the lane. A harness whose RTSan build
+fails is named in the run's output, and its corpus is unmeasured for real-time
+safety, not clean. `--nonblocking` without the `realtime` lane is an error, and
+`bhf fuzz` refuses `--sanitizers realtime`, as it does `cfi`.
+
+## Bug classes a run could not observe
+
+`run.json`'s `summary.unobservable_classes` and the run report's "Bug classes
+this run could not observe" list each class no lane of the run detects in the
+C/C++ targets it fuzzed, the languages it went unobserved in, and what would
+observe it: memory errors without ASan, undefined behavior without UBSan,
+leaks without LSan or ASan, uninitialized reads without the MSan replay (which
+has no C++ lane), data races without the TSan replay (C only), type
+confusion without the CFI replay, and real-time unsafe calls without the
+RealtimeSanitizer replay. A finding list without a class says nothing
+about it.
+
+### Bounds of the MSan, TSan, CFI and RealtimeSanitizer replays
 
 Each replayed input runs for at most `--timeout`, or 30 s, whichever is less.
 A run past it is a hang under that sanitizer: it is not run again, and the
@@ -534,4 +620,7 @@ of `auto/sanitizer-replay.jsonl`: the sanitizer, harness, input, `elapsed_ms`,
 - **Custom static-pool allocator:** keep ASan and wire `bhf_asan.h` so
   intra-pool overflows are caught.
 - **Leaks:** `--sanitizers asan,ubsan,lsan`. **Uninitialized reads / races:**
-  `--sanitizers msan` or `tsan` as separate campaigns.
+  `--sanitizers msan` or `tsan` as separate campaigns. **C++ type confusion and
+  bad indirect calls:** add `cfi` to `bhf auto --sanitizers`. **Interrupt
+  handlers and RTOS tasks that must not block:** add `realtime`, and name the
+  targets with `--nonblocking` when the default entry-point match misses them.

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copy this beside `bhf-pr.yml` to keep the corpus the PR checks start from
+# growing and lean: a weekly whole-tree fuzz (batch), then a prune of the
+# corpus it grew, then a coverage report. Each job continues the cache the
+# last one saved, which is the corpus the PR runs restore.
+name: bhf scheduled
+on:
+  schedule:
+    - cron: "23 3 * * 0" # Sundays, 03:23 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "batch | prune | coverage"
+        required: true
+        default: batch
+permissions:
+  contents: read
+jobs:
+  scheduled:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # one job's saved corpus is the next one's
+      matrix:
+        mode: [batch, prune, coverage]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Tarmo-Technologies/bhf/.github/actions/bhf-pr@main
+        with:
+          mode: ${{ matrix.mode }}
+          campaign-time: "1800"
+          per-target-time: "120"
+          pr-gate: never # a scheduled run reports; the PR check gates
+          comment: "false"
+          # As in bhf-pr.example.yml: drop this line in your repository.
+          build-from-source: "true"
+  dispatched:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Tarmo-Technologies/bhf/.github/actions/bhf-pr@main
+        with:
+          mode: ${{ inputs.mode }}
+          campaign-time: "1800"
+          per-target-time: "120"
+          pr-gate: never
+          comment: "false"
+          build-from-source: "true"

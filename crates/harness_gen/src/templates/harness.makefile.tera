@@ -202,6 +202,19 @@ MSAN_CFLAGS ?= -O1 -g -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-o
 # no observed read is dead-store-eliminated), hiding real races.
 TSAN_CC ?= clang
 TSAN_CFLAGS ?= -O0 -g -fsanitize=thread -fsanitize-coverage=trace-pc-guard,trace-cmp
+# Control-flow integrity build (#297): `auto --sanitizers cfi` replays the corpus
+# through it to find calls through a function pointer of the wrong type (and, in
+# C++, casts to the wrong class), which ASan/UBSan miss. CFI needs whole-program
+# LTO and hidden visibility, so it is a separate binary. Its checks report
+# through the UBSan runtime instead of trapping, so a report names the site.
+CFI_CC ?= clang
+CFI_CFLAGS ?= -O1 -g -flto -fvisibility=hidden -fsanitize=cfi -fno-sanitize-trap=cfi -fno-sanitize-recover=cfi -fsanitize-coverage=trace-pc-guard,trace-cmp
+# RealtimeSanitizer build (#298): `auto --sanitizers realtime` replays the corpus
+# through it to find allocations, locks and blocking calls in a target marked
+# nonblocking (an ISR or an RTOS task entry point). It needs clang 20 or newer,
+# which `auto` passes as RTSAN_CC.
+RTSAN_CC ?= clang
+RTSAN_CFLAGS ?= -O1 -g -fsanitize=realtime -DBHF_RTSAN -fsanitize-coverage=trace-pc-guard,trace-cmp
 # Source-based coverage build: `auto` replays the fuzz corpus through it and reads
 # per-line hit counts via llvm-cov to learn which lines the campaign EXECUTED — the
 # positive evidence for negative fuzz-confirmation (a covered-but-survived static
@@ -249,12 +262,12 @@ BHF_TOOLCHAIN_ID = $(CC) $(BHF_CC_FAMILY) | $(strip $(BHF_CFLAGS) $(CFLAGS)) | $
 # differential binaries depend on it, and it holds what their link recipes
 # read, so a lane relinks when its compiler, its flags, the dialect, a
 # compatibility flag or a toolchain define changes.
-BHF_LANE_TOOLCHAIN_ID = $(MSAN_CC) $(TSAN_CC) $(COV_CC) $(DIFF_CC) | $(BHF_DRIVER_CFLAGS) | $(MSAN_CFLAGS) | $(TSAN_CFLAGS) | $(COV_CFLAGS) | $(DIFF_CFLAGS) | $(C_COMPAT_FLAGS) $(C_STD) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_LIBS)
+BHF_LANE_TOOLCHAIN_ID = $(MSAN_CC) $(TSAN_CC) $(CFI_CC) $(RTSAN_CC) $(COV_CC) $(DIFF_CC) | $(BHF_DRIVER_CFLAGS) | $(MSAN_CFLAGS) | $(TSAN_CFLAGS) | $(CFI_CFLAGS) | $(RTSAN_CFLAGS) | $(COV_CFLAGS) | $(DIFF_CFLAGS) | $(C_COMPAT_FLAGS) $(C_STD) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_LIBS)
 # Driver stamp: every driver object depends on it instead, and it holds only
 # what their recipes use. A dialect ladder rung (C_STD), a repair round (CFLAGS)
 # or a compatibility flag relinks the harness without recompiling the driver; a
 # new compiler, target, define, include dir or driver flag still rebuilds it.
-BHF_DRIVER_ID = $(CC) $(BHF_CC_FAMILY) $(MSAN_CC) $(TSAN_CC) $(COV_CC) $(DIFF_CC) | $(BHF_DRIVER_SOURCE) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_DRIVER_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(FEATURE_TEST_FLAGS)
+BHF_DRIVER_ID = $(CC) $(BHF_CC_FAMILY) $(MSAN_CC) $(TSAN_CC) $(CFI_CC) $(RTSAN_CC) $(COV_CC) $(DIFF_CC) | $(BHF_DRIVER_SOURCE) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_DRIVER_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(FEATURE_TEST_FLAGS)
 # A lane links bhf_driver.o when its own driver compile would be the very
 # same command (one compiler for every lane and no toolchain target, flags or
 # defines, the usual case), and a driver object from its own compiler
@@ -264,6 +277,8 @@ bhf_same_words = $(if $(subst x$(strip $(1)),,x$(strip $(2)))$(subst x$(strip $(
 bhf_lane_driver = $(if $(call bhf_same_words,$(2) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS),$(BHF_DRIVER_COMPILE)),bhf_driver.o,$(1))
 BHF_MSAN_DRIVER = $(call bhf_lane_driver,bhf_driver_msan.o,$(MSAN_CC))
 BHF_TSAN_DRIVER = $(call bhf_lane_driver,bhf_driver_tsan.o,$(TSAN_CC))
+BHF_CFI_DRIVER = $(call bhf_lane_driver,bhf_driver_cfi.o,$(CFI_CC))
+BHF_RTSAN_DRIVER = $(call bhf_lane_driver,bhf_driver_rtsan.o,$(RTSAN_CC))
 BHF_COV_DRIVER = $(call bhf_lane_driver,bhf_driver_cov.o,$(COV_CC))
 BHF_DIFF_DRIVER = $(call bhf_lane_driver,bhf_driver_diff.o,$(DIFF_CC))
 -include build_context_objects.mk
@@ -272,6 +287,8 @@ CONTEXT_MAIN_OBJECTS ?=
 CONTEXT_AFL_OBJECTS ?=
 CONTEXT_MSAN_OBJECTS ?=
 CONTEXT_TSAN_OBJECTS ?=
+CONTEXT_CFI_OBJECTS ?=
+CONTEXT_RTSAN_OBJECTS ?=
 CONTEXT_COV_OBJECTS ?=
 CONTEXT_DIFF_OBJECTS ?=
 CONTEXT_PROV_OBJECTS ?=
@@ -280,6 +297,8 @@ REPAIR_CONTEXT_MAIN_OBJECTS ?=
 REPAIR_CONTEXT_AFL_OBJECTS ?=
 REPAIR_CONTEXT_MSAN_OBJECTS ?=
 REPAIR_CONTEXT_TSAN_OBJECTS ?=
+REPAIR_CONTEXT_CFI_OBJECTS ?=
+REPAIR_CONTEXT_RTSAN_OBJECTS ?=
 REPAIR_CONTEXT_COV_OBJECTS ?=
 REPAIR_CONTEXT_DIFF_OBJECTS ?=
 REPAIR_CONTEXT_PROV_OBJECTS ?=
@@ -289,10 +308,10 @@ ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl afl_cmplog winafl libfuzzer honggfuzz msan tsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
+.PHONY: all afl afl_cmplog winafl libfuzzer honggfuzz msan tsan cfi rtsan cov prov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
 all: main$(EXEEXT)
 # The bare goal names, for the binaries named with $(EXEEXT).
-BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_honggfuzz main_msan main_tsan main_cov main_diff main_prov
+BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_honggfuzz main_msan main_tsan main_cfi main_rtsan main_cov main_diff main_prov
 ifneq ($(EXEEXT),)
 .PHONY: $(BHF_BINARIES)
 $(BHF_BINARIES): %: %$(EXEEXT)
@@ -327,6 +346,12 @@ bhf_driver_msan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf
 
 bhf_driver_tsan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
 	$(TSAN_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
+
+bhf_driver_cfi.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
+	$(CFI_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
+
+bhf_driver_rtsan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
+	$(RTSAN_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
 	$(COV_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
@@ -410,6 +435,16 @@ tsan: main_tsan$(EXEEXT)
 main_tsan$(EXEEXT): main.c $(BHF_TSAN_DRIVER) bhf_lanes.stamp $(CONTEXT_TSAN_OBJECTS) $(REPAIR_CONTEXT_TSAN_OBJECTS)
 	$(TSAN_CC) $(TSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(TSAN_CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_TSAN_OBJECTS) $(REPAIR_CONTEXT_TSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BHF_TSAN_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(TSAN_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
+cfi: main_cfi$(EXEEXT)
+
+main_cfi$(EXEEXT): main.c $(BHF_CFI_DRIVER) bhf_lanes.stamp $(CONTEXT_CFI_OBJECTS) $(REPAIR_CONTEXT_CFI_OBJECTS)
+	$(CFI_CC) $(CFI_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CFI_CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_CFI_OBJECTS) $(REPAIR_CONTEXT_CFI_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BHF_CFI_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(CFI_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+
+rtsan: main_rtsan$(EXEEXT)
+
+main_rtsan$(EXEEXT): main.c $(BHF_RTSAN_DRIVER) bhf_lanes.stamp $(CONTEXT_RTSAN_OBJECTS) $(REPAIR_CONTEXT_RTSAN_OBJECTS)
+	$(RTSAN_CC) $(RTSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_C_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(RTSAN_CFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_RTSAN_OBJECTS) $(REPAIR_CONTEXT_RTSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BHF_RTSAN_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(RTSAN_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
+
 cov: main_cov$(EXEEXT)
 
 main_cov$(EXEEXT): main.c $(BHF_COV_DRIVER) bhf_lanes.stamp $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
@@ -437,5 +472,5 @@ main_prov$(EXEEXT): main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_PROV_OBJEC
 BHF_WINAFL_RUN_MARKERS = $(wildcard main_winafl-*.bhf-run)
 
 clean:
-	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_afl_cmplog$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_afl_cmplog main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_afl_cmplog$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_msan$(EXEEXT) main_tsan$(EXEEXT) main_cfi$(EXEEXT) main_rtsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main_prov$(EXEEXT) main main_afl main_afl_cmplog main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_msan main_tsan main_cfi main_rtsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cfi.o bhf_driver_rtsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
 	rm -rf context_objs repair_context_objs

@@ -212,6 +212,8 @@ pub struct AttemptOptions {
     /// cross-compiled (qemu-user / wine) paths, where host sanitizer
     /// instrumentation doesn't apply.
     pub sanitizers: multicore_fuzz::SanitizerSelection,
+    /// #297: the sanitizers run only as corpus replays (`--sanitizers cfi`).
+    pub replay_lanes: Vec<crate::auto::sanitizer_replay::ReplayLane>,
     /// Directory-name filter (`auto --exclude-dir`/`--include-dir`) — the SAME
     /// filter discovery uses to drop non-library dirs (tests/testsuite/examples/
     /// benchmarks/fuzz). Threaded into the Ada src-instrumentation walk so the
@@ -291,6 +293,7 @@ impl Default for AttemptOptions {
             max_repair_rounds: DEFAULT_MAX_REPAIR_ROUNDS,
             comparison_progress: false,
             sanitizers: multicore_fuzz::SanitizerSelection::Default,
+            replay_lanes: Vec::new(),
             dir_filter: crate::auto::discovery::DirFilter::default(),
             engines: vec![FuzzEngine::Builtin],
             ada_main_sources: HashMap::new(),
@@ -1480,12 +1483,19 @@ pub(crate) fn applicable_engines(
 ) -> Vec<FuzzEngine> {
     use crate::auto::candidate::Lang;
     let is_c_family = matches!(lang, Lang::C | Lang::Cpp);
+    // The COBOL and Fortran lanes build C glue on the same Makefile, so
+    // afl-clang-fast builds them too (#302); WinAFL takes C/C++ only.
+    // The Rust lane's staticlib links with afl-clang-fast too (#303), and an
+    // Ada harness with AFL++'s runtime (#304).
+    let builds_afl =
+        is_c_family || matches!(lang, Lang::Cobol | Lang::Fortran | Lang::Rust | Lang::Ada);
     let mut out: Vec<FuzzEngine> = requested
         .iter()
         .copied()
         .filter(|engine| match engine {
             FuzzEngine::Builtin => true,
-            FuzzEngine::AflPlusPlus | FuzzEngine::Winafl => is_c_family,
+            FuzzEngine::AflPlusPlus => builds_afl,
+            FuzzEngine::Winafl => is_c_family,
             // `bhf auto` refuses them before any target runs.
             FuzzEngine::Libfuzzer | FuzzEngine::Honggfuzz | FuzzEngine::Libafl => false,
         })
@@ -4008,24 +4018,46 @@ fn run_attempt(
                 // target or discards the builtin results.
                 if run_afl {
                     progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "afl++" }));
-                    let afl_build = crate::build::try_run_c_make_afl_build_with_extras(
-                        work_dir,
-                        &candidate.harness_id,
-                        &extra_sources,
-                        &extra_includes,
-                    );
-                    let afl_built = afl_build.status.success();
-                    let afl_lane = if afl_built {
-                        crate::auto::lanes::LaneStatus::built()
+                    // A Rust harness has no Makefile: its `build-afl.sh` links
+                    // the staticlib with afl-clang-fast, CmpLog build included.
+                    let rust = matches!(candidate.lang, crate::auto::candidate::Lang::Rust);
+                    // An Ada harness's objects link again with AFL++'s
+                    // runtime (#304). GNAT's build traces edges, not
+                    // compares, so there is no CmpLog build: AFL++ runs
+                    // without `-c`.
+                    let ada = matches!(candidate.lang, crate::auto::candidate::Lang::Ada);
+                    let afl_build: Result<(), String> = if ada {
+                        crate::build::try_ada_afl_build(&ada_build_args(
+                            work_dir,
+                            &candidate.harness_id,
+                            None,
+                            &options.ada_toolchain,
+                        ))
                     } else {
-                        crate::auto::lanes::LaneStatus::failed(
-                            "main_afl",
-                            &format!(
+                        let output = if rust {
+                            crate::auto::rust_build::build_rust_afl(&harness_dir)
+                        } else {
+                            crate::build::try_run_c_make_afl_build_with_extras(
+                                work_dir,
+                                &candidate.harness_id,
+                                &extra_sources,
+                                &extra_includes,
+                            )
+                        };
+                        if output.status.success() {
+                            Ok(())
+                        } else {
+                            Err(format!(
                                 "{}\n{}",
-                                String::from_utf8_lossy(&afl_build.stderr),
-                                String::from_utf8_lossy(&afl_build.stdout)
-                            ),
-                        )
+                                String::from_utf8_lossy(&output.stderr),
+                                String::from_utf8_lossy(&output.stdout)
+                            ))
+                        }
+                    };
+                    let afl_built = afl_build.is_ok();
+                    let afl_lane = match &afl_build {
+                        Ok(()) => crate::auto::lanes::LaneStatus::built(),
+                        Err(reason) => crate::auto::lanes::LaneStatus::failed("main_afl", reason),
                     };
                     if !afl_built {
                         bhfeprintln!(
@@ -4041,13 +4073,18 @@ fn run_attempt(
                     if afl_built {
                         // The CmpLog build afl-fuzz runs with `-c` (#274); without
                         // it AFL++ still runs, without its input-to-state stage.
-                        let cmplog = crate::build::try_run_c_make_afl_cmplog_build_with_extras(
-                            work_dir,
-                            &candidate.harness_id,
-                            &extra_sources,
-                            &extra_includes,
-                        );
-                        if !cmplog.status.success() {
+                        // A Rust harness's build made it already.
+                        let cmplog_built = rust
+                            || ada
+                            || crate::build::try_run_c_make_afl_cmplog_build_with_extras(
+                                work_dir,
+                                &candidate.harness_id,
+                                &extra_sources,
+                                &extra_includes,
+                            )
+                            .status
+                            .success();
+                        if !cmplog_built {
                             let _ = std::fs::remove_file(crate::auto::layout::harness_exe(
                                 &harness_dir,
                                 crate::build::AFL_CMPLOG_BINARY,
@@ -8054,6 +8091,7 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
         multicore_fuzz::Sanitizer::Ubsan => "undefined",
         multicore_fuzz::Sanitizer::Tsan => "thread",
         multicore_fuzz::Sanitizer::Lsan => "leak",
+        multicore_fuzz::Sanitizer::Hwasan => "hwaddress",
     }
 }
 
@@ -11896,11 +11934,29 @@ mod engine_selection_tests {
             applicable_engines(Lang::Cpp, &[AflPlusPlus]),
             vec![AflPlusPlus]
         );
-        // afl-only on a non-C/C++ target -> fall back to builtin (never empty)
-        assert_eq!(applicable_engines(Lang::Ada, &[AflPlusPlus]), vec![Builtin]);
+        // The COBOL and Fortran lanes' C glue builds with afl-clang-fast
+        // (#302); WinAFL stays C/C++.
+        assert_eq!(
+            applicable_engines(Lang::Cobol, &[Builtin, AflPlusPlus]),
+            vec![Builtin, AflPlusPlus]
+        );
+        assert_eq!(
+            applicable_engines(Lang::Fortran, &[AflPlusPlus]),
+            vec![AflPlusPlus]
+        );
+        assert_eq!(applicable_engines(Lang::Cobol, &[Winafl]), vec![Builtin]);
+        // An Ada harness links with AFL++'s runtime (#304).
+        assert_eq!(
+            applicable_engines(Lang::Ada, &[Builtin, AflPlusPlus]),
+            vec![Builtin, AflPlusPlus]
+        );
+        // afl-only on a lane without an AFL++ build -> fall back to builtin
+        // (never empty)
+        assert_eq!(applicable_engines(Lang::Go, &[AflPlusPlus]), vec![Builtin]);
+        // The Rust lane links its staticlib with afl-clang-fast (#303).
         assert_eq!(
             applicable_engines(Lang::Rust, &[AflPlusPlus]),
-            vec![Builtin]
+            vec![AflPlusPlus]
         );
         assert_eq!(
             applicable_engines(Lang::Java, &[AflPlusPlus]),

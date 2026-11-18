@@ -1003,7 +1003,9 @@ fn build_context(args: &GenerateDirectArgs<'_>) -> Result<TemplateContext, Harne
             ada_type_name: aliased_local_type(param, ada_type_name(&resolved_param.type_ref)),
             decoder_expr: decoder.call_expr,
             setup_lines: decoder.setup_lines,
-            needs_initializer: true,
+            // The target writes an `out` record; a definite one is declared
+            // as it is, with no value to build (#418).
+            needs_initializer: !is_out_record(&resolved_param),
             pre_call_lines,
             post_call_lines: Vec::new(),
             once_decl: None,
@@ -1900,6 +1902,12 @@ fn qualify_bare_by_target_package(
     let mut qualified: Vec<String> = full.split('.').map(str::to_owned).collect();
     qualified.extend(path);
     qualified
+}
+
+/// Whether `param` is an `out` parameter of a record type without
+/// discriminants, which a harness can declare with no initializer.
+fn is_out_record(param: &Parameter) -> bool {
+    param.mode == ParamMode::Out && matches!(param.type_ref.kind, TypeKind::Record(_))
 }
 
 fn resolve_param_type(ast: &StructuralAst, param: &Parameter) -> Parameter {

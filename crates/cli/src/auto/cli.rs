@@ -119,7 +119,7 @@ pub struct AutoArgs {
     /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, cxx-expected-exception, seed-file, seed-dir, sanitizers,
-    /// engine, languages, project, ada-deps, passes, force, rust-private, build-command,
+    /// nonblocking, engine, languages, project, ada-deps, passes, force, rust-private, build-command,
     /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
     /// msbuild-evaluate, winafl-path, dynamorio-path (`seed-mining = false` is
     /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
@@ -460,11 +460,11 @@ pub struct AutoArgs {
 
     /// Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin`
     /// (default) is the in-process coverage-guided engine. `afl++` drives AFL++
-    /// on the auto-recovered build (C/C++ targets only; needs `afl-fuzz` +
-    /// `afl-clang-fast` on PATH, else it falls back to builtin with a warning).
-    /// `--engine builtin,afl++` runs BOTH per target, splitting `--per-target-time`
-    /// evenly across them. For a non-C/C++ target an `afl++` selection falls back
-    /// to builtin (logged, never silently skipped). `winafl` drives WinAFL on
+    /// on the auto-recovered build (C/C++, COBOL, Fortran, Rust and Ada targets; needs
+    /// `afl-fuzz` + `afl-clang-fast` on PATH, else it falls back to builtin with
+    /// a warning). `--engine builtin,afl++` runs BOTH per target, splitting
+    /// `--per-target-time` evenly across them. For a target of another lane an
+    /// `afl++` selection falls back to builtin. `winafl` drives WinAFL on
     /// native Windows (C/C++ targets; needs WinAFL and DynamoRIO, see
     /// `--winafl-path` / `--dynamorio-path`; refused on other hosts): it fuzzes
     /// a build without sanitizers and replays each saved crash and hang through
@@ -726,7 +726,11 @@ pub struct AutoArgs {
     /// same arming `bhf fuzz --sanitizers` does, now for the auto pipeline.
     /// Default (empty) leaves the build and run env unchanged. Compatible set is
     /// `asan,ubsan,lsan`; `msan`/`tsan` are mutually exclusive with those and each
-    /// other. The special value `none` (standalone — not combinable with a
+    /// other. On an AArch64 host, `hwasan` (HWAddressSanitizer) takes ASan's
+    /// place: it finds the same memory errors with pointer tags, and is refused
+    /// beside `asan` and on any other host. `cfi` is never armed in the fuzzed build: it adds a control-flow
+    /// integrity replay of each C/C++ harness's corpus (`make cfi`) after the
+    /// fuzz passes. The special value `none` (standalone — not combinable with a
     /// sanitizer) builds each native C/C++ harness with coverage but NO
     /// `-fsanitize=`, i.e. crash-only fuzzing with zero ASan/UBSan false positives
     /// — the escape hatch for shared-memory / custom-allocator / RTOS code that
@@ -747,6 +751,16 @@ pub struct AutoArgs {
     /// and `LSAN_OPTIONS=suppressions=$PWD/lsan.supp` (#435).
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
+
+    /// The targets that must not block, for the RealtimeSanitizer replay
+    /// (`--sanitizers realtime`, #298): `entry-points` (the default: interrupt
+    /// handlers such as `USART1_IRQHandler` and RTOS task bodies, a function
+    /// with no result taking a `void *` with `task` or `thread` in its name),
+    /// `all`, or a target's name. Each runs in a real-time context under the
+    /// `rtsan` build, so an allocation, a lock or a blocking call it makes is a
+    /// finding. Repeatable.
+    #[arg(long = "nonblocking", value_name = "TARGET")]
+    pub nonblocking: Vec<String>,
 
     /// Emit an evidence-graded SBOM + VEX bundle at campaign end, into
     /// `<work-dir>/sbom/`. The bundle is generated where `FuzzReached` evidence is
@@ -1342,8 +1356,27 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
         return Ok(2);
     }
-    if let Err(error) = crate::fuzz::parse_sanitizer_args(&args.sanitizers) {
+    // `cfi` runs only as a corpus replay (#297); the rest is the fuzzed
+    // build's matrix.
+    let (build_sanitizers, replay_lanes) =
+        crate::auto::sanitizer_replay::split_replay_lanes(&args.sanitizers);
+    if let Err(error) = crate::fuzz::parse_sanitizer_args(&build_sanitizers) {
         bhfeprintln!("error: {error}");
+        return Ok(2);
+    }
+    // #298: the targets the RealtimeSanitizer replay runs in a real-time
+    // context, marked as their harnesses are generated.
+    if replay_lanes.contains(&crate::auto::sanitizer_replay::ReplayLane::Realtime) {
+        crate::generate_harness::set_nonblocking_targets(if args.nonblocking.is_empty() {
+            vec!["entry-points".to_owned()]
+        } else {
+            args.nonblocking.clone()
+        });
+    } else if !args.nonblocking.is_empty() {
+        bhfeprintln!(
+            "error: --nonblocking marks targets for the RealtimeSanitizer replay; add \
+             `--sanitizers realtime`"
+        );
         return Ok(2);
     }
     if engines.contains(&crate::fuzz::FuzzEngine::Winafl) {
@@ -1568,12 +1601,12 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // carry the exact same sanitizer/coverage contract as the harnesses that
     // will link them; parsing this only after the probe produced stale/default
     // artifacts for `--sanitizers none|msan|tsan|...`.
-    let sanitizers = crate::fuzz::parse_sanitizer_args(&args.sanitizers)
+    let sanitizers = crate::fuzz::parse_sanitizer_args(&build_sanitizers)
         .map_err(|error| anyhow::anyhow!(error))?;
     match &sanitizers {
         multicore_fuzz::SanitizerSelection::Set(_) => bhfeprintln!(
             "bhf auto: arming sanitizer matrix [{}] on each C/C++ harness build + run",
-            args.sanitizers.join(", ")
+            build_sanitizers.join(", ")
         ),
         multicore_fuzz::SanitizerSelection::None => bhfeprintln!(
             "bhf auto: --sanitizers none — building each C/C++ harness with coverage but \
@@ -2396,6 +2429,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         max_repair_rounds: args.max_repair_rounds,
         comparison_progress: args.comparison_progress,
         sanitizers,
+        replay_lanes: replay_lanes.clone(),
         dir_filter: dir_filter.clone(),
         engines,
         // Ada project-Main units (declared `for Main use (...)` in a .gpr under the
@@ -3273,6 +3307,65 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         );
     }
 
+    // RealtimeSanitizer corpus replay (C/C++, #298): only when asked for; it
+    // needs clang 20 or newer.
+    if options
+        .replay_lanes
+        .contains(&crate::auto::sanitizer_replay::ReplayLane::Realtime)
+    {
+        match crate::auto::rtsan::rtsan_compilers() {
+            Err(found) => bhfeprintln!(
+                "bhf auto: RealtimeSanitizer — skipped: it needs clang 20 or newer, and {found}"
+            ),
+            Ok(compilers) => {
+                let rtsan = crate::auto::rtsan::run_rtsan_replay(&work, &replay_bounds, &compilers);
+                bhfeprintln!(
+                    "bhf auto: RealtimeSanitizer — {} real-time unsafe call(s) found by corpus \
+                     replay of {} nonblocking target(s)",
+                    rtsan.findings,
+                    rtsan.nonblocking
+                );
+                if rtsan.nonblocking == 0 {
+                    bhfeprintln!(
+                        "bhf auto: RealtimeSanitizer — no target was marked nonblocking; name \
+                         them with --nonblocking (the default marks interrupt handlers and \
+                         RTOS task bodies)"
+                    );
+                }
+                if !rtsan.unbuilt.is_empty() {
+                    bhfeprintln!(
+                        "bhf auto: RealtimeSanitizer — {} harness(es) did not build with \
+                         -fsanitize=realtime: {}; their corpus is UNMEASURED",
+                        rtsan.unbuilt.len(),
+                        rtsan.unbuilt.join(", ")
+                    );
+                }
+            }
+        }
+    }
+
+    // Control-flow integrity corpus replay (C/C++, #297): only when asked for,
+    // since its build is a whole-program LTO link.
+    if options
+        .replay_lanes
+        .contains(&crate::auto::sanitizer_replay::ReplayLane::Cfi)
+    {
+        let cfi = crate::auto::cfi::run_cfi_replay(&work, &replay_bounds);
+        bhfeprintln!(
+            "bhf auto: control-flow integrity — {} violation(s) found by corpus replay",
+            cfi.findings
+        );
+        if !cfi.unbuilt.is_empty() {
+            bhfeprintln!(
+                "bhf auto: control-flow integrity — {} harness(es) did not build with \
+                 -fsanitize=cfi (it needs clang and an LTO link): {}; their corpus is \
+                 UNMEASURED for type confusion",
+                cfi.unbuilt.len(),
+                cfi.unbuilt.join(", ")
+            );
+        }
+    }
+
     // JVM sink-reachability oracle: the coverage agent records input-reachable
     // dangerous sinks (deserialization / exec / eval / SQL / LDAP) into each Java
     // harness's sink_report.txt; turn each reached sink into a behavioral finding.
@@ -3479,6 +3572,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         stopped_by_operator,
         output_budget.exhausted(),
         &options.sanitizers,
+        &options.replay_lanes,
     )?;
     crate::auto::discovery::bhfprof("auto:write_reports", _twr);
 

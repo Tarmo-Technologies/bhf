@@ -58,10 +58,20 @@ fuzz-confirmed finding.
    links `results/INDEX.md` for the full findings index.
 6. **Enforces the gate** — see below.
 
+With `corpus-cache` on (the default), the action restores the newest cache of
+the PR's branch, else of its base branch, into the work dir before the run: the
+corpus each harness grew (`corpus/`), the discovery cache, and the findings
+the last run stored, which `bhf ci` replays first as
+[regressions](#regression-replay). The log and the job summary say how many
+inputs and findings were restored. It saves them after the run, whatever the
+verdict, under a key of its own (a cache key cannot be overwritten), so each
+run continues the last one.
+
 ## Inputs
 
 | Input | Default | Meaning |
 |---|---|---|
+| `mode` | `pr` | `pr` \| `batch` \| `prune` \| `coverage` — see [Modes](#modes). |
 | `path` | `.` | Source root to scan. |
 | `base-ref` | *(auto)* | Git ref to diff against. Default: PR base / default branch. |
 | `languages` | *(all)* | Comma list to restrict any of the sixteen lanes (`ada,c,cpp,rust,java,python,perl,go,cobol,fortran,csharp,javascript,typescript,ruby,lua,php`). |
@@ -72,6 +82,22 @@ fuzz-confirmed finding.
 | `upload-sarif` | `true` | Upload SARIF to the code-scanning tab. |
 | `version` | `latest` | bhf release tag to install. |
 | `build-from-source` | `false` | Install from source (`cargo install --git`) instead. |
+| `corpus-cache` | `true` | Restore the work dir's corpus, discovery cache and stored findings from the Actions cache before the run, and save them after it. |
+| `corpus-dir` | `$RUNNER_TEMP/bhf_work` | The work dir bhf runs in and the cache keeps. |
+
+## Modes
+
+| Mode | What it runs |
+|---|---|
+| `pr` (default) | `bhf ci --changed-since <base>`: the changed code's targets, with the gate. |
+| `batch` | `bhf ci` over the whole tree, with the gate: every target's corpus grows. |
+| `prune` | A one-second `bhf auto` builds the harnesses again, then `bhf corpus minimize` keeps the inputs of each corpus that add coverage. The log and the job summary give the counts before and after. |
+| `coverage` | `bhf auto` for `per-target-time`, which replays each corpus through a source-coverage build: the run's line coverage in the job summary, and `results/coverage/` uploaded as an artifact. |
+
+`batch`, `prune` and `coverage` belong on a schedule. They share the corpus
+cache with the PR runs, so the corpus a PR check restores is the one the
+scheduled runs grew and pruned. `.github/workflows/bhf-scheduled.example.yml`
+runs the three in turn each week, and any one by hand.
 
 ## Gate policy
 
@@ -86,6 +112,23 @@ fuzz-confirmed finding.
 The default is deliberately quiet: a static-only or lab-only signal annotates the
 PR but does not block it, so the gate flags introduced defects rather than
 pre-existing noise.
+
+## Regression replay
+
+Before a run is judged, `bhf ci` replays the findings an earlier run stored
+against this run's build of their harness: a finding that still reproduces
+fails the gate (unless `pr-gate` is `never`), and one that no longer does is
+reported fixed and passes. They are a work dir's `regressions/` directory and
+each `--regressions <DIR>` (a directory of finding directories, as
+`results/findings/` holds them).
+
+A work dir restored from a CI cache still holds its last run's findings in
+`results/findings/`. They move to `regressions/` before the run, one per root
+cause, so they are checked as regressions instead of being counted again as
+this run's findings. Their minimized inputs (`min_testcase.bin`, else
+`testcase.bin`) also seed the run, so the engines run them first. The summary
+gives the counts, and `--ci-json` has `regressions` with the ids that
+`reproduced`, were `fixed`, or could not be replayed (`unverified`).
 
 ## Requirements
 
@@ -126,9 +169,43 @@ bhf ci . \
   finding with no crash frame (a format-string, memory-limit or deadline
   oracle) points at the fuzzed function's line, or at the source root when
   that is unknown. `--ci-json <path>` writes a compact machine-readable result (counts by
-  severity/verdict, confirmed count, scoped file count) for your own
-  reporting.
+  severity/verdict, confirmed count, scoped file count, and the
+  [regression replay](#regression-replay)'s ids) for your own reporting.
+- `--regressions <DIR>` replays the stored findings in `<DIR>` as well as the
+  work dir's own (repeatable).
+- `--gitlab-sast <path>` writes a [GitLab SAST report](#gitlab-ci) of the
+  run's findings.
 - Exit code is `0` unless the gate fails.
+
+## GitLab CI
+
+`ci/gitlab/bhf.gitlab-ci.yml` is a GitLab CI template with the action's
+behavior. Include it and name a bhf image (built from bhf's Dockerfile and
+pushed to your registry):
+
+```yaml
+include:
+  - remote: "https://raw.githubusercontent.com/Tarmo-Technologies/bhf/main/ci/gitlab/bhf.gitlab-ci.yml"
+variables:
+  BHF_IMAGE: registry.example.com/tools/bhf:latest
+```
+
+In a merge request pipeline its `bhf` job runs `bhf ci --changed-since` the
+target branch, gated by `BHF_PR_GATE`. It writes `gl-sast-report.json`, which
+`artifacts:reports:sast` hands to the merge request's security widget. The
+job caches the corpus, the discovery cache and the stored findings, keyed by
+branch with the default branch as the fallback, so each pipeline continues the
+corpus and replays the findings as [regressions](#regression-replay). A
+scheduled pipeline sweeps the whole tree (`BHF_MODE=batch`) without gating.
+`BHF_PATH`, `BHF_LANGUAGES`, `BHF_CAMPAIGN_TIME` and `BHF_PER_TARGET_TIME`
+are the action's inputs.
+
+The report is GitLab's SAST format 15.2.1. Each finding with a source location
+is one vulnerability: its bhf rule is the primary identifier and its CWEs
+follow, its location is the finding's file and line, its severity is the
+finding's, and its id is the finding's fingerprint, stable across pipelines.
+`bhf ci --gitlab-sast <PATH>` writes it for a run, and `bhf report
+--gitlab-sast` writes it to `results/gl-sast-report.json` from a work dir.
 
 ## LLM and agent use in CI
 

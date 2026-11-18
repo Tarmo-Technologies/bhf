@@ -2986,6 +2986,13 @@ mod tests {
     struct LoggingTarget {
         worker: usize,
         log: RunLog,
+        /// The workers that have run a mutated input: each one's first waits
+        /// a bounded time for the others, so a loaded host's scheduler cannot
+        /// let two workers spend the whole cap before the third starts. (A
+        /// seed's run does not wait: a worker with no seed of its own waits
+        /// for the seeds in flight.)
+        started: Arc<(Mutex<std::collections::BTreeSet<usize>>, std::sync::Condvar)>,
+        workers: usize,
     }
 
     impl TargetTransport for LoggingTarget {
@@ -2996,6 +3003,19 @@ mod tests {
 
     impl TargetSession for LoggingTarget {
         fn run_input(&mut self, input: &[u8]) -> target_transport::Result<RunOutcome> {
+            let (started, all) = &*self.started;
+            let mut seen = started.lock().unwrap();
+            let seed = input == b"a" || input == b"b";
+            if !seed && seen.insert(self.worker) {
+                all.notify_all();
+                let _ = all
+                    .wait_timeout_while(seen, std::time::Duration::from_secs(10), |seen| {
+                        seen.len() < self.workers
+                    })
+                    .unwrap();
+            } else {
+                drop(seen);
+            }
             self.log.lock().unwrap().push((self.worker, input.to_vec()));
             let faulted = input.contains(&b'!');
             Ok(RunOutcome {
@@ -3031,10 +3051,16 @@ mod tests {
             .collect();
         cfg.dictionary = vec![b"!".to_vec()];
         let log = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new((
+            Mutex::new(std::collections::BTreeSet::new()),
+            std::sync::Condvar::new(),
+        ));
         let make = |worker: usize| -> Result<Box<dyn TargetTransport>, TransportFuzzError> {
             Ok(Box::new(LoggingTarget {
                 worker,
                 log: Arc::clone(&log),
+                started: Arc::clone(&started),
+                workers: 3,
             }))
         };
         let summary = run_transport_campaign_workers(&make, 3, &cfg).unwrap();

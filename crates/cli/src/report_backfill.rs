@@ -124,7 +124,7 @@ fn is_sanitizer_crash(raw: &Value) -> bool {
         .pointer("/exception/name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let sanitizer_name = ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
+    let sanitizer_name = corpus::sanitizer::EXCEPTION_NAME_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
         || name == "FATAL_SIGNAL";

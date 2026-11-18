@@ -23,6 +23,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": ".github/workflows/bhf-scheduled.example.yml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".github/workflows/ci.yml",
       "license": "Apache-2.0"
     },
@@ -468,6 +472,10 @@
     },
     {
       "path": "c_runtime/zephyr/zephyr/module.yml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "ci/gitlab/bhf.gitlab-ci.yml",
       "license": "Apache-2.0"
     },
     {
@@ -1407,6 +1415,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/cfi.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/cli.rs",
       "license": "Apache-2.0"
     },
@@ -1623,6 +1635,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/rtsan.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/ruby.rs",
       "license": "Apache-2.0"
     },
@@ -1736,6 +1752,10 @@
     },
     {
       "path": "crates/cli/src/ci.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/ci_regression.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2195,6 +2215,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_ada_record_params.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_ada_vendored_runtime.rs",
       "license": "Apache-2.0"
     },
@@ -2204,6 +2228,10 @@
     },
     {
       "path": "crates/cli/tests/auto_afl_engine.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_afl_lanes.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2284,6 +2312,10 @@
     },
     {
       "path": "crates/cli/tests/auto_cascade.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_cfi_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2527,6 +2559,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_hwasan.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_int_cmplog.rs",
       "license": "Apache-2.0"
     },
@@ -2688,6 +2724,10 @@
     },
     {
       "path": "crates/cli/tests/auto_rtos_stub.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_rtsan_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2863,7 +2903,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/ci_action_script.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/ci_changed_since.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/ci_gitlab_sast.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/ci_regression_replay.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4519,6 +4571,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/results/src/render/gitlab.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/results/src/render/index_md.rs",
       "license": "Apache-2.0"
     },
@@ -5704,6 +5760,14 @@
     },
     {
       "path": "tests/fixtures/ada_multidir_gpr/src/parser/line_parser.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/ada_record_params/words.adb",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/ada_record_params/words.ads",
       "license": "Apache-2.0"
     },
     {

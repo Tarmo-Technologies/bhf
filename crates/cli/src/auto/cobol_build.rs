@@ -551,12 +551,15 @@ pub fn build_cobol_harness(
     let built = crate::command_output::output_with_timeout(
         Command::new("make")
             .current_dir(&hdir)
-            .env("AUTO_EXTRA_LDFLAGS", libs),
+            .env("AUTO_EXTRA_LDFLAGS", &libs),
         std::time::Duration::from_secs(30 * 60),
     );
     let main_bin = hdir.join("main");
     match built {
-        Ok(o) if o.status.success() && main_bin.is_file() => CobolBuildResult::Built,
+        Ok(o) if o.status.success() && main_bin.is_file() => {
+            crate::build::record_lane_ldflags(&hdir, &libs);
+            CobolBuildResult::Built
+        }
         Ok(o) => CobolBuildResult::Failed(format!(
             "COBOL harness build failed: {}",
             String::from_utf8_lossy(&o.stderr)

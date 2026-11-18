@@ -5,6 +5,10 @@ branding:
   icon: "target"
   color: "purple"
 inputs:
+  mode:
+    description: "pr | batch | prune | coverage. pr (default) fuzzes the PR's changed code and gates on it; batch fuzzes the whole tree; prune rebuilds the harnesses and shrinks each cached corpus to the inputs that add coverage; coverage fuzzes briefly from the corpus and uploads the line coverage it reaches. Run batch, prune and coverage on a schedule."
+    required: false
+    default: "pr"
   path:
     description: "Source root to scan."
     required: false
@@ -45,6 +49,14 @@ inputs:
     description: "Install bhf from source (cargo install --git) instead of a release binary."
     required: false
     default: "false"
+  corpus-cache:
+    description: "Restore the work dir's corpus, discovery cache and stored findings from the Actions cache before the run, and save them after it, so each run continues the last one's corpus and replays its findings as regressions."
+    required: false
+    default: "true"
+  corpus-dir:
+    description: "The bhf work dir to run in (and cache). Default: $RUNNER_TEMP/bhf_work."
+    required: false
+    default: ""
 outputs:
   exit-code:
     description: "The bhf ci exit code (0 = pass, 1 = gate failed)."
@@ -64,6 +76,35 @@ runs:
         GH_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         GH_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
+    - name: Resolve the work dir
+      id: work
+      shell: bash
+      run: |
+        dir="${INPUT_CORPUS_DIR:-}"
+        if [[ -z "$dir" ]]; then dir="$RUNNER_TEMP/bhf_work"; fi
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      env:
+        INPUT_CORPUS_DIR: ${{ inputs.corpus-dir }}
+
+    # The corpus each harness grew, the discovery cache, and the findings the
+    # last run stored (replayed as regressions): a run continues the newest
+    # cache of its branch, else of the base branch. A cache key cannot be
+    # overwritten, so each run saves under its own and restores by prefix.
+    - name: Restore the bhf corpus
+      if: ${{ inputs.corpus-cache == 'true' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ steps.work.outputs.dir }}/corpus
+          ${{ steps.work.outputs.dir }}/discovery-cache.json
+          ${{ steps.work.outputs.dir }}/regressions
+          ${{ steps.work.outputs.dir }}/results/findings
+        key: bhf-corpus-${{ runner.os }}-${{ github.head_ref || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          bhf-corpus-${{ runner.os }}-${{ github.head_ref || github.ref_name }}-
+          bhf-corpus-${{ runner.os }}-${{ github.base_ref || github.event.repository.default_branch }}-
+          bhf-corpus-${{ runner.os }}-
+
     - name: Install bhf
       id: install
       shell: bash
@@ -73,39 +114,43 @@ runs:
         INPUT_BUILD_FROM_SOURCE: ${{ inputs.build-from-source }}
         GH_TOKEN: ${{ github.token }}
 
-    - name: Run bhf (diff-scoped)
+    - name: Run bhf
       id: run
       shell: bash
-      run: |
-        set -uo pipefail
-        if ! bhf ci --help 2>/dev/null | grep -q -- '--changed-since'; then
-          echo "::error title=bhf::the installed bhf does not support 'ci --changed-since' — pin 'version:' to a release that ships it, or set 'build-from-source: true'"
-          exit 1
-        fi
-        sarif="$RUNNER_TEMP/bhf.sarif"
-        ci_json="$RUNNER_TEMP/bhf-ci.json"
-        lang_arg=""
-        if [[ -n "${{ inputs.languages }}" ]]; then
-          lang_arg="--languages ${{ inputs.languages }}"
-        fi
-        # The work dir lives outside the checkout so discovery never scans it.
-        set +e
-        bhf ci "${{ inputs.path }}" \
-          --changed-since "${{ steps.base.outputs.ref }}" \
-          --campaign-time "${{ inputs.campaign-time }}" \
-          --per-target-time "${{ inputs.per-target-time }}" \
-          $lang_arg \
-          --pr-gate "${{ inputs.pr-gate }}" \
-          --sarif "$sarif" \
-          --ci-json "$ci_json" \
-          --work-dir "$RUNNER_TEMP/bhf_work"
-        code=$?
-        set -e
-        echo "exit=$code" >> "$GITHUB_OUTPUT"
-        echo "sarif=$sarif" >> "$GITHUB_OUTPUT"
-        echo "ci_json=$ci_json" >> "$GITHUB_OUTPUT"
-        if [[ -f "$sarif" ]]; then echo "has_sarif=true" >> "$GITHUB_OUTPUT"; fi
-        echo "bhf ci finished with exit code $code"
+      run: ${{ github.action_path }}/scripts/run-bhf.sh
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_LANGUAGES: ${{ inputs.languages }}
+        INPUT_CAMPAIGN_TIME: ${{ inputs.campaign-time }}
+        INPUT_PER_TARGET_TIME: ${{ inputs.per-target-time }}
+        INPUT_PR_GATE: ${{ inputs.pr-gate }}
+        BASE_REF: ${{ steps.base.outputs.ref }}
+        BHF_WORK_DIR: ${{ steps.work.outputs.dir }}
+
+    - name: Upload the coverage report
+      if: ${{ always() && steps.run.outputs.coverage_dir != '' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: bhf-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.run.outputs.coverage_dir }}
+        if-no-files-found: ignore
+        retention-days: 30
+
+    # Saved whatever the verdict: a finding the run stored is what the next
+    # run replays as a regression.
+    - name: Save the bhf corpus
+      if: ${{ always() && inputs.corpus-cache == 'true' && steps.run.outputs.exit != '' }}
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ steps.work.outputs.dir }}/corpus
+          ${{ steps.work.outputs.dir }}/discovery-cache.json
+          ${{ steps.work.outputs.dir }}/regressions
+          ${{ steps.work.outputs.dir }}/results/findings
+        key: bhf-corpus-${{ runner.os }}-${{ github.head_ref || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     # A green check that fuzzed nothing and a green check that fuzzed everything
     # clean are the same colour, which is how a job that could not build a single
@@ -115,7 +160,7 @@ runs:
       shell: bash
       run: |
         set -uo pipefail
-        run_json="$RUNNER_TEMP/bhf_work/auto/run.json"
+        run_json="${{ steps.work.outputs.dir }}/auto/run.json"
         if [[ ! -f "$run_json" ]]; then
           echo "bhf: no changed fuzzable files in scope — nothing was fuzzed."
           echo "> **bhf**: no changed fuzzable files in scope — nothing was fuzzed." >> "$GITHUB_STEP_SUMMARY"
@@ -147,7 +192,7 @@ runs:
       shell: bash
       run: |
         set -uo pipefail
-        work="$RUNNER_TEMP/bhf_work"
+        work="${{ steps.work.outputs.dir }}"
         # Disk first: two full builds of a large Rust workspace (the source
         # install, then the harness build) is the leading explanation for a
         # cargo failure that does not reproduce on a developer host, and an
@@ -205,9 +250,9 @@ runs:
         # stderr and result.json live under `harnesses/` and are the evidence for
         # a build failure. Everything else there (binaries, corpora) is excluded.
         path: |
-          ${{ runner.temp }}/bhf_work/auto
-          ${{ runner.temp }}/bhf_work/harnesses/*/cargo-build-stderr.log
-          ${{ runner.temp }}/bhf_work/harnesses/*/result.json
+          ${{ steps.work.outputs.dir }}/auto
+          ${{ steps.work.outputs.dir }}/harnesses/*/cargo-build-stderr.log
+          ${{ steps.work.outputs.dir }}/harnesses/*/result.json
         if-no-files-found: ignore
         retention-days: 7
 
@@ -234,7 +279,7 @@ runs:
       run: |
         set -uo pipefail
         ci_json="${{ steps.run.outputs.ci_json }}"
-        work="$RUNNER_TEMP/bhf_work"
+        work="${{ steps.work.outputs.dir }}"
         run_json="$work/auto/run.json"
         bug_json="$work/auto/bug-report.json"
         if [[ -f "$ci_json" ]]; then

@@ -208,12 +208,25 @@ pub struct StackFrame {
     pub line: Option<u32>,
 }
 
+/// The prefixes a sanitizer crash's recorded `exception.name` starts with
+/// (`ASAN_HEAP_BUFFER_OVERFLOW`, `RTSAN_UNSAFE_LIBRARY_CALL`): the rest is its
+/// kind.
+pub const EXCEPTION_NAME_PREFIXES: &[&str] = &[
+    "ASAN_", "HWASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_", "RTSAN_",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sanitizer {
     AddressSanitizer,
     UndefinedBehaviorSanitizer,
     LeakSanitizer,
     MemorySanitizer,
+    /// RealtimeSanitizer (#298): a real-time unsafe call in a nonblocking
+    /// context.
+    RealtimeSanitizer,
+    /// HWAddressSanitizer (#333), AArch64's pointer-tagging alternative to
+    /// AddressSanitizer.
+    HWAddressSanitizer,
 }
 
 impl Sanitizer {
@@ -223,15 +236,19 @@ impl Sanitizer {
             Sanitizer::UndefinedBehaviorSanitizer => "ubsan",
             Sanitizer::LeakSanitizer => "lsan",
             Sanitizer::MemorySanitizer => "msan",
+            Sanitizer::RealtimeSanitizer => "rtsan",
+            Sanitizer::HWAddressSanitizer => "hwasan",
         }
     }
 }
 
 pub fn parse_sanitizer_report(stderr: &str) -> Option<SanitizerReport> {
     parse_asan(stderr)
+        .or_else(|| parse_hwasan(stderr))
         .or_else(|| parse_ubsan(stderr))
         .or_else(|| parse_lsan(stderr))
         .or_else(|| parse_msan(stderr))
+        .or_else(|| parse_rtsan(stderr))
         // A Rust panic is the PRIMARY bug signal for the native Rust lane: a
         // bounds-check / unwrap / overflow / explicit panic aborts via SIGABRT,
         // which the C-oriented `is_input_rejection` would otherwise dismiss as an
@@ -1146,22 +1163,7 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
     // by a READ/WRITE memory access." line, which carries the `==NN==` PID prefix
     // so it can't be anchored with `starts_with` (#30). Keep just the kind, drop
     // the noisy address.
-    let access = rest.lines().take(12).find_map(|l| {
-        let t = l.trim_start();
-        if t.starts_with("READ of size") || t.starts_with("WRITE of size") {
-            return Some(t.split(" at ").next().unwrap_or(t).trim().to_owned());
-        }
-        if let Some(pos) = l.find("The signal is caused by a ") {
-            let word = l[pos + "The signal is caused by a ".len()..]
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
-            if word == "READ" || word == "WRITE" {
-                return Some(format!("{word} memory access"));
-            }
-        }
-        None
-    });
+    let access = reported_access(rest);
     // For a non-canonical address ASan's direction is not one (see
     // `memory_access`); say so next to it.
     let high_value = rest
@@ -1194,8 +1196,103 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
     })
 }
 
+/// The access line of an AddressSanitizer or HWAddressSanitizer report
+/// (`READ of size 4`, `WRITE of size 8`), or a SEGV's direction (`WRITE memory
+/// access`), from the first lines of `report`.
+fn reported_access(report: &str) -> Option<String> {
+    report.lines().take(12).find_map(|l| {
+        let t = l.trim_start();
+        if t.starts_with("READ of size") || t.starts_with("WRITE of size") {
+            return Some(t.split(" at ").next().unwrap_or(t).trim().to_owned());
+        }
+        if let Some(pos) = l.find("The signal is caused by a ") {
+            let word = l[pos + "The signal is caused by a ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if word == "READ" || word == "WRITE" {
+                return Some(format!("{word} memory access"));
+            }
+        }
+        None
+    })
+}
+
 /// The text that opens the `ERROR:` line of an AddressSanitizer report.
 const ASAN_ERROR_MARKER: &str = "ERROR: AddressSanitizer:";
+
+/// The text that opens the `ERROR:` line of a HWAddressSanitizer report.
+const HWASAN_ERROR_MARKER: &str = "ERROR: HWAddressSanitizer:";
+
+/// A HWAddressSanitizer report (#333). Its `ERROR:` line names how the bug
+/// was caught (`tag-mismatch`), and the `Cause:` lines after the crash stack
+/// name what it is, most likely first; a stack mismatch gives a generic
+/// `stack tag-mismatch` cause before the specific one. The kind is the first
+/// cause that is not generic, under the rule ASan gives that kind. Its
+/// `SUMMARY:` line names frame #0, which for a `memcpy` is the runtime's
+/// `__hwasan_memcpy`, so the location falls back to the first frame of the
+/// crash stack that has a source and is not the runtime's.
+fn parse_hwasan(stderr: &str) -> Option<SanitizerReport> {
+    let pos = stderr.find(HWASAN_ERROR_MARKER)?;
+    let rest = &stderr[pos..];
+    let line = rest.lines().next()?;
+    let caught = asan_kind(&line[HWASAN_ERROR_MARKER.len()..])?;
+    let caught = caught.trim_end_matches(';');
+    let kind = if caught == "tag-mismatch" {
+        rest.lines()
+            .filter_map(|l| l.trim().strip_prefix("Cause:"))
+            .map(str::trim)
+            .find(|cause| !cause.is_empty() && !cause.contains("tag-mismatch"))
+            .unwrap_or(caught)
+    } else {
+        caught
+    }
+    .to_owned();
+    let rule_id = match kind.as_str() {
+        // A free of memory the allocator does not own, or owns as free.
+        "invalid-free" => "BHF-204",
+        // A write past the object's end, into its last granule, seen at free.
+        "allocation-tail-overwritten" => "BHF-201",
+        kind => asan_rule(kind),
+    };
+    let message = match reported_access(rest) {
+        Some(access) if kind != caught => format!("{line} ({access}; {kind})"),
+        Some(access) => format!("{line} ({access})"),
+        None => line.to_owned(),
+    };
+    let stacks = split_asan_stacks(rest);
+    let access = memory_access(rest, line, stacks.alloc, stacks.free);
+    let rule_id =
+        if is_memory_fault_kind(&kind) && access.as_deref().is_some_and(faults_in_null_page) {
+            "BHF-206"
+        } else {
+            rule_id
+        };
+    let location = summary_location(rest, "HWAddressSanitizer:").or_else(|| {
+        stacks.crash.iter().find_map(|frame| {
+            if frame.function.starts_with("__hwasan") || frame.function.starts_with("__interceptor")
+            {
+                return None;
+            }
+            Some(SourceLocation {
+                file: frame.file.clone()?,
+                line: frame.line?,
+                column: None,
+            })
+        })
+    });
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::HWAddressSanitizer),
+        kind,
+        rule_id,
+        stack: stacks.crash,
+        message,
+        location,
+        check: None,
+        access,
+        pc_offset: None,
+    })
+}
 
 /// Report classes AddressSanitizer names with a phrase on its `ERROR:` line,
 /// each with the kind its `SUMMARY:` line gives it. Every other class is the
@@ -1492,6 +1589,51 @@ fn parse_msan(stderr: &str) -> Option<SanitizerReport> {
         rule_id: "BHF-212",
         stack: parse_stack_frames(stderr),
         message: line.trim().to_owned(),
+        ..Default::default()
+    })
+}
+
+/// A RealtimeSanitizer report (#298): `==N==ERROR: RealtimeSanitizer: <kind>`
+/// (`unsafe-library-call`, `blocking-call`), the call it intercepted on the next
+/// line, and its stack. The report is located at the first frame with a source
+/// position: frame 0 is the intercepted library function.
+fn parse_rtsan(stderr: &str) -> Option<SanitizerReport> {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("ERROR: RealtimeSanitizer:"))?;
+    let kind = line
+        .split_once("ERROR: RealtimeSanitizer:")
+        .and_then(|(_, kind)| kind.split_whitespace().next())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("unsafe-library-call");
+    let after = stderr
+        .find(line)
+        .map(|pos| &stderr[pos + line.len()..])
+        .unwrap_or("");
+    let intercepted = after
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("");
+    let stack = parse_stack_frames(after);
+    let location = stack.iter().find_map(|frame| {
+        Some(SourceLocation {
+            file: frame.file.clone()?,
+            line: frame.line?,
+            column: None,
+        })
+    });
+    Some(SanitizerReport {
+        sanitizer: Some(Sanitizer::RealtimeSanitizer),
+        kind: kind.to_owned(),
+        rule_id: "BHF-232",
+        stack,
+        message: if intercepted.is_empty() {
+            line.trim().to_owned()
+        } else {
+            format!("{} {intercepted}", line.trim())
+        },
+        location,
         ..Default::default()
     })
 }
@@ -2170,6 +2312,114 @@ fn parse_file_line(token: &str) -> (Option<String>, Option<u32>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A HWASan heap overflow through `memcpy`, as clang 18's runtime prints
+    /// it on AArch64: frame #0 and the `SUMMARY:` line are the runtime's.
+    const HWASAN_HEAP_OVERFLOW: &str = "\
+==31==ERROR: HWAddressSanitizer: tag-mismatch on address 0x481201540000 at pc 0x7603ff5f7254
+WRITE of size 20 at 0x481201540000 tags: 7b/08(7b) (ptr/mem) in thread T0
+Invalid access starting at offset 8
+    #0 0x7603ff5f7254 in __hwasan_memcpy (/w/main+0x27254) (BuildId: 8565be78)
+    #1 0x7603ff629b34 in parse_record /src/record.c:5:5
+    #2 0x7603ff629b34 in bhf_run_one /w/harnesses/H-1/main.c:40:3
+
+[0x481201540000,0x481201540010) is a small allocated heap chunk; size: 16 offset: 0
+
+Cause: heap-buffer-overflow
+0x481201540000 is located 0 bytes inside a 8-byte region [0x481201540000,0x481201540008)
+allocated by thread T0 here:
+    #0 0x7603ff5ebf84 in malloc (/w/main+0x1bf84) (BuildId: 8565be78)
+    #1 0x7603ff629b24 in parse_record /src/record.c:4:17
+
+Thread: T0 0x400100002000 stack: [0x400000001000,0x400000801000) sz: 8388608
+
+Memory tags around the buggy address (one tag corresponds to 16 bytes):
+=>0x481201540000:[08] 00  00  00  00  00  00  00  00  00  00  00  00  00  00  00
+SUMMARY: HWAddressSanitizer: tag-mismatch (/w/main+0x27254) (BuildId: 8565be78) in __hwasan_memcpy
+";
+
+    #[test]
+    fn a_hwasan_heap_overflow_is_a_heap_overflow_at_the_target_frame() {
+        let report = parse_sanitizer_report(HWASAN_HEAP_OVERFLOW).unwrap();
+        assert_eq!(report.sanitizer, Some(Sanitizer::HWAddressSanitizer));
+        assert_eq!(report.kind, "heap-buffer-overflow");
+        assert_eq!(report.rule_id, "BHF-201");
+        let location = report.location.unwrap();
+        assert_eq!(
+            (location.file.as_str(), location.line),
+            ("/src/record.c", 5)
+        );
+        assert_eq!(report.stack[1].function, "parse_record");
+        assert!(
+            report
+                .message
+                .starts_with("ERROR: HWAddressSanitizer: tag-mismatch")
+                && report
+                    .message
+                    .ends_with("(WRITE of size 20; heap-buffer-overflow)"),
+            "{}",
+            report.message
+        );
+        let access = report.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Write);
+        assert_eq!(access.alloc_stack[1].function, "parse_record");
+    }
+
+    #[test]
+    fn a_hwasan_stack_mismatch_takes_its_specific_cause() {
+        let report = parse_sanitizer_report(
+            "==7==ERROR: HWAddressSanitizer: tag-mismatch on address 0x4000007ff628 at pc 0x71c4\n\
+             WRITE of size 1 at 0x4000007ff628 tags: 6e/00 (ptr/mem) in thread T0\n\
+             \x20   #0 0x71c4ec229b98 in decode /src/frame.c:3:91\n\
+             \n\
+             Cause: stack tag-mismatch\n\
+             Address 0x4000007ff628 is located in stack of thread T0\n\
+             Potentially referenced stack objects:\n\
+             Cause: stack-buffer-overflow\n\
+             0x4000007ff628 is located 24 bytes after a 16-byte local variable b in decode /src/frame.c:3\n\
+             SUMMARY: HWAddressSanitizer: tag-mismatch /src/frame.c:3:91 in decode\n",
+        )
+        .unwrap();
+        assert_eq!(report.kind, "stack-buffer-overflow");
+        assert_eq!(report.rule_id, "BHF-203");
+        let location = report.location.unwrap();
+        assert_eq!((location.file.as_str(), location.line), ("/src/frame.c", 3));
+    }
+
+    #[test]
+    fn a_hwasan_use_after_free_and_invalid_free_keep_their_rules() {
+        let uaf = "==9==ERROR: HWAddressSanitizer: tag-mismatch on address 0x4812 at pc 0x7a5b\n\
+                   READ of size 1 at 0x481201540002 tags: c7/df (ptr/mem) in thread T0\n\
+                   \x20   #0 0x7a5b in main /src/uaf.c:7:12\n\
+                   \n\
+                   Cause: use-after-free\n\
+                   freed by thread T0 here:\n\
+                   \x20   #1 0x7a5b in main /src/uaf.c:6:5\n\
+                   previously allocated by thread T0 here:\n\
+                   \x20   #1 0x7a5b in main /src/uaf.c:5:12\n\
+                   SUMMARY: HWAddressSanitizer: tag-mismatch /src/uaf.c:7:12 in main\n";
+        let report = parse_sanitizer_report(uaf).unwrap();
+        assert_eq!(
+            (report.kind.as_str(), report.rule_id),
+            ("use-after-free", "BHF-202")
+        );
+        // An invalid free names its class on the ERROR line; the cause that
+        // follows describes the memory, not the bug.
+        let invalid = "==9==ERROR: HWAddressSanitizer: invalid-free on address 0x4812 at pc 0x7a5b on thread T0\n\
+                       \x20   #0 0x7a5b in free (/w/main+0x1b8ec)\n\
+                       \x20   #1 0x7a5b in release /src/pool.c:12:5\n\
+                       \n\
+                       Cause: use-after-free\n\
+                       SUMMARY: HWAddressSanitizer: invalid-free (/w/main+0x1b8ec) in free\n";
+        let report = parse_sanitizer_report(invalid).unwrap();
+        assert_eq!(
+            (report.kind.as_str(), report.rule_id),
+            ("invalid-free", "BHF-204")
+        );
+        assert_eq!(report.location.unwrap().line, 12);
+        // ASan's parser does not take a HWASan report for its own.
+        assert!(parse_asan(uaf).is_none());
+    }
     #[test]
     fn parses_a_memory_sanitizer_report() {
         let report = parse_sanitizer_report(

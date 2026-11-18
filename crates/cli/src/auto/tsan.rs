@@ -207,7 +207,7 @@ fn replay_one(
         loop {
             let run_started = Instant::now();
             let run = crate::command_output::output_with_timeout_flagged(
-                Command::new(&bin)
+                crate::auto::sanitizer_replay::replay_command(&bin)
                     .arg(&path)
                     .env("TSAN_OPTIONS", "halt_on_error=1:exitcode=86"),
                 bounds.run_timeout,

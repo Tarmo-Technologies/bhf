@@ -253,8 +253,13 @@ fn enrich(value: &mut Value, diag: &LibcobDiag) -> bool {
     if let Some(act) = actionability.as_object_mut() {
         act.insert("cwe".to_owned(), serde_json::json!([cwe]));
     }
-    // Record the COBOL source site if we recovered one.
+    // Record the COBOL source site if we recovered one, in the exception too,
+    // where the report's location is read from (#424).
     if let Some((file, line)) = diag.source() {
+        if let Some(exc) = obj.get_mut("exception").and_then(Value::as_object_mut) {
+            exc.insert("source_file".to_owned(), Value::from(file));
+            exc.insert("source_line".to_owned(), Value::from(line));
+        }
         obj.insert(
             "cobol_source".to_owned(),
             serde_json::json!({ "file": file, "line": line }),
@@ -324,6 +329,8 @@ mod tests {
         assert_eq!(v["exception"]["name"], "COBOL_RUNTIME_ERROR");
         assert_eq!(v["actionability"]["cwe"][0], "CWE-125");
         assert_eq!(v["cobol_source"]["line"], 11);
+        assert_eq!(v["exception"]["source_file"], "parseit.cob");
+        assert_eq!(v["exception"]["source_line"], 11);
         assert!(v["exception"]["message"]
             .as_str()
             .unwrap()

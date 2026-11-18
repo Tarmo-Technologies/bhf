@@ -24,6 +24,11 @@ package body AdaFuzz.Input is
    Stdin_File : Ada.Streams.Stream_IO.File_Type;
    Stdin_Open : Boolean := False;
 
+   --  Raw mode's one input has been read. Opening /dev/stdin again starts a
+   --  regular file over, as AFL++ hands an input, and the harness read the
+   --  same input forever (#304).
+   Raw_Loaded : Boolean := False;
+
    procedure Open_Stdin is
    begin
       if not Stdin_Open then
@@ -146,6 +151,11 @@ package body AdaFuzz.Input is
    begin
       if not Framed_Mode then
          --  Legacy raw mode: this process's single input is all of stdin.
+         if Raw_Loaded then
+            Last := Buf'First - 1;
+            return;
+         end if;
+         Raw_Loaded := True;
          Load_From_File ("/dev/stdin", Buf, Last);
          return;
       end if;

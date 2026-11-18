@@ -53,6 +53,10 @@ control (CWE-22) — dynamically confirmed, not a static guess.
 
 ## Where bhf stands vs the field
 
+`bhf auto --engine afl++` runs the same COBOL harness under AFL++ too: its C
+glue builds with afl-clang-fast, and a crash AFL++ saves is replayed and
+attributed to the COBOL line as the builtin engine's are.
+
 There is **no dedicated COBOL fuzzer** in the field — no AFL/AFL++ COBOL mode, no
 libFuzzer integration, no OSS-Fuzz COBOL targets. The state of practice is either:
 

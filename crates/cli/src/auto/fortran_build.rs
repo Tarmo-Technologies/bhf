@@ -1082,6 +1082,7 @@ fn link_with_project_closure(
         let output = match built {
             Ok(o) if o.status.success() && main_bin.is_file() => {
                 write_build_record(hdir, &recorded);
+                crate::build::record_lane_ldflags(hdir, &ldflags);
                 return FortranBuildResult::Built;
             }
             Ok(o) => {

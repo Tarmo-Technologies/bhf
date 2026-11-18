@@ -865,6 +865,27 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-232",
+        slug: "bhf.c/realtime-unsafe-call",
+        name: "Real-time unsafe call in a nonblocking context (RealtimeSanitizer)",
+        description: "RealtimeSanitizer intercepted a call that may block or take unbounded time (an allocation, a lock, a system call, a sleep) while a function marked nonblocking was running: an interrupt handler or an RTOS task entry point that must finish within its deadline. Such a call can stall the task, miss the deadline or deadlock when it waits on a lock the interrupted code holds. The finding names the call and the stack that reached it. Allocate before entering the real-time path, use lock-free structures, and move blocking work to a non-real-time task.",
+        cwe: "CWE-1322",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.3,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/1322.html",
+            "https://clang.llvm.org/docs/RealtimeSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-555",
         slug: "bhf.timing/response-deadline-exceeded",
         name: "Response deadline exceeded (real-time timing oracle)",
@@ -5326,6 +5347,7 @@ mod tests {
             ("BHF-228", "CWE-758", "bhf.c/invalid-builtin-use"),
             ("BHF-230", "CWE-835", "bhf.c/hang"),
             ("BHF-231", "CWE-248", "bhf.cpp/uncaught-exception"),
+            ("BHF-232", "CWE-1322", "bhf.c/realtime-unsafe-call"),
         ] {
             let rule = by_id(id).unwrap_or_else(|| panic!("{id} must exist"));
             assert_eq!(rule.cwe, cwe, "{id}");

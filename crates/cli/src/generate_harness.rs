@@ -3468,6 +3468,19 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         Some(&invocation_function.name),
         RecordedBuildInputs::of(args),
     )?;
+    if args.kind != "sequence" {
+        let param_types: Vec<&str> = invocation_function
+            .params
+            .iter()
+            .map(|param| param.c_type.as_str())
+            .collect();
+        mark_nonblocking_if_selected(
+            &result.main_c,
+            &invocation_function.name,
+            &invocation_function.return_type,
+            &param_types,
+        )?;
+    }
     if generation_banner_enabled() {
         println!(
             "Generated C harness '{}' at {}",
@@ -3477,6 +3490,87 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         println!("  main.c   -> {}", result.main_c.display());
         println!("  Makefile -> {}", result.makefile.display());
     }
+    Ok(())
+}
+
+/// The targets a harness runs in a real-time context under the `rtsan` build
+/// (#298): names, `entry-points` (an interrupt handler or an RTOS task entry
+/// point, [`is_realtime_entry_point`]) or `all`. `bhf auto --nonblocking` sets
+/// them before it generates harnesses.
+static NONBLOCKING_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Run the targets `patterns` selects in a real-time context under the
+/// `rtsan` build ([`NONBLOCKING_TARGETS`]).
+pub(crate) fn set_nonblocking_targets(patterns: Vec<String>) {
+    if let Ok(mut targets) = NONBLOCKING_TARGETS.write() {
+        *targets = patterns;
+    }
+}
+
+/// Whether `name` looks like an interrupt handler or an RTOS task entry point
+/// (#298): a CMSIS/vendor handler name (`USART1_IRQHandler`, `SysTick_Handler`,
+/// `uart_isr`), or a task body: no result and one `void *` argument (FreeRTOS,
+/// ThreadX's `ULONG`, or Zephyr's three) with `task` or `thread` in its name.
+pub(crate) fn is_realtime_entry_point(name: &str, return_type: &str, param_types: &[&str]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let handler = name.ends_with("_IRQHandler")
+        || name.ends_with("_Handler")
+        || name.ends_with("IRQHandler")
+        || lower.ends_with("_isr")
+        || lower.starts_with("isr_")
+        || lower.ends_with("_irq_handler");
+    let void_pointer = |ty: &str| ty.replace(' ', "") == "void*";
+    let task_signature = return_type.trim() == "void"
+        && (matches!(param_types, [one] if void_pointer(one) || one.trim() == "ULONG")
+            || (param_types.len() == 3 && param_types.iter().all(|ty| void_pointer(ty))));
+    handler || (task_signature && (lower.contains("task") || lower.contains("thread")))
+}
+
+/// Mark the harness at `main` nonblocking when [`NONBLOCKING_TARGETS`]
+/// selects its target: `#define BHF_RTSAN_NONBLOCKING`, which the template's
+/// real-time macros read under the `rtsan` build.
+fn mark_nonblocking_if_selected(
+    main: &Path,
+    name: &str,
+    return_type: &str,
+    param_types: &[&str],
+) -> Result<()> {
+    let patterns = NONBLOCKING_TARGETS
+        .read()
+        .map(|patterns| patterns.clone())
+        .unwrap_or_default();
+    mark_nonblocking(main, name, return_type, param_types, &patterns)
+}
+
+/// [`mark_nonblocking_if_selected`] with the patterns given.
+fn mark_nonblocking(
+    main: &Path,
+    name: &str,
+    return_type: &str,
+    param_types: &[&str],
+    patterns: &[String],
+) -> Result<()> {
+    let selected = patterns.iter().any(|pattern| match pattern.as_str() {
+        "all" => true,
+        "entry-points" => is_realtime_entry_point(name, return_type, param_types),
+        other => other == name,
+    });
+    if !selected {
+        return Ok(());
+    }
+    let text = fs::read_to_string(main).with_context(|| format!("read {}", main.display()))?;
+    if text.contains("#define BHF_RTSAN_NONBLOCKING") {
+        return Ok(());
+    }
+    fs::write(
+        main,
+        format!(
+            "/* {name} is nonblocking (an interrupt handler or a task entry point, \
+             `--nonblocking`): RealtimeSanitizer checks its calls (#298). */\n\
+             #define BHF_RTSAN_NONBLOCKING 1\n{text}"
+        ),
+    )
+    .with_context(|| format!("write {}", main.display()))?;
     Ok(())
 }
 
@@ -8339,6 +8433,8 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false, false),
     ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true, false),
     ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true, false),
+    ("CFI", "$(CFI_CC)", "$(CFI_CFLAGS)", true, false),
+    ("RTSAN", "$(RTSAN_CC)", "$(RTSAN_CFLAGS)", true, false),
     ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
     ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
     ("PROV", "$(CC)", "$(BHF_CFLAGS) $(CFLAGS)", true, true),
@@ -8348,6 +8444,8 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
 const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("MAIN", "$(CXX)", "$(BHF_CXXFLAGS) $(CXXFLAGS)", true, true),
     ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
+    ("CFI", "$(CFI_CXX)", "$(CFI_CXXFLAGS)", true, false),
+    ("RTSAN", "$(RTSAN_CXX)", "$(RTSAN_CXXFLAGS)", true, false),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
     ("WINAFL", "$(CXX)", "$(WINAFL_CXXFLAGS)", true, true),
@@ -10434,7 +10532,9 @@ fn c_storage_class_macros(
         for (name, body) in c_parser::storage_class_macros(&text) {
             macros.entry(name).or_insert(body);
         }
-        let parent = path.parent().map_or_else(|| base.clone(), Path::to_path_buf);
+        let parent = path
+            .parent()
+            .map_or_else(|| base.clone(), Path::to_path_buf);
         queue.extend(
             include_spellings(&text)
                 .into_iter()
@@ -11529,6 +11629,21 @@ fn run_cpp_direct(args: &GenerateHarnessArgs) -> Result<()> {
         Some(&target_function),
         RecordedBuildInputs::of(args),
     )?;
+    // A free function only: a method's call through its receiver has no
+    // real-time exit.
+    if args.kind != "sequence" && function.qualifier_path.is_empty() {
+        let param_types: Vec<&str> = function
+            .params
+            .iter()
+            .map(|param| param.cpp_type.as_str())
+            .collect();
+        mark_nonblocking_if_selected(
+            &result.main_cpp,
+            &function.name,
+            &function.return_type,
+            &param_types,
+        )?;
+    }
     if generation_banner_enabled() {
         println!(
             "Generated C++ harness '{}' at {}",
@@ -20572,6 +20687,102 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     }
 
     /// Generate a direct harness for `target` in `source` under `root/out`.
+    /// #298: interrupt handlers and RTOS task bodies are entry points; a
+    /// function that merely mentions a task is not.
+    #[test]
+    fn interrupt_handlers_and_task_bodies_are_realtime_entry_points() {
+        for (name, ret, params) in [
+            ("USART1_IRQHandler", "void", &[][..]),
+            ("SysTick_Handler", "void", &[][..]),
+            ("uart_isr", "void", &["int"][..]),
+            ("vSensorTask", "void", &["void *"][..]),
+            ("sensor_task", "void", &["void*"][..]),
+            ("rx_thread", "void", &["void *", "void *", "void *"][..]),
+            ("tx_thread_entry", "void", &["ULONG"][..]),
+        ] {
+            assert!(super::is_realtime_entry_point(name, ret, params), "{name}");
+        }
+        for (name, ret, params) in [
+            ("parse_record", "int", &["const uint8_t *", "size_t"][..]),
+            ("create_task", "int", &["void *"][..]),
+            ("task_count", "void", &["int"][..]),
+        ] {
+            assert!(!super::is_realtime_entry_point(name, ret, params), "{name}");
+        }
+    }
+
+    /// #298: with `--nonblocking`, the generated harness of a FreeRTOS task
+    /// entry is marked to run in a real-time context under the `rtsan` build,
+    /// and still builds as before without it.
+    #[test]
+    fn a_marked_freertos_task_entry_harness_runs_in_a_realtime_context() {
+        let root = crate::test_support::TestDir::new("rtsan-mark");
+        let source = root.join("sensor.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\nvoid vSensorTask(void *pvParameters) {\n    \
+             const unsigned char *in = pvParameters;\n    (void)in;\n}\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "vSensorTask", "H-RT", &root);
+        let main = dir.join("main.c");
+        let generated = fs::read_to_string(&main).unwrap();
+        assert!(!generated.contains("#define BHF_RTSAN_NONBLOCKING"));
+        // The template brackets the call either way.
+        assert!(generated.contains("BHF_TARGET_EXIT();"), "{generated}");
+        assert!(generated.contains("__rtsan_realtime_enter"), "{generated}");
+
+        super::mark_nonblocking(
+            &main,
+            "vSensorTask",
+            "void",
+            &["void *"],
+            &["parse".to_owned()],
+        )
+        .unwrap();
+        assert!(!fs::read_to_string(&main)
+            .unwrap()
+            .contains("#define BHF_RTSAN_NONBLOCKING"));
+        super::mark_nonblocking(
+            &main,
+            "vSensorTask",
+            "void",
+            &["void *"],
+            &["entry-points".to_owned()],
+        )
+        .unwrap();
+        let marked = fs::read_to_string(&main).unwrap();
+        assert!(
+            marked.starts_with("/* vSensorTask is nonblocking"),
+            "{marked}"
+        );
+        assert_eq!(marked.matches("#define BHF_RTSAN_NONBLOCKING 1").count(), 1);
+        // Marked again: unchanged.
+        super::mark_nonblocking(
+            &main,
+            "vSensorTask",
+            "void",
+            &["void *"],
+            &["all".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&main).unwrap(), marked);
+        // The marked harness still builds, and its rtsan lane's macros only
+        // turn on there.
+        if which::which("clang").is_ok() && which::which("make").is_ok() {
+            let built = std::process::Command::new("make")
+                .arg("main")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+        }
+    }
+
     fn generate_for_make_test(source: &Path, target: &str, id: &str, root: &Path) -> PathBuf {
         run(GenerateHarnessArgs {
             source: source.to_path_buf(),
@@ -20857,6 +21068,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("libfuzzer", "main_libfuzzer"),
             ("msan", "main_msan"),
             ("tsan", "main_tsan"),
+            ("cfi", "main_cfi"),
+            ("rtsan", "main_rtsan"),
             ("cov", "main_cov"),
             ("diff", "main_diff"),
         ] {
@@ -20883,6 +21096,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             ("afl", "main_afl"),
             ("winafl", "main_winafl"),
             ("libfuzzer", "main_libfuzzer"),
+            ("cfi", "main_cfi"),
+            ("rtsan", "main_rtsan"),
             ("cov", "main_cov"),
             ("diff", "main_diff"),
         ] {

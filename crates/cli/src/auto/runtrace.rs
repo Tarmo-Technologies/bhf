@@ -252,6 +252,7 @@ pub(crate) fn is_internal_env_name(name: &str) -> bool {
         "BHF_",
         "AFL_",
         "ASAN_",
+        "HWASAN_",
         "UBSAN_",
         "LSAN_",
         "MSAN_",

@@ -100,6 +100,13 @@ fn auto_cobol_discovers_and_crashes_on_ref_mod_oob() {
         findings.iter().any(|f| f["rule_id"] == "BHF-210"),
         "expected a BHF-210 reachable-crash finding from the ref-mod OOB.\n{stdout}\n{stderr}"
     );
+    // #424: the report places it at the COBOL line libcob named.
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("results/findings.json")).unwrap())
+            .unwrap();
+    let location = &doc["findings"][0]["location"];
+    assert_eq!(location["file"], "parseit.cob", "{doc:#}");
+    assert_eq!(location["line"], 11, "{doc:#}");
 }
 
 /// A COBOL finding is recorded as libcob's runtime error, not the SIGSEGV the

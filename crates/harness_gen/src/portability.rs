@@ -268,9 +268,17 @@ staticlib and links it into `./{lf}`:\n\n```sh\n./build-libfuzzer.sh    # -> ./{
     // AFL++.
     if let Some(afl) = &spec.afl_binary {
         s.push_str("## AFL++\n\n");
-        s.push_str(&format!(
-            "```sh\nmake afl                # builds ./{afl} (afl-clang-fast persistent mode)\nafl-fuzz -i seeds -o out -- ./{afl}\n```\n\n"
-        ));
+        if spec.lane == Lane::Rust {
+            // The staticlib built again with bhf's instrumentation and linked
+            // by afl-clang-fast (#303); the same binary serves CmpLog.
+            s.push_str(&format!(
+                "```sh\n./build-afl.sh          # builds ./{afl} and ./{afl}_cmplog (afl-clang-fast persistent mode)\nafl-fuzz -i seeds -o out -c ./{afl}_cmplog -- ./{afl}\n```\n\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "```sh\nmake afl                # builds ./{afl} (afl-clang-fast persistent mode)\nafl-fuzz -i seeds -o out -- ./{afl}\n```\n\n"
+            ));
+        }
         s.push_str("For Mayhem, set `afl: true` on the command.\n\n");
     }
 

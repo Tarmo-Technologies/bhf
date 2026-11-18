@@ -98,9 +98,10 @@ is to bound the recursion depth.
 | `--no-discovery-cache` | off | Disable the discovery cache entirely (never read or write it) |
 | `--resume` | off | Resume a prior sweep over the SAME work-dir: reload targets that already completed and re-run only the rest. A per-target `harnesses/<id>/result.json` is written the moment each target finishes (so an INTERRUPTED run is resumable), and on a re-run it is loaded back into the report FULLY re-integrated — its outcome bucket, repair manifest, findings, and per-pass detail all appear in the new `run.json`/`run.md` exactly as if it had been re-run, plus a `resumed` count of how many were carried over. Requires the discovery cache to hit (target source unchanged); on a source change every target is re-attempted to avoid stale results. A target whose lane's toolchain was missing (`missing_toolchain`), whose sanitizer runtime could not start (`sanitizer_runtime_unavailable`), or that needed `--run-untrusted` (`consent_required`) is always tried again, since the host may have been fixed, or the run may give that consent, since |
 | `--reuse-discovery` | — | Deprecated no-op (caching is now the default); accepted for back-compat |
-| `--sanitizers <asan,ubsan,msan,tsan,lsan \| none>` | `address,undefined` (ASan and UBSan) | Arm the named matrix for native C/C++ builds instead of the default (the other lanes own their instrumentation). The opt-out `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
+| `--sanitizers <asan,ubsan,msan,tsan,lsan,hwasan,cfi,realtime \| none>` | `address,undefined` (ASan and UBSan) | Arm the named matrix for native C/C++ builds instead of the default (the other lanes own their instrumentation). `hwasan` takes ASan's place on an AArch64 host and is refused on any other. `cfi` is not armed in the fuzzed build: it adds a control-flow integrity replay of the corpus after the fuzz passes. `realtime` (clang 20+) likewise adds a RealtimeSanitizer replay of the nonblocking targets' corpora. The opt-out `none` builds native C/C++ coverage-only with no `-fsanitize=` (crash-only, zero ASan/UBSan false positives). Operator `<SAN>_OPTIONS` (suppressions / FP-killers) are merged, not clobbered. See [Sanitizers](../sanitizers/) |
+| `--nonblocking <entry-points \| all \| NAME>` | `entry-points` | With the `realtime` lane: the targets whose harness runs in a real-time context, so RealtimeSanitizer reports each allocation, lock, sleep or system call they make. `entry-points` marks interrupt handlers and RTOS task bodies, `all` every target, and a name that target (repeatable). An error without `--sanitizers ...,realtime`. See [Sanitizers](../sanitizers/#the-realtimesanitizer-replay) |
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
-| `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++ only; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
+| `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++, COBOL, Fortran, Rust and Ada; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
 | `--winafl-path <DIR>` / `--dynamorio-path <DIR>` | `BHF_WINAFL_PATH`, then `afl-fuzz.exe` on PATH / `BHF_DYNAMORIO_PATH`, then `DYNAMORIO_HOME`, then `drrun.exe` on PATH | WinAFL's directory (holding `afl-fuzz.exe` and `winafl.dll`) and DynamoRIO's install root (or its `bin64`) for `--engine winafl` (see [Windows](windows.md#installing-winafl-and-dynamorio)) |
 | `--winafl-instrumentation <dynamorio\|intel-pt>` / `--winafl-iterations <N>` / `--winafl-coverage-module <MODULE>` | `dynamorio` / `5000` / none | WinAFL's coverage (`afl-fuzz -D`, or Intel PT with `-P`, which needs an Intel CPU, a WinAFL built with `-DINTELPT=1` and no VM in between), its `-fuzz_iterations` (persistent-entry calls per process), and another module (a target DLL) to measure coverage in (repeatable) |
 | `--winafl-page-heap` | off | Run the WinAFL build under full PageHeap, so a heap overflow faults as a crash: WinAFL fuzzes a copy of `main_winafl.exe` under a name only the run uses, with an Image File Execution Options key bhf sets and removes after the run. Needs an elevated shell (refused up front otherwise) |
@@ -173,8 +174,8 @@ each spelled like its flag:
 - Build inputs: `cxx-std`, `grammar`, `extra-include`, `extra-source`,
   `exclude-path`, `project`, `ada-deps`, `cxx-expected-exception`.
 - Seeds and selection: `seed-file`, `seed-dir`, `seed-mining = false` (the
-  `--no-seed-mining` flag), `sanitizers`, `engine`, `languages`, `passes`,
-  `force`, `rust-private`.
+  `--no-seed-mining` flag), `sanitizers`, `nonblocking`, `engine`,
+  `languages`, `passes`, `force`, `rust-private`.
 - Explicit `--config` only, because they execute something: `build-command`,
   `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`,
   `msbuild-evaluate`, `winafl-path` and `dynamorio-path` (the WinAFL and
@@ -512,8 +513,9 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 | Lane | Black-box (Mayhem base-exe / AFL file) | libFuzzer | AFL++ persistent |
 |---|---|---|---|
 | C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl`, `make afl_cmplog` → `./main_afl_cmplog` (`-c`) |
-| Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | — |
-| Ada | `./main < input` (stdin) | — | — |
+| COBOL / Fortran | `./main <file>` (built by default) | — | `make afl AUTO_EXTRA_LDFLAGS="$(cat lane-ldflags.txt)"` → `./main_afl` |
+| Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | `./build-afl.sh` → `./main_afl`, `./main_afl_cmplog` (`-c`) |
+| Ada | `./main < input` (stdin) | — | `bhf auto --engine afl++` links `build/<id>/main_afl` (fork server, input on stdin, `BHF_CRASH_ON_FINDING=1`) |
 
 The libFuzzer binaries use a generated `bhf_libfuzzer.c` shim that forwards
 libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. A harness that

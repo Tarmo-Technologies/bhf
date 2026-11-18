@@ -1133,7 +1133,7 @@ fn contains_identifier(text: &str, ident: &str) -> bool {
 }
 
 fn humanize_exception(name: &str) -> String {
-    const PREFIXES: [&str; 5] = ["ASAN_", "UBSAN_", "MSAN_", "TSAN_", "LSAN_"];
+    const PREFIXES: [&str; 6] = ["ASAN_", "UBSAN_", "MSAN_", "TSAN_", "LSAN_", "RTSAN_"];
     let trimmed = PREFIXES
         .iter()
         .find_map(|p| name.strip_prefix(p))
@@ -2470,6 +2470,10 @@ mod tests {
             "Heap Buffer Overflow"
         );
         assert_eq!(humanize_exception("SIGSEGV"), "SIGSEGV");
+        assert_eq!(
+            humanize_exception("RTSAN_UNSAFE_LIBRARY_CALL"),
+            "Unsafe Library Call"
+        );
     }
 
     #[test]

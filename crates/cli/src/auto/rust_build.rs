@@ -3960,6 +3960,7 @@ pub fn build_rust_harness(
         &toolchain,
         "rust_harness",
         "libbhf_rust_harness*.a",
+        &[],
     );
     RustBuildResult::Built
 }
@@ -4024,6 +4025,111 @@ fn rust_build_libfuzzer_script(
     )
 }
 
+/// The AFL++ persistent driver of a Rust harness (#303), compiled with
+/// afl-clang-fast beside the staticlib's `bhf_run_one`, as cargo-afl links a
+/// crate: AFL++'s runtime takes the staticlib's trace-pc-guard edges and its
+/// trace-compares for CmpLog.
+const AFL_MAIN_C: &str = "\
+/* bhf AFL++ driver for a Rust harness: compiled with afl-clang-fast. */
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int bhf_run_one(const uint8_t *data, size_t size);
+/* Only bhf's own driver records where the target is entered. */
+void bhf_target_enter(void) {}
+__AFL_FUZZ_INIT();
+int main(void) {
+#ifdef __AFL_HAVE_MANUAL_CONTROL
+    __AFL_INIT();
+#endif
+    uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(10000)) {
+        size_t len = (size_t)__AFL_FUZZ_TESTCASE_LEN;
+        /* An input of exactly its size, as the other lanes pass it. */
+        uint8_t *input = (uint8_t *)malloc(len ? len : 1);
+        if (!input) abort();
+        memcpy(input, buf, len);
+        bhf_run_one(input, len);
+        free(input);
+    }
+    return 0;
+}
+";
+
+/// The driver [`rust_build_afl_script`] compiles.
+const AFL_MAIN_FILE: &str = "bhf_afl_main.c";
+
+/// The generated `build-afl.sh` for a Rust harness (#303): the kept harness
+/// crate at `manifest_subdir` built again with bhf's instrumentation into its
+/// own target directory, and linked with [`AFL_MAIN_C`] by afl-clang-fast into
+/// `main_afl`. The same binary is `main_afl_cmplog`: AFL++'s runtime logs the
+/// staticlib's compares when afl-fuzz runs it with `-c`.
+fn rust_build_afl_script(
+    toolchain: &RustToolchain,
+    manifest_subdir: &str,
+    staticlib_glob: &str,
+    features: &[String],
+) -> String {
+    let features = if features.is_empty() {
+        String::new()
+    } else {
+        format!(" \\\n\x20   --features \"{}\"", features.join(","))
+    };
+    format!(
+        "#!/bin/sh\n\
+         # Build an AFL++ binary from this Rust harness (bhf): the kept harness\n\
+         # crate with bhf's trace-pc-guard instrumentation, linked with the\n\
+         # {main} persistent driver by afl-clang-fast. Override the\n\
+         # toolchain with the CARGO env var if needed.\n\
+         set -e\n\
+         cd \"$(dirname \"$0\")\"\n\
+         : \"${{CARGO:={cargo}}}\"\n\
+         HOST=\"{host}\"\n\
+         RUSTFLAGS=\"{flags}\" \\\n\
+         \x20 \"$CARGO\" {channel} build --offline \\\n\
+         \x20   --manifest-path \"{sub}/Cargo.toml\" \\\n\
+         \x20   --target-dir \"{sub}/target-afl\" \\\n\
+         \x20   --target \"$HOST\"{features}\n\
+         A=\"$(ls {sub}/target-afl/$HOST/debug/{glob} | head -n1)\"\n\
+         afl-clang-fast -O1 -g -fsanitize=address {main} \"$A\" -lpthread -ldl -lm -lrt \\\n\
+         \x20 -o main_afl\n\
+         cp main_afl main_afl_cmplog\n\
+         echo \"built ./main_afl — run: afl-fuzz -i <seeds> -o <out> -c ./main_afl_cmplog -- ./main_afl\"\n",
+        main = AFL_MAIN_FILE,
+        cargo = toolchain.cargo.display(),
+        host = toolchain.host_triple,
+        flags = sancov_rustflags(),
+        channel = toolchain.channel_arg,
+        sub = manifest_subdir,
+        glob = staticlib_glob,
+    )
+}
+
+/// Build a Rust harness's `main_afl` and `main_afl_cmplog` with its
+/// `build-afl.sh` (#303), then remove the build's target directory. The
+/// caller inspects `.status.success()`.
+pub(crate) fn build_rust_afl(harness_dir: &Path) -> std::process::Output {
+    let script = harness_dir.join("build-afl.sh");
+    let output = crate::command_output::output_with_timeout(
+        Command::new("sh")
+            .arg(&script)
+            .current_dir(harness_dir)
+            // The script names the cargo the lane built with; a `CARGO` bhf
+            // inherits (cargo sets it for what it runs) is the one that
+            // started bhf, which may not take `+nightly`.
+            .env_remove("CARGO"),
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .unwrap_or_else(|error| crate::build::make_spawn_failure(&error));
+    // As for the main build: its target tree is an intermediate, hundreds of
+    // MiB on a real crate.
+    for crate_dir in ["rust_harness", "incrate"] {
+        let _ = std::fs::remove_dir_all(harness_dir.join(crate_dir).join("target-afl"));
+    }
+    output
+}
+
 /// Emit the portable-export artifacts beside a built Rust harness (#63). The
 /// default `main` already reads `argv[1]` as a one-shot file (black-box portable:
 /// Mayhem base-executable / AFL file mode). This adds the Mayhemfile,
@@ -4039,6 +4145,7 @@ fn emit_rust_portability(
     toolchain: &RustToolchain,
     manifest_subdir: &str,
     staticlib_glob: &str,
+    features: &[String],
 ) {
     use harness_gen::portability::{self, InputDelivery, Lane, PortabilitySpec};
     let harness_id = auto_dir
@@ -4058,7 +4165,7 @@ fn emit_rust_portability(
             input: InputDelivery::File,
             sanitizer: true,
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
-            afl_binary: None,
+            afl_binary: Some("main_afl".to_owned()),
             crash_on_finding_env: false,
             passthrough_entrypoint: false,
         },
@@ -4066,20 +4173,28 @@ fn emit_rust_portability(
     if wrote.is_err() {
         return;
     }
-    let script = auto_dir.join("build-libfuzzer.sh");
-    if std::fs::write(
-        &script,
-        rust_build_libfuzzer_script(toolchain, c_runtime_dir, manifest_subdir, staticlib_glob),
-    )
-    .is_ok()
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&script) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&script, perms);
+    let scripts = [
+        (
+            "build-libfuzzer.sh",
+            rust_build_libfuzzer_script(toolchain, c_runtime_dir, manifest_subdir, staticlib_glob),
+        ),
+        (
+            "build-afl.sh",
+            rust_build_afl_script(toolchain, manifest_subdir, staticlib_glob, features),
+        ),
+    ];
+    let _ = std::fs::write(auto_dir.join(AFL_MAIN_FILE), AFL_MAIN_C);
+    for (name, body) in scripts {
+        let script = auto_dir.join(name);
+        if std::fs::write(&script, body).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&script) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&script, perms);
+                }
             }
         }
     }
@@ -4413,6 +4528,7 @@ fn build_in_crate(
         toolchain,
         "incrate",
         &format!("lib{}*.a", resolved.crate_name),
+        target_features,
     );
     RustBuildResult::Built
 }
@@ -5547,6 +5663,35 @@ mod tests {
     /// confirm the resulting binary drives `bhf_run_one` to a crash. Skips cleanly
     /// without a nightly toolchain or the libFuzzer runtime.
     // build-libfuzzer.sh is a POSIX shell script.
+    /// An in-crate harness's AFL++ build takes the features its main build
+    /// enabled (#303).
+    #[test]
+    fn the_afl_build_script_passes_the_crate_features() {
+        let toolchain = RustToolchain {
+            cargo: PathBuf::from("/opt/cargo"),
+            channel_arg: "+nightly".to_owned(),
+            host_triple: "aarch64-unknown-linux-gnu".to_owned(),
+        };
+        let with = rust_build_afl_script(
+            &toolchain,
+            "incrate",
+            "libdemo*.a",
+            &["std".to_owned(), "fuzzing".to_owned()],
+        );
+        assert!(
+            with.contains("--target-dir \"incrate/target-afl\""),
+            "{with}"
+        );
+        assert!(with.contains("--features \"std,fuzzing\""), "{with}");
+        assert!(
+            with.contains("ls incrate/target-afl/$HOST/debug/libdemo*.a"),
+            "{with}"
+        );
+        assert!(with.contains(": \"${CARGO:=/opt/cargo}\""), "{with}");
+        let without = rust_build_afl_script(&toolchain, "rust_harness", "libx*.a", &[]);
+        assert!(!without.contains("--features"), "{without}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rust_build_libfuzzer_script_produces_a_working_libfuzzer_binary() {
@@ -5593,11 +5738,29 @@ mod tests {
             &toolchain,
             "rust_harness",
             "libbhf_rust_harness*.a",
+            &[],
         );
         // The portability artifacts + the build script must be emitted.
         assert!(auto_dir.join("Mayhemfile").is_file());
         assert!(auto_dir.join("PORTABILITY.md").is_file());
         assert!(auto_dir.join("bhf_libfuzzer.c").is_file());
+        // #303: the AFL++ build beside it, with the staticlib's own target
+        // tree and the persistent driver.
+        let afl = std::fs::read_to_string(auto_dir.join("build-afl.sh")).unwrap();
+        assert!(
+            afl.contains("--target-dir \"rust_harness/target-afl\""),
+            "{afl}"
+        );
+        assert!(afl.contains("-sanitizer-coverage-trace-pc-guard"), "{afl}");
+        assert!(
+            afl.contains("afl-clang-fast -O1 -g -fsanitize=address bhf_afl_main.c"),
+            "{afl}"
+        );
+        assert!(afl.contains("cp main_afl main_afl_cmplog"), "{afl}");
+        let driver = std::fs::read_to_string(auto_dir.join("bhf_afl_main.c")).unwrap();
+        assert!(driver.contains("__AFL_LOOP(10000)"), "{driver}");
+        let portability = std::fs::read_to_string(auto_dir.join("PORTABILITY.md")).unwrap();
+        assert!(portability.contains("./build-afl.sh"), "{portability}");
         let script = auto_dir.join("build-libfuzzer.sh");
         assert!(script.is_file(), "build-libfuzzer.sh must be emitted");
 

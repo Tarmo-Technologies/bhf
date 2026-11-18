@@ -237,7 +237,8 @@ jobs:
   # skipped the heavy jobs, and CI acceptance requires it to pass then.
   # Native ARM64: the workspace (the runtrace shim included) builds, every
   # test outside bhf's heavy integration suites passes, and `bhf auto` builds
-  # a C target and finds the stack overflow planted in it, on an ARM64 runner.
+  # a C target and finds the stack overflow planted in it, and with HWASan a
+  # heap overflow, on an ARM64 runner.
   arm64-build:
     name: ARM64 build, tests and auto smoke
     needs: changes
@@ -285,6 +286,16 @@ jobs:
 
       - name: Find a planted bug with bhf auto
         run: bash scripts/ci/arm64-auto-smoke.sh target/debug/bhf
+
+      # `--sanitizers hwasan` builds the fuzzed harness with HWAddressSanitizer,
+      # which only an AArch64 host runs, and finds the heap overflow planted in
+      # the test's target. BHF_REQUIRE_TOOLS=1 fails the test if clang cannot
+      # build and run a HWASan program here, instead of skipping it.
+      - name: Find a heap overflow with HWASan
+        env:
+          RAYON_NUM_THREADS: "1"
+          BHF_REQUIRE_TOOLS: "1"
+        run: cargo nextest run --locked -p bhf --test auto_hwasan --no-fail-fast --profile ci
 
   doc-contracts:
     name: Release and docs contract tests

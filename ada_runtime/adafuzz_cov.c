@@ -25,6 +25,12 @@
  * With BHF_COV_PCS=<file> (the coverage replay's, #310), each edge's PC is also
  * appended to that file the first time this process reaches it, as a hex offset
  * from the image's start, so the host can place it on an Ada line.
+ *
+ * In the AFL++ build (#304), which links AFL++'s runtime, each edge also goes
+ * to AFL++'s map: the edge from the previous PC, as AFL's classic
+ * instrumentation counts it, on one of a table of guards AFL++'s runtime
+ * numbers like its own. The runtime's functions are weak references, null in
+ * every other build.
  */
 
 #include <stdint.h>
@@ -52,6 +58,20 @@
 #endif
 
 static unsigned char *adafuzz_cov_map = 0;
+
+extern void __sanitizer_cov_trace_pc_guard(uint32_t *guard) __attribute__((weak));
+extern void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
+    __attribute__((weak));
+#define ADAFUZZ_AFL_GUARDS 4096u
+static uint32_t adafuzz_afl_guards[ADAFUZZ_AFL_GUARDS];
+static uintptr_t adafuzz_afl_prev_pc;
+
+__attribute__((constructor)) ADAFUZZ_NOCOV static void adafuzz_afl_guards_init(void) {
+    if (__sanitizer_cov_trace_pc_guard_init) {
+        __sanitizer_cov_trace_pc_guard_init(adafuzz_afl_guards,
+                                            adafuzz_afl_guards + ADAFUZZ_AFL_GUARDS);
+    }
+}
 
 /* The BHF_COV_PCS recorder: its file, and the PCs this process wrote. */
 #define ADAFUZZ_PCS_SLOTS (1u << 16)
@@ -126,6 +146,11 @@ ADAFUZZ_NOCOV static void adafuzz_pcs_record(uintptr_t pc) {
 
 ADAFUZZ_NOCOV void __sanitizer_cov_trace_pc(void) {
     uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    if (__sanitizer_cov_trace_pc_guard) {
+        __sanitizer_cov_trace_pc_guard(
+            &adafuzz_afl_guards[(pc ^ adafuzz_afl_prev_pc) % ADAFUZZ_AFL_GUARDS]);
+        adafuzz_afl_prev_pc = pc >> 1;
+    }
     if (adafuzz_pcs_fd >= 0) {
         adafuzz_pcs_record(pc);
     }

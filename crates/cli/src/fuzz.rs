@@ -461,8 +461,9 @@ pub struct FuzzArgs {
     pub extension: Option<PathBuf>,
 
     /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
-    /// lsan), or the standalone value `none` (build coverage-only with no
-    /// `-fsanitize=` — crash-only fuzzing without ASan/UBSan false positives).
+    /// lsan, and on an AArch64 host hwasan in place of asan), or the standalone
+    /// value `none` (build coverage-only with no `-fsanitize=` — crash-only
+    /// fuzzing without ASan/UBSan false positives).
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
@@ -6875,6 +6876,9 @@ struct ExternalIngest<'a> {
     feed: TraceInput,
     emitter: FindingEmitter,
     dedup: SanitizerClusterDedup,
+    /// Event signatures (hex) reported already: the harness's earlier
+    /// findings, then each this ingest emits (#304).
+    event_signatures: HashSet<String>,
     finding_ids: Vec<String>,
 }
 
@@ -6886,22 +6890,26 @@ impl<'a> ExternalIngest<'a> {
         feed: TraceInput,
     ) -> Result<Self, String> {
         let sandbox_metadata = prepared.runner.sandbox_metadata();
+        // An Ada finding replays and minimizes through the harness's own
+        // build, as the builtin engine's do (#304).
+        let fixture =
+            ada_main_beside_afl(&prepared.harness_path).unwrap_or(prepared.harness_path.clone());
         let mut emitter = with_harness_format(
             FindingEmitter::with_metadata_and_sandbox(
                 prepared.work_dir.clone(),
                 prepared.harness_id.clone(),
                 "unknown".to_owned(),
-                prepared.harness_path.display().to_string(),
+                fixture.display().to_string(),
                 serde_json::to_value(&sandbox_metadata)
                     .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
             )
             .with_mode(prepared.mode)
             .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
-            &prepared.harness_path,
+            &fixture,
             &prepared.work_dir,
             &prepared.harness_id,
         );
-        if let Some(identity) = build_binary_record(&prepared.harness_path) {
+        if let Some(identity) = build_binary_record(&fixture) {
             emitter = emitter.with_build_binary(identity);
         }
         let dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
@@ -6909,6 +6917,10 @@ impl<'a> ExternalIngest<'a> {
             &prepared.work_dir,
             &prepared.harness_id,
         ));
+        let event_signatures = ExistingFindings::load(&prepared.work_dir, &prepared.harness_id)
+            .signatures
+            .into_keys()
+            .collect();
         Ok(Self {
             prepared,
             engine,
@@ -6916,8 +6928,59 @@ impl<'a> ExternalIngest<'a> {
             feed,
             emitter,
             dedup,
+            event_signatures,
             finding_ids: Vec::new(),
         })
+    }
+
+    /// The findings an Ada harness's crashing `input` shows when it runs
+    /// again with the event log (#304): an exception that escaped the target,
+    /// or a predefined check the target swallowed, as the builtin engine
+    /// reports them. Under AFL++ the harness aborted on it
+    /// (`BHF_CRASH_ON_FINDING`), with no report of its own. Whether any was
+    /// new.
+    fn ada_findings(&mut self, input: &[u8], artifact: &str) -> Result<bool, String> {
+        let prepared = self.prepared;
+        let run = run_harness(
+            &prepared.runner,
+            &prepared.work_dir,
+            input,
+            &prepared.extra_env,
+            prepared.per_input_timeout,
+            prepared.rss_limit_mb,
+            prepared.deadline,
+        )?;
+        let mut emitted = false;
+        for testcase in &run.testcases {
+            for (handler_index, classification) in classify(testcase) {
+                let Some(handler) = resolve_handler(testcase, handler_index) else {
+                    continue;
+                };
+                // As the builtin engine filters them: a target rejecting an
+                // input with its own exception, or a stub body it reached.
+                if finding_tier(classification, &handler.as_ref().exception_name)
+                    == FindingTier::IntendedRejection
+                    || handler
+                        .as_ref()
+                        .exception_message
+                        .contains(crate::auto::ada_body_stub::STUB_RAISE_MARKER)
+                {
+                    continue;
+                }
+                let signature = compute_signature(testcase, handler.as_ref());
+                if !self.event_signatures.insert(signature.hex()) {
+                    continue;
+                }
+                let id = self
+                    .emitter
+                    .emit(input, testcase, handler_index)
+                    .map_err(|error| format!("emit {} finding: {error}", self.engine))?;
+                self.record_lineage(&id.0, artifact);
+                self.finding_ids.push(id.0);
+                emitted = true;
+            }
+        }
+        Ok(emitted)
     }
 
     /// Record the crashing `input` the engine saved as `artifact` (`crash
@@ -6931,10 +6994,24 @@ impl<'a> ExternalIngest<'a> {
         replay: &ExternalReplay<'_>,
     ) -> Result<(), String> {
         let prepared = self.prepared;
+        // An Ada harness aborts on an exception's top-level catch, which its
+        // event log describes and a signal does not.
+        if is_instrumented_ada_harness(&prepared.runner) && self.ada_findings(input, artifact)? {
+            return Ok(());
+        }
         let replayed = replay(input, &prepared.extra_env, None)
             .map_err(|error| format!("replay {artifact}: {error}"))?;
         let stderr = String::from_utf8_lossy(&replayed.stderr);
-        let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
+        // As in the builtin engine, a crash signal with no sanitizer report
+        // that is not the target rejecting the input is a reachable crash: a
+        // COBOL program's libcob runtime reports its own errors and faults
+        // (#302).
+        let report = corpus::parse_sanitizer_report(&stderr).or_else(|| {
+            (crate::fatal_signal::classify(&replayed.status, &stderr).is_some()
+                && !is_input_rejection(&replayed.status, &stderr))
+            .then(|| fatal_signal_report(&replayed.status, &stderr))
+        });
+        let Some(report) = report else {
             return Ok(());
         };
         let key = self.dedup.key(&report);
@@ -7174,6 +7251,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                     afl_fuzz.display()
                 );
             }
+        }
+        // An Ada harness catches every exception at its top level, which
+        // AFL++ would see as a clean run: it aborts there instead (#304).
+        if is_instrumented_ada_harness(&prepared.runner) {
+            afl_cmd.env("BHF_CRASH_ON_FINDING", "1");
         }
         afl_cmd
             .arg("--")
@@ -7635,13 +7717,25 @@ fn libfuzzer_binary_note(
 /// `build/<id>/obj/main`, so the sentinel is two levels up. Keyed on the sentinel
 /// (not the C-driver markers) so it can never flip C/C++ harness behavior, and so
 /// a GNAT that lacks trace-pc (no sentinel) cleanly degrades to no coverage.
+/// The Ada harness's own build (`build/<id>/obj/main`) beside its AFL++ build
+/// (`build/<id>/main_afl`, #304), if `harness` is one.
+fn ada_main_beside_afl(harness: &Path) -> Option<PathBuf> {
+    let build_dir = harness.parent()?;
+    let main = build_dir.join("obj").join("main");
+    (harness.file_name().is_some_and(|name| name == "main_afl")
+        && build_dir.join(crate::build::ADA_COV_SENTINEL).is_file()
+        && main.is_file())
+    .then_some(main)
+}
+
 fn is_instrumented_ada_harness(runner: &replay_min::HarnessRunner) -> bool {
+    // `build/<id>/obj/main`, or the AFL++ build staged in `build/<id>/` (#304).
     runner
         .harness_path()
-        .parent()
-        .and_then(|obj_dir| obj_dir.parent())
-        .map(|build_dir| build_dir.join(crate::build::ADA_COV_SENTINEL).is_file())
-        .unwrap_or(false)
+        .ancestors()
+        .skip(1)
+        .take(2)
+        .any(|dir| dir.join(crate::build::ADA_COV_SENTINEL).is_file())
 }
 
 /// Hard cap on a single libFuzzer-binary invocation. A fuzz input that
@@ -8405,14 +8499,35 @@ pub(crate) fn parse_sanitizer_args(
     }
     let mut out = Vec::new();
     for value in values {
+        if let Some(lane) = crate::auto::sanitizer_replay::ReplayLane::parse(value) {
+            return Err(format!(
+                "--sanitizers {lane}: it runs as a corpus replay through a build of its own, \
+                 which `bhf auto --sanitizers {lane}` does after its fuzz passes; `bhf fuzz` \
+                 fuzzes one build",
+                lane = lane.as_str()
+            ));
+        }
         let Some(sanitizer) = multicore_fuzz::Sanitizer::parse(value) else {
             return Err(format!(
-                "unknown sanitizer '{value}' (expected asan, msan, ubsan, tsan, lsan, or none)"
+                "unknown sanitizer '{value}' (expected asan, hwasan, msan, ubsan, tsan, lsan, or \
+                 none; `bhf auto` also takes cfi and realtime)"
             ));
         };
         if !out.contains(&sanitizer) {
             out.push(sanitizer);
         }
+    }
+    hwasan_host_check(&out, std::env::consts::ARCH)?;
+    // HWASan replaces ASan's shadow memory with pointer tags: clang refuses
+    // `-fsanitize=address,hwaddress`.
+    if out.contains(&multicore_fuzz::Sanitizer::Hwasan)
+        && out.contains(&multicore_fuzz::Sanitizer::Asan)
+    {
+        return Err(
+            "--sanitizers: hwasan cannot be combined with asan: it finds the same memory \
+             errors with pointer tags in place of ASan's shadow memory; pick one"
+                .to_owned(),
+        );
     }
     // MemorySanitizer and ThreadSanitizer each need a build of their own: no
     // other sanitizer links beside either (clang refuses
@@ -8437,6 +8552,21 @@ pub(crate) fn parse_sanitizer_args(
         }
     }
     Ok(SanitizerSelection::Set(out))
+}
+
+/// HWAddressSanitizer (#333) needs an AArch64 host: it keeps a tag in each
+/// pointer's top byte, which AArch64 ignores on every load and store (Top
+/// Byte Ignore) and other architectures do not, so its build fails or its
+/// runtime does not start anywhere else. `arch` is the host's.
+fn hwasan_host_check(sanitizers: &[multicore_fuzz::Sanitizer], arch: &str) -> Result<(), String> {
+    if !sanitizers.contains(&multicore_fuzz::Sanitizer::Hwasan) || arch == "aarch64" {
+        return Ok(());
+    }
+    Err(format!(
+        "--sanitizers hwasan needs an AArch64 host: HWAddressSanitizer keeps a tag in each \
+         pointer's top byte, which AArch64 ignores on every access and {arch} does not. Use \
+         --sanitizers asan on this host, or run on an AArch64 host"
+    ))
 }
 
 fn sanitizer_env_for(sanitizers: &[multicore_fuzz::Sanitizer]) -> Vec<(String, String)> {
@@ -8516,12 +8646,24 @@ pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
 /// of `abort_on_error=1`: the sanitizer exits non-zero after its report,
 /// which classifies it.
 pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
-    sanitizer_child_env_with(
+    let mut env = sanitizer_child_env_with(
         std::env::var("ASAN_OPTIONS").ok().as_deref(),
         std::env::var("UBSAN_OPTIONS").ok().as_deref(),
         leak,
         emulated,
-    )
+    );
+    // A HWASan build (#333) exists only on an AArch64 host, and runs natively
+    // there; it takes ASan's keys.
+    if cfg!(target_arch = "aarch64") && !emulated {
+        env.push((
+            "HWASAN_OPTIONS".to_owned(),
+            corpus::sanitizer_options::merge(
+                std::env::var("HWASAN_OPTIONS").ok().as_deref(),
+                &corpus::sanitizer_options::asan_required(leak, emulated),
+            ),
+        ));
+    }
+    env
 }
 
 /// [`sanitizer_child_env_for`] with the inherited `asan` and `ubsan` values:
@@ -8573,7 +8715,7 @@ fn in_loop_env(env: &[(String, String)], symbolize: bool) -> Vec<(String, String
     for (key, value) in env.iter_mut() {
         if matches!(
             key.as_str(),
-            "ASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
+            "ASAN_OPTIONS" | "HWASAN_OPTIONS" | "UBSAN_OPTIONS" | "MSAN_OPTIONS" | "TSAN_OPTIONS"
         ) {
             *value = corpus::sanitizer_options::merge(Some(value), "symbolize=0:abort_on_error=0");
         }
@@ -8696,6 +8838,7 @@ fn sanitizer_name(sanitizer: multicore_fuzz::Sanitizer) -> &'static str {
         multicore_fuzz::Sanitizer::Ubsan => "ubsan",
         multicore_fuzz::Sanitizer::Tsan => "tsan",
         multicore_fuzz::Sanitizer::Lsan => "lsan",
+        multicore_fuzz::Sanitizer::Hwasan => "hwasan",
     }
 }
 
@@ -10025,6 +10168,7 @@ fn hang_stack_env(extra_env: &[(String, String)], confirm: Duration) -> Vec<(Str
     env.push((HANG_REPORT_ENV.to_owned(), confirm.as_millis().to_string()));
     for key in [
         "ASAN_OPTIONS",
+        "HWASAN_OPTIONS",
         "UBSAN_OPTIONS",
         "MSAN_OPTIONS",
         "TSAN_OPTIONS",
@@ -13830,6 +13974,41 @@ mod parse_sanitizer_args_tests {
         assert_eq!(parse(&["NONE"]).unwrap(), SanitizerSelection::None);
     }
 
+    /// #297: `cfi` is `bhf auto`'s corpus replay, and `bhf fuzz` says so.
+    #[test]
+    fn cfi_is_refused_with_the_auto_lane_named() {
+        let error = parse(&["asan", "cfi"]).unwrap_err();
+        assert!(error.contains("bhf auto --sanitizers cfi"), "{error}");
+    }
+
+    /// #333: HWASan needs an AArch64 host; on any other the selection is
+    /// refused with the reason and what to use instead.
+    #[test]
+    fn hwasan_is_refused_off_aarch64_and_never_beside_asan() {
+        use super::hwasan_host_check;
+        let error =
+            hwasan_host_check(&[Sanitizer::Hwasan, Sanitizer::Ubsan], "x86_64").unwrap_err();
+        assert!(error.contains("needs an AArch64 host"), "{error}");
+        assert!(error.contains("x86_64 does not"), "{error}");
+        assert!(error.contains("--sanitizers asan"), "{error}");
+        assert_eq!(hwasan_host_check(&[Sanitizer::Hwasan], "aarch64"), Ok(()));
+        assert_eq!(hwasan_host_check(&[Sanitizer::Asan], "x86_64"), Ok(()));
+        if std::env::consts::ARCH == "aarch64" {
+            assert_eq!(
+                parse(&["hwaddress", "ubsan"]).unwrap(),
+                SanitizerSelection::Set(vec![Sanitizer::Hwasan, Sanitizer::Ubsan])
+            );
+            let error = parse(&["hwasan", "asan"]).unwrap_err();
+            assert!(
+                error.contains("hwasan cannot be combined with asan"),
+                "{error}"
+            );
+        } else {
+            let error = parse(&["hwaddress"]).unwrap_err();
+            assert!(error.contains("needs an AArch64 host"), "{error}");
+        }
+    }
+
     #[test]
     fn none_mixed_with_a_sanitizer_is_an_error() {
         // `none` is contradictory with a real sanitizer — reject, don't silently
@@ -15833,7 +16012,12 @@ exit 0
             Some("abort_on_error=1:symbolize=1:handle_abort=1")
         );
         assert_eq!(value("BHF_COV_SHM"), Some("/dev/shm/x"));
-        for key in ["UBSAN_OPTIONS", "MSAN_OPTIONS", "TSAN_OPTIONS"] {
+        for key in [
+            "HWASAN_OPTIONS",
+            "UBSAN_OPTIONS",
+            "MSAN_OPTIONS",
+            "TSAN_OPTIONS",
+        ] {
             assert!(
                 value(key).is_some_and(|options| options.ends_with("handle_abort=1")),
                 "{key}: {env:?}"

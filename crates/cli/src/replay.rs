@@ -690,6 +690,14 @@ pub(crate) fn replay_env(
     // debuginfod server (`DEBUGINFOD_URLS`, set on stock Ubuntu) and can wait
     // on it past the replay timeout. Local symbolization still names frames.
     env.push(("DEBUGINFOD_URLS".to_owned(), String::new()));
+    // A RealtimeSanitizer build comes from a newer clang than the host's
+    // default: name a symbolizer it can run, so its report names frames.
+    if crate::auto::sanitizer_replay::llvm_symbolizer().is_some() {
+        env.push((
+            "RTSAN_OPTIONS".to_owned(),
+            crate::auto::sanitizer_replay::with_symbolizer(""),
+        ));
+    }
     if input == CInput::Stdin {
         return env;
     }

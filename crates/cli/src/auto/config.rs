@@ -46,6 +46,9 @@ pub struct AutoConfig {
     pub seed_file: Option<Vec<PathBuf>>,
     pub seed_dir: Option<Vec<PathBuf>>,
     pub sanitizers: Option<Vec<String>>,
+    /// `--nonblocking`: the targets the RealtimeSanitizer replay runs in a
+    /// real-time context.
+    pub nonblocking: Option<Vec<String>>,
     pub engine: Option<String>,
     pub languages: Option<Vec<String>>,
     pub project: Option<PathBuf>,
@@ -101,6 +104,7 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ("seed-file", "seed-file"),
     ("seed-dir", "seed-dir"),
     ("sanitizers", "sanitizers"),
+    ("nonblocking", "nonblocking"),
     ("engine", "engine"),
     ("languages", "languages"),
     ("project", "project"),
@@ -399,6 +403,11 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             args.sanitizers = v;
         }
     }
+    if let Some(v) = config.nonblocking {
+        if args.nonblocking.is_empty() {
+            args.nonblocking = v;
+        }
+    }
     if let Some(v) = config.engine {
         if fills(args, "engine") {
             args.engine = v;
@@ -552,6 +561,7 @@ mod tests {
             | "seed-file"
             | "seed-dir"
             | "sanitizers"
+            | "nonblocking"
             | "languages"
             | "ada-deps"
             | "cflags"
@@ -876,19 +886,29 @@ mod tests {
         std::fs::write(
             tree.path().join(CONFIG_FILE_NAME),
             "sanitizers = [\"asan\"]\nengine = \"builtin,afl++\"\nlanguages = [\"c\", \"cpp\"]\n\
-             passes = \"fuzz_driven\"\n",
+             passes = \"fuzz_driven\"\nnonblocking = [\"sensor_task\"]\n",
         )
         .unwrap();
         let mut args = parse_auto_args(&["bhf", "tree"]);
         apply(&mut args, tree.path()).unwrap();
         assert_eq!(args.sanitizers, ["asan"]);
+        assert_eq!(args.nonblocking, ["sensor_task"]);
         assert_eq!(args.engine, "builtin,afl++");
         assert_eq!(args.languages.len(), 2);
         assert_eq!(args.passes.as_deref(), Some("fuzz_driven"));
 
-        let mut args = parse_auto_args(&["bhf", "tree", "--languages", "ada", "--single-pass"]);
+        let mut args = parse_auto_args(&[
+            "bhf",
+            "tree",
+            "--languages",
+            "ada",
+            "--single-pass",
+            "--nonblocking",
+            "isr_uart",
+        ]);
         apply(&mut args, tree.path()).unwrap();
         assert_eq!(args.languages.len(), 1, "the CLI wins");
+        assert_eq!(args.nonblocking, ["isr_uart"], "the CLI wins");
         assert_eq!(args.passes, None, "--single-pass is not overridden");
 
         std::fs::write(

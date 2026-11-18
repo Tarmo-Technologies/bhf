@@ -407,7 +407,7 @@ already be installed on the offline host:
 | Ruby | Ruby 2.0+ | `TracePoint` coverage + interpreter fuzz |
 | Lua | Lua 5.3+ (`lua`/`luac`) | line-hook coverage + interpreter fuzz |
 | PHP | PHP 8.0+; `pcov` recommended | syntax check + interpreter fuzz (`pcov` coverage or black-box fallback) |
-| AFL++ engine (optional, C/C++ only) | `afl-fuzz`, `afl-clang-fast` | alternate fuzz engine for native C/C++ targets only |
+| AFL++ engine (optional) | `afl-fuzz`, `afl-clang-fast` | alternate fuzz engine for native C/C++, COBOL, Fortran, Rust and Ada targets |
 
 Stage these from your distribution's offline package mirror or a pre-downloaded
 `.deb`/`.rpm` bundle (e.g. `apt-get install --download-only` on a connected

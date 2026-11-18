@@ -695,6 +695,68 @@ fn ada_compiler_adapter(args: &BuildArgs) -> Result<CompilerAdapter, String> {
     ))
 }
 
+/// AFL++'s compiler runtime (`afl-compiler-rt.o`): its fork server, the
+/// shared map and the guard functions. In `AFL_PATH`, else beside the
+/// `afl-fuzz` on PATH (`<prefix>/lib/afl`), else a distribution's
+/// `/usr/lib/afl` or `/usr/local/lib/afl`.
+pub(crate) fn afl_compiler_runtime() -> Option<PathBuf> {
+    const RUNTIME: &str = "afl-compiler-rt.o";
+    let from_env = std::env::var_os("AFL_PATH").map(PathBuf::from);
+    let beside_afl_fuzz = which::which("afl-fuzz").ok().and_then(|afl_fuzz| {
+        let prefix = std::fs::canonicalize(afl_fuzz)
+            .ok()?
+            .parent()?
+            .parent()?
+            .to_path_buf();
+        Some(prefix.join("lib").join("afl"))
+    });
+    from_env
+        .into_iter()
+        .chain(beside_afl_fuzz)
+        .chain(["/usr/local/lib/afl", "/usr/lib/afl"].map(PathBuf::from))
+        .map(|dir| dir.join(RUNTIME))
+        .find(|runtime| runtime.is_file())
+}
+
+/// The AFL++ build of an Ada harness (#304): the objects its `main` build
+/// compiled, linked again with AFL++'s runtime into `build/<id>/main_afl`,
+/// where `bhf fuzz --engine afl++` takes it. AFL++'s fork server starts it,
+/// and the Ada coverage runtime forwards its trace-pc edges into AFL++'s map
+/// once the runtime is linked. AFL++'s GCC plugin is not used: a
+/// distribution's plugin is built for one GCC point release and refuses to
+/// load into another.
+pub(crate) fn try_ada_afl_build(args: &BuildArgs) -> Result<(), String> {
+    let runtime = afl_compiler_runtime().ok_or_else(|| {
+        "AFL++'s afl-compiler-rt.o was not found (set AFL_PATH to its directory)".to_owned()
+    })?;
+    let harness_id = args
+        .harness
+        .as_deref()
+        .ok_or_else(|| "no harness to build for AFL++".to_owned())?;
+    let build_dir = args.work_dir.join("build").join(harness_id);
+    let adapter = ada_compiler_adapter(args)?;
+    let extra = [
+        "-o".to_owned(),
+        "main_afl".to_owned(),
+        "-largs".to_owned(),
+        runtime.display().to_string(),
+        "-lpthread".to_owned(),
+        "-ldl".to_owned(),
+        "-lrt".to_owned(),
+    ];
+    let result = adapter
+        .build_with_args(&build_dir.join("bhf_build.gpr"), &extra)
+        .map_err(|error| format!("gprbuild for main_afl: {error}"))?;
+    if result.exit_code != 0 {
+        return Err(format!("{}\n{}", result.stderr, result.stdout));
+    }
+    std::fs::rename(
+        build_dir.join("obj").join("main_afl"),
+        build_dir.join("main_afl"),
+    )
+    .map_err(|error| format!("stage main_afl: {error}"))
+}
+
 /// Whether `dir` directly contains at least one C source file (`.c`). Used to
 /// decide whether the generated Ada project must also declare the C language so
 /// gprbuild compiles + links the C glue a real Ada library binds to. Non-recursive
@@ -2684,7 +2746,7 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
 
 /// The result of a `make` that could not be started (not installed, or not
 /// on PATH): a failed build whose output says why, instead of a panic.
-fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
+pub(crate) fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
     #[cfg(unix)]
     let status = std::os::unix::process::ExitStatusExt::from_raw(127 << 8);
     #[cfg(windows)]
@@ -2995,7 +3057,7 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
     extra_includes: &[PathBuf],
 ) -> std::process::Output {
     let (target, _staged) = afl_make_target_and_artifact();
-    try_run_c_make_build_with_target(
+    try_run_c_make_build_with_target_and_ldflags(
         work_dir,
         harness_id,
         extra_sources,
@@ -3003,7 +3065,26 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
         None,
         target,
         None,
+        lane_ldflags(work_dir, harness_id).as_deref(),
     )
+}
+
+/// The file a lane that links its harness with flags of its own (libcob for
+/// COBOL, the gfortran runtime and objects for Fortran) records them in, so
+/// its AFL++ builds link the same way (#302).
+pub(crate) const LANE_LDFLAGS_FILE: &str = "lane-ldflags.txt";
+
+/// Record the link flags a lane's `main` build used.
+pub(crate) fn record_lane_ldflags(harness_dir: &Path, ldflags: &str) {
+    let _ = std::fs::write(harness_dir.join(LANE_LDFLAGS_FILE), ldflags);
+}
+
+/// The link flags a lane recorded for this harness, if any.
+fn lane_ldflags(work_dir: &Path, harness_id: &str) -> Option<String> {
+    std::fs::read_to_string(
+        crate::auto::layout::harness_dir(work_dir, harness_id).join(LANE_LDFLAGS_FILE),
+    )
+    .ok()
 }
 
 /// The CmpLog build afl-fuzz runs beside `main_afl` (`-c`, #274): the
@@ -3019,7 +3100,7 @@ pub(crate) fn try_run_c_make_afl_cmplog_build_with_extras(
     extra_sources: &[PathBuf],
     extra_includes: &[PathBuf],
 ) -> std::process::Output {
-    try_run_c_make_build_with_target(
+    try_run_c_make_build_with_target_and_ldflags(
         work_dir,
         harness_id,
         extra_sources,
@@ -3027,6 +3108,7 @@ pub(crate) fn try_run_c_make_afl_cmplog_build_with_extras(
         None,
         Some("afl_cmplog"),
         None,
+        lane_ldflags(work_dir, harness_id).as_deref(),
     )
 }
 

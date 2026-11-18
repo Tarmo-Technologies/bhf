@@ -70,6 +70,20 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada harness given its input as a file on stdin reads it once (#304).
+  Each loop reopened `/dev/stdin`, which starts a regular file over, so the
+  harness read the same input until it was killed.
+- A COBOL finding is placed at the COBOL line libcob named (#424). Its
+  location's file was the attributed message up to that line, as the
+  report took the site from the message's prefix; the attribution now
+  records it as the exception's source, which comes first.
+- An Ada record parameter whose components are not integers builds (#418).
+  An `out` record is declared without an initializer, an `in` record's
+  constrained String and enumeration components are decoded as their own
+  types (the tree lists a package's types twice, which had left them
+  defaulted), a component with no known neutral defaults with `<>` instead
+  of `0`, and a discriminant takes one of its static values, which an
+  aggregate needs for a variant part.
 - An Ada target whose project `with`s sibling library projects builds (#287).
   Staging copied the siblings' units into src_instrumented beside the projects
   that own them, and gprbuild refused the second owner (`unit "X" cannot belong
@@ -2839,6 +2853,71 @@
   when bhf panics.
 
 ### Added
+- A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
+  report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
+  write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's
+  security widget. The template fuzzes a merge request's changes, keeps the
+  corpus and stored findings in the cache, and sweeps the whole tree on a
+  schedule.
+- The bhf-pr action takes a `mode` (#319): `pr` (the diff-scoped gate, the
+  default), `batch` (the whole tree), `prune` (rebuild the harnesses and keep
+  each corpus's inputs that add coverage) and `coverage` (the run's line
+  coverage, with `results/coverage/` as an artifact). A scheduled example
+  workflow runs batch, prune and coverage in turn on the shared corpus cache.
+- The bhf-pr action keeps its work between runs (#317): with
+  `corpus-cache` (default on), it restores the corpus, the discovery cache
+  and the stored findings of the newest cache of the PR's branch, else of
+  the base branch, into `corpus-dir` before the run, says what it restored,
+  and saves them after it. Its run step is `scripts/run-bhf.sh`.
+- `bhf ci` replays stored findings against the run's build before it judges
+  the run (#318): a finding that still reproduces fails the gate, and one
+  that no longer does is reported fixed. A work dir restored from a cache
+  keeps its last findings in `regressions/`, one per root cause, and
+  `--regressions <DIR>` adds more; their minimized inputs seed the run, and
+  `--ci-json` lists the ids that reproduced, were fixed or were not
+  replayed.
+- `bhf auto --engine afl++` runs Ada targets under AFL++ (#304). The
+  harness's objects link again with AFL++'s runtime into
+  `build/<id>/main_afl`; the Ada coverage runtime forwards its trace-pc edges
+  into AFL++'s map, an exception that escapes the target aborts it
+  (`BHF_CRASH_ON_FINDING`), and each crash AFL++ saves is replayed with the
+  event log and reported, minimized and replayed as the builtin engine's
+  are. AFL++'s GCC plugin is not used: a distribution's plugin refuses a GCC
+  of another point release.
+- `bhf auto --engine afl++` runs Rust targets under AFL++ (#303). A Rust
+  harness's `build-afl.sh` builds its crate again with bhf's trace-pc-guard
+  instrumentation and links the staticlib with afl-clang-fast and a persistent
+  driver, as cargo-afl links a crate; the same binary is the CmpLog build.
+  The build's target tree is removed after it.
+- `bhf auto --engine afl++` runs COBOL and Fortran targets under AFL++
+  (#302). Their C glue builds with afl-clang-fast and links as the lane's
+  `main` does (`lane-ldflags.txt`), the passthrough driver has an AFL++
+  persistent loop, and gfortran's trace-pc edges reach AFL++'s map through a
+  guard table of the driver's own. A crash AFL++ saves with no sanitizer
+  report, as a COBOL program's libcob error is, is a reachable-crash finding
+  as it is under the builtin engine.
+- `--sanitizers hwasan` (`hwaddress`) builds the fuzzed C/C++ harness with
+  HWAddressSanitizer in place of ASan on an AArch64 host (#333). Its reports
+  are findings under the rule ASan gives the same bug, the kind taken from the
+  report's first specific `Cause:`, and `HWASAN_OPTIONS` is merged as
+  `ASAN_OPTIONS` is. It is refused beside `asan` and, with the reason, on any
+  other host.
+- `bhf auto --sanitizers ...,realtime` replays the corpus of each target that
+  must not block through a RealtimeSanitizer build (`make rtsan`, clang 20+
+  `-fsanitize=realtime`) after the fuzz passes (#298). The marked target runs
+  in a real-time context, and an allocation, lock, sleep or system call made
+  there is a BHF-232 (CWE-1322) finding that `bhf replay` reproduces with that
+  build. `--nonblocking <entry-points | all | NAME>` picks the targets; the
+  default marks interrupt handlers and RTOS task bodies. Without clang 20 the
+  lane is skipped and the run says so.
+- `bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
+  control-flow integrity build (`make cfi`, clang `-fsanitize=cfi -flto
+  -fvisibility=hidden`, reporting through the UBSan runtime) after the fuzz
+  passes (#297). A cast to the wrong class or a call through a function
+  pointer or vtable of the wrong type is a BHF-221 finding that `bhf replay`
+  reproduces with that build; a harness whose CFI build fails is named.
+  `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
+  no lane of the run could observe in its C/C++ targets, and what would.
 - Ada harnesses get a coverage report too (#310): the replay records the PC
   of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
   runtime), takes the binary's calls to the callback as the instrumented
