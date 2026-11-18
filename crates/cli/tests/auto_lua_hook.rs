@@ -112,10 +112,16 @@ fn a_stack_overflow_is_located_in_the_target() {
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("walk.lua"), WALK).unwrap();
+    // The test is where the overflow is located, not whether mutation finds
+    // the `[`: a seed takes the path, so a loaded runner cannot miss it.
+    let seed = root.join("seed.bin");
+    std::fs::write(&seed, b"[x").unwrap();
     let work = root.join("work");
     let started = Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(["auto", "--work-dir", work.to_str().unwrap()])
+        .arg("--seed-file")
+        .arg(&seed)
         .args([
             "--languages",
             "lua",
