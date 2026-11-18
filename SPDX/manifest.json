@@ -1811,6 +1811,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/export_regression.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/export_regression_ada.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/extension.rs",
       "license": "Apache-2.0"
     },
@@ -1896,6 +1904,10 @@
     },
     {
       "path": "crates/cli/src/introspect.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/launch_spec.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2679,6 +2691,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_msan_cpp.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_msan_finding_replay.rs",
       "license": "Apache-2.0"
     },
@@ -3016,6 +3032,10 @@
     },
     {
       "path": "crates/cli/tests/explain_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/export_regression.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5079,6 +5099,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docker/fixtures/binary-only/gate.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docker/fixtures/c-core/packet.c",
       "license": "Apache-2.0"
     },
@@ -6132,6 +6156,10 @@
     },
     {
       "path": "tests/fixtures/real_code_validation/manifest.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/regression_c/tag.c",
       "license": "Apache-2.0"
     },
     {
