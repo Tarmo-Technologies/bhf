@@ -1719,6 +1719,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/board_profile.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/build.rs",
       "license": "Apache-2.0"
     },
@@ -1816,6 +1820,18 @@
     },
     {
       "path": "crates/cli/src/fuzz/collector_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/fuzz/honggfuzz.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/fuzz/libafl.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/fuzz/libfuzzer.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2147,6 +2163,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_ada_coverage_report.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_ada_deep_workdir.rs",
       "license": "Apache-2.0"
     },
@@ -2172,6 +2192,14 @@
     },
     {
       "path": "crates/cli/tests/auto_ada_parallel.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_ada_vendored_runtime.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_ada_withed_projects.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2283,6 +2311,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_comparison_blockers.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_comparison_progress.rs",
       "license": "Apache-2.0"
     },
@@ -2300,6 +2332,10 @@
     },
     {
       "path": "crates/cli/tests/auto_constant_shell_command.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_coverage_report.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2983,11 +3019,23 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_honggfuzz_engine.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_interrupt_cleanup.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/cli/tests/fuzz_lane_flag_conflicts.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_libafl_engine.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_libfuzzer_engine.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5099,6 +5147,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/hil-boards/nucleo-f411re.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/hil-bringup.md",
       "license": "Apache-2.0"
     },
@@ -5452,6 +5504,14 @@
     },
     {
       "path": "docs/validation/2026-11-17-zoxide-incrate-parity.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-ada3-withed-projects.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-18-ada4-vendored-runtime.md",
       "license": "Apache-2.0"
     },
     {
