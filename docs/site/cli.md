@@ -2233,6 +2233,65 @@ reset-command = "./reset-case"
 Any unknown field (a typo) is still rejected at parse time by
 `deny-unknown-fields`, keeping the on-disk format strict.
 
+### Importing an OSS-Fuzz build
+
+`bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
+ClusterFuzzLite integration and collects the fuzzers its `build.sh` leaves in
+`$OUT`:
+
+```sh
+# A source tree with its own build.sh (or .clusterfuzzlite/build.sh):
+bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+
+# An OSS-Fuzz projects/<name>/ directory, and the checkout it builds:
+bhf project import-ossfuzz oss-fuzz/projects/libfoo --src path/to/libfoo \
+  --work-dir bhf_work
+```
+
+`build.sh` runs as OSS-Fuzz runs it, `bash -eux $SRC/build.sh` from
+`$SRC/<name>`, with the OSS-Fuzz build variables:
+
+| Variable | Value |
+|---|---|
+| `$SRC` | `<work>/ossfuzz/src`. The source tree is copied to `$SRC/<name>` (`--name`; by default the tree's directory name), and the script to `$SRC/build.sh` (`--build-script` names another) |
+| `$WORK` | `<work>/ossfuzz/work`, for intermediate files |
+| `$OUT` | `<work>/ossfuzz/out`, where the fuzzers go |
+| `$CC`, `$CXX` (`$CCC`) | clang and clang++ |
+| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link` |
+| `$LIB_FUZZING_ENGINE` | `<work>/ossfuzz/engine/libFuzzingEngine.a`: bhf's driver, the `main` and coverage runtime a generated harness links, with a `bhf_run_one` that calls the target's `LLVMFuzzerTestOneInput` |
+| `$SANITIZER`, `$FUZZING_ENGINE`, `$FUZZING_LANGUAGE`, `$ARCHITECTURE` | `address`, `libfuzzer`, `c++`, and the host's architecture |
+
+Nothing else of bhf's environment reaches the build: `PATH` is kept, `HOME`
+is `$WORK`, `TMPDIR` is `$WORK/tmp`, and `ASAN_OPTIONS` turns leak detection
+off for the build, as OSS-Fuzz does. `$SRC`, `$WORK` and `$OUT` are emptied
+before each import, and the source tree itself is never written.
+
+**Sandbox.** `build.sh` runs project code, so it runs in bubblewrap (`bwrap`)
+or, without that, firejail, with no network and no writes outside `$SRC`,
+`$WORK` and `$OUT`. Under bubblewrap the build sees the system directories
+(`/usr`, `/etc`, `/opt`, ...) and bhf's engine read-only and the three
+directories read-write, with an empty, read-only `/tmp` and no home
+directory. Under firejail the whole filesystem is read-only except the three
+directories. Before anything is staged, bhf runs the sandbox once with the
+build's mounts; when no sandbox works it refuses the import and says which
+tool is missing or why it failed. An unprivileged `bwrap` on Ubuntu 24.04
+gets no user namespace while `kernel.apparmor_restrict_unprivileged_userns`
+is 1 and no AppArmor profile allows it. `--sandbox bubblewrap` or
+`--sandbox firejail` picks one, `--sandbox-tool` names its executable, and
+`--sandbox none` runs `build.sh` directly, with your network and file
+access.
+
+**Fuzzers.** The fuzzers are the files in `$OUT`, and in its
+subdirectories, that OSS-Fuzz takes for fuzz targets: executable regular
+files named `[A-Za-z0-9_-]+`, with no extension or `.exe`, not
+`jazzer_driver*`, whose name ends in `_fuzzer` or whose bytes contain
+`LLVMFuzzerTestOneInput`. A tool the build leaves beside them is not one.
+The import lists them, writes the import record to
+`<work>/ossfuzz/import.json` (`--json` prints it), and keeps the build's
+output in `<work>/ossfuzz/build.log`. A failing `build.sh` fails the import
+with the end of that log. A target linked with `-fsanitize=fuzzer` instead
+of `$LIB_FUZZING_ENGINE` is listed as a `libFuzzer single input` binary.
+
 ## Out-of-Process Extensions
 
 `bhf extension` drives an explicitly-trusted, **out-of-process** extension that

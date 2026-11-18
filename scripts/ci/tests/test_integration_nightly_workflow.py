@@ -344,7 +344,7 @@ class IntegrationNightlyWinaflTests(unittest.TestCase):
         self.assertIn("name: Integration tests (bhf) (WinAFL, Windows)", self.job)
         self.assertIn("runs-on: windows-2022", self.job)
         report = job_block("report-failure")
-        self.assertIn("needs: [gate, build, integration, binary-analyzers, winafl]", report)
+        self.assertIn("needs: [gate, build, integration, binary-analyzers, ossfuzz-sandbox, winafl]", report)
         self.assertIn("needs.winafl.result == 'failure'", report)
 
     def test_a_cache_hit_skips_the_build(self) -> None:
@@ -413,6 +413,47 @@ class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
         )
         tests = (ROOT / "crates/cli/tests/binary_adapter_tools.rs").read_text()
         self.assertIn('eprintln!("skip binary_adapter_tools: set BHF_BINARY_ANALYZERS=1");', tests)
+
+
+class IntegrationNightlyOssfuzzSandboxTests(unittest.TestCase):
+    """The OSS-Fuzz import's sandbox tests run nightly under a bubblewrap
+    allowed its namespaces on that job's runner only (#334)."""
+
+    def setUp(self) -> None:
+        self.job = job_block("ossfuzz-sandbox")
+
+    def test_the_job_counts_as_an_integration_shard_and_reports_its_failure(self) -> None:
+        self.assertIn("name: Integration tests (bhf) (OSS-Fuzz import sandbox)", self.job)
+        self.assertIn("    needs: [gate, build]\n", self.job)
+        report = job_block("report-failure")
+        self.assertIn("needs.ossfuzz-sandbox.result == 'failure'", report)
+        self.assertIn("needs.ossfuzz-sandbox.result == 'cancelled'", report)
+
+    def test_it_gives_bubblewrap_its_namespaces_before_the_tests_require_it(self) -> None:
+        install = self.job.index("sudo apt-get install -y -q --no-install-recommends bubblewrap")
+        sysctl = self.job.index("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+        probe = self.job.index("bwrap --die-with-parent --unshare-all --ro-bind / / -- true")
+        tests = self.job.index("-E 'binary(=ossfuzz_import)'")
+        self.assertLess(install, sysctl)
+        self.assertLess(sysctl, probe)
+        self.assertLess(probe, tests)
+        self.assertIn(f"cargo nextest run {ARCHIVE} \\\n", self.job)
+        self.assertIn('BHF_OSSFUZZ_SANDBOX: "1"', self.job)
+        self.assertIn('BHF_REQUIRE_TOOLS: "1"', self.job)
+        # Only this job's runner: no other job lifts the restriction.
+        source = WORKFLOW.read_text()
+        self.assertEqual(source.count("apparmor_restrict_unprivileged_userns=0"), 1)
+
+    def test_the_hash_shards_may_skip_only_the_sandbox_tests(self) -> None:
+        allowed = (ROOT / "scripts/ci/allowed-skips.txt").read_text()
+        self.assertIn(
+            "bhf::ossfuzz_import::build_sh_*  skip build_sh_*: no working bubblewrap or firejail "
+            "here (set BHF_OSSFUZZ_SANDBOX=1 to require one)",
+            allowed,
+        )
+        tests = (ROOT / "crates/cli/tests/ossfuzz_import.rs").read_text()
+        self.assertIn('const SANDBOX_REQUIRED: &str = "BHF_OSSFUZZ_SANDBOX";', tests)
+        self.assertIn("no working bubblewrap or firejail here (set {SANDBOX_REQUIRED}=1", tests)
 
 
 if __name__ == "__main__":

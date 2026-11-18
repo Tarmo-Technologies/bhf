@@ -2,7 +2,8 @@
 
 //! `bhf project <validate|list|run>` — define, validate, and run an external
 //! project/target-profile manifest (`bhf.project.v1`) kept entirely outside the
-//! bhf source tree.
+//! bhf source tree. `bhf project import-ossfuzz` builds a project's existing
+//! OSS-Fuzz integration instead ([`crate::ossfuzz_import`]).
 //!
 //! This module is the only bridge between the pure [`project_profile`] crate
 //! (parse / validate / resolve+hash / lower) and the existing fuzzing engines
@@ -68,6 +69,8 @@ pub enum ProjectCommand {
     List(ListArgs),
     /// Materialize an isolated work directory from a target, resolve+hash its assets, write provenance, and run its campaign on the configured engine (builtin/afl++ or binary)
     Run(RunArgs),
+    /// Run a project's OSS-Fuzz build.sh in a sandbox (no network, writes only to $SRC, $WORK and $OUT) with the OSS-Fuzz build variables ($CC, $CXX, $CFLAGS, $CXXFLAGS, $LIB_FUZZING_ENGINE, $SRC, $WORK, $OUT), $LIB_FUZZING_ENGINE being bhf's own driver, and collect the fuzzers it leaves in $OUT
+    ImportOssfuzz(crate::ossfuzz_import::ImportArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -129,6 +132,7 @@ pub fn run(args: ProjectArgs) -> i32 {
     match args.command {
         ProjectCommand::Validate(a) => code_for(run_validate(&a)),
         ProjectCommand::List(a) => code_for(run_list(&a)),
+        ProjectCommand::ImportOssfuzz(a) => code_for(crate::ossfuzz_import::run(&a)),
         ProjectCommand::Run(a) => match run_run(&a) {
             Ok(code) => code,
             Err(error) => {

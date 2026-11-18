@@ -13,6 +13,9 @@ triage tools. This page describes three routes:
    need, then edit its `bhf_run_one` body.
 3. Fuzz an executable you cannot rebuild as a binary-only target.
 
+A project with an OSS-Fuzz or ClusterFuzzLite integration needs none of
+them: see [Import an OSS-Fuzz build](#import-an-oss-fuzz-build).
+
 All commands below use one work directory, `bhf_work`. Generate harnesses
 into `bhf_work/harnesses/<id>/`, the layout `bhf auto` uses. `bhf build`,
 `bhf fuzz`, `bhf explain` and `bhf capsule` find a harness there from the work
@@ -316,6 +319,24 @@ back.
 In a `bhf project` manifest, such an executable uses `engine = "binary"`.
 `engine = "builtin"` and `engine = "afl++"` expect a bhf harness binary, built
 from a harness directory bhf generated.
+
+## Import an OSS-Fuzz build
+
+A project with an OSS-Fuzz or ClusterFuzzLite integration already has
+`LLVMFuzzerTestOneInput` fuzz targets and a `build.sh` that builds them.
+`bhf project import-ossfuzz` runs that `build.sh` with `$LIB_FUZZING_ENGINE`
+set to bhf's driver, so every fuzz target it links is a bhf harness, with no
+`--extra-source` wiring and nothing regenerated:
+
+```sh
+bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+```
+
+`build.sh` runs in bubblewrap or firejail, without network and with writes
+confined to `$SRC`, `$WORK` and `$OUT`, and the import refuses to run it when
+neither works (`--sandbox none` runs it directly). The variables it gets and
+the sandbox are described in the
+[CLI reference](cli.md#importing-an-oss-fuzz-build).
 
 ## Pitfalls
 

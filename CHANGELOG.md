@@ -2892,6 +2892,21 @@
   byte mutation alone breaks. Seeds are repaired the same way and the
   message's own frame is a seed. Before, only the session lane used the frame
   fix-ups.
+- `bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
+  ClusterFuzzLite integration (#334). It runs the project's `build.sh` as
+  OSS-Fuzz does, `bash -eux $SRC/build.sh` from `$SRC/<name>`, with the
+  OSS-Fuzz build variables: `$SRC`, `$WORK` and `$OUT` under
+  `<work>/ossfuzz/`, clang as `$CC`/`$CXX`, OSS-Fuzz's address-sanitizer
+  `$CFLAGS`/`$CXXFLAGS` with the coverage bhf's driver reads, and
+  `$LIB_FUZZING_ENGINE` an archive of bhf's own driver, so every fuzz target
+  the build links is a bhf harness. The build runs in bubblewrap or
+  firejail, with no network and no writes outside `$SRC`, `$WORK` and `$OUT`,
+  and with nothing of bhf's environment beyond the build contract; the
+  import is refused, naming the missing tool or why it failed, when no
+  sandbox works, and `--sandbox none` runs it directly. The fuzzers are
+  collected from `$OUT` by OSS-Fuzz's own rule. The nightly runs the
+  sandbox tests in a job of their own that lets bubblewrap create its
+  namespaces, which the hosted Ubuntu 24.04 image denies.
 - The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
   no AddressSanitizer, so there the Fortran objects are compiled with
   gfortran's bounds and pointer checks, a failed check is a crash instead of
