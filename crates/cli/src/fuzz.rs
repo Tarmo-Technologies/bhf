@@ -5236,10 +5236,25 @@ fn run_builtin_with_progress(
     // The empty input always runs in a fresh process (an empty frame ends the
     // framed loop in some drivers). Run it once per pass and reuse the result.
     let mut empty_input_run: Option<HarnessRun> = None;
-    // #314, #373: an extension's mutation and codec stages.
-    let mut extension_stage = prepared.extension_manifest.as_deref().and_then(|manifest| {
-        extension_stage::ExtensionStage::open(manifest, &prepared.harness_id, prepared.time)
-    });
+    // #314, #373, #374: an extension's mutation, codec and lifecycle stages,
+    // set up before the first case (a failed setup stops the pass).
+    let mut extension_stage = match prepared.extension_manifest.as_deref() {
+        Some(manifest) => {
+            let root = prepared
+                .work_dir
+                .join("fuzz_scratch")
+                .join(format!("extension-{}", prepared.harness_id));
+            fs::create_dir_all(&root)
+                .map_err(|error| format!("create {}: {error}", root.display()))?;
+            extension_stage::ExtensionStage::open(
+                manifest,
+                &prepared.harness_id,
+                &root,
+                prepared.time,
+            )?
+        }
+        None => None,
+    };
     for iteration in 0..prepared.iterations {
         if prepared
             .time
@@ -5356,6 +5371,11 @@ fn run_builtin_with_progress(
         // "no input"), so they always go through the per-spawn path; everything
         // else uses the persistent fork-server when enabled, falling back to a
         // per-spawn run (and respawning the server) on a hard crash.
+        // #374: the extension's `lifecycle.reset` between cases; a failed
+        // reset stops the campaign.
+        if let Some(stage) = extension_stage.as_mut() {
+            stage.before_case()?;
+        }
         // #420: zero the per-exec hit-count map so THIS exec's edge hit counts
         // are recorded in isolation, then read back via `input_grew_buckets()`
         // after the exec. Placed AFTER #400 colorization / cmplog capture (which
@@ -6092,7 +6112,8 @@ fn run_builtin_with_progress(
     // When `--extension <manifest>` is set, drive the just-retained corpus
     // through the explicitly-trusted extension's out-of-process
     // `oracle.evaluate`. Runs AFTER the campaign; the loop's own extension
-    // stages (mutation, codec) finish first and are reported beside it as `stages`. An extension fault is bounded infrastructure that
+    // stages (mutation, codec, lifecycle) are torn down first and reported
+    // beside it as `stages`. An extension fault is bounded infrastructure that
     // never aborts the run nor becomes a target finding. Reuses the run's
     // finding emitter so an extension finding carries the harness identity.
     let stages = extension_stage.map(extension_stage::ExtensionStage::finish);

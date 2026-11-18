@@ -2861,6 +2861,9 @@
 - With `codec.decode` and `codec.encode`, a child is the base decoded, one
   value of it mutated and encoded back, so a framed format keeps its length
   and checksum right (#373). Codec errors are counted, never findings.
+- The extension's `lifecycle.setup`, `reset` and `teardown` run around the
+  campaign and between its cases (#374). A setup or reset the extension
+  answers as failed stops the campaign with its message.
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object

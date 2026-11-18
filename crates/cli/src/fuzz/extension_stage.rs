@@ -11,6 +11,13 @@
 //!   the extension's structured value, one value of it mutated, and encoded
 //!   back, so a framed format keeps its length and checksum fields right.
 //!   Decode and encode errors are counted; they are never findings.
+//! - `lifecycle.setup` / `reset` / `teardown` (#374): setup runs before the
+//!   pass, reset before every case after the first, teardown after the
+//!   pass. A setup or reset the extension answers as failed (or unsupported)
+//!   stops the campaign with its message: the cases would run on a fixture
+//!   it did not prepare. An extension that crashes, times out or answers
+//!   garbage is bounded infrastructure, as everywhere else: its stages stop
+//!   and the campaign goes on without them.
 //!
 //! The mutation and codec stages are bounded: at most [`MAX_CALLS`] calls
 //! and a quarter of the pass's time budget ([`DEFAULT_BUDGET`] without one).
@@ -18,11 +25,12 @@
 //! stage off for the rest of the pass, and the campaign goes on with the
 //! builtin mutations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use extension_host::{
-    capability, CaseId, CodecOutcome, ExtensionClient, ExtensionManifest, MutateOutcome,
+    capability, AckOutcome, CaseId, CodecOutcome, ExtensionClient, ExtensionManifest, InfraFailure,
+    MutateOutcome,
 };
 use fuzz_engine_builtin::MutationRng;
 use serde_json::{json, Value};
@@ -41,57 +49,111 @@ const STAGE_CAPS: &[&str] = &[
     capability::MUTATOR_MUTATE,
     capability::CODEC_DECODE,
     capability::CODEC_ENCODE,
+    capability::LIFECYCLE_SETUP,
+    capability::LIFECYCLE_RESET,
+    capability::LIFECYCLE_TEARDOWN,
 ];
 
 /// The stages of one pass.
 pub(super) struct ExtensionStage {
     client: ExtensionClient,
     campaign: String,
+    root: PathBuf,
     mutate: bool,
     codec: bool,
+    reset: bool,
+    teardown: bool,
     budget: Duration,
     spent: Duration,
     calls: usize,
     children: u64,
+    cases: usize,
     mutated: usize,
     mutate_declined: usize,
     encoded: usize,
     codec_errors: usize,
+    resets: usize,
     cut_off: Option<String>,
 }
 
 impl ExtensionStage {
-    /// The stages `manifest`'s extension provides. `None` when it provides
-    /// none of them, or cannot be started (the oracle pass reports that).
+    /// The stages `manifest`'s extension provides, set up with `root` as its
+    /// case root. `None` when it provides none of them, or cannot be started
+    /// (the oracle pass reports that). A setup the extension answers as failed
+    /// is an error.
     pub(super) fn open(
         manifest: &Path,
         campaign: &str,
+        root: &Path,
         pass_budget: Option<Duration>,
-    ) -> Option<Self> {
-        let loaded = ExtensionManifest::load(manifest).ok()?;
-        let client =
-            ExtensionClient::from_manifest_with_optional(&loaded, manifest, STAGE_CAPS).ok()?;
+    ) -> Result<Option<Self>, String> {
+        let Ok(loaded) = ExtensionManifest::load(manifest) else {
+            return Ok(None);
+        };
+        let Ok(mut client) =
+            ExtensionClient::from_manifest_with_optional(&loaded, manifest, STAGE_CAPS)
+        else {
+            return Ok(None);
+        };
         let mutate = client.supports(capability::MUTATOR_MUTATE);
         let codec =
             client.supports(capability::CODEC_DECODE) && client.supports(capability::CODEC_ENCODE);
-        if !(mutate || codec) {
-            return None;
+        let setup = client.supports(capability::LIFECYCLE_SETUP);
+        let reset = client.supports(capability::LIFECYCLE_RESET);
+        let teardown = client.supports(capability::LIFECYCLE_TEARDOWN);
+        if !(mutate || codec || setup || reset || teardown) {
+            return Ok(None);
         }
-        Some(Self {
+        if setup {
+            let case = CaseId::new(campaign, "ext-stage", "setup");
+            if let Err(fault) =
+                hook_result("lifecycle.setup", client.lifecycle_setup(&case, Some(root)))?
+            {
+                bhfeprintln!("bhf fuzz: {fault}; the extension's stages are off for this pass");
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
             client,
             campaign: campaign.to_owned(),
+            root: root.to_path_buf(),
             mutate,
             codec,
+            reset,
+            teardown,
             budget: pass_budget.map_or(DEFAULT_BUDGET, |budget| budget / 4),
             spent: Duration::ZERO,
             calls: 0,
             children: 0,
+            cases: 0,
             mutated: 0,
             mutate_declined: 0,
             encoded: 0,
             codec_errors: 0,
+            resets: 0,
             cut_off: None,
-        })
+        }))
+    }
+
+    /// Before each case: `lifecycle.reset` once a case has run. An error stops
+    /// the campaign.
+    pub(super) fn before_case(&mut self) -> Result<(), String> {
+        self.cases += 1;
+        if !self.reset || self.cases == 1 {
+            return Ok(());
+        }
+        let case = CaseId::new(&self.campaign, "ext-stage", format!("reset-{}", self.cases));
+        match hook_result(
+            "lifecycle.reset",
+            self.client.lifecycle_reset(&case, &self.root),
+        )? {
+            Ok(()) => self.resets += 1,
+            Err(fault) => {
+                self.cut_off = Some(fault);
+                (self.mutate, self.codec, self.reset, self.teardown) = (false, false, false, false);
+            }
+        }
+        Ok(())
     }
 
     /// The next mutated child from an extension stage, made from `base`, or
@@ -204,8 +266,13 @@ impl ExtensionStage {
         }
     }
 
-    /// What the stages did, for the run summary's `extension.stages`.
-    pub(super) fn finish(self) -> Value {
+    /// Tear the session down, and what the stages did, for the run summary's
+    /// `extension.stages`.
+    pub(super) fn finish(mut self) -> Value {
+        let teardown = self.teardown.then(|| {
+            let case = CaseId::new(&self.campaign, "ext-stage", "teardown");
+            matches!(self.client.lifecycle_teardown(&case), Ok(AckOutcome::Ok))
+        });
         json!({
             "mutator": self.mutate,
             "codec": self.codec,
@@ -216,8 +283,37 @@ impl ExtensionStage {
             "mutate_declined": self.mutate_declined,
             "encoded": self.encoded,
             "codec_errors": self.codec_errors,
+            "lifecycle": {
+                "reset": self.reset,
+                "resets": self.resets,
+                "teardown": teardown,
+            },
             "cut_off": self.cut_off,
         })
+    }
+}
+
+/// A lifecycle hook's result: `Ok(Ok(()))` on its acknowledgement,
+/// `Ok(Err(fault))` when the extension crashed, timed out or answered garbage
+/// (its stages stop), and `Err` with the message that stops the campaign when
+/// the extension answered that the hook failed.
+fn hook_result(
+    hook: &str,
+    outcome: extension_host::Result<AckOutcome>,
+) -> Result<Result<(), String>, String> {
+    let detail = |detail: Option<String>| detail.map(|d| format!(": {d}")).unwrap_or_default();
+    match outcome {
+        Ok(AckOutcome::Ok) => Ok(Ok(())),
+        Ok(AckOutcome::Unsupported { detail: d }) => {
+            Err(format!("extension {hook} failed: unsupported{}", detail(d)))
+        }
+        Ok(AckOutcome::Infrastructure(InfraFailure::ExtensionReported { detail: d })) => {
+            Err(format!("extension {hook} failed{}", detail(d)))
+        }
+        Ok(AckOutcome::Infrastructure(failure)) => {
+            Ok(Err(format!("extension {hook} failed: {failure:?}")))
+        }
+        Err(error) => Ok(Err(format!("extension {hook} failed: {error}"))),
     }
 }
 

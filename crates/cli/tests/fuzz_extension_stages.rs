@@ -7,7 +7,9 @@
 //!   not, and a slow one is cut off while the campaign goes on (#314);
 //! - its codec keeps a framed input's length and CRC right through a
 //!   mutation, so a bug behind the CRC check is reached only with it, and
-//!   its decode errors are counted, not findings (#373).
+//!   its decode errors are counted, not findings (#373);
+//! - its `lifecycle.reset` runs between cases, and a failed setup stops the
+//!   campaign with its message (#374).
 
 #![cfg(unix)]
 
@@ -221,4 +223,41 @@ fn codec_errors_are_counted_and_are_no_findings() {
         "a decode reject is no fault: {stages:#}"
     );
     assert!(planted(&work, "frame.adb").is_empty(), "{run:#}");
+}
+
+#[test]
+fn reset_runs_between_cases() {
+    let dir = TestDir::new("ext-stage-reset");
+    let seed = dir.join("seed");
+    fs::write(&seed, b"AAAA").unwrap();
+    let work = work_with_harness(&dir);
+    let ext = manifest(&dir, "count-resets", 5000);
+    assert_ran(&fuzz(&work, 25, &seed, Some(&ext)));
+    let run = summary(&work);
+    let lifecycle = &run["extension"]["stages"]["lifecycle"];
+    let executions = run["executions"].as_u64().unwrap();
+    assert_eq!(lifecycle["resets"], executions - 1, "{run:#}");
+    assert_eq!(lifecycle["teardown"], true, "{run:#}");
+    let log = work
+        .join("fuzz_scratch")
+        .join(format!("extension-{HARNESS}"))
+        .join("resets.log");
+    let logged = fs::read_to_string(&log).unwrap().lines().count() as u64;
+    assert_eq!(logged, executions - 1, "the extension saw each reset");
+}
+
+#[test]
+fn a_failed_setup_stops_the_campaign_with_its_message() {
+    let dir = TestDir::new("ext-stage-setup");
+    let seed = dir.join("seed");
+    fs::write(&seed, b"AAAA").unwrap();
+    let work = work_with_harness(&dir);
+    let ext = manifest(&dir, "failing-setup", 5000);
+    let output = fuzz(&work, 25, &seed, Some(&ext));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("extension lifecycle.setup failed") && stderr.contains("not ready"),
+        "{stderr}"
+    );
 }

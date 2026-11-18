@@ -2173,13 +2173,19 @@ loop the stages the extension provides:
   its length and checksum fields right. With both stages the two take turns.
   A decode or encode the extension rejects is counted (`codec_errors`), never
   a finding.
+- `lifecycle.setup`, `reset` and `teardown`: setup runs before the campaign
+  with a case root (`<work-dir>/fuzz_scratch/extension-<harness>`), reset
+  before every case after the first, and teardown after the campaign. A setup
+  or reset the extension answers as failed (`infrastructure_error`) or
+  unsupported stops the campaign with its message, since the cases would run
+  on a fixture the extension did not prepare.
 
 The mutation and codec stages make at most 1000 calls per pass and spend at
 most a quarter of its `--time` (60 s without one). A call that times out, an
 extension that crashes or answers garbage, or a stage past its bound is cut off
 for the rest of the pass, and the campaign goes on with the builtin mutations.
 The run summary's `extension.stages` records what each stage did: `calls`,
-`mutated`, `encoded`, `codec_errors` and `cut_off` (why a
+`mutated`, `encoded`, `codec_errors`, `lifecycle.resets` and `cut_off` (why a
 stage stopped, or `null`).
 
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
