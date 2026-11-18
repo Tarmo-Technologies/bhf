@@ -190,6 +190,9 @@ pub(crate) enum TransportPlan {
         task_id: Option<u64>,
         /// The firmware's comparison record (`cmplog=`, #386).
         cmplog: Option<CmpLogRegion>,
+        /// Coverage from the semihosting channel (`coverage=semihosting`,
+        /// #292), not the ring.
+        semihosting: bool,
     },
     /// Full-system `qemu-system` guest driven by QMP (snapshot lifecycle) + a
     /// gdbstub (input + coverage-ring readback).
@@ -220,6 +223,9 @@ pub(crate) enum TransportPlan {
         task_id: Option<u64>,
         /// The firmware's comparison record (`cmplog=`, #386).
         cmplog: Option<CmpLogRegion>,
+        /// Coverage from the semihosting channel (`coverage=semihosting`,
+        /// #292), not the ring.
+        semihosting: bool,
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
@@ -270,15 +276,19 @@ pub(crate) enum TransportSpecError {
 
     #[error(
         "--transport-coverage-map is missing required key {key:?} (need input, input_cap, \
-         ring, write, wrapped and cap; input_cap is the staging region's size in bytes)"
+         ring, write, wrapped and cap, or input, input_cap and coverage=semihosting; input_cap \
+         is the staging region's size in bytes)"
     )]
     MissingMapKey { key: &'static str },
 
     #[error(
         "--transport-coverage-map has unknown key {key:?} (allowed: input, input_cap, \
-         input_len, ring, write, wrapped, cap, cmplog, cmplog_cap)"
+         input_len, ring, write, wrapped, cap, coverage, cmplog, cmplog_cap)"
     )]
     UnknownMapKey { key: String },
+
+    #[error("--transport-coverage-map: {0}")]
+    Coverage(String),
 
     #[error("--transport-coverage-map: {0}")]
     CmpLog(String),
@@ -352,7 +362,7 @@ impl TransportPlan {
         }
 
         if let Some(rest) = spec.strip_prefix("gdb:") {
-            let (map, input, cmplog) = require_coverage_map("gdb", coverage_map)?;
+            let (map, input, cmplog, semihosting) = require_coverage_map("gdb", coverage_map)?;
             // `gdb:HOST:PORT[,firmware=PATH][,cycles=dwt|ADDR[,cpu_hz=N]][,task_id=ADDR]`.
             let mut parts = rest.split(',');
             let (host, port) = parse_host_port("gdb", spec, parts.next().unwrap_or(""))?;
@@ -385,12 +395,14 @@ impl TransportPlan {
                 cycles: cycles.counter("gdb", spec)?,
                 task_id,
                 cmplog,
+                semihosting,
             });
         }
 
         if let Some(rest) = spec.strip_prefix("qemu-system:") {
-            let (map, input, cmplog) = require_coverage_map("qemu-system", coverage_map)?;
-            return parse_qemu_system(spec, rest, map, input, cmplog);
+            let (map, input, cmplog, semihosting) =
+                require_coverage_map("qemu-system", coverage_map)?;
+            return parse_qemu_system(spec, rest, map, input, cmplog, semihosting);
         }
 
         Err(TransportSpecError::UnknownBackend {
@@ -426,6 +438,7 @@ impl TransportPlan {
                 cycles,
                 task_id,
                 cmplog,
+                semihosting,
             } => Ok(Box::new(
                 GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
                     // The I/O bound doubles as the absolute per-input execution
@@ -435,7 +448,8 @@ impl TransportPlan {
                     .with_input_contract(Some(input))
                     .with_cycle_counter(cycles)
                     .with_task_id(task_id)
-                    .with_cmplog(cmplog),
+                    .with_cmplog(cmplog)
+                    .with_semihosting_coverage(semihosting),
             )),
             Self::QemuSystem {
                 qmp_host,
@@ -451,6 +465,7 @@ impl TransportPlan {
                 cycles,
                 task_id,
                 cmplog,
+                semihosting,
                 notes: _,
             } => {
                 let mut transport = FullSystemTransport::new(
@@ -462,7 +477,8 @@ impl TransportPlan {
                 .with_input_contract(Some(input))
                 .with_cycle_counter(cycles)
                 .with_task_id(task_id)
-                .with_cmplog(cmplog);
+                .with_cmplog(cmplog)
+                .with_semihosting_coverage(semihosting);
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -551,7 +567,7 @@ fn reject_coverage_map(coverage_map: Option<&str>) -> Result<(), TransportSpecEr
 fn require_coverage_map(
     backend: &'static str,
     coverage_map: Option<&str>,
-) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>, bool), TransportSpecError> {
     let map = coverage_map
         .filter(|m| !m.trim().is_empty())
         .ok_or(TransportSpecError::MissingCoverageMap { backend })?;
@@ -564,6 +580,7 @@ fn parse_qemu_system(
     map: GdbMemoryMap,
     input: InputContract,
     cmplog: Option<CmpLogRegion>,
+    semihosting: bool,
 ) -> Result<TransportPlan, TransportSpecError> {
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
@@ -665,6 +682,7 @@ fn parse_qemu_system(
         cycles: cycles.counter("qemu-system", spec)?,
         task_id,
         cmplog,
+        semihosting,
         notes,
     })
 }
@@ -750,7 +768,7 @@ const MAX_CMPLOG_CAPACITY: u64 = 43_690;
 
 fn parse_coverage_map(
     spec: &str,
-) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>), TransportSpecError> {
+) -> Result<(GdbMemoryMap, InputContract, Option<CmpLogRegion>, bool), TransportSpecError> {
     let mut input = None;
     let mut ring = None;
     let mut write = None;
@@ -760,6 +778,7 @@ fn parse_coverage_map(
     let mut input_len = None;
     let mut cmplog = None;
     let mut cmplog_cap = None;
+    let mut semihosting = false;
 
     for part in spec.split(',') {
         let part = part.trim();
@@ -783,6 +802,19 @@ fn parse_coverage_map(
             "input_len" => input_len = Some(parse_int(key, value)?),
             "cmplog" => cmplog = Some(parse_int(key, value)?),
             "cmplog_cap" => cmplog_cap = Some(parse_int(key, value)?),
+            // Where each run's coverage comes from (#292): the ring the
+            // memory_buffer probe fills, or the event stream the semihosting
+            // probe writes to fd 2, which the target's semihosting calls
+            // hand to the debugger.
+            "coverage" => match value.trim() {
+                "memory_buffer" => semihosting = false,
+                "semihosting" => semihosting = true,
+                other => {
+                    return Err(TransportSpecError::Coverage(format!(
+                        "coverage={other:?}: expected memory_buffer or semihosting"
+                    )))
+                }
+            },
             other => {
                 return Err(TransportSpecError::UnknownMapKey {
                     key: other.to_owned(),
@@ -791,17 +823,42 @@ fn parse_coverage_map(
         }
     }
 
-    let cap = cap.ok_or(TransportSpecError::MissingMapKey { key: "cap" })?;
-    let ring_capacity =
-        usize::try_from(cap).map_err(|_| TransportSpecError::CapTooLarge { cap })?;
-
-    let map = GdbMemoryMap {
-        input_address: input.ok_or(TransportSpecError::MissingMapKey { key: "input" })?,
-        ring_address: ring.ok_or(TransportSpecError::MissingMapKey { key: "ring" })?,
-        ring_write_address: write.ok_or(TransportSpecError::MissingMapKey { key: "write" })?,
-        ring_wrapped_address: wrapped
-            .ok_or(TransportSpecError::MissingMapKey { key: "wrapped" })?,
-        ring_capacity,
+    let input_address = input.ok_or(TransportSpecError::MissingMapKey { key: "input" })?;
+    let map = if semihosting {
+        // The semihosting channel replaces the ring: no ring is read, so one
+        // named beside it would be a map that says two things.
+        if let Some(key) = [
+            ("ring", ring),
+            ("write", write),
+            ("wrapped", wrapped),
+            ("cap", cap),
+        ]
+        .iter()
+        .find_map(|(key, value)| value.map(|_| *key))
+        {
+            return Err(TransportSpecError::Coverage(format!(
+                "coverage=semihosting reads the semihosting channel, not a ring: drop {key}="
+            )));
+        }
+        GdbMemoryMap {
+            input_address,
+            ring_address: 0,
+            ring_write_address: 0,
+            ring_wrapped_address: 0,
+            ring_capacity: 0,
+        }
+    } else {
+        let cap = cap.ok_or(TransportSpecError::MissingMapKey { key: "cap" })?;
+        let ring_capacity =
+            usize::try_from(cap).map_err(|_| TransportSpecError::CapTooLarge { cap })?;
+        GdbMemoryMap {
+            input_address,
+            ring_address: ring.ok_or(TransportSpecError::MissingMapKey { key: "ring" })?,
+            ring_write_address: write.ok_or(TransportSpecError::MissingMapKey { key: "write" })?,
+            ring_wrapped_address: wrapped
+                .ok_or(TransportSpecError::MissingMapKey { key: "wrapped" })?,
+            ring_capacity,
+        }
     };
     // The staging region's size: bhf writes each input there, and one longer
     // than the region overwrites the guest globals after it.
@@ -835,7 +892,7 @@ fn parse_coverage_map(
             ))
         }
     };
-    Ok((map, contract, cmplog))
+    Ok((map, contract, cmplog, semihosting))
 }
 
 /// Parse a decimal or `0x`-hex unsigned integer.
@@ -2295,7 +2352,9 @@ mod tests {
                 cycles,
                 task_id,
                 cmplog,
+                semihosting,
             } => {
+                assert!(!semihosting);
                 assert_eq!(firmware, None);
                 assert_eq!(cycles, None);
                 assert_eq!(task_id, None);
@@ -2373,6 +2432,7 @@ mod tests {
                 cycles: _,
                 task_id: _,
                 cmplog: _,
+                semihosting: _,
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
@@ -2446,6 +2506,69 @@ mod tests {
                 assert_eq!(status.clear_value, 0xff);
             }
             other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    /// #292: `coverage=semihosting` takes each run's coverage from the
+    /// semihosting channel, so the map names no ring; `memory_buffer`, the
+    /// default, needs one.
+    #[test]
+    fn semihosting_coverage_replaces_the_ring_in_the_map() {
+        let semihosting = "input=0x1000,input_cap=64,coverage=semihosting";
+        for spec in [
+            "gdb:127.0.0.1:1234",
+            "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234",
+        ] {
+            let plan = TransportPlan::parse(spec, Some(semihosting)).unwrap();
+            let (TransportPlan::Gdb {
+                semihosting: on,
+                map,
+                ..
+            }
+            | TransportPlan::QemuSystem {
+                semihosting: on,
+                map,
+                ..
+            }) = plan
+            else {
+                panic!("expected a memory-read plan for {spec}");
+            };
+            assert!(on, "{spec}");
+            assert_eq!(map.input_address, 0x1000);
+            assert_eq!(map.ring_capacity, 0);
+        }
+        let ring = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=32";
+        let plan = TransportPlan::parse(
+            "gdb:127.0.0.1:1234",
+            Some(&format!("{ring},coverage=memory_buffer")),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            TransportPlan::Gdb {
+                semihosting: false,
+                ..
+            }
+        ));
+
+        for (map, want) in [
+            (
+                format!("{ring},coverage=semihosting"),
+                "coverage=semihosting reads the semihosting channel, not a ring: drop ring=",
+            ),
+            (
+                "input=0x1000,input_cap=64,coverage=swo".to_owned(),
+                "coverage=\"swo\": expected memory_buffer or semihosting",
+            ),
+            (
+                "input=0x1000,input_cap=64".to_owned(),
+                "missing required key \"cap\"",
+            ),
+        ] {
+            let error = TransportPlan::parse("gdb:127.0.0.1:1234", Some(&map))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(want), "{map}: {error}");
         }
     }
 

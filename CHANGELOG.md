@@ -2839,6 +2839,17 @@
   when bhf panics.
 
 ### Added
+- Semihosting coverage for the `gdb` and `qemu-system` transports (#292):
+  with `coverage=semihosting` in `--transport-coverage-map` (and no ring
+  keys), each run's coverage is the event stream the `semihosting` probe
+  backend writes to fd 2. The gdb client now serves the File-I/O requests a
+  debugger-routed semihosting call makes (QEMU's
+  `-semihosting-config target=gdb`, OpenOCD's `semihosting_fileio`): it reads
+  each write's buffer, keeps fd 1 as console output and fd 2 as the
+  semihosting channel, and refuses other calls. A run that used semihosting
+  used to fail on the first such request. Each reply carries the Ctrl-C flag
+  and the client continues the target after it, because QEMU 8.2 sends no
+  stop reply for the rest of a run after a plain File-I/O reply.
 - `bhf fuzz --engine libafl` runs a LibAFL campaign (#296) on the harness's
   `main`, in a bhf built with the `libafl-engine` feature (another bhf refuses
   the engine and names the rebuild). LibAFL mutates with havoc and the harness

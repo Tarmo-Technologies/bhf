@@ -148,7 +148,10 @@ supported one and needs no extra hardware.
 
 ## Semihosting (alternative coverage channel)
 
-With `-semihosting` firmware and OpenOCD's `arm semihosting enable`, the
-`SemihostingReader` consumes the same `BHF_EVENTS` stream written to the
-semihosting output channel. Use this when the board has no spare SRAM for a ring;
-otherwise prefer the memory ring, which needs no host-side stream capture.
+With `--probe-backend semihosting` firmware and OpenOCD's `arm semihosting
+enable` and `arm semihosting_fileio enable`, each semihosting write reaches BHF's
+gdb connection as a File-I/O request, and `coverage=semihosting` in the coverage
+map decodes the `BHF_EVENTS` stream the probe writes to fd 2 (see
+[Semihosting coverage](site/on-target-fuzzing.md#semihosting-coverage)). Use
+this when the board has no spare SRAM for a ring; otherwise prefer the memory
+ring, which costs no host round trip per write.

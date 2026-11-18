@@ -281,6 +281,11 @@ impl MemRegion {
     }
 }
 
+/// A File-I/O request (`F<call>,<args>`, without the `F`) a [`MockGdbStub`]
+/// makes while the target runs, with the bytes it first places in memory for
+/// it; the run goes on when the debugger's reply arrives.
+type FileIoRequest = (String, Option<(u64, Vec<u8>)>);
+
 /// A minimal gdbstub speaking the target side of the RSP: acks packets, answers
 /// `!`/`?`/`g`/`m`/`M`/`c`/`Z`/`z`, and records a per-iteration `R` reset. Serves
 /// memory reads/writes against scripted regions.
@@ -295,6 +300,8 @@ pub struct MockGdbStub<C: Read + Write> {
     console_output: Vec<Vec<u8>>,
     /// Memory the target writes while it runs, applied on each `c`.
     run_writes: Vec<(u64, Vec<u8>)>,
+    /// File-I/O requests the target makes on each `c` (#292).
+    file_io: Vec<FileIoRequest>,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -308,7 +315,24 @@ impl<C: Read + Write> MockGdbStub<C> {
             registers: vec![0_u8; 4],
             console_output: Vec::new(),
             run_writes: Vec::new(),
+            file_io: Vec::new(),
         }
+    }
+
+    /// On each `c`, write `data` at `address` and make a File-I/O
+    /// `write(fd, address, len)` request for it, as a semihosting call routed
+    /// to the debugger does; the run goes on when the reply arrives.
+    pub fn with_file_io_write(mut self, fd: u64, address: u64, data: Vec<u8>) -> Self {
+        let request = format!("write,{fd:x},{address:x},{:x}", data.len());
+        self.file_io.push((request, Some((address, data))));
+        self
+    }
+
+    /// On each `c`, make the File-I/O request `F<request>` (no `F`), with no
+    /// memory placed for it.
+    pub fn with_file_io_request(mut self, request: &str) -> Self {
+        self.file_io.push((request.to_owned(), None));
+        self
     }
 
     /// On each `c`, write `data` at `address` before the stop reply, modeling
@@ -397,6 +421,49 @@ impl<C: Read + Write> MockGdbStub<C> {
                         for region in &mut self.regions {
                             if let Some(offset) = region.contains(address, data.len()) {
                                 region.data[offset..offset + data.len()].copy_from_slice(&data);
+                            }
+                        }
+                    }
+                    // File-I/O requests, each answered before the run goes on:
+                    // the debugger reads the buffer with `m` and replies `F`.
+                    for (request, placed) in self.file_io.clone() {
+                        if let Some((address, data)) = placed {
+                            for region in &mut self.regions {
+                                if let Some(offset) = region.contains(address, data.len()) {
+                                    region.data[offset..offset + data.len()].copy_from_slice(&data);
+                                }
+                            }
+                        }
+                        self.connection
+                            .send_packet(format!("F{request}").as_bytes())?;
+                        while let Some(reply) = self.connection.recv_packet_opt()? {
+                            self.log
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&reply).into_owned());
+                            match reply.first() {
+                                // A reply with the Ctrl-C flag stops the
+                                // target, which reports it and waits for `c`.
+                                Some(b'F') if reply.ends_with(b",C") => {
+                                    self.connection.send_packet(b"T02")?;
+                                    while let Some(next) = self.connection.recv_packet_opt()? {
+                                        self.log
+                                            .lock()
+                                            .unwrap()
+                                            .push(String::from_utf8_lossy(&next).into_owned());
+                                        if next.first() == Some(&b'c') {
+                                            break;
+                                        }
+                                        self.connection.send_packet(b"")?;
+                                    }
+                                    break;
+                                }
+                                Some(b'F') => break,
+                                Some(b'm') => {
+                                    let read = self.handle_read(&reply);
+                                    self.connection.send_packet(&read)?;
+                                }
+                                _ => self.connection.send_packet(b"")?,
                             }
                         }
                     }

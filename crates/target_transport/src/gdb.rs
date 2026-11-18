@@ -69,6 +69,15 @@ const MAX_CONSOLE_PACKETS: usize = 100_000;
 /// Max total decoded console-output bytes retained while awaiting a stop reply.
 const MAX_CONSOLE_BYTES: usize = 1024 * 1024;
 
+/// The file descriptor the semihosting coverage probe writes its event stream
+/// to (`Semihosting_File_Descriptor` in
+/// `ada_runtime/adafuzz-probe-semihosting.adb`), and a semihosting console's
+/// stderr (#292).
+pub const SEMIHOSTING_COVERAGE_FD: u64 = 2;
+/// GDB File-I/O `errno` values a refused request answers with.
+const FILE_IO_EBADF: u32 = 9;
+const FILE_IO_EUNKNOWN: u32 = 9999;
+
 /// The RSP checksum: the low byte of the sum of the packet data bytes.
 pub fn rsp_checksum(data: &[u8]) -> u8 {
     data.iter().fold(0_u8, |acc, &byte| acc.wrapping_add(byte))
@@ -211,6 +220,8 @@ pub enum StopReply {
 /// mislabels a bus error and never fires for a real `SIGBUS`. These are the
 /// protocol values from GDB's `include/gdb/signals.def`.
 pub mod gdb_signal {
+    /// Interrupt: the stop a File-I/O reply with the Ctrl-C flag asks for.
+    pub const INT: u8 = 2;
     /// Illegal instruction.
     pub const ILL: u8 = 4;
     /// Trace/breakpoint trap — benign (a planted breakpoint or single-step stop).
@@ -426,6 +437,9 @@ impl<C: Read + Write + ReadDeadline> GdbConnection<C> {
 /// Higher-level RSP client: attach, memory access, continue, reset.
 pub struct GdbClient<C> {
     connection: GdbConnection<C>,
+    /// What the target wrote to [`SEMIHOSTING_COVERAGE_FD`] through File-I/O
+    /// requests since [`GdbClient::take_semihosting_output`] last took it.
+    semihosting: Vec<u8>,
 }
 
 impl<C: Read + Write> GdbClient<C> {
@@ -433,7 +447,84 @@ impl<C: Read + Write> GdbClient<C> {
     pub fn new(channel: C) -> Self {
         Self {
             connection: GdbConnection::new(channel),
+            semihosting: Vec::new(),
         }
+    }
+
+    /// Take what the target wrote to [`SEMIHOSTING_COVERAGE_FD`] through
+    /// File-I/O requests while it ran (#292): the semihosting coverage
+    /// probe's event stream, or a semihosting console's stderr.
+    pub fn take_semihosting_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.semihosting)
+    }
+
+    /// Serve a File-I/O request (`F<call>,<args>`) the target made while it
+    /// ran: a semihosting call routed to the debugger, as QEMU's
+    /// `-semihosting-config target=gdb`, OpenOCD's and a Black Magic Probe's
+    /// semihosting are (#292). A `write` to fd 1 is console output, one to
+    /// [`SEMIHOSTING_COVERAGE_FD`] is kept for
+    /// [`GdbClient::take_semihosting_output`], and both are read out of target
+    /// memory as a debugger does. The console descriptors are ttys that close
+    /// and read as empty; every other call is refused, so the target sees an
+    /// error and runs on.
+    ///
+    /// The reply carries the Ctrl-C flag, so the target stops (`T02`) instead
+    /// of resuming, and [`GdbClient::cont_until`] continues it with a fresh
+    /// `c`. QEMU 8.2's gdbstub resumes on a plain reply but then sends no stop
+    /// reply for the rest of the run, so the run's own stop was never seen.
+    fn serve_file_io(&mut self, request: &[u8], console: &mut Vec<u8>) -> Result<()> {
+        let text = std::str::from_utf8(request)
+            .map_err(|_| TransportError::gdb("File-I/O request is not ASCII"))?;
+        let mut fields = text.split(',');
+        let call = fields.next().unwrap_or_default();
+        let mut number = |what: &str| -> Result<u64> {
+            let field = fields.next().ok_or_else(|| {
+                TransportError::gdb(format!("File-I/O request {text:?} has no {what}"))
+            })?;
+            u64::from_str_radix(field, 16).map_err(|_| {
+                TransportError::gdb(format!("File-I/O request {text:?}: bad {what} {field:?}"))
+            })
+        };
+        let refuse = |errno: u32| format!("F-1,{errno:x},C");
+        let reply = match call {
+            "write" => {
+                let fd = number("descriptor")?;
+                let address = number("buffer")?;
+                let length = usize::try_from(number("length")?)
+                    .map_err(|_| TransportError::gdb("File-I/O write length overflows"))?;
+                if fd != 1 && fd != SEMIHOSTING_COVERAGE_FD {
+                    refuse(FILE_IO_EBADF)
+                } else {
+                    if console.len() + self.semihosting.len() + length > MAX_CONSOLE_BYTES {
+                        return Err(TransportError::gdb(format!(
+                            "semihosting output exceeded {MAX_CONSOLE_BYTES} bytes before a stop \
+                             reply"
+                        )));
+                    }
+                    let mut bytes = Vec::with_capacity(length);
+                    while bytes.len() < length {
+                        let chunk = (length - bytes.len()).min(MAX_MEMORY_READ);
+                        bytes.extend(self.read_memory(address + bytes.len() as u64, chunk)?);
+                    }
+                    if fd == 1 {
+                        console.extend_from_slice(&bytes);
+                    } else {
+                        self.semihosting.extend_from_slice(&bytes);
+                    }
+                    format!("F{length:x},0,C")
+                }
+            }
+            "isatty" => match number("descriptor")? {
+                0..=2 => "F1,0,C".to_owned(),
+                _ => refuse(FILE_IO_EBADF),
+            },
+            "close" | "read" => match number("descriptor")? {
+                0..=2 => "F0,0,C".to_owned(),
+                _ => refuse(FILE_IO_EBADF),
+            },
+            _ => refuse(FILE_IO_EUNKNOWN),
+        };
+        self.connection.send_packet(reply.as_bytes())
     }
 
     fn command(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
@@ -562,6 +653,8 @@ impl<C: Read + Write + ReadDeadline> GdbClient<C> {
         }
         self.connection.send_packet(b"c")?;
         let mut output = Vec::new();
+        // Set while the target stops for the File-I/O reply just sent.
+        let mut interrupted_for_file_io = false;
         for _ in 0..MAX_CONSOLE_PACKETS {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok((ContStop::DeadlineExceeded, output));
@@ -583,7 +676,12 @@ impl<C: Read + Write + ReadDeadline> GdbClient<C> {
                 Err(err) => return Err(err),
             };
             match frame.split_first() {
+                Some((&b'F', request)) => {
+                    self.serve_file_io(request, &mut output)?;
+                    interrupted_for_file_io = true;
+                }
                 Some((&b'O', payload)) => {
+                    interrupted_for_file_io = false;
                     let decoded = from_hex(payload)?;
                     if output.len() + decoded.len() > MAX_CONSOLE_BYTES {
                         return Err(TransportError::gdb(format!(
@@ -598,7 +696,14 @@ impl<C: Read + Write + ReadDeadline> GdbClient<C> {
                     if deadline.is_some_and(|d| Instant::now() >= d) {
                         return Ok((ContStop::DeadlineExceeded, output));
                     }
-                    return Ok((ContStop::Stopped(StopReply::parse(&frame)?), output));
+                    let stop = StopReply::parse(&frame)?;
+                    if std::mem::take(&mut interrupted_for_file_io)
+                        && stop == StopReply::Signal(gdb_signal::INT)
+                    {
+                        self.connection.send_packet(b"c")?;
+                        continue;
+                    }
+                    return Ok((ContStop::Stopped(stop), output));
                 }
             }
         }
@@ -737,6 +842,7 @@ pub struct GdbRemoteTransport<F> {
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
+    semihosting_coverage: bool,
 }
 
 impl<F> GdbRemoteTransport<F> {
@@ -750,6 +856,7 @@ impl<F> GdbRemoteTransport<F> {
             cycle_counter: None,
             task_id_address: None,
             cmplog: None,
+            semihosting_coverage: false,
         }
     }
 
@@ -782,6 +889,14 @@ impl<F> GdbRemoteTransport<F> {
         self
     }
 
+    /// Decode each run's coverage from the event stream the target writes to
+    /// its semihosting channel ([`crate::gdb::SEMIHOSTING_COVERAGE_FD`]) in
+    /// place of the coverage ring (#292).
+    pub fn with_semihosting_coverage(mut self, semihosting: bool) -> Self {
+        self.semihosting_coverage = semihosting;
+        self
+    }
+
     /// Set the absolute per-input execution deadline (#70). A run whose `continue`
     /// does not reach a stop within this wall-clock bound is a target-execution
     /// timeout (a hang), surfaced as an [`ExitKind::Timeout`] outcome rather than
@@ -809,6 +924,7 @@ where
             cycle_counter: self.cycle_counter,
             task_id_address: self.task_id_address,
             cmplog: self.cmplog,
+            semihosting_coverage: self.semihosting_coverage,
         }))
     }
 }
@@ -837,6 +953,28 @@ pub fn read_coverage_ring<C: Read + Write>(
     MemoryBufferReader::new(image, write, wrapped)?.read_edges()
 }
 
+/// The run's coverage edges: with `semihosting`, decoded from the event
+/// stream the target wrote to its semihosting channel (#292), else read from
+/// the coverage ring. Without semihosting coverage, what the target wrote
+/// there is console output and joins `stdout`. Shared by [`GdbSession`] and
+/// [`crate::fullsystem::FullSystemTransport`].
+pub(crate) fn collect_coverage<C: Read + Write>(
+    client: &mut GdbClient<C>,
+    map: &GdbMemoryMap,
+    semihosting: bool,
+    stdout: &mut Vec<u8>,
+) -> Result<Vec<u32>> {
+    let written = client.take_semihosting_output();
+    if semihosting {
+        crate::coverage::SemihostingReader::new(written.as_slice())
+            .read_edges()
+            .map_err(|err| TransportError::protocol(format!("semihosting coverage stream: {err}")))
+    } else {
+        stdout.extend_from_slice(&written);
+        read_coverage_ring(client, map)
+    }
+}
+
 /// A little-endian 32-bit word of target memory.
 pub(crate) fn read_u32<C: Read + Write>(client: &mut GdbClient<C>, address: u64) -> Result<u32> {
     let bytes = client.read_memory(address, 4)?;
@@ -856,6 +994,7 @@ pub struct GdbSession<C> {
     cycle_counter: Option<crate::cycles::CycleCounter>,
     task_id_address: Option<u64>,
     cmplog: Option<crate::cmplog::CmpLogRegion>,
+    semihosting_coverage: bool,
 }
 
 impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
@@ -874,6 +1013,7 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         if let Some(region) = &self.cmplog {
             crate::cmplog::clear(&mut self.client, region)?;
         }
+        self.client.take_semihosting_output();
         // The cycle counter starts last, so it measures the run (#251).
         let cycles_start = match &self.cycle_counter {
             Some(counter) => Some(counter.start(&mut self.client)?),
@@ -887,7 +1027,11 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
         let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
         let (stop, stdout) = match self.client.cont_until(deadline)? {
             (ContStop::Stopped(stop), stdout) => (stop, stdout),
-            (ContStop::DeadlineExceeded, stdout) => {
+            (ContStop::DeadlineExceeded, mut stdout) => {
+                let written = self.client.take_semihosting_output();
+                if !self.semihosting_coverage {
+                    stdout.extend_from_slice(&written);
+                }
                 let detail = match self.exec_deadline {
                     Some(budget) => format!(
                         "no stop within the per-input execution deadline {}ms",
@@ -942,11 +1086,16 @@ impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
                 }
             }
         }
-        let (coverage_edges, coverage_incomplete) =
-            match read_coverage_ring(&mut self.client, &self.map) {
-                Ok(edges) => (edges, cycles_failed),
-                Err(err) => (Vec::new(), Some(err.to_string())),
-            };
+        let mut stdout = stdout;
+        let (coverage_edges, coverage_incomplete) = match collect_coverage(
+            &mut self.client,
+            &self.map,
+            self.semihosting_coverage,
+            &mut stdout,
+        ) {
+            Ok(edges) => (edges, cycles_failed),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
         Ok(RunOutcome {
             target,
             exit,
@@ -1104,6 +1253,163 @@ mod tests {
 
         assert_eq!(stop, StopReply::Exited(0));
         assert_eq!(output, b"hello world");
+    }
+
+    /// A semihosting call routed to the debugger (#292) arrives as a File-I/O
+    /// request while the target runs: the client reads the buffer it names,
+    /// replies with the count written, and keeps fd 1 as console output and
+    /// fd 2 as the semihosting channel. A call it does not serve is refused,
+    /// and the run still reaches its stop.
+    #[test]
+    fn file_io_writes_are_served_and_kept_by_descriptor() {
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log))
+            .with_stop_reply(b"W00".to_vec())
+            .with_region(0x2000, vec![0_u8; 64])
+            .with_file_io_write(1, 0x2000, b"hello".to_vec())
+            .with_file_io_request("open,2010/4,0,1b6")
+            .with_file_io_write(2, 0x2010, vec![3, 0x34, 0x12, 0, 0])
+            .with_file_io_request("isatty,2");
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let (stop, output) = client.cont().unwrap();
+        let semihosting = client.take_semihosting_output();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(stop, StopReply::Exited(0));
+        assert_eq!(output, b"hello");
+        assert_eq!(semihosting, vec![3, 0x34, 0x12, 0, 0]);
+        let log = log.lock().unwrap();
+        let replies: Vec<&str> = log
+            .iter()
+            .filter(|p| p.starts_with('F'))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            replies,
+            ["F5,0,C", "F-1,270f,C", "F5,0,C", "F1,0,C"],
+            "{log:?}"
+        );
+        // Each reply stops the target, and the client continues it.
+        assert_eq!(log.iter().filter(|p| *p == "c").count(), 5, "{log:?}");
+        assert!(log.iter().any(|p| p == "m2000,5"), "{log:?}");
+        assert!(log.iter().any(|p| p == "m2010,5"), "{log:?}");
+    }
+
+    /// With semihosting coverage (#292), the run's edges are the crumbs of
+    /// the event stream the target wrote to fd 2, and the ring is not read;
+    /// without it, those bytes are console output and the ring gives the
+    /// edges.
+    #[test]
+    fn semihosting_coverage_decodes_the_stream_written_to_fd_2() {
+        let ring_capacity = 32_usize;
+        let stream = encode_event_stream(&[
+            Event::Begin { testcase_id: 1 },
+            Event::Crumb { id: 0x100 },
+            Event::Crumb { id: 0x2A0 },
+        ]);
+        let run = |semihosting: bool| {
+            let (image, write, wrapped) = simulate_ring(
+                &encode_event_stream(&[Event::Crumb { id: 0x77 }]),
+                ring_capacity,
+            );
+            let map = GdbMemoryMap {
+                input_address: 0x1000,
+                ring_address: 0x4000,
+                ring_write_address: 0x5000,
+                ring_wrapped_address: 0x5100,
+                ring_capacity,
+            };
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (client_end, stub_end) = duplex();
+            let stub = MockGdbStub::new(stub_end, Arc::clone(&log))
+                .with_region(map.input_address, vec![0_u8; 64])
+                .with_region(map.ring_address, image)
+                .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+                .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)])
+                .with_region(0x7000, vec![0_u8; 64])
+                .with_file_io_write(SEMIHOSTING_COVERAGE_FD, 0x7000, stream.clone());
+            let handle = thread::spawn(move || stub.serve());
+            let client_slot = Mutex::new(Some(client_end));
+            let transport = GdbRemoteTransport::new(
+                move || {
+                    client_slot
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+                },
+                map,
+            )
+            .with_semihosting_coverage(semihosting);
+            let mut session = transport.arm().unwrap();
+            let outcome = session.run_input(b"AAAA").unwrap();
+            drop(session);
+            handle.join().unwrap().unwrap();
+            let read_ring = log.lock().unwrap().iter().any(|p| p == "m4000,20");
+            (outcome, read_ring)
+        };
+
+        let (outcome, read_ring) = run(true);
+        assert_eq!(outcome.coverage_incomplete, None);
+        assert_eq!(outcome.coverage_edges, vec![0x100, 0x2A0]);
+        assert!(outcome.stdout.is_empty());
+        assert!(!read_ring);
+
+        let (outcome, read_ring) = run(false);
+        assert_eq!(outcome.coverage_edges, vec![0x77]);
+        assert_eq!(outcome.stdout, stream);
+        assert!(read_ring);
+    }
+
+    /// A semihosting stream cut mid-event is incomplete coverage, not a
+    /// failed run.
+    #[test]
+    fn a_truncated_semihosting_stream_is_incomplete_coverage() {
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0,
+            ring_write_address: 0,
+            ring_wrapped_address: 0,
+            ring_capacity: 0,
+        };
+        let mut stream = encode_event_stream(&[Event::Crumb { id: 0x100 }]);
+        stream.extend_from_slice(&[3, 0x01]);
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(0x7000, vec![0_u8; 64])
+            .with_file_io_write(SEMIHOSTING_COVERAGE_FD, 0x7000, stream);
+        let handle = thread::spawn(move || stub.serve());
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        )
+        .with_semihosting_coverage(true);
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"AAAA").unwrap();
+        drop(session);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(outcome.exit, ExitKind::Ok);
+        assert!(outcome.coverage_edges.is_empty());
+        let incomplete = outcome.coverage_incomplete.unwrap_or_default();
+        assert!(
+            incomplete.contains("semihosting coverage stream"),
+            "{incomplete}"
+        );
     }
 
     #[test]

@@ -106,12 +106,12 @@ The coverage channel compiled into the harness runtime:
 |---|---|---|
 | `host_file` (default) | host / qemu-user | event stream via host file I/O |
 | `memory_buffer` | on-target, no I/O | in-RAM ring buffer read back over the transport |
-| `semihosting` | emulator/probe with semihosting | events over the semihosting hook; **not read yet**: no transport decodes this output ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)), so a campaign over it runs without coverage |
+| `semihosting` | emulator/probe with semihosting, no RAM to spare for a ring | events written to the semihosting stderr, read by the `gdb` and `qemu-system` transports with `coverage=semihosting` (see [Semihosting coverage](#semihosting-coverage)) |
 | `stub` | smoke build | result status only, no event stream |
 
-For the `gdb` and `qemu-system` transports use `memory_buffer` — the host reads
-the ring out of target memory (see the coverage-map spec below). It is the only
-backend a transport reads today.
+The `gdb` and `qemu-system` transports read either `memory_buffer`, whose ring
+the host reads out of target memory, or `semihosting`, whose writes the target's
+semihosting calls hand to the debugger (see the coverage-map spec below).
 
 ### Vendor RTOS build systems
 
@@ -140,7 +140,7 @@ shared-memory / custom-allocator / RTOS code that false-positives under ASan.
 instead of the host libFuzzer/AFL lane. It is **additive**: absent, the host
 path is byte-for-byte unchanged. A malformed spec is a descriptive error. The
 memory-read transports (`gdb`, `qemu-system`) also need `--transport-coverage-map`
-to locate the on-target coverage ring.
+to locate the input buffer and the on-target coverage ring.
 
 ### Coverage-map spec
 
@@ -149,6 +149,13 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 
 ```
 --transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>[,cmplog=<addr>,cmplog_cap=<n>]
+```
+
+or, for the `semihosting` backend, that coverage comes from the semihosting
+channel, in place of the ring keys:
+
+```
+--transport-coverage-map input=<addr>,input_cap=<n>[,input_len=<addr>],coverage=semihosting[,cmplog=<addr>,cmplog_cap=<n>]
 ```
 
 - `input`   — where BHF writes the fuzz input on the target
@@ -164,12 +171,45 @@ For `gdb` and `qemu-system`, tell BHF where the `memory_buffer` ring lives
 - `write`   — the ring's write cursor
 - `wrapped` — the ring's wrapped flag
 - `cap`     — ring capacity in **bytes** (the length read back), not a record count
+- `coverage` — `memory_buffer` (the default) or `semihosting`. With
+  `semihosting` the map names no ring: a ring key beside it is an error.
 - `cmplog`, `cmplog_cap` — optional, together: the address of the firmware's
   comparison record and how many entries it holds (at most 43690, one
   read's worth). See [CmpLog on the target](#cmplog-on-the-target).
 
 The `agent` transport carries coverage over its own protocol and rejects this
 option.
+
+### Semihosting coverage
+
+The `semihosting` probe backend writes its event stream to file descriptor 2
+through `adafuzz_semihosting_write`, which the BSP provides: on ARM, open
+`:tt` for append (`SYS_OPEN` mode 8, the semihosting stderr) and `SYS_WRITE`
+the buffer to it. A semihosting call is the debugger's to serve when the
+target runs under one: QEMU with `-semihosting-config enable=on,target=gdb`,
+OpenOCD with `arm semihosting enable` and `arm semihosting_fileio enable`, or a
+Black Magic Probe. Each write then reaches BHF's gdb connection as a File-I/O
+request. BHF reads the buffer out of target memory, answers the call, and, with
+`coverage=semihosting`, decodes what fd 2 got during each run as that run's
+coverage. A write to fd 1 is console output, kept with the run like the stub's
+`O` packets.
+
+```sh
+qemu-system-arm -M mps2-an385 -nographic -S -kernel fw.elf \
+  -semihosting-config enable=on,target=gdb \
+  -gdb tcp::1234 -qmp tcp:127.0.0.1:4444,server,nowait \
+  -drive if=none,file=scratch.qcow2,format=qcow2,id=sc0 &
+bhf fuzz work/ --harness H-FW \
+  --target-transport qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:1234,done=0x1a8 \
+  --transport-coverage-map input=0x2000020c,input_cap=64,coverage=semihosting
+```
+
+Under QEMU, `target=gdb` is needed: QEMU's default `target=auto` picks the
+console when the guest starts, before BHF connects, and the stream goes to
+QEMU's own output. Anything else the firmware writes to its semihosting stderr
+lands in the same stream and breaks its decoding: that run's coverage is then
+recorded as incomplete. Each write is a round trip to the host, so a ring is
+faster where the target has RAM for one.
 
 ### CmpLog on the target
 
@@ -629,9 +669,8 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   RTOS images / vendor toolchains (BHF ships none — bring your own).
 - **Not available yet:** a Renode full-system transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340));
   `--target-transport` takes `agent`, `gdb` and `qemu-system` only. Renode's
-  gdbserver can be driven through `gdb:`, without snapshot reset. Semihosting
-  coverage ([#292](https://github.com/Tarmo-Technologies/bhf/issues/292)) is not
-  wired either, nor typed mutation of a raw struct image in a big-endian
+  gdbserver can be driven through `gdb:`, without snapshot reset. Nor is
+  typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).
 - **Non-goals:** BHF does not bundle or crack vendor toolchains, ship RTOS

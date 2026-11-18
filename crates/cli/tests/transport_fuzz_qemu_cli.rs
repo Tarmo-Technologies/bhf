@@ -70,6 +70,30 @@ static void ring_write_byte(uint8_t v){
     adafuzz_probe_memory_buffer_write++;
   }
 }
+#ifdef BHF_SEMIHOSTING
+/* The semihosting probe's channel (#292): each event goes to the semihosting
+ * stderr (`:tt` opened for append), which QEMU's
+ * `-semihosting-config target=gdb` hands to the debugger as a File-I/O
+ * write to fd 2. */
+static int semihost(int op, void *arg){
+  register int r0 __asm__("r0") = op;
+  register void *r1 __asm__("r1") = arg;
+  __asm volatile("bkpt 0xab" : "+r"(r0) : "r"(r1) : "memory");
+  return r0;
+}
+static int bhf_stderr = -1;
+static void emit_crumb(uint32_t id){
+  if (bhf_stderr < 0) {
+    static const char tt[] = ":tt";
+    uint32_t open_args[3] = {(uint32_t)tt, 8, 3};
+    bhf_stderr = semihost(0x01, open_args);
+  }
+  uint8_t event[5] = {3, (uint8_t)id, (uint8_t)(id >> 8), (uint8_t)(id >> 16),
+                      (uint8_t)(id >> 24)};
+  uint32_t write_args[3] = {(uint32_t)bhf_stderr, (uint32_t)event, 5};
+  semihost(0x05, write_args);
+}
+#else
 static void emit_crumb(uint32_t id){
   ring_write_byte(3);
   ring_write_byte((uint8_t)(id & 0xff));
@@ -77,6 +101,7 @@ static void emit_crumb(uint32_t id){
   ring_write_byte((uint8_t)((id >> 16) & 0xff));
   ring_write_byte((uint8_t)((id >> 24) & 0xff));
 }
+#endif
 volatile uint8_t  bhf_input[64];
 volatile uint32_t bhf_fault_flag = 0;
 void harness_done(void){ while(1){} }
@@ -254,6 +279,13 @@ impl Fixture {
     /// Boot the fixture; with `cmplog`, the variant whose only fault is
     /// behind a 4-byte magic its trace-cmp callbacks record.
     fn boot_variant(test: &str, dir: &Path, cmplog: bool) -> Option<Self> {
+        Self::boot_with(test, dir, cmplog, false)
+    }
+
+    /// [`Self::boot_variant`]; with `semihosting`, the variant that writes
+    /// its crumbs to the semihosting channel instead of the ring, under a
+    /// QEMU that routes semihosting to the debugger.
+    fn boot_with(test: &str, dir: &Path, cmplog: bool, semihosting: bool) -> Option<Self> {
         for tool in [CC, QEMU, QEMU_IMG, NM] {
             if !tool_present(tool) {
                 eprintln!("SKIP {test}: {tool} not on PATH");
@@ -283,6 +315,9 @@ impl Fixture {
             assert!(compiled.success(), "{CC} failed to build check.c");
             link.arg("-DBHF_CMPLOG").arg(&object);
         }
+        if semihosting {
+            link.arg("-DBHF_SEMIHOSTING");
+        }
         let built = link
             .arg("-T")
             .arg(&ld)
@@ -308,7 +343,11 @@ impl Fixture {
         // socket).
         let qmp_port = free_port();
         let gdb_port = free_port();
-        let child = Command::new(QEMU)
+        let mut qemu = Command::new(QEMU);
+        if semihosting {
+            qemu.args(["-semihosting-config", "enable=on,target=gdb"]);
+        }
+        let child = qemu
             .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
             .arg(&elf)
             .arg("-gdb")
@@ -589,6 +628,70 @@ fn cli_qemu_system_cmplog_solves_a_four_byte_magic() {
     assert!(
         input.starts_with(&0x5AFE_C0DE_u32.to_le_bytes()),
         "the finding's input is the magic: {input:02x?}"
+    );
+}
+
+/// Semihosting coverage (#292): the fixture's probe writes each crumb to its
+/// semihosting stderr, which QEMU hands to bhf's gdb connection as File-I/O
+/// writes. The campaign reads no ring: its coverage grows with each seed's
+/// path through the firmware, and the fault seed's crash is recorded. Each
+/// run boots its own guest.
+#[test]
+fn cli_qemu_system_semihosting_coverage_grows_with_each_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run = |name: &str, seeds: &[&[u8]]| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Fixture::boot_with(
+            "cli_qemu_system_semihosting_coverage_grows_with_each_path",
+            &dir,
+            false,
+            true,
+        )?;
+        let map = format!(
+            "input={:#x},input_cap=64,coverage=semihosting",
+            fixture.input_addr
+        );
+        let mut fuzz = Command::new(bhf_bin());
+        fuzz.args(["fuzz", "--target-transport", &fixture.spec()])
+            .args(["--transport-coverage-map", &map])
+            .args(["--harness", "cortex-m-semihosting"]);
+        for (index, seed) in seeds.iter().enumerate() {
+            let path = dir.join(format!("seed-{index}.bin"));
+            std::fs::write(&path, seed).unwrap();
+            fuzz.arg("--seed-file").arg(path);
+        }
+        let out = fuzz
+            .args(["--iterations", &seeds.len().to_string(), "--time", "60s"])
+            .arg(dir.join("work"))
+            .output()
+            .expect("run bhf fuzz");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let summary: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{name} summary JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(summary["incomplete_observations"], 0, "{name}: {summary:#}");
+        Some(summary)
+    };
+
+    // 0x100, 0x101, then the default branch's 0x300: two edges between them.
+    let Some(one) = run("one", &[b"A"]) else {
+        return;
+    };
+    let edges = |summary: &serde_json::Value| summary["coverage_edges"].as_u64().unwrap_or(0);
+    assert_eq!(edges(&one), 2, "the stream was not decoded: {one:#}");
+    // 0x42 takes the branch to 0x200 and 0x201: two edges more.
+    let two = run("two", &[b"A", b"B"]).unwrap();
+    assert_eq!(
+        edges(&two),
+        4,
+        "the second path added no coverage: {one:#}\n{two:#}"
+    );
+    let fault = run("fault", &[&[0xF7]]).unwrap();
+    assert_eq!(
+        fault["findings"].as_array().map(Vec::len),
+        Some(1),
+        "the fault seed's crash was not recorded: {fault:#}"
     );
 }
 
