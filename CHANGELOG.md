@@ -2853,6 +2853,16 @@
   when bhf panics.
 
 ### Added
+- `bhf fuzz --frame <profile.toml>` fuzzes a single-input harness through a
+  binary frame descriptor (#328): a `bhf.protocol.v1` profile of one message,
+  whose typed fields, lengths, checksums, TLVs and offsets the session lane
+  already reads. The builtin engine decodes each input into the message's
+  fields, edits a field or mutates the frame's bytes, and recomputes every
+  derived field before the harness runs it, as AFL++'s
+  `afl_custom_post_process` does, so a mutant passes a length/CRC gate that
+  byte mutation alone breaks. Seeds are repaired the same way and the
+  message's own frame is a seed. Before, only the session lane used the frame
+  fix-ups.
 - The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
   no AddressSanitizer, so there the Fortran objects are compiled with
   gfortran's bounds and pointer checks, a failed check is a crash instead of

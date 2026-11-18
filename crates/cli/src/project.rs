@@ -709,6 +709,7 @@ fn plan_to_fuzz_args(
         runtime_oracles: map_runtime_oracles(launch.runtime_oracles),
         cmplog_log: None,
         grammar_file,
+        frame_file: None,
         dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,

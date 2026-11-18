@@ -3107,6 +3107,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_frame_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_hit_count_buckets.rs",
       "license": "Apache-2.0"
     },
