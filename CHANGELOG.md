@@ -2853,6 +2853,18 @@
   when bhf panics.
 
 ### Added
+- Linux aarch64 release binaries (#343): a release publishes
+  `aarch64-unknown-linux-gnu` archives of the CLI, the daemon and both preload
+  shims, and the shell installers install them on a 64-bit ARM host. They are
+  built natively on an `ubuntu-24.04-arm` runner in a digest-pinned
+  `manylinux2014_aarch64` image and held to the same glibc 2.17 ceiling as
+  x86_64; the runtrace shim links with the toolchain's own `rust-lld`. The
+  release job unpacks the aarch64 archives and runs the Linux release smoke on
+  the ARM64 runner before uploading them, and a new CI job,
+  `arm64-release-build`, which CI acceptance and so the release's CI gate
+  require, builds them the same way, installs them through the generated
+  installers and runs the same smoke. The all-in-one signed bundle stays
+  x86_64 only.
 - The MSan corpus replay covers C++ (#323): a C++ harness's `make msan` builds
   against the MSan-instrumented libc++ `BHF_MSAN_LIBCXX` names, which the full
   image builds into `/opt/msan-libcxx`. A run whose MSan runtime stops before

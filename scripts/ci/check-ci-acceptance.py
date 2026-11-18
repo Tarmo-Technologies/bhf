@@ -27,6 +27,7 @@ HEAVY_JOBS = (
     "rhel7-build",
     "rhel-family-smoke",
     "ubuntu-release-smoke",
+    "arm64-release-build",
     "windows-build",
     "windows-current-build",
 )

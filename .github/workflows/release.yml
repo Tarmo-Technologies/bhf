@@ -265,9 +265,11 @@ jobs:
       # (proven: an identical probe with a FIXED runs-on expanded to jobs, while
       # one with `runs-on: matrix.runner` + the dynamic matrix skipped). Our dist
       # targets are fixed in Cargo.toml (`x86_64-unknown-linux-gnu`,
-      # `x86_64-pc-windows-msvc`), so the matrix is enumerated here to keep
-      # `matrix.runner` resolvable at parse time. Keep in sync with the
-      # `[workspace.metadata.dist] targets` list.
+      # `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`), so the matrix is
+      # enumerated here to keep `matrix.runner` resolvable at parse time. Keep in
+      # sync with the `[workspace.metadata.dist] targets` list. Each Linux entry
+      # builds natively in the manylinux2014 image of its runner's architecture,
+      # pinned by digest in `build_image`.
       matrix:
         include:
           - runner: ubuntu-22.04
@@ -278,6 +280,16 @@ jobs:
               shell: sh
               run: "bash scripts/ci/install-cargo-dist.sh"
             cache_provider: github
+            build_image: quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50
+          - runner: ubuntu-24.04-arm
+            host: aarch64-unknown-linux-gnu
+            targets: ["aarch64-unknown-linux-gnu"]
+            dist_args: "--artifacts=local --target=aarch64-unknown-linux-gnu"
+            install_dist:
+              shell: sh
+              run: "bash scripts/ci/install-cargo-dist.sh"
+            cache_provider: github
+            build_image: quay.io/pypa/manylinux2014_aarch64@sha256:ae34a6ceeefe0b535c525b2e96f297311c8f1e01cfd8b9be5f647eece5b5c60b
           - runner: windows-2022
             host: x86_64-pc-windows-msvc
             targets: ["x86_64-pc-windows-msvc"]
@@ -291,10 +303,12 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
       DIST_ARGS: ${{ matrix.dist_args }}
+      # Each entry builds one target: its release-directory and archive names.
+      DIST_TARGET: ${{ join(matrix.targets, '-') }}
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       BHF_RELEASE_VERSION: "1"
       BHF_VCS_REF: ${{ github.sha }}
-      RHEL7_BUILD_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50
+      RHEL7_BUILD_IMAGE: ${{ matrix.build_image }}
     steps:
       # always() is needed for matrix expansion, so enforce the upstream gate
       # again before checkout, tool installation, or artifact creation.
@@ -352,6 +366,7 @@ jobs:
             --workdir "$GITHUB_WORKSPACE" \
             --env GH_TOKEN \
             --env DIST_ARGS \
+            --env DIST_TARGET \
             --env RELEASE_TAG \
             --env BHF_RELEASE_VERSION \
             --env BHF_VCS_REF \
@@ -364,12 +379,18 @@ jobs:
               git config --global --add safe.directory "$PWD"
               bash scripts/ci/install-rustup.sh -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
+              # The aarch64 runtrace shim links with lld (see its build.rs):
+              # the rust-lld this toolchain ships, not a system package.
+              if [[ $DIST_TARGET == aarch64-unknown-linux-gnu ]]; then
+                PATH="$(rustc --print sysroot)/lib/rustlib/$DIST_TARGET/bin/gcc-ld:$PATH"
+                command -v ld.lld
+              fi
               bash scripts/ci/install-cargo-dist.sh
               # Bash 4.2 treats empty arrays as unset under nounset. Publishing
               # always requires a tag, validated before this job starts work.
               : "${RELEASE_TAG:?release tag is required}"
               dist build "--tag=$RELEASE_TAG" --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
-              release_dir=target/x86_64-unknown-linux-gnu/dist
+              release_dir=target/$DIST_TARGET/dist
               [[ -d $release_dir ]] || release_dir=target/dist
               scripts/check-linux-release-abi.sh "$release_dir"
             '
@@ -380,13 +401,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_dir=target/x86_64-unknown-linux-gnu/dist
+          release_dir="target/$DIST_TARGET/dist"
           [[ -d "$release_dir" ]] || release_dir=target/dist
           test -x "$release_dir/bhf"
           test -x "$release_dir/bhf-daemon"
           echo "path=$release_dir" >> "$GITHUB_OUTPUT"
+      # The signed all-in-one bundle is packaged from the x86_64 binaries; the
+      # aarch64 binaries ship as component archives and installers only.
       - name: Transfer raw Linux binaries to protected signing job
-        if: runner.os == 'Linux' && needs.plan.outputs.publishing == 'true'
+        if: runner.os == 'Linux' && env.DIST_TARGET == 'x86_64-unknown-linux-gnu' && needs.plan.outputs.publishing == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-release-raw
@@ -406,7 +429,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive=target/distrib/bhf-x86_64-unknown-linux-gnu.tar.xz
+          archive="target/distrib/bhf-$DIST_TARGET.tar.xz"
           [[ -f "$archive" ]] || { echo "bhf Linux archive not found" >&2; exit 1; }
           entries=$(tar -tf "$archive")
           for marker in \
@@ -431,10 +454,10 @@ jobs:
         run: |
           set -euo pipefail
           for archive in \
-            target/distrib/bhf-x86_64-unknown-linux-gnu.tar.xz \
-            target/distrib/bhf-daemon-x86_64-unknown-linux-gnu.tar.xz \
-            target/distrib/bhf_runtrace_shim-x86_64-unknown-linux-gnu.tar.xz \
-            target/distrib/bhf_cc_intercept-x86_64-unknown-linux-gnu.tar.xz
+            "target/distrib/bhf-$DIST_TARGET.tar.xz" \
+            "target/distrib/bhf-daemon-$DIST_TARGET.tar.xz" \
+            "target/distrib/bhf_runtrace_shim-$DIST_TARGET.tar.xz" \
+            "target/distrib/bhf_cc_intercept-$DIST_TARGET.tar.xz"
           do
             entries=$(tar -tf "$archive")
             grep -Eq '(^|/)INSTALL\.md$' <<<"$entries" || {
@@ -442,6 +465,16 @@ jobs:
               exit 1
             }
           done
+      # No signed bundle carries the aarch64 binaries through an install
+      # smoke, so run the archives this job uploads on the ARM64 runner.
+      - name: Smoke-test the aarch64 archives on the ARM64 runner
+        if: runner.os == 'Linux' && env.DIST_TARGET == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm make
+          bash scripts/ci/linux-archive-smoke.sh target/distrib "$DIST_TARGET"
       - name: Validate packaged harness runtimes (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

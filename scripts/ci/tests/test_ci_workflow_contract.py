@@ -71,6 +71,30 @@ class WorkflowContractTests(unittest.TestCase):
         installer = (ROOT / "scripts/ci/install-nextest.sh").read_text()
         self.assertIn('"Linux aarch64")', installer)
 
+    def test_arm64_release_dry_run_builds_installs_and_smokes_the_archives(self):
+        # The aarch64 counterpart of rhel7-build: dist builds the release
+        # archives in the pinned manylinux2014_aarch64 image, the generated
+        # installers install them, and the archives run on the ARM64 runner.
+        job = self.jobs["arm64-release-build"]
+        self.assertIn("runs-on: ubuntu-24.04-arm", job)
+        self.assertIn("if: needs.changes.outputs.heavy == 'true'", job)
+        self.assertRegex(job, r"RHEL7_BUILD_IMAGE: quay\.io/pypa/manylinux2014_aarch64@sha256:[0-9a-f]{64}\n")
+        steps = [
+            "bash scripts/ci/install-rustup.sh -y --profile minimal",
+            "lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH",
+            "bash scripts/ci/install-cargo-dist.sh",
+            "dist build --artifacts=local --target=aarch64-unknown-linux-gnu",
+            'scripts/check-linux-release-abi.sh "$release_dir"',
+            "dist build --artifacts=global",
+            "python3 scripts/fix-dist-library-installer.py",
+            "python3 scripts/ci/component-install-smoke.py",
+            "bash scripts/ci/linux-archive-smoke.sh target/rhel7/distrib aarch64-unknown-linux-gnu",
+        ]
+        for earlier, later in zip(steps, steps[1:]):
+            self.assertLess(job.index(earlier), job.index(later), later)
+        for script in ("install-rustup.sh", "install-cargo-dist.sh"):
+            self.assertIn('"Linux aarch64")', (ROOT / "scripts/ci" / script).read_text(), script)
+
     def test_gate_runs_after_failure_and_uses_same_run_observations(self):
         gate = self.jobs["ci-acceptance"]
         self.assertIn("    if: ${{ always() }}", gate)

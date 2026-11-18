@@ -13,15 +13,17 @@ runtimes. This checklist is mandatory for every version.
 
 The full CI called by the release workflow also builds real cargo-dist component
 archives and exercises their generated installers. Linux checks cover the CLI,
-daemon, and both shims on the EL7 ABI. Windows Server 2022 and 2025 each exercise
-the CLI and daemon installers under Windows PowerShell and PowerShell Core.
+daemon, and both shims on the EL7 ABI, for x86_64 and, on an ARM64 runner,
+aarch64. Windows Server 2022 and 2025 each exercise the CLI and daemon
+installers under Windows PowerShell and PowerShell Core.
 The checks use local artifact URLs, temporary install prefixes, archive and
 installed-binary hash comparisons, and exact source/version identity. They do
 not publish a release or authenticate a publisher.
 
-The `x86_64-unknown-linux-gnu` installer metadata requires glibc 2.17, matching
-the manylinux2014 build and ABI gate. This explicit cargo-dist setting prevents
-global installer generation on a newer host from raising the advertised floor.
+The `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` installer
+metadata require glibc 2.17, matching the manylinux2014 builds and ABI gate.
+This explicit cargo-dist setting prevents global installer generation on a
+newer host from raising the advertised floor.
 
 - [ ] `build-local-artifacts` transfers the raw Linux binaries to the protected
       `sign-linux-bundle` job. That job builds the full distribution archive with

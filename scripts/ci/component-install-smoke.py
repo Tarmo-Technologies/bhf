@@ -15,6 +15,19 @@ import tomllib
 import zipfile
 
 
+# The Linux release target each runner architecture installs.
+LINUX_TARGETS = {"x86_64": "x86_64-unknown-linux-gnu",
+                 "aarch64": "aarch64-unknown-linux-gnu"}
+
+
+def release_target(windows, machine):
+    if windows:
+        return "x86_64-pc-windows-msvc"
+    if machine not in LINUX_TARGETS:
+        raise ValueError(f"no Linux release target for machine {machine!r}")
+    return LINUX_TARGETS[machine]
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -60,7 +73,8 @@ def main():
         "platform": platform.platform(), "attempts": []}
     receipt.write_text(json.dumps(result, indent=2) + "\n")
     version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
-    target = "x86_64-pc-windows-msvc" if windows else "x86_64-unknown-linux-gnu"
+    target = release_target(windows, platform.machine())
+    result["target"] = target
     components = [("bhf", "bhf.exe" if windows else "bhf"),
                   ("bhf-daemon", "bhf-daemon.exe" if windows else "bhf-daemon")]
     if not windows:

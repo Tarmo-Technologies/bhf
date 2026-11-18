@@ -85,9 +85,10 @@ allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax). Portable CLI
-# and daemon packages publish for Linux and Windows; their package-local target
-# overrides retain both. The LD_PRELOAD libraries override this list to Linux.
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# and daemon packages publish for x86_64 and aarch64 Linux and for Windows;
+# their package-local target overrides retain all three. The LD_PRELOAD
+# libraries override this list to the two Linux targets.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Checksums to generate for each App
 checksum = "sha256"
 # GitHub Artifact Attestations are disabled because GitHub currently rejects
@@ -108,6 +109,12 @@ install-updater = false
 # installer generation runs on a newer host and cannot infer that baseline.
 [workspace.metadata.dist.min-glibc-version]
 x86_64-unknown-linux-gnu = "2.17"
+aarch64-unknown-linux-gnu = "2.17"
+
+# The release workflow's static build matrix builds aarch64 natively on the
+# same ARM64 runner image as the CI ARM64 jobs; keep the plan in agreement.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
 [workspace.dependencies]
 anyhow = "1.0"

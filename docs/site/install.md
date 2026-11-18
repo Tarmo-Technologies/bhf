@@ -53,8 +53,11 @@ and
 [EL9 validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-20-rhel9-proxmox.md)
 as well as the
 [current-platform validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-21-current-platform-matrix.md)
-for the exact VMs and results. Other architectures can be built from source,
-but they are not covered by this x86_64 release claim.
+for the exact VMs and results. The 64-bit ARM (`aarch64-unknown-linux-gnu`)
+component archives and installers are built on the same glibc 2.17 baseline
+and smoke-tested on an Ubuntu 24.04 ARM64 runner; the guest validation above
+covers x86_64 only. Other architectures can be built from source, but they are
+not covered by this release claim.
 
 The tested Ubuntu and Windows matrix is deliberately explicit; “latest” does
 not silently float to an untested future release:
@@ -200,7 +203,7 @@ same individual component.
 |---|---|---|
 | Complete Linux install with one installer | Full bundle, `.sha256`, and detached `.sig`; verify before extraction, then run `./install.sh --trust-policy /trusted/operator-policy.json` | Independently supplied verifier, publisher key, and trust policy; the CLI, daemon, both shims, runtimes, and signed content are included |
 | Windows CLI | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` and its sidecar | `bhf-daemon-installer.ps1` or the daemon ZIP only for IDE/JSON-RPC/MCP use |
-| Basic Linux CLI, scan, build, and fuzz | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` and its sidecar | Add the two Linux shims below for full runtime behavior and complex C/C++ build recovery |
+| Basic Linux CLI, scan, build, and fuzz | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` (`bhf-aarch64-unknown-linux-gnu.tar.xz` on 64-bit ARM) and its sidecar | Add the two Linux shims below for full runtime behavior and complex C/C++ build recovery |
 | Full Linux `bhf auto` | The Linux CLI plus `bhf_runtrace_shim-installer.sh` (or its archive and sidecar) | Add `bhf_cc_intercept` when testing C/C++ projects with real build systems |
 | Complex C/C++ `--probe-build` / `--build-command` recovery | Linux CLI plus `bhf_cc_intercept-installer.sh` (or its archive and sidecar) | Add the runtrace shim for runtime audit/fake-resource coverage too |
 | Linux IDE/JSON-RPC/MCP service | The required Linux CLI/shims for the intended workload, plus `bhf-daemon-installer.sh` or its archive | None |
@@ -289,7 +292,9 @@ Those three installers place `bhf`, `libbhf_runtrace_shim.so`, and
 ### Manual component-archive co-location
 
 Verify each selected archive with its sidecar, extract it, and copy both Linux
-libraries into the CLI directory:
+libraries into the CLI directory. On 64-bit ARM, use the
+`aarch64-unknown-linux-gnu` archives in place of `x86_64-unknown-linux-gnu`;
+the shell installers pick the archive for the host's architecture themselves.
 
 ```sh
 sha256sum -c bhf-x86_64-unknown-linux-gnu.tar.xz.sha256

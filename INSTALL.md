@@ -14,7 +14,9 @@ Every all-in-one bundle also carries `INSTALL.md`, `LICENSE`, `README.md`, and
 source-tree documentation.
 
 Do not mix versions or target triples. The commands below use the published
-64-bit GNU/Linux artifacts.
+x86_64 GNU/Linux artifacts. On 64-bit ARM Linux, use the component archives
+with `aarch64-unknown-linux-gnu` in place of `x86_64-unknown-linux-gnu`; the
+all-in-one bundle is published for x86_64 only.
 
 ## Choice 1: all-in-one `install.sh` bundle
 

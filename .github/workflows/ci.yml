@@ -598,6 +598,88 @@ jobs:
             "$RUNNER_TEMP/bhf-fuzz/auto/run.json"
           test -n "$(find "$RUNNER_TEMP/bhf-fuzz" -name runtrace.jsonl -type f -size +0c -print -quit)"
 
+  # The release dry run for Linux ARM64, as rhel7-build is for x86_64: dist
+  # builds the aarch64 component archives and installers in the pinned
+  # manylinux2014_aarch64 image the release job uses (glibc 2.17), installs
+  # them through the generated installers, and the archives are unpacked and
+  # smoke-tested on the ARM64 runner.
+  arm64-release-build:
+    name: ARM64 release archives and smoke
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      RHEL7_BUILD_IMAGE: quay.io/pypa/manylinux2014_aarch64@sha256:ae34a6ceeefe0b535c525b2e96f297311c8f1e01cfd8b9be5f647eece5b5c60b
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The pinned rustup-init and dist tarball the container fetches.
+      - name: Cache the pinned downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/fetch-cache
+          key: bhf-fetch-arm64-${{ hashFiles('scripts/ci/install-*.sh') }}
+
+      - name: Build the aarch64 release archives on the RHEL 7 ABI
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --workdir /io \
+            --env BHF_FETCH_CACHE=/io/target/fetch-cache \
+            --env CARGO_HOME=/tmp/cargo \
+            --env RUSTUP_HOME=/tmp/rustup \
+            --env CARGO_TARGET_DIR=/io/target/rhel7 \
+            "$RHEL7_BUILD_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              # The runner checkout is owned by the host user, while this
+              # disposable container runs as root. Trust this mount only.
+              git config --global --add safe.directory /io
+              export BHF_RELEASE_VERSION=1
+              BHF_VCS_REF="$(git rev-parse HEAD)"
+              export BHF_VCS_REF
+              bash scripts/ci/install-rustup.sh -y --profile minimal
+              export PATH="$CARGO_HOME/bin:$PATH"
+              test -x /opt/python/cp312-cp312/bin/python3
+              export PATH="/opt/python/cp312-cp312/bin:$PATH"
+              # The runtrace shim links with rust-lld, as in the release job.
+              PATH="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
+              command -v ld.lld
+              bash scripts/ci/install-cargo-dist.sh
+              dist build --artifacts=local --target=aarch64-unknown-linux-gnu --output-format=json > /io/target/component-local-manifest.json
+              release_dir="$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/dist"
+              [[ -d $release_dir ]] || release_dir="$CARGO_TARGET_DIR/dist"
+              scripts/check-linux-release-abi.sh "$release_dir"
+              dist build --artifacts=global --output-format=json > /io/target/component-global-manifest.json
+              artifact_dir="$CARGO_TARGET_DIR/distrib"
+              python3 scripts/augment-release-installer.py "$artifact_dir/bhf-installer.sh"
+              python3 scripts/fix-dist-shell-installer.py "$artifact_dir/bhf-installer.sh" "$artifact_dir/bhf-daemon-installer.sh" "$artifact_dir/bhf_runtrace_shim-installer.sh" "$artifact_dir/bhf_cc_intercept-installer.sh"
+              python3 scripts/fix-dist-library-installer.py "$artifact_dir/bhf_runtrace_shim-installer.sh" "$artifact_dir/bhf_cc_intercept-installer.sh"
+              python3 scripts/ci/component-install-smoke.py --artifacts "$artifact_dir" --evidence /io/target/component-install-linux-arm64
+            '
+
+      # clang and make build the smoke's C harness.
+      - name: Install clang and make
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm make
+
+      - name: Smoke-test the aarch64 archives on the ARM64 runner
+        run: bash scripts/ci/linux-archive-smoke.sh target/rhel7/distrib aarch64-unknown-linux-gnu
+
+      - name: Retain ARM64 component installer evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: component-install-linux-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/component-install-linux-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
   windows-build:
     name: Windows MSVC build and tests
     needs: changes
@@ -841,6 +923,7 @@ jobs:
       - rhel7-build
       - rhel-family-smoke
       - ubuntu-release-smoke
+      - arm64-release-build
       - windows-build
       - windows-current-build
     runs-on: ubuntu-24.04

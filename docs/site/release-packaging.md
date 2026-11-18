@@ -15,9 +15,11 @@ so neither install style depends on a source checkout or a CI build path.
 
 ## Artifacts
 
-The CLI and daemon archives are built for `x86_64-unknown-linux-gnu` and
-`x86_64-pc-windows-msvc`. The GNU/Linux build runs in a pinned manylinux2014 /
-CentOS 7 container. An automated gate rejects GLIBC requirements newer than
+The CLI and daemon archives are built for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`. Each GNU/Linux build
+runs natively in a pinned manylinux2014 / CentOS 7 container of its
+architecture; the aarch64 archives are smoke-tested on an ARM64 runner. An
+automated gate rejects GLIBC requirements newer than
 2.17 and missing preload-hook exports, fixing the release ABI for Ubuntu
 22.04/24.04/26.04 LTS and RHEL 7 through RHEL 10 instead of inheriting a newer
 Ubuntu runner's glibc. Release binaries are scan/build/fuzz tested across that
@@ -26,8 +28,10 @@ is smoke-tested on Server 2025; Windows Server 2019, Windows 11 Enterprise 25H2,
 and Windows 11 Enterprise LTSC 2024 are covered by the platform VM validation.
 The runtime
 preload libraries are Linux-only and use package-local targets, so they remain
-separate Linux cdylib assets rather than empty Windows artifacts. macOS,
-Linux/aarch64, and Windows-on-Arm artifacts are not currently published.
+separate Linux cdylib assets rather than empty Windows artifacts. The
+all-in-one `bhf-dist-*` bundle is published for x86_64 only; on aarch64 use the
+component archives or installers. macOS and Windows-on-Arm artifacts are not
+currently published.
 
 The GitHub Release contains the all-in-one Linux `install.sh` bundle,
 per-component platform archives, Unix shell installers, and PowerShell
