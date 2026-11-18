@@ -236,11 +236,33 @@ pub fn select_decoder_for_param(
                 .map(|field| parse_record_field(field))
                 .unwrap_or_else(|| ("D".to_owned(), "Integer".to_owned()));
             let disc_field = ada_name(&disc_name);
-            let disc_expr = discriminant_decode(ast, &record_type, &disc_ty);
-
+            // A discriminant that governs a variant part must be static in an
+            // aggregate, so the input picks one of its static values.
+            let choices = discriminant_choices(ast, &record_type, &disc_ty);
+            let decode_name = format!("Decode_{}", ada_name(&p.name));
+            let mut setup_lines = vec![
+                format!("function {decode_name} return {record_type} is"),
+                "begin".to_owned(),
+                format!(
+                    "   case Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, {})) is",
+                    choices.len() - 1
+                ),
+            ];
+            for (index, choice) in choices.iter().enumerate() {
+                let when = if index + 1 == choices.len() {
+                    "others".to_owned()
+                } else {
+                    index.to_string()
+                };
+                setup_lines.push(format!(
+                    "      when {when} => return {record_type}'({disc_field} => {choice}, others => <>);"
+                ));
+            }
+            setup_lines.push("   end case;".to_owned());
+            setup_lines.push(format!("end {decode_name};"));
             Ok(DecoderEmission {
-                call_expr: format!("{record_type}'({disc_field} => {disc_expr}, others => <>)"),
-                setup_lines: Vec::new(),
+                call_expr: decode_name,
+                setup_lines,
             })
         }
         TypeKind::Tagged { .. } | TypeKind::Private => {
@@ -743,11 +765,18 @@ fn select_neutral_for_param(
                 .map(|field| ada_name(&parse_record_field(field).0))
                 .unwrap_or_else(|| "D".to_owned());
 
+            let record_type = ada_type_name(p);
+            let disc_ty = discriminants
+                .0
+                .first()
+                .map(|field| parse_record_field(field).1)
+                .unwrap_or_else(|| "Integer".to_owned());
+            let first = discriminant_choices(ast, &record_type, &disc_ty)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "0".to_owned());
             Ok(DecoderEmission {
-                call_expr: format!(
-                    "{}'({disc_field} => Integer (0), others => <>)",
-                    ada_type_name(p)
-                ),
+                call_expr: format!("{record_type}'({disc_field} => {first}, others => <>)"),
                 setup_lines: Vec::new(),
             })
         }
@@ -1016,7 +1045,16 @@ fn record_neutral(p: &Parameter, fields: &ada_parser::ast::Fields) -> DecoderEmi
         .0
         .iter()
         .flat_map(|field| record_field_components(field))
-        .map(|(name, ty)| format!("{} => {}", ada_name(&name), guess_neutral_for_type(&ty)))
+        .map(|(name, ty)| {
+            // `<>` default-initializes a component whose type has no neutral
+            // here: a literal `0` only compiles for an integer.
+            let value = if type_has_known_neutral(&ty) {
+                guess_neutral_for_type(&ty)
+            } else {
+                "<>".to_owned()
+            };
+            format!("{} => {value}", ada_name(&name))
+        })
         .collect::<Vec<_>>();
 
     DecoderEmission {
@@ -1283,13 +1321,28 @@ fn qualify_component_type(arr_type: &str, elem_name: &str) -> String {
 /// `'Val`; any other (possibly *derived* integer, e.g. `SDPCM_Channel is new
 /// Unsigned_8`) is converted to its actual type — qualified with the record's
 /// package — instead of the historical hardcoded `Integer`.
-fn discriminant_decode(ast: &StructuralAst, record_type: &str, disc_ty: &str) -> String {
-    let by_field = decode_record_field(ast, disc_ty);
-    if by_field.contains("'Val") {
-        return by_field;
+fn discriminant_choices(ast: &StructuralAst, record_type: &str, disc_ty: &str) -> Vec<String> {
+    /// At most this many of an enumeration's literals are choices.
+    const MAX_ENUM_CHOICES: usize = 64;
+    if let Some(declared) = declared_field_type(ast, disc_ty) {
+        if let TypeKind::Enum(variants) = &declared.kind {
+            let literal_count = variants.iter().filter(|v| !v.starts_with("__")).count();
+            if literal_count >= 1 {
+                let leaf = disc_ty.trim().rsplit('.').next().unwrap_or(disc_ty).trim();
+                let qualified = qualify_enum_field(ast, disc_ty, leaf, declared);
+                return (0..literal_count.min(MAX_ENUM_CHOICES))
+                    .map(|index| format!("{qualified}'Val ({index})"))
+                    .collect();
+            }
+        }
+    }
+    if disc_ty.trim().eq_ignore_ascii_case("boolean") {
+        return vec!["False".to_owned(), "True".to_owned()];
     }
     let qualified = qualify_component_type(record_type, disc_ty);
-    format!("{qualified} (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4))")
+    (0..=4)
+        .map(|value| format!("{qualified} ({value})"))
+        .collect()
 }
 
 /// Whether a type name is a directly-visible Standard predefined scalar that must
@@ -1347,47 +1400,24 @@ fn integer_scalar_decode(name: &str) -> String {
 /// `with`s for the record — while an already-qualified field type is kept as
 /// written (its unit is `with`ed via the record's own source).
 fn decode_record_field(ast: &StructuralAst, ty: &str) -> String {
+    if is_constrained_string(ty) {
+        // `Name : String (1 .. 24)`: the component's own bounds apply to an
+        // `others` aggregate, which decodes each character in turn. (A
+        // decoded String of any length would fail its length check.)
+        return CONSTRAINED_STRING_DECODE.to_owned();
+    }
     let by_name = guess_decoder_for_type(ty);
     if by_name != "<>" {
         return by_name;
     }
     let leaf = ty.trim().rsplit('.').next().unwrap_or(ty).trim();
-    if leaf.is_empty() {
-        return "<>".to_owned();
-    }
-    let declared = if ty.contains('.') {
-        let requested = ty.split('.').map(str::trim).collect::<Vec<_>>();
-        ast.types.iter().find(|candidate| {
-            let qualified = match candidate.owner {
-                ada_parser::ast::TypeOwner::Package(package_id) => ast
-                    .packages
-                    .iter()
-                    .find(|package| package.id == package_id)
-                    .map(|package| {
-                        let mut path = package.name.split('.').collect::<Vec<_>>();
-                        path.extend(candidate.name_path.iter().map(String::as_str));
-                        path
-                    })
-                    .unwrap_or_default(),
-                _ => candidate.name_path.iter().map(String::as_str).collect(),
-            };
-            qualified.len() == requested.len()
-                && qualified
-                    .iter()
-                    .zip(&requested)
-                    .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        })
-    } else {
-        let mut matches = ast.types.iter().filter(|candidate| {
-            candidate
-                .name_path
-                .last()
-                .is_some_and(|name| name.eq_ignore_ascii_case(leaf))
-        });
-        let only = matches.next();
-        only.filter(|_| matches.next().is_none())
-    };
-    if let Some(declared) = declared {
+    if let Some(declared) = declared_field_type(ast, ty) {
+        if matches!(declared.kind, TypeKind::Derived { .. })
+            && is_constrained_string(&declared.constraints.0)
+        {
+            // `subtype Eword is String (1 .. 24)`.
+            return CONSTRAINED_STRING_DECODE.to_owned();
+        }
         if let TypeKind::Enum(variants) = &declared.kind {
             // A real in-tree enumeration: decode an index over its literals. The
             // synthetic "__external_discrete" marker has no known cardinality.
@@ -1402,6 +1432,74 @@ fn decode_record_field(ast: &StructuralAst, ty: &str) -> String {
         }
     }
     "<>".to_owned()
+}
+
+/// The declaration of a record component's type `ty` in the tree, by its
+/// qualified name or, for a bare name, by a name only one declaration has.
+fn declared_field_type<'a>(ast: &'a StructuralAst, ty: &str) -> Option<&'a TypeRef> {
+    let leaf = ty.trim().rsplit('.').next().unwrap_or(ty).trim();
+    if leaf.is_empty() {
+        return None;
+    }
+    if ty.contains('.') {
+        let requested = ty
+            .split('.')
+            .map(|part| part.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        ast.types
+            .iter()
+            .find(|candidate| qualified_type_path(ast, candidate) == requested)
+    } else {
+        // A library-level copy of a package's type is listed beside it under
+        // its qualified name: both are the one declaration.
+        let mut matches = ast
+            .types
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .name_path
+                    .last()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(leaf))
+            })
+            .map(|candidate| (qualified_type_path(ast, candidate), candidate));
+        let only = matches.next();
+        only.filter(|(path, _)| matches.all(|(other, _)| other == *path))
+            .map(|(_, candidate)| candidate)
+    }
+}
+
+/// A record component's or subtype's value decoded one character at a time:
+/// an `others` aggregate takes its bounds from the constrained String subtype
+/// it initializes, and evaluates its expression once per character.
+const CONSTRAINED_STRING_DECODE: &str =
+    "(others => Character'Val (Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 127))))";
+
+/// Whether `ty` (a component type or a subtype's definition) is a String
+/// constrained by an index range: `String (1 .. 24)`.
+fn is_constrained_string(ty: &str) -> bool {
+    let ty = ty.trim().to_ascii_lowercase();
+    let ty = ty.strip_prefix("standard.").unwrap_or(&ty);
+    ty.strip_prefix("string")
+        .map(str::trim_start)
+        .is_some_and(|rest| rest.starts_with('(') && rest.contains(".."))
+}
+
+/// A declared type's name with its owning package's, lower-cased:
+/// `["words", "eword"]` for `Eword` declared in package `Words`.
+fn qualified_type_path(ast: &StructuralAst, declared: &TypeRef) -> Vec<String> {
+    let mut path = match declared.owner {
+        ada_parser::ast::TypeOwner::Package(package_id) => ast
+            .packages
+            .iter()
+            .find(|package| package.id == package_id)
+            .map(|package| package.name.split('.').map(str::to_owned).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    path.extend(declared.name_path.iter().cloned());
+    path.iter()
+        .map(|part| part.trim().to_ascii_lowercase())
+        .collect()
 }
 
 /// The harness-visible name for an enum field type. An already-qualified `ty`
@@ -1677,7 +1775,10 @@ fn type_path_parts(type_ref: &TypeRef) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{known_stdlib_type_with, known_stdlib_with_for_type_name};
-    use super::{select_decoder_for_param, select_initializer_for_param, DecoderEmission};
+    use super::{
+        select_decoder_for_param, select_initializer_for_param, select_neutral_for_param,
+        DecoderEmission,
+    };
 
     #[test]
     fn known_stdlib_with_for_type_name_maps_calendar_and_streams() {
@@ -3036,16 +3137,23 @@ mod tests {
     }
 
     #[test]
-    fn record_param_with_constrained_string_field_uses_string_decoder() {
+    fn record_param_with_constrained_string_field_decodes_each_character() {
+        // A decoded String of any length fails the component's length check
+        // unless it is 8 long (#418): the component's bounds shape an `others`
+        // aggregate instead.
         let decoder = select(&param(
             "Root_Record",
             TypeKind::Record(Fields(vec!["Name : String (1 .. 8)".to_owned()])),
         ))
         .unwrap();
 
-        assert!(decoder
-            .call_expr
-            .contains("Name => AdaFuzz.Decode.Ada_String (Cur, 0, 64)"));
+        assert!(
+            decoder.call_expr.contains(
+                "Name => (others => Character'Val (Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 127))))"
+            ),
+            "{}",
+            decoder.call_expr
+        );
     }
 
     #[test]
@@ -3116,8 +3224,11 @@ mod tests {
         assert!(decoder.call_expr.starts_with("Pkg.Root_Record'("));
     }
 
+    /// A discriminant that governs a variant part must be static in an
+    /// aggregate (#418): the input picks one of five static values, each
+    /// converted to the discriminant's type, and the rest default.
     #[test]
-    fn discriminated_record_decoder_decodes_discriminant_first() {
+    fn discriminated_record_decoder_picks_a_static_discriminant() {
         let decoder = select(&param(
             "Variant_Record",
             TypeKind::Discriminated {
@@ -3126,17 +3237,30 @@ mod tests {
             },
         ))
         .unwrap();
-
-        assert!(decoder
-            .call_expr
-            .contains("Kind => Integer (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4)), others => <>"));
+        assert_eq!(decoder.call_expr, "Decode_Value");
+        let body = decoder.setup_lines.join("\n");
+        assert!(
+            body.contains("case Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4)) is"),
+            "{body}"
+        );
+        assert!(
+            body.contains("when 0 => return Variant_Record'(Kind => Integer (0), others => <>);"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "when others => return Variant_Record'(Kind => Integer (4), others => <>);"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("Kind => Integer (AdaFuzz"), "{body}");
     }
 
     #[test]
     fn discriminated_record_with_derived_integer_discriminant_converts_to_its_type() {
         // sdpcm's `Packet (Channel : SDPCM_Channel := ...)` where
-        // `SDPCM_Channel is new Interfaces.Unsigned_8`: the discriminant default
-        // must be converted to the discriminant's actual type (qualified with the
+        // `SDPCM_Channel is new Interfaces.Unsigned_8`: each choice is
+        // converted to the discriminant's actual type (qualified with the
         // record's package), not the hardcoded `Integer`.
         let decoder = select(&param(
             "Sdpcm.Packets.Packet",
@@ -3146,46 +3270,108 @@ mod tests {
             },
         ))
         .unwrap();
+        let body = decoder.setup_lines.join("\n");
         assert!(
-            decoder.call_expr.contains(
-                "Channel => Sdpcm.Packets.SDPCM_Channel (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4))"
+            body.contains(
+                "return Sdpcm.Packets.Packet'(Channel => Sdpcm.Packets.SDPCM_Channel (2), others => <>);"
             ),
-            "derived discriminant must be converted to its type: {}",
-            decoder.call_expr
+            "{body}"
+        );
+        assert!(!body.contains("Integer ("), "{body}");
+    }
+
+    #[test]
+    fn an_enumeration_discriminant_takes_each_literal_statically() {
+        let path = std::path::Path::new("words.ads");
+        let ast = ada_parser::reconcile::build_structural_ast(
+            "package Words is\n   type Part_Of_Speech_Type is (X, N, V);\n   \
+             type Entry_Record (Pofs : Part_Of_Speech_Type := X) is record\n      \
+             case Pofs is\n         when N => Count : Integer;\n         \
+             when others => null;\n      end case;\n   end record;\nend Words;\n",
+            None,
+            path,
+        )
+        .unwrap();
+        let decoder = select_with_ast(
+            &ast,
+            &param(
+                "Words.Entry_Record",
+                TypeKind::Discriminated {
+                    base: TypeId(9),
+                    discriminants: Fields(vec!["Pofs : Part_Of_Speech_Type".to_owned()]),
+                },
+            ),
+        )
+        .unwrap();
+        let body = decoder.setup_lines.join("\n");
+        assert!(
+            body.contains("case Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 2)) is"),
+            "{body}"
         );
         assert!(
-            !decoder.call_expr.contains("Integer (AdaFuzz"),
-            "must not hardcode Integer for a derived discriminant: {}",
-            decoder.call_expr
+            body.contains(
+                "when 1 => return Words.Entry_Record'(Pofs => Words.Part_Of_Speech_Type'Val (1), others => <>);"
+            ),
+            "{body}"
+        );
+        // An `out` one starts from the first literal.
+        let neutral = select_neutral_for_param(
+            &ast,
+            &param_with_mode(
+                "Words.Entry_Record",
+                TypeKind::Discriminated {
+                    base: TypeId(9),
+                    discriminants: Fields(vec!["Pofs : Part_Of_Speech_Type".to_owned()]),
+                },
+                ParamMode::Out,
+            ),
+            &ConstructorRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            neutral.call_expr,
+            "Words.Entry_Record'(Pofs => Words.Part_Of_Speech_Type'Val (0), others => <>)"
         );
     }
 
+    /// whitakers-words' `Ewds_Record` (#418): a constrained String subtype,
+    /// an enumeration and an integer component. Each decodes as its own
+    /// type, though the tree lists each type twice, under the package and
+    /// at library level.
     #[test]
-    fn discriminated_record_uses_others_box_for_remaining_fields() {
-        let decoder = select(&param(
-            "Variant_Record",
-            TypeKind::Discriminated {
-                base: TypeId(9),
-                discriminants: Fields(vec!["Kind : Integer".to_owned()]),
-            },
-        ))
+    fn a_record_decodes_string_subtype_and_enumeration_components_by_their_types() {
+        let path = std::path::Path::new("words.ads");
+        let ast = ada_parser::reconcile::build_structural_ast(
+            "package Words is\n   subtype Eword is String (1 .. 24);\n   \
+             type Part_Of_Speech_Type is (X, N, V, Adj);\n   type Ewds_Record is record\n      \
+             W : Eword;\n      Code : String (1 .. 4);\n      Pofs : Part_Of_Speech_Type;\n      \
+             Freq : Integer;\n   end record;\nend Words;\n",
+            None,
+            path,
+        )
         .unwrap();
-
-        assert!(decoder.call_expr.ends_with(", others => <>)"));
-    }
-
-    #[test]
-    fn discriminated_record_qualified_type_in_aggregate() {
-        let decoder = select(&param(
-            "Pkg.Variant_Record",
-            TypeKind::Discriminated {
-                base: TypeId(9),
-                discriminants: Fields(vec!["Kind : Integer".to_owned()]),
-            },
-        ))
-        .unwrap();
-
-        assert!(decoder.call_expr.starts_with("Pkg.Variant_Record'("));
+        let record = ast
+            .types
+            .iter()
+            .find(|t| t.name_path.last().is_some_and(|n| n == "ewds_record"))
+            .unwrap();
+        let mut target = param("Words.Ewds_Record", record.kind.clone());
+        let decoder = select_with_ast(&ast, &target).unwrap();
+        assert_eq!(
+            decoder.call_expr,
+            "Words.Ewds_Record'(W => (others => Character'Val (Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 127)))), \
+             Code => (others => Character'Val (Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 127)))), \
+             Pofs => Words.Part_Of_Speech_Type'Val (Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 3))), \
+             Freq => Integer (AdaFuzz.Decode.I32 (Cur)))"
+        );
+        // An `out` one in another harness kind keeps an initializer, which
+        // defaults what has no neutral instead of giving it a `0`.
+        target.mode = ParamMode::Out;
+        let neutral = select_neutral_for_param(&ast, &target, &ConstructorRegistry::new()).unwrap();
+        assert_eq!(
+            neutral.call_expr,
+            "Words.Ewds_Record'(W => <>, Code => <>, Pofs => <>, Freq => Integer (0))"
+        );
     }
 
     #[test]

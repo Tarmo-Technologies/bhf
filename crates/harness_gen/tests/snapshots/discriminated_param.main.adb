@@ -25,7 +25,17 @@ begin
       begin
       declare
          Cur : AdaFuzz.Decode.Cursor := AdaFuzz.Decode.Open (Buf'Unchecked_Access, Last);
-         R : Variant_Record := Variant_Record'(Kind => Integer (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4)), others => <>);
+         function Decode_R return Variant_Record is
+         begin
+            case Natural (AdaFuzz.Decode.Bounded_Range (Cur, 0, 4)) is
+               when 0 => return Variant_Record'(Kind => Integer (0), others => <>);
+               when 1 => return Variant_Record'(Kind => Integer (1), others => <>);
+               when 2 => return Variant_Record'(Kind => Integer (2), others => <>);
+               when 3 => return Variant_Record'(Kind => Integer (3), others => <>);
+               when others => return Variant_Record'(Kind => Integer (4), others => <>);
+            end case;
+         end Decode_R;
+         R : Variant_Record := Decode_R;
       begin
          AdaFuzz.Probe.Target_Entry;
          Switch (R);

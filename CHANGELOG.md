@@ -70,6 +70,13 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- An Ada record parameter whose components are not integers builds (#418).
+  An `out` record is declared without an initializer, an `in` record's
+  constrained String and enumeration components are decoded as their own
+  types (the tree lists a package's types twice, which had left them
+  defaulted), a component with no known neutral defaults with `<>` instead
+  of `0`, and a discriminant takes one of its static values, which an
+  aggregate needs for a variant part.
 - An Ada target whose project `with`s sibling library projects builds (#287).
   Staging copied the siblings' units into src_instrumented beside the projects
   that own them, and gprbuild refused the second owner (`unit "X" cannot belong
