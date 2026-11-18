@@ -13,6 +13,17 @@
 //!
 //! The command runs through the platform shell (`sh -c`, `cmd /C`) in its own
 //! process group, which is killed when the server is stopped or bhf exits.
+//!
+//! With [`SessionServer::with_coverage`] the service also gets `BHF_COV_SHM`
+//! (#363): a map bhf owns, one byte per edge, that a service built with
+//! SanitizerCoverage and `c_runtime/bhf_service_cov.c` fills. It outlives a
+//! restart, so coverage accumulates over the campaign.
+//!
+//! With [`SessionServer::with_runtime_oracles`] the service runs under the
+//! runtrace shim (#364). Before each session bhf writes the bytes the session
+//! carries where the shim reads its input, and after it bhf takes the events
+//! the session caused: those after the service started serving, so its
+//! start-up is no session's.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -30,6 +41,8 @@ pub(crate) const SERVER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const UDP_SETTLE: Duration = Duration::from_millis(300);
 /// How much of a service's stderr a finding keeps.
 const STDERR_CAP: u64 = 256 * 1024;
+/// The size of the service's edge map: one byte per edge, as bhf_driver.c's.
+const COVERAGE_MAP_BYTES: usize = 1 << 16;
 /// The sanitizer options a service runs with unless the environment sets its
 /// own: report and exit on the first error, with no leak check at exit.
 const DEFAULT_ASAN_OPTIONS: &str = "halt_on_error=1:abort_on_error=0:detect_leaks=0:symbolize=1";
@@ -52,6 +65,24 @@ pub(crate) struct SessionServer {
     log_dir: PathBuf,
     child: Option<Running>,
     starts: usize,
+    coverage: Option<CoverageMap>,
+    runtrace: Option<ServiceRuntrace>,
+}
+
+/// The runtrace a service writes under the shim, and the file the shim reads
+/// the session in flight from.
+struct ServiceRuntrace {
+    env: Vec<(String, String)>,
+    log: PathBuf,
+    input: PathBuf,
+    /// How much of `log` earlier sessions, and the start-up, have taken.
+    offset: u64,
+}
+
+/// The edge map a service writes, and the path it is told.
+struct CoverageMap {
+    _file: crate::fuzz::shared_map::SharedMapFile,
+    path: String,
 }
 
 struct Running {
@@ -72,7 +103,96 @@ impl SessionServer {
             log_dir: log_dir.to_path_buf(),
             child: None,
             starts: 0,
+            coverage: None,
+            runtrace: None,
         }
+    }
+
+    /// Run the service under the runtrace shim `oracles` names, its log and
+    /// the session input file in `dir`.
+    pub(crate) fn with_runtime_oracles(
+        mut self,
+        oracles: &crate::runtime_oracles::RuntimeOracles,
+        dir: &Path,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let log = dir.join("service-runtrace.jsonl");
+        let input = dir.join("service-input.bin");
+        std::fs::write(&input, b"").map_err(|e| format!("create {}: {e}", input.display()))?;
+        let mut env = oracles.env_pairs(&log);
+        env.push((
+            "BHF_SHIM_INPUT_FILE".to_owned(),
+            input.display().to_string(),
+        ));
+        env.push(("BHF_SHIM_INPUT_FILE_SHARED".to_owned(), "1".to_owned()));
+        self.runtrace = Some(ServiceRuntrace {
+            env,
+            log,
+            input,
+            offset: 0,
+        });
+        Ok(self)
+    }
+
+    /// Whether the service runs under the runtrace shim.
+    pub(crate) fn has_runtrace(&self) -> bool {
+        self.runtrace.is_some()
+    }
+
+    /// Make `bytes` the input the shim matches the service's sinks against:
+    /// the bytes of the session about to be driven.
+    pub(crate) fn publish_session_input(&self, bytes: &[u8]) -> Result<(), String> {
+        let Some(runtrace) = &self.runtrace else {
+            return Ok(());
+        };
+        // A new file, renamed in: the shim re-reads it when its inode changes.
+        let next = runtrace.input.with_extension("bin.next");
+        std::fs::write(&next, bytes).map_err(|e| format!("write {}: {e}", next.display()))?;
+        std::fs::rename(&next, &runtrace.input)
+            .map_err(|e| format!("rename {}: {e}", runtrace.input.display()))
+    }
+
+    /// The runtrace events since the last call (or since the service started
+    /// serving): those of the session just driven.
+    pub(crate) fn take_session_events(&mut self) -> Vec<crate::auto::runtrace::RuntraceEvent> {
+        let Some(runtrace) = &mut self.runtrace else {
+            return Vec::new();
+        };
+        let text = read_from(&runtrace.log, &mut runtrace.offset);
+        let mut events = crate::auto::runtrace::parse_str(&text);
+        crate::auto::runtrace::dedupe_in_place(&mut events);
+        events
+    }
+
+    /// Give the service an edge map in `work_dir`'s shared-map dir, which it
+    /// fills when built with `c_runtime/bhf_service_cov.c`.
+    pub(crate) fn with_coverage(mut self, work_dir: &Path) -> Result<Self, String> {
+        let (file, path) =
+            crate::fuzz::shared_map::SharedMapFile::create(work_dir, COVERAGE_MAP_BYTES)?;
+        self.coverage = Some(CoverageMap { _file: file, path });
+        Ok(self)
+    }
+
+    /// Whether the service is given an edge map.
+    pub(crate) fn has_coverage(&self) -> bool {
+        self.coverage.is_some()
+    }
+
+    /// The edges the service has reached so far, by index; none when it has
+    /// no map, or is not instrumented.
+    pub(crate) fn coverage_edges(&self) -> Vec<u64> {
+        let Some(coverage) = &self.coverage else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(&coverage.path) else {
+            return Vec::new();
+        };
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte != 0)
+            .map(|(index, _)| index as u64)
+            .collect()
     }
 
     /// The command line the service runs.
@@ -106,6 +226,12 @@ impl SessionServer {
         if std::env::var_os("ASAN_OPTIONS").is_none() {
             command.env("ASAN_OPTIONS", DEFAULT_ASAN_OPTIONS);
         }
+        if let Some(coverage) = &self.coverage {
+            command.env("BHF_COV_SHM", &coverage.path);
+        }
+        if let Some(runtrace) = &self.runtrace {
+            command.envs(runtrace.env.iter().map(|(key, value)| (key, value)));
+        }
         replay_min::process::isolate_process_group(&mut command);
         let child = command
             .spawn()
@@ -137,6 +263,10 @@ impl SessionServer {
                 })
             };
             if ready {
+                // What the service did before it served is its start-up.
+                if let Some(runtrace) = &mut self.runtrace {
+                    read_from(&runtrace.log, &mut runtrace.offset);
+                }
                 return Ok(());
             }
             if started.elapsed() >= SERVER_START_TIMEOUT {
@@ -213,6 +343,28 @@ fn shell_command(command_line: &str) -> Command {
         command.args(["-c", command_line]);
         command
     }
+}
+
+/// The complete lines of `path` from `offset` on, moving `offset` past them.
+fn read_from(path: &Path, offset: &mut u64) -> String {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(STDERR_CAP * 64).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    // A line still being written is the next call's.
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    *offset += complete as u64;
+    String::from_utf8_lossy(&bytes[..complete]).into_owned()
 }
 
 fn read_capped(path: &Path) -> String {

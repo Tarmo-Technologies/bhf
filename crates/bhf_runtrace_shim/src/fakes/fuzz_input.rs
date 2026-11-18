@@ -247,14 +247,21 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
 /// file would be rewritten under another process's read, and give it the
 /// other's input. Resolved in the driver's process, before it forks a
 /// command it runs, whose exec the shim matches against the same input.
+///
+/// With `BHF_SHIM_INPUT_FILE_SHARED=1` the file is the one named, for every
+/// process (#364): a service the session lane drives handles one session at
+/// a time, whichever of its processes runs the command, and bhf writes the
+/// session in flight there.
 pub fn input_file() -> Option<&'static std::ffi::CStr> {
     static PATH: OnceLock<Option<std::ffi::CString>> = OnceLock::new();
     PATH.get_or_init(|| {
         use std::os::unix::ffi::OsStrExt;
         let base = std::env::var_os("BHF_SHIM_INPUT_FILE").filter(|path| !path.is_empty())?;
         let mut path = base.as_bytes().to_vec();
-        path.push(b'.');
-        path.extend_from_slice(std::process::id().to_string().as_bytes());
+        if std::env::var_os("BHF_SHIM_INPUT_FILE_SHARED").is_none_or(|shared| shared != "1") {
+            path.push(b'.');
+            path.extend_from_slice(std::process::id().to_string().as_bytes());
+        }
         std::ffi::CString::new(path).ok()
     })
     .as_deref()

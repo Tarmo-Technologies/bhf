@@ -70,6 +70,37 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- Continuous scheduler jobs are tenant-aware, and orphaned jobs are
+  reconciled on start (#385). `submitJob` records the caller's tenant and
+  workspace root on the job (`Scheduler::submit_as` with a `JobOwner`). That
+  tenant and the other tenants of the same workspace root see and cancel it
+  (`list_jobs_as`, `cancel_as`); others, nested workspace roots included,
+  get "no job". A job a crashed scheduler left `running` is `failed` on the
+  next start with a `reason`, and its process (recorded under
+  `<data-dir>/running/`) is stopped if it still runs. Visibility was by
+  workspace prefix, and such jobs were queued to run again.
+- The continuous scheduler's stop and its webhook are bounded (#272).
+  Dropping a `Scheduler` waits for its workers for the shutdown timeout
+  plus 1 s, then 1 s more for the results refresh. A thread still running
+  after that finishes in the background, holding the data directory's lock
+  until it has. The webhook resolves its host within its 10 s deadline
+  (`continuous_daemon::resolve_with_timeout`). Shutdown joined every thread
+  with no deadline, and name resolution had none.
+- `bhf auto`'s minimize pass minimizes Ada findings (#281), on their
+  event-log signature as `bhf minimize` does, within the group's 30 s, so
+  an Ada finding has a `min_testcase.bin`. The pass skipped them.
+- `bhf corpus minimize` minimizes on the harness's coverage map in every lane
+  (#282). Each input is replayed in a fresh process with the map cleared,
+  and kept when it reaches an edge no earlier input did or, for Ada, adds an
+  event-log signature. It read only the Ada event log, so a C, C++ or Python
+  harness kept nothing. A map whose edges differ between two runs of one
+  input (a driver that hashes addresses) is not used, and a relative
+  `--harness` path now resolves before the replays run.
+- The AFL++ lane runs afl-fuzz for its whole budget (#412). bhf set
+  `AFL_BENCH_UNTIL_CRASH=0`, and afl-fuzz stops at its first crash when that
+  variable is set at all, so a run reported one crash and left the rest of
+  `--time` or `--per-target-time` unused. The variable is now removed from
+  afl-fuzz's environment, including a value bhf inherited.
 - The daemon's operator role has fewer permissions than workspace_admin
   (#361): it runs scans and jobs, but a `staticScan` with its own `policy`,
   `suppressions`, `baseline`, `enabled_rules` or `disabled_rules` needs a
@@ -2781,6 +2812,88 @@
   when bhf panics.
 
 ### Added
+- `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
+  finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
+  integer or flag to the first of 0, 1, -1 and its type's limits that still
+  crashes, then an integer to the value nearest zero that does, keeping the
+  input's layout. `minimization.typed` records what it tried and kept. A
+  lane without an argument layout, a binary finding and a transport finding
+  are refused by name. The strategy was Ada-only, and it refused every other
+  harness as "C/C++".
+- `bhf minimize` minimizes on-target transport findings (#280). It rebuilds
+  the transport from the finding's profile as `bhf replay` does
+  (`--transport-endpoint` relocates it), then delta-debugs the input,
+  keeping a reduction only when it faults with the same rule at the same
+  site, or for a deadline finding is again a clean run past the deadline.
+  It refused transport findings.
+- The workers of a `bhf fuzz --workers` campaign share their corpus while
+  they run (#277). Every `BHF_SYNC_INTERVAL_MS` (10 s by default, spread
+  over the workers), each writes the entries its pool kept to
+  `fuzz_campaigns/<harness>/sync/worker-<id>/`. It also runs the entries
+  the others wrote that it has not seen, by content hash, and keeps those
+  that add coverage. An entry is written once, and each worker logs its
+  imports to `sync-import.log`. The workers merged their queues only after
+  all of them had exited.
+- `bhf fuzz --engine afl++ --workers N` runs AFL++'s own parallel mode
+  (#276): a `-M main` instance, which runs CmpLog, and N-1 `-S` instances in
+  one output directory. They sync each other's queues at start and every
+  quarter of `--time` (1 to 30 minutes, unless `AFL_SYNC_TIME` is set). All
+  their crashes, hangs and queues are harvested, the summary's
+  `afl.instances` names them, and the stats add up. It ran N bhf workers
+  with an afl-fuzz each, in their own directories, that never synced.
+- The AFL++ lane keeps its session (#275). `afl_out/<harness>/out` is kept
+  between runs, `bhf auto` runs included, and afl-fuzz resumes it
+  (`AFL_AUTORESUME`). Seeds the session was not given before join its queue
+  (`offered-seeds.txt` records the ones it was given). After each run its
+  queue is taken into the bhf corpus (`corpus_persisted`). Inputs afl-fuzz
+  saved as hangs are re-run through `main_afl` with twice its 1 s limit, and
+  one that hangs again is a BHF-230 finding (`hangs` in the summary). The
+  crashes and hangs of a session a resume moved aside are harvested too. A
+  session afl-fuzz cannot resume is started over, once. The out directory
+  was deleted at the start of every run, the queue was never imported, and
+  `hangs/` was never read.
+- The AFL++ lane runs CmpLog (#274). The harness Makefile has an
+  `afl_cmplog` target that builds `main_afl_cmplog` under
+  `AFL_LLVM_CMPLOG=1`. `bhf auto --engine afl++` and `bhf build --c-engine
+  afl++` build it beside `main_afl`, and afl-fuzz runs with `-c
+  main_afl_cmplog -l 2AT`, so AFL++ solves magic values and checksums no
+  dictionary holds. The run's `afl` block records `cmplog_binary`. A CmpLog
+  binary older than `main_afl` is not used. The lane ran without CmpLog,
+  which bhf's own comparison measures AFL++ with.
+- `--session-transport transport:<spec>` drives a protocol session through a
+  `--target-transport` backend (#261): an on-target agent, a debug probe or
+  an emulator, with `--transport-coverage-map` for the gdb and qemu-system
+  backends. Each message is one execution, in order. A fault, crash or hang
+  at a message is a disconnect finding once a second drive confirms it, and
+  `bhf replay` reproduces it. The executions' edges feed the lane's code
+  channel (`coverage_source = "target"`). A reply is the backend's stdout,
+  which the agent backends do not have. The session lane could not reach a
+  protocol on the target.
+- `--session-transport serial:PATH[,baud=N]` drives a protocol session over
+  a UART or a pty (#262), opened raw as the agent's serial transport is, with
+  the profile's framing and every read bounded by the reply deadline.
+  `--session-reset reconnect` reopens the device; `none` keeps it open. The
+  session lane reached only TCP and UDP services, not a device's command
+  set.
+- `bhf fuzz --session-server-cmd ... --runtime-oracles on` runs the service
+  under the runtrace shim (#364). Before each session bhf writes the bytes
+  the session carries where the shim matches its sinks against its input
+  (`BHF_SHIM_INPUT_FILE_SHARED=1`, one file for every process of the
+  service). Each session's events are evaluated as that session's, and the
+  service's start-up is excluded. A command, path, library or query built
+  from a session's bytes is a finding of that session, once per rule and
+  sink API, which `bhf replay` reproduces under the shim. Sessions had only
+  the profile's response and state oracles, and the lane refused
+  `--runtime-oracles`.
+- A service the session lane runs with `--session-server-cmd` reports its
+  code coverage (#363). It gets `BHF_COV_SHM`, an edge map bhf keeps for the
+  campaign, which a service built with SanitizerCoverage and the new
+  `c_runtime/bhf_service_cov.c` fills. A session that reaches new code is
+  kept and scheduled as one that reaches a new state is. The summary's
+  `coverage_edges` counts the service's edges, and `coverage_source` says
+  whether it is `service`, `uninstrumented_service` or `none`. The lane
+  folded an empty edge set, so on a one-state protocol it kept nothing past
+  the seeds.
 - The zoxide harness-parity row is rerun with the in-crate lane (#245,
   completing #83): with `--rust-private`, auto picks the private
   `Database::deserialize` and enters and covers it (754 edges), and run at

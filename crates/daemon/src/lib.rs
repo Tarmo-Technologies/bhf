@@ -801,8 +801,11 @@ struct CancelJobParams {
 }
 
 /// The job methods (#271), or `None` for another method. A tenant submits
-/// jobs for projects inside its workspace root, and sees and cancels only
-/// those; an operator may submit and cancel, a viewer only list.
+/// jobs for projects inside its workspace root; each job records the tenant
+/// and its workspace root (#385), and that tenant and the other tenants of
+/// the same workspace root see and cancel it, no other (a job recorded
+/// before tenants were is a tenant's when its project is in its workspace
+/// root). An operator may submit and cancel, a viewer only list.
 fn dispatch_job_method(
     method: &str,
     params: Option<Value>,
@@ -821,12 +824,18 @@ fn dispatch_job_method(
                 "this daemon runs no job scheduler; start it with `bhf-daemon --jobs-dir DIR`",
             )
         })?;
-        let visible = |job: &continuous_daemon::FuzzJob| match identity {
-            AuthorizedIdentity::Local => true,
-            AuthorizedIdentity::Tenant(tenant) => tenant
-                .workspace_root
-                .canonicalize()
-                .is_ok_and(|root| job.project_dir.starts_with(root)),
+        let caller = match identity {
+            AuthorizedIdentity::Local => None,
+            AuthorizedIdentity::Tenant(tenant) => Some(continuous_daemon::JobOwner {
+                tenant: tenant.tenant.clone(),
+                workspace: canonicalize_for_auth(&tenant.workspace_root)?,
+            }),
+        };
+        // The scheduler scopes jobs by their owner; one recorded without one
+        // is a tenant's when its project is in the tenant's workspace root.
+        let visible = |job: &continuous_daemon::FuzzJob| match &caller {
+            None => true,
+            Some(owner) => job.tenant.is_some() || job.project_dir.starts_with(&owner.workspace),
         };
         let job_error =
             |error: continuous_daemon::DaemonError| RpcFailure::server_error(error.to_string());
@@ -838,7 +847,8 @@ fn dispatch_job_method(
                 authorize_path(identity, &params.project_dir, &mut pins)?;
                 let project_dir = canonicalize_for_auth(&params.project_dir)?;
                 let job_id = scheduler
-                    .submit(
+                    .submit_as(
+                        caller.clone(),
                         project_dir,
                         params.harness_id,
                         std::time::Duration::from_secs(params.time_budget_secs),
@@ -849,7 +859,7 @@ fn dispatch_job_method(
             "listJobs" => {
                 let params = parse_params::<ListJobsParams>(params)?;
                 let jobs: Vec<_> = scheduler
-                    .list_jobs()
+                    .list_jobs_as(caller.as_ref())
                     .map_err(job_error)?
                     .into_iter()
                     .filter(|job| visible(job))
@@ -865,7 +875,7 @@ fn dispatch_job_method(
                 let params = parse_params::<CancelJobParams>(params)?;
                 // Another tenant's job is no job of this one's.
                 let known = scheduler
-                    .list_jobs()
+                    .list_jobs_as(caller.as_ref())
                     .map_err(job_error)?
                     .iter()
                     .any(|job| job.job_id == params.job_id && visible(job));
@@ -875,7 +885,9 @@ fn dispatch_job_method(
                         params.job_id
                     )));
                 }
-                let state = scheduler.cancel(&params.job_id).map_err(job_error)?;
+                let state = scheduler
+                    .cancel_as(caller.as_ref(), &params.job_id)
+                    .map_err(job_error)?;
                 Ok(json!({ "job_id": params.job_id, "state": state }))
             }
         }

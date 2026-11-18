@@ -26,7 +26,10 @@
 //! (`states_covered` / `transitions_covered`) in distinct fields — never merged
 //! into one number. A plain request/response transport reports no code edges, so
 //! the code channel is honestly zero on such targets while the state channel
-//! carries the novelty.
+//! carries the novelty. A service bhf runs (`--session-server-cmd`) built with
+//! `c_runtime/bhf_service_cov.c` reports its edges after each session (#363),
+//! and a session that reaches new code is kept as one that reaches a new state
+//! is.
 //!
 //! Nothing here names a downstream consumer: a finding is emitted for importers /
 //! SARIF / vulnerability-management tools to read.
@@ -126,7 +129,6 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
     "--sandbox",
     "--sandbox-tool",
     "--sandbox-strict",
-    "--runtime-oracles",
     "--structured-inputs",
     "--print-final-stats",
     "--collector",
@@ -140,10 +142,21 @@ const UNSUPPORTED_FLAGS: &[&str] = &[
 ];
 
 /// The flags this run gives that the session lane would ignore.
+/// `--runtime-oracles` applies to a service bhf runs (#364): without
+/// `--session-server-cmd` there is no process to put under the shim.
+/// `--transport-coverage-map` applies to a `transport:` backend (#261).
 pub(crate) fn unsupported_flags(args: &FuzzArgs) -> Vec<&'static str> {
+    let over_target = args
+        .session_transport
+        .as_deref()
+        .is_some_and(|spec| spec.trim().starts_with("transport:"));
     crate::fuzz::given_flags(args)
         .into_iter()
-        .filter(|flag| UNSUPPORTED_FLAGS.contains(flag))
+        .filter(|flag| {
+            (UNSUPPORTED_FLAGS.contains(flag)
+                && !(*flag == "--transport-coverage-map" && over_target))
+                || (*flag == "--runtime-oracles" && args.session_server_cmd.is_none())
+        })
         .collect()
 }
 
@@ -160,15 +173,30 @@ pub(crate) enum SessionTransportPlan {
     /// A UDP backend: one datagram per message, one reply datagram awaited
     /// within the reply deadline, and a socket of its own per session.
     Udp { host: String, port: u16 },
+    /// A serial device (a UART, a pty), opened raw at `baud` when given (#262).
+    Serial { path: PathBuf, baud: Option<u32> },
+    /// A `--target-transport` backend (#261): each message is one execution
+    /// on the target. `spec` is the target-transport spec, and `coverage_map`
+    /// the `--transport-coverage-map` a gdb or qemu-system backend needs.
+    Target {
+        spec: String,
+        coverage_map: Option<String>,
+    },
 }
 
 /// A descriptive failure parsing a `--session-transport` spec. Never a silent
 /// `None`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionSpecError {
-    #[error("empty --session-transport spec; expected tcp:HOST:PORT or udp:HOST:PORT")]
+    #[error(
+        "empty --session-transport spec; expected tcp:HOST:PORT, udp:HOST:PORT, \
+         serial:PATH[,baud=N] or transport:TARGET-TRANSPORT-SPEC"
+    )]
     Empty,
-    #[error("unknown --session-transport backend {backend:?}; supported: tcp, udp")]
+    #[error(
+        "unknown --session-transport backend {backend:?}; supported: tcp, udp, serial, \
+         transport"
+    )]
     UnknownBackend { backend: String },
     #[error("malformed {backend} spec {spec:?}: {reason}")]
     Malformed {
@@ -181,6 +209,15 @@ pub(crate) enum SessionSpecError {
 impl SessionTransportPlan {
     /// Parse a `--session-transport` spec into an inspectable plan.
     pub(crate) fn parse(spec: &str) -> Result<Self, SessionSpecError> {
+        Self::parse_with_map(spec, None)
+    }
+
+    /// Parse a `--session-transport` spec with the `--transport-coverage-map`
+    /// a `transport:` backend takes.
+    pub(crate) fn parse_with_map(
+        spec: &str,
+        coverage_map: Option<&str>,
+    ) -> Result<Self, SessionSpecError> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Err(SessionSpecError::Empty);
@@ -193,6 +230,46 @@ impl SessionTransportPlan {
             let (host, port) = parse_host_port("udp", spec, rest)?;
             return Ok(Self::Udp { host, port });
         }
+        if let Some(rest) = spec.strip_prefix("transport:") {
+            crate::transport_fuzz::TransportPlan::parse(rest, coverage_map).map_err(|error| {
+                SessionSpecError::Malformed {
+                    backend: "transport",
+                    spec: spec.to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            return Ok(Self::Target {
+                spec: rest.to_owned(),
+                coverage_map: coverage_map.map(str::to_owned),
+            });
+        }
+        if let Some(rest) = spec.strip_prefix("serial:") {
+            let malformed = |reason: String| SessionSpecError::Malformed {
+                backend: "serial",
+                spec: spec.to_owned(),
+                reason,
+            };
+            let (path, baud) = match rest.split_once(",baud=") {
+                Some((path, baud)) => {
+                    let baud = baud
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|baud| *baud > 0)
+                        .ok_or_else(|| {
+                            malformed(format!("baud={baud} is not a positive integer"))
+                        })?;
+                    (path, Some(baud))
+                }
+                None => (rest, None),
+            };
+            if path.is_empty() {
+                return Err(malformed("the device path is empty".to_owned()));
+            }
+            return Ok(Self::Serial {
+                path: PathBuf::from(path),
+                baud,
+            });
+        }
         Err(SessionSpecError::UnknownBackend {
             backend: spec.split(':').next().unwrap_or(spec).to_owned(),
         })
@@ -203,14 +280,26 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { host, port } => format!("tcp:{host}:{port}"),
             Self::Udp { host, port } => format!("udp:{host}:{port}"),
+            Self::Serial { path, baud } => format!(
+                "serial:{}{}",
+                path.display(),
+                baud.map(|baud| format!(",baud={baud}")).unwrap_or_default()
+            ),
+            Self::Target { spec, .. } => format!("transport:{spec}"),
         }
     }
 
-    /// The host, port and whether it is UDP, for a service bhf starts.
-    fn endpoint(&self) -> (String, u16, bool) {
+    /// The host, port and whether it is UDP, for a service bhf starts; a
+    /// serial device has no port to wait for.
+    fn endpoint(&self) -> Result<(String, u16, bool), String> {
         match self {
-            Self::Tcp { host, port } => (host.clone(), *port, false),
-            Self::Udp { host, port } => (host.clone(), *port, true),
+            Self::Tcp { host, port } => Ok((host.clone(), *port, false)),
+            Self::Udp { host, port } => Ok((host.clone(), *port, true)),
+            Self::Serial { .. } | Self::Target { .. } => Err(format!(
+                "--session-server-cmd needs a tcp: or udp: --session-transport, whose port \
+                 bhf waits for; {} has none",
+                self.label()
+            )),
         }
     }
 
@@ -219,6 +308,8 @@ impl SessionTransportPlan {
         match self {
             Self::Tcp { .. } => "tcp",
             Self::Udp { .. } => "udp",
+            Self::Serial { .. } => "serial",
+            Self::Target { .. } => "transport",
         }
     }
 
@@ -231,8 +322,8 @@ impl SessionTransportPlan {
         reset: SessionResetMode,
         framing: Framing,
         reply_timeout: Option<Duration>,
-    ) -> LiveTransport {
-        match self {
+    ) -> Result<LiveTransport, String> {
+        Ok(match self {
             Self::Tcp { host, port } => LiveTransport::Tcp(TcpSessionTransport::new(
                 host,
                 port,
@@ -247,7 +338,27 @@ impl SessionTransportPlan {
                 framing,
                 reply_timeout.unwrap_or(UDP_REPLY_TIMEOUT),
             )),
-        }
+            Self::Serial { path, baud } => LiveTransport::Serial(SerialSessionTransport {
+                path,
+                baud,
+                reset,
+                framing,
+                io_timeout: reply_timeout.unwrap_or(SESSION_IO_TIMEOUT),
+                port: None,
+                pending: Vec::new(),
+            }),
+            Self::Target { spec, coverage_map } => {
+                let transport =
+                    crate::transport_fuzz::TransportPlan::parse(&spec, coverage_map.as_deref())
+                        .and_then(|plan| {
+                            plan.into_transport(Some(reply_timeout.unwrap_or(SESSION_IO_TIMEOUT)))
+                        })
+                        .map_err(|error| {
+                            format!("--session-transport transport:{spec}: {error}")
+                        })?;
+                LiveTransport::Target(TargetSessionTransport::new(transport, reset))
+            }
+        })
     }
 }
 
@@ -545,10 +656,215 @@ impl SessionTransport for UdpSessionTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The live serial backend
+// ---------------------------------------------------------------------------
+
+/// A serial [`SessionTransport`] (#262): a UART or a pty, opened raw (as the
+/// agent's `serial:` transport is: no echo, no line editing, no newline
+/// translation) at the given baud rate. Requests are framed as the profile
+/// says and replies read the same way, every read bounded by the reply
+/// deadline. A device has no connection, so `--session-reset reconnect`
+/// reopens it, which drops what it had sent; `none` keeps it open.
+pub(crate) struct SerialSessionTransport {
+    path: PathBuf,
+    baud: Option<u32>,
+    reset: SessionResetMode,
+    framing: Framing,
+    io_timeout: Duration,
+    port: Option<crate::serial_port::SerialPort>,
+    /// Bytes read past the end of the last reply.
+    pending: Vec<u8>,
+}
+
+impl SerialSessionTransport {
+    fn open(&mut self) -> Result<(), TransportError> {
+        self.port = None;
+        self.pending.clear();
+        let port = crate::serial_port::open(&self.path, self.baud, Some(self.io_timeout))
+            .map_err(|e| TransportError::new(format!("open {}: {e}", self.path.display())))?;
+        self.port = Some(port);
+        Ok(())
+    }
+
+    /// The device stopped answering, or failed: close it, so the next reset
+    /// opens it again whatever the reset mode.
+    fn lost(&mut self, message: String) -> TransportError {
+        self.port = None;
+        TransportError::session_lost(message)
+    }
+
+    /// Read until the framing has a whole reply. A raw reply is complete when
+    /// no byte arrives for its idle window after the first.
+    fn read_reply(&mut self) -> Result<Vec<u8>, TransportError> {
+        let idle = self.framing.reply_idle_ms().map(Duration::from_millis);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.framing.take_reply(&self.pending, MAX_REPLY_BYTES) {
+                ReplyProgress::Complete { reply, consumed } => {
+                    self.pending.drain(..consumed);
+                    return Ok(reply);
+                }
+                ReplyProgress::Invalid(reason) => {
+                    self.pending.clear();
+                    return Err(TransportError::new(format!("session reply: {reason}")));
+                }
+                ReplyProgress::NeedMore => {}
+            }
+            let quiet_completes = idle.is_some() && !self.pending.is_empty();
+            let wait = if quiet_completes {
+                idle
+            } else {
+                Some(self.io_timeout)
+            };
+            let port = self
+                .port
+                .as_mut()
+                .ok_or_else(|| TransportError::new("serial session is not open; reset first"))?;
+            if let Err(e) = port.set_read_timeout(wait) {
+                return Err(self.lost(format!("session read reply: {e}")));
+            }
+            match port.read(&mut chunk) {
+                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Err(e) if quiet_completes && e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(std::mem::take(&mut self.pending));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.lost(format!("session read reply: {e}"))),
+            }
+        }
+    }
+}
+
+impl SessionTransport for SerialSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let frame = self
+            .framing
+            .encode(request)
+            .map_err(|e| TransportError::new(e.to_string()))?;
+        let port = self
+            .port
+            .as_mut()
+            .ok_or_else(|| TransportError::new("serial session is not open; reset first"))?;
+        if let Err(e) = port.write_all(&frame).and_then(|()| port.flush()) {
+            return Err(self.lost(format!("session write: {e}")));
+        }
+        self.read_reply()
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.port.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.open()?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The target-transport backend
+// ---------------------------------------------------------------------------
+
+/// A session over a `--target-transport` backend (#261): an on-target agent,
+/// a debug probe, an emulator. Each message is one execution: the message's
+/// bytes are the input, and the reply is the backend's stdout channel, which
+/// agent backends do not have (a profile over them captures nothing). A
+/// fault, a crash or a hang ends the session at that message, which the lane
+/// confirms and records as a finding, and the executions' coverage edges feed
+/// its code channel. `--session-reset reconnect` arms a fresh target session
+/// for each protocol session; `none` keeps one armed.
+pub(crate) struct TargetSessionTransport {
+    transport: Box<dyn target_transport::TargetTransport>,
+    session: Option<Box<dyn target_transport::TargetSession>>,
+    reset: SessionResetMode,
+    edges: Vec<u64>,
+}
+
+impl TargetSessionTransport {
+    pub(crate) fn new(
+        transport: Box<dyn target_transport::TargetTransport>,
+        reset: SessionResetMode,
+    ) -> Self {
+        Self {
+            transport,
+            session: None,
+            reset,
+            edges: Vec::new(),
+        }
+    }
+}
+
+impl SessionTransport for TargetSessionTransport {
+    fn send_request(&mut self, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| TransportError::new("target session is not armed; reset first"))?;
+        let outcome = match session.run_input(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.session = None;
+                return Err(TransportError::session_lost(format!(
+                    "the target transport failed on this message: {error}"
+                )));
+            }
+        };
+        self.edges
+            .extend(outcome.coverage_edges.iter().map(|&edge| u64::from(edge)));
+        if let Some(reason) = &outcome.inconclusive {
+            return Err(TransportError::new(format!(
+                "the target's verdict on this message is inconclusive: {reason}"
+            )));
+        }
+        let fault = match (&outcome.fault, outcome.exit) {
+            (Some(fault), _) => Some(format!(
+                "{:?}{}{}",
+                fault.kind,
+                fault
+                    .address
+                    .map(|address| format!(" at {address:#x}"))
+                    .unwrap_or_default(),
+                if fault.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", fault.detail)
+                }
+            )),
+            (None, target_transport::ExitKind::Crash) => Some("a crash".to_owned()),
+            (None, target_transport::ExitKind::Timeout) => Some("a hang".to_owned()),
+            (None, _) => None,
+        };
+        if let Some(fault) = fault {
+            // The target is in no state to go on: arm it again.
+            self.session = None;
+            return Err(TransportError::session_lost(format!(
+                "the target faulted on this message: {fault}"
+            )));
+        }
+        Ok(outcome.stdout)
+    }
+
+    fn reset(&mut self) -> Result<(), TransportError> {
+        if self.session.is_none() || matches!(self.reset, SessionResetMode::Reconnect) {
+            self.session = Some(
+                self.transport
+                    .arm()
+                    .map_err(|error| TransportError::new(format!("arm the target: {error}")))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn take_coverage_edges(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.edges)
+    }
+}
+
 /// A live backend, as `--session-transport` names it.
 pub(crate) enum LiveTransport {
     Tcp(TcpSessionTransport),
     Udp(UdpSessionTransport),
+    Serial(SerialSessionTransport),
+    Target(TargetSessionTransport),
 }
 
 impl SessionTransport for LiveTransport {
@@ -556,6 +872,8 @@ impl SessionTransport for LiveTransport {
         match self {
             LiveTransport::Tcp(transport) => transport.send_request(request),
             LiveTransport::Udp(transport) => transport.send_request(request),
+            LiveTransport::Serial(transport) => transport.send_request(request),
+            LiveTransport::Target(transport) => transport.send_request(request),
         }
     }
 
@@ -563,6 +881,15 @@ impl SessionTransport for LiveTransport {
         match self {
             LiveTransport::Tcp(transport) => transport.reset(),
             LiveTransport::Udp(transport) => transport.reset(),
+            LiveTransport::Serial(transport) => transport.reset(),
+            LiveTransport::Target(transport) => transport.reset(),
+        }
+    }
+
+    fn take_coverage_edges(&mut self) -> Vec<u64> {
+        match self {
+            LiveTransport::Target(transport) => transport.take_coverage_edges(),
+            _ => Vec::new(),
         }
     }
 }
@@ -664,6 +991,9 @@ pub(crate) struct SessionFuzzConfig {
     pub reply_timeout: Option<Duration>,
     /// `--session-server-cmd`, recorded so a replay can start the service.
     pub server_cmd: Option<String>,
+    /// `--transport-coverage-map` of a `transport:` backend, recorded so a
+    /// replay rebuilds it.
+    pub coverage_map: Option<String>,
     /// Bounded cap on messages per session.
     pub max_messages: usize,
     /// The valid seed session(s) the campaign mutates.
@@ -707,6 +1037,11 @@ pub(crate) struct SessionFuzzSummary {
     pub coverage_edges: usize,
     /// Code-coverage channel (block/hit-count bits).
     pub coverage_blocks: usize,
+    /// Where the code channel's edges come from: `service`, a service bhf
+    /// runs with an edge map (#363); `uninstrumented_service`, one that never
+    /// wrote it; `target`, a `transport:` backend that reported edges (#261);
+    /// or `none`.
+    pub coverage_source: String,
     /// Protocol-state channel: distinct states visited.
     pub states_covered: usize,
     /// Protocol-state channel: distinct transitions walked.
@@ -765,6 +1100,17 @@ struct SessionArtifactMeta {
     /// `--session-server-cmd`, when bhf ran the service: a replay starts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     server_cmd: Option<String>,
+    /// `--transport-coverage-map` of a `transport:` backend (#261).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage_map: Option<String>,
+    /// For a runtime-oracle finding of the service (#364), the hit's
+    /// signature: a replay runs the service under the shim again and looks
+    /// for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_signature: Option<String>,
+    /// The runtrace mode (`reporting`, `attacking`) the service ran under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtrace_mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -801,11 +1147,12 @@ fn should_stop(
 /// Turn a capped state-novelty delta into scheduler feedback. The state
 /// contribution rides the breadcrumb channel (weighted by the scheduler's
 /// `breadcrumb_bit_bonus`) and is clamped so it cannot dominate code coverage.
-fn schedule_feedback(delta: StateNoveltyDelta) -> ScheduleFeedback {
-    let bits = (delta.new_states + delta.new_transitions).min(STATE_NOVELTY_CAP) as u32;
+fn schedule_feedback(delta: StateNoveltyDelta, new_edges: usize) -> ScheduleFeedback {
+    let state = (delta.new_states + delta.new_transitions).min(STATE_NOVELTY_CAP);
     ScheduleFeedback {
         new_exception_signatures: 0,
-        new_breadcrumb_bits: bits,
+        // The service's new code edges count in full (#363).
+        new_breadcrumb_bits: u32::try_from(state.saturating_add(new_edges)).unwrap_or(u32::MAX),
     }
 }
 
@@ -910,9 +1257,139 @@ fn persist_disconnect(
     Ok(path)
 }
 
+/// The runtime sink oracles over a service bhf runs under the runtrace shim
+/// (#364): the sinks the campaign's sessions reached, and the session each
+/// input the tracker may confirm came from.
+#[derive(Default)]
+pub(crate) struct ServiceOracles {
+    tracker: crate::auto::runtrace::SinkTaintTracker,
+    sessions: std::collections::HashMap<Vec<u8>, SessionTestcase>,
+}
+
+/// The most sessions [`ServiceOracles`] keeps to attribute a confirmed sink to.
+const MAX_ORACLE_SESSIONS: usize = 4096;
+
+/// The key a runtime-oracle finding of the service is deduplicated by: its
+/// rule and sink API. Each session's fuzzed bytes make a new command or path,
+/// so keyed by the subject, as a replay matches it, one sink would be a
+/// finding per session; the first session to reach it is the finding.
+fn runtime_hit_key(hit: &OracleHit) -> String {
+    format!("runtime:{}:{}", hit.rule_id, hit.api)
+}
+
+/// The bytes a session carries, as the shim matches a sink against them: its
+/// messages' byte and TLV field values, in order. Integers and enum symbols
+/// are framing, not text a service passes to a command or a path.
+fn session_input_bytes(testcase: &SessionTestcase) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for message in &testcase.messages {
+        for field in &message.fields {
+            if let protocol_session::FieldValue::Bytes { value }
+            | protocol_session::FieldValue::Tlv { value } = &field.value
+            {
+                bytes.extend_from_slice(value);
+            }
+        }
+    }
+    bytes
+}
+
+/// Emit a runtime-oracle finding of `testcase`: the oracle hit, with the
+/// session as its testcase and the session artifacts beside it.
+fn emit_runtime_hit(
+    emitter: &FindingEmitter,
+    testcase: &SessionTestcase,
+    mut hit: OracleHit,
+    config: &SessionFuzzConfig,
+) -> Result<String, SessionFuzzError> {
+    let serialized = testcase.to_json().map_err(SessionFuzzError::Serialize)?;
+    hit.evidence.push(OracleEvidence::new(
+        "state_path",
+        testcase.state_path.join(" -> "),
+    ));
+    hit.evidence.push(OracleEvidence::new(
+        "messages",
+        testcase.messages.len().to_string(),
+    ));
+    let signature = crate::runtime_oracles::oracle_signature(&hit);
+    let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
+    write_session_artifacts(
+        &id.0,
+        &serialized,
+        &hit.oracle_name,
+        Some(&hit.rule_id),
+        Some(&signature),
+        config,
+    )?;
+    Ok(id.0)
+}
+
+/// Evaluate the events of the session `candidate` (its bytes `input`): emit
+/// the per-run oracle hits now, and fold its sinks into the tracker the
+/// campaign confirms at its end.
+#[allow(clippy::too_many_arguments)]
+fn observe_service_events(
+    events: &[crate::auto::runtrace::RuntraceEvent],
+    candidate: &SessionTestcase,
+    input: &[u8],
+    oracles: &mut ServiceOracles,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+) -> Result<bool, SessionFuzzError> {
+    if events.is_empty() {
+        return Ok(false);
+    }
+    let mut new_finding = false;
+    for hit in crate::auto::runtrace::oracle_hits_from_events(events) {
+        if seen.insert(runtime_hit_key(&hit)) {
+            finding_ids.push(emit_runtime_hit(emitter, candidate, hit, config)?);
+            new_finding = true;
+        }
+    }
+    oracles.tracker.observe(events, input);
+    if oracles.sessions.len() < MAX_ORACLE_SESSIONS || oracles.sessions.contains_key(input) {
+        oracles
+            .sessions
+            .entry(input.to_vec())
+            .or_insert_with(|| candidate.clone());
+    }
+    Ok(new_finding)
+}
+
+/// The findings of the sinks the campaign confirmed fuzz-controlled: tainted
+/// by a session's bytes, never reached without them.
+fn emit_confirmed_service_sinks(
+    oracles: ServiceOracles,
+    emitter: &FindingEmitter,
+    config: &SessionFuzzConfig,
+    seen: &mut HashSet<String>,
+    finding_ids: &mut Vec<String>,
+) -> Result<(), SessionFuzzError> {
+    let ServiceOracles { tracker, sessions } = oracles;
+    for confirmed in tracker.into_confirmed() {
+        let Some(session) = sessions.get(&confirmed.input).or_else(|| {
+            sessions
+                .iter()
+                .find(|(bytes, _)| bytes.starts_with(&confirmed.input))
+                .map(|(_, session)| session)
+        }) else {
+            continue;
+        };
+        for hit in crate::auto::runtrace::confirmed_sink_hits(&confirmed) {
+            if seen.insert(runtime_hit_key(&hit)) {
+                finding_ids.push(emit_runtime_hit(emitter, session, hit, config)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drive one candidate against the transport, folding both novelty channels and
 /// emitting a finding (deduped by rule|oracle) on a clean-exit violation.
-/// Returns the state-novelty delta and whether a NEW finding was emitted.
+/// Returns the state-novelty delta, how many service edges it reached first,
+/// and whether a NEW finding was emitted.
 ///
 /// A session the target drops is a crash candidate: it is kept, driven again
 /// on a new connection, and written as a finding when the target drops it at
@@ -932,10 +1409,19 @@ fn drive_candidate(
     finding_ids: &mut Vec<String>,
     tally: &mut CrashTally,
     server: Option<&mut SessionServer>,
-) -> Result<(StateNoveltyDelta, bool), SessionFuzzError> {
+    oracles: Option<&mut ServiceOracles>,
+) -> Result<(StateNoveltyDelta, usize, bool), SessionFuzzError> {
+    // Under the runtrace shim the service matches its sinks against the
+    // bytes of the session in flight (#364).
+    let input = session_input_bytes(candidate);
+    if let Some(server) = server.as_deref() {
+        server
+            .publish_session_input(&input)
+            .map_err(SessionFuzzError::Server)?;
+    }
     // With a service bhf runs, a refused connection is the service gone: look
     // at it before counting a failure to connect.
-    let (driven, refused) = match server {
+    let (driven, refused) = match server.as_deref() {
         Some(_) => match runner.drive(&candidate.messages, transport) {
             Ok(run) => (Some(run), false),
             Err(protocol_session::RunnerError::Connect(_)) => (None, true),
@@ -948,7 +1434,27 @@ fn drive_candidate(
             false,
         ),
     };
+    // A backend that runs the target per message reports its edges (#261).
+    let mut new_edges = code_novelty.observe(&transport.take_coverage_edges());
+    let mut oracle_finding = false;
     if let Some(server) = server {
+        // The map outlives the process, so a session that crashed the service
+        // still counts the code it reached.
+        new_edges += code_novelty.observe(&server.coverage_edges());
+        // Its events, before a restart brings the start-up of the next.
+        if let Some(oracles) = oracles {
+            let events = server.take_session_events();
+            oracle_finding = observe_service_events(
+                &events,
+                candidate,
+                &input,
+                oracles,
+                emitter,
+                config,
+                seen,
+                finding_ids,
+            )?;
+        }
         let lost = refused
             || driven
                 .as_ref()
@@ -979,7 +1485,7 @@ fn drive_candidate(
                 finding_ids,
                 tally,
             )?;
-            return Ok((delta, new_finding));
+            return Ok((delta, new_edges, new_finding || oracle_finding));
         }
         if refused {
             drive_counting(runner, &candidate.messages, transport, tally)?;
@@ -987,13 +1493,10 @@ fn drive_candidate(
     }
     tally.previous = Some(candidate.clone());
     let Some(run) = driven else {
-        return Ok((StateNoveltyDelta::default(), false));
+        return Ok((StateNoveltyDelta::default(), new_edges, oracle_finding));
     };
 
     let delta = state_novelty.observe(&run.state_ids, &run.transitions);
-    // The session seam carries no code-coverage edges; fold an empty set so the
-    // code channel stays present (and honestly zero) alongside the state channel.
-    code_novelty.observe(&[]);
 
     let mut new_finding = false;
     if let SessionVerdict::Disconnected {
@@ -1009,7 +1512,7 @@ fn drive_candidate(
         });
         if !confirmed {
             tally.unconfirmed += 1;
-            return Ok((delta, false));
+            return Ok((delta, new_edges, oracle_finding));
         }
         let _ = std::fs::remove_file(kept);
         tally.crashes += 1;
@@ -1058,7 +1561,7 @@ fn drive_candidate(
             new_finding = true;
         }
     }
-    Ok((delta, new_finding))
+    Ok((delta, new_edges, new_finding || oracle_finding))
 }
 
 /// The service exited after `blamed` ran: start it again, drive `blamed`
@@ -1126,6 +1629,7 @@ fn confirm_server_crash(
             &serialized,
             SERVER_CRASH_ORACLE,
             Some(report.rule_id),
+            None,
             config,
         )?;
         finding_ids.push(id.0);
@@ -1184,6 +1688,11 @@ pub(crate) fn run_session_campaign(
     let mut finding_ids: Vec<String> = Vec::new();
     let mut seen_findings: HashSet<String> = HashSet::new();
     let mut tally = CrashTally::default();
+    // The runtime sink oracles, when the service runs under the shim (#364).
+    let mut service_oracles = server
+        .as_ref()
+        .is_some_and(|server| server.has_runtrace())
+        .then(ServiceOracles::default);
 
     // --- seed phase: drive every seed once; seeds are always corpus members. ---
     let seed_count = config.seeds.len();
@@ -1199,7 +1708,7 @@ pub(crate) fn run_session_campaign(
             break;
         }
         let serialized = seed.to_json().map_err(SessionFuzzError::Serialize)?;
-        let (delta, _) = drive_candidate(
+        let (delta, new_edges, _) = drive_candidate(
             seed,
             &runner,
             transport,
@@ -1211,9 +1720,11 @@ pub(crate) fn run_session_campaign(
             &mut finding_ids,
             &mut tally,
             server.as_deref_mut(),
+            service_oracles.as_mut(),
         )?;
         executions += 1;
-        scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
+        scheduler
+            .insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta, new_edges));
     }
 
     // --- mutation phase: scheduler-driven structured mutation. ---
@@ -1252,7 +1763,7 @@ pub(crate) fn run_session_campaign(
             }
             let candidate = mutate_one(&parent, model, &mut rng, &dictionary, config.max_messages);
             let serialized = candidate.to_json().map_err(SessionFuzzError::Serialize)?;
-            let (delta, _) = drive_candidate(
+            let (delta, new_edges, _) = drive_candidate(
                 &candidate,
                 &runner,
                 transport,
@@ -1264,13 +1775,28 @@ pub(crate) fn run_session_campaign(
                 &mut finding_ids,
                 &mut tally,
                 server.as_deref_mut(),
+                service_oracles.as_mut(),
             )?;
             executions += 1;
-            if delta.is_novel() {
-                scheduler.insert_with_feedback(serialized.into_bytes(), schedule_feedback(delta));
+            // A new protocol state, or new code in the service (#363).
+            if delta.is_novel() || new_edges > 0 {
+                scheduler.insert_with_feedback(
+                    serialized.into_bytes(),
+                    schedule_feedback(delta, new_edges),
+                );
                 corpus_new += 1;
             }
         }
+    }
+
+    if let Some(oracles) = service_oracles {
+        emit_confirmed_service_sinks(
+            oracles,
+            &emitter,
+            config,
+            &mut seen_findings,
+            &mut finding_ids,
+        )?;
     }
 
     Ok(SessionFuzzSummary {
@@ -1286,6 +1812,15 @@ pub(crate) fn run_session_campaign(
         corpus_new,
         coverage_edges: code_novelty.edges_covered(),
         coverage_blocks: 0,
+        coverage_source: match server.as_ref().is_some_and(|server| server.has_coverage()) {
+            true if code_novelty.edges_covered() > 0 => "service",
+            // A map the service never wrote: it was not built with
+            // `c_runtime/bhf_service_cov.c` and SanitizerCoverage.
+            true => "uninstrumented_service",
+            false if code_novelty.edges_covered() > 0 => "target",
+            false => "none",
+        }
+        .to_owned(),
         states_covered: state_novelty.states_covered(),
         transitions_covered: state_novelty.transitions_covered(),
         crashes: tally.crashes,
@@ -1341,7 +1876,7 @@ fn emit_session_finding(
     };
 
     let id = emitter.emit_oracle_hit(serialized.as_bytes(), &hit)?;
-    write_session_artifacts(&id.0, &serialized, oracle, rule_id, config)?;
+    write_session_artifacts(&id.0, &serialized, oracle, rule_id, None, config)?;
     Ok(id.0)
 }
 
@@ -1352,6 +1887,7 @@ fn write_session_artifacts(
     serialized: &str,
     oracle: &str,
     rule_id: Option<&str>,
+    runtime_signature: Option<&str>,
     config: &SessionFuzzConfig,
 ) -> Result<(), SessionFuzzError> {
     let finding_dir = corpus::layout::finding_dir(&config.work_dir, id);
@@ -1370,6 +1906,9 @@ fn write_session_artifacts(
             .reply_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         server_cmd: config.server_cmd.clone(),
+        coverage_map: config.coverage_map.clone(),
+        runtime_signature: runtime_signature.map(str::to_owned),
+        runtrace_mode: runtime_signature.map(|_| config.mode.to_string().to_ascii_lowercase()),
     };
     let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(SessionFuzzError::Serialize)?;
     write_artifact(&finding_dir.join(SESSION_META), &meta_bytes)
@@ -1434,13 +1973,14 @@ fn build_live_transport(
     meta: &SessionArtifactMeta,
     model: &ProtocolModel,
 ) -> Result<LiveTransport, String> {
-    let plan = SessionTransportPlan::parse(&meta.transport).map_err(|e| e.to_string())?;
+    let plan = SessionTransportPlan::parse_with_map(&meta.transport, meta.coverage_map.as_deref())
+        .map_err(|e| e.to_string())?;
     let reset = SessionResetMode::parse(&meta.reset)?;
-    Ok(plan.into_transport(
+    plan.into_transport(
         reset,
         model.framing().clone(),
         meta.reply_timeout_ms.map(Duration::from_millis),
-    ))
+    )
 }
 
 /// `bhf replay` of a session finding: re-drive the recorded session against a
@@ -1452,6 +1992,9 @@ pub(crate) fn replay_session_outcome(
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
     let mut transport = build_live_transport(&meta, &model)?;
     let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    if let (Some(signature), Some(command)) = (&meta.runtime_signature, &meta.server_cmd) {
+        return replay_runtime_oracle(&testcase, &model, &meta, signature, command, &mut transport);
+    }
     if let Some(mut server) = finding_server(&meta)? {
         let runner = SessionRunner::new(&model);
         let (_, exit) = drive_against_server(&runner, &testcase, &mut transport, &mut server.0)?;
@@ -1537,6 +2080,88 @@ pub(crate) fn replay_session_outcome(
     })
 }
 
+/// `bhf replay` of a runtime-oracle finding of the service (#364): start the
+/// service under the runtrace shim again, drive the session with its bytes as
+/// the shim's input, and look for the recorded hit among its events' hits.
+fn replay_runtime_oracle(
+    testcase: &SessionTestcase,
+    model: &ProtocolModel,
+    meta: &SessionArtifactMeta,
+    signature: &str,
+    command: &str,
+    transport: &mut dyn SessionTransport,
+) -> Result<crate::replay::LaneReplay, String> {
+    use crate::runtime_oracles::{RuntimeOracleMode, RuntimeOracles};
+    let mode = meta.runtrace_mode.as_deref().unwrap_or("reporting");
+    let oracles = RuntimeOracles::resolve(RuntimeOracleMode::On, mode)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the runtrace shim is unavailable".to_owned())?;
+    let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
+        .map_err(|e| e.to_string())?
+        .endpoint()?;
+    let dir = tempfile::Builder::new()
+        .prefix("bhf-session-server-")
+        .tempdir()
+        .map_err(|e| format!("create a dir for the service's logs: {e}"))?;
+    let mut server = SessionServer::new(command.to_owned(), host, port, udp, dir.path())
+        .with_runtime_oracles(&oracles, dir.path())?;
+    server.start()?;
+    let input = session_input_bytes(testcase);
+    server.publish_session_input(&input)?;
+    let _ = SessionRunner::new(model).replay(testcase, transport);
+    let events = server.take_session_events();
+    server.stop();
+    let mut hits = crate::auto::runtrace::oracle_hits_from_events(&events);
+    let mut tracker = crate::auto::runtrace::SinkTaintTracker::default();
+    tracker.observe(&events, &input);
+    for confirmed in tracker.into_confirmed() {
+        hits.extend(crate::auto::runtrace::confirmed_sink_hits(&confirmed));
+    }
+    let matched = hits
+        .iter()
+        .any(|hit| crate::runtime_oracles::oracle_signature(hit) == signature);
+    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    let replayed: Vec<String> = hits
+        .iter()
+        .map(|hit| format!("{} ({})", hit.oracle_name, hit.rule_id))
+        .collect();
+    Ok(crate::replay::LaneReplay {
+        lane: "session",
+        matched,
+        status_line: if matched {
+            "MATCH".to_owned()
+        } else {
+            "MISMATCH: the recorded session no longer reaches the service's sink".to_owned()
+        },
+        compared: format!(
+            "runtime oracle {} with rule {rule} in the service",
+            meta.oracle
+        ),
+        differences: if matched {
+            Vec::new()
+        } else {
+            vec![format!(
+                "verdict: recorded oracle {} with rule {rule}, replayed {}",
+                meta.oracle,
+                if replayed.is_empty() {
+                    "no runtime oracle hit".to_owned()
+                } else {
+                    replayed.join(", ")
+                }
+            )]
+        },
+        details: vec![
+            crate::replay::Detail::new(
+                "transport",
+                format!("{} (reset {})", meta.transport, meta.reset),
+            ),
+            crate::replay::Detail::new("service", command.to_owned()),
+        ],
+        history: "replay",
+        ..Default::default()
+    })
+}
+
 /// Whether `verdict` reproduces the SAME oracle finding that the metadata
 /// recorded, by both oracle name and `rule_id`.
 ///
@@ -1571,7 +2196,7 @@ fn finding_server(
     }
     let (host, port, udp) = SessionTransportPlan::parse(&meta.transport)
         .map_err(|e| e.to_string())?
-        .endpoint();
+        .endpoint()?;
     let logs = tempfile::Builder::new()
         .prefix("bhf-session-server-")
         .tempdir()
@@ -1798,7 +2423,8 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         );
         2
     })?;
-    let plan = SessionTransportPlan::parse(spec).map_err(|error| {
+    let plan = SessionTransportPlan::parse_with_map(spec, args.transport_coverage_map.as_deref())
+        .map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --session-transport: {error}");
         2
     })?;
@@ -1806,14 +2432,38 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
     let transport_kind = plan.kind().to_owned();
     let mut server = match args.session_server_cmd.as_deref() {
         Some(command) => {
-            let (host, port, udp) = plan.endpoint();
+            let (host, port, udp) = plan.endpoint().map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz: {error}");
+                2
+            })?;
             let mut server = SessionServer::new(
                 command.to_owned(),
                 host,
                 port,
                 udp,
                 &args.work_dir.join("session_server"),
-            );
+            )
+            .with_coverage(&args.work_dir)
+            .map_err(|error| {
+                crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                2
+            })?;
+            // `--runtime-oracles` runs the service under the runtrace shim (#364).
+            let mode_label = args.mode.to_string().to_ascii_lowercase();
+            let oracles =
+                crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                    .map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --runtime-oracles: {error}");
+                        2
+                    })?;
+            if let Some(oracles) = &oracles {
+                server = server
+                    .with_runtime_oracles(oracles, &args.work_dir.join("session_server"))
+                    .map_err(|error| {
+                        crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
+                        2
+                    })?;
+            }
             server.start().map_err(|error| {
                 crate::bhfeprintln!("bhf fuzz --session-server-cmd: {error}");
                 2
@@ -1822,11 +2472,16 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         }
         None => None,
     };
-    let mut transport = plan.into_transport(
-        args.session_reset,
-        model.framing().clone(),
-        args.session_reply_timeout,
-    );
+    let mut transport = plan
+        .into_transport(
+            args.session_reset,
+            model.framing().clone(),
+            args.session_reply_timeout,
+        )
+        .map_err(|error| {
+            crate::bhfeprintln!("bhf fuzz: {error}");
+            2
+        })?;
 
     let seeds = seed_sessions(&model);
     if seeds.is_empty() {
@@ -1847,6 +2502,7 @@ fn run_inner(args: FuzzArgs) -> Result<SessionFuzzSummary, i32> {
         reset: args.session_reset,
         reply_timeout: args.session_reply_timeout,
         server_cmd: args.session_server_cmd.clone(),
+        coverage_map: args.transport_coverage_map.clone(),
         max_messages: args.max_session_messages,
         seeds,
         iterations: args.effective_iterations(),
@@ -1989,6 +2645,7 @@ mod tests {
             reset: SessionResetMode::Reconnect,
             reply_timeout: None,
             server_cmd: None,
+            coverage_map: None,
             max_messages: 64,
             seeds: seed_sessions(model),
             iterations,
@@ -2341,6 +2998,9 @@ equals = 226
             oracle: oracle.to_owned(),
             reply_timeout_ms: None,
             server_cmd: None,
+            coverage_map: None,
+            runtime_signature: None,
+            runtrace_mode: None,
         }
     }
 
@@ -2567,6 +3227,123 @@ equals = 226
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "waited for the idle window"
+        );
+    }
+
+    /// A `TargetTransport` in memory: it records each input in order, answers
+    /// with the input's length as a u32, reports an edge per input byte value, and
+    /// faults on an input that starts with `fault_on`.
+    #[derive(Clone, Default)]
+    struct MockTarget {
+        inputs: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        arms: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fault_on: Option<u8>,
+    }
+
+    impl target_transport::TargetTransport for MockTarget {
+        fn arm(&self) -> target_transport::Result<Box<dyn target_transport::TargetSession>> {
+            self.arms.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl target_transport::TargetSession for MockTarget {
+        fn run_input(
+            &mut self,
+            input: &[u8],
+        ) -> target_transport::Result<target_transport::RunOutcome> {
+            self.inputs.lock().unwrap().push(input.to_vec());
+            let faulted = self.fault_on.is_some() && input.first() == self.fault_on.as_ref();
+            Ok(target_transport::RunOutcome {
+                exit: if faulted {
+                    target_transport::ExitKind::Crash
+                } else {
+                    target_transport::ExitKind::Ok
+                },
+                coverage_edges: input.iter().map(|&byte| u32::from(byte) + 1).collect(),
+                fault: faulted.then(|| target_transport::Fault {
+                    kind: target_transport::FaultKind::MemoryProtection,
+                    address: Some(0x0800_1234),
+                    detail: "CFSR=0x8200".to_owned(),
+                }),
+                // Four bytes: the toy profile captures a u32 handle.
+                stdout: u32::try_from(input.len())
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes()
+                    .to_vec(),
+                coverage_incomplete: None,
+                inconclusive: None,
+                target: Default::default(),
+            })
+        }
+    }
+
+    /// #261: over a target transport, a session's messages reach the target
+    /// in order, one execution each, with a fresh arm per session; the
+    /// executions' edges feed the code channel; and a fault at a message is
+    /// a confirmed disconnect finding.
+    #[test]
+    fn a_target_transport_delivers_messages_in_order_and_a_fault_is_a_finding() {
+        assert_eq!(
+            SessionTransportPlan::parse("transport:agent:tcp:127.0.0.1:7000").unwrap(),
+            SessionTransportPlan::Target {
+                spec: "agent:tcp:127.0.0.1:7000".to_owned(),
+                coverage_map: None,
+            }
+        );
+        // A backend's own requirements are checked: gdb needs its map.
+        let error = SessionTransportPlan::parse("transport:gdb:127.0.0.1:3333").unwrap_err();
+        assert!(
+            error.to_string().contains("--transport-coverage-map"),
+            "{error}"
+        );
+        let model = toy_model();
+        let seed = seed_sessions(&model).remove(0);
+        let runner = SessionRunner::new(&model);
+
+        let clean = MockTarget::default();
+        let mut transport =
+            TargetSessionTransport::new(Box::new(clean.clone()), SessionResetMode::Reconnect);
+        let run = runner.drive(&seed.messages, &mut transport).unwrap();
+        assert!(!run.verdict.is_disconnect(), "{:?}", run.verdict);
+        let sent: Vec<u8> = clean
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input[0])
+            .collect();
+        assert_eq!(sent, [1, 2], "OPEN, then WRITE, each its own execution");
+        assert!(!transport.take_coverage_edges().is_empty());
+        assert!(transport.take_coverage_edges().is_empty(), "taken once");
+        runner.drive(&seed.messages, &mut transport).unwrap();
+        assert_eq!(
+            clean.arms.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "reset=reconnect arms a target session per protocol session"
+        );
+
+        let work_dir = tmp_work_dir("target-transport");
+        let mut cfg = config(&model, work_dir.to_path_buf(), 20);
+        cfg.transport_label = "transport:mock".to_owned();
+        cfg.transport_kind = "transport".to_owned();
+        let faulty = MockTarget {
+            fault_on: Some(2),
+            ..MockTarget::default()
+        };
+        let mut transport =
+            TargetSessionTransport::new(Box::new(faulty), SessionResetMode::Reconnect);
+        let summary = run_session_campaign(&model, &mut transport, &cfg, None).unwrap();
+        assert_eq!(summary.coverage_source, "target", "{summary:?}");
+        assert!(summary.coverage_edges > 0, "{summary:?}");
+        assert!(summary.crashes > 0, "{summary:?}");
+        assert_eq!(summary.findings.len(), 1, "one per message: {summary:?}");
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let record = std::fs::read_to_string(finding_dir.join("finding.json")).unwrap();
+        assert!(record.contains(DISCONNECT_RULE), "{record}");
+        assert!(
+            record.contains("faulted on this message") && record.contains("0x8001234"),
+            "{record}"
         );
     }
 

@@ -33,6 +33,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long past the child shutdown timeout dropping a [`Scheduler`] waits
+/// for its threads (#272): a worker stops its job within the shutdown
+/// timeout, and one still busy past this (posting a webhook, say) finishes
+/// in the background.
+const SHUTDOWN_SLACK: Duration = Duration::from_secs(1);
 const DEFAULT_JOB_WALL_GRACE: Duration = Duration::from_secs(30);
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_WORKERS: u32 = 64;
@@ -78,7 +83,35 @@ pub struct FuzzJob {
     pub harness_id: String,
     pub time_budget_secs: u64,
     pub state: JobState,
+    /// The tenant that submitted the job (#385). Only it and the other
+    /// tenants of its workspace see and cancel the job. `None` for a local
+    /// caller, and for a job recorded before tenants were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The workspace root of the tenant that submitted the job (#385).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    /// Why the job failed, when the scheduler knows: a job a stopped
+    /// scheduler left running (#385).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+/// Who submits or looks at jobs (#385): a tenant, and the workspace root it
+/// works in. A job is its submitter's and its workspace's: a tenant sees and
+/// cancels a job it submitted or one submitted in the same workspace root
+/// (an operator's job, by the workspace's viewer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOwner {
+    pub tenant: String,
+    pub workspace: PathBuf,
+}
+
+/// The longest [`FuzzJob::reason`] the scheduler records.
+const MAX_REASON_BYTES: usize = 256;
+
+/// The directory of the running jobs' process ids, in the data dir (#385).
+const RUNNING_DIR: &str = "running";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,8 +182,10 @@ pub struct Scheduler {
     data_dir: PathBuf,
     job_wall_grace: Duration,
     limits: SchedulerLimits,
-    // Retained until Drop has joined every worker. The pathname is never removed.
-    _storage_lease: storage_lock::StorageLease,
+    shutdown_timeout: Duration,
+    // Retained until every worker has stopped (by Drop, or by the thread a
+    // Drop past its deadline leaves them to). The pathname is never removed.
+    storage_lease: Option<storage_lock::StorageLease>,
 }
 
 struct SharedState {
@@ -248,6 +283,7 @@ impl Scheduler {
             }
             let mut guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
             let mut seen_ids = HashSet::new();
+            let mut orphaned = false;
             let line_count = bytes.split(|b| *b == b'\n').count();
             for (index, line) in bytes.split(|b| *b == b'\n').enumerate() {
                 if line.is_empty() && index + 1 == line_count {
@@ -286,8 +322,12 @@ impl Scheduler {
                 })?);
                 validate_wall_budget(job.time_budget_secs, job_wall_grace)
                     .map_err(|error| corrupt(error.to_string()))?;
+                // #385: a job is left running only by a scheduler that
+                // stopped without stopping it (a clean stop queues it again).
                 if matches!(job.state, JobState::Running) {
-                    job.state = JobState::Queued;
+                    job.state = JobState::Failed;
+                    job.reason = Some(reconcile_orphan(&config.data_dir, &job));
+                    orphaned = true;
                 }
                 let needs_requeue = matches!(job.state, JobState::Queued);
                 let reserved = reserved_job_bytes(&job)?;
@@ -305,6 +345,9 @@ impl Scheduler {
                 if needs_requeue {
                     guard.queue.push_back(job);
                 }
+            }
+            if orphaned {
+                persist_jobs(&config.data_dir, &guard.seen).map_err(|failure| failure.error)?;
             }
         }
 
@@ -360,7 +403,8 @@ impl Scheduler {
             data_dir: config.data_dir.clone(),
             job_wall_grace,
             limits,
-            _storage_lease: storage_lease,
+            shutdown_timeout,
+            storage_lease: Some(storage_lease),
         })
     }
 
@@ -372,11 +416,25 @@ impl Scheduler {
         harness_id: String,
         time_budget: Duration,
     ) -> Result<String, DaemonError> {
-        self.submit_with_persistence(project_dir, harness_id, time_budget, persist_jobs)
+        self.submit_with_persistence(None, project_dir, harness_id, time_budget, persist_jobs)
+    }
+
+    /// [`Scheduler::submit`] for `owner` (#385), which the job records: only
+    /// it and its workspace's tenants see it ([`Scheduler::list_jobs_as`])
+    /// and cancel it ([`Scheduler::cancel_as`]).
+    pub fn submit_as(
+        &self,
+        owner: Option<JobOwner>,
+        project_dir: PathBuf,
+        harness_id: String,
+        time_budget: Duration,
+    ) -> Result<String, DaemonError> {
+        self.submit_with_persistence(owner, project_dir, harness_id, time_budget, persist_jobs)
     }
 
     fn submit_with_persistence<F>(
         &self,
+        owner: Option<JobOwner>,
         project_dir: PathBuf,
         harness_id: String,
         time_budget: Duration,
@@ -399,6 +457,12 @@ impl Scheduler {
             .as_os_str()
             .len()
             .saturating_add(harness_id.len())
+            .saturating_add(owner.as_ref().map_or(0, |owner| {
+                owner
+                    .tenant
+                    .len()
+                    .saturating_add(owner.workspace.as_os_str().len())
+            }))
             > self.limits.max_job_bytes
         {
             return Err(DaemonError::Capacity("job record bytes"));
@@ -416,6 +480,9 @@ impl Scheduler {
             harness_id,
             time_budget_secs: budget_secs,
             state: JobState::Queued,
+            tenant: owner.as_ref().map(|owner| owner.tenant.clone()),
+            workspace: owner.map(|owner| owner.workspace),
+            reason: None,
         };
         let reserved = reserved_job_bytes(&job)?;
         if reserved > self.limits.max_job_bytes {
@@ -457,11 +524,27 @@ impl Scheduler {
     /// state after the request: `Cancelled`, `Running` while its worker stops
     /// it, or the terminal state it already had.
     pub fn cancel(&self, job_id: &str) -> Result<JobState, DaemonError> {
+        self.cancel_as(None, job_id)
+    }
+
+    /// [`Scheduler::cancel`] for `owner` (#385): a job of another tenant and
+    /// workspace is no job of this one's, and is left alone. `None` is a
+    /// local caller, who may cancel any job; a job recorded without a tenant
+    /// may be cancelled by any caller the front end lets see it.
+    pub fn cancel_as(
+        &self,
+        owner: Option<&JobOwner>,
+        job_id: &str,
+    ) -> Result<JobState, DaemonError> {
         let mut guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         if guard.shutdown {
             return Err(DaemonError::Shutdown);
         }
-        let Some(index) = guard.seen.iter().position(|job| job.job_id == job_id) else {
+        let Some(index) = guard
+            .seen
+            .iter()
+            .position(|job| job.job_id == job_id && owned_by(job, owner))
+        else {
             return Err(DaemonError::UnknownJob(job_id.to_owned()));
         };
         match guard.seen[index].state {
@@ -495,6 +578,18 @@ impl Scheduler {
         Ok(guard.seen.clone())
     }
 
+    /// The jobs `owner` may see (#385): its own, its workspace's, and those
+    /// recorded without a tenant; every job for a local caller (`None`).
+    pub fn list_jobs_as(&self, owner: Option<&JobOwner>) -> Result<Vec<FuzzJob>, DaemonError> {
+        let guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(guard
+            .seen
+            .iter()
+            .filter(|job| owned_by(job, owner))
+            .cloned()
+            .collect())
+    }
+
     /// Return at most one configured page of retained jobs in submission order.
     pub fn list_jobs_page(&self, offset: usize, limit: usize) -> Result<Vec<FuzzJob>, DaemonError> {
         let guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -508,23 +603,178 @@ impl Scheduler {
     }
 }
 
+/// Whether `caller` may see and cancel `job`: a local caller (`None`) any,
+/// a tenant one it submitted, one submitted in its workspace root, and one
+/// recorded without a tenant.
+fn owned_by(job: &FuzzJob, caller: Option<&JobOwner>) -> bool {
+    let Some(caller) = caller else {
+        return true;
+    };
+    match job.tenant.as_deref() {
+        None => true,
+        Some(tenant) => {
+            tenant == caller.tenant || job.workspace.as_deref() == Some(caller.workspace.as_path())
+        }
+    }
+}
+
+/// Why job `job`, left running by a scheduler that stopped without
+/// stopping it, failed (#385), and its process stopped if it still runs:
+/// the process id its worker recorded under [`RUNNING_DIR`] names it, when
+/// it is still that job's `bhf fuzz`.
+fn reconcile_orphan(data_dir: &Path, job: &FuzzJob) -> String {
+    let pid_file = data_dir
+        .join(RUNNING_DIR)
+        .join(format!("{}.pid", job.job_id));
+    let pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    let _ = std::fs::remove_file(&pid_file);
+    let reason = match pid {
+        Some(pid) if orphan_still_runs(pid, job) => {
+            stop_orphan(pid);
+            format!(
+                "the scheduler stopped while this job ran; its process {pid} was still running \
+                 and was stopped"
+            )
+        }
+        _ => "the scheduler stopped while this job ran, and its process is gone".to_owned(),
+    };
+    reason.chars().take(MAX_REASON_BYTES).collect()
+}
+
+/// Whether process `pid` is `job`'s `bhf fuzz`, not a process that took its
+/// id since: on Linux by its command line.
+#[cfg(target_os = "linux")]
+fn orphan_still_runs(pid: u32, job: &FuzzJob) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+    let project = job.project_dir.as_os_str().as_encoded_bytes();
+    args.contains(&b"fuzz".as_slice())
+        && args.contains(&project)
+        && args.contains(&job.harness_id.as_bytes())
+}
+
+/// Elsewhere a process cannot be told from one that took its id since.
+#[cfg(not(target_os = "linux"))]
+fn orphan_still_runs(_pid: u32, _job: &FuzzJob) -> bool {
+    false
+}
+
+/// Stop an orphaned job's process tree: its worker started it as a process
+/// group leader.
+#[cfg(unix)]
+fn stop_orphan(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: kill(2) on the process group `orphan_still_runs` matched.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_orphan(_pid: u32) {}
+
+/// The process id of a running job, recorded under [`RUNNING_DIR`] while
+/// it runs and removed when it ends (#385).
+struct RunningPid(Option<PathBuf>);
+
+impl RunningPid {
+    fn record(data_dir: &Path, job_id: &str, pid: u32) -> Self {
+        let dir = data_dir.join(RUNNING_DIR);
+        let path = dir.join(format!("{job_id}.pid"));
+        let written =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, pid.to_string()));
+        Self(written.is_ok().then_some(path))
+    }
+}
+
+impl Drop for RunningPid {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn reserved_job_bytes(job: &FuzzJob) -> Result<usize, DaemonError> {
     let mut worst = job.clone();
-    // The longest state name the record can be persisted with.
+    // The longest state name the record can be persisted with, and the
+    // longest reason.
     worst.state = JobState::Cancelled;
+    worst.reason = Some("x".repeat(MAX_REASON_BYTES));
     Ok(serde_json::to_vec(&worst)?.len().saturating_add(1))
 }
 
 impl Drop for Scheduler {
+    /// Stop the workers, then the results refresh (which records what they
+    /// ran), waiting for each until a deadline (#272): the workers the
+    /// shutdown timeout they kill and reap their jobs within plus
+    /// [`SHUTDOWN_SLACK`], the refresh [`SHUTDOWN_SLACK`] more. A thread still
+    /// running then (a webhook post, a long results rebuild) is left to a
+    /// background thread that joins it, and that thread holds the data dir's
+    /// lock until it has, so no other scheduler takes the data dir while it
+    /// may still write.
     fn drop(&mut self) {
         self.request_shutdown();
+        let deadline = Instant::now() + self.shutdown_timeout + SHUTDOWN_SLACK;
+        let mut running: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
         for handle in self.workers.drain(..) {
-            let _ = handle.join();
+            if join_by(&handle, deadline) {
+                let _ = handle.join();
+            } else {
+                running.push(("worker", handle));
+            }
         }
         if let Some(refresher) = self.refresher.take() {
-            stop_refresher(&self.refresh, refresher);
+            self.refresh.request_shutdown();
+            if join_by(&refresher, Instant::now().max(deadline) + SHUTDOWN_SLACK) {
+                stop_refresher(&self.refresh, refresher);
+            } else {
+                running.push(("results refresh", refresher));
+            }
+        }
+        if running.is_empty() {
+            return;
+        }
+        eprintln!(
+            "scheduler shutdown: {} thread(s) still running after {:?} ({}); they finish in \
+             the background, holding {}",
+            running.len(),
+            self.shutdown_timeout + SHUTDOWN_SLACK * 2,
+            running
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.data_dir.display()
+        );
+        let lease = self.storage_lease.take();
+        let reaper = std::thread::Builder::new()
+            .name("bhf-scheduler-reaper".to_owned())
+            .spawn(move || {
+                for (_, handle) in running {
+                    let _ = handle.join();
+                }
+                drop(lease);
+            });
+        if let Err(error) = reaper {
+            eprintln!("scheduler shutdown: could not leave the threads to finish: {error}");
         }
     }
+}
+
+/// Wait until `handle`'s thread has finished or `deadline` passes; whether it
+/// finished.
+fn join_by(handle: &JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
 }
 
 /// Stop the refresh thread once every worker has stopped; it records what
@@ -607,7 +857,14 @@ fn worker_loop(
                 };
             }
         };
-        let outcome = run_one_job(&bin, &job, &state, shutdown_timeout, job_wall_grace);
+        let outcome = run_one_job(
+            &bin,
+            &job,
+            &state,
+            &data_dir,
+            shutdown_timeout,
+            job_wall_grace,
+        );
         state
             .inner
             .lock()
@@ -697,6 +954,7 @@ fn run_one_job(
     bin: &Path,
     job: &FuzzJob,
     state: &SharedState,
+    data_dir: &Path,
     shutdown_timeout: Duration,
     job_wall_grace: Duration,
 ) -> JobOutcome {
@@ -717,6 +975,8 @@ fn run_one_job(
     let Ok(mut child) = cmd.spawn() else {
         return JobOutcome::Finished(JobState::Failed);
     };
+    // For the next scheduler, should this one stop without stopping it.
+    let _pid = RunningPid::record(data_dir, &job.job_id, child.id());
     let deadline = if job.time_budget_secs == 0 {
         None
     } else {
@@ -853,15 +1113,58 @@ fn reap_after_kill(child: &mut Child, timeout: Duration) {
 /// — the v0.1 audience is on-prem (likely plain HTTP webhook to a
 /// chatops bot or local notification proxy).
 ///
-/// Socket work has a 10-second overall deadline and a 64 KiB response cap.
-/// Synchronous DNS resolution happens before this deadline and remains an
-/// unbounded platform operation for hostnames.
+/// The webhook post, name resolution included, has a 10-second overall
+/// deadline (#272) and a 64 KiB response cap.
 pub fn post_webhook(url: &str, payload: &str) -> Result<(), DaemonError> {
     post_webhook_with_timeout(url, payload, Duration::from_secs(10))
 }
 
-/// As [`post_webhook`] but with a caller-supplied overall socket deadline.
-/// DNS resolution for a hostname is not covered by this deadline.
+/// Resolve `host:port` within `timeout` (#272). The platform resolver
+/// blocks for as long as it takes, so it runs on a thread of its own: past
+/// the deadline the caller gets a `TimedOut` error, and the thread ends when
+/// the resolver returns.
+pub fn resolve_with_timeout(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    resolve_with(host, port, timeout, |host, port| {
+        use std::net::ToSocketAddrs;
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+}
+
+/// [`resolve_with_timeout`] with the resolver given.
+fn resolve_with(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    resolve: impl FnOnce(String, u16) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    // A literal address needs no resolver.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = host.to_owned();
+    std::thread::Builder::new()
+        .name("bhf-webhook-resolve".to_owned())
+        .spawn(move || {
+            let _ = sender.send(resolve(owned, port));
+        })?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("resolving {host} took longer than {timeout:?}"),
+        )),
+    }
+}
+
+/// As [`post_webhook`] but with a caller-supplied overall deadline, which
+/// covers resolving the host too.
 pub fn post_webhook_with_timeout(
     url: &str,
     payload: &str,
@@ -880,20 +1183,17 @@ pub fn post_webhook_with_timeout(
         )));
     }
     use std::io::{Read, Write};
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = (parsed.host.as_str(), parsed.port)
-        .to_socket_addrs()?
-        .collect();
-    let addr = addrs.first().ok_or_else(|| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("could not resolve {}:{}", parsed.host, parsed.port),
-        ))
-    })?;
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "webhook deadline overflows",
+        ))
+    })?;
+    let addrs = resolve_with_timeout(&parsed.host, parsed.port, timeout)?;
+    let addr = addrs.first().ok_or_else(|| {
+        DaemonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not resolve {}:{}", parsed.host, parsed.port),
         ))
     })?;
     let mut stream = std::net::TcpStream::connect_timeout(addr, remaining_webhook_time(deadline)?)?;
@@ -1492,6 +1792,9 @@ mod tests {
             harness_id: "old".to_owned(),
             time_budget_secs: 0,
             state: JobState::Complete,
+            tenant: None,
+            workspace: None,
+            reason: None,
         };
         std::fs::write(
             dir.join("jobs.jsonl"),
@@ -1515,6 +1818,9 @@ mod tests {
             harness_id: "H".to_owned(),
             time_budget_secs: 0,
             state: JobState::Complete,
+            tenant: None,
+            workspace: None,
+            reason: None,
         };
         let valid = serde_json::to_string(&old).unwrap();
         let alias = serde_json::to_string(&FuzzJob {
@@ -1589,6 +1895,9 @@ mod tests {
             harness_id: "H".to_owned(),
             time_budget_secs: 0,
             state: JobState::Complete,
+            tenant: None,
+            workspace: None,
+            reason: None,
         };
         std::fs::write(
             dir.join("jobs.jsonl"),
@@ -1629,13 +1938,19 @@ mod tests {
         let scheduler =
             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
         let error = scheduler
-            .submit_with_persistence(dir.clone(), "H".to_owned(), Duration::ZERO, |dir, jobs| {
-                persist_jobs_with_sync(dir, jobs, |_| {
-                    Err(std::io::Error::other(
-                        "injected parent directory sync error",
-                    ))
-                })
-            })
+            .submit_with_persistence(
+                None,
+                dir.clone(),
+                "H".to_owned(),
+                Duration::ZERO,
+                |dir, jobs| {
+                    persist_jobs_with_sync(dir, jobs, |_| {
+                        Err(std::io::Error::other(
+                            "injected parent directory sync error",
+                        ))
+                    })
+                },
+            )
             .unwrap_err();
         assert!(matches!(error, DaemonError::DurabilityUncertain { .. }));
         assert!(error.to_string().contains("J-000000"));
@@ -1763,6 +2078,285 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn owner(tenant: &str, workspace: &Path) -> JobOwner {
+        JobOwner {
+            tenant: tenant.to_owned(),
+            workspace: workspace.to_path_buf(),
+        }
+    }
+
+    /// #385: a job records the tenant that submitted it and its workspace,
+    /// on disk too; that tenant, the other tenants of its workspace and a
+    /// local caller see it, and no one else.
+    #[cfg(unix)]
+    #[test]
+    fn submit_records_caller_tenant() {
+        let (_dir_guard, dir) = tempdir("tenant-submit");
+        let config = ok_config(dir.clone(), PathBuf::from("/bin/sleep"));
+        let acme = owner("acme", &dir.join("acme"));
+        let id = {
+            let scheduler = Scheduler::start(&config).unwrap();
+            let id = scheduler
+                .submit_as(
+                    Some(acme.clone()),
+                    dir.clone(),
+                    "H".to_owned(),
+                    Duration::from_secs(30),
+                )
+                .unwrap();
+            let theirs = scheduler.list_jobs_as(Some(&acme)).unwrap();
+            assert_eq!(theirs.len(), 1);
+            assert_eq!(theirs[0].tenant.as_deref(), Some("acme"));
+            assert_eq!(
+                theirs[0].workspace.as_deref(),
+                Some(acme.workspace.as_path())
+            );
+            // Another tenant of the same workspace (its viewer) sees it; one
+            // of another workspace, nested in it included, does not.
+            let viewer = owner("audit", &acme.workspace);
+            assert_eq!(scheduler.list_jobs_as(Some(&viewer)).unwrap().len(), 1);
+            for other in [
+                owner("globex", &dir.join("globex")),
+                owner("nested", &acme.workspace.join("sub")),
+            ] {
+                assert!(scheduler.list_jobs_as(Some(&other)).unwrap().is_empty());
+            }
+            assert_eq!(scheduler.list_jobs_as(None).unwrap().len(), 1);
+            id
+        };
+        let restarted = Scheduler::start(&config).unwrap();
+        let job = restarted
+            .list_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.job_id == id)
+            .unwrap();
+        assert_eq!(job.tenant.as_deref(), Some("acme"));
+    }
+
+    /// #385: another tenant cannot cancel a job: it is no job of theirs, and
+    /// it runs on; its own tenant can.
+    #[cfg(unix)]
+    #[test]
+    fn cross_tenant_cancel_is_denied() {
+        let (_dir_guard, dir) = tempdir("tenant-cancel");
+        let script = dir.join("sleepy.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let scheduler = Scheduler::start(&ok_config(dir.clone(), script)).unwrap();
+        let acme = owner("acme", &dir.join("acme"));
+        let id = scheduler
+            .submit_as(
+                Some(acme.clone()),
+                dir.clone(),
+                "H".to_owned(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        wait_for_state(&scheduler, &id, JobState::Running);
+        assert!(matches!(
+            scheduler.cancel_as(Some(&owner("globex", &dir.join("globex"))), &id),
+            Err(DaemonError::UnknownJob(_))
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        let state = |scheduler: &Scheduler| {
+            scheduler
+                .list_jobs()
+                .unwrap()
+                .into_iter()
+                .find(|job| job.job_id == id)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(&scheduler), JobState::Running);
+        assert_eq!(
+            scheduler.cancel_as(Some(&acme), &id).unwrap(),
+            JobState::Running
+        );
+        wait_for_state(&scheduler, &id, JobState::Cancelled);
+    }
+
+    /// #385: a job a scheduler left running when it stopped without stopping
+    /// it (it crashed) is failed on the next start, with why, and its process
+    /// is stopped if it still runs. It was queued to run again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphaned_running_jobs_are_marked_failed_on_start() {
+        use std::os::unix::process::CommandExt;
+        let (_dir_guard, dir) = tempdir("orphans");
+        let running = |id: &str, harness: &str| FuzzJob {
+            job_id: id.to_owned(),
+            project_dir: dir.clone(),
+            harness_id: harness.to_owned(),
+            time_budget_secs: 60,
+            state: JobState::Running,
+            tenant: Some("acme".to_owned()),
+            workspace: Some(dir.clone()),
+            reason: None,
+        };
+        // J-000001's process is gone; J-000002's still runs, as its worker
+        // started it: a process group of its own running `... fuzz <project>
+        // --harness <id>`.
+        let mut orphan = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .arg("fuzz")
+            .arg(&dir)
+            .arg("--harness")
+            .arg("H-live")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::fs::create_dir_all(dir.join(RUNNING_DIR)).unwrap();
+        std::fs::write(dir.join(RUNNING_DIR).join("J-000001.pid"), "999999999").unwrap();
+        std::fs::write(
+            dir.join(RUNNING_DIR).join("J-000002.pid"),
+            orphan.id().to_string(),
+        )
+        .unwrap();
+        let snapshot = [running("J-000001", "H-gone"), running("J-000002", "H-live")]
+            .iter()
+            .map(|job| serde_json::to_string(job).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(dir.join("jobs.jsonl"), snapshot).unwrap();
+
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        let jobs = scheduler.list_jobs().unwrap();
+        for job in &jobs {
+            assert_eq!(job.state, JobState::Failed, "{job:?}");
+        }
+        assert!(
+            jobs[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("its process is gone")),
+            "{jobs:?}"
+        );
+        assert!(
+            jobs[1].reason.as_deref().is_some_and(|reason| reason
+                .contains(&format!("process {}", orphan.id()))
+                && reason.contains("was stopped")),
+            "{jobs:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while orphan.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the orphan still runs");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // On disk, and nothing was queued to run again.
+        let saved = std::fs::read_to_string(dir.join("jobs.jsonl")).unwrap();
+        assert_eq!(saved.matches("\"failed\"").count(), 2, "{saved}");
+        assert!(!dir.join(RUNNING_DIR).join("J-000001.pid").exists());
+    }
+
+    /// #272: a host the resolver takes too long on is an error at the
+    /// deadline, not a wait as long as the resolver's; a literal address
+    /// needs no resolver.
+    #[test]
+    fn unresolvable_target_host_times_out_within_bound() {
+        let started = Instant::now();
+        let error = resolve_with("never.invalid", 80, Duration::from_millis(200), |_, _| {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let literal = resolve_with("127.0.0.1", 9, Duration::ZERO, |_, _| {
+            unreachable!("a literal address is not resolved")
+        })
+        .unwrap();
+        assert_eq!(literal, ["127.0.0.1:9".parse().unwrap()]);
+        // The webhook's own deadline covers resolving its host.
+        let started = Instant::now();
+        let _ = post_webhook_with_timeout(
+            "http://bhf-unresolvable.invalid:9/hook",
+            "{}",
+            Duration::from_millis(300),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #272: dropping the scheduler returns within its shutdown deadline
+    /// while one worker runs a job and another is posting a webhook to a
+    /// server that never answers (10 s of socket deadline). The running job
+    /// is stopped and requeued, and the data dir stays locked until the
+    /// webhook worker is done.
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_shutdown_returns_within_deadline_with_running_jobs() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir_guard, dir) = tempdir("shutdown-deadline");
+        // Accepts and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let script = dir.join("fake-bhf.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh
+[ \"$4\" = fast ] && exit 0
+sleep 30
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = ok_config(dir.clone(), script);
+        config.webhook_url = Some(format!("http://127.0.0.1:{port}/hook"));
+        let shutdown_timeout = Duration::from_millis(500);
+        let scheduler = Scheduler::start_with_shutdown_timeout(&config, shutdown_timeout).unwrap();
+        let fast = scheduler
+            .submit(dir.clone(), "fast".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &fast, JobState::Complete);
+        let slow = scheduler
+            .submit(dir.clone(), "slow".to_owned(), Duration::from_secs(60))
+            .unwrap();
+        wait_for_state(&scheduler, &slow, JobState::Running);
+        // The fast job's worker is in its webhook post by now.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        drop(scheduler);
+        let took = started.elapsed();
+        assert!(
+            took < shutdown_timeout + SHUTDOWN_SLACK * 2 + Duration::from_millis(700),
+            "shutdown took {took:?}"
+        );
+        let jobs: Vec<FuzzJob> = std::fs::read_to_string(dir.join("jobs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let slow_job = jobs.iter().find(|job| job.job_id == slow).unwrap();
+        assert_eq!(slow_job.state, JobState::Queued, "{jobs:?}");
+        assert!(
+            matches!(
+                Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))),
+                Err(DaemonError::DataDirInUse(_))
+            ),
+            "the webhook worker still holds the data dir"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_kills_owned_process_tree_and_requeues_job_for_restart() {
@@ -1881,6 +2475,9 @@ mod tests {
             harness_id: "H".into(),
             time_budget_secs: 0,
             state: JobState::Complete,
+            tenant: None,
+            workspace: None,
+            reason: None,
         };
         let line = format!("{}\n", serde_json::to_string(&job).unwrap());
         std::fs::write(&path, line.as_bytes()).unwrap();

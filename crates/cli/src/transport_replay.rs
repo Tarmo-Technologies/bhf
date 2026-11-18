@@ -123,6 +123,36 @@ fn with_recorded_input_cap(map: &str, len: usize) -> String {
     }
 }
 
+/// A transport finding's target, rebuilt from its profile and armed, with
+/// what a re-driven input is judged against.
+struct Rebuilt {
+    spec: String,
+    input: Vec<u8>,
+    recorded: FaultIdentity,
+    timing_deadline: Option<Duration>,
+    cycle_counter: Option<target_transport::cycles::CycleCounter>,
+    session: Box<dyn target_transport::TargetSession>,
+}
+
+impl Rebuilt {
+    /// Re-drive `input` once and judge the run against the finding.
+    fn judge(&mut self, input: &[u8]) -> Result<Judged, String> {
+        let started = Instant::now();
+        let outcome = self.session.run_input(input).map_err(|error| {
+            format!("re-driving the recorded input through the transport failed: {error}")
+        })?;
+        // A deadline recorded against target time is judged by target time.
+        let (elapsed, _) =
+            crate::transport_fuzz::run_time(self.cycle_counter, &outcome, started.elapsed());
+        Ok(judge_run(
+            &self.recorded,
+            self.timing_deadline,
+            &outcome,
+            elapsed,
+        ))
+    }
+}
+
 /// Replay a transport finding: rebuild its transport, re-drive the recorded
 /// input and compare the fault identity (or, for a deadline finding, the
 /// timing predicate). An unreachable or unbuildable transport is an error.
@@ -131,6 +161,55 @@ pub(crate) fn replay_transport_outcome(
     endpoint: Option<&str>,
     runs: usize,
 ) -> Result<crate::replay::LaneReplay, String> {
+    let mut rebuilt = rebuild(finding_dir, endpoint)?;
+    // #250: the input is re-driven `runs` times, each from the transport's
+    // reset, so a fault that reproduces only sometimes is reported as such.
+    let mut judged = Vec::with_capacity(runs.max(1));
+    let input = rebuilt.input.clone();
+    for _ in 0..runs.max(1) {
+        judged.push(rebuilt.judge(&input)?);
+    }
+    Ok(combine_runs(judged, &rebuilt.spec))
+}
+
+/// A transport finding's input, minimized (#280).
+pub(crate) struct TransportMinimization {
+    pub(crate) original_len: usize,
+    pub(crate) minimized: Vec<u8>,
+    pub(crate) predicate_runs: usize,
+}
+
+/// Minimize a transport finding (#280): rebuild its transport from the
+/// profile as [`replay_transport_outcome`] does and delta-debug its input,
+/// keeping a candidate only when re-driving it reproduces the same fault
+/// identity (rule and site), or for a deadline finding the same timing
+/// predicate. An input that no longer reproduces is an error.
+pub(crate) fn minimize_transport_finding(
+    finding_dir: &Path,
+    endpoint: Option<&str>,
+) -> Result<TransportMinimization, String> {
+    let mut rebuilt = rebuild(finding_dir, endpoint)?;
+    let input = rebuilt.input.clone();
+    let first = rebuilt.judge(&input)?;
+    if !first.matched {
+        return Err(format!(
+            "the recorded input does not reproduce the finding through {}: {}",
+            rebuilt.spec, first.status_line
+        ));
+    }
+    let result = replay_min::ddmin_bytes(&input, |candidate| {
+        rebuilt.judge(candidate).map(|judged| judged.matched)
+    })?;
+    Ok(TransportMinimization {
+        original_len: input.len(),
+        minimized: result.minimized,
+        predicate_runs: result.predicate_runs + 1,
+    })
+}
+
+/// Rebuild a transport finding's target from its profile, arm it, and read
+/// what a re-driven input is judged against.
+fn rebuild(finding_dir: &Path, endpoint: Option<&str>) -> Result<Rebuilt, String> {
     let profile_path = finding_dir.join(TRANSPORT_PROFILE_FILE);
     let profile: serde_json::Value = std::fs::read(&profile_path)
         .ok()
@@ -204,7 +283,7 @@ pub(crate) fn replay_transport_outcome(
     let transport = plan
         .into_transport(per_input_timeout)
         .map_err(|error| format!("rebuild transport from profile: {error}"))?;
-    let mut session = transport.arm().map_err(|error| {
+    let session = transport.arm().map_err(|error| {
         format!(
             "could not reach the recorded transport ({spec}): {error}; \
              relocate it with --transport-endpoint HOST:PORT"
@@ -226,20 +305,14 @@ pub(crate) fn replay_transport_outcome(
         } else {
             None
         };
-    // #250: the input is re-driven `runs` times, each from the transport's
-    // reset, so a fault that reproduces only sometimes is reported as such.
-    let mut judged = Vec::with_capacity(runs.max(1));
-    for _ in 0..runs.max(1) {
-        let started = Instant::now();
-        let outcome = session.run_input(&input).map_err(|error| {
-            format!("re-driving the recorded input through the transport failed: {error}")
-        })?;
-        // A deadline recorded against target time is judged by target time.
-        let (elapsed, _) =
-            crate::transport_fuzz::run_time(cycle_counter, &outcome, started.elapsed());
-        judged.push(judge_run(&recorded, timing_deadline, &outcome, elapsed));
-    }
-    Ok(combine_runs(judged, &spec))
+    Ok(Rebuilt {
+        spec,
+        input,
+        recorded,
+        timing_deadline,
+        cycle_counter,
+        session,
+    })
 }
 
 /// One re-driven run, judged against the finding.

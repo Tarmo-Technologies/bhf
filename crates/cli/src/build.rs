@@ -1348,6 +1348,9 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
                     return Some(2);
                 }
                 bhfeprintln!("built harness binary -> {}", dest.display());
+                if args.c_engine == CEngine::AflPlusPlus {
+                    stage_afl_cmplog_build(&harness_dir, &build_dir, &force_includes);
+                }
                 // The emulator a foreign binary runs under, recorded beside it
                 // (and beside the harness) for the commands that run it. A
                 // native rebuild forgets one an earlier build recorded.
@@ -2981,6 +2984,76 @@ pub(crate) fn try_run_c_make_afl_build_with_extras(
         target,
         None,
     )
+}
+
+/// The CmpLog build afl-fuzz runs beside `main_afl` (`-c`, #274): the
+/// Makefile's `afl_cmplog` target, `main_afl_cmplog`.
+pub(crate) const AFL_CMPLOG_BINARY: &str = "main_afl_cmplog";
+
+/// Build `main_afl_cmplog` for an auto-recovered C/C++ harness, with the same
+/// recovered extras as its `main_afl` build. The AFL++ lane runs without
+/// CmpLog when this fails, so the caller only reports it.
+pub(crate) fn try_run_c_make_afl_cmplog_build_with_extras(
+    work_dir: &Path,
+    harness_id: &str,
+    extra_sources: &[PathBuf],
+    extra_includes: &[PathBuf],
+) -> std::process::Output {
+    try_run_c_make_build_with_target(
+        work_dir,
+        harness_id,
+        extra_sources,
+        extra_includes,
+        None,
+        Some("afl_cmplog"),
+        None,
+    )
+}
+
+/// `bhf build --c-engine afl++`: build `main_afl_cmplog` too and stage it
+/// beside `main_afl`. A failed CmpLog build leaves AFL++ running without
+/// `-c`, which the warning says.
+fn stage_afl_cmplog_build(harness_dir: &Path, build_dir: &Path, force_includes: &[PathBuf]) {
+    let mut cmd = std::process::Command::new("make");
+    cmd.current_dir(harness_dir).arg("afl_cmplog");
+    apply_c_family_make_env(&mut cmd, &[], &[], force_includes, None);
+    let output = crate::command_output::output_with_timeout_flagged(
+        &mut cmd,
+        std::time::Duration::from_secs(30 * 60),
+    );
+    let built = crate::auto::layout::harness_exe(harness_dir, AFL_CMPLOG_BINARY);
+    let dest = build_dir.join(crate::auto::layout::harness_exe_name(AFL_CMPLOG_BINARY));
+    // A CmpLog binary an earlier build left would not match this main_afl.
+    let _ = fs::remove_file(&dest);
+    match output {
+        Ok((out, false)) if out.status.success() && built.is_file() => {
+            match fs::copy(&built, &dest) {
+                Ok(_) => bhfeprintln!("built CmpLog binary -> {}", dest.display()),
+                Err(error) => bhfeprintln!(
+                    "bhf build: warning: copy '{}' -> '{}': {error}; AFL++ runs without CmpLog",
+                    built.display(),
+                    dest.display()
+                ),
+            }
+        }
+        Ok((out, timed_out)) => bhfeprintln!(
+            "bhf build: warning: `make afl_cmplog` {}; AFL++ runs without CmpLog (-c){}",
+            if timed_out {
+                "timed out".to_owned()
+            } else {
+                format!("failed ({:?})", out.status.code())
+            },
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| format!(": {}", line.trim()))
+                .unwrap_or_default()
+        ),
+        Err(error) => bhfeprintln!(
+            "bhf build: warning: run `make afl_cmplog`: {error}; AFL++ runs without CmpLog (-c)"
+        ),
+    }
 }
 
 /// Synthesised repair headers that must be force-included into every TU of

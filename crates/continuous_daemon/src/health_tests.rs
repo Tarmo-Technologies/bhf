@@ -28,6 +28,9 @@ fn job(state: JobState) -> FuzzJob {
         harness_id: "private-harness-do-not-export".into(),
         time_budget_secs: 1,
         state,
+        tenant: None,
+        workspace: None,
+        reason: None,
     }
 }
 
@@ -161,6 +164,7 @@ fn rejected_admission_latches_fault_without_consuming_id_or_record() {
     let dir = tempfile::tempdir().unwrap();
     let scheduler = Scheduler::start(&config(dir.path())).unwrap();
     let result = scheduler.submit_with_persistence(
+        None,
         dir.path().to_owned(),
         "H".into(),
         Duration::ZERO,
@@ -189,6 +193,7 @@ fn uncertain_admission_reserves_id_and_bytes_and_exposes_installed_flag() {
     let dir = tempfile::tempdir().unwrap();
     let scheduler = Scheduler::start(&config(dir.path())).unwrap();
     let result = scheduler.submit_with_persistence(
+        None,
         dir.path().to_owned(),
         "H".into(),
         Duration::ZERO,

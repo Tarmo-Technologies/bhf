@@ -97,6 +97,10 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         include_bytes!("../../../c_runtime/bhf_driver.c"),
     ),
     (
+        "c_runtime/bhf_service_cov.c",
+        include_bytes!("../../../c_runtime/bhf_service_cov.c"),
+    ),
+    (
         "c_runtime/bhf_trace.h",
         include_bytes!("../../../c_runtime/bhf_trace.h"),
     ),

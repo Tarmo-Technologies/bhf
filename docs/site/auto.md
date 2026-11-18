@@ -91,7 +91,7 @@ is to bound the recursion depth.
 | `--passes <SET>` | all (`empty,rng,fuzz`) | Restrict the per-target cascade to a comma list of passes (`empty`, `rng`, `fuzz`). E.g. `--passes fuzz` runs only the fuzz-driven pass — ~3× the throughput of the full 3-pass cascade. Mutually exclusive with `--single-pass` |
 | `--single-pass` | off | Convenience for `--passes fuzz`: run ONLY the fuzz-driven pass per target |
 | `--max-repair-rounds <N>` | `16` | Ceiling on build-fail → repair → retry rounds per target. The default covers all 95 successful clean/damaged samples in the strengthened 53-repository matrix (p95 6, p99/max 14 rounds); the no-progress early-break still applies, so it is a cap, not a fixed cost |
-| `--no-minimize` | off | Skip minimizing each root-cause representative after fuzzing (bounded to 30 s a group, 5 min in all) |
+| `--no-minimize` | off | Skip minimizing each root-cause representative after fuzzing (bounded to 30 s a group, 5 min in all; C/C++ on the crash, Ada on its event-log signature), which writes its `min_testcase.bin` |
 | _(discovery cache)_ | **on** | Discovery is cached by default to `<work>/discovery-cache.json` and reused on a re-run when a **build-stable** content fingerprint of the target source (file paths + sizes + content hashes + dir-filter) is unchanged, skipping the tree-sitter re-parse + re-rank — the dominant re-run cost on a big tree. The fingerprint depends only on the fuzzed code (not on which bhf build computed it), so rebuilding bhf does not invalidate it. A mismatch recomputes and rewrites the cache; a stale cache is never used silently |
 | `--discovery-cache <PATH>` | `<work>/discovery-cache.json` | Put the default-on cache at an explicit path, useful when work directories change or the cache belongs on a known volume |
 | `--fresh-discovery` | off | Force a fresh discovery this run (ignore any cache), then overwrite the cache with the new result |
@@ -474,7 +474,7 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 
 | Lane | Black-box (Mayhem base-exe / AFL file) | libFuzzer | AFL++ persistent |
 |---|---|---|---|
-| C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl` |
+| C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl`, `make afl_cmplog` → `./main_afl_cmplog` (`-c`) |
 | Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | — |
 | Ada | `./main < input` (stdin) | — | — |
 

@@ -112,9 +112,23 @@ pub fn minimize_finding_bytes_with_runner(
     finding_dir: &Path,
     runner: &HarnessRunner,
 ) -> Result<ByteMinimization, MinimizeError> {
+    minimize_finding_bytes_with_runner_until(finding_dir, runner, None)
+}
+
+/// [`minimize_finding_bytes_with_runner`], stopping at `deadline`: past it
+/// every candidate is taken not to reproduce, so the delta-debug ends with
+/// the smallest input it has shown to reproduce the recorded signature.
+pub fn minimize_finding_bytes_with_runner_until(
+    finding_dir: &Path,
+    runner: &HarnessRunner,
+    deadline: Option<std::time::Instant>,
+) -> Result<ByteMinimization, MinimizeError> {
     let (recorded, input) = load_reproducing_input_with_runner(finding_dir, runner)?;
 
     ddmin_bytes(&input, |candidate| {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(false);
+        }
         candidate_preserves_signature_with_runner(runner, candidate, recorded)
     })
 }

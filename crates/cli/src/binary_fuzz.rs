@@ -1439,7 +1439,9 @@ pub(crate) fn minimize_binary_finding(
 ) -> anyhow::Result<BinaryMinimizeSummary> {
     if strategy != MinimizeStrategy::Bytes {
         return Err(anyhow!(
-            "minimize --strategy typed is not yet supported for binary findings"
+            "minimize --strategy typed reduces the arguments a generated harness decodes, by \
+             its arg-layout.json; a binary finding's input reaches the binary whole and has \
+             none, so minimize it with --strategy bytes"
         ));
     }
     let finding = read_finding(finding_dir)?;
