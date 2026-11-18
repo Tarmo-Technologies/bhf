@@ -2853,6 +2853,10 @@
   when bhf panics.
 
 ### Added
+- `bhf export regression [--lang c|ada]` writes a work dir's harnesses,
+  corpora and findings' minimized inputs as a standalone regression suite
+  (#339): `run.sh` builds each harness against the scanned tree and fails
+  when an input crashes, so a finding fails it until its bug is fixed.
 - The Java, JavaScript and TypeScript lanes run on native Windows (#307):
   their launchers have launch specs (`java` with the agent, `node` on the
   driver), Java's classpaths take the host's separator, the JVM agent jar is

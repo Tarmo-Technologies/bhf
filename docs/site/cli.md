@@ -1274,6 +1274,17 @@ bhf ci . --work-dir bhf_work --policy bhf-policy.json --runner-plan bhf_work/run
 bhf export --work-dir bhf_work --out bhf_work/export-manifest.json --bundle-dir bhf_work/export-bundle --policy bhf-policy.json --update-pack update-pack.json --runner-plan bhf_work/runner-plan.json
 ```
 
+`bhf export regression --work-dir bhf_work --out suite [--lang c|ada]` writes
+a standalone regression suite of the work dir. Each harness keeps its sources,
+its Makefile (C/C++) or `regress.gpr` (Ada, against the scanned tree's own
+sources and a copy of bhf's Ada runtime), the build context bhf recovered for
+it, its corpus (at most `--max-corpus`, 500 by default, smallest first) and the
+minimized input of each of its findings. A finding of a replay lane's build
+(MSan, TSan, CFI, RealtimeSanitizer) is left out, since the suite runs each
+harness's own build. `suite/run.sh` builds every harness against the scanned
+tree (`SOURCE_ROOT=<checkout>` names another) and runs every input; it exits 1
+when one crashes, so a finding's input fails the suite until its bug is fixed.
+
 `policy validate` checks the policy-as-code document and emits a deterministic
 summary of enabled languages, rule counts, runner requirements, CI thresholds,
 and allowed update-pack kinds.

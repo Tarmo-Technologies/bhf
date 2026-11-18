@@ -47,6 +47,8 @@ mod cartography;
 pub mod ci;
 pub(crate) mod ci_regression;
 pub(crate) mod launch_spec;
+pub mod export_regression;
+pub(crate) mod export_regression_ada;
 mod clean;
 mod cmplog_cli;
 mod collector_run;

@@ -3,14 +3,20 @@
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ExportArgs {
+    /// `bhf export regression`: the work dir's harnesses, corpora and
+    /// findings as a standalone regression suite.
+    #[command(subcommand)]
+    pub command: Option<ExportCommand>,
+
     /// BHF work directory to inventory.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
     /// Output manifest path.
-    #[arg(long)]
-    pub out: PathBuf,
+    #[arg(long, required = true)]
+    pub out: Option<PathBuf>,
 
     /// Optional directory to materialize copied export artifacts for air-gapped handoff.
     #[arg(long)]
@@ -41,10 +47,26 @@ pub struct ExportArgs {
     pub required_artifacts: Vec<String>,
 }
 
+#[derive(Debug, clap::Subcommand)]
+pub enum ExportCommand {
+    /// Write a standalone regression suite: each harness's sources and build
+    /// context, its corpus and its findings' minimized inputs, and a `run.sh`
+    /// that builds the harnesses against the scanned tree and fails when an
+    /// input crashes.
+    Regression(crate::export_regression::RegressionArgs),
+}
+
 pub fn run(args: ExportArgs) -> i32 {
+    if let Some(ExportCommand::Regression(regression)) = args.command {
+        return crate::export_regression::run(regression);
+    }
+    let Some(out) = args.out else {
+        bhfeprintln!("error: bhf export needs --out (or a subcommand: regression)");
+        return 2;
+    };
     let options = governance::ExportOptions {
         work_dir: args.work_dir,
-        out: args.out,
+        out,
         bundle_dir: args.bundle_dir,
         policy: args.policy,
         update_packs: args.update_packs,
