@@ -5,8 +5,10 @@
 //! target, is driven by the host's `AgentTransport` as `--target-transport
 //! agent:tcp` drives it. Coverage grows as an input reaches new code, a
 //! fault is reported for the input that caused it and the agent serves the
-//! next input, and an input longer than its buffer is refused, not run. It
-//! needs clang; `BHF_REQUIRE_TOOLS=1` makes a missing one a failure.
+//! next input, and an input longer than its buffer is refused, not run. The
+//! Zephyr glue (`c_runtime/zephyr/`, #291) runs the same way against a host
+//! stand-in for the Zephyr API it uses. It needs clang; `BHF_REQUIRE_TOOLS=1`
+//! makes a missing one a failure.
 #![cfg(unix)]
 
 use std::io::BufRead;
@@ -194,4 +196,136 @@ fn the_reference_agent_reports_coverage_faults_and_refusals_over_tcp() {
     drop(session);
     let mut again = transport.arm().unwrap();
     assert_eq!(edges(b"B", &mut again), b);
+}
+
+/// Build the Zephyr glue against the host stand-in of `tests/agent/zephyr_host`
+/// (#291), with the test target, into `dir`; `None` without clang.
+fn build_zephyr_host_agent(dir: &Path) -> Option<PathBuf> {
+    if !common::tool_on_path("clang") {
+        assert!(
+            std::env::var_os("BHF_REQUIRE_TOOLS").is_none_or(|value| value != "1"),
+            "BHF_REQUIRE_TOOLS=1 and clang is not on PATH"
+        );
+        return None;
+    }
+    let runtime = repo().join("c_runtime");
+    let host = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/agent/zephyr_host");
+    let include = |args: &mut Vec<std::ffi::OsString>| {
+        for dir in [&host, &runtime, &runtime.join("zephyr")] {
+            args.push("-I".into());
+            args.push(dir.into());
+        }
+    };
+    let compile = |source: PathBuf, extra: &[&str], object: &str| {
+        let mut args: Vec<std::ffi::OsString> = vec!["-Wall".into(), "-Werror".into()];
+        include(&mut args);
+        args.extend(extra.iter().map(Into::into));
+        args.extend([
+            "-c".into(),
+            source.into(),
+            "-o".into(),
+            dir.join(object).into(),
+        ]);
+        let status = Command::new("clang").args(&args).status().unwrap();
+        assert!(status.success(), "clang {args:?}");
+    };
+    compile(
+        runtime.join("bhf_agent.c"),
+        &["-std=c99", "-DBHF_AGENT_NO_SETJMP"],
+        "bhf_agent.o",
+    );
+    compile(
+        runtime.join("zephyr/bhf_agent_zephyr.c"),
+        &[
+            &format!("-DCONFIG_BHF_AGENT_INPUT_SIZE={INPUT_CAP}"),
+            "-DCONFIG_BHF_AGENT_EDGE_CAP=1024",
+            "-DCONFIG_BHF_AGENT_STACK_SIZE=65536",
+            "-DCONFIG_BHF_AGENT_PRIORITY=5",
+        ],
+        "bhf_agent_zephyr.o",
+    );
+    compile(host.join("zephyr_host.c"), &[], "zephyr_host.o");
+    compile(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/agent/target.c"),
+        &["-fsanitize-coverage=trace-pc-guard", "-O0"],
+        "target.o",
+    );
+    let agent = dir.join("zephyr_agent");
+    let status = Command::new("clang")
+        .args([
+            "zephyr_host.o",
+            "bhf_agent_zephyr.o",
+            "bhf_agent.o",
+            "target.o",
+        ])
+        .args(["-pthread", "-o"])
+        .arg(&agent)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "link the Zephyr host agent");
+    Some(agent)
+}
+
+/// #291: the Zephyr glue serves the agent protocol; a fault ends the agent
+/// thread, the thread that started it reports the fault for the input, and
+/// a new agent thread serves the next input.
+#[test]
+fn the_zephyr_glue_reports_a_fault_and_serves_on_in_a_new_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(binary) = build_zephyr_host_agent(dir.path()) else {
+        eprintln!("skipping: clang not on PATH");
+        return;
+    };
+    let agent = start(&binary);
+    let port = agent.port;
+    let transport =
+        AgentTransport::new(move || TcpStream::connect(("127.0.0.1", port)).map_err(Into::into));
+    let mut session = transport.arm().unwrap();
+    let clean = |input: &[u8], session: &mut Box<dyn target_transport::TargetSession>| {
+        let outcome = session.run_input(input).unwrap();
+        assert_eq!(outcome.exit, ExitKind::Ok, "{input:?}: {outcome:?}");
+        assert!(outcome.fault.is_none() && outcome.inconclusive.is_none());
+        let mut edges = outcome.coverage_edges;
+        edges.sort_unstable();
+        edges
+    };
+    let b = clean(b"B", &mut session);
+    let bu = clean(b"BU", &mut session);
+    assert!(
+        bu.iter().any(|edge| !b.contains(edge)),
+        "BU reaches new code: {b:?} {bu:?}"
+    );
+
+    for _ in 0..3 {
+        let fault = session.run_input(b"BUG").unwrap();
+        assert_eq!(fault.exit, ExitKind::Crash, "{fault:?}");
+        let detail = fault.fault.clone().expect("a fault");
+        assert_eq!(detail.kind, FaultKind::CpuException);
+        assert_eq!(detail.detail, "Zephyr fatal error");
+        assert!(
+            fault
+                .coverage_edges
+                .iter()
+                .any(|edge| !b.contains(edge) && !bu.contains(edge)),
+            "the faulting input's edges are reported: {fault:?}"
+        );
+        assert_eq!(
+            clean(b"BU", &mut session),
+            bu,
+            "a new agent thread serves on"
+        );
+    }
+
+    let refused = session.run_input(&[b'B'; INPUT_CAP + 1]).unwrap();
+    assert!(
+        refused
+            .inconclusive
+            .as_deref()
+            .is_some_and(|reason| reason.contains("refused")),
+        "{refused:?}"
+    );
+    drop(session);
+    let mut again = transport.arm().unwrap();
+    assert_eq!(clean(b"B", &mut again), b);
 }

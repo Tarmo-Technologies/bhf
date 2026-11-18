@@ -27,7 +27,10 @@
  * bhf_agent_fault(): the agent reports the fault for the input that was
  * running and goes on with the next one (it longjmps out of the handler; on
  * a target where that is not safe, reset instead and report the fault from
- * the record a reset keeps).
+ * the record a reset keeps). Built with BHF_AGENT_NO_SETJMP, the handler
+ * only records the fault: an RTOS that ends the faulting thread (Zephyr's
+ * fatal-error path) has another thread call bhf_agent_report_fault() and
+ * serve on (c_runtime/zephyr/).
  */
 #ifndef BHF_AGENT_H
 #define BHF_AGENT_H
@@ -96,6 +99,12 @@ void bhf_agent_edge(uint32_t id);
  * running input, and resume the agent loop. Does not return while an input
  * runs; returns at once otherwise. */
 void bhf_agent_fault(uint32_t kind, uint64_t addr, const char *detail);
+
+/* Send the reply of the input a recorded fault ended, from the context that
+ * serves next, when the faulting one could not resume (BHF_AGENT_NO_SETJMP).
+ * 0 after the reply, or when no fault is pending; nonzero when the link is
+ * gone. */
+int bhf_agent_report_fault(void);
 
 #ifdef __cplusplus
 }

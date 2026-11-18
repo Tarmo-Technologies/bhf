@@ -2824,6 +2824,17 @@
   when bhf panics.
 
 ### Added
+- The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
+  serves the agent protocol on the UART the devicetree's chosen
+  `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,
+  `bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`). Zephyr ends a thread that
+  faults, so the module's `k_sys_fatal_error_handler` records the fault for
+  the running input, and the calling thread sends the reply
+  (`bhf_agent_report_fault`, new in `bhf_agent.h`) and starts a new agent
+  thread. Its `qemu_cortex_m3` sample runs clean, fault and clean inputs in one
+  boot and replays the fault (`transport_zephyr_agent_cli`, opt in with
+  `BHF_ZEPHYR_CLI=1`; hil-emu installs Zephyr and runs it). The glue also runs
+  on the host against a stand-in for the Zephyr API, in `agent_loopback`.
 - `bhf auto` fuzzes a Python instance method whose class's `__init__` takes
   arguments (#286). The harness decodes each required `__init__` argument from
   the input ahead of the method's own, as it decodes a method parameter of that

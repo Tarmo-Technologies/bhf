@@ -13,6 +13,9 @@
 #   RV-3  live_fullsystem     — FullSystemTransport end-to-end on emulated Cortex-M
 #                               (qemu-system-arm mps2-an385: savevm/loadvm snapshot
 #                                reset + coverage-ring readback + planted fault)
+#   RV-4  the pinned FreeRTOS task/queue profile and the FreeRTOS agent task
+#   RV-5  the reference agent's Zephyr sample (west + ZEPHYR_BASE, from
+#         scripts/ci/install-zephyr.sh)
 #
 # Unlike the default `cargo test` (which self-skips when the emulator/cross
 # toolchains are absent), this lane first HARD-FAILS if any required tool is
@@ -120,4 +123,12 @@ BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_CLI=1 cargo test --locked \
   -p bhf --test transport_freertos_agent_cli -- --nocapture
 echo
 
-echo "== hil-emu: RV-1 through RV-4 executed the REAL live paths and passed =="
+echo "== RV-5: the reference agent's Zephyr sample, CLI finding and replay =="
+command -v west >/dev/null && [ -n "${ZEPHYR_BASE:-}" ] || {
+  echo "ERROR: RV-5 needs west and ZEPHYR_BASE (scripts/ci/install-zephyr.sh)" >&2
+  exit 1
+}
+BHF_ZEPHYR_CLI=1 cargo test --locked -p bhf --test transport_zephyr_agent_cli -- --nocapture
+echo
+
+echo "== hil-emu: RV-1 through RV-5 executed the REAL live paths and passed =="

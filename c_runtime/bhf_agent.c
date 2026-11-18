@@ -170,6 +170,13 @@ BHF_AGENT_NOCOV int bhf_agent_serve_one(void) {
     return bhf_reply(status);
 }
 
+BHF_AGENT_NOCOV int bhf_agent_report_fault(void) {
+    if (!bhf_faulted) return 0;
+    if (bhf_reply(BHF_AGENT_STATUS_CRASH) != 0) return -1;
+    bhf_faulted = 0;
+    return 0;
+}
+
 BHF_AGENT_NOCOV void bhf_agent_serve(void) {
     while (bhf_agent_serve_one() == 0) {
     }

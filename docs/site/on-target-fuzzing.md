@@ -54,7 +54,7 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
-| An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. Kernel is bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
+| An open RTOS (FreeRTOS, Zephyr) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. ✅ The reference agent as a Zephyr module (`c_runtime/zephyr/`): its `qemu_cortex_m3` sample runs clean → fault → clean and replays under `qemu-system-arm`. Kernels are bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
@@ -339,7 +339,16 @@ task over the UART. `crates/target_transport/tests/freertos/agent_task.c` is
 one, for FreeRTOS on `mps2-an385` under QEMU, and its `Makefile` builds it.
 Its HardFault handler returns from the exception into a function that reports
 the fault from the task. The run is recorded in
-[validation](../validation/2026-11-18-freertos-agent.md). An agent that
+[validation](../validation/2026-11-18-freertos-agent.md).
+
+`c_runtime/zephyr/` is the agent as a Zephyr module: set `CONFIG_BHF_AGENT=y`,
+name the UART with the devicetree's chosen `bhf,agent-uart`, and call
+`bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`. Zephyr ends a thread that
+faults, so the module's `k_sys_fatal_error_handler` records the fault, and the
+calling thread sends the reply and starts a new agent thread. Its
+`qemu_cortex_m3` sample is in `c_runtime/zephyr/samples/agent`, and its
+README has the commands; the run is recorded in
+[validation](../validation/2026-11-18-zephyr-agent.md). An agent that
 implements the protocol itself uses this frame format. Every integer is little-endian, one
 round trip per input:
 
