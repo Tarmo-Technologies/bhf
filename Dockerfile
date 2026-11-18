@@ -113,6 +113,60 @@ RUN source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" 
       && test -f /out/opt/msan-libcxx/lib/libc++.so.1 || exit; \
     fi
 
+# AFL++'s QEMU and Frida modes for uninstrumented binaries, which Ubuntu's
+# afl++ package does not ship. They are built from the AFL++ release that
+# package carries (4.09c), so afl-fuzz and the two trace programs share one
+# forkserver protocol. qemuafl is fetched at the commit that release pins
+# (its build script's shallow clone cannot check that commit out), and
+# Frida's GumJS devkit is checked against its release digest. Without the
+# default engines the stage is empty.
+FROM ubuntu-pinned AS afl-binary-modes
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BHF_ENGINES=default
+ARG AFLPP_VERSION=4.09c
+ARG AFLPP_SOURCE_SHA256=2d3b2e4f066b1f3eda17faff147dfa3e4b16fba044257361aca51a2322c5122d
+ARG QEMUAFL_COMMIT=a1321713c7502c152dd7527555e0f8a800d55225
+ARG FRIDA_GUM_VERSION=16.0.11
+ARG FRIDA_COPYING_SHA256=5ea1544b51a28bc823b03159190d4108f9fb4f4ef912389f5137c6d295e175b2
+ARG CARGO_BUILD_JOBS=2
+RUN mkdir -p /out; \
+    if [[ "$BHF_ENGINES" == default ]]; then \
+      source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+      apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils git make gcc g++ python3 python3-venv python3-setuptools \
+        ninja-build pkg-config libglib2.0-dev libpixman-1-dev bison flex \
+      && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo /tmp/aflpp.tar.gz \
+        "https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v${AFLPP_VERSION}.tar.gz" \
+      && echo "${AFLPP_SOURCE_SHA256}  /tmp/aflpp.tar.gz" | sha256sum -c - \
+      && mkdir /tmp/aflpp && tar -C /tmp/aflpp --strip-components=1 -xzf /tmp/aflpp.tar.gz \
+      && [[ "$(cat /tmp/aflpp/qemu_mode/QEMUAFL_VERSION)" == "${QEMUAFL_COMMIT:0:10}" ]] \
+      && make -C /tmp/aflpp -j"$CARGO_BUILD_JOBS" afl-showmap \
+      && git init -q /tmp/aflpp/qemu_mode/qemuafl \
+      && git -C /tmp/aflpp/qemu_mode/qemuafl fetch -q --depth 1 https://github.com/AFLplusplus/qemuafl "$QEMUAFL_COMMIT" \
+      && git -C /tmp/aflpp/qemu_mode/qemuafl checkout -q FETCH_HEAD \
+      && [[ "$(git -C /tmp/aflpp/qemu_mode/qemuafl rev-parse HEAD)" == "$QEMUAFL_COMMIT" ]] \
+      && (cd /tmp/aflpp/qemu_mode && NO_CHECKOUT=1 JOBS="$CARGO_BUILD_JOBS" ./build_qemu_support.sh) \
+      && mkdir -p /tmp/aflpp/frida_mode/build/frida \
+      && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo \
+        "/tmp/aflpp/frida_mode/build/frida/frida-gumjs-devkit-${FRIDA_GUM_VERSION}-linux-${BHF_FRIDA_ARCH}.tar.xz" \
+        "https://github.com/frida/frida/releases/download/${FRIDA_GUM_VERSION}/frida-gumjs-devkit-${FRIDA_GUM_VERSION}-linux-${BHF_FRIDA_ARCH}.tar.xz" \
+      && echo "${BHF_FRIDA_GUM_SHA256}  /tmp/aflpp/frida_mode/build/frida/frida-gumjs-devkit-${FRIDA_GUM_VERSION}-linux-${BHF_FRIDA_ARCH}.tar.xz" | sha256sum -c - \
+      && make -C /tmp/aflpp/frida_mode -j"$CARGO_BUILD_JOBS" \
+      && mkdir -p /out/usr/bin /out/usr/lib/afl /out/usr/share/bhf/licenses/afl \
+      && install -m 0755 /tmp/aflpp/afl-qemu-trace /out/usr/bin/afl-qemu-trace \
+      && install -m 0755 /tmp/aflpp/afl-frida-trace.so /out/usr/lib/afl/afl-frida-trace.so \
+      && strip --strip-unneeded /out/usr/bin/afl-qemu-trace /out/usr/lib/afl/afl-frida-trace.so \
+      && cp /tmp/aflpp/LICENSE /out/usr/share/bhf/licenses/afl/AFLplusplus-LICENSE \
+      && cp /tmp/aflpp/qemu_mode/qemuafl/COPYING /out/usr/share/bhf/licenses/afl/qemuafl-COPYING \
+      && curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 5 -fsSLo \
+        /out/usr/share/bhf/licenses/afl/frida-COPYING "https://raw.githubusercontent.com/frida/frida/${FRIDA_GUM_VERSION}/COPYING" \
+      && echo "${FRIDA_COPYING_SHA256}  /out/usr/share/bhf/licenses/afl/frida-COPYING" | sha256sum -c - \
+      && printf '%s\n' "AFLplusplus https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v${AFLPP_VERSION}.tar.gz sha256:${AFLPP_SOURCE_SHA256}" \
+        "qemuafl https://github.com/AFLplusplus/qemuafl git:${QEMUAFL_COMMIT}" \
+        > /out/usr/share/bhf/licenses/afl/UPSTREAM-SOURCES.txt \
+      || exit; \
+    fi
+
 ########################################  builder  ########################################
 FROM ubuntu-pinned AS builder
 ARG TARGETPLATFORM
@@ -180,7 +234,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
     case "$BHF_ENGINES" in default|builtin) ;; *) echo 'invalid BHF_ENGINES' >&2; exit 2 ;; esac; \
     mapfile -t packages < <(bhf_language_packages container "$languages"); \
-    if [[ "$BHF_ENGINES" == default ]]; then packages+=(afl++); fi; \
+    if [[ "$BHF_ENGINES" == default ]]; then packages+=(afl++ libglib2.0-0t64); fi; \
     apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils file git tini locales python3 "${packages[@]}" \
     && rm -rf /var/lib/apt/lists/* && locale-gen C.UTF-8 \
@@ -222,6 +276,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
 
 COPY --from=javascript-tools /out/ /
 COPY --from=msan-libcxx /out/ /
+COPY --from=afl-binary-modes /out/ /
 
 # Maven's upstream distribution retains its bundled licenses and has newer
 # dependencies than the archived Ubuntu Maven package.

@@ -2853,6 +2853,17 @@
   when bhf panics.
 
 ### Added
+- The container image ships AFL++'s QEMU and Frida modes (#321):
+  `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
+  the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl
+  commit that release pins and a digest-checked Frida GumJS devkit, so
+  `bhf binary fuzz` fuzzes a binary without source with coverage there
+  instead of falling back to the blind builtin loop. The container
+  acceptance runs both modes on an uninstrumented binary, and the image
+  inventory lists them. `bhf binary fuzz --engine afl-qemu` now merges
+  `symbolize=0` into the `ASAN_OPTIONS`, `UBSAN_OPTIONS` and `LSAN_OPTIONS`
+  it passes `afl-fuzz`, which refuses a custom setting without it, as the
+  image's defaults are.
 - Linux aarch64 release binaries (#343): a release publishes
   `aarch64-unknown-linux-gnu` archives of the CLI, the daemon and both preload
   shims, and the shell installers install them on a 64-bit ARM host. They are

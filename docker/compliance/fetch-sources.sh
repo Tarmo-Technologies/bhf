@@ -50,6 +50,48 @@ while IFS= read -r spec; do
     fi
 done < "$MANIFEST"
 
+# Components built from upstream source rather than installed from a package
+# (AFL++'s QEMU mode, from qemuafl): "<name> <url> sha256:<digest>" names an
+# archive and its digest, "<name> <url> git:<commit>" a commit of a repository.
+UPSTREAM="${UPSTREAM_SOURCES:-$(dirname "$MANIFEST")/afl/UPSTREAM-SOURCES.txt}"
+if [ -f "$UPSTREAM" ]; then
+    cp "$UPSTREAM" REQUESTED-UPSTREAM-SOURCES.txt
+    while read -r name url pin; do
+        case "$name" in ''|'#'*) continue;; esac
+        n=$((n + 1))
+        echo "== upstream source: $name $pin =="
+        case "$pin" in
+            sha256:*)
+                file="$name-$(basename "$url")"
+                if ! curl --proto '=https' -fsSL --retry 5 -o "$file" "$url" \
+                    || ! echo "${pin#sha256:}  $file" | sha256sum -c - >/dev/null; then
+                    echo "   ERROR: exact source unavailable: $name $url" >&2
+                    rm -f "$file"
+                    fail=$((fail + 1))
+                fi
+                ;;
+            git:*)
+                commit="${pin#git:}"
+                repo=$(mktemp -d)
+                # With its submodules, which the build compiled in too.
+                if git -C "$repo" init -q \
+                    && git -C "$repo" fetch -q --depth 1 "$url" "$commit" \
+                    && git -C "$repo" checkout -q FETCH_HEAD \
+                    && [ "$(git -C "$repo" rev-parse HEAD)" = "$commit" ] \
+                    && git -C "$repo" submodule -q update --init --depth 1; then
+                    tar -C "$repo" --exclude=.git --transform "s|^\\.|$name-$commit|" \
+                        -czf "$PWD/$name-$commit.tar.gz" .
+                else
+                    echo "   ERROR: exact source unavailable: $name $url $commit" >&2
+                    fail=$((fail + 1))
+                fi
+                rm -rf "$repo"
+                ;;
+            *) echo "   ERROR: unknown pin $pin for $name" >&2; fail=$((fail + 1)) ;;
+        esac
+    done < "$UPSTREAM"
+fi
+
 echo
 echo "fetched corresponding source for $((n - fail))/$n package(s) into $DEST"
 if [ "$fail" -gt 0 ]; then

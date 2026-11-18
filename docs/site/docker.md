@@ -63,6 +63,20 @@ build recovery. The validation helpers use the explicit `validation` target.
 With C++ selected, the image also carries libc++ and libc++abi built with
 MemorySanitizer in `/opt/msan-libcxx` (`BHF_MSAN_LIBCXX`), which the C++ MSan
 replay builds against: see [Sanitizers](../sanitizers/#c-under-the-msan-replay).
+They add about 14 MB.
+
+With the default engines, the image carries AFL++'s QEMU and Frida modes for
+binaries without source, which Ubuntu's `afl++` package leaves out:
+`/usr/bin/afl-qemu-trace` (what `bhf binary fuzz --engine afl-qemu` and
+`afl-fuzz -Q` run) and `/usr/lib/afl/afl-frida-trace.so` (`afl-fuzz -O`,
+`bhf fuzz --afl-mode frida`). They are built from the AFL++ release the
+package carries (4.09c), with the qemuafl commit that release pins and a
+digest-checked Frida GumJS devkit, so `afl-fuzz` and both trace programs share
+one forkserver protocol. They and the GLib runtime the QEMU mode loads add
+about 17 MB. The container acceptance runs each mode on an uninstrumented
+binary and checks that it reports coverage. qemuafl is GPL-2.0:
+`fetch-sources.sh` also downloads the sources listed in
+`/usr/share/bhf/licenses/afl/UPSTREAM-SOURCES.txt`.
 
 | Profile | Included build tools | Executed acceptance |
 |---|---|---|

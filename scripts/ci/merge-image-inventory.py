@@ -81,11 +81,12 @@ def main():
         resolver = pathlib.Path(__file__).resolve().parents[1] / "language-selection.sh"
         languages = subprocess.check_output(["bash", "-c", 'source "$1"; bhf_resolve_languages "$2"',
                                              "resolve", str(resolver), label], text=True).strip().split(",")
-    result = reconcile_tools(result, tools, flavor, languages)
+    engines = read("image-inspect.json")[0]["Config"]["Labels"].get("io.tarmo.bhf.engines")
+    result = reconcile_tools(result, tools, flavor, languages, engines)
     (args.evidence / "image.cyclonedx.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
-def reconcile_tools(sbom, tools, flavor, languages=None):
+def reconcile_tools(sbom, tools, flavor, languages=None, engines=None):
     expected = {"node", "esbuild", "go", "dotnet-sdk", "msan-libcxx", "rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"} if flavor == "runtime" else set()
     if languages is not None:
         if tools.get("languages") != languages or not languages:
@@ -97,6 +98,9 @@ def reconcile_tools(sbom, tools, flavor, languages=None):
         if "csharp" in languages: expected.add("dotnet-sdk")
         if "cpp" in languages: expected.add("msan-libcxx")
         if "rust" in languages: expected.update({"rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"})
+    # The default engines carry AFL++'s QEMU and Frida modes, built from source.
+    if flavor == "runtime" and (engines or "default") == "default":
+        expected.update({"aflpp-qemu-mode", "aflpp-frida-mode"})
     components = tools["components"]
     if tools["flavor"] != flavor or {c["name"] for c in components} != expected:
         raise ValueError("missing or mismatched standalone toolchain inventory")

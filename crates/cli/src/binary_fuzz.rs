@@ -1184,6 +1184,18 @@ fn run_afl_qemu(
     for (key, value) in env {
         cmd.env(key, value);
     }
+    // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
+    // ("Custom ASAN_OPTIONS set without symbolize=0", afl-fuzz-init.c), as
+    // the container image's defaults are: merge it into whatever is set.
+    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
+        let set = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+        if set.is_some() {
+            cmd.env(
+                key,
+                multicore_fuzz::merge_sanitizer_options(set.as_deref(), "symbolize=0"),
+            );
+        }
+    }
     let output = cmd
         .output()
         .with_context(|| format!("spawn afl-fuzz '{}'", aq.afl_fuzz.display()))?;
@@ -1191,7 +1203,13 @@ fn run_afl_qemu(
     // intended end of a time-boxed run, not a failure. A positive exit is a real
     // error (bad seed, core_pattern, missing afl-qemu-trace, …).
     if output.status.code().is_some_and(|code| code != 0) {
-        let tail: String = String::from_utf8_lossy(&output.stderr)
+        // afl-fuzz prints its own abort message on stdout.
+        let said = if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let tail: String = String::from_utf8_lossy(said)
             .lines()
             .rev()
             .take(12)
