@@ -1851,6 +1851,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/extension_stage.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/honggfuzz.rs",
       "license": "Apache-2.0"
     },
@@ -2531,6 +2535,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_fortran_lane.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_frankenstein.rs",
       "license": "Apache-2.0"
     },
@@ -2883,6 +2891,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/binary_fuzz_afl_modes.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/binary_fuzz_cli.rs",
       "license": "Apache-2.0"
     },
@@ -3084,6 +3096,10 @@
     },
     {
       "path": "crates/cli/tests/fuzz_crash_throughput.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_extension_stages.rs",
       "license": "Apache-2.0"
     },
     {
