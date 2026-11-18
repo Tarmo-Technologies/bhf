@@ -2853,6 +2853,11 @@
   when bhf panics.
 
 ### Added
+- The C# lane runs on native Windows (#306): its `main` and `main_symbols`
+  launchers have launch specs (`dotnet` on the harness assembly), and the
+  driver maps the coverage file and runs the framed protocol through .NET's
+  file mapping and console streams where there is no libc to call
+  (`BHF_CS_PORTABLE_IO=1` takes that path on any host).
 - The Python lane runs on native Windows (#305). Beside its POSIX `main`
   launcher it writes `main.launch.json` (the interpreter, the driver and the
   environment), which the harness runner execs directly where the launcher

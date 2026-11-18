@@ -1092,10 +1092,6 @@ fn fortran_finding_round_trips_from_source() {
 /// SharpFuzz.Common.dll and the launcher) from the SharpFuzz command-line
 /// tool's own copy of the assembly.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_harness_round_trips() {
     skip_unless!(
         runs("dotnet", &["--version"]),
@@ -1135,10 +1131,6 @@ fn csharp_harness_round_trips() {
 /// Preloaded, the shim hung the CLR, which ignored SIGTERM, so every C#
 /// finding replayed as a timeout MISMATCH after ten seconds.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_finding_replays_as_a_match_without_the_shim() {
     skip_unless!(
         runs("dotnet", &["--version"]),
@@ -1215,10 +1207,6 @@ fn csharp_finding_replays_as_a_match_without_the_shim() {
 /// packed by the test into a local feed dir, which fills a package cache of
 /// the test's own without the network.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_finding_with_a_cached_package_round_trips_vendored() {
     skip_unless!(
         runs("dotnet", &["--version"]),

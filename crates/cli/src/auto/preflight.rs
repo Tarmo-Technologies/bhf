@@ -223,22 +223,19 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
 /// [`native_windows_refusal`] applies it on Windows.
 pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
     match lang {
-        Lang::Java
-        | Lang::Perl
-        | Lang::CSharp
-        | Lang::Js
-        | Lang::Ts
-        | Lang::Ruby
-        | Lang::Lua
-        | Lang::Php => Some("its harness launcher is a POSIX shell script"),
+        Lang::Java | Lang::Perl | Lang::Js | Lang::Ts | Lang::Ruby | Lang::Lua | Lang::Php => {
+            Some("its harness launcher is a POSIX shell script")
+        }
         Lang::Rust => Some("its harness is a Unix static archive linked with libpthread and libdl"),
         Lang::Fortran => Some(
             "its crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC ships no \
              sanitizer runtime",
         ),
-        // Python runs from its launch spec where its shell launcher cannot
-        // (#305).
-        Lang::Ada | Lang::C | Lang::Cpp | Lang::Go | Lang::Cobol | Lang::Python => None,
+        // Python and C# run from their launch specs where their shell
+        // launchers cannot (#305, #306).
+        Lang::Ada | Lang::C | Lang::Cpp | Lang::Go | Lang::Cobol | Lang::Python | Lang::CSharp => {
+            None
+        }
     }
 }
 
@@ -523,7 +520,6 @@ mod tests {
         let wsl = [
             Lang::Java,
             Lang::Perl,
-            Lang::CSharp,
             Lang::Js,
             Lang::Ts,
             Lang::Ruby,

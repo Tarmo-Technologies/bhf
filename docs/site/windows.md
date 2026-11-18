@@ -747,7 +747,12 @@ cmplog, and ASan all work natively on Windows.
   `main.launch.json` beside it: the interpreter, the driver and the environment
   the launcher sets, which the engine, `bhf replay` and `bhf minimize` run on
   Windows in its place.
-- Java, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently emit
+- The C# lane runs on native Windows with the .NET 8 SDK and SharpFuzz (the
+  `sharpfuzz` tool and its NuGet package, as on Linux). Its `main` and
+  `main_symbols` launchers have launch specs (`dotnet` on the harness
+  assembly), and its driver maps the coverage file and speaks the framed
+  protocol through .NET's own file mapping and console streams there.
+- Java, Perl, JavaScript/TypeScript, Ruby, Lua, and PHP currently emit
   POSIX `main` launchers even though discovery is portable. Run those lanes
   under WSL/Linux for now; installing only the interpreter/JDK on native Windows
   is not sufficient.
