@@ -2853,6 +2853,16 @@
   when bhf panics.
 
 ### Added
+- `bhf differential --metamorphic-transform` has a transform registry (#330):
+  `append-newline`, `trailing-whitespace` (a space and a tab at the end of
+  every line), `reorder-json-keys` (every JSON object's members in reverse
+  order, every other byte kept) and `utf8-bom` (a byte order mark before the
+  input). Each declares the relation its variant must keep: the same stdout
+  and exit status, or for `utf8-bom` the same exit status only, so a parser
+  that echoes the mark is not flagged and one that rejects it is. The flag
+  takes several transforms, comma-separated or repeated, each applied to
+  every input; a finding's `metamorphic` block names the `relation` it
+  broke. Only `append-newline` existed before.
 - `bhf minimize --strategy grammar --grammar <PATH>` minimizes a grammar
   finding on its derivation tree (#369), so the minimized input is a smaller
   sentence of the grammar that still reproduces; byte-wise minimization broke

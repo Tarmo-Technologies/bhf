@@ -607,11 +607,18 @@ bhf_work`; the old `--out DIR` spelling is a deprecated alias for it) and
 `results/` is rebuilt. Differential
 findings carry `oracle.name = "differential-output-runtime"` evidence from the
 same executable-oracle registry used by runtime runtrace findings.
-`bhf differential --harness <H> --metamorphic-transform append-newline
---inputs <DIR>` replays each input through one harness before and after
-appending a trailing newline; mismatched stdout, exit status, or timeout
-behavior emits BHF-307 `metamorphic-relation-runtime` findings with both the
-original and transformed testcase bytes.
+`bhf differential --harness <H> --metamorphic-transform <NAME>[,<NAME>...]
+--inputs <DIR>` replays each input through one harness and again as the
+variant each transform makes of it, and a variant that breaks its transform's
+relation emits a BHF-307 `metamorphic-relation-runtime` finding with both the
+original and transformed testcase bytes and the `transform` and `relation` it
+broke. `append-newline` (a `\n` after the input), `trailing-whitespace` (a
+space and a tab at the end of every line) and `reorder-json-keys` (every JSON
+object's members in reverse order, every other byte kept) must keep stdout and
+the exit status; `utf8-bom` (a byte order mark before the input) must keep the
+exit status. Several transforms, comma-separated or the flag repeated, are each
+applied to every input; a transform that does not apply to an input (no JSON
+object to reorder, a BOM already there) leaves it out.
 
 Runtrace `runtime_check` events from Ada instrumentation can promote handled
 `Constraint_Error` range/index checks into BHF-102

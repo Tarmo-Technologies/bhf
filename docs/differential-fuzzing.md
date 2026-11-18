@@ -21,8 +21,9 @@ Run it over a directory of inputs:
 bhf differential --harness-a ./harness_a --harness-b ./harness_b \
   --inputs ./corpus --work-dir ./bhf_work
 
-# one harness, metamorphic transform
-bhf differential --harness ./harness --metamorphic-transform append-newline \
+# one harness, metamorphic transforms
+bhf differential --harness ./harness \
+  --metamorphic-transform append-newline,reorder-json-keys,utf8-bom \
   --inputs ./corpus --work-dir ./bhf_work
 ```
 
@@ -31,8 +32,25 @@ and emits findings on divergence:
 
 - `BHF-301` (differential output divergence) when two harnesses disagree on the
   same input;
-- `BHF-307` (metamorphic relation violation) when one harness disagrees with
-  itself across a metamorphic transform (currently `append-newline`).
+- `BHF-307` (metamorphic relation violation) when one harness breaks the
+  relation a metamorphic transform declares between an input and its variant.
+
+Each transform declares the relation its variant must keep:
+
+| Transform | Variant | Relation |
+| --- | --- | --- |
+| `append-newline` | a `\n` after the input | same output: stdout bytes and exit status |
+| `trailing-whitespace` | a space and a tab at the end of every line, before its `\r\n` or `\n` | same output |
+| `reorder-json-keys` | every JSON object's members in reverse order, every other byte (whitespace, separators, values' spelling) kept | same output |
+| `utf8-bom` | a UTF-8 byte order mark (`EF BB BF`) before the input | same exit status; stdout may differ, as a parser that echoes its input echoes the mark |
+
+`--metamorphic-transform` takes several, comma-separated or the flag repeated;
+each is applied to every input, the input itself runs once, and each variant
+is checked against its own relation. A finding's `metamorphic` block names its
+`transform` and `relation`, and the variant is `testcase_transformed.bin`.
+A transform that does not apply to an input (no JSON text or no object with two
+members for `reorder-json-keys`, a byte order mark already there for
+`utf8-bom`) leaves it out, and the summary line counts the variants left out.
 
 Each divergence is written to `<work-dir>/results/findings/F-DIFF-NNNN/` as a
 JSON finding with stdout/exit-code previews and oracle metadata, and

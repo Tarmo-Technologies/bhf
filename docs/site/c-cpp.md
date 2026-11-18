@@ -1055,9 +1055,12 @@ directory through two harness binaries and emits BHF-301 output-divergence
 findings stamped with the `differential-output-runtime` oracle when stdout,
 exit status, or timeout behavior differs.
 The same command supports single-harness metamorphic checks with `--harness`
-and `--metamorphic-transform append-newline`; BHF compares original versus
-transformed execution and emits BHF-307 `metamorphic-relation-runtime` findings
-when the relation is violated.
+and `--metamorphic-transform`, one or several of `append-newline`,
+`trailing-whitespace`, `reorder-json-keys` and `utf8-bom`; BHF compares
+original versus transformed execution and emits BHF-307
+`metamorphic-relation-runtime` findings when the relation the transform
+declares is violated: the same output for the first three, the same exit
+status for `utf8-bom` (the table is in `docs/differential-fuzzing.md`).
 
 Ada-only findings such as swallowed exception breadcrumbs, Ada handler paths,
 and generated `repro.adb` files do not apply to C/C++ targets: a report writes

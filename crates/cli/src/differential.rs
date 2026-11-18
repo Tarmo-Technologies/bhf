@@ -3,6 +3,13 @@
 //! `bhf differential` subcommand: replay each input through
 //! two harnesses, compare stdout + exit code, emit BHF-301 findings
 //! on divergence. No mutation or coverage feedback — pure replay.
+//!
+//! Metamorphic mode replays each input and its variants under the
+//! transforms of [`TRANSFORMS`] through one harness. Each transform
+//! declares the [`Relation`] its variant must keep with the input (the same
+//! output, or the same exit status), as metamorphic testing pairs a
+//! follow-up input with an expected relation; a broken relation is a BHF-307
+//! finding.
 
 use finding_rules::oracle_registry::ORACLE_REGISTRY;
 use finding_rules::oracle_sdk::{OracleHit, OracleRuntimeEvent};
@@ -28,9 +35,22 @@ pub struct DifferentialArgs {
     #[arg(long = "harness", value_name = "PATH")]
     pub harness: Option<PathBuf>,
 
-    /// Metamorphic transform to apply to each input before replaying the same harness.
-    #[arg(long = "metamorphic-transform", value_enum, value_name = "NAME")]
-    pub metamorphic_transform: Option<MetamorphicTransform>,
+    /// Metamorphic transform to apply to each input before replaying the same
+    /// harness; several, comma-separated or the flag repeated, are each applied
+    /// to every input. `append-newline` (a `\n` after the input) and
+    /// `trailing-whitespace` (a space and a tab at the end of every line) must
+    /// keep the output; `reorder-json-keys` (every JSON object's members in
+    /// reverse order, every other byte kept) must keep the output;
+    /// `utf8-bom` (a UTF-8 byte order mark before the input) must keep the
+    /// exit status. An input a transform does not apply to (no JSON text,
+    /// one with a BOM already) is left out for it.
+    #[arg(
+        long = "metamorphic-transform",
+        value_enum,
+        value_name = "NAME",
+        value_delimiter = ','
+    )]
+    pub metamorphic_transforms: Vec<MetamorphicTransform>,
 
     /// Directory of input files to replay through both harnesses.
     #[arg(long, value_name = "DIR")]
@@ -72,23 +92,342 @@ impl DifferentialArgs {
 pub enum MetamorphicTransform {
     #[value(name = "append-newline")]
     AppendNewline,
+    #[value(name = "trailing-whitespace")]
+    TrailingWhitespace,
+    #[value(name = "reorder-json-keys")]
+    ReorderJsonKeys,
+    #[value(name = "utf8-bom")]
+    Utf8Bom,
 }
 
-impl MetamorphicTransform {
+/// What must hold between the run of an input and the run of its
+/// transformed variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relation {
+    /// The same stdout bytes and the same exit status: the transform must not
+    /// change what the harness computes.
+    SameOutput,
+    /// The same exit status (and neither or both timed out); stdout may
+    /// differ: the harness must accept or reject the variant as it does the
+    /// input, though it may echo the change.
+    SameExit,
+}
+
+impl Relation {
     fn as_str(self) -> &'static str {
         match self {
-            MetamorphicTransform::AppendNewline => "append-newline",
+            Relation::SameOutput => "same-output",
+            Relation::SameExit => "same-exit",
         }
     }
 
-    fn apply(self, input: &[u8]) -> Vec<u8> {
+    /// Whether the runs that diverged as `div` break the relation.
+    fn broken_by(self, div: &Divergence) -> bool {
         match self {
+            Relation::SameOutput => !div.stdout_equal || !div.exit_equal,
+            Relation::SameExit => !div.exit_equal,
+        }
+    }
+}
+
+/// One registered metamorphic transform: its name, what it does to an input,
+/// and the relation its variant must keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransformSpec {
+    pub(crate) transform: MetamorphicTransform,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) relation: Relation,
+}
+
+/// The transform registry.
+pub(crate) const TRANSFORMS: [TransformSpec; 4] = [
+    TransformSpec {
+        transform: MetamorphicTransform::AppendNewline,
+        name: "append-newline",
+        description: "a `\\n` after the input",
+        relation: Relation::SameOutput,
+    },
+    TransformSpec {
+        transform: MetamorphicTransform::TrailingWhitespace,
+        name: "trailing-whitespace",
+        description: "a space and a tab at the end of every line",
+        relation: Relation::SameOutput,
+    },
+    TransformSpec {
+        transform: MetamorphicTransform::ReorderJsonKeys,
+        name: "reorder-json-keys",
+        description: "every JSON object's members in reverse order, every other byte kept",
+        relation: Relation::SameOutput,
+    },
+    TransformSpec {
+        transform: MetamorphicTransform::Utf8Bom,
+        name: "utf8-bom",
+        description: "a UTF-8 byte order mark (EF BB BF) before the input",
+        relation: Relation::SameExit,
+    },
+];
+
+impl MetamorphicTransform {
+    fn spec(self) -> &'static TransformSpec {
+        TRANSFORMS
+            .iter()
+            .find(|spec| spec.transform == self)
+            .expect("every transform is registered")
+    }
+
+    fn as_str(self) -> &'static str {
+        self.spec().name
+    }
+
+    fn relation(self) -> Relation {
+        self.spec().relation
+    }
+
+    /// `input`'s variant under the transform; `None` when the transform does
+    /// not apply to it or leaves it as it is (no JSON object with two
+    /// members, a BOM already there), so there is no relation to check.
+    fn apply(self, input: &[u8]) -> Option<Vec<u8>> {
+        let transformed = match self {
             MetamorphicTransform::AppendNewline => {
                 let mut transformed = input.to_vec();
                 transformed.push(b'\n');
                 transformed
             }
+            MetamorphicTransform::TrailingWhitespace => trailing_whitespace(input),
+            MetamorphicTransform::ReorderJsonKeys => reverse_json_members(input)?,
+            MetamorphicTransform::Utf8Bom => {
+                if input.starts_with(UTF8_BOM) {
+                    return None;
+                }
+                [UTF8_BOM, input].concat()
+            }
+        };
+        (transformed != input).then_some(transformed)
+    }
+}
+
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// `input` with a space and a tab at the end of every line, before its
+/// `\r\n` or `\n`, the last one too when it has no line end.
+fn trailing_whitespace(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 8 + 2);
+    let mut line_start = 0;
+    for (at, &byte) in input.iter().enumerate() {
+        if byte == b'\n' {
+            let end = if at > line_start && input[at - 1] == b'\r' {
+                at - 1
+            } else {
+                at
+            };
+            out.extend_from_slice(&input[line_start..end]);
+            out.extend_from_slice(b" \t");
+            out.extend_from_slice(&input[end..=at]);
+            line_start = at + 1;
         }
+    }
+    if line_start < input.len() {
+        out.extend_from_slice(&input[line_start..]);
+        out.extend_from_slice(b" \t");
+    }
+    out
+}
+
+/// The deepest JSON nesting [`reverse_json_members`] reads.
+const MAX_JSON_DEPTH: usize = 512;
+
+/// `input` with the members of every JSON object in reverse order and every
+/// other byte (whitespace, separators, numbers' and strings' own spelling)
+/// where it was: an order-independent consumer gives the same output for
+/// both. `None` when `input` is no JSON text (RFC 8259).
+fn reverse_json_members(input: &[u8]) -> Option<Vec<u8>> {
+    let mut scan = JsonScan { s: input, at: 0 };
+    let lead = scan.whitespace();
+    let value = scan.value(0)?;
+    let trail = scan.whitespace();
+    (scan.at == input.len()).then(|| [lead, &value[..], trail].concat())
+}
+
+struct JsonScan<'a> {
+    s: &'a [u8],
+    at: usize,
+}
+
+impl<'a> JsonScan<'a> {
+    fn whitespace(&mut self) -> &'a [u8] {
+        let start = self.at;
+        while matches!(self.s.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+        &self.s[start..self.at]
+    }
+
+    fn eat(&mut self, byte: u8) -> Option<()> {
+        (self.s.get(self.at) == Some(&byte)).then(|| self.at += 1)
+    }
+
+    /// One value, with the members of its objects reversed.
+    fn value(&mut self, depth: usize) -> Option<Vec<u8>> {
+        if depth > MAX_JSON_DEPTH {
+            return None;
+        }
+        match *self.s.get(self.at)? {
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
+            b'"' => self.string().map(<[u8]>::to_vec),
+            b't' => self.literal(b"true"),
+            b'f' => self.literal(b"false"),
+            b'n' => self.literal(b"null"),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+
+    fn literal(&mut self, word: &[u8]) -> Option<Vec<u8>> {
+        let end = self.at + word.len();
+        (self.s.get(self.at..end) == Some(word)).then(|| {
+            self.at = end;
+            word.to_vec()
+        })
+    }
+
+    fn number(&mut self) -> Option<Vec<u8>> {
+        let start = self.at;
+        let digits = |scan: &mut Self| {
+            let from = scan.at;
+            while scan.s.get(scan.at).is_some_and(u8::is_ascii_digit) {
+                scan.at += 1;
+            }
+            scan.at > from
+        };
+        let _ = self.eat(b'-');
+        if self.eat(b'0').is_none() && !digits(self) {
+            return None;
+        }
+        if self.eat(b'.').is_some() && !digits(self) {
+            return None;
+        }
+        if matches!(self.s.get(self.at), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.s.get(self.at), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            if !digits(self) {
+                return None;
+            }
+        }
+        Some(self.s[start..self.at].to_vec())
+    }
+
+    /// A string, as it is spelled.
+    fn string(&mut self) -> Option<&'a [u8]> {
+        let start = self.at;
+        self.eat(b'"')?;
+        loop {
+            match *self.s.get(self.at)? {
+                b'"' => {
+                    self.at += 1;
+                    return Some(&self.s[start..self.at]);
+                }
+                b'\\' => {
+                    let escape = *self.s.get(self.at + 1)?;
+                    match escape {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 2,
+                        b'u' => {
+                            let hex = self.s.get(self.at + 2..self.at + 6)?;
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return None;
+                            }
+                            self.at += 6;
+                        }
+                        _ => return None,
+                    }
+                }
+                0x00..=0x1F => return None,
+                _ => self.at += 1,
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Option<Vec<u8>> {
+        let start = self.at;
+        self.eat(b'[')?;
+        let mut out = vec![b'['];
+        out.extend_from_slice(self.whitespace());
+        if self.eat(b']').is_some() {
+            out.push(b']');
+            return Some(out);
+        }
+        loop {
+            out.extend_from_slice(&self.value(depth + 1)?);
+            out.extend_from_slice(self.whitespace());
+            match *self.s.get(self.at)? {
+                b',' => {
+                    self.at += 1;
+                    out.push(b',');
+                    out.extend_from_slice(self.whitespace());
+                }
+                b']' => {
+                    self.at += 1;
+                    out.push(b']');
+                    debug_assert_eq!(out.len(), self.at - start);
+                    return Some(out);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// An object: `{` and the whitespace after it, the members (each its
+    /// key, `:`, its value and the whitespace between), the separators
+    /// between them as they were, and the whitespace before `}`; the members
+    /// are written back in reverse order between the same separators.
+    fn object(&mut self, depth: usize) -> Option<Vec<u8>> {
+        self.eat(b'{')?;
+        let mut out = vec![b'{'];
+        out.extend_from_slice(self.whitespace());
+        if self.eat(b'}').is_some() {
+            out.push(b'}');
+            return Some(out);
+        }
+        let mut members: Vec<Vec<u8>> = Vec::new();
+        let mut separators: Vec<Vec<u8>> = Vec::new();
+        let closing;
+        loop {
+            let mut member = self.string()?.to_vec();
+            member.extend_from_slice(self.whitespace());
+            self.eat(b':')?;
+            member.push(b':');
+            member.extend_from_slice(self.whitespace());
+            member.extend_from_slice(&self.value(depth + 1)?);
+            members.push(member);
+            let gap = self.whitespace().to_vec();
+            match *self.s.get(self.at)? {
+                b',' => {
+                    self.at += 1;
+                    let mut separator = gap;
+                    separator.push(b',');
+                    separator.extend_from_slice(self.whitespace());
+                    separators.push(separator);
+                }
+                b'}' => {
+                    self.at += 1;
+                    closing = gap;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        for (index, member) in members.iter().rev().enumerate() {
+            if index > 0 {
+                out.extend_from_slice(&separators[index - 1]);
+            }
+            out.extend_from_slice(member);
+        }
+        out.extend_from_slice(&closing);
+        out.push(b'}');
+        Some(out)
     }
 }
 
@@ -100,14 +439,14 @@ enum RunMode {
     },
     Metamorphic {
         harness: PathBuf,
-        transform: MetamorphicTransform,
+        transforms: Vec<MetamorphicTransform>,
     },
 }
 
 impl RunMode {
     fn from_args(args: &DifferentialArgs) -> Result<Self, std::io::Error> {
-        match args.metamorphic_transform {
-            Some(transform) => {
+        match args.metamorphic_transforms.first() {
+            Some(_) => {
                 if args.harness_a.is_some() || args.harness_b.is_some() {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
@@ -120,7 +459,17 @@ impl RunMode {
                         "--metamorphic-transform requires --harness",
                     )
                 })?;
-                Ok(RunMode::Metamorphic { harness, transform })
+                // Each transform once, in the order given.
+                let mut transforms: Vec<MetamorphicTransform> = Vec::new();
+                for transform in &args.metamorphic_transforms {
+                    if !transforms.contains(transform) {
+                        transforms.push(*transform);
+                    }
+                }
+                Ok(RunMode::Metamorphic {
+                    harness,
+                    transforms,
+                })
             }
             None => {
                 if args.harness.is_some() {
@@ -201,6 +550,7 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
 
     let timeout = Duration::from_secs(args.timeout_secs);
     let mut divergences = 0usize;
+    let mut not_applicable = 0usize;
 
     for (input_index, input_path) in inputs.iter().enumerate() {
         let input_bytes = fs::read(input_path)?;
@@ -223,29 +573,53 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
                     )?;
                 }
             }
-            RunMode::Metamorphic { harness, transform } => {
-                let transformed_bytes = transform.apply(&input_bytes);
-                let transformed_path = transformed_root.join(format!("{input_index:04}.bin"));
-                fs::write(&transformed_path, &transformed_bytes)?;
-                let original = run_harness(harness, input_path, timeout);
-                let transformed = run_harness(harness, &transformed_path, timeout);
-                if let Some(div) = compare_outputs(&original, &transformed) {
-                    divergences += 1;
-                    write_metamorphic_finding(
-                        &mut ids,
-                        &input_bytes,
-                        input_path,
-                        &transformed_bytes,
-                        harness,
-                        *transform,
-                        &div,
-                    )?;
+            RunMode::Metamorphic {
+                harness,
+                transforms,
+            } => {
+                let mut original = None;
+                for transform in transforms {
+                    let Some(transformed_bytes) = transform.apply(&input_bytes) else {
+                        not_applicable += 1;
+                        continue;
+                    };
+                    let transformed_path = transformed_root
+                        .join(format!("{input_index:04}-{}.bin", transform.as_str()));
+                    fs::write(&transformed_path, &transformed_bytes)?;
+                    let original =
+                        original.get_or_insert_with(|| run_harness(harness, input_path, timeout));
+                    let transformed = run_harness(harness, &transformed_path, timeout);
+                    let Some(div) = compare_outputs(original, &transformed) else {
+                        continue;
+                    };
+                    if transform.relation().broken_by(&div) {
+                        divergences += 1;
+                        write_metamorphic_finding(
+                            &mut ids,
+                            &input_bytes,
+                            input_path,
+                            &transformed_bytes,
+                            harness,
+                            *transform,
+                            &div,
+                        )?;
+                    }
                 }
             }
         }
     }
 
-    println!("{} inputs, {} divergences", inputs.len(), divergences);
+    if not_applicable > 0 {
+        println!(
+            "{} inputs, {} divergences, {} transformed inputs left out (the transform does not \
+             apply to the input)",
+            inputs.len(),
+            divergences,
+            not_applicable
+        );
+    } else {
+        println!("{} inputs, {} divergences", inputs.len(), divergences);
+    }
     Ok(if divergences > 0 { 1 } else { 0 })
 }
 
@@ -437,7 +811,7 @@ fn write_metamorphic_finding(
         "classification": "metamorphic_violation",
         "exception": {
             "name": "METAMORPHIC_RELATION_VIOLATION",
-            "message": if div.stdout_equal {
+            "message": if div.stdout_equal || transform.relation() == Relation::SameExit {
                 "exit codes differ after metamorphic transform"
             } else {
                 "stdout bytes differ after metamorphic transform"
@@ -446,6 +820,7 @@ fn write_metamorphic_finding(
         "metamorphic": {
             "harness": harness.display().to_string(),
             "transform": transform.as_str(),
+            "relation": transform.relation().as_str(),
             "stdout_equal": div.stdout_equal,
             "exit_equal": div.exit_equal,
             "original_stdout_preview": div.stdout_a_preview,
@@ -529,6 +904,10 @@ fn metamorphic_oracle_hit(
                 "transformed_input_sha256".to_owned(),
                 transformed_sha256.to_owned(),
             ),
+            (
+                "expected_relation".to_owned(),
+                transform.relation().as_str().to_owned(),
+            ),
         ],
     };
     ORACLE_REGISTRY
@@ -549,9 +928,12 @@ fn oracle_hit_json(hit: &OracleHit) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_outputs, truncate_preview, HarnessOutput};
+    use super::{
+        compare_outputs, reverse_json_members, trailing_whitespace, truncate_preview,
+        HarnessOutput, MetamorphicTransform, Relation, TRANSFORMS,
+    };
     #[cfg(unix)]
-    use super::{fs, run_inner, sha256_hex, DifferentialArgs, MetamorphicTransform, Path, PathBuf};
+    use super::{fs, run_inner, sha256_hex, DifferentialArgs, Path, PathBuf};
 
     fn harness_output(stdout: &[u8], exit_code: i32) -> HarnessOutput {
         HarnessOutput {
@@ -638,7 +1020,7 @@ mod tests {
             harness_a: None,
             harness_b: None,
             harness: None,
-            metamorphic_transform: None,
+            metamorphic_transforms: Vec::new(),
             inputs: inputs.clone(),
             work_dir: work,
             out: None,
@@ -660,11 +1042,326 @@ mod tests {
         let work = root.join("work-meta");
         let mut metamorphic = args(work.clone());
         metamorphic.harness = Some(lines);
-        metamorphic.metamorphic_transform = Some(MetamorphicTransform::AppendNewline);
+        metamorphic.metamorphic_transforms = vec![MetamorphicTransform::AppendNewline];
         assert_eq!(run_inner(metamorphic).unwrap(), 1);
         let found = lineage(&work);
         assert_eq!(found["origin"], "user_seed", "{found}");
         assert_eq!(found["root_path"], named.as_str());
         assert_eq!(found["depth"], 0);
+    }
+    /// Every transform `--metamorphic-transform` takes is registered once,
+    /// under its command-line name, with what it does and the relation its
+    /// variant must keep; the relation decides which divergence breaks it.
+    #[test]
+    fn each_transform_declares_a_relation() {
+        use clap::ValueEnum;
+        for transform in MetamorphicTransform::value_variants() {
+            let specs: Vec<_> = TRANSFORMS
+                .iter()
+                .filter(|spec| spec.transform == *transform)
+                .collect();
+            assert_eq!(specs.len(), 1, "{transform:?} is registered once");
+            let spec = specs[0];
+            let flag = transform.to_possible_value().unwrap();
+            assert_eq!(spec.name, flag.get_name(), "{transform:?}");
+            assert!(!spec.description.is_empty(), "{transform:?}");
+            assert_eq!(transform.relation(), spec.relation);
+        }
+        assert_eq!(
+            TRANSFORMS.len(),
+            MetamorphicTransform::value_variants().len()
+        );
+        let relation = |transform: MetamorphicTransform| transform.relation();
+        assert_eq!(
+            relation(MetamorphicTransform::AppendNewline),
+            Relation::SameOutput
+        );
+        assert_eq!(
+            relation(MetamorphicTransform::TrailingWhitespace),
+            Relation::SameOutput
+        );
+        assert_eq!(
+            relation(MetamorphicTransform::ReorderJsonKeys),
+            Relation::SameOutput
+        );
+        assert_eq!(relation(MetamorphicTransform::Utf8Bom), Relation::SameExit);
+
+        // Other stdout alone breaks only the same-output relation; another
+        // exit status breaks both.
+        let stdout_only =
+            compare_outputs(&harness_output(b"a", 0), &harness_output(b"b", 0)).expect("divergent");
+        assert!(Relation::SameOutput.broken_by(&stdout_only));
+        assert!(!Relation::SameExit.broken_by(&stdout_only));
+        let exit =
+            compare_outputs(&harness_output(b"a", 0), &harness_output(b"a", 1)).expect("divergent");
+        assert!(Relation::SameOutput.broken_by(&exit));
+        assert!(Relation::SameExit.broken_by(&exit));
+    }
+
+    #[test]
+    fn the_transforms_rewrite_only_what_they_name() {
+        assert_eq!(trailing_whitespace(b"a\nb\r\nc"), b"a \t\nb \t\r\nc \t");
+        assert_eq!(trailing_whitespace(b"a\n"), b"a \t\n");
+        assert_eq!(
+            reverse_json_members(b" {\"a\": 1,\n \"b\" :[{\"x\":1,\"y\":\"}\"}], \"c\":{}} ")
+                .unwrap(),
+            b" {\"c\":{},\n \"b\" :[{\"y\":\"}\",\"x\":1}], \"a\": 1} "
+        );
+        // No JSON text, or nothing to reorder: no variant.
+        assert_eq!(reverse_json_members(b"{\"a\":1,}"), None);
+        assert_eq!(reverse_json_members(b"key=value"), None);
+        assert_eq!(
+            MetamorphicTransform::ReorderJsonKeys.apply(b"[1, {\"a\": 2}]"),
+            None
+        );
+        let bom = MetamorphicTransform::Utf8Bom.apply(b"{}").unwrap();
+        assert_eq!(bom, b"\xEF\xBB\xBF{}");
+        assert_eq!(MetamorphicTransform::Utf8Bom.apply(&bom), None);
+    }
+
+    #[cfg(unix)]
+    fn script(root: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn metamorphic_args(
+        inputs: &Path,
+        work: &Path,
+        harness: &Path,
+        transforms: &[MetamorphicTransform],
+    ) -> DifferentialArgs {
+        DifferentialArgs {
+            harness_a: None,
+            harness_b: None,
+            harness: Some(harness.to_path_buf()),
+            metamorphic_transforms: transforms.to_vec(),
+            inputs: inputs.to_path_buf(),
+            work_dir: work.to_path_buf(),
+            out: None,
+            timeout_secs: 5,
+        }
+    }
+
+    /// Each finding under `work`: its record and its transformed testcase.
+    #[cfg(unix)]
+    fn metamorphic_findings(work: &Path) -> Vec<(serde_json::Value, Vec<u8>)> {
+        let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<_> = entries
+            .flatten()
+            .map(|entry| {
+                let dir = entry.path();
+                let record: serde_json::Value =
+                    serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+                (
+                    record,
+                    fs::read(dir.join("testcase_transformed.bin")).unwrap(),
+                )
+            })
+            .collect();
+        found.sort_by_key(|(record, _)| record["id"].as_str().unwrap_or_default().to_owned());
+        found
+    }
+
+    /// A harness whose output follows the order of a JSON object's keys
+    /// breaks the relation `reorder-json-keys` keeps; one whose output does
+    /// not, does not. An input that is no JSON is left out.
+    #[test]
+    #[cfg(unix)]
+    fn reorder_json_keys_detects_order_dependent_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let inputs = root.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        let json = b"{\"user\": \"ada\", \"role\": [\"admin\", {\"x\": 1, \"y\": 2}]}\n";
+        fs::write(inputs.join("a.json"), json).unwrap();
+        fs::write(inputs.join("b.txt"), b"user=ada\n").unwrap();
+        // The first key the object names, as a parser that keeps the first
+        // of a duplicated or order-sensitive field might use it.
+        let first_key = script(
+            root,
+            "first-key",
+            "#!/bin/sh\nsed -n 's/^{\"\\([a-z]*\\)\".*/\\1/p' \"$1\"\n",
+        );
+        // The bytes it was given, counted: the same for any key order.
+        let length = script(root, "length", "#!/bin/sh\nwc -c < \"$1\"\n");
+        let reorder = [MetamorphicTransform::ReorderJsonKeys];
+
+        let work = root.join("work-dependent");
+        assert_eq!(
+            run_inner(metamorphic_args(&inputs, &work, &first_key, &reorder)).unwrap(),
+            1
+        );
+        let found = metamorphic_findings(&work);
+        assert_eq!(found.len(), 1, "only the JSON input has a variant");
+        let (record, transformed) = &found[0];
+        assert_eq!(record["metamorphic"]["transform"], "reorder-json-keys");
+        assert_eq!(record["metamorphic"]["relation"], "same-output");
+        assert_eq!(record["metamorphic"]["original_stdout_preview"], "user\n");
+        assert_eq!(
+            record["metamorphic"]["transformed_stdout_preview"],
+            "role\n"
+        );
+        assert_eq!(
+            transformed.as_slice(),
+            b"{\"role\": [\"admin\", {\"y\": 2, \"x\": 1}], \"user\": \"ada\"}\n"
+        );
+        assert_eq!(record["rule_id"], "BHF-307");
+
+        let work = root.join("work-independent");
+        assert_eq!(
+            run_inner(metamorphic_args(&inputs, &work, &length, &reorder)).unwrap(),
+            0
+        );
+        assert!(metamorphic_findings(&work).is_empty());
+    }
+
+    /// A parser that refuses a byte order mark breaks the relation
+    /// `utf8-bom` keeps (the same exit status); one that accepts it and
+    /// echoes it does not, though its output differs.
+    #[test]
+    #[cfg(unix)]
+    fn utf8_bom_detects_bom_sensitive_parser() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let inputs = root.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        fs::write(inputs.join("doc.json"), b"{\"k\": 1}").unwrap();
+        let sensitive = script(
+            root,
+            "sensitive",
+            "#!/bin/sh\n[ \"$(head -c 3 \"$1\")\" = \"$(printf '\\357\\273\\277')\" ] && \
+             { echo 'unexpected byte 0xEF' >&2; exit 2; }\ncat \"$1\"\n",
+        );
+        let tolerant = script(root, "tolerant", "#!/bin/sh\ncat \"$1\"\n");
+        let bom = [MetamorphicTransform::Utf8Bom];
+
+        let work = root.join("work-sensitive");
+        assert_eq!(
+            run_inner(metamorphic_args(&inputs, &work, &sensitive, &bom)).unwrap(),
+            1
+        );
+        let found = metamorphic_findings(&work);
+        assert_eq!(found.len(), 1);
+        let (record, transformed) = &found[0];
+        assert_eq!(record["metamorphic"]["transform"], "utf8-bom");
+        assert_eq!(record["metamorphic"]["relation"], "same-exit");
+        assert_eq!(record["metamorphic"]["original_exit"], 0);
+        assert_eq!(record["metamorphic"]["transformed_exit"], 2);
+        assert_eq!(
+            record["exception"]["message"],
+            "exit codes differ after metamorphic transform"
+        );
+        assert_eq!(transformed.as_slice(), b"\xEF\xBB\xBF{\"k\": 1}");
+        let evidence = record["oracle"]["evidence"].to_string();
+        assert!(evidence.contains("same-exit"), "{evidence}");
+
+        let work = root.join("work-tolerant");
+        assert_eq!(
+            run_inner(metamorphic_args(&inputs, &work, &tolerant, &bom)).unwrap(),
+            0,
+            "an echoed BOM keeps the exit status"
+        );
+        assert!(metamorphic_findings(&work).is_empty());
+    }
+
+    /// Several `--metamorphic-transform` values, comma-separated or the flag
+    /// repeated, are each applied to every input, each checked against its
+    /// own relation, and named in the findings they make.
+    #[test]
+    #[cfg(unix)]
+    fn multiple_values_per_transform_are_applied() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: DifferentialArgs,
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let inputs = root.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        fs::write(inputs.join("one.txt"), b"alpha\nbeta").unwrap();
+        fs::write(inputs.join("two.txt"), b"gamma\n").unwrap();
+        let echo = script(root, "echo", "#!/bin/sh\ncat \"$1\"\n");
+        let work = root.join("work");
+        let cli = Cli::try_parse_from([
+            "differential".as_ref(),
+            "--harness".as_ref(),
+            echo.as_os_str(),
+            "--metamorphic-transform".as_ref(),
+            "append-newline,utf8-bom".as_ref(),
+            "--metamorphic-transform".as_ref(),
+            "trailing-whitespace".as_ref(),
+            "--metamorphic-transform".as_ref(),
+            "append-newline".as_ref(),
+            "--inputs".as_ref(),
+            inputs.as_os_str(),
+            "--work-dir".as_ref(),
+            work.as_os_str(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.args.metamorphic_transforms,
+            [
+                MetamorphicTransform::AppendNewline,
+                MetamorphicTransform::Utf8Bom,
+                MetamorphicTransform::TrailingWhitespace,
+                MetamorphicTransform::AppendNewline,
+            ]
+        );
+
+        assert_eq!(run_inner(cli.args).unwrap(), 1);
+        // Two inputs, three transforms (the repeat runs once): six variants.
+        let mut variants: Vec<String> = fs::read_dir(work.join("differential/metamorphic_inputs"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        variants.sort();
+        assert_eq!(
+            variants,
+            [
+                "0000-append-newline.bin",
+                "0000-trailing-whitespace.bin",
+                "0000-utf8-bom.bin",
+                "0001-append-newline.bin",
+                "0001-trailing-whitespace.bin",
+                "0001-utf8-bom.bin",
+            ]
+        );
+        // The echo changes its output for both same-output transforms of
+        // both inputs, and keeps its exit status under the BOM.
+        let mut made: Vec<(String, Vec<u8>)> = metamorphic_findings(&work)
+            .into_iter()
+            .map(|(record, transformed)| {
+                (
+                    record["metamorphic"]["transform"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    transformed,
+                )
+            })
+            .collect();
+        made.sort();
+        assert_eq!(
+            made,
+            [
+                ("append-newline".to_owned(), b"alpha\nbeta\n".to_vec()),
+                ("append-newline".to_owned(), b"gamma\n\n".to_vec()),
+                (
+                    "trailing-whitespace".to_owned(),
+                    b"alpha \t\nbeta \t".to_vec()
+                ),
+                ("trailing-whitespace".to_owned(), b"gamma \t\n".to_vec()),
+            ]
+        );
     }
 }
