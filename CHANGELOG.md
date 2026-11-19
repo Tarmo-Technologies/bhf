@@ -11,6 +11,16 @@
   runs the input as on `qemu-system:`. It takes the same `done=`, `fault=`,
   `firmware=`, `cycles=` and `task_id=` keys. The gdb client now drops a stop
   reply a stub sends unprompted, as Renode's does.
+- The C direct harness maps the device registers its target reads at fixed
+  addresses (#341): the pages of the volatile register accesses the target's
+  code reaches in its source and the headers it includes are mapped once,
+  through `bhf_shim_mmio_fill` when the runtrace shim is loaded, and refilled
+  from each input, so a bug gated on a register's value is found where the
+  read used to fault. Poison and sentinel pointers (`LIST_POISON1`) and a page
+  a loop condition polls are left unmapped. `bhf auto` asks the built harness
+  which windows it mapped (`mmio-mapped.txt`), and only those make the
+  finding's `hardware_peripherals` fidelity say `emulated:`.
+  `BHF_NO_MMIO_EMULATION=1` turns it off.
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto

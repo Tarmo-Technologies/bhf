@@ -122,6 +122,85 @@ static uint32_t _bhf_env_next_u32(void) {
     return ({{ r.return_type }})_bhf_env_next_u32();
 }
 {%- endfor %}
+{%- if environment.mmio_windows %}
+/* #341: device registers the target reads at fixed addresses (a
+ * `*(volatile uint32_t *)0x40011000` behind a register macro). Nothing is
+ * mapped there on the host, so the read would fault. Each window is mapped
+ * once, by the runtrace shim's bhf_shim_mmio_fill when the shim is loaded
+ * (it logs the window), else here, and refilled from every input before the
+ * target runs: byte i of a window is input[i % size], zero for an empty
+ * input, so a register-gated branch is reachable and a register write never
+ * leaks into the next input. A window that cannot be mapped (the address is
+ * taken, or not mappable on this host) is left alone and its read faults as
+ * it did before. Linux only: other hosts read the registers unmapped. */
+#if defined(__linux__) && !defined(BHF_WINDOWS_CRT)
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+extern int bhf_shim_mmio_fill(uintptr_t addr, size_t len) __attribute__((weak));
+static const struct { uintptr_t base; size_t len; const char *name; } _bhf_mmio_windows[] = {
+{%- for w in environment.mmio_windows %}
+    { (uintptr_t){{ w.base }}u, {{ w.len }}u, "{{ w.name }}" },
+{%- endfor %}
+};
+#define _BHF_MMIO_COUNT (sizeof(_bhf_mmio_windows) / sizeof(_bhf_mmio_windows[0]))
+/* Per window: 0 not tried yet, 1 mapped, 2 not mappable. */
+static unsigned char _bhf_mmio_state[_BHF_MMIO_COUNT];
+BHF_NOCOV static int _bhf_mmio_map(uintptr_t base, size_t len) {
+    if (bhf_shim_mmio_fill && bhf_shim_mmio_fill(base, len) == 0) return 1;
+    long page_size = sysconf(_SC_PAGESIZE);
+    uintptr_t page = (uintptr_t)(page_size > 0 ? page_size : 4096);
+    uintptr_t start = base & ~(page - 1);
+    size_t span = (size_t)(((base + len + page - 1) & ~(page - 1)) - start);
+    void *at = mmap((void *)start, span, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (at == MAP_FAILED) return 0;
+    if ((uintptr_t)at != start) {
+        /* A kernel without MAP_FIXED_NOREPLACE took the address as a hint. */
+        munmap(at, span);
+        return 0;
+    }
+    return 1;
+}
+BHF_NOCOV static void _bhf_mmio_fill(const uint8_t *data, size_t size) {
+    size_t i;
+    for (i = 0; i < _BHF_MMIO_COUNT; ++i) {
+        volatile uint8_t *window = (volatile uint8_t *)_bhf_mmio_windows[i].base;
+        size_t len = _bhf_mmio_windows[i].len, j;
+        if (_bhf_mmio_state[i] == 0) {
+            _bhf_mmio_state[i] = _bhf_mmio_map(_bhf_mmio_windows[i].base, len) ? 1 : 2;
+            if (_bhf_mmio_state[i] == 2 && getenv("BHF_MMIO_VERBOSE"))
+                fprintf(stderr, "bhf: device window %#lx (%s) could not be mapped\n",
+                        (unsigned long)_bhf_mmio_windows[i].base, _bhf_mmio_windows[i].name);
+        }
+        if (_bhf_mmio_state[i] != 1) continue;
+        for (j = 0; j < len; ++j) window[j] = size ? data[j % size] : 0;
+    }
+}
+#define BHF_MMIO_FILL(data, size) _bhf_mmio_fill((data), (size))
+/* With BHF_MMIO_PROBE set, map the windows, print the ones mapped as
+ * `BASE LEN NAME` lines and exit before the target runs: bhf records them,
+ * so a report claims emulation only for a window this build could map (one
+ * inside ASan's shadow gap cannot be). */
+__attribute__((constructor)) BHF_NOCOV static void _bhf_mmio_probe(void) {
+    size_t i;
+    if (!getenv("BHF_MMIO_PROBE")) return;
+    for (i = 0; i < _BHF_MMIO_COUNT; ++i) {
+        if (!_bhf_mmio_map(_bhf_mmio_windows[i].base, _bhf_mmio_windows[i].len)) continue;
+        printf("%#lx %#lx %s\n", (unsigned long)_bhf_mmio_windows[i].base,
+               (unsigned long)_bhf_mmio_windows[i].len, _bhf_mmio_windows[i].name);
+    }
+    fflush(stdout);
+    _exit(0);
+}
+#else
+#define BHF_MMIO_FILL(data, size) ((void)0)
+#endif
+{%- else %}
+#define BHF_MMIO_FILL(data, size) ((void)0)
+{%- endif %}
 {%- endif %}
 
 {#- support blocks (callback typedefs + trampolines) must precede the
@@ -866,6 +945,7 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     _bhf_env_data = Data;
     _bhf_env_size = Size;
     _bhf_env_index = 0;
+    BHF_MMIO_FILL(Data, Size);
 {%- endif %}
 {%- for d in params_decode %}
     {{ d }};

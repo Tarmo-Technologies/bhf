@@ -2695,6 +2695,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_mmio_register_emulation.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_mmio_register_fault.rs",
       "license": "Apache-2.0"
     },

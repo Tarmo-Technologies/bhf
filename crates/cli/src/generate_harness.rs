@@ -3426,9 +3426,13 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         } else {
             None
         };
+        // #341: the device pages the target's code reads at fixed
+        // addresses, mapped by the harness and refilled from each input.
+        let mmio_windows = c_mmio_windows(&source_path, &invocation_function.name);
+        write_mmio_windows_record(&output_dir, &mmio_windows)?;
         harness_gen::c_generate::generate_c_direct_harness(
             harness_gen::c_generate::GenerateCDirectArgs {
-                environment: args.environment.clone(),
+                environment: with_mmio_windows(args.environment.clone(), mmio_windows),
                 harness_id: id,
                 output_dir: output_dir.clone(),
                 source_path: source_path.clone(),
@@ -3644,6 +3648,202 @@ pub(crate) const DICTIONARY_HEADER: &str = "\
 # source's directory). Not runtime evidence: comparison operands observed
 # while fuzzing are in learned_dictionary.txt and cmplog.jsonl beside this file.
 ";
+
+/// The record of the device windows a C direct harness is built to map
+/// (#341), one `BASE LEN NAME` line per window, in the harness directory.
+pub(crate) const MMIO_WINDOWS_RECORD: &str = "mmio-windows.txt";
+/// The record of the windows the built harness did map on this host, in the
+/// same format, from [`record_mapped_mmio_windows`]. A window the build's
+/// sanitizer layout reserves (ASan's shadow gap on x86-64 holds the Cortex-M
+/// system control space at 0xE000E000) is not in it. The report reads it to
+/// mark the target's peripherals as emulated.
+pub(crate) const MMIO_MAPPED_RECORD: &str = "mmio-mapped.txt";
+/// Set on a harness run, the harness maps its device windows, prints those
+/// it mapped and exits before it runs the target.
+const MMIO_PROBE_ENV: &str = "BHF_MMIO_PROBE";
+
+/// The device page a register lies on, and the unit a window grows by.
+const MMIO_PAGE: u64 = 0x1000;
+/// Cap on the windows one harness maps.
+const MAX_MMIO_WINDOWS: usize = 16;
+/// The last page a window may start on: the top of a 47-bit user space.
+const MMIO_HIGHEST_PAGE: u64 = 0x7fff_ffff_f000;
+/// Set to `1` to leave fixed-address registers unmapped, so their reads
+/// fault on the host as they did before #341.
+const NO_MMIO_EMULATION: &str = "BHF_NO_MMIO_EMULATION";
+
+/// Whether a register named `name` at `address` is a poison or sentinel
+/// value rather than a device: list.h's `LIST_POISON1` and the fill patterns
+/// allocators and debuggers use. Mapping one would turn the fault its
+/// dereference is into a read of fuzz bytes.
+fn is_sentinel(name: Option<&str>, address: u64) -> bool {
+    const FILL_PATTERNS: &[u64] = &[
+        0xdead_beef,
+        0xdead_dead,
+        0xdead_c0de,
+        0xbaad_f00d,
+        0xcafe_babe,
+        0xfeed_face,
+        0xfeee_feee,
+        0xcccc_cccc,
+        0xcdcd_cdcd,
+        0xabab_abab,
+        0xa5a5_a5a5,
+        0x5a5a_5a5a,
+    ];
+    let named = name.is_some_and(|name| {
+        let name = name.to_ascii_uppercase();
+        ["POISON", "SENTINEL", "INVALID", "BOGUS"]
+            .iter()
+            .any(|word| name.contains(word))
+    });
+    named || FILL_PATTERNS.contains(&address)
+}
+
+/// The device windows the C target `function` (defined in `source`) reads
+/// or writes at fixed addresses: the pages of the volatile register accesses
+/// its code and the functions it calls make, in `source` and the headers
+/// beside it that it includes ([`crate::auto::mmio_registers::device_access`]),
+/// adjacent pages merged, at most [`MAX_MMIO_WINDOWS`]. Each window is named
+/// by the first register macro on it. Left out: a page whose register a loop
+/// condition polls (a status bit that holds one value for the whole run would
+/// spin there until the per-input timeout; unmapped, its read keeps #175's
+/// environment classification), sentinels ([`is_sentinel`]), and a target
+/// with no register access at all.
+pub(crate) fn c_mmio_windows(
+    source: &Path,
+    function: &str,
+) -> Vec<harness_gen::c_generate::CMmioWindow> {
+    if std::env::var_os(NO_MMIO_EMULATION).is_some_and(|value| value == "1") {
+        return Vec::new();
+    }
+    let access = crate::auto::mmio_registers::device_access(&[source.to_path_buf()], function);
+    let polled: BTreeSet<u64> = access
+        .polled
+        .iter()
+        .map(|address| address & !(MMIO_PAGE - 1))
+        .collect();
+    let mut pages: BTreeMap<u64, Option<String>> = BTreeMap::new();
+    for register in access.accessed {
+        let page = register.address & !(MMIO_PAGE - 1);
+        if page > MMIO_HIGHEST_PAGE
+            || polled.contains(&page)
+            || is_sentinel(register.name.as_deref(), register.address)
+        {
+            continue;
+        }
+        let name = pages.entry(page).or_default();
+        if name.is_none() {
+            *name = register.name;
+        }
+    }
+    let mut windows: Vec<(u64, u64, Option<String>)> = Vec::new();
+    for (page, name) in pages {
+        match windows.last_mut() {
+            Some((base, len, first)) if *base + *len == page => {
+                *len += MMIO_PAGE;
+                if first.is_none() {
+                    *first = name;
+                }
+            }
+            _ => windows.push((page, MMIO_PAGE, name)),
+        }
+    }
+    windows
+        .into_iter()
+        .take(MAX_MMIO_WINDOWS)
+        .map(|(base, len, name)| {
+            harness_gen::c_generate::CMmioWindow::new(base, len, name.as_deref())
+        })
+        .collect()
+}
+
+/// `environment` with `windows` added; a target with no other environment
+/// model gets one holding only the windows.
+pub(crate) fn with_mmio_windows(
+    environment: Option<harness_gen::c_generate::CEnvironmentModel>,
+    windows: Vec<harness_gen::c_generate::CMmioWindow>,
+) -> Option<harness_gen::c_generate::CEnvironmentModel> {
+    if windows.is_empty() {
+        return environment;
+    }
+    let mut environment = environment.unwrap_or_default();
+    environment.mmio_windows = windows;
+    Some(environment)
+}
+
+/// Remove `path` if it is there.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Write the [`MMIO_WINDOWS_RECORD`], or remove a stale one when the harness
+/// maps no window. A regenerated harness has mapped nothing yet, so its
+/// [`MMIO_MAPPED_RECORD`] goes too.
+fn write_mmio_windows_record(
+    output_dir: &Path,
+    windows: &[harness_gen::c_generate::CMmioWindow],
+) -> Result<()> {
+    remove_if_present(&output_dir.join(MMIO_MAPPED_RECORD))?;
+    let path = output_dir.join(MMIO_WINDOWS_RECORD);
+    if windows.is_empty() {
+        return remove_if_present(&path);
+    }
+    fs::create_dir_all(output_dir).with_context(|| format!("create {}", output_dir.display()))?;
+    let text: String = windows
+        .iter()
+        .map(|window| {
+            let name = if window.name.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", window.name)
+            };
+            format!("{} {}{name}\n", window.base, window.len)
+        })
+        .collect();
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))
+}
+
+/// Ask the built C harness `binary` which of its device windows it can map
+/// on this host, and write them to `harness_dir`'s [`MMIO_MAPPED_RECORD`]:
+/// with [`MMIO_PROBE_ENV`] set the harness maps each window, prints the ones
+/// it mapped as [`MMIO_WINDOWS_RECORD`] lines and exits. Only the windows the
+/// harness was generated with count. A harness without windows, or a probe
+/// that fails, leaves no record, so the report claims no emulation.
+pub(crate) fn record_mapped_mmio_windows(harness_dir: &Path, binary: &Path) {
+    let record = harness_dir.join(MMIO_MAPPED_RECORD);
+    let _ = remove_if_present(&record);
+    let Ok(planned) = fs::read_to_string(harness_dir.join(MMIO_WINDOWS_RECORD)) else {
+        return;
+    };
+    let planned: Vec<&str> = planned.lines().map(str::trim).collect();
+    let mut command = std::process::Command::new(binary);
+    command
+        .env(MMIO_PROBE_ENV, "1")
+        .stdin(std::process::Stdio::null());
+    let Ok((output, timed_out)) = crate::command_output::output_with_timeout_flagged(
+        &mut command,
+        std::time::Duration::from_secs(30),
+    ) else {
+        return;
+    };
+    if timed_out || !output.status.success() {
+        return;
+    }
+    let mapped: String = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| planned.contains(line))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if !mapped.is_empty() {
+        let _ = fs::write(&record, mapped);
+    }
+}
 
 pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[MinedToken]) -> Result<()> {
     if tokens.is_empty() {
@@ -14845,6 +15045,7 @@ mod tests {
         CppBuildContext, DecoderLimitArgs, GenerateHarnessArgs, HeaderPreflight,
         BLOCKED_BY_NON_SELF_CONTAINED_HEADER,
     };
+    use super::{c_mmio_windows, with_mmio_windows, MMIO_WINDOWS_RECORD};
     use super::{compile_database_flags_in, BUILD_CONTEXT_LDFLAG_PREFIX};
     use super::{
         finding_format_note, recorded_harness_format_version, stale_harness_format_note,
@@ -18491,6 +18692,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                     }],
                 }],
                 fuzz_driven_callbacks: true,
+                mmio_windows: Vec::new(),
             }),
         };
         run(args).unwrap();
@@ -18507,6 +18709,221 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             main_c.contains("_bhf_env_data = Data;"),
             "the fuzz-fed source must be armed from the input: {main_c}"
         );
+    }
+
+    /// #341: the device pages a target's sources read at fixed addresses,
+    /// through register macros in a header it includes, become the C
+    /// harness's MMIO windows, and the record the report reads names them.
+    #[test]
+    fn registers_the_target_reads_at_fixed_addresses_become_harness_windows() {
+        let root = crate::test_support::TestDir::new("mmio-windows");
+        fs::write(
+            root.join("uart.h"),
+            "#include <stdint.h>\n\
+             #define UART1_BASE 0x40011000UL\n\
+             #define UART_SR (*(volatile uint32_t *)(UART1_BASE + 0x00))\n\
+             #define UART_DR (*(volatile uint32_t *)(UART1_BASE + 0x04))\n",
+        )
+        .unwrap();
+        let source = root.join("uart.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n#include \"uart.h\"\n\
+             int uart_status(int unused) {\n\
+             \x20   (void)unused;\n\
+             \x20   return (int)(UART_SR & 0xffu);\n}\n",
+        )
+        .unwrap();
+        let out = root.join("generated_harnesses");
+        run(GenerateHarnessArgs {
+            source: source.clone(),
+            target: Some("uart_status".to_owned()),
+            target_line: None,
+            output: out.clone(),
+            id: Some("H-MMIO".to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: Vec::new(),
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+        let main_c = fs::read_to_string(out.join("H-MMIO/main.c")).unwrap();
+        assert!(
+            main_c.contains("{ (uintptr_t)0x40011000u, 0x1000u, \"UART_SR\" }"),
+            "the UART page is one window: {main_c}"
+        );
+        assert!(main_c.contains("BHF_MMIO_FILL(Data, Size);"), "{main_c}");
+        let record = fs::read_to_string(out.join("H-MMIO").join(MMIO_WINDOWS_RECORD)).unwrap();
+        assert_eq!(record, "0x40011000 0x1000 UART_SR\n");
+    }
+
+    fn mmio_spans(windows: &[harness_gen::c_generate::CMmioWindow]) -> Vec<(&str, &str, &str)> {
+        windows
+            .iter()
+            .map(|w| (w.base.as_str(), w.len.as_str(), w.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn mmio_windows_merge_adjacent_pages_and_skip_what_cannot_be_a_device() {
+        let root = crate::test_support::TestDir::new("mmio-window-merge");
+        let source = root.join("dev.c");
+        fs::write(
+            &source,
+            "#include <stdint.h>\n\
+             #define A (*(volatile uint32_t *)0x40020004u)\n\
+             #define B (*(volatile uint32_t *)0x40021ff0u)\n\
+             #define C (*(volatile uint32_t *)0x50000000u)\n\
+             #define LOW (*(volatile uint32_t *)0x100u)\n\
+             #define KERNEL (*(volatile uint32_t *)0xffff800000001000ull)\n\
+             int f(void) { return (int)(A + B + C + LOW + KERNEL); }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mmio_spans(&c_mmio_windows(&source, "f")),
+            [("0x40020000", "0x2000", "A"), ("0x50000000", "0x1000", "C")]
+        );
+
+        let plain = root.join("plain.c");
+        fs::write(&plain, "int g(int x) { return x + 1; }\n").unwrap();
+        assert!(c_mmio_windows(&plain, "g").is_empty());
+    }
+
+    /// #341: a poison pointer is no device. list.h's `LIST_POISON1` is a
+    /// plain `(void *)` cast of a constant; mapping its page made a use
+    /// after `list_del` read fuzz bytes instead of faulting.
+    #[test]
+    fn a_poison_pointer_gets_no_window() {
+        let root = crate::test_support::TestDir::new("mmio-poison");
+        let source = root.join("list.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             #define LIST_POISON1 ((void *) 0x00100100)\n\
+             #define LIST_POISON2 ((void *) 0x00200200)\n\
+             #define BAD_SLOT (*(volatile unsigned *)0xdeadbeefu)\n\
+             #define TRACE_POISON (*(volatile unsigned *)0x00300300u)\n\
+             struct node { struct node *next; int v; };\n\
+             int walk(const unsigned char *data, size_t len) {\n\
+             \x20   struct node n = { NULL, 0 };\n\
+             \x20   if (len > 0 && data[0] == 'D') { n.next = LIST_POISON1; n.v = BAD_SLOT + TRACE_POISON; }\n\
+             \x20   return n.next ? n.next->v : 0;\n}\n",
+        )
+        .unwrap();
+        assert_eq!(mmio_spans(&c_mmio_windows(&source, "walk")), []);
+    }
+
+    /// #341: a register the target polls in a loop condition holds one value
+    /// for the whole run, so a mapped page would spin there until the
+    /// per-input timeout: that page stays unmapped, the others are mapped.
+    #[test]
+    fn a_polled_register_page_stays_unmapped() {
+        let root = crate::test_support::TestDir::new("mmio-poll");
+        fs::write(
+            root.join("uart.h"),
+            "#include <stdint.h>\n\
+             #define UART1_BASE 0x40011000UL\n\
+             #define UART_SR (*(volatile uint32_t *)(UART1_BASE + 0x00))\n\
+             #define UART_DR (*(volatile uint32_t *)(UART1_BASE + 0x04))\n\
+             #define UART_READY() ((UART_SR & 0x80u) != 0)\n\
+             #define GPIO_IDR (*(volatile uint32_t *)0x40020010UL)\n\
+             #define TIM_CNT (*(volatile uint32_t *)0x40000024UL)\n",
+        )
+        .unwrap();
+        let source = root.join("uart.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n#include \"uart.h\"\n\
+             static void put(unsigned char c) { while (!(UART_SR & 0x80u)) {} UART_DR = c; }\n\
+             static int timer_ready(void) { return TIM_CNT > 10u; }\n\
+             int uart_send(const unsigned char *data, size_t len) {\n\
+             \x20   for (size_t i = 0; i < len; i++) put(data[i]);\n\
+             \x20   return (int)(GPIO_IDR & 1u);\n}\n\
+             int macro_poll(void) { do {} while (!UART_READY()); return 0; }\n\
+             int helper_poll(void) { for (;;) { if (timer_ready()) break; } return (int)GPIO_IDR; }\n\
+             int table_lookup(const unsigned char *data, size_t len) {\n\
+             \x20   static const int table[4] = {1, 2, 3, 4};\n\
+             \x20   return len ? table[data[0]] : 0;\n}\n",
+        )
+        .unwrap();
+        // The poll is in a helper the target calls: the UART page stays
+        // unmapped, the GPIO register it only reads is mapped.
+        assert_eq!(
+            mmio_spans(&c_mmio_windows(&source, "uart_send")),
+            [("0x40020000", "0x1000", "GPIO_IDR")]
+        );
+        // A `do ... while` through a status macro.
+        assert_eq!(mmio_spans(&c_mmio_windows(&source, "macro_poll")), []);
+        // A `for (;;)` left by `break` on a helper's register read.
+        assert_eq!(
+            mmio_spans(&c_mmio_windows(&source, "helper_poll")),
+            [("0x40020000", "0x1000", "GPIO_IDR")]
+        );
+        // A target that touches no register in a file that has them.
+        assert_eq!(mmio_spans(&c_mmio_windows(&source, "table_lookup")), []);
+    }
+
+    /// #341: the windows a harness reports it mapped are recorded; one it
+    /// could not map, or a probe that failed, gives no claim.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_windows_the_built_harness_mapped_are_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestDir::new("mmio-mapped");
+        let harness = dir.join("main");
+        let probe = |script: &str| {
+            fs::write(&harness, script).unwrap();
+            fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+            super::record_mapped_mmio_windows(dir.path(), &harness);
+            fs::read_to_string(dir.join(super::MMIO_MAPPED_RECORD)).ok()
+        };
+        // Not generated with windows: not run, no record.
+        assert_eq!(probe("#!/bin/sh\necho 0x40011000 0x1000 UART_SR\n"), None);
+        fs::write(
+            dir.join(MMIO_WINDOWS_RECORD),
+            "0x40011000 0x1000 UART_SR\n0xe000e000 0x1000 SCB_CPUID\n",
+        )
+        .unwrap();
+        // The probe names the mapped one (and a line it was not built with,
+        // which does not count); the unmappable one is not claimed.
+        assert_eq!(
+            probe(
+                "#!/bin/sh\n[ \"$BHF_MMIO_PROBE\" = 1 ] || exit 3\n\
+                 echo '0x40011000 0x1000 UART_SR '\necho 0x50000000 0x1000 X\n"
+            )
+            .as_deref(),
+            Some("0x40011000 0x1000 UART_SR\n")
+        );
+        // A probe that fails leaves none, nor a stale one.
+        assert_eq!(
+            probe("#!/bin/sh\necho 0x40011000 0x1000 UART_SR\nexit 1\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_mmio_windows_merge_into_an_existing_environment_model() {
+        let window = harness_gen::c_generate::CMmioWindow::new(0x4001_1000, 0x1000, None);
+        assert_eq!(with_mmio_windows(None, Vec::new()), None);
+        let env = with_mmio_windows(None, vec![window.clone()]).unwrap();
+        assert_eq!(env.mmio_windows, std::slice::from_ref(&window));
+        assert!(!env.fuzz_driven_callbacks && env.peripheral_readers.is_empty());
+        let existing = harness_gen::c_generate::CEnvironmentModel {
+            fuzz_driven_callbacks: true,
+            ..Default::default()
+        };
+        let merged = with_mmio_windows(Some(existing), vec![window.clone()]).unwrap();
+        assert!(merged.fuzz_driven_callbacks);
+        assert_eq!(merged.mmio_windows, [window]);
     }
 
     /// §27.11: the `--container-size-max` flag threads all the way to the

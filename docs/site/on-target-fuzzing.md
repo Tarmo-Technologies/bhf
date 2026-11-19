@@ -598,11 +598,58 @@ is refused.
 
 Firmware that reads a peripheral through a fixed address
 (`#define UART_SR (*(volatile uint32_t *)(UART1_BASE + 0x00))`, a CMSIS
-`((UART_TypeDef *) UART1_BASE)`, or a cast of a literal) SEGVs on the host, where
-nothing is mapped there. `bhf auto` reads the pointer casts of constants in the
-crash path's sources and the headers they include, macros expanded, and a SEGV
-whose address lies on one of those registers (or the same 4 KiB page) is an
-environment result, not an out-of-bounds read: the finding records
+`((UART_TypeDef *) UART1_BASE)` whose members are `__IO`, or a volatile cast of
+a literal) would SEGV on the host, where nothing is mapped there. So the C
+direct harness (`bhf auto` and `bhf generate-harness --kind direct` for a C
+target) maps those registers. The C sequence harness (a handle-lifecycle C
+target) and the C++ harness do not: their register reads still fault, and the
+classification below applies.
+
+The generator reads the volatile register accesses of constants in the
+target's source file and the headers beside it that it includes, macros
+expanded: a `volatile` (or `__IO`, `__I`, `__O`) cast, or a cast to a struct
+whose members are. It keeps the ones the target's own code reaches, through
+the functions it calls in those files and the macros it uses, and maps each
+4 KiB page they lie on (adjacent pages merged, at most 16 windows). A plain
+pointer cast is no register: list.h's `LIST_POISON1` (`(void *) 0x00100100`)
+and other poison or sentinel values (`*_POISON*`, `0xdeadbeef` and the like)
+are never mapped, so a dereference of one still faults. A target that reaches
+no register gets no window, whatever else its file reads.
+
+On Linux the harness maps each window once, through the runtrace shim's
+`bhf_shim_mmio_fill` when the shim is loaded and with its own `mmap` otherwise,
+and before every input refills it from that input: byte `i` of a window is
+input byte `i % size`. A register read returns fuzz-chosen bytes, so a bug
+behind a register's value (a framing-error path, a status bit) is reachable,
+and a register the target writes does not carry into the next input.
+
+A register keeps one value for the whole run, so a loop that polls it would
+spin until the per-input timeout on every input that leaves its bit clear. A
+page whose register a loop condition reads (`while (!(UART_SR & 0x80)) {}`, a
+`do ... while`, the test of a `for`, an `if (...) break;`, directly or through
+a macro or a function the condition calls) is therefore left unmapped: its read
+faults, and the target keeps its throughput and the environment result below.
+A poll the scan cannot see (through a function pointer, or in another
+translation unit) still spins.
+
+The harness lists the windows it was generated with in `mmio-windows.txt`.
+After `bhf auto` builds it natively, it asks the harness which of them it
+could map on this host (`BHF_MMIO_PROBE=1`: the harness maps them, prints
+them and exits) and records those in `mmio-mapped.txt`. A window the build
+cannot map is left unmapped, and its read faults as before: the address is in
+use, or the sanitizer reserves it (ASan's shadow gap on x86-64 holds the
+Cortex-M system control space at 0xE000E000). Only the target's mapped
+windows set its findings' `hardware_peripherals` fidelity to `not_exercised`
+with a reason that starts `emulated:` and names them: the registers were
+memory, not a device. A cross build is not probed and claims none.
+`BHF_MMIO_VERBOSE=1` prints each window the harness could not map, and
+`BHF_NO_MMIO_EMULATION=1` leaves every register unmapped.
+
+When a register read still faults, because it was not mapped, `bhf auto` reads
+the pointer casts of constants in the crash path's sources and the headers they
+include, macros expanded, and a SEGV whose address lies on one of those
+registers (or the same 4 KiB page) is an environment result, not an
+out-of-bounds read: the finding records
 `environment_origin` (`kind: "mmio_register"`, the fault and register addresses
 and the macro), its verdict is `lab_only` (`verdict_reason: "mmio_register"`) at
 low severity, and its `hardware_peripherals` fidelity is `not_exercised` with

@@ -652,7 +652,40 @@ fn target_fidelity(
     if let Some(limit) = limit {
         fidelity.sanitizers = actionability::FidelityDimension::not_exercised(limit);
     }
+    // #341: device registers the harness emulated with memory.
+    if let Some(emulated) = mmio_emulation(&r.harness_dir) {
+        fidelity.hardware_peripherals = actionability::FidelityDimension::not_exercised(emulated);
+    }
     Some(fidelity)
+}
+
+/// The fidelity reason for a harness that mapped device windows at the fixed
+/// addresses its target reads (#341), from the windows the built harness
+/// reported it mapped ([`crate::generate_harness::MMIO_MAPPED_RECORD`]);
+/// `None` for one that mapped none, or was never asked.
+fn mmio_emulation(harness_dir: &Path) -> Option<String> {
+    let record =
+        std::fs::read_to_string(harness_dir.join(crate::generate_harness::MMIO_MAPPED_RECORD))
+            .ok()?;
+    let windows: Vec<String> = record
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let base = fields.next()?;
+            let _len = fields.next()?;
+            Some(match fields.next() {
+                Some(name) => format!("{base} ({name})"),
+                None => base.to_owned(),
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then(|| {
+        format!(
+            "emulated: the device registers at {} were host memory refilled from each input, \
+             so register reads returned fuzz-chosen values, not a device's behaviour",
+            windows.join(", ")
+        )
+    })
 }
 
 /// Whether a C/C++ harness was built with `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`:
@@ -4260,6 +4293,31 @@ fn md_section(s: &mut String, title: &str, bag: &[Aggregated]) {
 #[cfg(test)]
 mod tests {
     /// #297: what a run's lanes leave unobserved, per fuzzed language.
+    /// #341: a harness that mapped device windows records them, and the
+    /// fidelity names them as emulated; one that mapped none has no note.
+    #[test]
+    fn a_harness_with_mmio_windows_reports_emulated_peripherals() {
+        let dir = crate::test_support::TestDir::new("mmio-fidelity");
+        assert_eq!(super::mmio_emulation(dir.path()), None);
+        // Windows the harness was generated with are no claim until the
+        // built harness says it mapped them.
+        std::fs::write(
+            dir.join(crate::generate_harness::MMIO_WINDOWS_RECORD),
+            "0x40011000 0x1000 UART_SR\n0x50000000 0x2000\n0xe000e000 0x1000 SCB_CPUID\n",
+        )
+        .unwrap();
+        assert_eq!(super::mmio_emulation(dir.path()), None);
+        std::fs::write(
+            dir.join(crate::generate_harness::MMIO_MAPPED_RECORD),
+            "0x40011000 0x1000 UART_SR\n0x50000000 0x2000\n",
+        )
+        .unwrap();
+        let note = super::mmio_emulation(dir.path()).unwrap();
+        assert!(note.starts_with("emulated: "), "{note}");
+        assert!(note.contains("0x40011000 (UART_SR), 0x50000000"), "{note}");
+        assert!(!note.contains("0xe000e000"), "{note}");
+    }
+
     #[test]
     fn the_classes_no_lane_could_observe_are_listed() {
         use crate::auto::sanitizer_replay::ReplayLane;

@@ -7,7 +7,7 @@
 //! not an out-of-bounds read the input caused. [`register_fault`] finds such a
 //! crash: its fault address lies on a register the crash path's sources name.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -31,6 +31,11 @@ pub(crate) struct Register {
     pub(crate) file: PathBuf,
     /// 1-based.
     pub(crate) line: usize,
+    /// Whether the access is volatile: a `volatile` (or CMSIS `__IO`, `__I`,
+    /// `__O`) qualified cast, or a cast to a struct whose members are, as a
+    /// device register's always is. A plain `(void *)0x00100100` sentinel is
+    /// not.
+    pub(crate) volatile: bool,
 }
 
 /// A crash at a fixed device-register address.
@@ -100,19 +105,38 @@ fn fault_address(raw: &serde_json::Value) -> Option<u64> {
 
 /// The register addresses `files` and the headers they include name.
 pub(crate) fn registers(files: &[PathBuf]) -> Vec<Register> {
-    let mut sources = Vec::new();
-    let mut seen = HashSet::new();
-    for file in files {
-        collect(file, 0, &mut seen, &mut sources);
-    }
-    let mut defines: BTreeMap<String, Define> = BTreeMap::new();
-    for source in &sources {
-        for (name, define) in defines_in(source) {
-            defines.entry(name).or_insert(define);
+    let scan = Scan::of(files);
+    registers_in(&scan)
+}
+
+/// The sources one scan reads and the macros they define.
+struct Scan {
+    sources: Vec<Source>,
+    defines: BTreeMap<String, Define>,
+}
+
+impl Scan {
+    fn of(files: &[PathBuf]) -> Self {
+        let mut sources = Vec::new();
+        let mut seen = HashSet::new();
+        for file in files {
+            collect(file, 0, &mut seen, &mut sources);
         }
+        let mut defines: BTreeMap<String, Define> = BTreeMap::new();
+        for source in &sources {
+            for (name, define) in defines_in(source) {
+                defines.entry(name).or_insert(define);
+            }
+        }
+        Self { sources, defines }
     }
+}
+
+fn registers_in(scan: &Scan) -> Vec<Register> {
+    let Scan { sources, defines } = scan;
+    let volatile = VolatileNames::of(scan);
     let mut out = Vec::new();
-    for source in &sources {
+    for source in sources {
         for (line, mut text, macro_name) in logical_lines(source) {
             // A register macro taking an offset names its device's base.
             if let Some(params) = macro_name
@@ -124,8 +148,8 @@ pub(crate) fn registers(files: &[PathBuf]) -> Vec<Register> {
                     text = replace_word(&text, param, "0");
                 }
             }
-            for operand in cast_operands(&text) {
-                if let Some(address) = evaluate(&operand, &defines, 0)
+            for (cast, operand) in casts(&text) {
+                if let Some(address) = evaluate(&operand, defines, 0)
                     .filter(|address| *address >= LOWEST_DEVICE_ADDRESS)
                 {
                     out.push(Register {
@@ -133,6 +157,7 @@ pub(crate) fn registers(files: &[PathBuf]) -> Vec<Register> {
                         name: macro_name.clone(),
                         file: source.path.clone(),
                         line,
+                        volatile: volatile.cast_is_volatile(&cast),
                     });
                 }
             }
@@ -286,33 +311,46 @@ static POINTER_CAST: LazyLock<Regex> = LazyLock::new(|| {
 /// The operand after each pointer cast in `text`: the parenthesized expression
 /// or the token that follows it.
 fn cast_operands(text: &str) -> Vec<String> {
+    casts(text)
+        .into_iter()
+        .map(|(_, operand)| operand)
+        .collect()
+}
+
+/// Each pointer cast in `text` and the operand after it.
+fn casts(text: &str) -> Vec<(String, String)> {
     POINTER_CAST
         .find_iter(text)
         .filter_map(|cast| {
-            let rest = text[cast.end()..].trim_start();
-            if rest.starts_with('(') {
-                let mut depth = 0usize;
-                for (at, c) in rest.char_indices() {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                return Some(rest[1..at].to_owned());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                None
-            } else {
-                let end = rest
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .unwrap_or(rest.len());
-                (end > 0).then(|| rest[..end].to_owned())
-            }
+            let operand = cast_operand(&text[cast.end()..])?;
+            Some((cast.as_str().to_owned(), operand))
         })
         .collect()
+}
+
+/// The parenthesized expression or the token at the start of `rest`.
+fn cast_operand(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        return (end > 0).then(|| rest[..end].to_owned());
+    }
+    let mut depth = 0usize;
+    for (at, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[1..at].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The constant `expression` is, with the object-like macros of `defines`
@@ -529,6 +567,524 @@ impl Parser<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What a target's code does with the registers (#341)
+// ---------------------------------------------------------------------------
+
+/// The qualifiers that make an access volatile: `volatile` and the CMSIS
+/// register qualifiers. A macro the sources define as one of them counts too.
+const VOLATILE_QUALIFIERS: &[&str] = &["volatile", "__IO", "__I", "__O", "__IOM", "__IM", "__OM"];
+
+/// Cap on the functions one target's reach follows.
+const MAX_REACHED_FUNCTIONS: usize = 256;
+/// How deep a macro body is expanded when looking for register names.
+const MAX_MACRO_DEPTH: usize = 8;
+
+static WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex"));
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    WORD.find_iter(text).map(|word| word.as_str())
+}
+
+/// The words and type names that make a cast a volatile access.
+struct VolatileNames {
+    qualifiers: HashSet<String>,
+    /// Typedefs and struct tags of volatile types or of structs with
+    /// volatile members (a CMSIS `USART_TypeDef`).
+    types: HashSet<String>,
+}
+
+static STRUCT_OPEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(typedef\s+)?((?:[A-Za-z_]\w*\s+)*?)(?:struct|union)\s*([A-Za-z_]\w*)?\s*\{")
+        .expect("valid regex")
+});
+static PLAIN_TYPEDEF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\btypedef\s+([^;{}]*?)\b([A-Za-z_]\w*)\s*;").expect("valid regex")
+});
+
+impl VolatileNames {
+    fn of(scan: &Scan) -> Self {
+        let mut qualifiers: HashSet<String> = VOLATILE_QUALIFIERS
+            .iter()
+            .map(|qualifier| (*qualifier).to_owned())
+            .collect();
+        // `#define __IO volatile`, `#define __I volatile const`.
+        for (name, define) in &scan.defines {
+            let body: Vec<&str> = words(&define.body).collect();
+            if define.params.is_none()
+                && body.iter().any(|word| qualifiers.contains(*word))
+                && body
+                    .iter()
+                    .all(|word| *word == "const" || qualifiers.contains(*word))
+            {
+                qualifiers.insert(name.clone());
+            }
+        }
+        let mut names = Self {
+            qualifiers,
+            types: HashSet::new(),
+        };
+        let texts: Vec<String> = scan
+            .sources
+            .iter()
+            .map(|source| code_only(&source.text))
+            .collect();
+        // Twice, so a struct of volatile typedefs declared before them counts.
+        for _ in 0..2 {
+            for text in &texts {
+                names.collect_types(text);
+            }
+        }
+        names
+    }
+
+    fn is_volatile_word(&self, word: &str) -> bool {
+        self.qualifiers.contains(word) || self.types.contains(word)
+    }
+
+    fn mentions_volatile(&self, text: &str) -> bool {
+        words(text).any(|word| self.is_volatile_word(word))
+    }
+
+    /// Whether `cast` (`(volatile uint32_t *)`, `(UART_TypeDef *)`) is a
+    /// volatile access.
+    fn cast_is_volatile(&self, cast: &str) -> bool {
+        self.mentions_volatile(cast)
+    }
+
+    fn collect_types(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut found = Vec::new();
+        for open in STRUCT_OPEN.captures_iter(text) {
+            let whole = open.get(0).expect("match");
+            let Some(close) = matching_brace(bytes, whole.end() - 1) else {
+                continue;
+            };
+            let body = &text[whole.end()..close];
+            let qualified = open
+                .get(2)
+                .is_some_and(|prefix| self.mentions_volatile(prefix.as_str()));
+            if !(qualified || self.mentions_volatile(body)) {
+                continue;
+            }
+            if let Some(tag) = open.get(3) {
+                found.push(tag.as_str().to_owned());
+            }
+            if open.get(1).is_some() {
+                let rest = &text[close + 1..];
+                let declarators = &rest[..rest.find(';').unwrap_or(rest.len())];
+                found.extend(
+                    words(declarators)
+                        .filter(|word| !self.qualifiers.contains(*word) && *word != "const")
+                        .map(str::to_owned),
+                );
+            }
+        }
+        for typedef in PLAIN_TYPEDEF.captures_iter(text) {
+            if self.mentions_volatile(&typedef[1]) {
+                found.push(typedef[2].to_owned());
+            }
+        }
+        self.types.extend(found);
+    }
+}
+
+/// `text` with comments, string and character literals and preprocessor
+/// lines blanked, keeping every newline: the code a function parse reads.
+fn code_only(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('/', Some('*')) => {
+                chars.next();
+                let mut last = ' ';
+                for c in chars.by_ref() {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    if last == '*' && c == '/' {
+                        break;
+                    }
+                    last = c;
+                }
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('"' | '\'', _) => {
+                out.push(' ');
+                let mut escaped = false;
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(' ');
+                    if escaped {
+                        escaped = false;
+                    } else if inner == '\\' {
+                        escaped = true;
+                    } else if inner == c {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Preprocessor lines, with their continuations.
+    let mut blanked = String::with_capacity(out.len());
+    let mut continued = false;
+    for line in out.split_inclusive('\n') {
+        let directive = continued || line.trim_start().starts_with('#');
+        continued = directive && line.trim_end_matches('\n').ends_with('\\');
+        if directive {
+            blanked.extend(line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+        } else {
+            blanked.push_str(line);
+        }
+    }
+    blanked
+}
+
+/// The index of the `}` closing the `{` at `open`.
+fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The index of the `(` opening the `)` at the end of `text`.
+fn matching_open_paren(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, byte) in text.bytes().enumerate().rev() {
+        match byte {
+            b')' => depth += 1,
+            b'(' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The name of the function whose body opens right after `prefix`, when
+/// `prefix` ends with a parameter list (`int f(int x)`, `f(void)
+/// __attribute__((noinline))`).
+fn function_name_before(prefix: &str) -> Option<String> {
+    let mut head = prefix.trim_end();
+    loop {
+        if !head.ends_with(')') {
+            return None;
+        }
+        let open = matching_open_paren(head)?;
+        let before = head[..open].trim_end();
+        let name_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |at| at + 1);
+        let name = &before[name_start..];
+        match name {
+            "__attribute__" | "__declspec" => head = before[..name_start].trim_end(),
+            "" | "if" | "while" | "for" | "switch" | "return" | "sizeof" | "do" | "else" => {
+                return None
+            }
+            _ if name.starts_with(|c: char| c.is_ascii_digit()) => return None,
+            _ => return Some(name.to_owned()),
+        }
+    }
+}
+
+/// A function definition in a scanned source.
+struct Function {
+    file: PathBuf,
+    /// 1-based lines of its body's braces.
+    first_line: usize,
+    last_line: usize,
+    /// Its body, as [`code_only`] leaves it.
+    body: String,
+}
+
+impl Function {
+    /// Whether `register` is a cast written in this function's body (not
+    /// through a macro, which [`Reach::named`] finds by name).
+    fn spells_out(&self, register: &Register) -> bool {
+        register.name.is_none()
+            && register.file == self.file
+            && (self.first_line..=self.last_line).contains(&register.line)
+    }
+}
+
+fn functions_in(source: &Source) -> Vec<(String, Function)> {
+    let text = code_only(&source.text);
+    let bytes = text.as_bytes();
+    let line_of = |at: usize| 1 + bytes[..at].iter().filter(|b| **b == b'\n').count();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'{' if depth == 0 => {
+                let body_end = function_name_before(&text[..at])
+                    .and_then(|name| Some((name, matching_brace(bytes, at)?)));
+                if let Some((name, end)) = body_end {
+                    out.push((
+                        name,
+                        Function {
+                            file: source.path.clone(),
+                            first_line: line_of(at),
+                            last_line: line_of(end),
+                            body: text[at..=end].to_owned(),
+                        },
+                    ));
+                    at = end + 1;
+                    continue;
+                }
+                depth += 1;
+            }
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        at += 1;
+    }
+    out
+}
+
+static LOOP_HEAD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(while|for|if)\s*\(").expect("valid regex"));
+
+/// The conditions in `body` that decide whether a loop goes round again:
+/// `while (...)` (a `do ... while` too), the test of a `for (;;)`, and an
+/// `if (...)` whose statement is `break`.
+fn loop_conditions(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for head in LOOP_HEAD.captures_iter(body) {
+        let whole = head.get(0).expect("match");
+        let open = whole.end() - 1;
+        let Some(condition) = cast_operand(&body[open..]) else {
+            continue;
+        };
+        match &head[1] {
+            "while" => out.push(condition),
+            "for" => {
+                let parts: Vec<&str> = condition.split(';').collect();
+                if parts.len() == 3 {
+                    out.push(parts[1].to_owned());
+                }
+            }
+            _ => {
+                let after = body[open + condition.len() + 2..].trim_start();
+                let after = after.strip_prefix('{').unwrap_or(after).trim_start();
+                let breaks = after.strip_prefix("break").is_some_and(|rest| {
+                    !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                });
+                if breaks {
+                    out.push(condition);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The device registers a target's code accesses at fixed addresses
+/// through a volatile access, and the addresses of those it polls.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceAccess {
+    /// The registers `function` and the functions it calls (in the scanned
+    /// sources) read or write.
+    pub(crate) accessed: Vec<Register>,
+    /// The register addresses a loop condition there reads: a status poll
+    /// (`while (!(UART_SR & 0x80)) {}`) that a register holding one value
+    /// for the whole run would spin on.
+    pub(crate) polled: Vec<u64>,
+}
+
+/// What `function`, defined in `files` or the quoted headers they include,
+/// does with device registers. Nothing for a function the scan does not
+/// find. A sentinel cast (`(void *)0x00100100`) is no register access.
+pub(crate) fn device_access(files: &[PathBuf], function: &str) -> DeviceAccess {
+    let scan = Scan::of(files);
+    let registers: Vec<Register> = registers_in(&scan)
+        .into_iter()
+        .filter(|register| register.volatile)
+        .collect();
+    if registers.is_empty() {
+        return DeviceAccess::default();
+    }
+    let mut functions: BTreeMap<String, Function> = BTreeMap::new();
+    for source in &scan.sources {
+        for (name, function) in functions_in(source) {
+            functions.entry(name).or_insert(function);
+        }
+    }
+    if !functions.contains_key(function) {
+        return DeviceAccess::default();
+    }
+    let reach = Reach {
+        scan: &scan,
+        registers: &registers,
+        functions: &functions,
+        volatile: VolatileNames::of(&scan),
+    };
+    // The functions the target reaches, in call order from it.
+    let mut reached = vec![function.to_owned()];
+    let mut seen: HashSet<String> = reached.iter().cloned().collect();
+    let mut next = 0;
+    while next < reached.len() && reached.len() < MAX_REACHED_FUNCTIONS {
+        let body = &functions[&reached[next]].body;
+        let mut called = Vec::new();
+        reach.called_functions(body, 0, &mut HashSet::new(), &mut called);
+        for name in called {
+            if seen.insert(name.clone()) {
+                reached.push(name);
+            }
+        }
+        next += 1;
+    }
+    let mut accessed = BTreeSet::new();
+    let mut polled = BTreeSet::new();
+    for name in &reached {
+        let function = &functions[name];
+        accessed.extend(reach.named(&function.body));
+        accessed
+            .extend((0..registers.len()).filter(|index| function.spells_out(&registers[*index])));
+        for condition in loop_conditions(&function.body) {
+            polled.extend(reach.polled_by(&condition));
+        }
+    }
+    DeviceAccess {
+        accessed: accessed
+            .into_iter()
+            .map(|index| registers[index].clone())
+            .collect(),
+        polled: polled.into_iter().collect(),
+    }
+}
+
+struct Reach<'a> {
+    scan: &'a Scan,
+    /// The volatile register accesses of the scanned sources.
+    registers: &'a [Register],
+    functions: &'a BTreeMap<String, Function>,
+    volatile: VolatileNames,
+}
+
+impl Reach<'_> {
+    /// The functions `text` calls, through the macros it uses too.
+    fn called_functions(
+        &self,
+        text: &str,
+        depth: usize,
+        macros: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for word in words(text) {
+            if self.functions.contains_key(word) {
+                out.push(word.to_owned());
+            }
+            if let Some(define) = self.scan.defines.get(word) {
+                if depth < MAX_MACRO_DEPTH && macros.insert(word.to_owned()) {
+                    self.called_functions(&define.body, depth + 1, macros, out);
+                }
+            }
+        }
+    }
+
+    /// The registers `text` names, directly or through the macros it uses.
+    fn named(&self, text: &str) -> BTreeSet<usize> {
+        let mut names = HashSet::new();
+        self.expand(text, 0, &mut names);
+        self.registers
+            .iter()
+            .enumerate()
+            .filter(|(_, register)| {
+                register
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| names.contains(name))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Every word `text` holds, with the bodies of the macros it uses.
+    fn expand(&self, text: &str, depth: usize, out: &mut HashSet<String>) {
+        for word in words(text) {
+            if !out.insert(word.to_owned()) {
+                continue;
+            }
+            if let Some(define) = self.scan.defines.get(word) {
+                if depth < MAX_MACRO_DEPTH {
+                    self.expand(&define.body, depth + 1, out);
+                }
+            }
+        }
+    }
+
+    /// The register addresses `condition` reads: the registers it names,
+    /// the volatile casts of constants in it, and the registers of the
+    /// functions it calls.
+    fn polled_by(&self, condition: &str) -> BTreeSet<u64> {
+        let mut out: BTreeSet<u64> = self
+            .named(condition)
+            .into_iter()
+            .map(|index| self.registers[index].address)
+            .collect();
+        for (cast, operand) in casts(condition) {
+            if self.volatile.cast_is_volatile(&cast) {
+                if let Some(address) = evaluate(&operand, &self.scan.defines, 0)
+                    .filter(|address| *address >= LOWEST_DEVICE_ADDRESS)
+                {
+                    out.insert(address);
+                }
+            }
+        }
+        let mut called = Vec::new();
+        self.called_functions(condition, 0, &mut HashSet::new(), &mut called);
+        let mut seen = HashSet::new();
+        while let Some(name) = called.pop() {
+            if seen.len() >= MAX_REACHED_FUNCTIONS || !seen.insert(name.clone()) {
+                continue;
+            }
+            let function = &self.functions[&name];
+            out.extend(
+                self.named(&function.body)
+                    .into_iter()
+                    .map(|index| self.registers[index].address),
+            );
+            out.extend(
+                self.registers
+                    .iter()
+                    .filter(|register| function.spells_out(register))
+                    .map(|register| register.address),
+            );
+            self.called_functions(&function.body, 0, &mut HashSet::new(), &mut called);
+        }
+        out
+    }
+}
+
 /// `text` with every whole-word `word` replaced by `with`.
 fn replace_word(text: &str, word: &str, with: &str) -> String {
     let pattern = Regex::new(&format!(r"\b{}\b", regex::escape(word))).expect("escaped word");
@@ -610,6 +1166,85 @@ mod tests {
         // A wild address, or NULL, is not one.
         assert!(register_fault(&segv(&c, "0x7ffd12345678")).is_none());
         assert!(register_fault(&segv(&c, "0x000000000000")).is_none());
+    }
+
+    /// #341: only a volatile access is a register: a volatile cast, a CMSIS
+    /// qualifier, or a struct whose members are volatile. A plain pointer
+    /// cast of a constant (list.h's poison values) is not.
+    #[test]
+    fn a_register_access_is_volatile_and_a_sentinel_cast_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = source(
+            dir.path(),
+            "dev.c",
+            "#define __IO volatile\n\
+             typedef struct { __IO unsigned SR; __IO unsigned DR; } USART_TypeDef;\n\
+             typedef struct { unsigned a; unsigned b; } plain_t;\n\
+             typedef volatile unsigned reg32_t;\n\
+             #define USART1 ((USART_TypeDef *) 0x40011000u)\n\
+             #define TABLE ((plain_t *) 0x40022000u)\n\
+             #define CTRL (*(reg32_t *) 0x40033000u)\n\
+             #define RAW (*(volatile unsigned *) 0x40044000u)\n\
+             #define LIST_POISON1 ((void *) 0x00100100)\n\
+             int f(void) { return (int)(USART1->SR + TABLE->a + CTRL + RAW); }\n",
+        );
+        let volatile: Vec<(u64, bool)> = registers(&[c])
+            .into_iter()
+            .map(|register| (register.address, register.volatile))
+            .collect();
+        assert_eq!(
+            volatile,
+            [
+                (0x4001_1000, true),
+                (0x4002_2000, false),
+                (0x4003_3000, true),
+                (0x4004_4000, true),
+                (0x0010_0100, false),
+            ]
+        );
+    }
+
+    /// #341: the registers a target's code reaches (through the functions it
+    /// calls and the macros it uses), and the ones a loop condition polls.
+    #[test]
+    fn a_targets_reach_and_its_polls_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        source(dir.path(), "uart.h", UART_H);
+        let c = source(
+            dir.path(),
+            "uart.c",
+            "#include \"uart.h\"\n\
+             #define GPIO (*(volatile unsigned *)0x48000010u)\n\
+             static const char *banner = \"while (UART_SR) { not code }\";\n\
+             static void wait_ready(void) { while (!(UART_SR & 0x80)) {} }\n\
+             static int level(void) { return (int)GPIO; }\n\
+             int send(int c) { wait_ready(); UART_REG(4) = (unsigned)c; return level(); }\n\
+             int direct(void) { return *(volatile unsigned *)0x50000004u; }\n\
+             int pure(int x) { return x * 2; }\n",
+        );
+        let access = device_access(std::slice::from_ref(&c), "send");
+        let mut names: Vec<&str> = access
+            .accessed
+            .iter()
+            .filter_map(|register| register.name.as_deref())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["GPIO", "UART_REG", "UART_SR"]);
+        assert_eq!(access.polled, [0x4001_1000]);
+
+        let direct = device_access(std::slice::from_ref(&c), "direct");
+        let addresses: Vec<u64> = direct.accessed.iter().map(|r| r.address).collect();
+        assert_eq!(addresses, [0x5000_0004]);
+        assert!(direct.polled.is_empty());
+
+        assert_eq!(
+            device_access(std::slice::from_ref(&c), "pure"),
+            DeviceAccess::default()
+        );
+        assert_eq!(
+            device_access(std::slice::from_ref(&c), "missing"),
+            DeviceAccess::default()
+        );
     }
 
     #[test]

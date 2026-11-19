@@ -6,6 +6,13 @@
 //! BHF-223 read, with `hardware_peripherals: not_applicable`. It is now an
 //! environment result (`lab_only`, low) with the peripheral `not_exercised`;
 //! a genuine out-of-bounds read beside it is still a HIGH finding.
+//!
+//! Since #341 the harness maps the device pages a target reads, except one
+//! whose register a loop condition polls: a register holds one value for the
+//! whole run, so the driver's `while (!(UART_SR & 0x80)) {}` would spin on
+//! every input. This runs the default (emulation on) and checks the poll
+//! keeps its throughput, its coverage and this environment result, and that
+//! the register-free target beside it claims no emulated peripheral.
 #![cfg(target_os = "linux")]
 
 use std::process::Command;
@@ -44,6 +51,7 @@ fn a_segv_on_a_device_register_is_an_environment_result() {
     let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(["auto", "--work-dir", work.to_str().unwrap()])
         .args(["--jobs", "1", "--per-target-time", "5"])
+        .env_remove("BHF_NO_MMIO_EMULATION")
         .arg(&src)
         .output()
         .expect("run bhf auto");
@@ -86,10 +94,52 @@ fn a_segv_on_a_device_register_is_an_environment_result() {
             .contains("0x40011000"));
     }
 
-    // The genuine out-of-bounds read is still a high finding.
+    // The polling target ran at its usual rate: a mapped status register
+    // would have spun every input to the per-input timeout (6 executions
+    // and 15 edges in a 10 s budget, against about a thousand and 68).
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    let send = run["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["name"] == "uart_send")
+        .unwrap_or_else(|| panic!("uart_send ran: {run:#}"));
+    let passes = send["outcome"]["passes"].as_array().unwrap();
+    let executions: u64 = passes
+        .iter()
+        .filter_map(|pass| pass["executions"].as_u64())
+        .sum();
+    let edges = passes
+        .iter()
+        .filter_map(|pass| pass["coverage_edges"].as_u64())
+        .max()
+        .unwrap_or(0);
+    assert!(executions >= 50, "{executions} executions: {send:#}");
+    assert!(edges >= 30, "{edges} edges: {send:#}");
+    assert!(
+        !stderr.contains("hung beyond"),
+        "no input hung on the status poll:\n{stderr}"
+    );
+
+    // The genuine out-of-bounds read is still a high finding, and its
+    // target, which reads no register, claims no emulated peripheral.
     let lookup = in_function("table_lookup");
     assert!(
         lookup.iter().any(|finding| finding["severity"] == "high"),
         "{doc:#}\n{stderr}"
     );
+    for finding in &lookup {
+        let id = finding["id"].as_str().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.join("results/findings").join(id).join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        let reason = raw["fidelity"]["hardware_peripherals"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!reason.starts_with("emulated"), "{raw:#}");
+    }
+    let run_md = std::fs::read_to_string(work.join("auto/run.md")).unwrap_or_default();
+    assert!(!run_md.contains("reduced-fidelity"), "{run_md}");
 }
