@@ -90,8 +90,8 @@ proprietary toolchain — is listed separately, with the evidence recorded under
 `docs/validation/` (see §5, §6). The emulator-in-the-loop lane was run live on
 2026-09-27 — RV-1/RV-2/RV-3 passed on QEMU 8.2.2
 (`docs/validation/2026-09-27-hil-emu-live-qemu.md`); the steps still *unproven
-until run* are real silicon, proprietary RTOS images, the TCP/serial agent
-transport, and Renode. Software-complete is **never** a claim of validated
+until run* are real silicon, proprietary RTOS images, and the TCP/serial agent
+transport. Software-complete is **never** a claim of validated
 on-target capability.
 Where a track has a purely *library* capability that is not yet reachable from a
 `bhf` command, that is called out explicitly rather than counted as a live
@@ -101,10 +101,10 @@ feature.
 |---|---|---|---|---|
 | CC-1 | `a0ca452` | yes | `crates/actionability/src/fidelity.rs`; JSON schema `docs/finding-report-fields.md` (`fidelity` block) | — (in-tree only) |
 | HDF-1 | `80d5df3` | yes | `crates/target_transport` — `agent::tests::agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault`; `coverage.rs` Semihosting/MemoryBuffer readers (incl. wrap case); `host::HostChildTransport` | real board via `GdbRemoteTransport` still gated (`hil_board.rs` / `BHF_HIL_GDB`); the live-gdbstub coverage path **validated 2026-09-27** (RV-2 `live_gdb`, qemu-arm); the `agent:tcp` lane against the reference agent as a FreeRTOS task **validated 2026-11-18** (`transport_freertos_agent_cli`, qemu-arm; [record](validation/2026-11-18-freertos-agent.md)) |
-| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | The gdbstub and `qemu-system` backends **validated 2026-09-27** (RV-2 `live_gdb`, RV-3 `live_fullsystem`); the shipped CLI drives them live (`crates/cli/tests/transport_fuzz_qemu_cli.rs`), and the FreeRTOS emulator profile (`crates/target_transport/tests/freertos/`, #84) passes clean → fault → clean through the CLI. The memory-read transports take the staging buffer's capacity (`input_cap=`, #162). Open: a Renode transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340)), a target-side agent for the TCP/serial lane ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and virtual time; `agent:serial` opens its port raw with a read deadline (#164) |
+| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | The gdbstub and `qemu-system` backends **validated 2026-09-27** (RV-2 `live_gdb`, RV-3 `live_fullsystem`); the shipped CLI drives them live (`crates/cli/tests/transport_fuzz_qemu_cli.rs`), and the FreeRTOS emulator profile (`crates/target_transport/tests/freertos/`, #84) passes clean → fault → clean through the CLI. The memory-read transports take the staging buffer's capacity (`input_cap=`, #162). Open: a target-side agent for the TCP/serial lane ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and virtual time; `agent:serial` opens its port raw with a read deadline (#164) |
 | HDF-2 | `229105a` | yes | `crates/cli/src/transport_fault.rs` — backend-neutral `Fault`→finding mapping; cross-build compiler guards | on-emulator Cortex-M hard-fault reporting **validated 2026-09-27** (RV-3 `live_fullsystem`: input `0xF7` → `udf` → `HardFault_Handler`, distinct fault breadcrumb); on-silicon vectors still gated |
 | HDF-3 | `dbebbf7` | partial: decoded arguments get typed values little-endian, as `bhf_decode.h` reads them on every target ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)); the ABI model's target-byte-order struct images are not used in production | `crates/type_model/src/abi.rs` — `struct_image_is_emitted_in_target_byte_order`, `host_abi_matches_the_x86_64_lab_host`; `crates/cli/src/auto/cross_target.rs` PPC/MIPS/SPARC triples | BE-only branch reached under `qemu-ppc64` but not on the LE host **validated 2026-09-27** (RV-1, `powerpc64-linux-gnu-gcc` + qemu-ppc64) |
-| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). Proprietary RTOS images and Renode = documented follow-ups; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
+| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). The Renode lane (`renode:`, #340) ran against Renode 1.17.0 (RV-7); proprietary RTOS images remain a follow-up; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
 | HDF-5 | `d31a824` | yes | `crates/target_rank/src/c_rank.rs` — `intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven`, `mmio_polled_register_reader_is_a_channel_consumer`; `crates/harness_gen/src/c_generate.rs` — `peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence` | — (in-tree only) |
 | HDF-6 | `94ad2c4` | yes | `crates/c_stub_gen/src/lib.rs` — `fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e`; `crates/bhf_runtrace_shim/src/{fakes/fuzz_input.rs,hooks/rtos.rs}` (fuzz-driven RTOS channels + MMIO fill) | bare-metal MMIO interception on a real cross build (the host stub-isolation lane is in-tree) |
 | HDF-7 | `dc47e31` / #58 | yes | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/protocol_session/` — profile parse / model compile / encode+repair+ref-resolution / graph-gated mutation / drive+replay+minimize (38 tests); `crates/cli/tests/session_fuzz_cli.rs` — `bhf fuzz --protocol-profile` drives a live-TCP toy `OPEN`/`WRITE` service to the clean-exit boundary, then replays after a fresh reset and minimizes | **CLI-wired (#58):** `bhf fuzz --protocol-profile` drives a response-dependent multi-message session over a TCP `SessionTransport`, with separate code vs state/transition novelty, a `session.json` finding artifact, and replay/minimize. IIOP/GIOP dispatch and a live DDS transport remain documented follow-ups |
@@ -128,8 +128,7 @@ feature.
   gdbstub), RV-3 (`qemu-system-arm` full-system) all passed
   (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
   against their resource (§5, §6): a real board/probe (`hil_board.rs` /
-  `BHF_HIL_GDB`), proprietary RTOS images, the TCP/serial agent transport, and
-  Renode.
+  `BHF_HIL_GDB`), proprietary RTOS images, and the TCP/serial agent transport.
 - **HDF-4 Nyx is retired, not finished.** `nyx_adapter` is scaffolding
   superseded by `FullSystemTransport`; it collects zero coverage and is on no
   live path (CC-2).
@@ -377,12 +376,13 @@ run was **validated 2026-09-27** against a BHF-authored image (RV-3
 `docs/validation/2026-09-27-hil-emu-live-qemu.md`); a lawfully-obtained
 proprietary RTOS image remains a gated follow-up.
 
-*Deliverable 2 (Renode)* is a documented follow-up (see the `fullsystem` module
-docs): a Renode `.resc` board exposes a GDB server, so the same `GdbClient` +
-`MemoryBufferReader` reconstruct coverage and Renode `Save`/`Load` play the
-snapshot role; only a small monitor adapter (Renode's telnet CLI, not QMP) is
-needed in place of `QmpClient`. It is deferred rather than shipped untested
-because there is no Renode instance in-tree to validate against.
+*Deliverable 2 (Renode)* ships as `--target-transport renode:` (#340):
+`target_transport::renode` drives Renode's telnet monitor (`Save`/`Load`, and
+`mach set` plus `machine StartGdbServer` after each `Load`, which drops both)
+and reuses the qemu-system lane's gdb run and `MemoryBufferReader`. It was run
+against Renode 1.17.0 with a bare-metal Cortex-M3 image on a minimal board
+(`live_renode`, `transport_fuzz_renode_cli`; RV-7 in `scripts/hil-emu.sh`).
+Vendor board scripts and an RTOS under Renode are unvalidated.
 
 *Deliverable 3 (Nyx)* resolves roadmap **CC-2** for nyx by **retiring** the
 `nyx_adapter` stub: it has no consumers, does not implement the transport seam,
@@ -608,7 +608,7 @@ See §1a for the full per-track delivered-status table.
   `armhf` cross gcc) and passed — RV-1/RV-2/RV-3
   (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
   against their resource: a real board (`hil_board.rs` / `BHF_HIL_GDB`), the
-  TCP/serial agent transport, proprietary RTOS images, and Renode. Completion of
+  TCP/serial agent transport, and proprietary RTOS images. Completion of
   a track's *software* is not a claim of validated on-target capability.
 - **Proprietary RTOS fidelity.** BHF's vendor-API models are scaffolding; they
   make code build and fuzz on the host, they do not reproduce Wind River /

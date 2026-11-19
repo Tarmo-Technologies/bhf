@@ -3479,6 +3479,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/transport_fuzz_renode_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/transport_fuzz_timeout_cli.rs",
       "license": "Apache-2.0"
     },
@@ -5071,6 +5075,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/src/renode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/src/testsupport.rs",
       "license": "Apache-2.0"
     },
@@ -5127,7 +5135,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/tests/live_renode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/tests/live_rtos.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/renode_mock.rs",
       "license": "Apache-2.0"
     },
     {

@@ -570,13 +570,16 @@ pub struct FuzzArgs {
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
     /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
-    /// needs `--transport-coverage-map`). Live agent/gdb/qemu backends are
+    /// needs `--transport-coverage-map`), and
+    /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
+    /// board: its telnet monitor saves and loads the baseline; needs
+    /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are
     /// hardware/emulator-gated; a malformed spec is a descriptive error.
     #[arg(long = "target-transport", value_name = "SPEC")]
     pub target_transport: Option<String>,
 
     /// Locate the input staging buffer and the on-target coverage ring for the
-    /// memory-read transports (`gdb`, `qemu-system`) as
+    /// memory-read transports (`gdb`, `qemu-system`, `renode`) as
     /// `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>`,
     /// plus `input_len=<addr>` when the firmware reads the input's length from
     /// a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` for the comparison

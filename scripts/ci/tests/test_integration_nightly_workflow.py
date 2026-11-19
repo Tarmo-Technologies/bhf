@@ -456,5 +456,67 @@ class IntegrationNightlyOssfuzzSandboxTests(unittest.TestCase):
         self.assertIn("no working bubblewrap or firejail here (set {SANDBOX_REQUIRED}=1", tests)
 
 
+class RenodeLaneTests(unittest.TestCase):
+    """The Renode transport's CLI test skips in the hash shards, which do not
+    install Renode, and runs in hil-emu against a pinned Renode (#340)."""
+
+    def test_the_hash_shards_may_skip_only_the_renode_cli_test(self) -> None:
+        allowed = (ROOT / "scripts/ci/allowed-skips.txt").read_text()
+        entry = (
+            "bhf::transport_fuzz_renode_cli::*  skip transport_fuzz_renode_cli: renode is not "
+            "installed (set BHF_RENODE_CLI=1*"
+        )
+        self.assertIn(entry, allowed)
+        tests = (ROOT / "crates/cli/tests/transport_fuzz_renode_cli.rs").read_text()
+        self.assertIn('const RENODE_REQUIRED: &str = "BHF_RENODE_CLI";', tests)
+        self.assertIn(
+            '"skip transport_fuzz_renode_cli: renode is not installed (set {RENODE_REQUIRED}=1',
+            tests,
+        )
+
+    def test_renode_is_pinned_by_digest(self) -> None:
+        script = (ROOT / "scripts/ci/install-renode.sh").read_text()
+        self.assertIn("renode_version=1.17.0\n", script)
+        self.assertIn(
+            "renode_sha256=4ba7c68b59e2447f188ef4b4b112fcccd2802582c460beedceb63b84e5605a5f\n",
+            script,
+        )
+        self.assertEqual(script.count('"$here/fetch.sh" \\\n'), 1, script)
+        self.assertNotIn("curl", script)
+        self.assertIn('echo "BHF_RENODE=$dir/renode/renode"', script)
+
+    def test_hil_emu_installs_renode_and_requires_both_live_tests(self) -> None:
+        workflow = (ROOT / ".github/workflows/hil-emu.yml").read_text()
+        install = workflow.index('bash scripts/ci/install-renode.sh "$HOME/.local/opt/renode-ci" >> "$GITHUB_ENV"')
+        run = workflow.index("run: scripts/hil-emu.sh")
+        self.assertLess(install, run)
+        lane = (ROOT / "scripts/hil-emu.sh").read_text()
+        self.assertIn(
+            "BHF_REQUIRE_TOOLS=1 cargo test --locked -p target_transport --test live_renode", lane
+        )
+        self.assertIn("BHF_REQUIRE_TOOLS=1 BHF_RENODE_CLI=1 cargo test --locked \\\n", lane)
+        self.assertIn("-p bhf --test transport_fuzz_renode_cli", lane)
+
+    def test_the_lane_fails_without_renode(self) -> None:
+        lane = (ROOT / "scripts/hil-emu.sh").read_text()
+        start = lane.index('[ -n "${BHF_RENODE:-}" ]')
+        guard = lane[start : lane.index("\n}\n", start) + 3]
+        with tempfile.TemporaryDirectory() as empty:
+            env = {"PATH": empty, "BHF_RENODE": ""}
+            missing = subprocess.run(
+                ["/bin/bash", "-c", guard + "echo ran"], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(missing.returncode, 1, missing)
+            self.assertIn("RV-7 needs Renode", missing.stderr)
+            launcher = Path(empty) / "renode"
+            launcher.write_text("#!/bin/sh\n")
+            launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+            env["BHF_RENODE"] = str(launcher)
+            found = subprocess.run(
+                ["/bin/bash", "-c", guard + "echo ran"], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(found.stdout.strip(), "ran", found)
+
+
 if __name__ == "__main__":
     unittest.main()

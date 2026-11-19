@@ -5,7 +5,8 @@
 # Runs the REAL (live-QEMU) transport validations — RV-1 (cross-endian fidelity),
 # RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M),
 # RV-4 (pinned FreeRTOS task/queue, CLI finding and replay), RV-5 (the
-# reference agent's Zephyr sample, CLI finding and replay) —
+# reference agent's Zephyr sample, CLI finding and replay), RV-7 (the Renode
+# transport against a pinned Renode, library and CLI) —
 # via scripts/hil-emu.sh. The script hard-fails if the qemu / cross toolchains are
 # missing and runs the gated tests with BHF_HIL_REQUIRE=1, so the emulator
 # validations CANNOT silently skip in CI. The physical-board lane
@@ -30,6 +31,9 @@ on:
       - "c_runtime/zephyr/**"
       - "crates/cli/tests/transport_zephyr_agent_cli.rs"
       - "scripts/ci/install-zephyr.sh"
+      - "crates/cli/tests/transport_fuzz_renode_cli.rs"
+      - "scripts/ci/install-renode.sh"
+      - "scripts/ci/fetch.sh"
       - "scripts/hil-emu.sh"
       - ".github/workflows/hil-emu.yml"
   schedule:
@@ -100,6 +104,11 @@ jobs:
         run: |
           bash scripts/ci/install-zephyr.sh >> "$GITHUB_ENV"
           echo "$HOME/.local/opt/zephyrproject/.venv/bin" >> "$GITHUB_PATH"
+
+      # The Renode transport's live tests (RV-7) run against this pinned
+      # portable Renode; the script puts BHF_RENODE in the environment.
+      - name: Install Renode
+        run: bash scripts/ci/install-renode.sh "$HOME/.local/opt/renode-ci" >> "$GITHUB_ENV"
 
       - name: Run the emulator-in-the-loop validations
         run: scripts/hil-emu.sh

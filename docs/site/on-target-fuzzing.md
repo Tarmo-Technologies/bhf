@@ -38,7 +38,8 @@ An embedded campaign has two halves:
    body on the host under sanitizers ("stub-isolation lane").
 2. **Back half — execute & harvest.** The `--target-transport` seam delivers an
    input, triggers one execution on the real target (on-device agent, debug
-   probe/emulator over gdb-remote, or a full-system `qemu-system` guest), and
+   probe/emulator over gdb-remote, or a full-system `qemu-system` guest or
+   Renode board), and
    reads back coverage + status + faults. The built-in engine consumes all
    transports through one trait and stays backend-agnostic.
 
@@ -54,6 +55,7 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
+| A cross toolchain + Renode (a board `qemu-system` does not model: most STM32, nRF52, i.MX RT parts) | **Full-system emulator (Renode)** | Real core, Renode's peripheral models, `Save`/`Load` reset | ✅ Renode 1.17, bare-metal Cortex-M3 on a minimal board (`live_renode`, `transport_fuzz_renode_cli`; they run when Renode is installed). Vendor board scripts and an RTOS under Renode are unvalidated. |
 | An open RTOS (FreeRTOS, Zephyr) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. ✅ The reference agent as a Zephyr module (`c_runtime/zephyr/`): its `qemu_cortex_m3` sample runs clean → fault → clean and replays under `qemu-system-arm`. Kernels are bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
@@ -353,6 +355,41 @@ application references one; the reference profile's `app.c` keeps
 `bhf_kernel_version` for this. Without `firmware=`, the profile says that no
 identity was recorded.
 
+#### Renode boards
+
+`renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` is the same lane for
+a board Renode models and `qemu-system` does not. Start
+Renode with its monitor on a TCP port and the board loaded but **not
+started** (no `start` in the script):
+
+```sh
+renode --disable-gui -P 1234 board.resc &   # board.resc: mach create,
+                                            # LoadPlatformDescription, sysbus LoadELF
+bhf fuzz bhf_work --harness H-C0001 \
+  --target-transport "renode:monitor=127.0.0.1:1234,gdb=127.0.0.1:3333,snapshot=/tmp/base.save,done=0x188,fault=0x20000100" \
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+```
+
+BHF connects to the monitor, `pause`s, and writes the baseline with
+`Save @PATH`. Before each input it runs `Load @PATH`, then
+`machine StartGdbServer PORT` with the `gdb=` port, because `Load` replaces
+the machine and its gdb server goes with it. It then dials gdb, plants the
+`done=` breakpoint and runs the input as on `qemu-system:`. The other keys
+(`done_kind`, `fault_width`, `fault_clear`, `firmware`, `cycles`, `cpu_hz`,
+`task_id`) work as they do there.
+
+- `snapshot=` is a path on the Renode host; the default `bhf-baseline.save` is
+  relative to Renode's working directory. Its directory must exist: Renode
+  1.17 exits when `Save` cannot write the file. Each `Save` replaces the
+  file. The path may use only `[A-Za-z0-9._/\:-]`, since it is part of a
+  monitor command line.
+- Renode's gdb server listens on the port `gdb=` dials, so dial it directly,
+  not through a port mapping that changes the number.
+- A failed monitor command (`There was an error executing command ...`,
+  `No such command or device`) stops the run with Renode's text.
+- `Load` reloads the whole emulation, so a run costs more than a `loadvm`:
+  about 0.4 s per input on the minimal board in the tests.
+
 ### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
 For a device running an agent that receives inputs and streams edges and
@@ -637,10 +674,12 @@ bhf fuzz bhf_work --harness H-C0001 \
 big-endian PPC64 fidelity (RV-1), the gdb-remote client against a real
 `qemu-arm` stub (RV-2), and the full-system Cortex-M snapshot path with a
 planted HardFault (RV-3), and the pinned FreeRTOS task/queue profile with
-CLI finding and replay (RV-4). It **hard-fails** if a required tool is missing so the
-lane cannot silently skip:
+CLI finding and replay (RV-4), and the Renode transport, library and CLI,
+against the Renode `BHF_RENODE` names (RV-7). It **hard-fails** if a required
+tool is missing so the lane cannot silently skip:
 
 ```sh
+eval "$(scripts/ci/install-renode.sh ~/.local/opt/renode-ci | sed 's/^/export /')"
 BHF_HIL_REQUIRE=1 scripts/hil-emu.sh
 ```
 
@@ -691,10 +730,12 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   physical board (`hil_board.rs` + `BHF_HIL_GDB`), the TCP/serial `agent`
   transport (no target-side agent ships yet, [#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and proprietary
   RTOS images / vendor toolchains (BHF ships none — bring your own).
-- **Not available yet:** a Renode full-system transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340));
-  `--target-transport` takes `agent`, `gdb` and `qemu-system` only. Renode's
-  gdbserver can be driven through `gdb:`, without snapshot reset. Nor is
-  typed mutation of a raw struct image in a big-endian
+- **Renode:** `renode:` was run against Renode 1.17 with a bare-metal
+  Cortex-M3 image on a minimal board (`crates/target_transport/tests/live_renode.rs`
+  and `crates/cli/tests/transport_fuzz_renode_cli.rs`, which skip without
+  Renode; `BHF_RENODE=/path/to/renode` points them at a portable build). Vendor
+  board scripts, peripherals and an RTOS under Renode are unvalidated.
+- **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).
 - **Non-goals:** BHF does not bundle or crack vendor toolchains, ship RTOS

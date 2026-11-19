@@ -34,5 +34,10 @@ bhf::binary_adapter_tools::*  skip binary_adapter_tools: set BHF_BINARY_ANALYZER
 # ossfuzz-sandbox job allows them and runs these with BHF_OSSFUZZ_SANDBOX=1.
 bhf::ossfuzz_import::build_sh_*  skip build_sh_*: no working bubblewrap or firejail here (set BHF_OSSFUZZ_SANDBOX=1 to require one)
 
+# The Renode transport's CLI test needs Renode, which the hash shards do not
+# install; hil-emu.yml installs it (scripts/ci/install-renode.sh) and runs it
+# with BHF_RENODE_CLI=1.
+bhf::transport_fuzz_renode_cli::*  skip transport_fuzz_renode_cli: renode is not installed (set BHF_RENODE_CLI=1*
+
 # The arrow-key installer prompt needs a real terminal, which no CI job has.
 bhf::offline_dist_scripts::offline_dist_installer_interactive_prompt_accepts_down_arrow_to_ok  skip: interactive arrow-key TUI needs a real terminal*

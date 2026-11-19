@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+### Added
+- `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
+  fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
+  baseline with `Save` and restores it with `Load` before each input, and gdb
+  runs the input as on `qemu-system:`. It takes the same `done=`, `fault=`,
+  `firmware=`, `cycles=` and `task_id=` keys. The gdb client now drops a stop
+  reply a stub sends unprompted, as Renode's does.
+
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto
   --rust-private` (#244), or `rust-private = true` in the config; it was
