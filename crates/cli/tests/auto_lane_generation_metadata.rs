@@ -132,7 +132,10 @@ fn a_cobol_harness_records_its_generation() {
 
 #[test]
 fn a_rust_harness_records_its_generation() {
-    if !runs("cargo", &["+nightly", "--version"]) {
+    if !runs(
+        &support::rustup_cargo().to_string_lossy(),
+        &["+nightly", "--version"],
+    ) {
         eprintln!("skipping: no cargo nightly");
         return;
     }

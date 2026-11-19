@@ -128,7 +128,7 @@ fn rust_fuzz_fixture() -> PathBuf {
 /// failing on a machine without nightly.
 fn has_cargo_nightly() -> bool {
     let present = {
-        Command::new("cargo")
+        Command::new(support::rustup_cargo())
             .args(["+nightly", "--version"])
             .output()
             .map(|o| o.status.success())

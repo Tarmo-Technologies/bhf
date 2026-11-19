@@ -22,7 +22,7 @@ fn fixture() -> PathBuf {
 }
 
 fn has_cargo_nightly() -> bool {
-    let present = Command::new("cargo")
+    let present = Command::new(support::rustup_cargo())
         .args(["+nightly", "--version"])
         .output()
         .is_ok_and(|o| o.status.success());

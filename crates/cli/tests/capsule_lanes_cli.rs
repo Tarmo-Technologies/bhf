@@ -16,6 +16,8 @@ fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
 }
 
+mod support;
+
 /// Whether `program <args>` runs successfully here.
 fn runs(program: &str, args: &[&str]) -> bool {
     Command::new(program)
@@ -685,7 +687,10 @@ fn crc32(data: &[u8]) -> u32 {
 #[test]
 fn rust_finding_round_trips() {
     skip_unless!(
-        runs("cargo", &["+nightly", "--version"]),
+        runs(
+            &support::rustup_cargo().to_string_lossy(),
+            &["+nightly", "--version"]
+        ),
         "cargo with a rustup nightly toolchain not installed"
     );
     skip_unless!(runs("clang", &["--version"]), "clang not installed");
@@ -745,7 +750,10 @@ fn cargo_crate_cached(name: &str) -> bool {
 #[test]
 fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
     skip_unless!(
-        runs("cargo", &["+nightly", "--version"]),
+        runs(
+            &support::rustup_cargo().to_string_lossy(),
+            &["+nightly", "--version"]
+        ),
         "cargo with a rustup nightly toolchain not installed"
     );
     skip_unless!(runs("clang", &["--version"]), "clang not installed");

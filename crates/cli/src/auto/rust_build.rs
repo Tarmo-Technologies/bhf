@@ -113,10 +113,27 @@ fn parse_host_triple(version_verbose: &str) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
+/// rustup's `cargo` proxy (`$CARGO_HOME/bin/cargo`), the one that takes a
+/// `+toolchain` argument, when it is installed. Under `cargo run` or `cargo
+/// test` on Windows, rustup puts the running toolchain's own `bin` first on
+/// PATH, and that cargo refuses `+nightly`.
+fn rustup_cargo() -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })?;
+    let cargo = home
+        .join("bin")
+        .join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    cargo.is_file().then_some(cargo)
+}
+
 /// Probe for a usable Rust toolchain with nightly sancov support. Returns `None`
 /// (skip the lane) when cargo is absent or no nightly is installed.
 fn probe_toolchain() -> Option<RustToolchain> {
-    let cargo = which::which("cargo").ok()?;
+    let cargo = rustup_cargo().or_else(|| which::which("cargo").ok())?;
     // A container can supply a dated, preinstalled channel to avoid resolving a
     // rolling nightly while disconnected. Confirm a nightly
     // rustc actually exists by asking for its verbose version through cargo's

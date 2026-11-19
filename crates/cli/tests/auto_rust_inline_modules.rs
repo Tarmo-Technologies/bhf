@@ -45,7 +45,7 @@ pub fn digest(data: &[u8]) -> u32 {
 
 fn cargo_available() -> bool {
     let present = {
-        Command::new("cargo")
+        Command::new(support::rustup_cargo())
             .args(["+nightly", "--version"])
             .output()
             .is_ok_and(|output| output.status.success())

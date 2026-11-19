@@ -32,7 +32,7 @@ fn bhf_bin() -> PathBuf {
 
 fn has_cargo_nightly() -> bool {
     let present = {
-        Command::new("cargo")
+        Command::new(support::rustup_cargo())
             .args(["+nightly", "--version"])
             .output()
             .map(|o| o.status.success())
