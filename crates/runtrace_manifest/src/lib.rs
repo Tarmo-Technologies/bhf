@@ -219,6 +219,23 @@ pub const MANIFEST: &[ManifestEntry] = &[
         "BHF_FAKE_DETERMINISM",
         "deterministic randomness so a saved input replays identically",
     ),
+    ManifestEntry::gated(
+        "clock",
+        &[
+            b"clock_gettime\0",
+            b"gettimeofday\0",
+            b"time\0",
+            b"clock\0",
+            b"timespec_get\0",
+            b"clock_nanosleep\0",
+            b"pthread_cond_timedwait\0",
+            b"pthread_cond_clockwait\0",
+            b"sem_timedwait\0",
+            b"sem_clockwait\0",
+        ],
+        "BHF_FAKE_CLOCK",
+        "a virtual clock that each input starts over, so the same input sees the same times",
+    ),
     ManifestEntry::always_on(
         "ioctl",
         &[b"ioctl\0"],

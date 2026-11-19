@@ -181,7 +181,43 @@ fn replay(
     output
 }
 
-pub(super) fn run(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
+/// The runtrace shim's virtual-clock gate (#342).
+const FAKE_CLOCK: &str = "BHF_FAKE_CLOCK";
+
+/// Whether a child given `extra_env` on top of this process's environment
+/// would run with the shim's virtual clock on.
+fn fake_clock_on(extra_env: &[(String, String)], inherited: Option<&str>) -> bool {
+    extra_env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == FAKE_CLOCK)
+        .map(|(_, value)| value.as_str())
+        .or(inherited)
+        == Some("1")
+}
+
+/// libFuzzer runs in the harness's own process and times `-timeout` with the
+/// clock the runtrace shim fakes under `BHF_FAKE_CLOCK=1` (#342): the time it
+/// reads would advance 1 ms per read, so a hanging input would never time out
+/// and the campaign would run on until bhf's backstop stops it. Every child
+/// of a libFuzzer campaign keeps the real clock.
+fn keep_the_real_clock(extra_env: &mut Vec<(String, String)>, inherited: Option<&str>) -> bool {
+    if !fake_clock_on(extra_env, inherited) {
+        return false;
+    }
+    extra_env.push((FAKE_CLOCK.to_owned(), "0".to_owned()));
+    true
+}
+
+pub(super) fn run(mut prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
+    let inherited = std::env::var(FAKE_CLOCK).ok();
+    if keep_the_real_clock(&mut prepared.extra_env, inherited.as_deref()) {
+        bhfeprintln!(
+            "bhf fuzz: warning: {FAKE_CLOCK}=1 is ignored with --engine libfuzzer: libFuzzer \
+             runs in the harness process and times -timeout with the clock it would fake, so \
+             a hang would go undetected. Use the builtin or AFL++ engine for a virtual clock."
+        );
+    }
     reset_target_entry(&prepared.extra_env);
     let (_, cmplog_summary) = load_cmplog_for_run(prepared.cmplog_log.as_deref(), &prepared.seeds);
     let dirs = CampaignDirs::create(&prepared.work_dir, &prepared.harness_id)?;
@@ -393,6 +429,25 @@ pub(super) fn run(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #342: a libFuzzer campaign's children keep the real clock, whether
+    /// the gate came from bhf's environment or from the run's own.
+    #[test]
+    fn a_libfuzzer_campaign_keeps_the_real_clock() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let mut env = vec![pair("LD_PRELOAD", "/x/libbhf_runtrace_shim.so")];
+        assert!(!keep_the_real_clock(&mut env, None));
+        assert!(!keep_the_real_clock(&mut env, Some("0")));
+        assert_eq!(env.len(), 1);
+
+        assert!(keep_the_real_clock(&mut env, Some("1")));
+        assert_eq!(env.last(), Some(&pair(FAKE_CLOCK, "0")));
+        assert!(!fake_clock_on(&env, Some("1")));
+
+        let mut own = vec![pair(FAKE_CLOCK, "1")];
+        assert!(keep_the_real_clock(&mut own, None));
+        assert!(!fake_clock_on(&own, None));
+    }
 
     #[test]
     fn libfuzzer_artifacts_and_final_stats_are_read() {

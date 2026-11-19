@@ -27,20 +27,27 @@ the inventory without linking interceptors. A unit test in
 
 ## Adding a plugin
 
-For a hypothetical `clock` plugin that fakes `clock_gettime`:
+For a hypothetical `uname` plugin that fakes `uname`:
 
-1. Create `crates/bhf_runtrace_shim/src/hooks/clock.rs` with:
-   - A unit struct (`pub struct Clock;`).
-   - An `impl crate::sdk::FakeResource for Clock` returning
-     `name = "clock"`, the intercept list, `is_enabled` reading a
-     `BHF_FAKE_CLOCK` env var, and a one-line description.
-   - `#[no_mangle] extern "C" fn clock_gettime(...)` that returns
-     a deterministic timespec when enabled and forwards to the real
+1. Create `crates/bhf_runtrace_shim/src/hooks/uname.rs` with:
+   - A unit struct (`pub struct Uname;`).
+   - An `impl crate::sdk::FakeResource for Uname` returning
+     `name = "uname"`, the intercept list, `is_enabled` reading a
+     `BHF_FAKE_UNAME` env var, and a one-line description.
+   - `#[no_mangle] extern "C" fn uname(...)` that fills a
+     deterministic `utsname` when enabled and forwards to the real
      symbol otherwise.
 2. Register the new module in `hooks/mod.rs`.
 3. Append a matching `ManifestEntry::gated(...)` to `MANIFEST` in the
-   `runtrace_manifest` crate and a `&Clock` entry to
+   `runtrace_manifest` crate and a `&Uname` entry to
    `registry::REGISTRY`.
+
+The `clock` plugin (`Clock` in `hooks/determinism.rs`, `BHF_FAKE_CLOCK`)
+is a worked example of a hook that libc's own start-up and a sanitizer
+runtime also reach: it resolves the real functions in a load-time
+constructor instead of through `ResolvedFn`, and reads its gate from
+`environ` instead of calling `getenv`, because a lazy lookup inside that
+hook re-entered the dynamic loader.
 4. The cross-check unit test in `registry.rs` verifies the two
    slices agree.
 

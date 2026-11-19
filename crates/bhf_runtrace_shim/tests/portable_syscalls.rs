@@ -35,6 +35,14 @@ const PORTABLE_SYSCALLS: &[&str] = &[
     "SYS_getppid",
     "SYS_getuid",
     "SYS_getgid",
+    // x86_64 (228, 96) and aarch64 (113, 169, checked in libc 0.2.191): the
+    // virtual clock's pass-through before the real functions are resolved
+    // (#342).
+    "SYS_clock_gettime",
+    "SYS_gettimeofday",
+    // x86_64 (230) and aarch64 (115, checked in libc 0.2.191): an absolute
+    // sleep before the real function is resolved (#342).
+    "SYS_clock_nanosleep",
 ];
 
 #[test]

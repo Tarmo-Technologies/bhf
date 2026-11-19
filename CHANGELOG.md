@@ -21,6 +21,17 @@
   which windows it mapped (`mmio-mapped.txt`), and only those make the
   finding's `hardware_peripherals` fidelity say `emulated:`.
   `BHF_NO_MMIO_EMULATION=1` turns it off.
+- `BHF_FAKE_CLOCK=1` gives a target under the runtrace shim a virtual clock
+  (#342): `clock_gettime`, `gettimeofday`, `time`, `clock` and
+  `timespec_get` start at a fixed instant, advance 1 ms per read and start
+  over with each input, so the same input sees the same times on every run.
+  The real functions are resolved as the shim loads, never inside a call.
+  An absolute-deadline wait (`clock_nanosleep` with `TIMER_ABSTIME`,
+  `pthread_cond_timedwait`/`clockwait`, `sem_timedwait`/`clockwait`) on a
+  virtual deadline waits that long on the real clock. `bhf fuzz --engine
+  libfuzzer` ignores the gate with a warning, since libFuzzer times its
+  `-timeout` with the clock it would fake. `bhf auto --list-fakes` lists it
+  as `clock`.
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto

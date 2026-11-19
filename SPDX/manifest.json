@@ -1243,6 +1243,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/clock_fake.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/cmplog_target.rs",
       "license": "Apache-2.0"
     },
