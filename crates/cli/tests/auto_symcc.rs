@@ -337,3 +337,53 @@ fn only_the_solver_loop_passes_a_modular_arithmetic_gate() {
     let imports = std::fs::read_to_string(solved.join("symcc-import.log")).unwrap();
     assert!(!imports.trim().is_empty());
 }
+
+/// #332 with #331: on two workers per target the solver loop runs in each
+/// worker, and what it gave is the parent's once the workers' trees are
+/// gone: `<work>/symcc-import.log` lists the inputs, and the pass's `symcc`
+/// block names the target's own `main_symcc`.
+#[test]
+fn the_solver_loop_on_two_workers_logs_into_the_target_work_dir() {
+    if !symcc_installed() {
+        eprintln!("skipping: needs SymCC's symcc and sym++, and make");
+        return;
+    }
+    let root = TestDir::new("symcc-workers");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("gate.c"), GATE).unwrap();
+    let work = root.join("work");
+    let (target, stderr, harness) = auto(
+        &work,
+        &src,
+        &[
+            "--per-target-time",
+            "9",
+            "--symcc",
+            "--workers-per-target",
+            "2",
+        ],
+        &[("BHF_SYMCC_PLATEAU_MS", "500")],
+    );
+    assert_eq!(
+        target["lanes"]["symcc"]["built"], true,
+        "{target:#}\n{stderr}"
+    );
+    assert!(stderr.contains("SymCC ran"), "{stderr}");
+    let imports = std::fs::read_to_string(work.join("symcc-import.log"))
+        .unwrap_or_else(|error| panic!("no symcc-import.log: {error}\n{stderr}"));
+    assert!(!imports.trim().is_empty(), "{stderr}");
+    let id = target["harness_id"].as_str().unwrap();
+    let pass: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join(format!("fuzz_runs/{id}-latest.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pass["workers"]["completed"], 2, "{pass:#}");
+    let binary = PathBuf::from(pass["symcc"]["binary"].as_str().unwrap());
+    assert!(binary.is_file(), "{}: {pass:#}", binary.display());
+    assert_eq!(binary.parent(), Some(harness.as_path()), "{pass:#}");
+    assert!(
+        !stderr.contains("left in worker dirs"),
+        "the merge names worker dirs it removes: {stderr}"
+    );
+}

@@ -467,6 +467,50 @@ pub(crate) struct SymccRunSummary {
     pub(crate) stopped: Option<String>,
 }
 
+impl SymccRunSummary {
+    /// The SymCC stages of a pass's workers (#332), from their run
+    /// summaries: their counts summed. `None` when none had a stage.
+    pub(crate) fn sum_of<'a>(
+        summaries: impl Iterator<Item = &'a serde_json::Value>,
+    ) -> Option<Self> {
+        let mut total: Option<Self> = None;
+        for symcc in summaries.filter_map(|summary| summary.get("symcc")) {
+            let count = |name: &str| {
+                symcc
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0)
+            };
+            let sum = total.get_or_insert_with(|| Self {
+                binary: symcc
+                    .get("binary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                plateau_ms: symcc
+                    .get("plateau_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                ..Self::default()
+            });
+            sum.rounds += count("rounds");
+            sum.entries_solved += count("entries_solved");
+            sum.inputs_generated += count("inputs_generated");
+            sum.inputs_imported += count("inputs_imported");
+            sum.failed_runs += count("failed_runs");
+            sum.timed_out_runs += count("timed_out_runs");
+            if sum.stopped.is_none() {
+                sum.stopped = symcc
+                    .get("stopped")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+        total
+    }
+}
+
 /// The SymCC stage of one builtin pass (#331), the solver loop AFL++'s
 /// SymCC mutator and LibAFL's concolic stage run: once the pass's corpus
 /// has stopped growing for the plateau, its newest entries that SymCC has
@@ -976,6 +1020,43 @@ mod tests {
                  input(s); SymCC stopped: 3 runs in a row failed"
             )
         );
+    }
+
+    /// #332: a pass's workers' SymCC stages sum into one.
+    #[test]
+    fn the_workers_symcc_stages_sum_into_one() {
+        let worker = |rounds: u64, imported: u64, stopped: Option<&str>| {
+            let mut symcc = serde_json::json!({
+                "binary": "/w/harnesses/H-1/main_symcc",
+                "plateau_ms": 5000,
+                "rounds": rounds,
+                "entries_solved": rounds * 2,
+                "inputs_generated": imported + 1,
+                "inputs_imported": imported,
+                "failed_runs": 0,
+                "timed_out_runs": 1,
+            });
+            if let Some(stopped) = stopped {
+                symcc["stopped"] = stopped.into();
+            }
+            serde_json::json!({ "executions": 10, "symcc": symcc })
+        };
+        let without = serde_json::json!({ "executions": 10 });
+        assert_eq!(SymccRunSummary::sum_of([&without].into_iter()), None);
+        let summaries = [
+            worker(1, 2, None),
+            without,
+            worker(3, 4, Some("3 runs failed")),
+        ];
+        let sum = SymccRunSummary::sum_of(summaries.iter()).unwrap();
+        assert_eq!(sum.binary, PathBuf::from("/w/harnesses/H-1/main_symcc"));
+        assert_eq!(sum.plateau_ms, 5000);
+        assert_eq!(sum.rounds, 4);
+        assert_eq!(sum.entries_solved, 8);
+        assert_eq!(sum.inputs_generated, 8);
+        assert_eq!(sum.inputs_imported, 6);
+        assert_eq!(sum.timed_out_runs, 2);
+        assert_eq!(sum.stopped.as_deref(), Some("3 runs failed"));
     }
 
     /// A stand-in for `main_symcc` that logs each run (its argument, then

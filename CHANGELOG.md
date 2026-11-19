@@ -20,6 +20,17 @@
   (rounds, entries run, inputs generated and imported),
   `<work>/symcc-import.log` lists each input, and `bhf fuzz` runs the loop
   when `BHF_SYMCC=1` and the harness has `main_symcc` beside it.
+- `bhf auto --workers-per-target N` runs each target's builtin passes on N
+  workers (#332), which share their corpus as they run and whose queues and
+  findings merge into the target's when the pass ends. A pass's run summary
+  gains an optional `workers` block, and its `hangs`, `fresh_reruns`, `symcc`
+  and `stability` blocks are the workers' (counts summed; the least stable
+  worker's calibration). `bhf fuzz` takes a hidden
+  `--harness-env KEY=VALUE`, through which a campaign gives its workers the
+  harness env, `{work_dir}` standing for each worker's own work dir, and the
+  hidden `--campaign-seed-file` takes a directory for every file in it, so a
+  campaign (`bhf fuzz --workers` too) hands its workers the shared queue and
+  its seeds in a command line of fixed length.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb

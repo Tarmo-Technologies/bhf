@@ -2481,6 +2481,7 @@ pub(crate) fn run_on_host(
         hangs: None,
         stability: None,
         symcc: None,
+        workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)

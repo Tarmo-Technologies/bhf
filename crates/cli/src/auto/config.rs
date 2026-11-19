@@ -205,6 +205,8 @@ pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
     "external-tools",
     // Runs SymCC (GPL-3.0); BHF_SYMCC=1 is its persistent form.
     "symcc",
+    // Multiplies `jobs` by its count of fuzz processes.
+    "workers-per-target",
     "differential",
     "sloc",
     "static-dynamic",

@@ -328,6 +328,23 @@ pub struct AutoArgs {
     #[arg(long = "jobs", short = 'j', default_value_t = default_auto_jobs(), value_name = "N")]
     pub jobs: usize,
 
+    /// Run each target's builtin fuzz passes on N cores (#332): every pass is
+    /// a campaign of N `bhf fuzz` workers, each in its own copy of the work
+    /// dir, that share the corpus entries they keep as they run (every
+    /// BHF_SYNC_INTERVAL_MS, default 10000) and whose queues and findings are
+    /// merged into the target's when the pass ends. With `--jobs J` that is
+    /// up to J x N fuzz processes, each with `--rss-limit-mb`. A cross-built
+    /// target that runs under an emulator, and the AFL++ engine, keep one.
+    /// `--per-target-finding-count` is checked between passes, not inside
+    /// one. Default 1: each pass runs in process.
+    #[arg(
+        long = "workers-per-target",
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub workers_per_target: u32,
+
     /// DEPRECATED no-op: discovery caching is now ON BY DEFAULT (this flag is
     /// accepted for back-compat and does nothing). See `--no-discovery-cache` to
     /// opt out and `--fresh-discovery` to force a re-discovery.
@@ -1496,6 +1513,23 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(EXIT_NO_CANDIDATES);
         }
         std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
+    }
+    // #332: --workers-per-target N reaches the builtin passes' programmatic
+    // runs, which run each pass on N workers.
+    if args.workers_per_target > 1 {
+        std::env::set_var(
+            crate::fuzz::WORKERS_PER_TARGET_ENV,
+            args.workers_per_target.to_string(),
+        );
+        bhfeprintln!(
+            "bhf auto: each target's builtin passes run on {} workers that share their corpus \
+             (up to {} fuzz processes with --jobs {})",
+            args.workers_per_target,
+            args.workers_per_target as usize * args.jobs.max(1),
+            args.jobs.max(1)
+        );
+    } else {
+        std::env::remove_var(crate::fuzz::WORKERS_PER_TARGET_ENV);
     }
     // #324: --symcc (or BHF_SYMCC=1) turns the SymCC lane on for every native
     // C/C++ harness, when the license profile and the installed tools allow it.

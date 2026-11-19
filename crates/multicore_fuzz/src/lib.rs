@@ -412,8 +412,11 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         }
         // The shared queue's entries are the campaign's, not seeds given to
         // the worker: it names their lineage from the campaign's records.
-        for seed_file in &shared_seed_files {
-            cmd.arg("--campaign-seed-file").arg(seed_file);
+        // The queue goes as its directory, which stands for every file in
+        // it: one argument however many entries it holds, where one per
+        // entry outgrows a command line (32,767 characters on Windows).
+        if !shared_seed_files.is_empty() {
+            cmd.arg("--campaign-seed-file").arg(&shared_queue);
         }
         for arg in &config.extra_worker_args {
             cmd.arg(arg);
@@ -2047,8 +2050,9 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
     /// A worker starts from the campaign's lineage and seed list, so what
     /// it reseeds from the shared queue keeps its chain and a listed seed
     /// its source; it is handed the shared queue's entries as campaign
-    /// seeds, not as seeds given to `bhf fuzz`. A worker tree whose parent
-    /// has neither file loses the copy an earlier campaign left there.
+    /// seeds, not as seeds given to `bhf fuzz`, in one argument naming the
+    /// queue however many entries it holds. A worker tree whose parent has
+    /// neither file loses the copy an earlier campaign left there.
     #[cfg(unix)]
     #[test]
     fn workers_start_from_the_campaign_lineage_and_take_the_queue_as_campaign_seeds() {
@@ -2058,6 +2062,9 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
         let queue = work.join("corpus/H-CPY/queue");
         std::fs::create_dir_all(&queue).unwrap();
         std::fs::write(queue.join("entry.bin"), b"entry").unwrap();
+        for n in 0..300 {
+            std::fs::write(queue.join(format!("more-{n:03}.bin")), n.to_string()).unwrap();
+        }
         let lineage = work
             .join("corpus/H-CPY")
             .join(corpus::lineage::LINEAGE_FILE);
@@ -2104,10 +2111,17 @@ if [ "$BHF_WORKER_ID" = 1 ]; then printf "held-b" > "$q/held-b.bin"; fi
             );
             let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
             let argv: Vec<&str> = argv.lines().collect();
-            let entry = queue.join("entry.bin").display().to_string();
+            let queue_arg = queue.display().to_string();
             assert!(
                 argv.windows(2)
-                    .any(|pair| pair[0] == "--campaign-seed-file" && pair[1] == entry),
+                    .any(|pair| pair[0] == "--campaign-seed-file" && pair[1] == queue_arg),
+                "{argv:?}"
+            );
+            assert_eq!(
+                argv.iter()
+                    .filter(|arg| **arg == "--campaign-seed-file")
+                    .count(),
+                1,
                 "{argv:?}"
             );
             assert!(!argv.contains(&"--seed-file"), "{argv:?}");
