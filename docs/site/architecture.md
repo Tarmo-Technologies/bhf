@@ -91,8 +91,9 @@ Build / fuzz / replay:
   raw image at a base address) from its reset vector in bhf's own ARMv7-M
   Thumb-2 interpreter, feeds each input through a fixed buffer in its
   memory or through its peripheral reads (per-register MMIO models:
-  passthrough from the input, or constant), and counts the basic blocks it
-  enters into a 64 KiB edge map.
+  passthrough from the input, constant, or bit-extract, which it infers for
+  status-register polling loops by probing a recorded trace of the reads),
+  and counts the basic blocks it enters into a 64 KiB edge map.
   `bhf binary rehost` (`crates/cli/src/binary_rehost.rs`) fuzzes with it and
   writes its faults as findings `bhf replay` reproduces.
 

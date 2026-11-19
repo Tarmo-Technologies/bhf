@@ -4607,6 +4607,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/src/infer.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4635,11 +4639,23 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/tests/fixture_dispatch.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/tests/fixture_faults.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/rehost/tests/fixture_mmio.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_uart.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/dispatch.c",
       "license": "Apache-2.0"
     },
     {
@@ -4656,6 +4672,10 @@
     },
     {
       "path": "crates/rehost/tests/fixtures/startup.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/uart.c",
       "license": "Apache-2.0"
     },
     {

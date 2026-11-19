@@ -6,7 +6,11 @@
 //!
 //! Each input is written into a fixed buffer in the firmware's memory, or
 //! read by its peripheral reads through MMIO models (passthrough, which takes
-//! the read's bytes from the input, and constant), or both; the core starts
+//! the read's bytes from the input, constant, and bit-extract, which feeds
+//! only some bits from the input), or both. Before the campaign, the polling
+//! loops the seeds reach are found and given bit-extract models for the bits
+//! they wait on (`rehost::infer_polling_models`), unless a loop whose read
+//! already takes the input is not shown to be a status poll. The core starts
 //! from the reset vector, and the basic blocks it enters fill an edge map
 //! that steers the builtin engine's mutator and power schedule. A run that
 //! faults (an invalid memory access, a bad PC, or a HardFault) is a finding
@@ -21,11 +25,11 @@ use fuzz_engine_builtin::{
 };
 use rehost::{
     CoverageMap, Execution, Fault, Image, InputBuffer, Machine, MachineConfig, MemoryRange,
-    MmioConfig, MmioDefault, MmioModel, MmioModelKind, Stop, DEFAULT_MAX_INSTRUCTIONS,
+    MmioConfig, MmioDefault, MmioModel, MmioModelKind, NotAPoll, Stop, DEFAULT_MAX_INSTRUCTIONS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -117,8 +121,10 @@ pub struct BinaryRehostArgs {
     /// A model for a peripheral register's reads: `ADDR[@PC]=MODEL`, where
     /// ADDR is the register (hex or an ELF symbol), PC limits the model to
     /// the instruction there (hex or a function), and MODEL is `passthrough`
-    /// (each read takes its bytes from the input) or `constant:VALUE` (hex).
-    /// A model for one instruction wins over one for the register.
+    /// (each read takes its bytes from the input), `constant:VALUE` (hex) or
+    /// `bitextract:MASK` (hex: the bits of MASK come from the input, a byte
+    /// for each eight, and the others read as zero). A model for one
+    /// instruction wins over one for the register.
     /// Repeatable. Peripheral reads take the input in order (after the
     /// bytes `--input-buffer` holds), and a run whose reads want more input
     /// than it has stops as `input_exhausted`.
@@ -138,6 +144,20 @@ pub struct BinaryRehostArgs {
     /// records).
     #[arg(long = "mmio-default", value_enum, value_name = "MODEL")]
     pub mmio_default: Option<MmioDefaultArg>,
+
+    /// Do not infer models for polling loops. By default, before the
+    /// campaign, the seeds (and an input of zeros) run with each peripheral
+    /// read recorded; a register one instruction reads over and over, that
+    /// no model serves, is a polling loop, and probes that flip one bit of
+    /// its read at a time find the bits that decide it. The instruction gets
+    /// a bit-extract model feeding those bits from the input (with an input
+    /// buffer and no peripheral input, a constant that ends the loop). A
+    /// read the passthrough default feeds keeps the whole input unless its
+    /// loop is shown to be a status poll, so a data register a getter reads
+    /// in a dispatch loop is left whole. The run JSON's `mmio_inference`
+    /// lists the loops.
+    #[arg(long = "no-mmio-inference")]
+    pub no_mmio_inference: bool,
 
     /// Runs in the campaign: the seeds, then mutations of the inputs that
     /// reached new edges.
@@ -292,21 +312,35 @@ fn parse_mmio_model(image: &Image, spec: &str) -> anyhow::Result<MmioModel> {
             value: hex_number(value)
                 .ok_or_else(|| anyhow!("--mmio {spec:?}: {value:?} is not a hex value"))?,
         },
-        None if model == "constant" => {
+        Some(("bitextract", mask)) => {
+            let mask = hex_number(mask)
+                .ok_or_else(|| anyhow!("--mmio {spec:?}: {mask:?} is not a hex mask"))?;
+            if mask == 0 {
+                return Err(anyhow!("--mmio {spec:?}: the mask has no bits"));
+            }
+            MmioModelKind::BitExtract { mask }
+        }
+        None if model == "constant" || model == "bitextract" => {
             return Err(anyhow!(
-                "--mmio {spec:?}: a constant model is constant:VALUE"
+                "--mmio {spec:?}: a {model} model is {model}:{}",
+                if model == "constant" { "VALUE" } else { "MASK" }
             ))
         }
         _ => {
             return Err(anyhow!(
-                "--mmio {spec:?}: {model:?} is not a model (passthrough or constant:VALUE)"
+                "--mmio {spec:?}: {model:?} is not a model (passthrough, constant:VALUE or \
+                 bitextract:MASK)"
             ))
         }
     };
     Ok(MmioModel { address, pc, kind })
 }
 
-fn mmio_to_json(mmio: &MmioConfig) -> Value {
+/// A model's site: its register and instruction.
+type Site = (u32, Option<u32>);
+
+/// `inferred` names the sites whose models inference added.
+fn mmio_to_json(mmio: &MmioConfig, inferred: &BTreeSet<Site>) -> Value {
     json!({
         "default": mmio.default.as_str(),
         "models": mmio.models.iter().map(|model| {
@@ -315,12 +349,33 @@ fn mmio_to_json(mmio: &MmioConfig) -> Value {
                 "pc": model.pc.map(hex),
                 "model": model.kind.as_str(),
             });
-            if let MmioModelKind::Constant { value } = model.kind {
-                entry["value"] = json!(hex(value));
+            match model.kind {
+                MmioModelKind::Passthrough => {}
+                MmioModelKind::Constant { value } => entry["value"] = json!(hex(value)),
+                MmioModelKind::BitExtract { mask } => entry["mask"] = json!(hex(mask)),
+            }
+            if inferred.contains(&(model.address, model.pc)) {
+                entry["inferred"] = json!(true);
             }
             entry
         }).collect::<Vec<_>>(),
     })
+}
+
+/// The sites of the models a setup records as inferred.
+fn inferred_from_json(value: &Value) -> BTreeSet<Site> {
+    value["models"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry["inferred"] == true)
+        .filter_map(|entry| {
+            let address = hex_number(entry["address"].as_str()?)?;
+            let pc = entry["pc"].as_str().and_then(hex_number);
+            Some((address, pc))
+        })
+        .collect()
 }
 
 /// The peripheral default an `mmio` object records, or `None` when it
@@ -370,9 +425,13 @@ fn mmio_from_json(value: &Value, field: &str) -> Result<MmioConfig, String> {
                     value: hex_field(entry, "value")?
                         .ok_or_else(|| format!("{field}.models[].value is missing"))?,
                 },
+                Some("bitextract") => MmioModelKind::BitExtract {
+                    mask: hex_field(entry, "mask")?
+                        .ok_or_else(|| format!("{field}.models[].mask is missing"))?,
+                },
                 other => {
                     return Err(format!(
-                        "{field}.models[].model {} is not passthrough or constant",
+                        "{field}.models[].model {} is not passthrough, constant or bitextract",
                         other
                             .map_or_else(|| entry["model"].to_string(), |name| format!("{name:?}"))
                     ))
@@ -394,6 +453,8 @@ struct ModelsFile {
     /// The default it records; a file that names none leaves the default to
     /// the usual rule (`passthrough` without an input buffer).
     default: Option<MmioDefault>,
+    /// The sites of the models it records as inferred.
+    inferred: BTreeSet<Site>,
 }
 
 /// The MMIO models of a `--mmio-models` file: the `mmio` object itself, or
@@ -419,6 +480,7 @@ fn load_mmio_models(path: &Path) -> anyhow::Result<ModelsFile> {
     Ok(ModelsFile {
         models: mmio_from_json(mmio, "mmio").map_err(named)?.models,
         default: mmio_default_from_json(mmio, "mmio").map_err(named)?,
+        inferred: inferred_from_json(mmio),
     })
 }
 
@@ -434,6 +496,8 @@ struct Setup {
     exit_at: Vec<u32>,
     max_instructions: u64,
     mmio: MmioConfig,
+    /// The sites of the models inference added.
+    inferred: BTreeSet<Site>,
 }
 
 impl Setup {
@@ -454,8 +518,11 @@ impl Setup {
             .map(load_mmio_models)
             .transpose()?;
         let recorded_default = file.as_ref().and_then(|file| file.default);
+        let (models, inferred) = file
+            .map(|file| (file.models, file.inferred))
+            .unwrap_or_default();
         let mut mmio = MmioConfig {
-            models: file.map(|file| file.models).unwrap_or_default(),
+            models,
             default: MmioDefault::Zero,
         };
         for spec in &args.mmio {
@@ -488,6 +555,7 @@ impl Setup {
             exit_at,
             max_instructions: args.max_instructions,
             mmio,
+            inferred,
         })
     }
 
@@ -562,7 +630,7 @@ impl Setup {
             })),
             "exit_at": self.exit_at.iter().copied().map(hex).collect::<Vec<_>>(),
             "max_instructions": self.max_instructions,
-            "mmio": mmio_to_json(&self.mmio),
+            "mmio": mmio_to_json(&self.mmio, &self.inferred),
         })
     }
 
@@ -629,6 +697,7 @@ impl Setup {
                 .as_u64()
                 .ok_or("rehost.setup.max_instructions is missing")?,
             mmio: mmio_from_json(&value["mmio"], "rehost.setup.mmio")?,
+            inferred: inferred_from_json(&value["mmio"]),
         })
     }
 }
@@ -667,19 +736,68 @@ fn input_buffer(
     })
 }
 
+/// Find the polling loops `seeds` (and an input of zeros) reach, and add a
+/// model for each to `setup`: bit-extract, feeding the bits that decide the
+/// loop from the input, when peripheral reads take input; otherwise a
+/// constant that ends the loop. A loop whose read the passthrough default
+/// already feeds from the input gets neither unless it is shown to be a
+/// status poll (`not_a_poll` says why not). Returns the run JSON's
+/// `mmio_inference`.
+fn infer_mmio_models(setup: &mut Setup, image: &Image, seeds: &[Vec<u8>]) -> anyhow::Result<Value> {
+    let started = Instant::now();
+    let mut inputs: Vec<Vec<u8>> = seeds.iter().take(7).cloned().collect();
+    inputs.push(vec![0; setup.max_input_len()]);
+    let inference = rehost::infer_polling_models(image, &setup.config(), &inputs)
+        .map_err(|error| anyhow!("{}: {error}", setup.image.display()))?;
+    let fed = setup.mmio.takes_input();
+    let mut loops = Vec::new();
+    for found in &inference.loops {
+        let model = if fed {
+            found.bit_extract()
+        } else {
+            found.constant()
+        };
+        if let Some(model) = model {
+            setup.inferred.insert((model.address, model.pc));
+            setup.mmio.models.push(model);
+        }
+        loops.push(json!({
+            "pc": hex(found.polling.pc),
+            "address": hex(found.polling.address),
+            "size": found.polling.size,
+            "polls": found.polling.polls,
+            "value": hex(found.polling.value),
+            "mask": (found.mask != 0).then(|| hex(found.mask)),
+            "exit": found.exit.map(hex),
+            "writes": found.polling.writes,
+            "not_a_poll": found.not_a_poll.map(|reason| match reason {
+                NotAPoll::OtherBits { value } => json!({"reason": reason.as_str(), "value": hex(value)}),
+                _ => json!({"reason": reason.as_str()}),
+            }),
+            "model": model.map(|model| model.kind.as_str()),
+        }));
+    }
+    Ok(json!({
+        "rounds": inference.rounds,
+        "probes": inference.probes,
+        "polling_loops": loops,
+        "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }))
+}
+
 /// What a rehosted run does and does not model, recorded with every run and
 /// finding so a result is never read as more than it is.
-fn fidelity(mmio: &MmioConfig) -> Value {
+fn fidelity(setup: &Setup) -> Value {
     json!({
         "execution": "rehosted",
         "cpu": "ARMv7-M Thumb-2 integer core (Cortex-M3/M4), interpreted",
-        "peripherals": describe_peripherals(mmio),
+        "peripherals": describe_peripherals(&setup.mmio, setup.inferred.len()),
         "interrupts": "not modelled",
         "floating_point": "not modelled",
     })
 }
 
-fn describe_peripherals(mmio: &MmioConfig) -> String {
+fn describe_peripherals(mmio: &MmioConfig, inferred: usize) -> String {
     if mmio.models.is_empty() && mmio.default == MmioDefault::Zero {
         return "not modelled: peripheral registers read as zero and drop writes".to_owned();
     }
@@ -690,11 +808,14 @@ fn describe_peripherals(mmio: &MmioConfig) -> String {
         .collect();
     kinds.sort_unstable();
     kinds.dedup();
-    let models = match mmio.models.len() {
+    let mut models = match mmio.models.len() {
         0 => "no register models".to_owned(),
         1 => format!("1 register model ({})", kinds.join(", ")),
         count => format!("{count} register models ({})", kinds.join(", ")),
     };
+    if inferred > 0 {
+        models.push_str(&format!(", {inferred} inferred from polling loops"));
+    }
     let others = match mmio.default {
         MmioDefault::Zero => "read as zero",
         MmioDefault::Passthrough => "take their bytes from the input",
@@ -796,7 +917,7 @@ fn render_finding(
             "fault": fault_json(fault),
             "instructions": run.instructions,
             "blocks": run.blocks,
-            "fidelity": fidelity(&target.setup.mmio),
+            "fidelity": fidelity(target.setup),
         },
         "paths": {
             "testcase": "testcase.bin",
@@ -939,8 +1060,9 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         return Err(anyhow!("--iterations must be greater than zero"));
     }
     let (image, bytes) = load_image(&args.image, args.base)?;
-    let setup = Setup::from_args(args, &image)?;
-    let machine = setup.machine(&image)?;
+    let mut setup = Setup::from_args(args, &image)?;
+    // The setup as given must run before anything is inferred for it.
+    setup.machine(&image)?;
     let mut seeds = args
         .seed_inputs
         .iter()
@@ -952,6 +1074,12 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
     if seeds.is_empty() {
         seeds.push(Vec::new());
     }
+    let inference = if args.no_mmio_inference {
+        Value::Null
+    } else {
+        infer_mmio_models(&mut setup, &image, &seeds)?
+    };
+    let machine = setup.machine(&image)?;
     let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
@@ -1034,7 +1162,8 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         "sha256": campaign.target.sha256,
         "engine": "rehost",
         "setup": setup.to_json(),
-        "fidelity": fidelity(&setup.mmio),
+        "fidelity": fidelity(&setup),
+        "mmio_inference": inference,
         "seeds_run": seeds_run,
         "executions": campaign.executions,
         "corpus_new": campaign.corpus_new,
@@ -1182,6 +1311,7 @@ mod tests {
             mmio: Vec::new(),
             mmio_models: None,
             mmio_default: None,
+            no_mmio_inference: false,
             iterations: 1,
             time: None,
             seed_inputs: Vec::new(),
@@ -1203,6 +1333,46 @@ mod tests {
         args.input_length = None;
         args.inject_at = None;
         args.mmio = vec!["0x40013000=constant:0x4c31a5c3".to_owned()];
+        args
+    }
+
+    /// The polled-UART fixture (`uart.c`): its status register's bit 7
+    /// (transmit empty) and bit 5 (receive not empty) are polled by the
+    /// instructions at these addresses.
+    const USART_SR: u32 = 0x4001_1000;
+    const TXE_POLL: u32 = 0x0800_00a2;
+    const RXNE_POLL: u32 = 0x0800_00b2;
+
+    /// `line` as the UART fixture reads it under the models inference gives
+    /// it: a byte for the prompt's transmit poll, then for each byte of the
+    /// line and its newline a byte for the receive poll and the four bytes
+    /// of the data register.
+    fn polled_line(line: &[u8]) -> Vec<u8> {
+        let mut input = vec![1];
+        for &byte in line.iter().chain(b"\n") {
+            input.extend_from_slice(&[1, byte, 0, 0, 0]);
+        }
+        input
+    }
+
+    /// A "FUZZC" line whose field length, `length`, runs past the 8-byte
+    /// field into the saved return address when it is 16 or more.
+    fn field_line(dir: &Path, length: u8) -> PathBuf {
+        let mut line = b"FUZZC".to_vec();
+        line.push(length);
+        line.extend_from_slice(&[b'A'; 16]);
+        let path = dir.join(format!("seed-line-{length}"));
+        fs::write(&path, polled_line(&line)).unwrap();
+        path
+    }
+
+    /// `uart.elf` with no input buffer: everything arrives over the UART.
+    fn uart_args(work: &Path) -> BinaryRehostArgs {
+        let mut args = args(fixture("uart.elf"), work);
+        args.input_buffer = None;
+        args.input_length = None;
+        args.inject_at = None;
+        args.max_instructions = 200_000;
         args
     }
 
@@ -1337,9 +1507,18 @@ mod tests {
         args.mmio = vec![
             "0x40011000=constant:0x20".to_owned(),
             "0x40011004@main=passthrough".to_owned(),
+            "0x40011008=bitextract:0x81".to_owned(),
         ];
-        let setup = Setup::from_args(&args, &image).unwrap();
-        assert_eq!(setup.mmio.models.len(), 2);
+        let mut setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.mmio.models.len(), 3);
+        assert_eq!(setup.to_json()["mmio"]["models"][2]["mask"], "0x00000081");
+        // Which models inference added is recorded with them.
+        setup.inferred.insert((0x4001_1008, None));
+        assert_eq!(setup.to_json()["mmio"]["models"][2]["inferred"], true);
+        assert_eq!(
+            setup.to_json()["mmio"]["models"][0]["inferred"],
+            Value::Null
+        );
         assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup.clone()));
         let mut broken = setup.to_json();
         broken["input"]["address"] = json!("rx_buf");
@@ -1401,12 +1580,18 @@ mod tests {
             model("0x40013004=constant:10").unwrap().kind,
             MmioModelKind::Constant { value: 0x10 }
         );
+        assert_eq!(
+            model("0x40013000=bitextract:0x20").unwrap().kind,
+            MmioModelKind::BitExtract { mask: 0x20 }
+        );
         for (bad, says) in [
             ("0x40013000", "ADDR[@PC]=MODEL"),
             ("0x40013000=", "passthrough"),
             ("=passthrough", "ADDR[@PC]=MODEL"),
             ("0x40013000=constant", "constant:VALUE"),
             ("0x40013000=constant:zz", "\"zz\""),
+            ("0x40013000=bitextract", "bitextract:MASK"),
+            ("0x40013000=bitextract:0", "no bits"),
             ("0x40013000=mystery", "\"mystery\""),
             (
                 "0x40013000@no_such_function=passthrough",
@@ -1603,6 +1788,178 @@ mod tests {
             replay.differences[0].contains("went idle"),
             "{:?}",
             replay.differences
+        );
+    }
+
+    #[test]
+    fn inferred_bit_extract_models_take_a_polled_uart_line_to_its_parser_bug() {
+        let work = TestDir::new("rehost-uart");
+        let mut args = uart_args(&work);
+        args.seed_files = vec![field_line(&work, 16)];
+        let summary = run_inner(&args).unwrap();
+        let inference = &summary["mmio_inference"];
+        let loops: Vec<[&Value; 4]> = inference["polling_loops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| {
+                [
+                    &found["pc"],
+                    &found["address"],
+                    &found["mask"],
+                    &found["model"],
+                ]
+            })
+            .collect();
+        let (txe, rxne, sr) = (
+            json!(hex(TXE_POLL)),
+            json!(hex(RXNE_POLL)),
+            json!(hex(USART_SR)),
+        );
+        let bitextract = json!("bitextract");
+        assert_eq!(
+            loops,
+            vec![
+                [&txe, &sr, &json!("0x00000080"), &bitextract],
+                [&rxne, &sr, &json!("0x00000020"), &bitextract],
+            ],
+            "{summary:#}"
+        );
+        assert_eq!(inference["rounds"], 3);
+        let models = &summary["setup"]["mmio"]["models"];
+        assert_eq!(
+            models,
+            &json!([
+                {"address": "0x40011000", "pc": "0x080000a2", "model": "bitextract",
+                 "mask": "0x00000080", "inferred": true},
+                {"address": "0x40011000", "pc": "0x080000b2", "model": "bitextract",
+                 "mask": "0x00000020", "inferred": true},
+            ])
+        );
+        assert_eq!(summary["stops"]["fault"], 1, "{summary:#}");
+        let id = summary["findings"][0].as_str().unwrap().to_owned();
+        let dir = corpus::layout::findings_dir(&work).join(&id);
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["classification"], "bad_pc");
+        assert_eq!(finding["rehost"]["fault"]["pc"], "0x41414140");
+        assert_eq!(&finding["rehost"]["setup"]["mmio"]["models"], models);
+        let peripherals = finding["rehost"]["fidelity"]["peripherals"]
+            .as_str()
+            .unwrap();
+        assert!(
+            peripherals.contains("2 inferred from polling loops"),
+            "{peripherals}"
+        );
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        // A rerun that loads the recorded models has nothing left to infer.
+        let models_file = work.join("models.json");
+        fs::write(&models_file, finding.to_string()).unwrap();
+        args.mmio_models = Some(models_file);
+        let rerun = run_inner(&args).unwrap();
+        assert_eq!(rerun["mmio_inference"]["polling_loops"], json!([]));
+        assert_eq!(rerun["repeated_faults"], 1, "{rerun:#}");
+        // and still records which of its models were inferred.
+        assert_eq!(&rerun["setup"]["mmio"]["models"], models);
+        let peripherals = rerun["fidelity"]["peripherals"].as_str().unwrap();
+        assert!(
+            peripherals.contains("2 inferred from polling loops"),
+            "{peripherals}"
+        );
+    }
+
+    /// The command-dispatch fixture (`dispatch.c`): a getter reads each
+    /// command from the data register at 0x40013004 with the instruction at
+    /// 0x080000a2; 0x01 arms it, 0x04 ends the session, and 'X' once armed
+    /// three times stores through a pointer to unmapped memory.
+    fn dispatch_args(work: &Path) -> BinaryRehostArgs {
+        let mut args = args(fixture("dispatch.elf"), work);
+        args.input_buffer = None;
+        args.input_length = None;
+        args.inject_at = None;
+        args.max_instructions = 200_000;
+        let seed = work.join("seed-armed");
+        // Armed three times, then a 'Y': one bit from the bug.
+        fs::write(&seed, [1, 1, 1, b'Y']).unwrap();
+        args.seed_files = vec![seed];
+        args.iterations = 3000;
+        args
+    }
+
+    #[test]
+    fn a_dispatch_loop_on_a_data_register_keeps_its_input_and_mutation_reaches_its_bug() {
+        let work = TestDir::new("rehost-dispatch");
+        let args = dispatch_args(&work);
+        let summary = run_inner(&args).unwrap();
+        // The getter's reads are a loop as a trace shows it, but 'X' changes
+        // its path too, so the read keeps taking a whole byte of input.
+        assert_eq!(
+            summary["mmio_inference"]["polling_loops"],
+            json!([{
+                "pc": "0x080000a2", "address": "0x40013004", "size": 1, "polls": 4096,
+                "value": "0x00000000", "mask": "0x00000005", "exit": "0x00000004",
+                "writes": false,
+                "not_a_poll": {"reason": "other_bits", "value": "0x00000058"},
+                "model": null,
+            }]),
+            "{summary:#}"
+        );
+        assert_eq!(summary["setup"]["mmio"]["models"], json!([]));
+        assert_eq!(summary["setup"]["mmio"]["default"], "passthrough");
+        let findings = summary["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{summary:#}");
+        let dir = corpus::layout::findings_dir(&work).join(findings[0].as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["rehost"]["fault"]["kind"], "write_unmapped");
+        assert_eq!(finding["rehost"]["fault"]["address"], "0x60000000");
+        assert_eq!(fs::read(dir.join("testcase.bin")).unwrap()[3], b'X');
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        // A bit-extract model for the bits one flip at a time shows would
+        // hide it: the same campaign finds nothing.
+        let narrowed = TestDir::new("rehost-dispatch-narrowed");
+        let mut args = dispatch_args(&narrowed);
+        args.mmio = vec!["0x40013004@0x080000a2=bitextract:0x05".to_owned()];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["findings"], json!([]), "{summary:#}");
+    }
+
+    #[test]
+    fn without_inference_the_polled_line_never_reaches_the_parser() {
+        let work = TestDir::new("rehost-uart-off");
+        let mut args = uart_args(&work);
+        args.seed_files = vec![field_line(&work, 16)];
+        args.no_mmio_inference = true;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["mmio_inference"], Value::Null);
+        assert_eq!(summary["findings"], json!([]), "{summary:#}");
+        assert_eq!(summary["setup"]["mmio"]["models"], json!([]));
+    }
+
+    #[test]
+    fn with_an_input_buffer_an_inferred_loop_is_pinned_to_the_value_that_ends_it() {
+        // The buffer holds the input, so no peripheral read takes any: a
+        // polling loop is passed with a constant instead.
+        let work = TestDir::new("rehost-uart-buffer");
+        let mut args = uart_args(&work);
+        args.input_buffer = Some("line".to_owned());
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(
+            summary["setup"]["mmio"]["models"],
+            json!([
+                {"address": "0x40011000", "pc": "0x080000a2", "model": "constant",
+                 "value": "0x00000080", "inferred": true},
+                {"address": "0x40011000", "pc": "0x080000b2", "model": "constant",
+                 "value": "0x00000020", "inferred": true},
+            ]),
+            "{summary:#}"
+        );
+        assert_eq!(summary["stops"]["instruction_limit"], 1, "{summary:#}");
+        assert_eq!(
+            Setup::from_json(&summary["setup"]).unwrap().inferred,
+            BTreeSet::from([(USART_SR, Some(TXE_POLL)), (USART_SR, Some(RXNE_POLL))])
         );
     }
 

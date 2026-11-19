@@ -41,13 +41,17 @@
 //! ```
 //!
 //! Peripheral registers read through MMIO models ([`MmioConfig`]): a model
-//! for a register, or for one instruction's reads of it, either takes the
-//! read's bytes from the input (passthrough) or returns a constant, and a
-//! read no model names returns zero or, with [`MmioDefault::Passthrough`],
-//! the input's bytes. Peripheral reads take the input as a stream (after the
-//! bytes an [`InputBuffer`] holds), and a read the input has no bytes left
-//! for ends the run as [`Stop::InputExhausted`]. Peripheral writes are
-//! dropped.
+//! for a register, or for one instruction's reads of it, takes the read's
+//! bytes from the input (passthrough), returns a constant, or feeds only the
+//! bits of a mask from the input (bit-extract), and a read no model names
+//! returns zero or, with [`MmioDefault::Passthrough`], the input's bytes.
+//! [`infer_polling_models`] finds the status-register polling loops a run
+//! stalls in and the bits that decide them, for bit-extract models, and
+//! keeps a read the input feeds whole when its loop is not shown to be a
+//! status poll ([`NotAPoll`]). Peripheral reads take the input as a stream
+//! (after the bytes an [`InputBuffer`] holds), and a read the input has no
+//! bytes left for ends the run as [`Stop::InputExhausted`]. Peripheral
+//! writes are dropped.
 //!
 //! What a rehosted run does not model: peripheral behaviour beyond those
 //! reads, interrupts, the floating-point unit, the M4's SIMD instructions,
@@ -62,6 +66,7 @@ mod coverage;
 mod cpu;
 mod fault;
 mod image;
+mod infer;
 mod machine;
 mod memory;
 mod mmio;
@@ -71,6 +76,10 @@ mod thumb32;
 pub use coverage::{CoverageMap, EdgeMap, EDGE_MAP_SIZE};
 pub use fault::{Fault, FaultClass, FaultKind};
 pub use image::{Image, ImageFormat, LoadError, RamRange, Segment, Symbol};
+pub use infer::{
+    decide, infer_polling_models, polling_loops, probe_outcome, Inference, InferredLoop, NotAPoll,
+    PollingLoop, ProbeOutcome, MIN_POLLS,
+};
 pub use machine::{
     Execution, IdleReason, InputBuffer, Machine, MachineConfig, MemoryRange, SetupError, Stop,
     DEFAULT_MAX_INSTRUCTIONS, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE,

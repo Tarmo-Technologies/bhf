@@ -381,3 +381,135 @@ fn an_mmio_model_flag_that_does_not_parse_is_refused() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{}", text(&output));
 }
+
+/// A "FUZZC" line for the polled-UART fixture (`uart.c`) whose field length
+/// is `length`, laid out as the inferred models read it: a byte for the
+/// prompt's transmit poll, then for each byte of the line and its newline a
+/// byte for the receive poll and the four bytes of the data register.
+fn polled_field_line(dir: &Path, length: u8) -> PathBuf {
+    let mut line = b"FUZZC".to_vec();
+    line.push(length);
+    line.extend_from_slice(&[b'A'; 16]);
+    let mut input = vec![1];
+    for &byte in line.iter().chain(b"\n") {
+        input.extend_from_slice(&[1, byte, 0, 0, 0]);
+    }
+    let path = dir.join(format!("seed-line-{length}"));
+    fs::write(&path, input).unwrap();
+    path
+}
+
+#[test]
+fn a_uart_polling_image_reaches_its_parser_bug_through_inferred_models() {
+    let root = TestDir::new("binary-rehost-uart");
+    let work = root.join("work");
+    // A two-byte field: the seed runs clean, one byte from the overflow.
+    let seed = polled_field_line(&root, 2);
+    let output = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("uart.elf"))
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--seed-file",
+            seed.to_str().unwrap(),
+            "--max-instructions",
+            "200000",
+            "--iterations",
+            "3000",
+        ])
+        .output()
+        .unwrap();
+    let run = summary(&output);
+    let loops = run["mmio_inference"]["polling_loops"].as_array().unwrap();
+    assert_eq!(loops.len(), 2, "{run:#}");
+    assert!(
+        loops.iter().all(|found| found["model"] == "bitextract"),
+        "{run:#}"
+    );
+    let findings = run["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{run:#}");
+    for id in findings {
+        let dir = work.join("results/findings").join(id.as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["classification"], "bad_pc", "{finding:#}");
+        let models = finding["rehost"]["setup"]["mmio"]["models"]
+            .as_array()
+            .unwrap();
+        assert!(
+            models
+                .iter()
+                .all(|model| model["model"] == "bitextract" && model["inferred"] == true),
+            "{finding:#}"
+        );
+        let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+        assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+    }
+    // With inference off the same campaign never gets past the polls.
+    let off = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("uart.elf"))
+        .arg("--work-dir")
+        .arg(root.join("off"))
+        .args([
+            "--no-mmio-inference",
+            "--seed-file",
+            polled_field_line(&root, 16).to_str().unwrap(),
+            "--max-instructions",
+            "200000",
+            "--iterations",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let off = summary(&off);
+    assert_eq!(off["mmio_inference"], Value::Null);
+    assert_eq!(off["findings"], serde_json::json!([]), "{off:#}");
+}
+
+#[test]
+fn a_data_register_dispatch_loop_keeps_its_input_and_reaches_its_bug_with_inference_on() {
+    // `dispatch.c` reads each command byte from a data register through a
+    // getter, so the read repeats like a status poll; 0x01 arms it and 'X'
+    // once armed three times stores through a wild pointer.
+    let root = TestDir::new("binary-rehost-dispatch");
+    let work = root.join("work");
+    let seed = root.join("seed-armed");
+    fs::write(&seed, [1, 1, 1, b'Y']).unwrap();
+    let output = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("dispatch.elf"))
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--seed-file",
+            seed.to_str().unwrap(),
+            "--max-instructions",
+            "200000",
+            "--iterations",
+            "3000",
+        ])
+        .output()
+        .unwrap();
+    let run = summary(&output);
+    let loops = run["mmio_inference"]["polling_loops"].as_array().unwrap();
+    assert_eq!(loops.len(), 1, "{run:#}");
+    assert_eq!(loops[0]["address"], "0x40013004", "{run:#}");
+    assert_eq!(loops[0]["model"], Value::Null, "{run:#}");
+    assert_eq!(loops[0]["not_a_poll"]["reason"], "other_bits", "{run:#}");
+    assert_eq!(run["setup"]["mmio"]["models"], serde_json::json!([]));
+    let findings = run["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{run:#}");
+    for id in findings {
+        let dir = work.join("results/findings").join(id.as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(
+            finding["rehost"]["fault"]["address"], "0x60000000",
+            "{finding:#}"
+        );
+        let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+        assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+    }
+}

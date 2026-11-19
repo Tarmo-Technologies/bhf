@@ -3011,6 +3011,26 @@
   JSON gains `mmio_reads`, all additive to `bhf.binary_rehost.run.v1` and
   `bhf.rehost.v1`. The `rehost` crate gains `MmioConfig` and a recorded
   trace of a run's peripheral reads (`Machine::trace_mmio`).
+- `bhf binary rehost` infers bit-extract MMIO models for status-register
+  polling loops (#381): before the campaign the seeds and an input of zeros
+  run with their peripheral reads recorded, a register one instruction reads
+  8 or more times in a row is a polling loop, and probes that flip one bit
+  of its read at a time find the bits that decide it. The instruction gets
+  a `bitextract` model feeding those bits from the input (a constant that
+  ends the loop when only an input buffer takes input), and inference
+  repeats past each loop to find the next. A loop whose read the
+  `passthrough` default already feeds from the input keeps it whole unless
+  it is shown to be a status poll (a bit ends it, it stores nothing new
+  between reads, and no value of the other bits changes its path), so a
+  data register a getter reads in a dispatch loop is not narrowed. `--mmio`
+  takes `bitextract:MASK`; `--no-mmio-inference` turns inference off. The
+  run JSON gains `mmio_inference` (the loops, masks, exit values, `writes`,
+  `not_a_poll`, rounds and probes), and inferred models carry
+  `"inferred": true` in the recorded setup, which `bhf replay` runs as
+  recorded and a `--mmio-models` rerun keeps; both additive. The `rehost`
+  crate gains `infer_polling_models`, `polling_loops`, `decide` and
+  `NotAPoll`, and its trace of peripheral reads records a digest of the
+  stores between them.
 - `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
   `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
   against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the

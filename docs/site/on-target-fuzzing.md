@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed or constant), no interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, `bhf replay` MATCH |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed, constant, or bit-extract inferred from polling loops), no interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, `bhf replay` MATCH |
 
 ---
 
@@ -870,8 +870,11 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   the register. ADDR and PC are hex or ELF symbols; MODEL is `passthrough`
   (each read takes as many bytes as it is wide from the input, so the
   fuzzer drives what the firmware sees there; Fuzzware calls this model
-  "identity") or `constant:VALUE` (hex; a fixed value, such as the ID or
-  ready bit a driver checks once). A register no model names reads as
+  "identity"), `constant:VALUE` (hex; a fixed value, such as the ID or
+  ready bit a driver checks once) or `bitextract:MASK` (hex; the bits of
+  MASK come from the input, lowest first, a byte for each eight of them,
+  and the others read as zero: a status register whose one ready bit
+  matters). A register no model names reads as
   `--mmio-default`: `passthrough` when there is no `--input-buffer`, so
   every unmodelled read takes the input, and `zero` when there is one, as
   before models existed. Peripheral reads take the input in order, after
@@ -891,6 +894,49 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   the default to the rule above. The run JSON's `mmio_reads` counts the peripheral
   reads of the campaign, and a finding's `input` block says how many bytes
   its peripheral reads took (`mmio_bytes`).
+- **Polling loops (inferred bit-extract models).** Firmware that waits for a
+  status bit (`while (!(USART->SR & RXNE)) {}`) stalls on a zero read and,
+  fed whole from the input, eats several input bytes a poll on a bit the
+  fuzzer must hit by chance. Before the campaign bhf runs the seeds, and an
+  input of zeros, recording every peripheral read. A register one
+  instruction reads at least 8 times in a row, with no other peripheral
+  read between and no model serving it, is a polling loop. Probes pause
+  the run just before the loop's first read and run it on from there with
+  one bit of the read flipped at a time; a bit whose flip changes the path
+  to the next peripheral read
+  (another register is read next, or none, or the same one after a
+  different number of instructions) is one the firmware tests (when no
+  single bit does, all are flipped and then the ones the loop does not need
+  are put back). The polling instruction gets a `bitextract` model for
+  those bits, so the input decides each poll with one byte; with
+  `--input-buffer` and no peripheral input it gets a `constant` that ends
+  the loop instead.
+  A getter that reads a data register in a dispatch loop
+  (`for (;;) { c = fifo_pop(); ... }`) repeats the same way, but every bit
+  of what it reads matters, and a test such as `c == 'X'` shows in no
+  single-bit flip. A read the zero default answers only gains bits from a
+  model, but under the `passthrough` default the read already takes the
+  input whole, so its loop keeps that unless it is shown to be a status
+  poll: some bit must end the loop, the loop must store nothing to memory
+  between its reads but the same stores each time round (a call's saved
+  registers, say), and no value of the bits outside the mask may change its
+  path. The last check tries every value of those bits for an 8- or 16-bit
+  read, and every value of each byte's for a 32-bit read, so a 32-bit data
+  register compared against a constant that spans bytes at once can still
+  be narrowed; name it `--mmio ADDR=passthrough` to keep it whole.
+  Inference repeats past the loops it found, each pinned to a value that
+  ends it, so a loop behind another (the receive poll after a prompt's
+  transmit poll) is found too. The run JSON's `mmio_inference` lists each
+  loop (`pc`, `address`, `polls`, the deciding `mask`, the `exit` value,
+  whether it `writes` memory between its reads, why it is `not_a_poll`
+  when its read keeps the input: `no_exit`, `writes_memory`, or
+  `other_bits` with the `value` that showed it, and the `model` added) with
+  the rounds and probes it took; inferred models carry `"inferred": true`
+  in the recorded setup, so `bhf replay` and a rerun with `--mmio-models`
+  use them without inferring again, and the rerun's setup still marks them
+  inferred. `--no-mmio-inference` turns it off. Loops that alternate
+  between two registers, or whose exit depends on more than the bits of
+  one read, are not inferred; name those with `--mmio`.
 - `--ram BASE:SIZE` (repeatable) maps RAM; the default is
   `0x20000000:0x100000`, and an ELF's `.data` and `.bss` RAM is mapped as
   well. An initial stack pointer outside RAM is refused before anything

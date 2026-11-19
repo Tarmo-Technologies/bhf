@@ -525,9 +525,11 @@ ELF, or a raw image with `--base`) in bhf's own emulator: each input is
 written into a fixed buffer (`--input-buffer`, an address or ELF symbol,
 with `--input-size`, `--input-length` and `--inject-at`), read by the
 firmware's peripheral reads through MMIO models (`--mmio ADDR[@PC]=MODEL`,
-`passthrough` from the input or `constant:VALUE`; `--mmio-models FILE`;
-`--mmio-default zero|passthrough`), or both; the core starts from the reset
-vector, and basic-block edge coverage steers the mutation. Addresses are
+`passthrough` from the input, `constant:VALUE` or `bitextract:MASK`;
+`--mmio-models FILE`; `--mmio-default zero|passthrough`), or both. Polling
+loops on a status register get bit-extract models inferred before the
+campaign (`--no-mmio-inference` turns that off). The core starts from the
+reset vector, and basic-block edge coverage steers the mutation. Addresses are
 hex, `0x` optional, as `nm` prints them. An invalid memory access, a bad PC
 or a HardFault is a `kind: rehost_fault` finding, which `bhf replay`
 reproduces through the recorded machine setup and MMIO models. Interrupts

@@ -71,6 +71,49 @@ impl Bank {
         }
     }
 
+    /// The byte range of `page`.
+    fn page(&self, page: usize) -> std::ops::Range<usize> {
+        let start = page << PAGE_SHIFT;
+        start.min(self.data.len())..(start + (1 << PAGE_SHIFT)).min(self.data.len())
+    }
+
+    /// The pages written since reset, with their contents now.
+    fn checkpoint(&self) -> BankCheckpoint {
+        let mut pages = Vec::new();
+        for (word_index, &word) in self.dirty.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let page = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                pages.push((page, self.data[self.page(page)].into()));
+            }
+        }
+        BankCheckpoint {
+            dirty: self.dirty.clone(),
+            pages,
+        }
+    }
+
+    /// Put the bank back as it was at `checkpoint`: the pages written since
+    /// that were clean then go back to their reset contents, and the pages
+    /// written by then to the contents they had.
+    fn rollback(&mut self, checkpoint: &BankCheckpoint) {
+        for word_index in 0..self.dirty.len() {
+            let mut bits = self.dirty[word_index] & !checkpoint.dirty[word_index];
+            while bits != 0 {
+                let page = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let range = self.page(page);
+                self.data[range.clone()].copy_from_slice(&self.pristine[range]);
+            }
+            self.dirty[word_index] = checkpoint.dirty[word_index];
+        }
+        for (page, bytes) in &checkpoint.pages {
+            let range = self.page(*page);
+            self.data[range].copy_from_slice(bytes);
+        }
+    }
+
     fn reset(&mut self) {
         for (word_index, word) in self.dirty.iter_mut().enumerate() {
             let mut bits = std::mem::take(word);
@@ -90,6 +133,17 @@ impl Bank {
 pub(crate) struct Memory {
     banks: Vec<Bank>,
     last: usize,
+}
+
+struct BankCheckpoint {
+    dirty: Vec<u64>,
+    pages: Vec<(usize, Box<[u8]>)>,
+}
+
+/// Memory's contents at one point of a run, to go back to with
+/// [`Memory::rollback`]: the pages the run had written by then.
+pub(crate) struct Checkpoint {
+    banks: Vec<BankCheckpoint>,
 }
 
 impl Memory {
@@ -173,6 +227,21 @@ impl Memory {
     pub(crate) fn reset(&mut self) {
         for bank in &mut self.banks {
             bank.reset();
+        }
+    }
+
+    /// The contents now, as the pages written since reset.
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            banks: self.banks.iter().map(Bank::checkpoint).collect(),
+        }
+    }
+
+    /// Put memory back as it was at `checkpoint`, taken since the last
+    /// reset; a later reset still restores every page.
+    pub(crate) fn rollback(&mut self, checkpoint: &Checkpoint) {
+        for (bank, saved) in self.banks.iter_mut().zip(&checkpoint.banks) {
+            bank.rollback(saved);
         }
     }
 
@@ -330,6 +399,34 @@ mod tests {
         assert_eq!(memory.write(0x2000_0fff, 2, 0), Err(Miss::Unmapped));
         memory.reset();
         assert_eq!(memory.read(0x2000_0ffe, 2), Ok(0), "reset restores RAM");
+    }
+
+    #[test]
+    fn a_rollback_goes_back_to_the_checkpoint_and_a_reset_still_goes_back_to_reset() {
+        let image = Image::raw(&[0xaa; 4], 0x2000_0010).unwrap();
+        let mut memory = memory(
+            &image,
+            &[MemoryRange {
+                base: 0x2000_0000,
+                size: 0x2000,
+            }],
+        );
+        // Written before the checkpoint: the segment's page.
+        memory.write(0x2000_0010, 4, 1).unwrap();
+        let checkpoint = memory.checkpoint();
+        for _ in 0..2 {
+            // The same page again, and a page clean at the checkpoint.
+            memory.write(0x2000_0010, 4, 2).unwrap();
+            memory.write(0x2000_1800, 4, 3).unwrap();
+            memory.rollback(&checkpoint);
+            assert_eq!(memory.read(0x2000_0010, 4), Ok(1));
+            assert_eq!(memory.read(0x2000_1800, 4), Ok(0));
+        }
+        memory.write(0x2000_1800, 4, 3).unwrap();
+        memory.rollback(&checkpoint);
+        memory.reset();
+        assert_eq!(memory.read(0x2000_0010, 4), Ok(0xaaaa_aaaa));
+        assert_eq!(memory.read(0x2000_1800, 4), Ok(0));
     }
 
     #[test]
