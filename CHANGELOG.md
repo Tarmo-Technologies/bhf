@@ -2936,6 +2936,21 @@
   when bhf panics.
 
 ### Added
+- A `rehost` crate runs an unmodified Cortex-M firmware image in an emulator
+  (#351): an ELF, or a raw image at a base address, starts at the reset
+  vector with the stack pointer its vector table names. Each input is
+  written into a fixed buffer in the firmware's memory, with an optional
+  length word, at reset or when the core first reaches a given address (so
+  the start-up code's `.bss` clearing does not wipe it), and every basic
+  block the core enters is counted in a 64 KiB edge map. The emulator is
+  bhf's own ARMv7-M Thumb-2 interpreter: integer instructions, `SVC`
+  exceptions, the System Control Block registers start-up code writes, and
+  semihosting output and exit. Peripheral registers read as zero, and
+  interrupts and floating point are not modelled; an instruction outside
+  the model stops the run as unsupported rather than as a firmware fault,
+  while `UDF` and the encodings ARMv7-M leaves unallocated fault as
+  undefined instructions. Semihosting writes stop reading memory once the
+  64 KiB output is full.
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse

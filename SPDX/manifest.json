@@ -4543,6 +4543,66 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/alu.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/core_tests.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/cpu.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/fault.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/image.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/machine.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/memory.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/thumb16.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/thumb32.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/magic.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/startup.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/relational/Cargo.toml",
       "license": "Apache-2.0"
     },
