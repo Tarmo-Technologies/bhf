@@ -114,7 +114,13 @@ The remaining value-profile-only case is a **transformed** comparison — the ma
 is a function of the input that never surfaces verbatim as an operand
 (`crc32(buf) == K`, `a == (b ^ K)` where the compiler folds the operand into a
 derived form, length/hash math). Neither input-to-state nor leading-byte
-comparison-progress can synthesize those; a future enhancement is hybrid concolic
-via optional symbolic-execution adapters (SymCC/KLEE, deferred post-1.0) on
-branches that stay cold, fed back as seeds. A full per-site distance metric over arbitrary transforms would be a
+comparison-progress can synthesize those. For C/C++, `bhf auto --symcc` (#324,
+#331) adds a hybrid concolic loop: each harness also builds with SymCC
+(`main_symcc`), and when a builtin pass's corpus stops growing, its newest
+entries run through SymCC, which solves the branch conditions they reached and
+writes an input per branch it can flip; those inputs run next in the pass and
+stay in the corpus when they add coverage, as AFL++'s SymCC custom mutator and
+LibAFL's concolic stage feed theirs. SymCC is GPL-3.0 and runs only as a
+subprocess, under a license profile that permits it (see [Licensing](../licensing/)).
+A full per-site distance metric over arbitrary transforms would be a
 further future addition, requiring comparison-distance instrumentation.

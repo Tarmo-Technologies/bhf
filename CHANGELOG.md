@@ -11,6 +11,15 @@
   `targets[].lanes.symcc`. SymCC (GPL-3.0) runs only as a subprocess under a
   license profile that permits it; `external-tools` now allows `symcc`, and
   `strict-permissive` refuses the flag with a note.
+- With `--symcc`, each builtin pass runs a solver loop (#331): once its corpus
+  has not grown for `BHF_SYMCC_PLATEAU_MS` (default 5 s), its newest entries
+  run through `main_symcc` and the inputs SymCC solves run next, so a
+  comparison on a hashed or modular-arithmetic value can be passed. SymCC's
+  runs take the harness's `--sandbox` and `--rss-limit-mb` (as an
+  address-space limit). A fuzz run summary gains an optional `symcc` block
+  (rounds, entries run, inputs generated and imported),
+  `<work>/symcc-import.log` lists each input, and `bhf fuzz` runs the loop
+  when `BHF_SYMCC=1` and the harness has `main_symcc` beside it.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `bhf auto --symcc` (#324): the SymCC lane of a C/C++ harness. Building it
-//! needs SymCC's `symcc` (C) and `sym++` (C++), which
+//! `bhf auto --symcc`: the SymCC lane of a C/C++ harness (#324) and the
+//! solver loop that runs a plateaued pass's corpus entries through it
+//! (#331). These need SymCC's `symcc` (C) and `sym++` (C++), which
 //! `scripts/ci/install-symcc.sh` builds; `BHF_REQUIRE_TOOLS=1` makes a
 //! missing one a failure. The strict-permissive profile's refusal needs only
 //! clang and make.
@@ -30,8 +31,8 @@ fn symcc_installed() -> bool {
 /// check only when `tag * 0x9E3779B1 + 0x7F4A7C15 == 0x2545F491` (mod 2^32):
 /// the input holds the tag, never the value it is compared against. The
 /// passing record then overflows a four-byte copy.
-const GATE: &str = "#include <stdint.h>
-#include <stdlib.h>
+const GATE: &str = "#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 int parse_record(const uint8_t *data, size_t size) {
@@ -41,10 +42,9 @@ int parse_record(const uint8_t *data, size_t size) {
     }
     memcpy(&tag, data + 4, sizeof tag);
     if (tag * 0x9E3779B1u + 0x7F4A7C15u == 0x2545F491u) {
-        char *copy = (char *)malloc(4);
+        char copy[4];
         memcpy(copy, data, size);
-        free(copy);
-        return 1;
+        return copy[3];
     }
     return 0;
 }
@@ -65,13 +65,28 @@ fn auto_symcc(
     src: &Path,
     env: &[(&str, &str)],
 ) -> (serde_json::Value, String, PathBuf) {
-    let work = root.join("work");
+    auto(
+        &root.join("work"),
+        src,
+        &["--per-target-time", "2", "--symcc"],
+        env,
+    )
+}
+
+/// `bhf auto <src>` into `work` with `args` and `env`, as [`auto_symcc`].
+fn auto(
+    work: &Path,
+    src: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (serde_json::Value, String, PathBuf) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bhf"));
     cmd.arg("auto")
         .arg(src)
         .arg("--work-dir")
-        .arg(&work)
-        .args(["--per-target-time", "2", "--jobs", "1", "--symcc"])
+        .arg(work)
+        .args(["--jobs", "1"])
+        .args(args)
         .arg("--no-discovery-cache")
         .env_remove("BHF_PROFILE")
         .env_remove("BHF_SYMCC");
@@ -146,11 +161,7 @@ fn the_symcc_lane_of_a_cpp_harness_builds_and_generates_an_input() {
     let root = TestDir::new("symcc-cpp");
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("gate.cpp"),
-        GATE.replace("#include <stdlib.h>", "#include <cstdlib>"),
-    )
-    .unwrap();
+    std::fs::write(src.join("gate.cpp"), GATE).unwrap();
     let (target, stderr, harness) = auto_symcc(&root, &src, &[]);
     assert_eq!(
         target["lanes"]["symcc"]["built"], true,
@@ -270,4 +281,59 @@ fn the_strict_permissive_profile_refuses_the_symcc_lane() {
     assert!(target["lanes"].get("symcc").is_none(), "{target:#}");
     assert!(harness.join("main").is_file(), "{target:#}");
     assert!(!harness.join("main_symcc").exists());
+}
+
+/// The testcases of the findings `bhf auto` wrote into `work`.
+fn finding_testcases(work: &Path) -> Vec<Vec<u8>> {
+    std::fs::read_dir(work.join("results/findings"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| std::fs::read(entry.path().join("testcase.bin")).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #331: the modular-arithmetic gate is passed only with the solver loop.
+/// `bhf auto` alone finds nothing behind it in the budget; with `--symcc`, a
+/// pass whose corpus stops growing runs its newest entries through SymCC,
+/// and the input SymCC solves reaches the overflow behind the gate.
+#[test]
+fn only_the_solver_loop_passes_a_modular_arithmetic_gate() {
+    if !symcc_installed() {
+        eprintln!("skipping: needs SymCC's symcc and sym++, and make");
+        return;
+    }
+    let root = TestDir::new("symcc-loop");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("gate.c"), GATE).unwrap();
+    let budget = ["--per-target-time", "9"];
+
+    let plain = root.join("plain");
+    let (target, stderr, _) = auto(&plain, &src, &budget, &[]);
+    assert!(target["lanes"].get("symcc").is_none(), "{target:#}");
+    let found = finding_testcases(&plain);
+    assert!(
+        found.is_empty(),
+        "the builtin engine alone passed the gate: {found:?}\n{stderr}"
+    );
+
+    let solved = root.join("symcc");
+    let mut args = budget.to_vec();
+    args.push("--symcc");
+    let (target, stderr, _) = auto(&solved, &src, &args, &[("BHF_SYMCC_PLATEAU_MS", "500")]);
+    assert_eq!(
+        target["lanes"]["symcc"]["built"], true,
+        "{target:#}\n{stderr}"
+    );
+    assert!(stderr.contains("SymCC ran"), "{stderr}");
+    let found = finding_testcases(&solved);
+    assert!(
+        found.iter().any(|input| passes_the_gate(input)),
+        "no finding past the gate: {found:?}\n{stderr}"
+    );
+    let imports = std::fs::read_to_string(solved.join("symcc-import.log")).unwrap();
+    assert!(!imports.trim().is_empty());
 }

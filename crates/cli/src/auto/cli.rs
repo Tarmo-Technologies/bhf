@@ -800,7 +800,12 @@ pub struct AutoArgs {
     /// `external-tools`, and `strict-permissive` refuses it. Needs `symcc`
     /// (C) and `sym++` (C++) on PATH, or SYMCC_CC/SYMCC_CXX naming them; a
     /// harness whose SymCC build fails is fuzzed without it, and
-    /// `targets[].lanes.symcc` in run.json says why. `BHF_SYMCC=1` does the same.
+    /// `targets[].lanes.symcc` in run.json says why. Each builtin pass of a
+    /// harness with the lane runs a solver loop: once the pass's corpus has not
+    /// grown for BHF_SYMCC_PLATEAU_MS (default 5000), its newest entries
+    /// (BHF_SYMCC_ENTRIES per round, default 8) run through `main_symcc`, each
+    /// for at most BHF_SYMCC_TIMEOUT_MS (default 10000), and the inputs SymCC
+    /// solves run next in the pass. `BHF_SYMCC=1` does the same as the flag.
     #[arg(long = "symcc")]
     pub symcc: bool,
 

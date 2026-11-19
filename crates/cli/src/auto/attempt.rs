@@ -3942,6 +3942,13 @@ fn run_attempt(
                     // pass's mutator splices the magic bytes this pass observed,
                     // and into the learned dictionary later runs load.
                     harvest_pass_cmplog(&harness_dir);
+                    // #331: what the pass's SymCC stage solved.
+                    if let Some(note) = crate::symcc::pass_note(summary.symcc.as_ref()) {
+                        bhfeprintln!(
+                            "bhf auto: {}: pass `{pass_label}`: {note}",
+                            candidate.harness_id
+                        );
+                    }
                     // Flush the pass's final counters. Live ticks are throttled
                     // and a sub-throttle pass emits none, so this is what makes a
                     // working run show real execs instead of the execs=0 start.

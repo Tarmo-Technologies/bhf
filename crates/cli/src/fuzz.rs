@@ -1146,6 +1146,10 @@ pub(crate) struct FuzzRunSummary {
     /// (#232). Omitted when none was calibrated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stability: Option<StabilitySummary>,
+    /// #331: what the pass's SymCC stage did: its rounds, the entries it ran
+    /// and the inputs it gave the pass. Omitted when the pass had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symcc: Option<crate::symcc::SymccRunSummary>,
 }
 
 /// Fresh-process re-runs of new corpus inputs during one fork-server pass.
@@ -1449,6 +1453,10 @@ struct PreparedFuzzRun {
     /// builtin engine drives `oracle.evaluate` over the retained corpus after the
     /// run. `None` leaves fuzzing byte-for-byte unchanged.
     extension_manifest: Option<PathBuf>,
+    /// #331: the SymCC stage of a builtin pass, which runs the corpus entries
+    /// of a plateau through `main_symcc` and runs the inputs it solves.
+    /// `None` unless the run asked for SymCC and the harness has the lane.
+    symcc: Option<crate::symcc::SymccConfig>,
 }
 
 #[derive(Clone)]
@@ -3417,6 +3425,12 @@ fn prepare_with_runner(
     }
 
     let harness_path = find_harness_executable(&work_dir, &args.harness, args.engine)?;
+    // #331: the SymCC stage's runs take the harness's sandbox.
+    let sandbox = crate::symcc::Sandbox {
+        mode: args.sandbox,
+        tool: args.sandbox_tool.clone(),
+        strict: args.sandbox_strict,
+    };
     let runner = match runner {
         Some(runner) => runner,
         None => harness_runner_for(
@@ -3636,6 +3650,16 @@ fn prepare_with_runner(
     let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
     let afl_workers = afl_worker_count(args.engine, args.workers);
+    let symcc = if args.engine == FuzzEngine::Builtin {
+        crate::symcc::SymccConfig::for_run(
+            &harness_path,
+            runner.qemu_prefix().is_some(),
+            &sandbox,
+            args.rss_limit_mb,
+        )
+    } else {
+        None
+    };
     Ok(PreparedFuzzRun {
         work_dir,
         harness_id: args.harness,
@@ -3686,6 +3710,7 @@ fn prepare_with_runner(
         afl_max_len: None,
         afl_workers,
         extension_manifest: args.extension,
+        symcc,
     })
 }
 
@@ -4802,6 +4827,17 @@ fn run_builtin_with_progress(
     if let Some(sync) = peer_sync.as_mut() {
         sync.skip_seeds(pool.len());
     }
+    // #331: on a plateau, the pool's newest entries run through SymCC and the
+    // inputs it solves run next.
+    let mut symcc_stage = prepared.symcc.take().map(|config| {
+        crate::symcc::SymccStage::new(
+            config,
+            &prepared.work_dir,
+            &prepared.harness_id,
+            prepared.max_len,
+            Instant::now(),
+        )
+    });
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -5358,6 +5394,19 @@ fn run_builtin_with_progress(
             }
             _ => None,
         };
+        // Then an input SymCC solved, once the seeds have run.
+        let imported = imported.or_else(|| match symcc_stage.as_mut() {
+            Some(stage) if iteration >= initial_seed_count => {
+                stage.tick(
+                    Instant::now(),
+                    pool.len(),
+                    |index| (pool[index].bytes.as_slice(), pool[index].retired),
+                    pass_deadline,
+                );
+                stage.next_import()
+            }
+            _ => None,
+        });
         let input = if let Some(imported) = imported {
             parents = crate::fuzz_lineage::InputParents::Generated;
             imported
@@ -6285,6 +6334,7 @@ fn run_builtin_with_progress(
         fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: calibration.summary(),
+        symcc: symcc_stage.as_ref().map(|stage| stage.summary().clone()),
     };
     if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
         bhfeprintln!("{hint}");
@@ -7812,6 +7862,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         fresh_reruns: None,
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
+        symcc: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -18098,6 +18149,106 @@ exit 0
             expected.display()
         );
         write_c_libfuzzer_harness(work_dir, id, &script);
+    }
+
+    /// #331: once a builtin pass's corpus stops growing, its SymCC stage runs
+    /// the entries through `main_symcc`, and the input the solver writes runs
+    /// in the pass: here the only input on which the harness crashes, which
+    /// no mutation of the seed finds in a short pass, becomes a finding. The
+    /// run summary says what the stage did.
+    #[test]
+    #[cfg(unix)]
+    fn a_plateaued_pass_runs_the_input_symcc_solves() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let solved: Vec<u8> = (0..24u8).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &solved).unwrap();
+        write_exact_match_harness(&work_dir, "H-SYMCC", &expected);
+        let recorded = root.join("recorded");
+        fs::create_dir_all(&recorded).unwrap();
+        fs::write(recorded.join("000000"), &solved).unwrap();
+        let solver = work_dir.join("build/H-SYMCC/main_symcc");
+        fs::write(
+            &solver,
+            format!(
+                "#!/bin/sh\ncp '{}'/* \"$SYMCC_OUTPUT_DIR\"/\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&solver, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args = afl_programmatic_args(
+            &work_dir,
+            "H-SYMCC",
+            vec![b"parse_record".to_vec()],
+            Some(Duration::from_secs(20)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            4096,
+        );
+        args.engine = FuzzEngine::Builtin;
+        args.iterations = Some(64);
+        args.stop_after_findings = Some(1);
+        let mut prepared = prepare(args).unwrap();
+        prepared.symcc = Some(crate::symcc::SymccConfig {
+            binary: solver.clone(),
+            runner: replay_min::HarnessRunner::direct(solver.clone()),
+            rss_limit_mb: 0,
+            plateau: Duration::ZERO,
+            run_timeout: Duration::from_secs(10),
+            entries_per_round: 8,
+        });
+        let summary = run_builtin_with_progress(prepared, None).unwrap();
+        assert_eq!(summary.findings.len(), 1, "{:?}", summary.findings);
+        let testcase = fs::read(
+            corpus::layout::finding_dir(&work_dir, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(testcase, solved);
+        let symcc = summary.symcc.as_ref().expect("the stage's summary");
+        assert_eq!(symcc.binary, solver);
+        assert!(symcc.rounds >= 1, "{symcc:?}");
+        assert_eq!(symcc.inputs_imported, 1, "{symcc:?}");
+        let json = fs::read_to_string(work_dir.join("fuzz_runs/H-SYMCC-latest.json")).unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(recorded["symcc"]["inputs_imported"], 1, "{json}");
+    }
+
+    /// Without the SymCC stage the same short pass does not find that input:
+    /// the finding above is the stage's.
+    #[test]
+    #[cfg(unix)]
+    fn without_symcc_the_short_pass_misses_that_input() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let solved: Vec<u8> = (0..24u8).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &solved).unwrap();
+        write_exact_match_harness(&work_dir, "H-NOSYMCC", &expected);
+        let mut args = afl_programmatic_args(
+            &work_dir,
+            "H-NOSYMCC",
+            vec![b"parse_record".to_vec()],
+            Some(Duration::from_secs(20)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            4096,
+        );
+        args.engine = FuzzEngine::Builtin;
+        args.iterations = Some(64);
+        let prepared = prepare(args).unwrap();
+        assert!(prepared.symcc.is_none(), "the run did not ask for SymCC");
+        let summary = run_builtin_with_progress(prepared, None).unwrap();
+        assert!(summary.findings.is_empty(), "{:?}", summary.findings);
+        assert!(summary.symcc.is_none());
+        let json = fs::read_to_string(work_dir.join("fuzz_runs/H-NOSYMCC-latest.json")).unwrap();
+        assert!(!json.contains("\"symcc\""), "{json}");
     }
 
     #[test]
