@@ -80,6 +80,12 @@ pub fn producer_for(kind: Kind, id: &str) -> &'static str {
     }
 }
 
+/// `kind` of a `bhf binary rehost` finding: a fault of firmware run in the
+/// rehosting emulator, which only `bhf replay` reproduces.
+const REHOST_FAULT_KIND: &str = "rehost_fault";
+/// The producer of a [`REHOST_FAULT_KIND`] finding.
+const REHOST_PRODUCER: &str = "binary rehost";
+
 /// The interpreter a reproducer command names: Windows' Python installer
 /// provides `python` (and `py`), not `python3`.
 const REPLAY_PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
@@ -192,7 +198,16 @@ pub fn from_finding_report(
         .or_else(|| f.cluster_key.clone())
         .unwrap_or_else(|| primary.clone());
     let finding_dir = ctx.results_dir.join("findings").join(&f.id);
-    let evidence = evidence_for(&finding_dir, &f.id);
+    let rehost =
+        kind == Kind::Binary && raw.get("kind").and_then(Value::as_str) == Some(REHOST_FAULT_KIND);
+    // The generic replay.py runs a host harness, which a rehosted firmware
+    // image is not: `bhf replay` is its reproducer.
+    let evidence = evidence_for(&finding_dir, &f.id).map(|mut evidence| {
+        if rehost {
+            evidence.files.retain(|file| file.role != "replay_script");
+        }
+        evidence
+    });
     if matches!(kind, Kind::Fuzz | Kind::Runtime) {
         caveats.extend(actionability::harness_state_caveats(
             raw,
@@ -213,7 +228,11 @@ pub fn from_finding_report(
     let mut finding = Finding {
         id: f.id.clone(),
         kind,
-        producer: producer_for(kind, &f.id).to_owned(),
+        producer: if rehost {
+            REHOST_PRODUCER.to_owned()
+        } else {
+            producer_for(kind, &f.id).to_owned()
+        },
         severity: severity::resolve(
             Some(a.impact.as_str()),
             raw.get("severity").and_then(Value::as_str),
@@ -272,7 +291,11 @@ pub fn from_finding_report(
             harness_id: str_at(raw, &["harness_id"]),
             // Only commands bhf builds: record text (`triage.replay`) may come
             // from an imported directory.
-            command: has_replay.then(|| format!("{REPLAY_PYTHON} findings/{}/replay.py", f.id)),
+            command: if rehost {
+                Some(format!("bhf replay findings/{}", f.id))
+            } else {
+                has_replay.then(|| format!("{REPLAY_PYTHON} findings/{}/replay.py", f.id))
+            },
             build: BuildInfo {
                 sanitizers: sanitizers(raw, exception.sanitizer.as_deref()),
                 binary_sha256: binary_sha256.clone(),
@@ -2110,6 +2133,35 @@ mod tests {
         assert_eq!(access.allocated_by_harness, None);
     }
 
+    /// The schema's producer enum holds every producer a finding is given.
+    #[test]
+    fn the_schema_lists_every_producer() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/bhf.findings.v1.schema.json"))
+                .unwrap();
+        let listed: Vec<&str> = schema["$defs"]["finding"]["properties"]["producer"]["enum"]
+            .as_array()
+            .expect("an enum of producers")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        let kinds = [
+            Kind::Fuzz,
+            Kind::Runtime,
+            Kind::Static,
+            Kind::Binary,
+            Kind::Differential,
+            Kind::Sca,
+        ];
+        for kind in kinds {
+            for id in ["S-0000", "F-0000-1a2b3c4d"] {
+                let producer = producer_for(kind, id);
+                assert!(listed.contains(&producer), "{producer:?} in {listed:?}");
+            }
+        }
+        assert!(listed.contains(&REHOST_PRODUCER), "{listed:?}");
+    }
+
     /// The schema lists exactly the reason codes the verdict classifier gives.
     #[test]
     fn the_schema_lists_every_verdict_reason() {
@@ -3197,6 +3249,41 @@ mod tests {
         assert_eq!(sha256_file_uncapped(&tmp.path().join("link")), None);
         assert_eq!(sha256_file(&tmp.path().join("link")), None);
         assert_eq!(sha256_file_uncapped(tmp.path()), None, "a directory");
+    }
+
+    #[test]
+    fn a_rehost_fault_reproduces_through_bhf_replay() {
+        let raw = json!({
+            "id": "BF-0000", "kind": "rehost_fault", "rule_id": "BHF-501", "severity": "high",
+            "classification": "invalid_access",
+            "message": "Rehosted firmware fault: a store to unmapped memory",
+            "binary": {"path": "/fw/widget.elf", "sha256": "cd".repeat(32), "format": "elf"},
+            "crash": {"exit_code": null, "timeout": false,
+                      "signature": "invalid_access:write_unmapped:0x080000c2"},
+            "triage": {"replay": "bhf replay /w/results/findings/BF-0000"},
+            "finding_kind": "binary"
+        });
+        // The generic replay.py runs a host harness; a rehosted image is not
+        // one, so it is not offered.
+        let (_tmp, f) = normalize_dir(raw, None, |dir| {
+            std::fs::write(dir.join("testcase.bin"), b"FUZZW").unwrap();
+            std::fs::write(dir.join("replay.py"), b"print()").unwrap();
+        });
+        assert_eq!(f.kind, Kind::Binary);
+        assert_eq!(f.producer, "binary rehost");
+        assert_eq!(
+            f.reproduce.as_ref().unwrap().command.as_deref(),
+            Some("bhf replay findings/BF-0000")
+        );
+        let files = &f.evidence.as_ref().unwrap().files;
+        assert!(
+            files.iter().all(|file| file.role != "replay_script"),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.role == "testcase"),
+            "{files:?}"
+        );
     }
 
     #[test]

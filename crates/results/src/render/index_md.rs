@@ -416,12 +416,13 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             }
         }
         if let Some(command) = rep.reproduce.as_ref().and_then(|r| r.command.as_deref()) {
-            let _ = writeln!(
-                out,
-                "- Reproduce: `{}`{}",
-                md_code(command),
+            // The note is about the harness replay.py runs.
+            let note = if command.ends_with("replay.py") {
                 REPRODUCE_PLATFORM_NOTE
-            );
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "- Reproduce: `{}`{}", md_code(command), note);
         }
         out.push('\n');
     }
@@ -632,6 +633,18 @@ mod tests {
                 "- Input bytes compared (offsets in `min_testcase.bin`): bytes 0..4 → memcmp at \
                  `src/parse.c:31`\n"
             ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_bhf_replay_command_is_shown_without_the_harness_note() {
+        let mut doc = example();
+        doc.findings[0].reproduce.as_mut().unwrap().command =
+            Some("bhf replay findings/BF-0000".to_owned());
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(
+            md.contains("- Reproduce: `bhf replay findings/BF-0000`\n"),
             "{md}"
         );
     }

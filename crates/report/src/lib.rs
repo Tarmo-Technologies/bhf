@@ -2029,8 +2029,12 @@ fn normalize_finding(
     // generic when the bug-class map left it empty.
     ensure_finding_cwe(&mut actionability, &raw, rule_id.as_deref());
     // Standalone Python reproducer for EVERY finding (C/C++/Ada/unknown): runs the
-    // built harness on the recorded testcase with the sanitizer env.
-    let generated_repro_py = if generate_reproducers {
+    // built harness on the recorded testcase with the sanitizer env. A
+    // rehosted firmware fault has no host harness: `bhf replay` reproduces it.
+    let rehost_fault = raw.get("kind").and_then(Value::as_str) == Some("rehost_fault");
+    let generated_repro_py = if rehost_fault {
+        None
+    } else if generate_reproducers {
         repro_py_status(finding_dir, &id, &raw, &actionability)
     } else if finding_dir.join("replay.py").is_file() {
         Some(finding_artifact_path(&id, "replay.py"))
@@ -4493,6 +4497,25 @@ mod tests {
             "{:?}",
             found[0].repro_ada_omitted_reason
         );
+    }
+
+    #[test]
+    fn a_rehosted_firmware_fault_gets_no_python_reproducer() {
+        // `bhf replay` reproduces it; replay.py runs a host harness, which a
+        // rehosted firmware image is not.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("BF-0000");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"BF-0000","kind":"rehost_fault","finding_kind":"binary","rule_id":"BHF-501"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"FUZZW").unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, true).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(found[0].generated_repro_py, None);
+        assert!(!dir.join("replay.py").exists());
     }
 
     #[cfg(unix)]

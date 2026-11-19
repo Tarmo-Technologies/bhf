@@ -13,7 +13,7 @@ checks.
 | Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report`, `model` |
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
-| Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
+| Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`, `rehost`) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
@@ -68,6 +68,7 @@ bhf introspect path/to/src --work-dir bhf_work
 bhf binary scan path/to/bin-or-firmware --out bhf_work/binary
 bhf --profile external-tools binary adapter path/to/bin --adapter rizin --out bhf_work/binary-adapter
 bhf binary fuzz path/to/bin --work-dir bhf_work --input-mode stdin --seed-input smoke
+bhf binary rehost path/to/firmware.elf --work-dir bhf_work --input-buffer rx_buf --inject-at main
 bhf clean bhf_work --build --corpus --reports
 ```
 
@@ -517,6 +518,17 @@ The two AFL++ modes also take:
 bhf binary fuzz ./parser --engine afl-qemu --input-mode file \
   --seed-file samples/record.bin --persistent-addr 0x4011b6 --time 10m
 ```
+
+`bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image (an
+ELF, or a raw image with `--base`) in bhf's own emulator: each input is
+written into a fixed buffer (`--input-buffer`, an address or ELF symbol,
+with `--input-size`, `--input-length` and `--inject-at`), the core starts
+from the reset vector, and basic-block edge coverage steers the mutation.
+Addresses are hex, `0x` optional, as `nm` prints them. An invalid memory
+access, a bad PC or a HardFault is a `kind: rehost_fault` finding, which
+`bhf replay` reproduces through the recorded machine setup. Peripherals and
+interrupts are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md)
+for the flags and the fidelity.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic

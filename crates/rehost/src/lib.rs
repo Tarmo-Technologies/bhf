@@ -59,7 +59,7 @@ mod thumb16;
 mod thumb32;
 
 pub use coverage::{CoverageMap, EdgeMap, EDGE_MAP_SIZE};
-pub use fault::{Fault, FaultKind};
+pub use fault::{Fault, FaultClass, FaultKind};
 pub use image::{Image, ImageFormat, LoadError, RamRange, Segment, Symbol};
 pub use machine::{
     Execution, IdleReason, InputBuffer, Machine, MachineConfig, MemoryRange, SetupError, Stop,

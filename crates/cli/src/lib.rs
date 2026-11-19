@@ -39,6 +39,7 @@ pub mod auto;
 mod benchmark;
 mod binary_adapter;
 mod binary_fuzz;
+mod binary_rehost;
 mod binary_scan;
 pub mod board_profile;
 mod build;
@@ -157,7 +158,7 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Build support stub, instrument, fake-corba
   Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
                 differential, relational, cmplog, explain, cartography, decode-args
-  Binaries      binary (scan, adapter, fuzz — no source)
+  Binaries      binary (scan, adapter, fuzz, rehost — no source)
   Projects      project (validate, list, run, import-ossfuzz),
                 extension (validate, evaluate)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
@@ -279,7 +280,7 @@ enum Command {
     DecodeArgs(decode_args::DecodeArgsArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
-    /// No-source analysis of compiled binaries & firmware: scan (CVE/SBOM), fuzz (black-box), and the adapter stubs
+    /// No-source analysis of compiled binaries & firmware: scan (CVE/SBOM), fuzz (black-box), rehost (Cortex-M firmware in an emulator), and the adapter stubs
     Binary(BinaryArgs),
 
     // ── External project/target profiles ────────────────────────────────────
@@ -365,8 +366,9 @@ enum Command {
     ListOracles(list_oracles::ListOraclesArgs),
 }
 
-/// `bhf binary <scan|adapter|fuzz>` — no-source analysis of compiled
-/// artifacts. Groups the former `binary-*` top-level commands.
+/// `bhf binary <scan|adapter|fuzz|rehost>` — no-source analysis of compiled
+/// artifacts and firmware images. Groups the former `binary-*` top-level
+/// commands.
 #[derive(Debug, clap::Args)]
 struct BinaryArgs {
     #[command(subcommand)]
@@ -385,6 +387,8 @@ enum BinaryCommand {
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),
+    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer, edge coverage, invalid access / bad PC / HardFault findings
+    Rehost(binary_rehost::BinaryRehostArgs),
 }
 
 /// `bhf list <targets|oracles>` — enumerate discovered fuzzable targets or
@@ -515,6 +519,16 @@ where
                     None,
                     |_| results::model::ProducerStatus::Complete,
                     || binary_fuzz::run(args),
+                )
+            }
+            BinaryCommand::Rehost(args) => {
+                let work = args.work_dir.clone();
+                with_results(
+                    &work,
+                    "binary rehost",
+                    None,
+                    |_| results::model::ProducerStatus::Complete,
+                    || binary_rehost::run(args),
                 )
             }
         },
@@ -918,7 +932,7 @@ mod tests {
 
         let binary = sub("binary").expect("`binary` parent exists");
         let bsubs: Vec<&str> = binary.get_subcommands().map(|c| c.get_name()).collect();
-        for expected in ["scan", "adapter", "fuzz"] {
+        for expected in ["scan", "adapter", "fuzz", "rehost"] {
             assert!(
                 bsubs.contains(&expected),
                 "binary missing `{expected}`: {bsubs:?}"

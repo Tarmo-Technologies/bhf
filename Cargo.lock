@@ -207,6 +207,7 @@ dependencies = [
  "python_parser",
  "rayon",
  "regex",
+ "rehost",
  "relational",
  "replay_min",
  "report",

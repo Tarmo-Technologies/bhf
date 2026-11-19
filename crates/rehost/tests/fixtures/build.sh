@@ -8,7 +8,7 @@ set -eu
 cd "$(dirname "$0")"
 CFLAGS="-mcpu=cortex-m4 -mthumb -mfloat-abi=soft -O2 -g0 -ffreestanding -nostdlib -fno-builtin"
 LDFLAGS="-T link.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-z,max-page-size=16"
-for image in magic; do
+for image in magic faults; do
     arm-none-eabi-gcc $CFLAGS $LDFLAGS -o "$image.elf" startup.c "$image.c" -lgcc
     arm-none-eabi-objcopy -O binary "$image.elf" "$image.bin"
 done

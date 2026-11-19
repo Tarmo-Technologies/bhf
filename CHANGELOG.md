@@ -2951,6 +2951,24 @@
   while `UDF` and the encodings ARMv7-M leaves unallocated fault as
   undefined instructions. Semihosting writes stop reading memory once the
   64 KiB output is full.
+- `bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image
+  in that emulator (#380): the input goes into a fixed buffer named by
+  address (hex, `0x` optional, as `nm` prints it) or ELF symbol
+  (`--input-buffer`, `--input-size`, `--input-length`, `--inject-at`; the
+  run JSON's `input_not_delivered` counts runs that never reached
+  `--inject-at`, and bhf warns when no seed does), RAM is
+  `--ram BASE:SIZE`, a raw image loads at `--base`, and the edge coverage
+  steers the builtin engine's mutator. A run that faults is a `kind: rehost_fault` finding
+  (`finding_kind: binary`, rule `BHF-501`) classified as `invalid_access`,
+  `bad_pc` or `hard_fault`, with the fault, the registers and the machine
+  setup; `bhf replay` runs its testcase through that setup again and
+  reports `MATCH` on the same fault signature (`--harness` names another
+  copy of the image). The run JSON is `bhf.binary_rehost.run.v1`, and it
+  and every finding carry a `fidelity` block saying peripherals and
+  interrupts are not modelled. In `results/` these findings have producer
+  `binary rehost` (a value added to the `bhf.findings.v1` schema's
+  `producer` enum) and the reproduce command `bhf replay findings/<id>`;
+  they get no `replay.py`.
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse
